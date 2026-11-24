@@ -1223,9 +1223,26 @@ fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
                 min: -2.0,
                 max: 2.0,
             },
-            ClearContext { joints_within_limits: false, ..base_met },
-            ClearRefusal::JointLimitsNotSatisfied,
-            ClearContext { joints_within_limits: true, ..base_met },
+            ClearContext {
+                joint_limit_violation: Some(armd::safety::JointLimitClearViolation::OutOfBounds {
+                    joint_idx: 1,
+                    joint_name: BoundedText::new("joint_2"),
+                    value: 3.5,
+                    min: -2.0,
+                    max: 2.0,
+                    margin: armd::supervisor::JOINT_LIMIT_CLEAR_MARGIN_RAD,
+                }),
+                ..base_met
+            },
+            ClearRefusal::JointLimitsNotSatisfied(armd::safety::JointLimitClearViolation::OutOfBounds {
+                joint_idx: 1,
+                joint_name: BoundedText::new("joint_2"),
+                value: 3.5,
+                min: -2.0,
+                max: 2.0,
+                margin: armd::supervisor::JOINT_LIMIT_CLEAR_MARGIN_RAD,
+            }),
+            ClearContext { joint_limit_violation: None, ..base_met },
         ),
         // CollisionLatched: keeps existing rule (enable state unknown / hw fault / stale feedback)
         (
@@ -1295,32 +1312,53 @@ fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
     let mut inner = SupervisorInner::new(cfg.clone());
     inner.thermal_cooldown_duration = Duration::from_millis(40);
     inner.temperatures = vec![30.0; cfg.dof];
-    // JointLimit: out of bounds -> refused; back within limits + margin -> cleared.
-    inner.measured_positions[0] = inner.config.limits[0].max_position + 0.2;
+    // JointLimit: out of bounds -> refused naming joint/position/limits; back within limits + margin -> cleared.
+    let j0_lim = inner.config.limits[0].clone();
+    let over_q = j0_lim.max_position + 0.2;
+    inner.measured_positions[0] = over_q;
     inner.safety.latch(
         FaultKind::JointLimit,
         FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("joint 1 out of bounds")),
     );
-    assert!(inner.clear_fault().unwrap_err().to_string().contains("within limits"));
+    let jl_err = inner.clear_fault().unwrap_err().to_string();
+    assert!(
+        jl_err.contains(&j0_lim.name)
+            && jl_err.contains(&format!("{over_q:.4}"))
+            && jl_err.contains(&format!("{:.4}", j0_lim.min_position))
+            && jl_err.contains(&format!("{:.4}", j0_lim.max_position))
+            && jl_err.contains("within limits"),
+        "JointLimit refusal must name joint, position, and limits: {jl_err}"
+    );
     assert_eq!(
         inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)),
-        Err(ClearFaultError::Rejected(ClearRefusal::JointLimitsNotSatisfied))
+        Err(ClearFaultError::Rejected(ClearRefusal::JointLimitsNotSatisfied(
+            armd::safety::JointLimitClearViolation::OutOfBounds {
+                joint_idx: 0,
+                joint_name: BoundedText::new(&j0_lim.name),
+                value: over_q,
+                min: j0_lim.min_position,
+                max: j0_lim.max_position,
+                margin: armd::supervisor::JOINT_LIMIT_CLEAR_MARGIN_RAD,
+            }
+        )))
     );
     // Just inside outward margin (0.005 < JOINT_LIMIT_CLEAR_MARGIN_RAD = 0.01) -> clears.
-    inner.measured_positions[0] = inner.config.limits[0].max_position + 0.005;
+    inner.measured_positions[0] = j0_lim.max_position + 0.005;
     assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
 
-    // WatchdogTimeout: active lease with stale heartbeat -> refused; fresh heartbeat or release -> cleared.
-    let gen = inner.acquire_lease("client-w").unwrap();
+    // WatchdogTimeout: active (non-expired) lease with stale heartbeat -> refused; fresh heartbeat or expired lease -> cleared.
+    let _gen = inner.acquire_lease("client-w").unwrap();
     inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
-    std::thread::sleep(Duration::from_millis(45));
+    inner.last_heartbeat = Instant::now() - Duration::from_millis(45);
+    assert!(inner.is_lease_active(), "lease must still be active when testing stale heartbeat");
     assert_eq!(
         inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)),
         Err(ClearFaultError::Rejected(ClearRefusal::WatchdogHeartbeatRequired))
     );
     assert!(inner.clear_fault().unwrap_err().to_string().contains("Fresh heartbeat"));
-    // Re-acquiring lease refreshes heartbeat -> clears cleanly.
-    let _ = inner.release_lease("client-w", gen);
+    // Once the lease expires (acquired_at >= lease_timeout), it counts as NO lease -> clears!
+    std::thread::sleep(Duration::from_millis(45));
+    assert!(!inner.is_lease_active());
     assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
 
     // ThermalTrip with non-zero cooldown dwell: hot -> refused, cool < 40 ms -> refused, cool >= 40 ms -> cleared.
@@ -1482,10 +1520,18 @@ fn paired_fault_kinds_refuse_clear_until_both_conditions_hold_and_report_most_se
         }
         assert_eq!(sm.fault_code(), Some(FaultCode::BusLoss), "BusLoss outranks JointLimit");
         assert!(!sm.recoverable());
+        let jl_violation = armd::safety::JointLimitClearViolation::OutOfBounds {
+            joint_idx: 0,
+            joint_name: BoundedText::new("joint_1"),
+            value: 3.2,
+            min: -2.0,
+            max: 2.0,
+            margin: armd::supervisor::JOINT_LIMIT_CLEAR_MARGIN_RAD,
+        };
         // Bus fresh, joints still outside limits -> refused
         assert_eq!(
-            sm.clear_check(&ClearContext { joints_within_limits: false, ..driver_met }),
-            Err(ClearRefusal::JointLimitsNotSatisfied)
+            sm.clear_check(&ClearContext { joint_limit_violation: Some(jl_violation), ..driver_met }),
+            Err(ClearRefusal::JointLimitsNotSatisfied(jl_violation))
         );
         // Joints back within limits, bus still stale -> refused
         assert_eq!(
@@ -1497,13 +1543,21 @@ fn paired_fault_kinds_refuse_clear_until_both_conditions_hold_and_report_most_se
     }
 
     // Pair 4: ThermalTrip + JointLimit
+    let jl_violation = armd::safety::JointLimitClearViolation::OutOfBounds {
+        joint_idx: 0,
+        joint_name: BoundedText::new("joint_1"),
+        value: 3.2,
+        min: -2.0,
+        max: 2.0,
+        margin: armd::supervisor::JOINT_LIMIT_CLEAR_MARGIN_RAD,
+    };
     let mut sm = SafetyManager::new();
     sm.latch(FaultKind::JointLimit, FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("jl")));
     sm.latch(FaultKind::ThermalTrip, FaultDetail::ThermalTrip { joint_idx: 0, temperature: 90.0, limit: 75.0 });
     assert_eq!(sm.fault_code(), Some(FaultCode::ThermalTrip));
     assert_eq!(
-        sm.clear_check(&ClearContext { joints_within_limits: false, ..driver_met }),
-        Err(ClearRefusal::JointLimitsNotSatisfied)
+        sm.clear_check(&ClearContext { joint_limit_violation: Some(jl_violation), ..driver_met }),
+        Err(ClearRefusal::JointLimitsNotSatisfied(jl_violation))
     );
     assert_eq!(
         sm.clear_check(&ClearContext { thermal_below_threshold: false, ..driver_met }),
@@ -2211,7 +2265,10 @@ fn clear_check_runs_before_motor_reset_on_legacy_and_executor_paths() {
             let _ = alloc::take();
             let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
             assert_eq!(alloc::take().calls, 0, "executor joint-limit refusal before reset allocated");
-            assert_eq!(err, ClearFaultError::Rejected(ClearRefusal::JointLimitsNotSatisfied));
+            assert!(matches!(
+                err,
+                ClearFaultError::Rejected(ClearRefusal::JointLimitsNotSatisfied(_))
+            ), "expected JointLimitsNotSatisfied, got {err:?}");
         } else {
             let err = inner.clear_fault().unwrap_err();
             assert!(err.to_string().contains("within limits"), "{err}");
@@ -2414,4 +2471,148 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         assert!(inner.safety.state().is_stopped(), "fault must stay latched after out-of-limit post-recovery feedback");
         assert!(inner.safety.has_latched_fault_kind(FaultKind::JointLimit));
     }
+}
+
+#[test]
+fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limit_names_joint() {
+    // 1. Thermal cooldown accrues ONLY while temperature feedback is fresh; stale temp resets timer!
+    let clock = MockClock::new();
+    let limits = dm_limits();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits.clone())
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.max_temperature = 75.0;
+    cfg.resting_pose = None;
+    let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.thermal_cooldown_duration = Duration::from_millis(80);
+    inner.safety.set_off_thread_reclaim(true);
+
+    // Latch ThermalTrip, then deliver fresh cool feedback (40 C) so cooldown timer starts.
+    inner.safety.latch(
+        FaultKind::ThermalTrip,
+        FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 },
+    );
+    bus.with(|s| {
+        s.motors[0].temperature_c = 40;
+        s.push_all_feedback();
+    });
+    let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+    inner.tick(0.02);
+    // Let 50 ms of real wall-clock dwell accrue while still below the 80 ms cooldown requirement.
+    std::thread::sleep(Duration::from_millis(50));
+    let err_mid = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+    assert!(
+        matches!(err_mid, ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { required_ms: 80, .. })),
+        "expected ThermalCooldownNotElapsed mid-dwell, got {err_mid:?}"
+    );
+
+    // Now make temperature feedback stale (> 250 ms old) and tick: cooldown timer MUST reset!
+    clock.advance(Duration::from_millis(300));
+    let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+    inner.tick(0.02);
+    // Wait another 50 ms while stale (total wall time since initial cool > 100 ms > 80 ms!)
+    std::thread::sleep(Duration::from_millis(50));
+    let err_stale = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+    assert_eq!(err_stale, ClearFaultError::Rejected(ClearRefusal::FreshFeedbackRequired));
+
+    // Fresh cool feedback resumes: because stale temp reset the timer, cooldown MUST start from ~0 ms
+    // and refuse immediately (must NOT inherit pre-stale dwell!).
+    bus.with(|s| {
+        s.motors[0].temperature_c = 40;
+        s.push_all_feedback();
+    });
+    let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+    inner.tick(0.02);
+    alloc::time_this_thread();
+    let _ = alloc::take();
+    let err_restarted = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+    assert_eq!(alloc::take().calls, 0, "restarted cooldown refusal must do 0 heap ops");
+    match err_restarted {
+        ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms, required_ms }) => {
+            assert_eq!(required_ms, 80);
+            assert!(elapsed_ms < 40, "cooldown timer must have reset on stale temp, got elapsed_ms={elapsed_ms}");
+        }
+        other => panic!("expected restarted ThermalCooldownNotElapsed after stale gap, got {other:?}"),
+    }
+    // After a FULL fresh 85 ms dwell -> clears cleanly!
+    std::thread::sleep(Duration::from_millis(85));
+    bus.with(|s| s.push_all_feedback());
+    let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+    assert_eq!(
+        inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap(),
+        SafetyState::Idle
+    );
+
+    // 2. Expired lease counts as NO lease for WatchdogTimeout, while active lease with stale heartbeat refuses.
+    let mut wd_cfg = ArmConfig::rebot_dm();
+    wd_cfg.lease_timeout_ms = 30;
+    let mut wd_inner = SupervisorInner::new(wd_cfg);
+    let _ = wd_inner.acquire_lease("holder-1").unwrap();
+    wd_inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+    // Lease is still active (`acquired_at` is fresh), but `last_heartbeat` is stale -> refused!
+    wd_inner.last_heartbeat = Instant::now() - Duration::from_millis(50);
+    assert!(wd_inner.is_lease_active());
+    assert_eq!(
+        wd_inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)),
+        Err(ClearFaultError::Rejected(ClearRefusal::WatchdogHeartbeatRequired))
+    );
+    // Fresh heartbeat from active holder -> clears!
+    let wd_ep = wd_inner.safety.epoch_id();
+    wd_inner.heartbeat("holder-1", wd_ep).unwrap();
+    assert_eq!(wd_inner.clear_fault().unwrap(), SafetyState::Idle);
+    // Re-latch WatchdogTimeout and let lease expire without releasing -> active_lease is Some(..)
+    // but expired (`!is_lease_active()`), which MUST count as NO lease and clear!
+    wd_inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+    std::thread::sleep(Duration::from_millis(45));
+    assert!(wd_inner.active_lease.is_some() && !wd_inner.is_lease_active());
+    assert_eq!(wd_inner.clear_fault().unwrap(), SafetyState::Idle);
+
+    // 3. JointLimit with torque OFF and arm resting beyond soft limit + 0.01 rad:
+    // keep refusing (never allow software clear into out-of-limit pose), and name joint, position, and limit!
+    let mut jl_inner = SupervisorInner::new(ArmConfig::rebot_dm());
+    jl_inner.lease_enabled = false;
+    jl_inner.is_torqued = false;
+    jl_inner.safety.set_off_thread_reclaim(true);
+    let j2_lim = jl_inner.config.limits[2].clone();
+    let resting_beyond = j2_lim.min_position - 0.05; // beyond soft min - 0.01 rad
+    jl_inner.measured_positions[2] = resting_beyond;
+    jl_inner.safety.latch(
+        FaultKind::JointLimit,
+        FaultDetail::JointLimitExceeded {
+            joint_idx: 2,
+            joint_name: BoundedText::new(&j2_lim.name),
+            value: resting_beyond,
+            min: j2_lim.min_position,
+            max: j2_lim.max_position,
+        },
+    );
+    // Legacy clear_fault refuses with joint name, position, and limits.
+    let legacy_msg = jl_inner.clear_fault().unwrap_err().to_string();
+    assert!(
+        legacy_msg.contains(&j2_lim.name)
+            && legacy_msg.contains("joint 3")
+            && legacy_msg.contains(&format!("{resting_beyond:.4}"))
+            && legacy_msg.contains(&format!("{:.4}", j2_lim.min_position))
+            && legacy_msg.contains(&format!("{:.4}", j2_lim.max_position))
+            && legacy_msg.contains("by hand"),
+        "JointLimit torque-off refusal must name joint, position, and limits: {legacy_msg}"
+    );
+    assert!(jl_inner.safety.has_latched_fault_kind(FaultKind::JointLimit));
+    // RT executor clear_fault_executor_bounded refuses with 0 heap allocations and renders identical message.
+    let _ = alloc::take();
+    let rt_err = jl_inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+    assert_eq!(alloc::take().calls, 0, "JointLimit refusal on RT path must do 0 heap ops");
+    assert_eq!(SafetyError::from(rt_err).to_string(), legacy_msg);
+    // Operator moves joint 3 back within soft limit + 0.01 rad by hand -> clears!
+    jl_inner.measured_positions[2] = j2_lim.min_position - 0.005;
+    assert_eq!(jl_inner.clear_fault().unwrap(), SafetyState::Idle);
 }

@@ -916,6 +916,49 @@ impl std::fmt::Display for ClearFaultDriverError {
     }
 }
 
+/// Structured, allocation-free description of the first joint violating `JointLimit` clear bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JointLimitClearViolation {
+    /// Telemetry length mismatch or missing configured limits.
+    FeedbackIncomplete { measured_len: usize, dof: usize },
+    /// Joint reported a non-finite position (`NaN` / `±Inf`).
+    NonFinite {
+        joint_idx: u16,
+        joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>,
+        value: f32,
+    },
+    /// Measured joint position lies outside `[min - margin, max + margin]`.
+    OutOfBounds {
+        joint_idx: u16,
+        joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>,
+        value: f32,
+        min: f32,
+        max: f32,
+        margin: f32,
+    },
+}
+
+impl std::fmt::Display for JointLimitClearViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FeedbackIncomplete { measured_len, dof } => write!(
+                f,
+                "Measured joint positions incomplete ({measured_len} of {dof} joints); all joints must be back within limits before clearing JointLimit"
+            ),
+            Self::NonFinite { joint_idx, joint_name, value } => write!(
+                f,
+                "Joint '{joint_name}' (joint {}) position {value} rad is non-finite; restore valid feedback within limits before clearing JointLimit",
+                joint_idx + 1
+            ),
+            Self::OutOfBounds { joint_idx, joint_name, value, min, max, margin } => write!(
+                f,
+                "Joint '{joint_name}' (joint {}) at {value:.4} rad is outside limits [{min:.4}, {max:.4}] rad (clear margin {margin:.2} rad); move it back within limits by hand before clearing JointLimit",
+                joint_idx + 1
+            ),
+        }
+    }
+}
+
 /// Typed, bounded `clear_fault` refusal carrying zero heap allocations on the control thread;
 /// rendered off-thread to the exact `SafetyError::ClearFaultRejected(String)` text.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -939,7 +982,7 @@ pub enum ClearRefusal {
     TemperatureAboveThreshold,
     ThermalCooldownNotElapsed { elapsed_ms: u64, required_ms: u64 },
     WatchdogHeartbeatRequired,
-    JointLimitsNotSatisfied,
+    JointLimitsNotSatisfied(JointLimitClearViolation),
     EnableStateUnknown,
     ReclaimQueueFull,
     UnknownFaultKind,
@@ -987,7 +1030,7 @@ impl std::fmt::Display for ClearRefusal {
             Self::ThermalCooldownNotElapsed { elapsed_ms, required_ms } =>
                 write!(f, "Thermal cooldown period not elapsed ({elapsed_ms} ms of {required_ms} ms required below threshold)"),
             Self::WatchdogHeartbeatRequired => f.write_str("Fresh heartbeat from the active lease holder is required before clearing WatchdogTimeout"),
-            Self::JointLimitsNotSatisfied => f.write_str("Measured joint positions must be back within limits before clearing JointLimit"),
+            Self::JointLimitsNotSatisfied(violation) => write!(f, "{violation}"),
             Self::EnableStateUnknown => f.write_str("Hardware enable state is unknown; reset remains latched"),
             Self::ReclaimQueueFull => f.write_str("Fault state reclamation queue is full; retry after off-thread drain"),
             Self::UnknownFaultKind => f.write_str("Unknown latched fault kind cannot be cleared (fail closed)"),
@@ -1014,7 +1057,7 @@ pub struct ClearContext {
     pub thermal_cooldown_required_ms: u64,
     pub has_active_lease: bool,
     pub lease_heartbeat_fresh: bool,
-    pub joints_within_limits: bool,
+    pub joint_limit_violation: Option<JointLimitClearViolation>,
     pub enable_state_known: bool,
     /// True when the driver reports a latched motor fault bit that requires a motor reset
     /// before it can clear. `clear_check` permits this reset ONLY after every OTHER recorded
@@ -1048,7 +1091,7 @@ impl ClearContext {
             thermal_cooldown_required_ms: 0,
             has_active_lease: false,
             lease_heartbeat_fresh: true,
-            joints_within_limits: true,
+            joint_limit_violation: None,
             enable_state_known: true,
             hardware_reset_required: false,
             hardware_reset_sent: false,
@@ -1934,8 +1977,8 @@ impl SafetyManager {
                     if ctx.has_driver && !ctx.feedback_fresh {
                         return Err(ClearRefusal::FreshFeedbackRequired);
                     }
-                    if !ctx.joints_within_limits {
-                        return Err(ClearRefusal::JointLimitsNotSatisfied);
+                    if let Some(violation) = ctx.joint_limit_violation {
+                        return Err(ClearRefusal::JointLimitsNotSatisfied(violation));
                     }
                 }
                 FaultKind::CollisionLatched | FaultKind::Estop | FaultKind::Other => {

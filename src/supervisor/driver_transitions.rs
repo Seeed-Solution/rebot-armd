@@ -799,18 +799,45 @@ impl SupervisorInner {
     }
 
     /// Pure read-only check of measured positions against either validated candidate limits (if
-    /// `driver_config_error` just resolved) or current `self.config.limits`.
-    fn joints_within_clear_limits_with_candidates(&self, cand: Option<&CandidateDriverLimits>) -> bool {
+    /// `driver_config_error` just resolved) or current `self.config.limits` (zero heap allocations).
+    fn joint_limit_clear_violation_with_candidates(
+        &self,
+        cand: Option<&CandidateDriverLimits>,
+    ) -> Option<crate::safety::JointLimitClearViolation> {
+        use crate::safety::{BoundedText, JointLimitClearViolation as V};
         if let Some(c) = cand {
-            self.measured_positions.len() == c.dof
-                && (0..c.dof).all(|i| {
-                    let q = self.measured_positions[i];
-                    q.is_finite()
-                        && q >= c.min[i] - JOINT_LIMIT_CLEAR_MARGIN_RAD
-                        && q <= c.max[i] + JOINT_LIMIT_CLEAR_MARGIN_RAD
-                })
+            if self.measured_positions.len() != c.dof || self.config.limits.len() != c.dof {
+                return Some(V::FeedbackIncomplete {
+                    measured_len: self.measured_positions.len(),
+                    dof: c.dof,
+                });
+            }
+            for i in 0..c.dof {
+                let q = self.measured_positions[i];
+                let joint_name = BoundedText::new(&self.config.limits[i].name);
+                if !q.is_finite() {
+                    return Some(V::NonFinite {
+                        joint_idx: i as u16,
+                        joint_name,
+                        value: q,
+                    });
+                }
+                if q < c.min[i] - JOINT_LIMIT_CLEAR_MARGIN_RAD
+                    || q > c.max[i] + JOINT_LIMIT_CLEAR_MARGIN_RAD
+                {
+                    return Some(V::OutOfBounds {
+                        joint_idx: i as u16,
+                        joint_name,
+                        value: q,
+                        min: c.min[i],
+                        max: c.max[i],
+                        margin: JOINT_LIMIT_CLEAR_MARGIN_RAD,
+                    });
+                }
+            }
+            None
         } else {
-            self.joints_within_clear_limits()
+            self.joint_limit_clear_violation()
         }
     }
 
@@ -1683,11 +1710,10 @@ impl SupervisorInner {
         } else {
             0
         };
-        let has_active_lease = self.active_lease.is_some();
-        let lease_heartbeat_fresh = self.active_lease.as_ref().is_some_and(|active| {
-            active.acquired_at.elapsed() < self.lease_timeout
-                && self.last_heartbeat.elapsed() <= self.lease_timeout
-        });
+        // An expired lease counts as NO lease for the WatchdogTimeout heartbeat condition.
+        let has_active_lease = self.is_lease_active();
+        let lease_heartbeat_fresh =
+            has_active_lease && self.last_heartbeat.elapsed() <= self.lease_timeout;
         ClearContext {
             expected_epoch: None,
             pending_estop: self.estop_request_unapplied(),
@@ -1704,7 +1730,7 @@ impl SupervisorInner {
             thermal_cooldown_required_ms: self.thermal_cooldown_duration.as_millis().min(u128::from(u64::MAX)) as u64,
             has_active_lease,
             lease_heartbeat_fresh,
-            joints_within_limits: self.joints_within_clear_limits(),
+            joint_limit_violation: self.joint_limit_clear_violation(),
             enable_state_known: self.driver.is_none(),
             hardware_reset_required: false,
             hardware_reset_sent: false,
@@ -1859,7 +1885,7 @@ impl SupervisorInner {
         pre_ctx.thermal_below_threshold = true;
         pre_ctx.thermal_cooldown_elapsed_ms = pre_ctx.thermal_cooldown_required_ms;
         pre_ctx.lease_heartbeat_fresh = true;
-        pre_ctx.joints_within_limits = true;
+        pre_ctx.joint_limit_violation = None;
         pre_ctx.enable_state_known = true;
         if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
             if refusal == ClearRefusal::EStopActive {
@@ -1891,14 +1917,18 @@ impl SupervisorInner {
                     d.lock().ok().and_then(|mut drv| {
                         let states = drv.read_joint_states().ok()?;
                         let loads = drv.joint_loads();
-                        if Self::states_valid(&states, drv.capabilities(), self.config.dof, loads.as_deref()) {
-                            Some((states, loads))
+                        let caps = drv.capabilities();
+                        let fresh = drv.is_feedback_valid()
+                            && drv.feedback_all_within(self.config.dof, Duration::from_millis(250))
+                            && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                        if fresh {
+                            Some((states, loads, caps.temperature_feedback))
                         } else {
                             None
                         }
                     })
                 });
-                if let Some((states, loads)) = synced {
+                if let Some((states, loads, temp_fb)) = synced {
                     self.feedback_numeric_valid = true;
                     Self::apply_feedback(
                         &mut self.measured_positions,
@@ -1910,8 +1940,14 @@ impl SupervisorInner {
                         &states,
                         loads.as_deref(),
                     );
-                    let temps_copy = self.temperatures.clone();
-                    self.update_thermal_cooldown_from_temps(&temps_copy);
+                    if temp_fb {
+                        let temps_copy = self.temperatures.clone();
+                        self.update_thermal_cooldown_from_temps(&temps_copy);
+                    } else {
+                        self.thermal_below_since = None;
+                    }
+                } else {
+                    self.thermal_below_since = None;
                 }
                 let mut mit_ctx = self.build_mit_recovery_clear_context();
                 if clear_driver_err_field && driver_err_override.is_none() {
@@ -1919,8 +1955,8 @@ impl SupervisorInner {
                 }
                 mit_ctx.expected_epoch = expected_epoch;
                 mit_ctx.pending_estop = self.estop_request_unapplied();
-                mit_ctx.joints_within_limits =
-                    self.joints_within_clear_limits_with_candidates(candidate_limits.as_ref());
+                mit_ctx.joint_limit_violation =
+                    self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
                 if let Err(refusal) = self.safety.clear_check(&mit_ctx) {
                     if refusal == ClearRefusal::EStopActive {
                         return Err(apply_estop_refusal(self));
@@ -2009,14 +2045,14 @@ impl SupervisorInner {
             }
             let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
             let thermal_below = fb_fresh
+                && caps.temperature_feedback
                 && !states.is_empty()
                 && states.iter().all(|s| s.temperature.is_finite() && s.temperature <= threshold);
-            if fb_fresh {
-                if thermal_below {
-                    self.thermal_below_since.get_or_insert_with(Instant::now);
-                } else {
-                    self.thermal_below_since = None;
-                }
+            // Cooldown accrues ONLY while temperature feedback is fresh; stale/unavailable temp resets it.
+            if thermal_below {
+                self.thermal_below_since.get_or_insert_with(Instant::now);
+            } else {
+                self.thermal_below_since = None;
             }
 
             let mut resting_feedback_missing = false;
@@ -2042,8 +2078,8 @@ impl SupervisorInner {
             ctx.feedback_fresh = fb_fresh;
             ctx.thermal_sensor_available = caps.temperature_feedback;
             ctx.thermal_below_threshold = thermal_below;
-            ctx.joints_within_limits =
-                self.joints_within_clear_limits_with_candidates(candidate_limits.as_ref());
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
@@ -2105,8 +2141,8 @@ impl SupervisorInner {
             }
             ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
-            ctx.joints_within_limits =
-                self.joints_within_clear_limits_with_candidates(candidate_limits.as_ref());
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == ClearRefusal::EStopActive {
                     return Err(apply_estop_refusal(self));
@@ -2407,16 +2443,30 @@ impl SupervisorInner {
             self.scratch.ages = scratch_ages;
             self.ws_eval_bufs = ws_bufs;
 
+            let fb_fresh = self.feedback_numeric_valid && fb_valid && ages_valid;
+            // Cooldown accrues ONLY while temperature feedback is fresh; stale/unavailable temp resets it.
+            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+            let thermal_below = fb_fresh
+                && temp_fb
+                && !self.temperatures.is_empty()
+                && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+            if thermal_below {
+                self.thermal_below_since.get_or_insert_with(Instant::now);
+            } else {
+                self.thermal_below_since = None;
+            }
+
             ctx = self.build_clear_context_base(driver_err_override);
             if candidate_limits.is_some() {
                 ctx.driver_config_error = None;
             }
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
-            ctx.feedback_fresh = self.feedback_numeric_valid && fb_valid && ages_valid;
+            ctx.feedback_fresh = fb_fresh;
             ctx.thermal_sensor_available = temp_fb;
-            ctx.joints_within_limits =
-                self.joints_within_clear_limits_with_candidates(candidate_limits.as_ref());
+            ctx.thermal_below_threshold = thermal_below;
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
@@ -2477,8 +2527,8 @@ impl SupervisorInner {
             }
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
-            ctx.joints_within_limits =
-                self.joints_within_clear_limits_with_candidates(candidate_limits.as_ref());
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == R::EStopActive {
                     self.consume_pending_estop();

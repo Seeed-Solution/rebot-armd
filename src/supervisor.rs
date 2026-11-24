@@ -1682,27 +1682,71 @@ impl SupervisorInner {
         }
     }
 
+    /// Returns the first measured joint violating configured limits plus
+    /// [`JOINT_LIMIT_CLEAR_MARGIN_RAD`] (zero heap allocations), or `None` when every joint is
+    /// finite and within clear bounds.
+    pub(crate) fn joint_limit_clear_violation(&self) -> Option<crate::safety::JointLimitClearViolation> {
+        use crate::safety::{BoundedText, JointLimitClearViolation as V};
+        let dof = self.config.dof;
+        if self.measured_positions.len() != dof || self.config.limits.len() != dof {
+            return Some(V::FeedbackIncomplete {
+                measured_len: self.measured_positions.len(),
+                dof,
+            });
+        }
+        for (i, (&q, l)) in self.measured_positions.iter().zip(&self.config.limits).enumerate() {
+            if !q.is_finite() {
+                return Some(V::NonFinite {
+                    joint_idx: i as u16,
+                    joint_name: BoundedText::new(&l.name),
+                    value: q,
+                });
+            }
+            if q < l.min_position - JOINT_LIMIT_CLEAR_MARGIN_RAD
+                || q > l.max_position + JOINT_LIMIT_CLEAR_MARGIN_RAD
+            {
+                return Some(V::OutOfBounds {
+                    joint_idx: i as u16,
+                    joint_name: BoundedText::new(&l.name),
+                    value: q,
+                    min: l.min_position,
+                    max: l.max_position,
+                    margin: JOINT_LIMIT_CLEAR_MARGIN_RAD,
+                });
+            }
+        }
+        None
+    }
+
     /// True when every measured joint position is finite and within configured limits plus
     /// [`JOINT_LIMIT_CLEAR_MARGIN_RAD`].
+    #[allow(dead_code)]
     pub(crate) fn joints_within_clear_limits(&self) -> bool {
-        self.measured_positions.len() == self.config.dof
-            && self.config.limits.len() == self.config.dof
-            && self.measured_positions.iter().zip(&self.config.limits).all(|(&q, l)| {
-                q.is_finite()
-                    && q >= l.min_position - JOINT_LIMIT_CLEAR_MARGIN_RAD
-                    && q <= l.max_position + JOINT_LIMIT_CLEAR_MARGIN_RAD
-            })
+        self.joint_limit_clear_violation().is_none()
     }
 
     /// Thermal protection remains active while torqued or while torque disable is unconfirmed.
     /// `was_active` preserves thermal protection when a torque transition confirmed disable on
     /// the exact same Step 2 poll that delivered an over-temperature sample.
+    ///
+    /// Thermal cooldown accrues ONLY while temperature feedback is fresh; stale or unavailable
+    /// temperature feedback resets the cooldown timer (`thermal_below_since = None`).
     pub(crate) fn check_thermal_protection(&mut self, was_active: bool) {
-        let temperature_available = self
-            .driver
-            .as_ref()
-            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
-        if temperature_available {
+        let (temperature_available, temperature_fresh) = match self.driver.as_ref() {
+            None => (true, true),
+            Some(d) => match d.lock() {
+                Ok(drv) => {
+                    let avail = drv.capabilities().temperature_feedback;
+                    let fresh = avail
+                        && self.feedback_numeric_valid
+                        && drv.is_feedback_valid()
+                        && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
+                    (avail, fresh)
+                }
+                Err(_) => (false, false),
+            },
+        };
+        if temperature_fresh {
             let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
             if !self.temperatures.is_empty()
                 && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
@@ -2176,10 +2220,26 @@ impl SupervisorInner {
                                     sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
                                     out.hw_rx = true;
                                 }
+                                if driver.capabilities().temperature_feedback {
+                                    let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                                    if !self.temperatures.is_empty()
+                                        && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
+                                    {
+                                        self.thermal_below_since.get_or_insert_with(Instant::now);
+                                    } else {
+                                        self.thermal_below_since = None;
+                                    }
+                                } else {
+                                    self.thermal_below_since = None;
+                                }
+                            } else {
+                                // Stale or invalid temperature feedback resets thermal cooldown.
+                                self.thermal_below_since = None;
                             }
                         }
                         Err(_) => {
                             self.last_can_feedback_instant = None;
+                            self.thermal_below_since = None;
                             out.reset_stillness_on_read_err = true;
                         }
                     }
@@ -2218,6 +2278,7 @@ impl SupervisorInner {
                 }
                 Err(_) => {
                     self.last_can_feedback_instant = None;
+                    self.thermal_below_since = None;
                     out.reset_stillness_on_read_err = true;
                 }
             }
