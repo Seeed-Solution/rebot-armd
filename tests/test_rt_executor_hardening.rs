@@ -1680,7 +1680,7 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
         s.push_all_feedback();
     });
     drv.read_joint_states().unwrap();
-    assert_eq!(drv.enable_state(), EnableState::Disabled);
+    assert_eq!(drv.enable_state(), EnableState::Unknown);
 
     let p0 = drv.begin_torque(false).unwrap();
     assert!(matches!(p0, TorqueProgress::Pending { .. }));

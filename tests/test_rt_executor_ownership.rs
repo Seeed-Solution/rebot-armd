@@ -2348,8 +2348,10 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
         0,
         "E-stop during DrainBeforeEnable must transmit ZERO CMD_ENABLE frames"
     );
-    assert_eq!(*fx_a.core.safety.state(), SafetyState::EStop);
-    assert!(!fx_a.core.is_torqued, "arm was never enabled; is_torqued stays false");
+    assert_eq!(fx_a.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(fx_a.core.safety.has_latched_fault_kind(armd::safety::FaultKind::Estop));
+    assert!(fx_a.core.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
+    assert!(!fx_a.core.is_torqued, "arm was never enabled; all motors stayed OffConfirmed so is_torqued stays false");
 
     // (b) E-stop AFTER `CMD_ENABLE` transmitted and motors enabled, BEFORE confirmation poll finishes:
     // transition ends `Outcome::Failed("ESTOP_ACTIVE")`, zero extra enable frames, AND honest
@@ -2402,12 +2404,14 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
         tx_after_begin,
         "no further CMD_ENABLE frames allowed after E-stop"
     );
-    assert_eq!(*fx_b.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx_b.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(fx_b.core.safety.has_latched_fault_kind(armd::safety::FaultKind::Estop));
+    assert!(fx_b.core.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
     assert!(fx_b.core.is_torqued, "honest physical torque state must stay true after partial/complete enable + E-stop");
     assert!(fx_b.core.pending_rearm);
 
-    // (c) Concurrent `e_stop_latched` inside `send_enable` TX loop aborts remaining motors with ESTOP_ACTIVE
-    // and does NOT mutate safety state into Fault(EnableFailed).
+    // (c) Concurrent `e_stop_latched` inside `send_enable` TX loop aborts remaining motors with ESTOP_ACTIVE,
+    // enters FailedHold + ENABLE_FAILED while preserving the E-stop latch.
     let raw_bus_c2 = FakeBus::with_clock(&dm_limits(), clock.clone());
     raw_bus_c2.with(|s| {
         s.immediate_replies = true;
@@ -2434,17 +2438,24 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     let (mut fx_c, mut broker_c, _tw_c, _stop_c) =
         ReleaseFixture::new(inner_c2, BootId(33), Capacities { commands: 4, plans: 2, replies: 8 });
     let auth_c = fx_c.core.authority(&fx_c.ctx(fx_c.now()));
-    broker_c
+    let req_c = broker_c
         .submit(ClientId(1), 1, auth_c, fx_c.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn))
         .unwrap();
     let rc1 = fx_c.step();
-    assert_eq!(rc1.command.unwrap().1, Err("ESTOP_ACTIVE"));
+    assert!(rc1.command.unwrap().1.is_ok(), "started enable transition reports terminal outcome");
+    let ended = rc1.transition_ended.or_else(|| fx_c.step().transition_ended);
+    assert_eq!(
+        ended,
+        Some((armd::rt_core::broker::ActionId(req_c.0), Outcome::Failed("ESTOP_ACTIVE")))
+    );
     assert_eq!(
         raw_bus_c2.tx_log().iter().filter(|f| f.data == armd::protocol::damiao::CMD_ENABLE).count(),
         3,
         "must stop transmitting CMD_ENABLE immediately when E-stop latches on frame 3"
     );
-    assert!(!matches!(fx_c.core.safety.state(), SafetyState::Fault(_)), "must not fault EnableFailed on E-stop");
+    assert_eq!(fx_c.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(fx_c.core.safety.has_latched_fault_kind(armd::safety::FaultKind::Estop), "E-stop latch must be preserved");
+    assert!(fx_c.core.safety.has_latched_fault_code(armd::FaultCode::EnableFailed), "interruption enters unified ENABLE_FAILED");
     assert!(fx_c.core.is_torqued, "partial enable before E-stop must preserve is_torqued=true");
 }
 
@@ -2486,17 +2497,12 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
     assert_eq!(r_off.command.unwrap().1, Err("UNSUPPORTED"));
     assert_eq!(raw_bus.tx_log().len(), 0, "refused ImmediateOp torque must transmit 0 bus frames");
 
-    // (b) Enable failure at rest with fresh feedback uses non-blocking `enable_failed_budgeted`
-    // (no blocking read_joint_states / sleep) and completes background disable through Step 2's
-    // single RX pass!
+    // (b) Enable failure at rest with fresh feedback uses the single budgeted reducer
+    // (no blocking read_joint_states / sleep, NO automatic rollback at any pose) and enters
+    // FailedHold + ENABLE_FAILED; an explicit TorqueOff at rest uses budgeted disable and
+    // completes within Step 2's single RX pass!
     raw_bus.with(|s| {
         s.motors[3].drop_torque_frames = 10;
-        // Once rollback disable starts, hold motor 4 silent so disable stays pending for Step 2.
-        s.on_disable_state = Some(Arc::new(|st| {
-            st.motors[3].silent = true;
-            st.rx.clear();
-            st.pending.clear();
-        }));
     });
     let auth_fail = fx.core.authority(&fx.ctx(fx.now()));
     broker
@@ -2506,7 +2512,7 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
     assert!(r_start.command.unwrap().1.is_ok());
 
     // Advance past Damiao enable confirmation timeout while all motors report fresh feedback
-    // at rest -> transition fails without extra blocking RX, and at-rest rollback starts pending disable!
+    // at rest -> transition fails without extra blocking RX and enters FailedHold (0 disables!).
     let mut failed_outcome = None;
     for _ in 0..30 {
         clock.advance(Duration::from_millis(20));
@@ -2520,26 +2526,40 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
         }
     }
     assert_eq!(failed_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
-    assert!(fx.core.disable_pending, "unconfirmed disable after enable failure at rest must stay disable_pending");
+    assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(!fx.core.disable_pending, "failed enable must not trigger automatic rollback disable");
+    assert!(fx.core.is_torqued);
+    assert_eq!(
+        raw_bus.tx_log().iter().filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE).count(),
+        0,
+        "failed enable at rest must send ZERO automatic rollback disable frames"
+    );
 
-    // Motor 4 recovers and confirms fresh disabled feedback -> Step 2's
-    // `service_background_disable` confirms disable cleanly within the single RX budget!
+    // Explicit TorqueOff at rest goes through the rest gate and completes within the single RX budget.
     raw_bus.with(|s| {
-        s.on_disable_state = None;
-        s.motors[3].silent = false;
         s.motors[3].drop_torque_frames = 0;
         s.push_all_feedback();
     });
-    for _ in 0..10 {
+    let auth_off = fx.core.authority(&fx.ctx(fx.now()));
+    broker
+        .submit(ClientId(1), 4, auth_off, fx.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOff))
+        .unwrap();
+    let r_off_start = fx.step();
+    assert!(r_off_start.command.unwrap().1.is_ok());
+    let mut off_outcome = None;
+    for _ in 0..20 {
         clock.advance(Duration::from_millis(20));
+        raw_bus.with(|s| s.push_all_feedback());
         bus.rx_calls.store(0, Ordering::SeqCst);
-        let _ = fx.step();
+        let r = fx.step();
         assert!(bus.rx_calls.load(Ordering::SeqCst) <= 64);
-        if !fx.core.disable_pending && !fx.core.is_torqued {
+        if let Some((_, o)) = r.transition_ended {
+            off_outcome = Some(o);
             break;
         }
     }
-    assert!(!fx.core.disable_pending && !fx.core.is_torqued, "background disable must confirm in Step 2");
+    assert_eq!(off_outcome, Some(Outcome::Completed));
+    assert!(!fx.core.disable_pending && !fx.core.is_torqued, "explicit TorqueOff must confirm in Step 2");
 
     // (c) Thermal trip under `rt_executor_owned == true` triggers non-blocking `request_disable()`
     // with 0 RX in Step 5 and finishes disable confirmation in Step 2!

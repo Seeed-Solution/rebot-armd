@@ -113,9 +113,9 @@ fn an_enable_is_withheld_until_the_driver_confirms_it_then_applied_to_the_superv
 
 #[test]
 fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() {
-    // 1. Silent motor (> 100 ms stale at 150 ms enable timeout): cannot prove rest pose from fresh
-    //    feedback, so rollback is refused, torque stays on (motors hold), and `ENABLE_ROLLBACK_HELD`
-    //    latches (alongside `BUS_LOSS` because motor 4 is actually silent while torqued).
+    // 1. Silent motor (> 100 ms stale at 150 ms enable timeout): no automatic rollback,
+    //    enters FailedHold, keeps holding healthy joints, and latches non-recoverable
+    //    `ENABLE_FAILED` (alongside `BUS_LOSS` because motor 4 is actually silent while torqued).
     let mut r = rig();
     r.bus.with(|s| s.motors[3].silent = true);
     r.submit(TransitionOp::TorqueOn);
@@ -124,9 +124,16 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     assert_eq!(outcome, Outcome::Failed("ENABLE_FAILED"));
     let inner = &r.fx.core;
     assert!(!inner.torque_transition_pending());
-    assert!(inner.is_torqued && !inner.disable_pending, "stale rollback refused: must keep holding ({}, {})", inner.is_torqued, inner.disable_pending);
+    assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(inner.is_torqued && !inner.disable_pending, "failed enable must hold without rollback ({}, {})", inner.is_torqued, inner.disable_pending);
     assert!(matches!(inner.safety.state(), armd::SafetyState::Fault(_)), "{:?}", inner.safety.state());
-    assert!(inner.safety.has_latched_fault_code(armd::FaultCode::EnableRollbackHeld));
+    assert!(inner.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
+    assert!(!inner.safety.recoverable());
+    assert_eq!(
+        r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "failed enable must send ZERO automatic rollback disable frames"
+    );
     // a second enable while the fault latches is refused at the commit, before any frame
     r.bus.with(|s| s.motors[3].silent = false);
     let before = r.enable_frames();
@@ -134,8 +141,9 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     assert!(r.step().command.unwrap().1.is_err());
     assert_eq!(r.enable_frames(), before);
 
-    // 2. Raised pose with fresh feedback and non-confirming motor: rollback is refused (0 disables),
-    //    torque stays on, and ONLY recoverable `ENABLE_ROLLBACK_HELD` latches (`recoverable == true`).
+    // 2. Raised pose with fresh feedback and non-confirming motor: NO automatic rollback
+    //    (0 disables), enters FailedHold, and latches non-recoverable `ENABLE_FAILED` with
+    //    per-joint status.
     let mut r_raised = rig();
     r_raised.bus.with(|s| {
         s.follow_commands = false;
@@ -144,6 +152,7 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
         s.push_all_feedback();
     });
     r_raised.step();
+    r_raised.bus.clear_log();
     r_raised.submit(TransitionOp::TorqueOn);
     assert!(r_raised.step().command.unwrap().1.is_ok());
     let mut raised_outcome = None;
@@ -156,20 +165,24 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
         }
     }
     assert_eq!(raised_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
+    assert_eq!(r_raised.fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
     assert!(r_raised.fx.core.is_torqued && !r_raised.fx.core.disable_pending);
     assert_eq!(
-        r_raised.fx.core.safety.fault().map(|f| f.code),
-        Some(armd::FaultCode::EnableRollbackHeld)
+        r_raised.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "raised failed enable must send ZERO automatic rollback disable frames"
     );
-    assert!(
-        r_raised.fx.core.safety.recoverable(),
-        "raised refused rollback with fresh feedback must latch recoverable ENABLE_ROLLBACK_HELD"
-    );
+    let raised_fault = r_raised.fx.core.safety.fault().expect("ENABLE_FAILED fault expected");
+    assert_eq!(raised_fault.code, armd::FaultCode::EnableFailed);
+    assert!(!r_raised.fx.core.safety.recoverable(), "ENABLE_FAILED must be non-recoverable");
+    assert!(raised_fault.message.contains("J4:unk/held"), "missing per-joint status: {}", raised_fault.message);
 
-    // 3. Non-confirming motor that keeps replying fresh state 0 at the rest pose: rollback is
-    //    allowed at rest, sends disables, and latches `ENABLE_FAILED`.
+    // 3. Rest pose with non-confirming motor: STILL NO automatic rollback (0 disables), enters
+    //    FailedHold + non-recoverable `ENABLE_FAILED`; a later explicit TorqueOff at rest
+    //    passes the rest gate and disables torque cleanly.
     let mut r2 = rig();
     r2.bus.with(|s| s.motors[3].drop_torque_frames = 10);
+    r2.bus.clear_log();
     r2.submit(TransitionOp::TorqueOn);
     assert!(r2.step().command.unwrap().1.is_ok());
     let mut rest_outcome = None;
@@ -182,10 +195,26 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
         }
     }
     assert_eq!(rest_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
+    assert_eq!(
+        r2.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+        0,
+        "failed enable at rest must NOT automatically roll back"
+    );
     let inner2 = &r2.fx.core;
     assert!(!inner2.torque_transition_pending());
-    assert!(!inner2.is_torqued || inner2.disable_pending, "at-rest rollback turns torque off ({}, {})", inner2.is_torqued, inner2.disable_pending);
+    assert_eq!(inner2.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert!(inner2.is_torqued && !inner2.disable_pending);
     assert_eq!(inner2.safety.fault().map(|f| f.code), Some(armd::FaultCode::EnableFailed));
+    assert!(!inner2.safety.recoverable());
+
+    // Explicit TorqueOff at the rest pose succeeds through the rest gate!
+    r2.bus.with(|s| s.motors[3].drop_torque_frames = 0);
+    r2.submit(TransitionOp::TorqueOff);
+    assert!(r2.step().command.unwrap().1.is_ok());
+    let (_, off_outcome, _) = r2.until_ended(30);
+    assert_eq!(off_outcome, Outcome::Completed);
+    assert!(!r2.fx.core.is_torqued);
+    assert_eq!(r2.fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::Disarmed);
 }
 
 #[test]

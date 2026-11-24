@@ -190,7 +190,7 @@ fn test_feetech_torque_enable_rollback() {
     driver.read_joint_states().unwrap();
     let _ = driver.transport_mut().take_tx();
 
-    // Servo 1 reports 1 (enabled), Servo 2 fails (reports 0)
+    // Servo 1 reports 1 (enabled), Servo 2 fails (reports 0) — NO local rollback.
     let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
     let resp1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs1];
     let cs2 = calculate_checksum(2, 3, 0x00, &[0]);
@@ -199,30 +199,27 @@ fn test_feetech_torque_enable_rollback() {
     let mut rx = Vec::new();
     rx.extend_from_slice(&resp1);
     rx.extend_from_slice(&resp2);
-    // Rollback readbacks: both return 0 (disabled)
-    let cs_rb1 = calculate_checksum(1, 3, 0x00, &[0]);
-    let resp_rb1 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_rb1];
-    let cs_rb2 = calculate_checksum(2, 3, 0x00, &[0]);
-    let resp_rb2 = vec![0xFF, 0xFF, 2, 3, 0x00, 0, cs_rb2];
-    rx.extend_from_slice(&resp_rb1);
-    rx.extend_from_slice(&resp_rb2);
     driver.transport_mut().provide_rx(&rx);
 
     let res = driver.set_torque(true);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert!(matches!(err, ArmDriverError::HardwareFault(_)));
-    assert_eq!(driver.enable_state(), EnableState::Disabled);
+    // Per-motor evidence reflects causal readback: servo 1 OnConfirmed, servo 2 OffConfirmed -> aggregate Unknown.
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
+    let mut ev = [armd::driver::MotorTorqueEvidence::Unknown; 2];
+    driver.motor_torque_evidence_into(&mut ev);
+    assert_eq!(
+        ev,
+        [
+            armd::driver::MotorTorqueEvidence::OnConfirmed,
+            armd::driver::MotorTorqueEvidence::OffConfirmed,
+        ]
+    );
 
-    // Verify rollback: driver wrote disable packets (REG_TORQUE_ENABLE = 0) and read back status
+    // Verify NO local rollback: only pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + Readback reads (2*8=16) = 46 bytes
     let tx = driver.transport_mut().take_tx();
-    // Pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (2*8=16) + Rollback reads (2*8=16) = 78 bytes
-    assert_eq!(tx.len(), 78);
-    // Rollback write to servo 1 at offset 46: [0xFF, 0xFF, 1, 4, 3, 0x28, 0, cs]
-    assert_eq!(tx[46 + 2], 1); // ID 1
-    assert_eq!(tx[46 + 4], INST_WRITE);
-    assert_eq!(tx[46 + 5], REG_TORQUE_ENABLE);
-    assert_eq!(tx[46 + 6], 0); // Torque disable
+    assert_eq!(tx.len(), 46, "Feetech must not transmit automatic rollback disable packets");
 }
 
 // -------------------------------------------------------------------------
@@ -1901,11 +1898,9 @@ fn test_feetech_partial_enable_holding_preservation() {
     // NOT joint 1 (which is already holding at Some(true)).
     let cs_tq_rb1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs_tq_rb2 = calculate_checksum(2, 3, 0x00, &[0]); // joint 2 fails
-    let cs_rb2 = calculate_checksum(2, 3, 0x00, &[0]); // rollback readback for joint 2 verifies 0
     let rx_enable_rb = vec![
         0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq_rb1,
         0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq_rb2,
-        0xFF, 0xFF, 2, 3, 0x00, 0, cs_rb2,
     ];
     driver.transport_mut().provide_rx(&rx_enable_rb);
 
@@ -1920,16 +1915,19 @@ fn test_feetech_partial_enable_holding_preservation() {
     assert_eq!(tx[4], feetech::INST_SYNC_WRITE);
     assert_eq!(tx[7], 2); // Servo ID 2 only!
 
-    // Verify rollback wrote disable ONLY to joint 2, NOT joint 1, and read back joint 2!
-    // tx structure: SyncWrite (11) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback write (1*8=8) + Rollback read (1*8=8) = 59 bytes
-    assert_eq!(tx.len(), 59);
-    let rb_pkt = &tx[43..51];
-    assert_eq!(rb_pkt[2], 2); // ID 2
-    assert_eq!(rb_pkt[4], INST_WRITE);
-    assert_eq!(rb_pkt[5], REG_TORQUE_ENABLE);
-    assert_eq!(rb_pkt[6], 0); // Torque disabled on joint 2
+    // Verify NO local rollback write: SyncWrite (11) + Enable writes (2*8=16) + Readback reads (2*8=16) = 43 bytes
+    assert_eq!(tx.len(), 43);
 
-    // And joint 1 remains known enabled while joint 2 is disabled!
+    // And joint 1 remains known enabled while joint 2 is confirmed off!
+    let mut ev = [armd::driver::MotorTorqueEvidence::Unknown; 2];
+    driver.motor_torque_evidence_into(&mut ev);
+    assert_eq!(
+        ev,
+        [
+            armd::driver::MotorTorqueEvidence::OnConfirmed,
+            armd::driver::MotorTorqueEvidence::OffConfirmed,
+        ]
+    );
     assert!(driver.has_known_partial_enable());
     assert!(driver.has_any_joint_enabled());
 }
