@@ -571,7 +571,9 @@ impl SupervisorInner {
             let is_expired = active.generation <= self.fenced_lease_generation
                 || active.acquired_at.elapsed() >= self.lease_timeout;
             if active.client_id == conn && !is_expired {
-                return Ok((active.generation, None));
+                let gen = active.generation;
+                self.authorize_servo_stream_for_committed_lease(gen);
+                return Ok((gen, None));
             }
 
             if active.client_id != conn {
@@ -627,6 +629,7 @@ impl SupervisorInner {
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
         self.set_active_lease_in_place(0, conn, label, gen, now);
+        self.authorize_servo_stream_for_committed_lease(gen);
         self.last_heartbeat = now;
         if let Some((ref ev_conn, ev_gen)) = evicted {
             self.last_preemption = Some(now);
@@ -648,7 +651,11 @@ impl SupervisorInner {
             let is_expired = active.generation <= self.fenced_lease_generation
                 || active.acquired_at.elapsed() >= self.lease_timeout;
             if !is_expired {
-                if active.client_id == client_id { return Ok(active.generation); }
+                if active.client_id == client_id {
+                    let gen = active.generation;
+                    self.authorize_servo_stream_for_committed_lease(gen);
+                    return Ok(gen);
+                }
                 return Err((active.client_id.clone(), active.generation));
             }
         }
@@ -665,6 +672,7 @@ impl SupervisorInner {
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
         self.set_active_lease_in_place(0, client_id, "", gen, now);
+        self.authorize_servo_stream_for_committed_lease(gen);
         Ok(gen)
     }
 

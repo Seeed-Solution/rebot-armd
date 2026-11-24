@@ -336,7 +336,7 @@ impl SupervisorInner {
         }
         self.torque_hold_filter(targets);
         self.power_hold_filter(targets);
-        if self.is_pos_force_j7_stale() {
+        if self.check_pos_force_gripper_fresh_static().is_err() {
             if let Some(g) = self.config.gripper_index() {
                 if targets.len() > g {
                     if let Some(freeze_pos) = self.pos_force_j7_freeze_position() {
@@ -354,7 +354,7 @@ impl SupervisorInner {
     /// releases the stall latch on a target away from the stall. A torque-cap latch needs the
     /// target [`GRIPPER_FORCE_RELEASE_MARGIN_RAD`] more open than the hold.
     pub(super) fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
-        if self.is_pos_force_j7_stale() {
+        if self.check_pos_force_gripper_fresh_static().is_err() {
             self.gripper_stream_target = None;
             return;
         }
@@ -386,8 +386,17 @@ impl SupervisorInner {
     /// [`Self::servo`] from a slice: no allocation once the servo buffers hold a target
     /// (the latest-target path consumes through it).
     pub fn servo_slice(admitted: Admitted<'_>, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
+        let prev_j7_stamp = admitted.inner.j7_admitted_stamp;
         let (this, _proof) = admitted.consume()?;
-        this.servo_slice_inner(targets_in, epoch_id)
+        // If J7 PosForce feedback is stale, `validate_and_filter_servo_targets` clamps J7 to the
+        // last fresh freeze position while letting J1–J6 continue; never advance `j7_admitted_stamp`
+        // on a refused frame or while J7 is gated stale by `check_pos_force_gripper_fresh_static`.
+        let j7_stale = this.check_pos_force_gripper_fresh_static().is_err();
+        let res = this.servo_slice_inner(targets_in, epoch_id);
+        if res.is_err() || j7_stale {
+            this.j7_admitted_stamp = prev_j7_stamp;
+        }
+        res
     }
 
     fn servo_slice_inner(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
@@ -1629,7 +1638,7 @@ pub mod targets {
     }
 
     /// Status, `error` and `safety_state` of a refusal code, as `ApiError::from` gives them.
-    fn reject_fields(code: &str) -> (u16, &str, Option<&'static str>) {
+    pub(crate) fn reject_fields(code: &str) -> (u16, &str, Option<&'static str>) {
         match code {
             "ESTOP_ACTIVE" => (409, code, Some("EStop")),
             "FAULT_ACTIVE" => (409, code, Some("Fault")),
@@ -1703,6 +1712,17 @@ pub mod targets {
             self.lease_generation = generation;
         }
 
+        /// Synchronize sequence state across an owner handoff (legacy <-> executor) on the same lease.
+        pub fn sync_from(&mut self, generation: u64, last_sequence: Option<u64>) {
+            self.lease_generation = generation;
+            self.last_sequence = last_sequence;
+        }
+
+        /// Advance `last_sequence` after passing sequence validation on a malformed-payload frame.
+        pub fn advance_sequence(&mut self, sequence: u64) {
+            self.last_sequence = Some(sequence);
+        }
+
         pub fn last_sequence(&self) -> Option<u64> { self.last_sequence }
     }
 
@@ -1737,19 +1757,68 @@ pub mod targets {
         arm: ArmId,
         boot: BootId,
         seq: u64,
+        /// Monotonic high-water mark of closed servo lease generations: late submissions for any
+        /// non-zero generation `<= closed_servo_gen` are rejected immediately off-thread.
+        closed_servo_gen: u64,
+        /// Non-zero servo lease generations currently open in `writer` (bounded by `MAX_STREAMS`).
+        open_servo_gens: Vec<u64>,
     }
 
     impl TargetPort {
-        pub fn new(writer: TargetWriter, arm: ArmId, boot: BootId) -> Self { Self { writer, arm, boot, seq: 0 } }
+        pub fn new(writer: TargetWriter, arm: ArmId, boot: BootId) -> Self {
+            Self {
+                writer,
+                arm,
+                boot,
+                seq: 0,
+                closed_servo_gen: 0,
+                open_servo_gens: Vec::with_capacity(crate::rt_core::mailbox::MAX_STREAMS),
+            }
+        }
 
         /// Frames replaced before consumption.
         pub fn coalesced(&self) -> u64 { self.writer.coalesced() }
 
+        /// Sequence number assigned to the most recently built frame (0 before first submission).
+        pub fn last_seq(&self) -> u64 { self.seq }
+
+        /// Highest lease generation permanently closed on this port (0 if none closed yet).
+        pub fn closed_servo_generation(&self) -> u64 { self.closed_servo_gen }
+
+        /// True when `lease_generation` (non-zero) has been closed via [`Self::close_servo`].
+        pub fn is_servo_closed(&self, lease_generation: u64) -> bool {
+            lease_generation != 0 && lease_generation <= self.closed_servo_gen
+        }
+
+        /// Underlying target writer (for low-level mailbox access / tests).
+        pub fn writer(&self) -> &TargetWriter { &self.writer }
+
+        /// Mutable access to the underlying target writer (for low-level mailbox access / tests).
+        pub fn writer_mut(&mut self) -> &mut TargetWriter { &mut self.writer }
+
         /// Drains the RT's outcomes of consumed frames.
         pub fn outcomes(&mut self, each: impl FnMut(TargetOutcome)) -> usize { self.writer.outcomes(each) }
 
-        /// The connection holding lease `lease_generation` closed: forget its stream.
-        pub fn close_servo(&mut self, lease_generation: u64) { self.writer.close_stream(servo_stream(lease_generation)); }
+        /// The connection holding lease `lease_generation` ended (release, preemption, expiry, or
+        /// disconnect): forget its stream (and any older open servo streams) in the mailbox writer
+        /// and fence late submissions from that generation.
+        pub fn close_servo(&mut self, lease_generation: u64) {
+            if lease_generation == 0 {
+                return;
+            }
+            self.closed_servo_gen = self.closed_servo_gen.max(lease_generation);
+            self.writer.close_stream(servo_stream(lease_generation));
+            let closed = self.closed_servo_gen;
+            let writer = &mut self.writer;
+            self.open_servo_gens.retain(|&g| {
+                if g <= closed {
+                    writer.close_stream(servo_stream(g));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
 
         /// Policy run `action_id` ended: forget its stream.
         pub fn close_policy(&mut self, action_id: u64) { self.writer.close_stream(policy_stream(action_id)); }
@@ -1766,9 +1835,14 @@ pub mod targets {
         }
 
         /// Submits one WS servo message; returns the WS reply (None: queued, no reply).
+        /// Rejects late submissions from closed lease generations before touching sequence state.
         /// Sequence rules as the legacy loop: a missing `sequence_id`, a repeat or a jump of
         /// more than 1000 (wrapping) is refused; the sequence advances once it passes them.
         pub fn submit_servo(&mut self, stream: &mut ServoStream, msg: &ServoMessage<'_>) -> Option<Value> {
+            let lease_gen = msg.authority.lease_generation;
+            if self.is_servo_closed(lease_gen) {
+                return Some(json!({"type":"lease_lost", "generation": lease_gen}));
+            }
             if msg.calibration_busy { return Some(json!({"type":"servo_reject", "reason":"calibration_busy"})); }
             let Some(sequence) = msg.sequence_id else { return Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})); };
             if stream.last_sequence.is_some_and(|last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) {
@@ -1776,13 +1850,18 @@ pub mod targets {
             }
             stream.last_sequence = Some(sequence);
             let epoch = msg.authority.epoch;
-            let stream_id = servo_stream(msg.authority.lease_generation);
+            let stream_id = servo_stream(lease_gen);
             let Some(frame) = self.frame(stream_id, msg.authority, 0, msg.positions, msg.received_at, None, None,
                 msg.received_at + SERVO_TARGET_TTL, true) else {
                 return Some(servo_reject("SAFETY_ERROR", "servo target is empty, has non-finite values or more joints than the arm", epoch));
             };
             match self.writer.submit(frame) {
-                Submitted::Accepted | Submitted::Coalesced { .. } => None,
+                Submitted::Accepted | Submitted::Coalesced { .. } => {
+                    if lease_gen != 0 && !self.open_servo_gens.contains(&lease_gen) {
+                        self.open_servo_gens.push(lease_gen);
+                    }
+                    None
+                }
                 Submitted::Busy => Some(servo_reject("MOTION_BUSY", "a policy target is waiting to be applied", epoch)),
                 Submitted::StreamsFull => Some(servo_reject("STREAMS_FULL", "too many open target streams", epoch)),
                 Submitted::OutOfOrder => Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"})),
@@ -1826,6 +1905,38 @@ pub mod targets {
             }
             this.core.authorize_stream(TargetAuthority { stream: Some(servo_stream(lease_generation)), ..TargetAuthority::default() });
             Ok(())
+        }
+
+        /// Authorizes the committed lease generation's servo stream through
+        /// [`Self::authorize_servo_stream`] (zero allocations, zero locks), preserving any active
+        /// policy stream. Fails closed (revokes the stream) if admission cannot currently pass
+        /// (for example while E-stop is latched; restored automatically on `clear_fault`).
+        pub(crate) fn authorize_servo_stream_for_committed_lease(&mut self, lease_generation: u64) {
+            if lease_generation == 0 {
+                self.core.revoke_stream();
+                return;
+            }
+            #[cfg(feature = "policy-runtime")]
+            if let Some(run) = self.policy_run.as_ref() {
+                if self.core.target_authority().stream == Some(policy_stream(run.action_id)) {
+                    return;
+                }
+            }
+            let stamp = crate::supervisor::AdmissionStamp::for_rt_internal(
+                self.current_stop_gen(),
+                self.safety.epoch_id(),
+                lease_generation,
+            );
+            match self.check_admission(stamp) {
+                Ok(admitted) => {
+                    if Self::authorize_servo_stream(admitted, lease_generation).is_err() {
+                        self.core.revoke_stream();
+                    }
+                }
+                Err(_) => {
+                    self.core.revoke_stream();
+                }
+            }
         }
 
         /// After a policy run of `action_id`: hand the targets back to the lease holder's

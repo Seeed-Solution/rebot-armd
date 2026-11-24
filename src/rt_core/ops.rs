@@ -571,6 +571,11 @@ pub trait CoreOps {
     /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
     /// before command commit, target intake, or bus output.
     fn sync_disconnect_fence(&mut self, _now: Instant) -> bool { false }
+    /// True when displaced lease generations are queued for off-thread `close_servo` dispatch.
+    fn has_pending_servo_closes(&self) -> bool { false }
+    /// Drains displaced lease generations queued since the last drain (zero allocs) so the
+    /// release engine can dispatch off-thread `close_servo(old_generation)` strictly after publish.
+    fn drain_servo_closes(&mut self, _each: &mut dyn FnMut(u64)) {}
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
     /// Applies an authorized stop at `generation` and synchronizes the owner's stop counter.
@@ -1204,6 +1209,14 @@ impl CoreOps for SupervisorInner {
         self.sync_nonblocking_disconnect_fence(now)
     }
 
+    fn has_pending_servo_closes(&self) -> bool {
+        self.pending_servo_close_len > 0
+    }
+
+    fn drain_servo_closes(&mut self, each: &mut dyn FnMut(u64)) {
+        self.drain_pending_servo_closes(each);
+    }
+
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
     fn apply_stop(&mut self) { self.authorized_stop(); }
 
@@ -1583,6 +1596,8 @@ pub struct ReleaseEngine {
     conn_lifecycle: Option<super::requests::lease::ConnLifecycleIntake>,
     lifecycle_replies_flushed: bool,
     eviction_tx: Option<rtrb::Producer<(super::requests::lease::ConnectionHandle, u64)>>,
+    servo_close_tx: Option<rtrb::Producer<u64>>,
+    servo_closes_flushed: bool,
     active: Option<ActiveSlot>,
     /// The driver transition in flight.
     transition: Option<Installed>,
@@ -1606,6 +1621,8 @@ impl ReleaseEngine {
                 conn_lifecycle: None,
                 lifecycle_replies_flushed: false,
                 eviction_tx: None,
+                servo_close_tx: None,
+                servo_closes_flushed: false,
                 active: None,
                 transition: None,
                 releases: 0,
@@ -1637,6 +1654,35 @@ impl ReleaseEngine {
         tx: rtrb::Producer<(super::requests::lease::ConnectionHandle, u64)>,
     ) {
         self.eviction_tx = Some(tx);
+    }
+
+    /// Attaches the bounded post-publication servo stream close ring (0 RT allocs) so every
+    /// lease revocation (release, preemption, expiry, disconnect) dispatches `close_servo(old_gen)`
+    /// off-thread on `armd-dispatch`.
+    pub fn attach_servo_close_tx(&mut self, tx: rtrb::Producer<u64>) {
+        self.servo_close_tx = Some(tx);
+    }
+
+    /// Flushes any displaced lease generations recorded on `core` into `servo_close_tx` strictly
+    /// AFTER publication (0 RT allocs).
+    pub fn flush_servo_closes<O: CoreOps>(&mut self, core: &mut O) -> bool {
+        let mut pushed = false;
+        if let Some(tx) = self.servo_close_tx.as_mut() {
+            core.drain_servo_closes(&mut |gen| {
+                let _ = tx.push(gen);
+                pushed = true;
+            });
+        } else {
+            core.drain_servo_closes(&mut |_| {});
+        }
+        if pushed {
+            self.servo_closes_flushed = true;
+        }
+        pushed
+    }
+
+    pub fn take_servo_closes_flushed(&mut self) -> bool {
+        std::mem::take(&mut self.servo_closes_flushed)
     }
 
     pub fn has_pending_lifecycle_replies(&self) -> bool {
@@ -1851,6 +1897,7 @@ impl ReleaseEngine {
             if self.flush_lifecycle_replies() {
                 self.lifecycle_replies_flushed = true;
             }
+            let _ = self.flush_servo_closes(core);
             return report;
         }
         // 3. Urgent recheck + at most one ordinary command (replies deferred until strictly AFTER Step 6 publish)
@@ -2093,6 +2140,7 @@ impl ReleaseEngine {
                 let _ = tx.push(eviction);
             }
         }
+        let _ = self.flush_servo_closes(core);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ActiveSlot::Macro { parent, child_plan }) = self.active.as_mut() {
             if child_plan.is_some() && !core.macro_child_running(parent.action()) {
@@ -2136,7 +2184,7 @@ impl ReleaseEngine {
         let finished = self
             .take_finished_transition(report)
             .or_else(|| self.take_aborted_transition(core, report));
-        if urgent_applied || lifecycle_pending || finished.is_some() {
+        if urgent_applied || lifecycle_pending || core.has_pending_servo_closes() || finished.is_some() {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
             if let Some((t, outcome)) = finished {
@@ -2148,6 +2196,7 @@ impl ReleaseEngine {
             if self.flush_lifecycle_replies() {
                 self.lifecycle_replies_flushed = true;
             }
+            let _ = self.flush_servo_closes(core);
             return true;
         }
         if self.has_pending_urgent_stop_replies() && self.flush_urgent_stop_replies() {

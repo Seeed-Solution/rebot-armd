@@ -1343,8 +1343,10 @@ pub fn install_lease_acquire(
                     active.label.clear();
                     active.label.push_str(label);
                 }
+                let gen = active.generation;
+                inner.authorize_servo_stream_for_committed_lease(gen);
                 return Ok(LeaseOutcome::Granted {
-                    generation: active.generation,
+                    generation: gen,
                     evicted_connection: None,
                     evicted_generation: 0,
                 });
@@ -1371,6 +1373,7 @@ pub fn install_lease_acquire(
     inner.lease_generation_counter += 1;
     let gen = inner.lease_generation_counter;
     inner.set_active_lease_in_place(req.connection.id(), conn, label, gen, ctx.now);
+    inner.authorize_servo_stream_for_committed_lease(gen);
     Ok(LeaseOutcome::Granted {
         generation: gen,
         evicted_connection: None,
@@ -1403,8 +1406,10 @@ pub fn install_lease_preempt(
             || active.generation <= fenced_gen
             || ctx.now.saturating_duration_since(active.acquired_at) >= inner.lease_timeout;
         if active.client_id == conn && !is_expired {
+            let gen = active.generation;
+            inner.authorize_servo_stream_for_committed_lease(gen);
             return Ok(LeaseOutcome::Granted {
-                generation: active.generation,
+                generation: gen,
                 evicted_connection: None,
                 evicted_generation: 0,
             });
@@ -1487,6 +1492,7 @@ pub fn install_lease_preempt(
     inner.lease_generation_counter += 1;
     let gen = inner.lease_generation_counter;
     inner.set_active_lease_in_place(req.connection.id(), conn, label, gen, commit_now);
+    inner.authorize_servo_stream_for_committed_lease(gen);
     inner.last_heartbeat = commit_now;
     let (evicted_connection, evicted_generation) = if let Some((ev_handle, ev_gen)) = evicted {
         inner.last_preemption = Some(commit_now);

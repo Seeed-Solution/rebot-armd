@@ -3626,6 +3626,15 @@ impl SupervisorInner {
                 drv.acknowledge_mit_fence_trip();
             }
         }
+        // If a valid lease was acquired while E-stop was latched, its servo stream could not be
+        // authorized until E-stop cleared; authorize it now when no policy stream owns targets.
+        if self.core.target_authority().stream.is_none() {
+            let check_now = now_override.unwrap_or_else(Instant::now);
+            let active_gen = self.active_lease_gen_at(check_now);
+            if active_gen != 0 {
+                self.authorize_servo_stream_for_committed_lease(active_gen);
+            }
+        }
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
         Ok(state)

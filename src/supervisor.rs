@@ -918,6 +918,10 @@ pub struct SupervisorInner {
     pub(crate) active_lease_conn_id: u64,
     /// Highest lease generation fenced by release, expiry, preemption, or disconnect.
     pub(crate) fenced_lease_generation: u64,
+    /// Fixed zero-alloc queue of displaced lease generations awaiting off-thread `close_servo`
+    /// dispatch on `armd-dispatch` (populated by `fence_displaced_lease_generation`).
+    pub(crate) pending_servo_closes: [u64; 32],
+    pub(crate) pending_servo_close_len: usize,
     pub lease_generation_counter: u64,
     /// Boot identity of the active owner (process boot in legacy, `ExecutorConfig::boot` in RT).
     pub(crate) boot_id: crate::rt_core::broker::BootId,
@@ -2029,6 +2033,8 @@ impl SupervisorInner {
             active_lease: None,
             active_lease_conn_id: 0,
             fenced_lease_generation: 0,
+            pending_servo_closes: [0; 32],
+            pending_servo_close_len: 0,
             lease_generation_counter: 0,
             boot_id: crate::rt_core::broker::BootId::process(),
             schema_revision: 0,
@@ -2303,10 +2309,11 @@ impl SupervisorInner {
     }
 
     /// Lock-free, zero-allocation owner synchronization of immediate socket-close fences
-    /// (`atomic_fenced_lease_gen`, `shared_closed_bitset`, and `pending_disconnect_hold`).
-    /// Runs at the top of every control tick, RT Step 1, and every RT checkpoint BEFORE any
-    /// command commit, target intake, or bus output.
-    pub(crate) fn sync_nonblocking_disconnect_fence(&mut self, _now: Instant) -> bool {
+    /// (`atomic_fenced_lease_gen`, `shared_closed_bitset`, `pending_disconnect_hold`) and lease
+    /// expiry at `now`. Runs at the top of every control tick, RT Step 1, and every RT checkpoint
+    /// (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`) BEFORE any command commit, target intake,
+    /// or bus output.
+    pub(crate) fn sync_nonblocking_disconnect_fence(&mut self, now: Instant) -> bool {
         let mut fenced_any = false;
         let atomic_fenced = self.atomic_fenced_lease_gen.load(Ordering::SeqCst);
         if atomic_fenced > self.fenced_lease_generation {
@@ -2332,6 +2339,23 @@ impl SupervisorInner {
                 }
                 let _ = self.clear_active_lease_in_place();
             }
+            fenced_any = true;
+        }
+        // Fence an expired lease generation BEFORE target consumption, gripper, motion, or
+        // watchdog output runs (preserves `active_lease = Some(expired)` for expiry telemetry,
+        // retires expired client motion, and preserves any autonomous watchdog park explicitly).
+        if let Some(expired_gen) = self
+            .active_lease
+            .as_ref()
+            .filter(|a| {
+                a.generation > self.fenced_lease_generation
+                    && now.saturating_duration_since(a.acquired_at) >= self.lease_timeout
+            })
+            .map(|a| a.generation)
+        {
+            let stop_client_motion =
+                self.watchdog_park.is_none() && !self.pending_normal_unload;
+            self.fence_displaced_lease_generation(expired_gen, stop_client_motion);
             fenced_any = true;
         }
         if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
@@ -2362,8 +2386,8 @@ impl SupervisorInner {
         self.sync_nonblocking_disconnect_fence(Instant::now());
     }
 
-    /// Current valid (unexpired, unfenced, open-connection) active lease generation, or `0` when no valid lease is held.
-    pub fn current_active_lease_gen(&self) -> u64 {
+    /// Current valid (unexpired at `now`, unfenced, open-connection) active lease generation, or `0`.
+    pub(crate) fn active_lease_gen_at(&self, now: Instant) -> u64 {
         let fenced = self.effective_fenced_lease_generation();
         if self.active_lease_conn_id != 0 && self.is_connection_closed(self.active_lease_conn_id) {
             return 0;
@@ -2372,9 +2396,14 @@ impl SupervisorInner {
             .as_ref()
             .filter(|a| {
                 a.generation > fenced
-                    && a.acquired_at.elapsed() < self.lease_timeout
+                    && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
             })
             .map_or(0, |a| a.generation)
+    }
+
+    /// Current valid (unexpired, unfenced, open-connection) active lease generation, or `0` when no valid lease is held.
+    pub fn current_active_lease_gen(&self) -> u64 {
+        self.active_lease_gen_at(Instant::now())
     }
 
     /// Capture an [`AdmissionStamp`] from the current owner state (for tests and in-process
@@ -2629,6 +2658,35 @@ impl SupervisorInner {
         }
     }
 
+    fn record_pending_servo_close(&mut self, displaced_gen: u64) {
+        if displaced_gen == 0 {
+            return;
+        }
+        let slice = &self.pending_servo_closes[..self.pending_servo_close_len];
+        if slice.contains(&displaced_gen) {
+            return;
+        }
+        if self.pending_servo_close_len < self.pending_servo_closes.len() {
+            self.pending_servo_closes[self.pending_servo_close_len] = displaced_gen;
+            self.pending_servo_close_len += 1;
+        } else {
+            let last = self.pending_servo_closes.len() - 1;
+            self.pending_servo_closes[last] = self.pending_servo_closes[last].max(displaced_gen);
+        }
+    }
+
+    /// Drains all displaced lease generations recorded since the last drain (zero allocs).
+    pub(crate) fn drain_pending_servo_closes(&mut self, mut each: impl FnMut(u64)) {
+        let n = self.pending_servo_close_len;
+        self.pending_servo_close_len = 0;
+        for i in 0..n {
+            let gen = self.pending_servo_closes[i];
+            if gen != 0 {
+                each(gen);
+            }
+        }
+    }
+
     /// Single owner-side entry point fencing a displaced lease generation (release, expiry,
     /// preemption, or disconnect) BEFORE another owner's output can run.
     pub(crate) fn fence_displaced_lease_generation(
@@ -2643,6 +2701,7 @@ impl SupervisorInner {
         self.atomic_fenced_lease_gen
             .fetch_max(self.fenced_lease_generation, Ordering::SeqCst);
         self.core.revoke_stream();
+        self.record_pending_servo_close(displaced_gen);
         if self.gripper_stream_lease == Some(displaced_gen) {
             self.end_gripper_stream();
         }
@@ -6771,25 +6830,9 @@ impl SupervisorInner {
         // the scratch goes back for the helpers below; `before_velocities` stays in it
         self.scratch = sc;
 
-        // 0.0 Apply any non-blocking socket-close lease fence & pending disconnect hold BEFORE
-        // expiry check, gripper, motion, or bus output runs.
+        // 0.0 Apply any non-blocking socket-close lease fence, pending disconnect hold, and
+        // lease-expiry fence BEFORE gripper, motion, or bus output runs.
         self.sync_nonblocking_disconnect_fence(Instant::now());
-
-        // 0.0b Fence an expired lease generation BEFORE gripper/motion/watchdog output runs
-        // (preserves `active_lease = Some(expired)` for expiry telemetry, retires expired client
-        // servo/trajectory motion, and preserves any autonomous watchdog park explicitly).
-        if let Some(expired_gen) = self
-            .active_lease
-            .as_ref()
-            .filter(|a| {
-                a.generation > self.fenced_lease_generation
-                    && a.acquired_at.elapsed() >= self.lease_timeout
-            })
-            .map(|a| a.generation)
-        {
-            let stop_client_motion = self.watchdog_park.is_none() && !self.pending_normal_unload;
-            self.fence_displaced_lease_generation(expired_gen, stop_client_motion);
-        }
 
         // 0.1 Gripper stall protection state machine
         if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
