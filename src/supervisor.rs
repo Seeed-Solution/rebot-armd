@@ -1156,10 +1156,14 @@ pub struct SupervisorInner {
     /// Cached scalar `driver.capabilities().torque_feedback` (true without driver) so RT gripper
     /// commits check close-torque capability without acquiring `driver.lock()`.
     pub(crate) driver_has_torque_feedback: bool,
+    /// Cached scalar pos-force gripper close speed limit (rad/s) for lock-free RT gripper commits.
+    pub(crate) driver_gripper_close_speed_limit: Option<f32>,
+    /// Cached scalar pos-force gripper ceiling torque estimate (N·m) for lock-free RT gripper commits.
+    pub(crate) driver_gripper_ceiling_torque_estimate: Option<f32>,
     /// Owner boot identity (matches process boot in Legacy mode and `ExecutorConfig::boot` on RT).
     pub(crate) boot_id: crate::rt_core::broker::BootId,
     /// Monotonic revision for `config.power_budget` (starts at 1; checked by prepared actions).
-    pub(crate) power_budget_revision: u64,
+    pub power_budget_revision: u64,
     /// Lock-free exact closed-connection bitset shared with the RT `Broker` (checked on RT commits).
     rt_closed_connections: Option<Arc<crate::rt_core::requests::actions::ClosedBitset>>,
 }
@@ -1797,6 +1801,8 @@ impl SupervisorInner {
             gripper_motion_spare: None,
             move_samples_spares: Vec::new(),
             driver_has_torque_feedback: true,
+            driver_gripper_close_speed_limit: None,
+            driver_gripper_ceiling_torque_estimate: None,
             held_label_spare: String::new(),
             boot_id: crate::rt_core::broker::BootId::process(),
             power_budget_revision: 1,
@@ -1872,12 +1878,26 @@ impl SupervisorInner {
         }
     }
 
+    /// True when driven by the RT `ReleaseEngine` (live `start_executor` or `ReleaseFixture`).
+    pub(crate) fn is_rt_owner(&self) -> bool {
+        self.rt_executor_owned || self.rt_closed_connections.is_some()
+    }
+
     /// Attaches the broker's lock-free closed-connection bitset read on `armd-control`.
     pub(crate) fn attach_closed_bitset(
         &mut self,
         bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
     ) {
         self.rt_closed_connections = Some(bitset);
+        let target_spares = GRIPPER_BASELINE_PENDING_MAX + 2;
+        if self.move_samples_spares.capacity() < target_spares {
+            self.move_samples_spares
+                .reserve(target_spares - self.move_samples_spares.len());
+        }
+        while self.move_samples_spares.len() < target_spares {
+            self.move_samples_spares
+                .push(crate::gripper_baseline::MoveSamples::default());
+        }
     }
 
     /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under
@@ -2498,6 +2518,24 @@ impl SupervisorInner {
             .driver
             .as_ref()
             .map_or(true, |d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        let pf_info = self
+            .config
+            .gripper_index()
+            .and_then(|g| {
+                self.driver
+                    .as_ref()
+                    .and_then(|d| d.lock().ok())
+                    .and_then(|drv| drv.gripper_pos_force_info())
+                    .filter(|info| info.joint == g)
+            });
+        self.driver_gripper_close_speed_limit = pf_info
+            .as_ref()
+            .map(|info| info.close_speed_rad_s)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        self.driver_gripper_ceiling_torque_estimate = pf_info
+            .as_ref()
+            .and_then(|info| info.ceiling_torque_estimate_nm)
+            .filter(|v| v.is_finite() && *v > 0.0);
         // Maintain the strict single-buffer invariant on RT: EXACTLY ONE 128-byte heap String
         // exists across `(self.held, self.held_label_spare)`, so transitions between `Some` and
         // `None` never drop or allocate on `armd-control` even if an object was held at handover.
@@ -3685,7 +3723,7 @@ impl SupervisorInner {
             quiesced = true;
             self.pending_deferred_done = None;
         }
-        if quiesced && self.rt_executor_owned && self.driver.is_some() {
+        if quiesced && self.is_rt_owner() && self.driver.is_some() {
             if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
                 m.hold_pending_bus_accept = true;
             }
@@ -7855,6 +7893,18 @@ impl ArmSupervisor {
                     inner.loads = vec![f32::NAN; inner.config.dof];
                 }
                 inner.driver_has_torque_feedback = driver.capabilities().torque_feedback;
+                if let Some(pf) = inner
+                    .config
+                    .gripper_index()
+                    .and_then(|g| driver.gripper_pos_force_info().filter(|info| info.joint == g))
+                {
+                    inner.driver_gripper_close_speed_limit =
+                        (pf.close_speed_rad_s.is_finite() && pf.close_speed_rad_s > 0.0)
+                            .then_some(pf.close_speed_rad_s);
+                    inner.driver_gripper_ceiling_torque_estimate = pf
+                        .ceiling_torque_estimate_nm
+                        .filter(|v| v.is_finite() && *v > 0.0);
+                }
                 let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
                 inner.apply_driver_limits(driver.as_ref());
                 inner.driver = Some(std::sync::Mutex::new(driver));

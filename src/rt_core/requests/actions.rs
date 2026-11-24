@@ -735,7 +735,7 @@ impl ActionRefusal {
             "MOTION_BUSY" => ArmError::Motion(MotionError::MotionBusy(
                 "a motion or macro sub-motion is running".into(),
             )),
-            "STALE_ADMISSION" => ArmError::Safety(SafetyError::StampAlreadyConsumed),
+            "STAMP_REUSED" | "STALE_ADMISSION" => ArmError::Safety(SafetyError::StampAlreadyConsumed),
             "TERMINALS_BUSY" => ArmError::Safety(SafetyError::TerminalsBusy),
             "TOOL_MISMATCH" => ArmError::Rejected {
                 status: 409,

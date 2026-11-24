@@ -703,7 +703,7 @@ impl SupervisorInner {
             return false;
         }
         let id = m.id;
-        if self.rt_executor_owned {
+        if self.is_rt_owner() {
             let _ = self.quiesce_macro_children_rt(id);
         } else {
             if self.macro_child_active_or_pending(id) { self.stop_motion(); }
@@ -971,6 +971,9 @@ impl SupervisorInner {
     /// Effective closing speed limit enforced by the attached driver in position-force mode
     /// (`None` for legacy POS_VEL or drivers without a pos-force motor current cap).
     pub(crate) fn gripper_close_speed_limit(&self) -> Option<f32> {
+        if self.rt_executor_owned {
+            return self.driver_gripper_close_speed_limit;
+        }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
@@ -982,8 +985,11 @@ impl SupervisorInner {
 
     /// Estimated motor ceiling torque (N·m) of the attached position-force gripper: calibrated
     /// `ceiling_torque_nm` when available, else the feedback-equivalent estimate from
-    /// `current_raw * 0.0019 N·m/raw`. Allocation-free on `armd-control`.
+    /// `current_raw * 0.0019 N·m/raw`. Allocation-free and lock-free on `armd-control`.
     pub(crate) fn gripper_ceiling_torque_estimate(&self) -> Option<f32> {
+        if self.rt_executor_owned {
+            return self.driver_gripper_ceiling_torque_estimate;
+        }
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
@@ -1278,7 +1284,7 @@ impl SupervisorInner {
             false
         };
         let needs_bus_accept =
-            self.rt_executor_owned && self.driver.is_some() && (quiesced_any || prev_hold_pending);
+            self.is_rt_owner() && self.driver.is_some() && (quiesced_any || prev_hold_pending);
         if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
             m.finishing = true;
             if needs_bus_accept {
