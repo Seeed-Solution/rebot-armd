@@ -34,7 +34,7 @@ use armd::rt_core::executor::{
     ExecutorClock, ExecutorConfig, ParkedAlloc, PersistTestHooks, RtExecutorHandle, TailAllocProbe,
     DIAG_RING_CAPACITY, ESTOP_ACK_CAPACITY,
 };
-use armd::rt_core::ops::{CoreOps, PlanSlot, Primitive};
+use armd::rt_core::ops::{CoreOps, PlanSlot};
 use armd::supervisor::PendingZeroCheckPersist;
 use armd::{ArmConfig, ArmSupervisor};
 
@@ -658,7 +658,7 @@ async fn stalled_consumers_normal_refused_commits_urgent_stop_terminal_retiremen
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
     // Prepare a valid Cartesian path off-thread BEFORE transferring ownership.
-    let (cart_slot, start_pos, init_epoch) = {
+    let (cart_slot, start_pos, init_epoch, motion_cfg, after_cart_q, after_cart_v) = {
         let mut inner = sup.inner().write().await;
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
@@ -677,7 +677,44 @@ async fn stalled_consumers_normal_refused_commits_urgent_stop_terminal_retiremen
         let slot = prepare_cartesian_path(&snap, &path, None).unwrap();
         let start = inner.commanded_positions.clone();
         let ep = inner.safety.epoch_id();
-        (slot, start, ep)
+        let motion_cfg = Arc::new(armd::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&inner));
+        // Measure the exact (commanded_positions, commanded_velocities) produced after 1 tick of `cart_slot`
+        // so `r_jog` (queued behind `r_cart` while `hub` is paused) matches the post-tick start state exactly.
+        let (after_cart_q, after_cart_v) = {
+            let mut probe = armd::SupervisorInner::new(inner.config.clone());
+            probe.lease_enabled = false;
+            probe.commanded_positions = start.clone();
+            probe.measured_positions = start.clone();
+            probe.target_positions = start.clone();
+            let s = probe.current_admission_stamp();
+            armd::SupervisorInner::enable_torque(probe.check_admission(s).unwrap()).unwrap();
+            probe.tick(0.02);
+            let (mut pw, pr) = armd::rt_core::broker::plan_slots(1, PlanSlot::default);
+            let h = pw.stage(|s| s.copy_from(&slot).unwrap()).unwrap();
+            let pctx = armd::rt_core::ops::CommitCtx {
+                arm: armd::rt_core::ids::ArmId::LOCAL,
+                boot: armd::rt_core::broker::BootId(1),
+                now: clock.now(),
+                stop_generation: 0,
+            };
+            probe.set_boot_id(armd::rt_core::broker::BootId(1));
+            let d = armd::rt_core::broker::Descriptor {
+                stamp: armd::rt_core::broker::Stamp {
+                    arm: armd::rt_core::ids::ArmId::LOCAL,
+                    boot: armd::rt_core::broker::BootId(1),
+                    request: armd::rt_core::broker::RequestId(1),
+                    client: ClientId(1),
+                    client_seq: 1,
+                    authority: probe.authority(&pctx),
+                    deadline: clock.now() + Duration::from_secs(5),
+                },
+                kind: armd::rt_core::broker::CommandKind::Install { plan: h },
+            };
+            probe.commit_prepared_slot(&d, pr.pin(h).unwrap(), &pctx).unwrap();
+            probe.tick(0.01);
+            (probe.commanded_positions.clone(), probe.commanded_velocities.clone())
+        };
+        (slot, start, ep, motion_cfg, after_cart_q, after_cart_v)
     };
 
     // Hold `hub.reader_guard()` BEFORE `start_executor` to prove contended startup prewarm
@@ -716,20 +753,44 @@ async fn stalled_consumers_normal_refused_commits_urgent_stop_terminal_retiremen
         .unwrap();
     let mut bad_start = start_pos.clone();
     bad_start[0] += 0.5;
-    let stale_prim = Primitive::joint_quintic(&bad_start, &start_pos, 0.2).unwrap();
+    let mk_jog = |from: &[f32], v0: &[f32], to: &[f32]| {
+        use armd::rt_core::requests::motion::{self as req_motion, MotionPlanSnapshot, MotionRequest, PlanAuthority};
+        let snap = MotionPlanSnapshot {
+            config: Arc::clone(&motion_cfg),
+            commanded_positions: from.to_vec(),
+            commanded_velocities: v0.to_vec(),
+            measured_positions: from.to_vec(),
+            torque_hold: None,
+            power_hold: None,
+            holding_after_clear: false,
+            mit_active: false,
+            authority: PlanAuthority {
+                boot: armd::rt_core::broker::BootId(1),
+                epoch: init_epoch,
+                lease_generation: 0,
+                stop_generation: 0,
+                deadline: now + Duration::from_secs(5),
+            },
+            workspace_revision: motion_cfg.workspace_revision,
+            motion_config_revision: motion_cfg.motion_config_revision,
+        };
+        req_motion::prepare_motion(&snap, &MotionRequest::jog(to.to_vec(), Some(0.2), None)).unwrap().slot
+    };
+    let zeros = vec![0.0f32; start_pos.len()];
+    let stale_slot = mk_jog(&bad_start, &zeros, &start_pos);
     let r_stale = handle.broker().lock().unwrap()
-        .submit(ClientId(1), 3, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| s.set(stale_prim)))
+        .submit(ClientId(1), 3, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(s, &stale_slot)))
         .unwrap();
 
-    // (b) Normal commits: prepared Cartesian path (pinned PlanSlotRef) -> superseded by JointQuintic -> authorized urgent stop!
+    // (b) Normal commits: prepared Cartesian path (pinned PlanSlotRef) -> superseded by prepared jog -> authorized urgent stop!
     let r_cart = handle.broker().lock().unwrap()
         .submit(ClientId(1), 4, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&cart_slot).unwrap()))
         .unwrap();
-    let mut q_jog = start_pos.clone();
+    let mut q_jog = after_cart_q.clone();
     q_jog[0] += 0.04;
-    let jog_prim = Primitive::joint_quintic(&start_pos, &q_jog, 0.2).unwrap();
+    let jog_slot = mk_jog(&after_cart_q, &after_cart_v, &q_jog);
     let r_jog = handle.broker().lock().unwrap()
-        .submit(ClientId(1), 5, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| s.set(jog_prim)))
+        .submit(ClientId(1), 5, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(s, &jog_slot)))
         .unwrap();
 
     // Advance 5 releases so all 5 descriptors commit/refuse while broker & hub stay stalled!

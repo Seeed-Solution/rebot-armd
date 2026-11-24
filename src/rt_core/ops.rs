@@ -834,20 +834,10 @@ impl CoreOps for SupervisorInner {
                 let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                 SupervisorInner::commit_macro_child(admitted, primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
             }
-            Primitive::JointQuintic { dof, start, q, duration_s } => {
-                // the fields are public: a hand-built primitive may name more joints than it holds
-                let n = usize::from(*dof);
-                if n == 0 || n > MAX_DOF {
-                    return Err("INVALID_COMMAND");
-                }
-                if !start_matches(&start[..n], &self.commanded_positions) {
-                    return Err("PLAN_STALE");
-                }
-                self.jog_precheck_static()?;
-                let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
-                SupervisorInner::jog_action_slice(admitted, &q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
-                    .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
-                    .map_err(static_code)
+            Primitive::JointQuintic { .. } => {
+                // Joint quintic plans must be prepared off armd-control and staged as a
+                // `PreparedMotionSlot` (`PlanSlot::motion` via `req::stage_jog`); never plan on RT.
+                Err("INVALID_COMMAND")
             }
         }
     }

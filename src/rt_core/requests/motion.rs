@@ -140,7 +140,7 @@ pub struct MotionPlanSnapshot {
     pub torque_hold: Option<TorqueHold>,
     pub power_hold: Option<PowerHold>,
     pub holding_after_clear: bool,
-    pub mit_moving: bool,
+    pub mit_active: bool,
     pub authority: PlanAuthority,
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
@@ -177,7 +177,7 @@ impl MotionPlanSnapshot {
             torque_hold: inner.torque_guard.hold,
             power_hold: inner.power.gov.hold,
             holding_after_clear: inner.holding_after_clear(),
-            mit_moving: inner.mit_active() && inner.commanded_velocities.iter().any(|&v| v != 0.0),
+            mit_active: inner.mit_active(),
             authority,
             workspace_revision,
             motion_config_revision,
@@ -216,7 +216,7 @@ impl MotionPlanSnapshot {
             torque_hold: None,
             power_hold: None,
             holding_after_clear: snap.rt.holding_after_clear,
-            mit_moving: false,
+            mit_active: false,
             authority: PlanAuthority {
                 boot: snap.rt.boot_id,
                 epoch: snap.obs.epoch_id,
@@ -430,7 +430,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
             _ => MotionError::Unsupported("Gripper close during commissioning jog requires torque_feedback when max_close_torque_nm is configured".into()).into(),
         });
     }
-    if req.kind == MotionKind::Park && (snap.holding_after_clear || snap.mit_moving) {
+    if req.kind == MotionKind::Park && (snap.holding_after_clear || snap.mit_active) {
         return Ok(PreparedMotionPlan {
             slot: PreparedMotionSlot {
                 kind: MotionKind::Park, dof: dof as u8,
@@ -441,7 +441,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
                 workspace_revision: snap.workspace_revision, motion_config_revision: snap.motion_config_revision,
                 authority: snap.authority,
                 for_holding_after_clear: snap.holding_after_clear,
-                for_mit_deferral: !snap.holding_after_clear && snap.mit_moving,
+                for_mit_deferral: !snap.holding_after_clear && snap.mit_active,
                 continuation_action: None,
             },
             heap_traj: None,
@@ -643,7 +643,7 @@ pub fn verify_motion_authority(inner: &SupervisorInner, kind: MotionKind, speed_
     } else if !inner.supports_automatic_unload() {
         return Err(MotionInstallError::UnsupportedUnload);
     }
-    if inner.disable_pending || inner.torque_transition.is_some() || inner.park_continuation.is_some() || inner.mit.park_after_hand_back {
+    if inner.disable_pending || inner.torque_transition.is_some() || inner.park_continuation.is_some() || inner.mit.park_after_hand_back || inner.watchdog_park_pending.is_some() {
         return Err(MotionInstallError::MotionBusy);
     }
     if expected_epoch.is_some_and(|ep| ep != inner.safety.epoch_id()) { return Err(MotionInstallError::EpochMismatch); }
@@ -711,7 +711,9 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
         } else {
             inner.commanded_positions[i]
         };
-        if (cur - slot.start[i]).abs() > EXACT_START_TOL || (inner.commanded_velocities[i] - slot.v0[i]).abs() > EXACT_START_TOL {
+        if (cur - slot.start[i]).abs() >= crate::rt_core::ops::START_TOLERANCE
+            || (inner.commanded_velocities[i] - slot.v0[i]).abs() > EXACT_START_TOL
+        {
             return Err(MotionInstallError::StartDrifted);
         }
     }
@@ -829,27 +831,19 @@ pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot:
     }
 
     if this.mit_active() {
-        if this.mit_hand_back("park").is_err() {
-            if this.mit_active() && !this.safety.state().is_stopped() {
-                this.replace_active_trajectory(None);
-                this.release_servo_target();
-                this.servo_stream_active = false;
-                this.mit.park_after_hand_back = true;
-                this.mit.deferred_park_off_owner = true;
-                let id = this.begin_action_rt("park");
-                this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::WaitingMitHandback, epoch, stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
-                return Ok(MotionInstalled::DeferredContinuation { epoch, action_id: id, expected_duration_s: PARK_EXTRA_DURATION_S });
-            }
-            return Err(MotionInstallError::MotionBusy);
-        }
-        if slot.for_mit_deferral || verify_motion_freshness(this, slot).is_err() {
-            let id = this.begin_action_rt("park");
-            this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::ReadyForPlan, epoch, stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
-            this.notify_park_continuation();
-            return Ok(MotionInstalled::DeferredContinuation { epoch, action_id: id, expected_duration_s: PARK_DURATION_S + PARK_EXTRA_DURATION_S });
-        }
+        // Never invoke blocking `mit_hand_back` / `set_joint_modes_confirmed` under the WS write
+        // lock: defer immediately to the control tick, which brakes/hands back off the WS lock
+        // and advances `park_continuation` to `ReadyForPlan`.
+        this.replace_active_trajectory(None);
+        this.release_servo_target();
+        this.servo_stream_active = false;
+        this.mit.park_after_hand_back = true;
+        this.mit.deferred_park_off_owner = true;
+        let id = this.begin_action_rt("park");
+        this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::WaitingMitHandback, epoch, stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
+        return Ok(MotionInstalled::DeferredContinuation { epoch, action_id: id, expected_duration_s: PARK_DURATION_S + PARK_EXTRA_DURATION_S });
     }
-    install_park_trajectory(this, None, slot, heap_traj)
+    install_park_trajectory(this, ParkActionMode::New, slot, heap_traj)
 }
 
 pub fn install_park_continuation(inner: &mut SupervisorInner, action_id: u64, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool) -> Result<MotionInstalled, MotionInstallError> {
@@ -892,7 +886,76 @@ pub fn install_park_continuation_at(inner: &mut SupervisorInner, action_id: u64,
     if require_fresh_feedback && !inner.commit_feedback_valid() { return Err(MotionInstallError::FeedbackStale); }
     let _ = verify_motion_freshness(inner, slot)?;
     inner.park_continuation = None;
-    install_park_trajectory(inner, Some(action_id), slot, heap_traj)
+    install_park_trajectory(inner, ParkActionMode::Existing(action_id), slot, heap_traj)
+}
+
+/// System stop-direction watchdog park install (exempt from client `Admitted` / lease, still
+/// prepared off-thread and installed through the single shared `install_park_trajectory` path).
+/// Zero heap allocations and zero frees on `armd-control`.
+pub fn install_watchdog_park(
+    inner: &mut SupervisorInner,
+    generation: u64,
+    slot: &PreparedMotionSlot,
+    heap_traj: Option<MultiJointQuinticTrajectory>,
+) -> Result<MotionInstalled, MotionInstallError> {
+    if slot.kind != MotionKind::Park || slot.for_holding_after_clear || slot.for_mit_deferral {
+        return Err(MotionInstallError::InvalidCommand);
+    }
+    let Some(pending) = inner.watchdog_park_pending.filter(|p| p.generation == generation && !p.waiting_mit_handback) else {
+        return Err(MotionInstallError::ContinuationMismatch);
+    };
+    if inner.watchdog_park.is_none() {
+        return Err(MotionInstallError::ContinuationMismatch);
+    }
+    if slot.authority.boot.is_zero() || slot.authority.boot != inner.boot_id {
+        return Err(MotionInstallError::WrongTarget);
+    }
+    if inner.e_stop_latched.load(Ordering::SeqCst) || inner.shutdown_committed {
+        return Err(MotionInstallError::EStopActive);
+    }
+    match inner.safety.state() {
+        SafetyState::EStop => return Err(MotionInstallError::EStopActive),
+        SafetyState::Fault(_) => return Err(MotionInstallError::FaultActive),
+        s if !s.is_operational() => return Err(MotionInstallError::NotArmed),
+        _ => {}
+    }
+    if inner.safety.epoch_id() != pending.epoch {
+        return Err(MotionInstallError::EpochMismatch);
+    }
+    if inner.workspace_revision != pending.workspace_revision || inner.motion_config_revision != pending.motion_config_revision {
+        return Err(MotionInstallError::PlanStale);
+    }
+    if !inner.is_torqued || inner.pending_rearm || inner.disable_pending || inner.torque_transition.is_some()
+        || inner.mit_active() || inner.handover_settling_since.is_some() || inner.collision.hold.is_some()
+    {
+        return Err(MotionInstallError::MotionBusy);
+    }
+    if !inner.supports_automatic_unload() {
+        return Err(MotionInstallError::UnsupportedUnload);
+    }
+    let _ = verify_motion_freshness(inner, slot)?;
+    inner.watchdog_park_pending = None;
+    let installed = install_park_trajectory(inner, ParkActionMode::Watchdog, slot, heap_traj)?;
+    let budget = inner.watchdog_park_timeout();
+    if let Some(park) = inner.watchdog_park.as_mut() {
+        park.budget_s = budget.as_secs_f64();
+    }
+    Ok(installed)
+}
+
+/// Completes a failed off-thread watchdog park preparation by holding torque and latching
+/// `Fault(WatchdogTimeout)` (zero heap allocations on `armd-control`).
+pub fn fail_watchdog_park_plan(
+    inner: &mut SupervisorInner,
+    generation: u64,
+    reason: crate::safety::BoundedText<160>,
+) {
+    if inner.watchdog_park_pending.is_some_and(|p| p.generation == generation) {
+        inner.watchdog_park_pending = None;
+        inner.watchdog_park = None;
+        inner.safety.log_watchdog_park_blocked(reason);
+        inner.latch_watchdog_fault();
+    }
 }
 
 pub fn fail_park_continuation(inner: &mut SupervisorInner, action_id: u64, code: &'static str, text: &str) {
@@ -908,7 +971,9 @@ pub fn fail_park_continuation(inner: &mut SupervisorInner, action_id: u64, code:
     }
 }
 
-fn install_park_trajectory(this: &mut SupervisorInner, existing_action_id: Option<u64>, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>) -> Result<MotionInstalled, MotionInstallError> {
+enum ParkActionMode { New, Existing(u64), Watchdog }
+
+fn install_park_trajectory(this: &mut SupervisorInner, mode: ParkActionMode, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>) -> Result<MotionInstalled, MotionInstallError> {
     let dof = usize::from(slot.dof);
     this.release_servo_target();
     this.servo_settled_ticks.fill(0);
@@ -917,9 +982,13 @@ fn install_park_trajectory(this: &mut SupervisorInner, existing_action_id: Optio
     let _ = this.safety.set_torque(true);
     let _ = this.safety.mark_motion_started();
     this.unload_planned_duration = Some(slot.duration);
-    let id = existing_action_id.unwrap_or_else(|| this.begin_action_rt("park"));
-    if let Some(s) = slot.power_scale { this.note_action_power_scale(id, s); }
-    this.replace_active_trajectory(Some(slot.active_trajectory(Some(id), heap_traj)));
+    let action_id = match mode {
+        ParkActionMode::New => Some(this.begin_action_rt("park")),
+        ParkActionMode::Existing(id) => Some(id),
+        ParkActionMode::Watchdog => None,
+    };
+    if let (Some(id), Some(s)) = (action_id, slot.power_scale) { this.note_action_power_scale(id, s); }
+    this.replace_active_trajectory(Some(slot.active_trajectory(action_id, heap_traj)));
     copy_into(&mut this.target_positions, &slot.target[..dof]);
     this.pending_normal_unload = true;
     this.clear_unload_settle();
@@ -929,7 +998,7 @@ fn install_park_trajectory(this: &mut SupervisorInner, existing_action_id: Optio
     let now = Instant::now();
     this.last_heartbeat = now;
     this.last_motion_frame = now;
-    Ok(MotionInstalled::Started { epoch: this.safety.epoch_id(), action_id: id, expected_duration_s: slot.duration + PARK_EXTRA_DURATION_S })
+    Ok(MotionInstalled::Started { epoch: this.safety.epoch_id(), action_id: action_id.unwrap_or(0), expected_duration_s: slot.duration + PARK_EXTRA_DURATION_S })
 }
 
 fn stage_slot(slot: &mut PlanSlot, prepared: &PreparedMotionSlot, kind: MotionKind, continuation_action: Option<u64>) {

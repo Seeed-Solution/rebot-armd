@@ -57,6 +57,8 @@ pub struct RtMotionMeta {
     pub config_inhibited: bool,
     pub calibration_busy: bool,
     pub holding_after_clear: bool,
+    pub watchdog_park_pending_gen: u64,
+    pub watchdog_park_pending_attempt: u8,
 }
 
 impl Default for RtMotionMeta {
@@ -71,6 +73,8 @@ impl Default for RtMotionMeta {
             config_inhibited: false,
             calibration_busy: false,
             holding_after_clear: false,
+            watchdog_park_pending_gen: 0,
+            watchdog_park_pending_attempt: 0,
         }
     }
 }
@@ -94,6 +98,8 @@ pub struct RtSample {
     pub config_inhibited: bool,
     pub calibration_busy: bool,
     pub holding_after_clear: bool,
+    pub watchdog_park_pending_gen: u64,
+    pub watchdog_park_pending_attempt: u8,
 }
 
 impl Default for RtSample {
@@ -117,6 +123,8 @@ impl RtSample {
             config_inhibited: false,
             calibration_busy: false,
             holding_after_clear: false,
+            watchdog_park_pending_gen: 0,
+            watchdog_park_pending_attempt: 0,
         }
     }
 
@@ -274,6 +282,8 @@ impl StatePublisher {
         slot.rt.config_inhibited = rt.meta.config_inhibited;
         slot.rt.calibration_busy = rt.meta.calibration_busy;
         slot.rt.holding_after_clear = rt.meta.holding_after_clear;
+        slot.rt.watchdog_park_pending_gen = rt.meta.watchdog_park_pending_gen;
+        slot.rt.watchdog_park_pending_attempt = rt.meta.watchdog_park_pending_attempt;
         let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();

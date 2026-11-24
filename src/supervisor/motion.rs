@@ -190,6 +190,7 @@ impl SupervisorInner {
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;
+        self.watchdog_park_pending = None;
         self.retire_motion_payloads();
         self.pending_deferred_done = None;
         self.gripper_stream_target = None;
@@ -669,8 +670,11 @@ impl SupervisorInner {
     /// A new lease owner takes over from a running watchdog park: the park's
     /// motion is cancelled like any other queued motion and the arm brakes to a hold.
     pub(super) fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
-        if self.watchdog_park.take().is_some() && self.pending_normal_unload {
-            tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
+        let had_pending = self.watchdog_park_pending.take().is_some();
+        if self.watchdog_park.take().is_some() && (self.pending_normal_unload || had_pending) {
+            if !self.rt_executor_owned {
+                tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
+            }
             self.stop_motion();
         }
     }
@@ -679,11 +683,19 @@ impl SupervisorInner {
     /// from its measured velocity (max over joints of |v| / planning acceleration), the
     /// planned park duration (which already starts from the commanded velocity), the
     /// settle hold and [`WATCHDOG_PARK_MARGIN`]; never less than [`WATCHDOG_PARK_TIMEOUT`].
+    /// Zero heap allocations (uses inline planning limits when within inline DOF bound).
     pub fn watchdog_park_timeout(&self) -> Duration {
-        let decel = self.measured_velocities.iter().zip(self.planning_limits())
-            .filter(|(v, l)| v.is_finite() && l.max_acceleration > 1e-6)
-            .map(|(v, l)| f64::from(v.abs() / l.max_acceleration))
-            .fold(0.0, f64::max);
+        let decel = if let Some((limits, n)) = self.planning_limits_inline(None) {
+            self.measured_velocities.iter().zip(&limits[..n])
+                .filter(|(v, l)| v.is_finite() && l.max_acceleration > 1e-6)
+                .map(|(v, l)| f64::from(v.abs() / l.max_acceleration))
+                .fold(0.0, f64::max)
+        } else {
+            self.measured_velocities.iter().zip(&self.config.limits)
+                .filter(|(v, l)| v.is_finite() && l.max_acceleration > 1e-6)
+                .map(|(v, l)| f64::from(v.abs() / l.max_acceleration))
+                .fold(0.0, f64::max)
+        };
         let planned = self.unload_planned_duration
             .filter(|d| d.is_finite() && *d >= 0.0)
             .map_or(Duration::ZERO, |d| Duration::from_secs_f64((decel + d).min(3600.0)) + UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN);
@@ -695,11 +707,19 @@ impl SupervisorInner {
     /// [`WATCHDOG_PARK_SETTLE_GRACE`]; otherwise torque is held and WatchdogTimeout latched.
     pub(super) fn supervise_watchdog_park(&mut self, dt: f64) {
         let Some(mut park) = self.watchdog_park.take() else { return; };
-        if !self.pending_normal_unload {
-            tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
+        if !self.pending_normal_unload && self.watchdog_park_pending.is_none() {
+            if !self.rt_executor_owned {
+                tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
+            }
             if self.is_torqued {
                 self.latch_watchdog_fault();
             }
+            return;
+        }
+        if self.watchdog_park_pending.is_some()
+            && (!self.is_torqued || self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst))
+        {
+            self.watchdog_park_pending = None;
             return;
         }
         // budget in reference time: the power governor may slow the park
@@ -708,17 +728,31 @@ impl SupervisorInner {
             self.watchdog_park = Some(park);
             return;
         }
+        if self.watchdog_park_pending.take().is_some() {
+            self.mit.park_after_hand_back = false;
+            self.mit.deferred_park_off_owner = false;
+            if !self.rt_executor_owned {
+                tracing::warn!("Watchdog park off-thread plan timed out after {:.2} s; holding torque and latching WatchdogTimeout", park.budget_s);
+            }
+            self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("watchdog park plan timed out"));
+            self.latch_watchdog_fault();
+            return;
+        }
         let blocker = self.unload_settle_blocker().unwrap_or_else(|| "settle pending".into());
         let at_pose = self.active_trajectory.is_none() && self.resting_pose_static_violation().is_none();
         if at_pose && !park.grace_granted {
-            tracing::warn!("Watchdog park at the resting pose after {:.2} s but not settled ({blocker}); waiting up to {:?} more",
-                park.elapsed_s, WATCHDOG_PARK_SETTLE_GRACE);
+            if !self.rt_executor_owned {
+                tracing::warn!("Watchdog park at the resting pose after {:.2} s but not settled ({blocker}); waiting up to {:?} more",
+                    park.elapsed_s, WATCHDOG_PARK_SETTLE_GRACE);
+            }
             park.budget_s += WATCHDOG_PARK_SETTLE_GRACE.as_secs_f64();
             park.grace_granted = true;
             self.watchdog_park = Some(park);
             return;
         }
-        tracing::warn!("Watchdog park did not finish within {:.2} s ({blocker}); holding torque and latching WatchdogTimeout", park.budget_s);
+        if !self.rt_executor_owned {
+            tracing::warn!("Watchdog park did not finish within {:.2} s ({blocker}); holding torque and latching WatchdogTimeout", park.budget_s);
+        }
         self.latch_watchdog_fault();
     }
 
@@ -796,6 +830,7 @@ impl SupervisorInner {
                 }
             }
             self.watchdog_park = None;
+            self.watchdog_park_pending = None;
             self.pending_normal_unload = false;
             self.retire_motion_payloads();
             self.pending_deferred_done = None;
@@ -992,25 +1027,6 @@ impl SupervisorInner {
         Some((out, dof))
     }
 
-    /// Zero-allocation static refusal checks for RT jog commits (`commit_primitive` /
-    /// `Primitive::JointQuintic`), preserving the exact refusal precedence of `jog_action_slice`.
-    pub(crate) fn jog_precheck_static(&self) -> Result<(), &'static str> {
-        if self.config.active_tool.commissioning_required { return Err("COMMISSIONING_REQUIRED"); }
-        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
-        if self.gravity_comp.is_some() { return Err("MOTION_BUSY"); }
-        // When MIT tracking is configured on a torqued arm, defer remaining checks to
-        // `jog_action_slice` so `mit_motion_blocker()` keeps its exact precedence.
-        if self.is_torqued && self.config.joint_tracking.is_some() { return Ok(()); }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_loading || self.policy_run.is_some() { return Err("MOTION_BUSY"); }
-        if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
-        if self.handover_settling_since.is_some() { return Err("REJECTED"); }
-        if self.e_stop_latched.load(Ordering::SeqCst) { return Err("ESTOP_ACTIVE"); }
-        if self.pending_rearm || self.pending_normal_unload { return Err("NOT_ARMED"); }
-        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() { return Err("MOTION_BUSY"); }
-        Ok(())
-    }
-
     /// Zero-allocation workspace sweep check of a joint-space quintic trajectory using
     /// reused evaluator buffers (`ws_eval_bufs`) and stack-only adaptive subdivision.
     /// Falls back to [`Self::workspace_samples`] + [`Self::check_workspace_path`] only when
@@ -1044,104 +1060,6 @@ impl SupervisorInner {
         })();
         self.ws_eval_bufs = bufs;
         result
-    }
-
-    /// Jog from a fixed slice (RT commit path: no `to_vec()`, no `planning_limits()`
-    /// allocation, no `workspace_samples` `Vec`, no `target_positions` replacement free).
-    pub(crate) fn jog_action_slice(admitted: Admitted<'_>, target_positions: &[f32], duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str) -> Result<(u64, u64, f64), ArmError> {
-        let (this, proof) = admitted.consume()?;
-        this.jog_action_slice_inner(&proof, target_positions, duration_secs, epoch_id, kind)
-    }
-
-    fn jog_action_slice_inner(&mut self, proof: &crate::supervisor::AdmittedProof, target_positions: &[f32], duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str) -> Result<(u64, u64, f64), ArmError> {
-        use crate::rt_core::mailbox::MAX_DOF;
-        if self.config.active_tool.commissioning_required {
-            return Err(SafetyError::CommissioningRequired(format!("{kind} (requires speed_scale <= 0.2)")).into());
-        }
-        let n = target_positions.len();
-        if n > MAX_DOF {
-            return self.jog_action_with_speed_scale_inner(proof, target_positions.to_vec(), duration_secs, epoch_id, kind, None);
-        }
-        let Some((limits_buf, lim_n)) = self.planning_limits_inline(None) else {
-            return self.jog_action_with_speed_scale_inner(proof, target_positions.to_vec(), duration_secs, epoch_id, kind, None);
-        };
-        self.check_terminal_fifo_for_new_action()?;
-        let limits = &limits_buf[..lim_n];
-        let mut target = [0.0f32; MAX_DOF];
-        target[..n].copy_from_slice(target_positions);
-        let target = &mut target[..n];
-
-        self.config_motion_check()?;
-        self.gravity_comp_motion_busy()?;
-        if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_loading {
-            return Err(MotionError::MotionBusy("a policy is loading".into()).into());
-        }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_run.is_some() {
-            return Err(MotionError::MotionBusy("a policy run is active".into()).into());
-        }
-        self.collision_hold_check()?;
-        if self.handover_settling_since.is_some() {
-            return Err(ArmError::Safety(SafetyError::HandoverSettling));
-        }
-        if self.e_stop_latched.load(Ordering::SeqCst) {
-            return Err(ArmError::Safety(SafetyError::EStopActive));
-        }
-        if self.pending_rearm || self.pending_normal_unload {
-            return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
-        }
-        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() {
-            return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
-        }
-        self.pending_normal_unload = false;
-
-        self.safety.validate_motion_command(epoch_id, target, &self.config.limits)?;
-        self.torque_hold_filter(target);
-        self.power_hold_filter(target);
-
-        if let Some(g_idx) = self.config.gripper_index() {
-            if self.gripper_stalled && target.len() > g_idx && self.commanded_positions.len() > g_idx {
-                let delta = target[g_idx] - self.commanded_positions[g_idx];
-                let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
-                if (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
-                    self.gripper_stalled = false;
-                    self.gripper_high_torque_ticks = 0;
-                    self.gripper_low_torque_ticks = 0;
-                    self.gripper_stall_window.reset();
-                }
-            }
-        }
-
-        let zeros = [0.0f32; MAX_DOF];
-        let traj = TrajectoryPlanner::plan(
-            &self.commanded_positions,
-            &self.commanded_velocities,
-            target,
-            &zeros[..self.config.dof],
-            duration_secs,
-            limits,
-        )?;
-        let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, target, limits, true)?;
-        self.check_workspace_quintic_inline(&traj)?;
-
-        self.last_heartbeat = Instant::now();
-        if self.config.gripper_index().is_some_and(|g| target.len() > g && (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
-            self.gripper_hold_vel_ceiling = None;
-        }
-        self.release_servo_target();
-        self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
-        crate::rt_core::scratch::copy_into(&mut self.target_positions, target);
-        self.safety.mark_motion_started()?;
-        let duration = traj.duration;
-        let id = self.begin_action_rt(kind);
-        if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
-        // No `speed_scale` here, so `active_tracking_limits` already uses `planning_limits()`
-        // when `motion_limits` is None (avoids cloning `Vec<JointLimit>` and joint name strings).
-        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
-        Ok((self.safety.epoch_id(), id, duration))
     }
 
     pub fn jog(admitted: Admitted<'_>, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>) -> Result<u64, ArmError> {
@@ -1663,7 +1581,7 @@ impl SupervisorInner {
     /// RT-safe: when keeping a watchdog park, records fields into [`crate::rt_core::ops::stop_diag`]
     /// without tracing or allocating; a normal-priority thread formats off-thread.
     pub fn authorized_stop(&mut self) -> bool {
-        if let Some(park) = self.watchdog_park.as_ref().filter(|_| self.pending_normal_unload) {
+        if let Some(park) = self.watchdog_park.as_ref().filter(|_| self.pending_normal_unload || self.watchdog_park_pending.is_some()) {
             crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), park.elapsed_s, park.budget_s);
             return false;
         }

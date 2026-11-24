@@ -1565,6 +1565,7 @@ impl SupervisorInner {
         self.pending_normal_unload = false;
         self.clear_unload_settle();
         self.watchdog_park = None;
+        self.watchdog_park_pending = None;
         self.servo_target = None;
         self.servo_stream_active = false;
         self.servo_ws_min_depths = None;

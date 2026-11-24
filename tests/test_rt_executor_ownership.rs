@@ -824,6 +824,18 @@ impl CoreOps for OrderRecordingCore {
         self.log.lock().unwrap().push("commit_primitive");
         self.inner.commit_primitive(d, p, ctx)
     }
+    fn commit_install_slot(
+        &mut self,
+        d: &armd::rt_core::broker::Descriptor,
+        slot: &armd::rt_core::requests::motion::PreparedMotionSlot,
+        ctx: &armd::rt_core::ops::CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        self.log.lock().unwrap().push("commit_primitive");
+        self.inner.commit_install_slot(d, slot, ctx)
+    }
+    fn set_boot_id(&mut self, boot: BootId) {
+        self.inner.set_boot_id(boot);
+    }
     fn commit_immediate(
         &mut self,
         d: &armd::rt_core::broker::Descriptor,
@@ -887,6 +899,7 @@ fn exact_release_order_and_unconditional_checkpoints() {
 
     let (mut engine, broker, mut tw, stop) =
         ReleaseEngine::new(BootId(7), Capacities { commands: 4, plans: 2, replies: 8 });
+    inner.set_boot_id(BootId(7));
     let broker = Arc::new(Mutex::new(broker));
     let mut core = OrderRecordingCore {
         inner,
@@ -931,11 +944,22 @@ fn exact_release_order_and_unconditional_checkpoints() {
     let start = core.inner.commanded_positions.clone();
     let mut target_q = start.clone();
     target_q[0] += 0.001;
-    let prim = Primitive::joint_quintic(&start, &target_q, 0.01).unwrap();
+    let mut plan_snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&core.inner);
+    plan_snap.authority = armd::rt_core::requests::motion::PlanAuthority {
+        boot: BootId(7),
+        epoch: auth1.epoch,
+        lease_generation: auth1.lease_generation,
+        stop_generation: auth1.stop_generation,
+        deadline,
+    };
+    let jog_plan = armd::rt_core::requests::motion::prepare_motion(
+        &plan_snap,
+        &armd::rt_core::requests::motion::MotionRequest::jog(target_q, Some(0.01), None),
+    ).unwrap();
     let req_install = broker
         .lock()
         .unwrap()
-        .submit(ClientId(1), 2, auth1, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(prim)))
+        .submit(ClientId(1), 2, auth1, deadline, Submit::Install(&move |slot: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(slot, &jog_plan.slot)))
         .unwrap();
     let req_imm = broker
         .lock()
@@ -3303,15 +3327,21 @@ fn superseded_install_delivers_terminal_and_ack_strictly_after_publish() {
 
     let (mut engine, mut broker, _tw, _stop) =
         ReleaseEngine::new(BootId(42), Capacities { commands: 4, plans: 4, replies: 16 });
+    inner.set_boot_id(BootId(42));
     let now = Instant::now();
     let deadline = now + Duration::from_secs(5);
     let auth = inner.authority(&engine.ctx(now));
     let start = inner.commanded_positions.clone();
     let mut q1 = start.clone();
     q1[0] += 0.15;
-    let p1 = Primitive::joint_quintic(&start, &q1, 1.0).unwrap();
+    let mut s1 = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&inner);
+    s1.authority.deadline = deadline;
+    let p1 = armd::rt_core::requests::motion::prepare_motion(
+        &s1,
+        &armd::rt_core::requests::motion::MotionRequest::jog(q1, Some(1.0), None),
+    ).unwrap();
     let req1 = broker
-        .submit(ClientId(1), 1, auth, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(p1)))
+        .submit(ClientId(1), 1, auth, deadline, Submit::Install(&move |slot: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(slot, &p1.slot)))
         .unwrap();
     let r1 = engine.step(&mut inner, || now, 0.02, now + Duration::from_millis(20), 1);
     assert!(r1.command.unwrap().1.is_ok());
@@ -3342,6 +3372,15 @@ fn superseded_install_delivers_terminal_and_ack_strictly_after_publish() {
         ) -> Result<Committed, &'static str> {
             self.inner.commit_primitive(d, p, ctx)
         }
+        fn commit_install_slot(
+            &mut self,
+            d: &armd::rt_core::broker::Descriptor,
+            slot: &armd::rt_core::requests::motion::PreparedMotionSlot,
+            ctx: &armd::rt_core::ops::CommitCtx,
+        ) -> Result<Committed, &'static str> {
+            self.inner.commit_install_slot(d, slot, ctx)
+        }
+        fn set_boot_id(&mut self, boot: BootId) { self.inner.set_boot_id(boot); }
         fn commit_immediate(
             &mut self,
             d: &armd::rt_core::broker::Descriptor,
@@ -3379,12 +3418,17 @@ fn superseded_install_delivers_terminal_and_ack_strictly_after_publish() {
     let cur_start = inner.commanded_positions.clone();
     let mut q2 = cur_start.clone();
     q2[0] -= 0.05;
-    let p2 = Primitive::joint_quintic(&cur_start, &q2, 1.0).unwrap();
+    let mut s2 = armd::rt_core::requests::motion::MotionPlanSnapshot::from_supervisor(&inner);
+    s2.authority.deadline = deadline;
+    let p2 = armd::rt_core::requests::motion::prepare_motion(
+        &s2,
+        &armd::rt_core::requests::motion::MotionRequest::jog(q2, Some(1.0), None),
+    ).unwrap();
     let auth2 = inner.authority(&engine.ctx(now));
     let req2 = broker_shared
         .lock()
         .unwrap()
-        .submit(ClientId(1), 2, auth2, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(p2)))
+        .submit(ClientId(1), 2, auth2, deadline, Submit::Install(&move |slot: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(slot, &p2.slot)))
         .unwrap();
     let mut check_core = PublishCheckCore {
         inner,

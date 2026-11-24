@@ -746,6 +746,19 @@ pub struct ParkContinuation {
     pub motion_config_revision: u64,
 }
 
+/// Pending off-thread preparation state for a lease-expiry watchdog park (zero heap allocations).
+/// While active, the arm holds at its measured position until the off-thread planner installs a
+/// prepared `MotionRequest::park()` plan through `rt_core::requests::motion::install_watchdog_park`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchdogParkPending {
+    pub generation: u64,
+    pub attempt: u8,
+    pub epoch: u64,
+    pub workspace_revision: u64,
+    pub motion_config_revision: u64,
+    pub waiting_mit_handback: bool,
+}
+
 /// Internal mutable state of the robotic arm supervisor
 pub struct SupervisorInner {
     pub config: ArmConfig,
@@ -1175,6 +1188,12 @@ pub struct SupervisorInner {
     /// Last executor/release clock instant observed on `tick_control_with_deadline` or transition wake,
     /// mirrored into `RtSample.clock_now` so off-RT snapshots inherit the owner's exact clock origin.
     pub(crate) last_clock_now: Option<Instant>,
+    /// Pending off-thread watchdog park preparation (set on lease expiry instead of planning on tick).
+    pub(crate) watchdog_park_pending: Option<WatchdogParkPending>,
+    /// Monotonic generation counter for off-thread watchdog park requests.
+    pub(crate) watchdog_park_seq: u64,
+    /// Set by `ArmSupervisor::tick_shared` so legacy watchdog expiry never plans under `SupervisorLock`.
+    pub(crate) defer_watchdog_park_plan: bool,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -1819,6 +1838,9 @@ impl SupervisorInner {
             boot_id: crate::rt_core::broker::BootId::process(),
             motion_plan_deadline: crate::rt_core::requests::motion::DEFAULT_MOTION_PLAN_DEADLINE,
             last_clock_now: None,
+            watchdog_park_pending: None,
+            watchdog_park_seq: 0,
+            defer_watchdog_park_plan: false,
         };
         inner.prepare_workspace_eval_bufs();
         inner.prepare_park_release_spare();
@@ -2433,6 +2455,10 @@ impl SupervisorInner {
             hook();
         }
         let clock_now = self.last_clock_now.unwrap_or(sampled_at);
+        let (wd_gen, wd_attempt) = match self.watchdog_park_pending {
+            Some(p) if !p.waiting_mit_handback => (p.generation, p.attempt),
+            _ => (0, 0),
+        };
         let meta = crate::rt_core::publish::RtMotionMeta {
             boot_id: self.boot_id,
             clock_now: Some(clock_now),
@@ -2443,6 +2469,8 @@ impl SupervisorInner {
             config_inhibited: self.core.motion_inhibited_by_config(),
             calibration_busy: self.calibration_busy,
             holding_after_clear: self.holding_after_clear(),
+            watchdog_park_pending_gen: wd_gen,
+            watchdog_park_pending_attempt: wd_attempt,
         };
         let SupervisorInner { core, measured_positions, measured_velocities, commanded_velocities, .. } = self;
         core.publish_with_motion(
@@ -5119,6 +5147,7 @@ impl SupervisorInner {
             && self.is_torqued
             && !matches!(self.safety.state(), SafetyState::Booting | SafetyState::Idle)
             && !self.pending_normal_unload
+            && self.watchdog_park_pending.is_none()
             && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::WatchdogTimeout)
             && self.last_heartbeat.elapsed() > self.lease_timeout
         {
@@ -5131,15 +5160,57 @@ impl SupervisorInner {
             // rigid lock at the current position and latch the fault, keeping torque on.
             match self.watchdog_park_blocker_bounded() {
                 None => {
-                    tracing::warn!("Watchdog: lease expired while torqued, parking");
-                    self.apply_stop_policy(StopPolicy::NormalUnload);
-                    if self.pending_normal_unload {
+                    if self.rt_executor_owned || self.defer_watchdog_park_plan {
+                        // Never plan on `armd-control` or under `SupervisorLock`: hold at the
+                        // measured position meanwhile and hand off planning to the off-thread
+                        // worker (`install_watchdog_park`, zero alloc/free on RT).
+                        if !self.rt_executor_owned {
+                            tracing::warn!("Watchdog: lease expired while torqued, holding at measured pose for off-thread park plan");
+                        }
+                        self.release_servo_target();
+                        self.servo_settled_ticks.fill(0);
+                        self.retire_servo_ws_min_depths();
+                        self.servo_stream_active = false;
+                        self.retire_motion_payloads();
+                        self.pending_deferred_done = None;
+                        self.end_gripper_stream();
+                        let waiting_mit_handback = if self.mit_active() {
+                            self.mit.park_after_hand_back = true;
+                            self.mit.deferred_park_off_owner = true;
+                            true
+                        } else {
+                            self.commanded_velocities.fill(0.0);
+                            if self.measured_positions.len() == self.config.dof
+                                && self.measured_positions.iter().all(|p| p.is_finite())
+                            {
+                                copy_into(&mut self.commanded_positions, &self.measured_positions);
+                            }
+                            copy_into(&mut self.target_positions, &self.commanded_positions);
+                            false
+                        };
+                        self.watchdog_park_seq = self.watchdog_park_seq.wrapping_add(1).max(1);
+                        let generation = self.watchdog_park_seq;
+                        self.watchdog_park_pending = Some(WatchdogParkPending {
+                            generation,
+                            attempt: 0,
+                            epoch: self.safety.epoch_id(),
+                            workspace_revision: self.workspace_revision,
+                            motion_config_revision: self.motion_config_revision,
+                            waiting_mit_handback,
+                        });
                         let budget = self.watchdog_park_timeout();
-                        tracing::info!("Watchdog park budget {:.2} s (planned {:.2} s)", budget.as_secs_f64(), self.unload_planned_duration.unwrap_or(0.0));
                         self.watchdog_park = Some(WatchdogPark { elapsed_s: 0.0, budget_s: budget.as_secs_f64(), grace_granted: false });
                     } else {
-                        self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("watchdog park could not be planned"));
-                        self.latch_watchdog_fault();
+                        tracing::warn!("Watchdog: lease expired while torqued, parking");
+                        self.apply_stop_policy(StopPolicy::NormalUnload);
+                        if self.pending_normal_unload {
+                            let budget = self.watchdog_park_timeout();
+                            tracing::info!("Watchdog park budget {:.2} s (planned {:.2} s)", budget.as_secs_f64(), self.unload_planned_duration.unwrap_or(0.0));
+                            self.watchdog_park = Some(WatchdogPark { elapsed_s: 0.0, budget_s: budget.as_secs_f64(), grace_granted: false });
+                        } else {
+                            self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("watchdog park could not be planned"));
+                            self.latch_watchdog_fault();
+                        }
                     }
                 }
                 Some(reason) => {
@@ -5741,6 +5812,13 @@ impl SupervisorInner {
                     self.finish_action(c.action_id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
                     self.notify_park_continuation();
                 }
+                if self.watchdog_park_pending.take().is_some() {
+                    self.watchdog_park = None;
+                    if self.is_torqued && !self.safety.state().is_stopped() {
+                        self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("MIT tracking lost during watchdog park"));
+                        self.latch_watchdog_fault();
+                    }
+                }
                 if let Some(id) = self.mit.deferred_park_action.take() {
                     let mut msg = self.take_action_msg_buf(id, 96);
                     msg.clear();
@@ -5752,6 +5830,9 @@ impl SupervisorInner {
                 if std::mem::take(&mut self.mit.deferred_park_off_owner) {
                     if let Some(c) = self.park_continuation.as_mut() {
                         c.phase = ParkContinuationPhase::ReadyForPlan;
+                    }
+                    if let Some(w) = self.watchdog_park_pending.as_mut() {
+                        w.waiting_mit_handback = false;
                     }
                     self.notify_park_continuation();
                 } else {
@@ -6787,6 +6868,8 @@ pub struct ArmSupervisor {
     legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
     /// Unique identifier for this daemon/supervisor instance (changes across restarts).
     instance_id: String,
+    /// Guards off-lock legacy watchdog park planning against concurrent duplicate spawns.
+    watchdog_park_planning: Arc<AtomicBool>,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -6980,6 +7063,7 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             instance_id,
+            watchdog_park_planning: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -8302,6 +8386,71 @@ impl ArmSupervisor {
         self.tick_shared(dt, false, Some(release_deadline)).await;
     }
 
+    async fn run_watchdog_park_off_lock_inner(
+        sup_inner: Arc<SupervisorLock<SupervisorInner>>,
+        planning_flag: Arc<AtomicBool>,
+        generation: u64,
+    ) -> bool {
+        use crate::rt_core::requests::motion as req;
+        struct ResetOnDrop(Arc<AtomicBool>);
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+        }
+        let _guard = ResetOnDrop(planning_flag);
+        const MAX_RETRIES: usize = 5;
+        for attempt in 0..MAX_RETRIES {
+            let snap = {
+                let inner = sup_inner.read().await;
+                if inner.detached
+                    || !inner.watchdog_park_pending.is_some_and(|p| p.generation == generation && !p.waiting_mit_handback)
+                {
+                    return false;
+                }
+                req::MotionPlanSnapshot::from_supervisor(&inner)
+            };
+            let planned = tokio::task::spawn_blocking(move || req::prepare_motion(&snap, &req::MotionRequest::park())).await;
+            let mut inner = sup_inner.write().await;
+            if inner.detached
+                || !inner.watchdog_park_pending.is_some_and(|p| p.generation == generation && !p.waiting_mit_handback)
+            {
+                return false;
+            }
+            match planned {
+                Ok(Ok(plan)) => match req::install_watchdog_park(&mut inner, generation, &plan.slot, plan.heap_traj) {
+                    Ok(_) => return true,
+                    Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_RETRIES => continue,
+                    Err(req::MotionInstallError::ContinuationMismatch) => return false,
+                    Err(e) => {
+                        req::fail_watchdog_park_plan(&mut inner, generation, crate::safety::BoundedText::new(e.code()));
+                        return true;
+                    }
+                },
+                Ok(Err(e)) => {
+                    let mut msg = crate::safety::BoundedText::<160>::empty();
+                    let _ = core::fmt::write(&mut msg, format_args!("watchdog park could not be planned: {e}"));
+                    req::fail_watchdog_park_plan(&mut inner, generation, msg);
+                    return true;
+                }
+                Err(e) => {
+                    let mut msg = crate::safety::BoundedText::<160>::empty();
+                    let _ = core::fmt::write(&mut msg, format_args!("watchdog park planner aborted: {e}"));
+                    req::fail_watchdog_park_plan(&mut inner, generation, msg);
+                    return true;
+                }
+            }
+        }
+        let mut inner = sup_inner.write().await;
+        if !inner.detached {
+            req::fail_watchdog_park_plan(
+                &mut inner,
+                generation,
+                crate::safety::BoundedText::new("watchdog park drifted repeatedly"),
+            );
+            return true;
+        }
+        false
+    }
+
     /// One tick; publishes its observation (`crate::rt_core::publish`) and returns a copy
     /// when `keep`.
     async fn tick_shared(
@@ -8319,7 +8468,7 @@ impl ArmSupervisor {
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (obs, terminal_obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
+        let (mut obs, terminal_obs, wait, lock_held, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
@@ -8330,6 +8479,7 @@ impl ArmSupervisor {
             // No other guard exists now: the log is complete up to the guard waited for.
             let log = self.inner.take_log();
             inner.defer_zero_check_persist = true;
+            inner.defer_watchdog_park_plan = true;
             inner.tick_phases_us = [0; 5];
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
@@ -8346,7 +8496,9 @@ impl ArmSupervisor {
             let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
             inner.defer_zero_check_persist = false;
+            inner.defer_watchdog_park_plan = false;
             let pending_zc = inner.pending_zero_check_persist.take();
+            let pending_wd = inner.watchdog_park_pending.filter(|p| !p.waiting_mit_handback);
             let control_hz = inner.config.control_frequency_hz;
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
@@ -8360,7 +8512,7 @@ impl ArmSupervisor {
             } else {
                 None
             };
-            (kept, terminal_obs, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked,
+            (kept, terminal_obs, locked - started, lock_end - locked, control_hz, pending_zc, pending_wd, phases, log, locked, usage_locked,
                 body_start - locked, lock_end - body_end, allocs)
         };
         let released = Instant::now();
@@ -8372,6 +8524,24 @@ impl ArmSupervisor {
             }
         }
         self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
+        if let Some(wd) = pending_wd {
+            if self.watchdog_park_planning.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let sup_inner = Arc::clone(&self.inner);
+                let planning_flag = Arc::clone(&self.watchdog_park_planning);
+                if keep {
+                    if Self::run_watchdog_park_off_lock_inner(sup_inner, planning_flag, wd.generation).await {
+                        let inner = self.inner.read().await;
+                        if !inner.detached {
+                            obs = Some(inner.current_observation());
+                        }
+                    }
+                } else {
+                    tokio::spawn(async move {
+                        Self::run_watchdog_park_off_lock_inner(sup_inner, planning_flag, wd.generation).await;
+                    });
+                }
+            }
+        }
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);

@@ -362,6 +362,47 @@ async fn legacy_home_and_jog_write_lock_hold_under_2ms_with_no_in_lock_fallback(
     let inner = sup.inner().read().await;
     assert!(inner.active_trajectory.is_none(), "must never fall back to in-lock planning");
     assert_eq!(inner.prepared_quintics_used, 2);
+    drop(inner);
+
+    // 1b. M2 extension: real WS dispatch path (/api/v1/motion/jog + /api/v1/motion/home) with a
+    //     concurrent 50 Hz tick loop on the legacy owner -> write-lock holds stay <= 2 ms.
+    {
+        let cfg = dm_config_with_planning_load();
+        let mut q0 = cfg.home_positions.clone();
+        q0[0] += 0.20;
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let (mut ws, gen, _, sup, _) = common::torqued_rig(sup, &q0).await;
+        let before_seq = sup.hub().published_seq();
+        let ep = sup.get_observation().await.epoch_id;
+        let mut jog_t = q0.clone();
+        jog_t[0] -= 0.08;
+        let jog_ack = common::rpc(
+            &mut ws,
+            gen,
+            ep,
+            "/api/v1/motion/jog",
+            json!({"target_positions": jog_t, "duration_secs": 0.4}),
+        ).await;
+        assert_eq!(jog_ack["type"], "command_ack", "{jog_ack}");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let ep = sup.get_observation().await.epoch_id;
+        let home_ack = common::rpc(&mut ws, gen, ep, "/api/v1/motion/home", json!({"duration_secs": 0.4})).await;
+        assert_eq!(home_ack["type"], "command_ack", "{home_ack}");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let stats = sup.tick_stats();
+        assert!(sup.hub().published_seq() >= before_seq + 5, "concurrent 50 Hz ticks must advance during WS motion");
+        assert!(
+            stats.writer_hold_us.max <= 2_000,
+            "WS jog/home writer_hold_us.max = {} us (> 2 ms budget)",
+            stats.writer_hold_us.max
+        );
+        assert!(
+            stats.lock_us.max <= 2_000,
+            "concurrent tick lock_us.max = {} us (> 2 ms budget)",
+            stats.lock_us.max
+        );
+        assert!(sup.inner().read().await.prepared_quintics_used >= 2);
+    }
 }
 
 // ============================================================================
@@ -1356,4 +1397,184 @@ fn m1_prepared_plan_authority_and_deadline_enforced_at_install() {
             assert_eq!(refreshed.authority, orig_auth, "drift retry must preserve original request authority and deadline");
         }
     });
+}
+
+// ============================================================================
+// 9. Round 2 M2: Off-thread lease-expiry watchdog park (0 alloc), bare JointQuintic
+//    refusal on RT, legacy watchdog park off SupervisorLock, and MIT park off WS lock
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_alloc() {
+    let period = Duration::from_millis(5);
+    let period_ns = period.as_nanos() as u64;
+
+    // 9a. Bare broker `Primitive::JointQuintic` without `PreparedMotionSlot` is refused on
+    //     armd-control without planning and with AllocCounts::ZERO.
+    {
+        let clock = ScriptedClock::new();
+        let (drv, _) = MotionTestDriver::new(vec![0.4, 0.2], Duration::from_millis(4), Duration::from_millis(4), Some(clock.clone()));
+        let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+        let handle = start_scripted_executor(&sup, period, clock.clone(), true).await;
+        clock.run_steps(period_ns, 2);
+        let auth = submit_enable_and_wait(&sup, &handle, &clock, period_ns, 1);
+        let prim = armd::rt_core::ops::Primitive::joint_quintic(&[0.4, 0.2], &[0.1, 0.1], 0.5).unwrap();
+        let req_id = handle.broker().lock().unwrap().submit(
+            ClientId(1), 2, auth, clock.now() + Duration::from_secs(10),
+            Submit::Install(&move |s: &mut PlanSlot| s.set(prim)),
+        ).unwrap();
+        clock.run_steps(period_ns, 3);
+        let rs = drain_replies(&handle);
+        assert!(rs.iter().any(|r| matches!(r, Reply::Refused { request, code: "INVALID_COMMAND", .. } if *request == req_id)), "{rs:?}");
+        assert_eq!(sup.hub().latest().unwrap().obs.commanded_positions, vec![0.4, 0.2]);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+        drop(handle);
+    }
+
+    // 9b. Executor lease-expiry NormalUnload: holds at measured position while off-RT armd-persist
+    //     prepares the park plan, installs via shared `install_watchdog_park`, ignores client Stop,
+    //     parks to rest, disables torque, and runs with strictly AllocCounts::ZERO on armd-control!
+    {
+        let mut cfg = parkable_2dof_config();
+        cfg.lease_timeout_ms = 60;
+        let clock = ScriptedClock::new();
+        let (drv, knobs) = MotionTestDriver::new(vec![0.6, 0.3], Duration::from_millis(4), Duration::from_millis(4), Some(clock.clone()));
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        {
+            let mut inner = sup.inner().write().await;
+            inner.lease_enabled = true;
+            let _ = inner.acquire_lease("client-wd").unwrap();
+            let s = inner.current_admission_stamp();
+            SupervisorInner::enable_torque(inner.check_admission(s).unwrap()).unwrap();
+            inner.commanded_positions = vec![0.6, 0.3];
+            inner.measured_positions = vec![0.6, 0.3];
+            inner.target_positions = vec![0.6, 0.3];
+            // Pre-expire heartbeat so release #1 triggers lease-expiry watchdog immediately.
+            inner.last_heartbeat = std::time::Instant::now() - Duration::from_millis(200);
+        }
+        let mut exec_cfg = ExecutorConfig::for_tests(period);
+        exec_cfg.alloc_timing = true;
+        let mut hooks = PersistTestHooks::default();
+        hooks.clock = Some(clock.clone());
+        let handle = sup.start_executor_with_hooks(exec_cfg, hooks).await.unwrap();
+
+        // Release #1: watchdog triggers -> holds at measured [0.6, 0.3] & publishes watchdog_park_pending_gen != 0.
+        clock.run_steps(period_ns, 1);
+        let snap1 = sup.hub().latest().unwrap();
+        assert_ne!(snap1.rt.watchdog_park_pending_gen, 0, "must defer watchdog park planning off armd-control");
+        assert_eq!(snap1.obs.commanded_positions, vec![0.6, 0.3], "must hold at measured position while preparing");
+        assert!(snap1.obs.is_torqued);
+
+        // Client Stop during the off-thread prepare window must NOT cancel the watchdog park.
+        let sg = handle.stop_requests().request();
+        clock.run_steps(period_ns, 1);
+        assert_eq!(handle.stop_requests().applied(), sg);
+
+        // Let armd-persist prepare off-thread and push the Copy WatchdogParkPlan, then run to Idle!
+        let mut reached_idle = false;
+        for _ in 0..800 {
+            clock.run_steps(period_ns, 2);
+            let s = sup.hub().latest().unwrap();
+            if s.obs.safety_state == SafetyState::Idle && !s.obs.is_torqued {
+                reached_idle = true;
+                break;
+            }
+            if s.rt.watchdog_park_pending_gen != 0 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert!(reached_idle, "executor off-thread watchdog park did not reach Idle: {:?}", sup.hub().latest().map(|s| s.obs.safety_state.clone()));
+        assert!(knobs.disable_started.load(Ordering::Acquire));
+        let end_snap = sup.hub().latest().unwrap();
+        assert!(end_snap.obs.positions.iter().all(|p| p.abs() < 1e-2), "ended at rest: {:?}", end_snap.obs.positions);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "lease-expiry watchdog park must perform zero alloc/free on armd-control");
+        drop(handle);
+    }
+
+    // 9c. Legacy watchdog park off SupervisorLock: heavy workspace + resting pose, expires under
+    //     control_tick -> parks to rest and disables torque with write-lock hold <= 2 ms.
+    {
+        let mut cfg = dm_config_with_planning_load();
+        cfg.lease_timeout_ms = 40;
+        let mut q0 = cfg.resting_positions().to_vec();
+        q0[0] += 0.25;
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
+        {
+            let mut inner = sup.inner().write().await;
+            let _ = inner.acquire_lease("client-legacy-wd").unwrap();
+            inner.commanded_positions = q0.clone();
+            inner.measured_positions = q0.clone();
+            inner.target_positions = q0.clone();
+            inner.last_heartbeat = std::time::Instant::now() - Duration::from_millis(120);
+        }
+        let _ = tokio::task::spawn_blocking(|| {}).await;
+        let _ = sup.inner().take_log();
+        let mut reached_idle = false;
+        for _ in 0..400 {
+            sup.control_tick(0.02).await;
+            let obs = sup.get_observation().await;
+            if obs.safety_state == SafetyState::Idle && !obs.is_torqued {
+                reached_idle = true;
+                break;
+            }
+            if sup.inner().read().await.active_trajectory.is_none() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        assert!(reached_idle, "legacy off-lock watchdog park did not complete");
+        let stats = sup.tick_stats();
+        assert!(stats.lock_us.max <= 2_000, "legacy watchdog tick lock_us.max = {} us (> 2 ms)", stats.lock_us.max);
+        assert!(stats.writer_hold_us.max <= 2_000, "legacy watchdog install writer_hold_us.max = {} us (> 2 ms)", stats.writer_hold_us.max);
+    }
+
+    // 9d. Legacy MIT stationary park: install_park defers to WaitingMitHandback WITHOUT calling
+    //     blocking `set_joint_modes_confirmed` under the WS write lock; tick hands back off WS lock.
+    {
+        let limits: Vec<DamiaoLimits> = ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(|r| r.limits()).collect();
+        let bus = FakeBus::with_clock(&limits, armd::transport::MockClock::new());
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(limits.clone()).unwrap();
+        bus.with(|s| { s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000); s.push_all_feedback(); });
+        drv.read_joint_states().unwrap();
+        let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(drv));
+        let l = limits[3];
+        let rec = MitQualificationFile {
+            version: mit::QUALIFICATION_VERSION,
+            joints: vec![MitJointQualification {
+                profile_id: "rebot_b601dm".into(), joint: 4, joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
+                zero_fingerprint: mit::zero_fingerprint(0.0), motor_id: 4, reply_id: 0x14, esc_id: 4, mst_id: 0x14, sw_ver: SW_VER,
+                pmax: l.p_max, vmax: l.v_max, tmax: l.t_max, timeout_raw: 2000, timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
+                timeout_unit_verified: true, tested_response: "disabled".into(), measured_expiry_ms: 101.0, worst_latency_ms: 8.0,
+                load_envelope: "unloaded, supported".into(), max_kp: 15.0, max_kd: 0.5, effort_ceiling_nm: 4.0,
+                date: "2026-11-22T00:00:00Z".into(), trace_id: "test".into(),
+            }],
+            invalidated: None,
+        };
+        inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: serde_json::to_value(&rec).ok(), ..Default::default() }));
+        let stamp = inner.current_admission_stamp();
+        SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+        inner.tick(0.01);
+        assert!(inner.mit_active());
+        assert!(inner.commanded_velocities.iter().all(|&v| v == 0.0), "stationary MIT arm");
+
+        let snap = MotionPlanSnapshot::from_supervisor(&inner);
+        let park_plan = req::prepare_motion(&snap, &MotionRequest::park()).unwrap();
+        assert!(park_plan.slot.for_mit_deferral);
+        let stamp = inner.current_admission_stamp();
+        let ep = inner.safety.epoch_id();
+        let installed = req::install_park(&mut inner, stamp, &park_plan.slot, None, Some(ep), false).unwrap();
+        let park_id = match installed {
+            MotionInstalled::DeferredContinuation { action_id, .. } => action_id,
+            other => panic!("stationary MIT park must defer handback off WS write lock, got {other:?}"),
+        };
+        assert_eq!(inner.park_continuation().unwrap().phase, ParkContinuationPhase::WaitingMitHandback);
+        assert!(inner.mit_active(), "MIT handback must NOT have executed synchronously under WS write lock");
+
+        inner.tick(0.01);
+        assert!(!inner.mit_active(), "control tick completes MIT handback off WS write lock");
+        assert_eq!(inner.park_continuation().unwrap().phase, ParkContinuationPhase::ReadyForPlan);
+        let cont_plan = req::prepare_motion(&MotionPlanSnapshot::from_supervisor(&inner), &MotionRequest::park()).unwrap();
+        req::install_park_continuation(&mut inner, park_id, &cont_plan.slot, None, Some(ep), false).unwrap();
+        assert!(inner.park_continuation().is_none() && inner.pending_normal_unload);
+    }
 }

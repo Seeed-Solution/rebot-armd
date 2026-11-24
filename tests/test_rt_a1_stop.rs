@@ -422,13 +422,25 @@ async fn no_stale_dynamic_frames_after_applied_stop_and_post_stop_frame_transmit
         _ => panic!("unexpected maintenance reply"),
     };
     assert_eq!(snap.authority.stop_generation, sg);
-    let mut start = [0.0f32; MAX_DOF];
-    start[..7].copy_from_slice(&snap.commanded[..7]);
-    let mut goal = start;
-    goal[0] = (q_stopped[0] + 0.18).min(0.9);
+    let mut goal_vec = snap.commanded[..7].to_vec();
+    goal_vec[0] = (q_stopped[0] + 0.18).min(0.9);
+    let dl = Instant::now() + Duration::from_secs(5);
+    let published = sup.hub().latest().expect("published snapshot for post-stop jog");
+    let cfg = sup.hub().motion_config().expect("motion config on hub");
+    let mut plan_snap = armd::rt_core::requests::motion::MotionPlanSnapshot::from_published(&published, cfg).unwrap();
+    plan_snap.commanded_positions = snap.commanded[..7].to_vec();
+    plan_snap.authority.epoch = snap.authority.epoch;
+    plan_snap.authority.lease_generation = snap.authority.lease_generation;
+    plan_snap.authority.stop_generation = snap.authority.stop_generation;
+    plan_snap.authority.deadline = dl;
+    let plan = armd::rt_core::requests::motion::prepare_motion(
+        &plan_snap,
+        &armd::rt_core::requests::motion::MotionRequest::jog(goal_vec.clone(), Some(0.15), None),
+    ).unwrap();
+    let goal = goal_vec;
     let req = handle.broker().lock().unwrap().submit(
-        ClientId(10), 1, snap.authority, Instant::now() + Duration::from_secs(5),
-        Submit::Install(&|slot: &mut PlanSlot| slot.set(Primitive::JointQuintic { dof: 7, start, q: goal, duration_s: 0.15 })),
+        ClientId(10), 1, snap.authority, dl,
+        Submit::Install(&move |slot: &mut PlanSlot| armd::rt_core::requests::motion::stage_jog(slot, &plan.slot)),
     ).unwrap();
     let mut reply_for_req = None;
     wait_until(Duration::from_secs(1), || {
