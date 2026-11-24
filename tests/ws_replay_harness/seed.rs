@@ -192,6 +192,7 @@ pub async fn materialize_seed(setup: &SessionSetup) -> MaterializedSeed {
         }
         let pq_path = episodes_dir.join(format!("{SEEDED_EPISODE_ID}.parquet"));
         armd::write_frames_to_parquet(&pq_path, &frames).unwrap();
+        let jz = armd::recording::store::JointZeroStamp::of(&vec![0.0f32; cfg.dof]);
         let sidecar = json!({
             "id": SEEDED_EPISODE_ID,
             "dataset": "default",
@@ -203,13 +204,14 @@ pub async fn materialize_seed(setup: &SessionSetup) -> MaterializedSeed {
             "frames": 10,
             "joint_names": cfg.limits.iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
             "units": "rad",
-            "joint_zero": {
-                "offsets_rad": vec![0.0f32; cfg.dof],
-                "version": 1
-            },
+            "joint_zero": jz,
             "profile_id": cfg.profile_id,
             "armd_version": env!("CARGO_PKG_VERSION"),
             "fps_nominal": f64::from(cfg.control_frequency_hz),
+            "arm_dof": cfg.arm_dof(),
+            "gripper_joint": cfg.gripper_index(),
+            "tool_id": cfg.active_tool.id,
+            "tool_config_digest": cfg.active_tool.config_digest,
             "truncated": false
         });
         std::fs::write(

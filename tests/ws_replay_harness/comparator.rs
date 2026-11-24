@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSetup {
     /// Profile preset: `"rebot_dm"` (default), `"rebot_dm_short_lease"`, `"default_6dof"`.
     #[serde(default = "default_profile")]
@@ -28,6 +28,20 @@ pub struct SessionSetup {
     pub seed_calibration: bool,
     #[serde(default)]
     pub mock_detector: bool,
+}
+
+impl Default for SessionSetup {
+    fn default() -> Self {
+        Self {
+            profile: default_profile(),
+            operator_pin: None,
+            seed_poses: false,
+            seed_episode: false,
+            seed_policy: false,
+            seed_calibration: false,
+            mock_detector: false,
+        }
+    }
 }
 
 fn default_profile() -> String {
@@ -345,9 +359,17 @@ impl Normalizer {
                         return self.norm_stop_gen(n);
                     }
                 }
-                "pose_id" | "recording_id" | "job_id" | "token" | "backup" | "content_sha256" => {
+                "pose_id" | "recording_id" | "job_id" | "token" | "backup" | "content_sha256"
+                | "deleted" => {
                     if let Some(s) = val.as_str() {
                         return Value::String(self.norm_opaque(s));
+                    }
+                }
+                "expected_duration_s" => {
+                    if let Some(n) = val.as_f64() {
+                        if n.is_finite() {
+                            return Value::from((n * 100.0).round() / 100.0);
+                        }
                     }
                 }
                 "id" if matches!(parent_key, Some("pose" | "sequence" | "episode" | "body")) => {
@@ -451,18 +473,29 @@ impl Normalizer {
                 epoch_id,
                 is_torqued,
                 control_mode,
-            } => serde_json::json!({
-                "ev": "action_terminal",
-                "client": client,
-                "action_id": self.norm_action_id(*action_id),
-                "kind": kind,
-                "state": state,
-                "code": code,
-                "safety_state": safety_state,
-                "epoch_id": self.norm_epoch(*epoch_id),
-                "is_torqued": is_torqued,
-                "control_mode": control_mode,
-            }),
+            } => {
+                // On completion tick, `Moving` -> `Armed` can straddle the terminal vs next tick;
+                // normalize only those two operational states on `done` while keeping Fault/EStop/Idle strict.
+                let norm_safety = if state == "done"
+                    && matches!(safety_state.as_str(), Some("Moving" | "Armed"))
+                {
+                    Value::String("$operational".into())
+                } else {
+                    safety_state.clone()
+                };
+                serde_json::json!({
+                    "ev": "action_terminal",
+                    "client": client,
+                    "action_id": self.norm_action_id(*action_id),
+                    "kind": kind,
+                    "state": state,
+                    "code": code,
+                    "safety_state": norm_safety,
+                    "epoch_id": self.norm_epoch(*epoch_id),
+                    "is_torqued": is_torqued,
+                    "control_mode": control_mode,
+                })
+            }
             RecordedEvent::NoReply { client } => serde_json::json!({
                 "ev": "no_reply",
                 "client": client,

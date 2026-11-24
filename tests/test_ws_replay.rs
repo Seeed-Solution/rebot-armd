@@ -313,21 +313,66 @@ async fn controlled_clock_and_injected_owner_event_replay_parity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_corpus_matches_baseline_zero_diff() {
-    let manifest_path = corpus_dir().join("manifest.json");
+    let dir = corpus_dir();
+    let bin = replay_binary();
+    if std::env::var_os("ARMD_WS_REPLAY_RECORD").is_some_and(|v| v == "1") {
+        std::fs::create_dir_all(&dir).unwrap();
+        let specs = ws_replay_harness::scenarios::all_scenarios();
+        let mut filenames = Vec::with_capacity(specs.len());
+        let mut total_frames = 0usize;
+        for spec in specs {
+            let tr = execute_binary_session(
+                &bin,
+                spec.id,
+                spec.family,
+                spec.description,
+                &spec.setup,
+                &spec.steps,
+            )
+            .await;
+            total_frames += tr.events.len();
+            let filename = format!("{}.json", spec.id);
+            let text = tr.to_compact_json().unwrap();
+            std::fs::write(dir.join(&filename), text).unwrap();
+            filenames.push(filename);
+        }
+        let manifest = json!({
+            "baseline_commit": "0afeb1d",
+            "sessions": filenames,
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap() + "\n",
+        )
+        .unwrap();
+        eprintln!(
+            "REPLAY_RECORDED: binary={} sessions={} frames={}",
+            bin.display(),
+            filenames.len(),
+            total_frames
+        );
+        return;
+    }
+
+    let manifest_path = dir.join("manifest.json");
     if !manifest_path.exists() {
         return;
     }
-    let bin = replay_binary();
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     let files = manifest["sessions"]
         .as_array()
         .expect("manifest.sessions array");
+    assert!(
+        files.len() >= 30,
+        "corpus must have at least 30 sessions, found {}",
+        files.len()
+    );
     let mut total_frames = 0usize;
     let mut total_diffs = 0usize;
     for entry in files {
         let filename = entry.as_str().expect("session filename");
-        let path = corpus_dir().join(filename);
+        let path = dir.join(filename);
         let expected: SessionTranscript =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
                 .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));

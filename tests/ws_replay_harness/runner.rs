@@ -1,7 +1,7 @@
 //! WS replay session recorder/replayer against `armd --follower mock` binaries and
 //! in-process controlled-clock / injected owner-event harnesses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ impl Drop for ChildGuard {
 
 struct ClientState {
     ws: WsConn,
-    seen_terminals: HashSet<(u64, String)>,
+    buffered_terminals: HashMap<u64, RecordedEvent>,
 }
 
 struct RuntimeVars {
@@ -159,6 +159,33 @@ async fn fetch_epoch(http: &reqwest::Client, base_url: &str) -> u64 {
     obs["epoch_id"].as_u64().unwrap_or(1)
 }
 
+fn extract_terminals_from_obs(v: &Value, buf: &mut HashMap<u64, RecordedEvent>) {
+    for key in ["action", "previous_action"] {
+        let Some(la) = v.get(key).filter(|x| x.is_object()) else {
+            continue;
+        };
+        let id = la.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let state = la.get("state").and_then(Value::as_str).unwrap_or("");
+        if id > 0 && matches!(state, "done" | "failed" | "cancelled") {
+            buf.entry(id).or_insert_with(|| RecordedEvent::ActionTerminal {
+                client: String::new(),
+                action_id: id,
+                kind: la.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
+                state: state.to_string(),
+                code: la.get("code").and_then(Value::as_str).map(str::to_string),
+                safety_state: v.get("safety_state").cloned().unwrap_or(Value::Null),
+                epoch_id: v.get("epoch_id").and_then(Value::as_u64).unwrap_or(0),
+                is_torqued: v.get("is_torqued").and_then(Value::as_bool).unwrap_or(false),
+                control_mode: v
+                    .get("control_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+}
+
 async fn read_next_control(client: &mut ClientState) -> Value {
     tokio::time::timeout(Duration::from_secs(6), async {
         loop {
@@ -174,6 +201,7 @@ async fn read_next_control(client: &mut ClientState) -> Value {
                     if v.get("type").is_some() {
                         return v;
                     }
+                    extract_terminals_from_obs(&v, &mut client.buffered_terminals);
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
                 Message::Close(cf) => panic!("unexpected WS Close while waiting for control: {cf:?}"),
@@ -186,6 +214,9 @@ async fn read_next_control(client: &mut ClientState) -> Value {
 }
 
 async fn read_action_terminal(client: &mut ClientState, target_action_id: u64) -> RecordedEvent {
+    if let Some(ev) = client.buffered_terminals.remove(&target_action_id) {
+        return ev;
+    }
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let msg = client
@@ -199,28 +230,9 @@ async fn read_action_terminal(client: &mut ClientState, target_action_id: u64) -
             if v.get("type").is_some() {
                 continue;
             }
-            let Some(la) = v.get("last_action").filter(|x| x.is_object()) else {
-                continue;
-            };
-            let id = la.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let state = la.get("state").and_then(Value::as_str).unwrap_or("");
-            if id == target_action_id && matches!(state, "done" | "failed" | "cancelled") {
-                client.seen_terminals.insert((id, state.to_string()));
-                return RecordedEvent::ActionTerminal {
-                    client: String::new(),
-                    action_id: id,
-                    kind: la.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
-                    state: state.to_string(),
-                    code: la.get("code").and_then(Value::as_str).map(str::to_string),
-                    safety_state: v.get("safety_state").cloned().unwrap_or(Value::Null),
-                    epoch_id: v.get("epoch_id").and_then(Value::as_u64).unwrap_or(0),
-                    is_torqued: v.get("is_torqued").and_then(Value::as_bool).unwrap_or(false),
-                    control_mode: v
-                        .get("control_mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                };
+            extract_terminals_from_obs(&v, &mut client.buffered_terminals);
+            if let Some(ev) = client.buffered_terminals.remove(&target_action_id) {
+                return ev;
             }
         }
     })
@@ -349,7 +361,7 @@ pub async fn run_steps_against(
                             client.clone(),
                             ClientState {
                                 ws,
-                                seen_terminals: HashSet::new(),
+                                buffered_terminals: HashMap::new(),
                             },
                         );
                     }

@@ -4,4 +4,5 @@
 
 pub mod comparator;
 pub mod runner;
+pub mod scenarios;
 pub mod seed;
