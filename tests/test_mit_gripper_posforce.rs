@@ -54,9 +54,22 @@ fn targets(j7: f32) -> Vec<JointTarget> {
 
 #[test]
 fn pos_force_frame_bytes() {
-    let f = damiao::build_pos_force_frame(damiao::POS_FORCE_BASE_ID, 7, 1.0, damiao::pos_force_vel_raw(0.30), 220);
-    assert_eq!(f.id, 0x307);
-    assert_eq!(f.data, [0x00, 0x00, 0x80, 0x3F, 0x1E, 0x00, 0xDC, 0x00]);
+    let payload = damiao::encode_pos_force_payload(1.0, damiao::pos_force_vel_raw(0.30), 220);
+    assert_eq!(payload, [0x00, 0x00, 0x80, 0x3F, 0x1E, 0x00, 0xDC, 0x00]);
+    // Verify the single emitter actually transmits CAN ID 0x307 with this exact payload layout.
+    let (mut d, bus, _) = rig(true);
+    bus.with(|s| s.motors[J7].q = -1.0);
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("enable");
+    bus.clear_log();
+    let mut t = targets(1.0);
+    t[J7].velocity = Some(0.30);
+    d.begin_tx_tick();
+    d.write_joint_targets_bounded(&t).expect("write");
+    let j7 = j7_commands(&bus.tx_log());
+    assert_eq!(j7.len(), 1);
+    assert_eq!(j7[0].id, 0x307);
+    assert_eq!(j7[0].data, [0x00, 0x00, 0x80, 0x3F, 0x1E, 0x00, 0xDC, 0x00]);
     assert_eq!(damiao::pos_force_vel_raw(2.0), 200);
     assert_eq!(damiao::pos_force_vel_raw(-0.304), 30);
     assert_eq!(damiao::pos_force_vel_raw(0.306), 30, "must quantize downward so wire speed <= ceiling");

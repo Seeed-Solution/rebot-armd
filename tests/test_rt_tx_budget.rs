@@ -4181,16 +4181,20 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
         );
 
         if rel == "protocol/damiao.rs" {
-            // Only the `pub fn build_pos_force_frame(` definition itself (and `POS_FORCE_BASE_ID = 0x300`)
-            // may appear here.
+            // `build_pos_force_frame` MUST be `pub(crate)` and require `&crate::driver::PosForceSendToken`
+            // so only private `driver::pos_force_emitter` can invoke it at compile time.
             assert_eq!(
                 compact.matches("build_pos_force_frame(").count(),
                 1,
                 "src/protocol/damiao.rs must contain only the build_pos_force_frame definition"
             );
             assert!(
-                compact.contains("pubfnbuild_pos_force_frame("),
-                "expected pub fn build_pos_force_frame definition in src/protocol/damiao.rs"
+                compact.contains("pub(crate)fnbuild_pos_force_frame(_token:&crate::driver::PosForceSendToken,"),
+                "build_pos_force_frame in src/protocol/damiao.rs must be pub(crate) and sealed by &PosForceSendToken"
+            );
+            assert!(
+                !compact.contains("pubfnbuild_pos_force_frame("),
+                "build_pos_force_frame must not be publicly callable without PosForceSendToken"
             );
             continue;
         }
@@ -4212,35 +4216,58 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
                 "src/driver.rs must not hand-construct raw CanFrame literals/constructors in production code"
             );
 
-            // 2. `build_pos_force_frame(` exists ONLY inside `DamiaoArmDriver::emit_pos_force_frame`.
+            // 2a. `build_pos_force_frame(` exists ONLY inside private `pos_force_emitter::build_wire_frame`.
             let (outside_build, inside_build) =
-                partition_unique_fn_compact(&prod, "fn emit_pos_force_frame(");
+                partition_unique_fn_compact(&prod, "fn build_wire_frame(");
             assert_eq!(
                 inside_build.matches("build_pos_force_frame(").count(),
                 1,
-                "DamiaoArmDriver::emit_pos_force_frame must contain EXACTLY ONE build_pos_force_frame( call"
+                "pos_force_emitter::build_wire_frame must contain EXACTLY ONE build_pos_force_frame( call"
             );
             assert_eq!(
                 outside_build.matches("build_pos_force_frame(").count(),
                 0,
-                "src/driver.rs must have ZERO build_pos_force_frame( calls outside emit_pos_force_frame"
+                "src/driver.rs must have ZERO build_pos_force_frame( calls outside pos_force_emitter::build_wire_frame"
             );
             total_driver_build_sites += inside_build.matches("build_pos_force_frame(").count();
+
+            // 2b. `PosForceSendToken(` is defined and constructed ONLY inside private `mod pos_force_emitter`
+            //     (`struct PosForceSendToken(())` + `PosForceSendToken(())` inside `fn send_frame(`).
+            let (outside_send_frame, inside_send_frame) =
+                partition_unique_fn_compact(&prod, "fn send_frame<");
+            assert_eq!(
+                inside_send_frame.matches("PosForceSendToken(").count(),
+                1,
+                "pos_force_emitter::send_frame must construct PosForceSendToken(()) once"
+            );
+            assert_eq!(
+                outside_send_frame.matches("PosForceSendToken(").count(),
+                1,
+                "outside send_frame, only `struct PosForceSendToken(())` may contain `PosForceSendToken(`"
+            );
+            assert!(
+                outside_send_frame.contains("pub(crate)structPosForceSendToken(())"),
+                "PosForceSendToken must be a private-field tuple struct inside private mod pos_force_emitter"
+            );
+            assert!(
+                !compact.contains("pubmodpos_force_emitter"),
+                "mod pos_force_emitter must remain private"
+            );
 
             // 3. Explicit allow-list for EVERY `POS_FORCE_BASE_ID` reference in production driver.rs:
             //    all non-emitter sites are strictly read-only CAN ID predicates or key lookups.
             const POS_FORCE_BASE_ID_ALLOWLIST: &[(&str, &str)] = &[
                 (
-                    "fn emit_pos_force_frame(",
-                    "Sole production constructor calling damiao::build_pos_force_frame",
+                    "fn build_wire_frame(",
+                    "Sole production constructor inside private mod pos_force_emitter calling damiao::build_pos_force_frame",
                 ),
                 (
                     "fn frame_pos_force_joint(",
-                    "Read-only CAN ID predicate used by DamiaoArmDriver::send submission guard",
+                    "Read-only CAN ID predicate used by DamiaoArmDriver::send_inner submission guard",
                 ),
                 (
                     "fn pos_force_freeze_params(",
-                    "Read-only lookup of last_target_frames CAN ID for boot-fallback parameters",
+                    "Read-only lookup of last_target_frames CAN ID for freeze parameters",
                 ),
                 (
                     "fn is_pos_force_freeze_frame(",
@@ -4267,50 +4294,103 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
                 "src/driver.rs references POS_FORCE_BASE_ID outside its explicit allow-list"
             );
 
-            // 4. Explicit allow-list for EVERY caller of `emit_pos_force_frame(` in production driver.rs:
-            //    every site goes through `emit_pos_force_frame` (`send()` chokepoint) and documents
-            //    why it is safe alongside the control-tick emitter.
-            const EMIT_POS_FORCE_FRAME_ALLOWLIST: &[(&str, &str)] = &[
-                (
-                    "fn emit_pos_force_frame(",
-                    "Definition of the sole production 0x307 frame builder/transmitter",
-                ),
-                (
-                    "fn emit_pos_force_j7_impl(",
-                    "Single control-tick J7 emitter invoked once per tick from the tick epilogue (both Legacy & RT Executor) and direct-driver fallback; enforces stop_gen/estop_epoch stamp degradation",
-                ),
+            // 4. Secondary text check on EVERY caller of `pos_force_emitter::send_frame` and the
+            //    narrow `pos_force_emitter::emit_*` APIs in production driver.rs.
+            const NARROW_EMITTER_CALLERS: &[(&str, &str, &str)] = &[
                 (
                     "fn finish_pos_force_readback(",
-                    "Pre-enable stationary hold during torque-on handshake right after CTRL_MODE readback while motor is still disabled (allow_freeze = false; fails closed unless fresh <= 100 ms stationary torque-off feedback)",
+                    "pos_force_emitter::emit_pre_enable_hold(",
+                    "Pre-enable stationary hold during torque-on handshake right after CTRL_MODE readback while motor is still disabled (allow_freeze = false)",
                 ),
                 (
                     "fn write_modes_send(",
-                    "Immediate hold frame directly following a CTRL_MODE register switch (allow_freeze = false; fails closed if stale or stop-inhibited)",
+                    "pos_force_emitter::emit_mode_switch_hold(",
+                    "Immediate hold frame directly following a CTRL_MODE register switch (allow_freeze = false)",
                 ),
                 (
                     "fn write_modes_confirmed(",
-                    "Immediate hold frame directly following a confirmed CTRL_MODE register switch (allow_freeze = false; fails closed if stale, fenced, or stop-inhibited)",
+                    "pos_force_emitter::emit_mode_switch_hold(",
+                    "Immediate hold frame directly following a confirmed CTRL_MODE register switch (allow_freeze = false)",
                 ),
                 (
                     "fn receive_feedback(",
-                    "Standalone-driver recovery only (early-continues when external_pos_force_emitter == true, so unreachable under SupervisorInner; allow_freeze = false)",
+                    "pos_force_emitter::emit_standalone_recovery_hold(",
+                    "Standalone-driver recovery only (refuses with BuildRefused whenever external_pos_force_emitter == true; allow_freeze = false)",
                 ),
             ];
-            let (outside_emit_callers, emit_bodies) =
-                partition_allowlisted_fns_compact(&prod, EMIT_POS_FORCE_FRAME_ALLOWLIST);
-            assert_eq!(
-                outside_emit_callers.matches("emit_pos_force_frame(").count(),
-                0,
-                "src/driver.rs has unlisted emit_pos_force_frame( caller outside allow-list"
-            );
-            for (fn_name, body) in emit_bodies {
-                if fn_name == "fn emit_pos_force_frame(" {
-                    continue;
-                }
+            let narrow_allowlist: Vec<(&str, &str)> = NARROW_EMITTER_CALLERS
+                .iter()
+                .map(|&(fn_sig, _, why)| (fn_sig, why))
+                .collect();
+            let (outside_narrow, narrow_bodies) =
+                partition_allowlisted_fns_compact(&prod, &narrow_allowlist);
+            for &(_, api, _) in NARROW_EMITTER_CALLERS {
                 assert_eq!(
-                    body.matches("emit_pos_force_frame(").count(),
+                    outside_narrow.matches(api).count(),
+                    0,
+                    "src/driver.rs calls {api} outside its explicit allow-list"
+                );
+            }
+            for (fn_name, body) in &narrow_bodies {
+                let &(_, api, _) = NARROW_EMITTER_CALLERS
+                    .iter()
+                    .find(|&&(sig, _, _)| sig == *fn_name)
+                    .unwrap_or_else(|| panic!("unexpected narrow allow-list entry {fn_name}"));
+                assert_eq!(
+                    body.matches(api).count(),
                     1,
-                    "allow-listed {fn_name} expected exactly 1 emit_pos_force_frame( call"
+                    "allow-listed {fn_name} expected exactly 1 {api} call"
+                );
+            }
+            // Partition `DamiaoArmDriver` vs the rest of `driver.rs` (trait default methods and
+            // other arm drivers) so `EMIT_TICK_ALLOWLIST` matches Damiao's unique trait impls and
+            // proves ZERO `pos_force_emitter::` calls exist anywhere outside Damiao.
+            let dm_impl_start = prod
+                .find("impl<C: CanTransport> DamiaoArmDriver<C>")
+                .expect("DamiaoArmDriver impl block");
+            let rs_impl_start = prod
+                .find("pub struct RobStrideArmDriver")
+                .expect("RobStrideArmDriver struct");
+            assert!(dm_impl_start < rs_impl_start);
+            let outside_dm_compact: String = format!("{}{}", &prod[..dm_impl_start], &prod[rs_impl_start..])
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            assert_eq!(
+                outside_dm_compact.matches("pos_force_emitter::").count(),
+                0,
+                "src/driver.rs must have ZERO pos_force_emitter:: calls outside DamiaoArmDriver"
+            );
+            let dm_prod = &prod[dm_impl_start..rs_impl_start];
+            const EMIT_TICK_ALLOWLIST: &[(&str, &str)] = &[
+                (
+                    "fn emit_pos_force_j7(",
+                    "ArmDriver trait entrypoint called once per tick from SupervisorInner tick epilogue (Legacy & RT Executor)",
+                ),
+                (
+                    "fn write_estop_hold_bounded(",
+                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
+                ),
+                (
+                    "fn write_joint_targets_bounded(",
+                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
+                ),
+                (
+                    "fn drain_pending_tx(",
+                    "Direct-driver fallback when external_pos_force_emitter == false (returns early when true)",
+                ),
+            ];
+            let (outside_emit_tick, emit_tick_bodies) =
+                partition_allowlisted_fns_compact(dm_prod, EMIT_TICK_ALLOWLIST);
+            assert_eq!(
+                outside_emit_tick.matches("pos_force_emitter::emit_tick(").count(),
+                0,
+                "src/driver.rs calls pos_force_emitter::emit_tick( outside its explicit allow-list"
+            );
+            for (fn_name, body) in emit_tick_bodies {
+                assert!(
+                    body.matches("pos_force_emitter::emit_tick(").count() >= 1,
+                    "allow-listed {fn_name} expected at least 1 pos_force_emitter::emit_tick( call"
                 );
             }
             continue;
