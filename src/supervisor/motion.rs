@@ -484,11 +484,19 @@ impl SupervisorInner {
                 // Cancel any in-flight enable through the reducer before protective thermal cut
                 // takes over, preserving the thermal latch (highest severity) and protective cut.
                 self.interrupt_enable_for_thermal();
+                let already_protective = matches!(
+                    self.active_disable_kind,
+                    Some(crate::driver::DisableKind::DisableProtective { .. })
+                );
                 let thermal_disable = crate::driver::DisableKind::DisableProtective {
                     reason: crate::driver::DisableProtectiveReason::Thermal,
                 };
                 self.active_disable_kind = Some(thermal_disable);
+                // T2: Upgrading from a user `DisableRequested` to `DisableProtective { Thermal }`
+                // MUST bypass the 250 ms retry throttle so the driver immediately switches to
+                // protective disable (never stuck on rest-pose-gated `DisableRequested`).
                 if !self.disable_pending
+                    || !already_protective
                     || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
                 {
                     if let Err(e) = self.request_disable_bounded(thermal_disable) {

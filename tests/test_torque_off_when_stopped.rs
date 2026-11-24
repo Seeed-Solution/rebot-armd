@@ -6256,3 +6256,238 @@ fn t1_thermal_checks_active_during_enabling_rt_and_legacy() {
         );
     }
 }
+
+/// Rule T2: A thermal trip must not discard a pending `Disable`.
+/// Verifies:
+/// 1. Broker submits `TransitionOp::TorqueOff` (in-flight `TorqueTransition::Disable`); `< 250 ms`
+///    later, over-temperature arrives on Step 2 (even while the arm drifts to a raised pose where
+///    `DisableRequested` retries would refuse): `ThermalTrip` latches, the 250 ms rate limit is
+///    bypassed, `DisableProtective` transmits immediately, `TorqueTransition::Disable` completes,
+///    and the broker receives `Reply::Terminal` **EXACTLY ONCE** (never dropped / never duplicated).
+/// 2. Thermal trip during a pending broker `Disable` when protective transmit fails with a bus
+///    error delivers **EXACTLY ONE** `Reply::Terminal` (`Outcome::Failed`) to the broker while
+///    keeping `disable_pending` + `DisableProtective` armed for background recovery once the bus
+///    recovers.
+#[test]
+fn t2_thermal_trip_upgrades_pending_disable_with_single_broker_terminal() {
+    use armd::rt_core::broker::{Outcome, Reply};
+    use armd::rt_core::ops::VirtualClock;
+
+    // 1. In-flight broker `TransitionOp::TorqueOff` interrupted < 250 ms later by over-temperature
+    //    at a raised pose: MUST NOT discard the pending Disable, MUST bypass the 250 ms throttle
+    //    to transmit `DisableProtective`, MUST confirm disable, and MUST deliver exactly 1 terminal.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let rest = ArmConfig::rebot_dm().resting_positions().to_vec();
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.enabled = true;
+                m.temperature_c = 35;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            max_temperature: 70.0,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        // Arm normally first.
+        inner.tick(0.02);
+        assert!(enable_torque_admitted(&mut inner).is_ok());
+        assert!(inner.is_torqued);
+
+        // Hold disable pending on the bus initially so `TorqueTransition::Disable` stays in flight.
+        bus.with(|s| {
+            for m in &mut s.motors {
+                m.drop_torque_frames = 1;
+            }
+        });
+
+        let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(201),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(clock.clone()),
+        );
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        let req_id = broker
+            .submit(
+                ClientId(1),
+                1,
+                auth,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOff),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert!(fx.core.torque_transition_pending(), "T2: Disable must be in flight");
+        assert!(fx.transition().is_some(), "T2: ReleaseEngine must hold installed Disable");
+
+        // Immediately (< 250 ms after DisableRequested started): arm drifts to a raised pose
+        // AND J2 hits 94 °C (> 70 °C). Also let subsequent disable writes succeed on the bus so
+        // DisableProtective confirms once transmitted.
+        bus.clear_log();
+        bus.with(|s| {
+            for m in &mut s.motors {
+                m.q = 0.50; // raised pose (rest-pose gate would refuse DisableRequested)
+                m.drop_torque_frames = 0;
+            }
+            s.motors[1].temperature_c = 94;
+            s.push_all_feedback();
+        });
+
+        let mut terminals = Vec::new();
+        for _ in 0..8 {
+            let _ = fx.step();
+            broker.poll(|_, r| {
+                if let Reply::Terminal { request, outcome, .. } = r {
+                    terminals.push((request, outcome));
+                }
+                true
+            });
+        }
+        assert!(
+            fx.core.safety.has_latched_fault_kind(armd::safety::FaultKind::ThermalTrip),
+            "T2: over-temperature during pending Disable must latch ThermalTrip"
+        );
+        assert!(
+            spec_count_damiao_disables(&bus) >= 7,
+            "T2: thermal upgrade must bypass 250 ms throttle and transmit DisableProtective at raised pose"
+        );
+        assert!(!fx.core.is_torqued, "T2: DisableProtective must confirm torque off");
+        assert!(!fx.core.disable_pending, "T2: disable_pending must clear after confirmation");
+        assert!(fx.transition().is_none(), "T2: ReleaseEngine must not retain orphaned transition");
+        assert_eq!(
+            terminals,
+            vec![(req_id, Outcome::Completed)],
+            "T2: broker request for pending Disable must receive terminal EXACTLY ONCE"
+        );
+    }
+
+    // 2. Thermal trip during a pending broker `Disable` while CAN TX returns errors:
+    //    broker receives EXACTLY ONE terminal (`Outcome::Failed`), `ThermalTrip` latches, and
+    //    `disable_pending` + `DisableProtective` remain armed so disable confirms once TX recovers.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let rest = ArmConfig::rebot_dm().resting_positions().to_vec();
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = rest[i];
+                m.enabled = true;
+                m.temperature_c = 35;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            max_temperature: 70.0,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.tick(0.02);
+        assert!(enable_torque_admitted(&mut inner).is_ok());
+
+        bus.with(|s| {
+            for m in &mut s.motors {
+                m.drop_torque_frames = 10;
+            }
+        });
+
+        let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(202),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(clock.clone()),
+        );
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        let req_id = broker
+            .submit(
+                ClientId(1),
+                2,
+                auth,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOff),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert!(fx.core.torque_transition_pending());
+
+        // Inject bus TX error + over-temperature on Step 2.
+        bus.with(|s| {
+            s.tx_error = true;
+            s.motors[0].temperature_c = 95;
+            s.push_all_feedback();
+        });
+        let mut terminals = Vec::new();
+        for _ in 0..3 {
+            let _ = fx.step();
+            broker.poll(|_, r| {
+                if let Reply::Terminal { request, outcome, .. } = r {
+                    terminals.push((request, outcome));
+                }
+                true
+            });
+        }
+        assert!(fx.core.safety.has_latched_fault_kind(armd::safety::FaultKind::ThermalTrip));
+        assert!(fx.core.disable_pending, "T2: protective disable must stay pending after TX error");
+        assert_eq!(
+            terminals.len(),
+            1,
+            "T2: broker must receive EXACTLY ONE terminal on thermal TX error, got {terminals:?}"
+        );
+        assert_eq!(terminals[0].0, req_id);
+        assert!(matches!(terminals[0].1, Outcome::Failed(_)));
+
+        // Restore CAN bus and advance past the 250 ms background retry cadence (wall-clock retry
+        // check on `last_disable_attempt`): clear `last_disable_attempt` to trigger background retry
+        // deterministically without sleeping, then step past the 20 ms settle window.
+        bus.clear_log();
+        bus.with(|s| {
+            s.tx_error = false;
+            for m in &mut s.motors {
+                m.drop_torque_frames = 0;
+                m.q = 0.50; // raised pose
+            }
+        });
+        fx.core.last_disable_attempt = None;
+        for _ in 0..6 {
+            let _ = fx.step();
+            broker.poll(|_, r| {
+                if let Reply::Terminal { request, outcome, .. } = r {
+                    terminals.push((request, outcome));
+                }
+                true
+            });
+        }
+        assert!(
+            spec_count_damiao_disables(&bus) >= 7,
+            "T2: background thermal DisableProtective retry must transmit at raised pose"
+        );
+        assert!(!fx.core.is_torqued && !fx.core.disable_pending, "T2: background protective disable must confirm");
+        assert_eq!(
+            terminals.len(),
+            1,
+            "T2: background thermal completion must NEVER emit a second broker terminal"
+        );
+    }
+}

@@ -1218,18 +1218,35 @@ impl SupervisorInner {
         &mut self,
         kind: crate::driver::DisableKind,
     ) -> Result<(), RequestDisableError> {
-        // a blocking disable (park, thermal trip, fault path) replaces a transition in flight
-        // (the driver's disable replaces its pending enable): that transition ends SUPERSEDED
-        if self.torque_transition.take().is_some() { self.core.begin_transition(Err("SUPERSEDED")); }
+        use crate::rt_core::ops::TorqueProgress as Rt;
+        // T2: Never silently discard a pending broker `Disable` transition when upgrading to
+        // protective disable (e.g. thermal trip). Non-disable transitions (such as an uncancelled
+        // `Enable`) end `SUPERSEDED`; a pending `Disable` stays attached to the upgraded driver
+        // disable handshake (or completes/fails here) so its broker request receives a terminal
+        // delivered exactly once.
+        let pending_disable = matches!(self.torque_transition, Some(TorqueTransition::Disable { .. }));
+        if !pending_disable && self.torque_transition.take().is_some() {
+            self.core.begin_transition(Err("SUPERSEDED"));
+        }
         self.active_disable_kind = Some(kind);
         self.disable_requested();
         if let Some(ref d) = self.driver {
-            let mut drv = d.lock().map_err(|_| RequestDisableError {
-                code: "FEEDBACK_UNAVAILABLE",
-                message: crate::safety::BoundedText::new("Feedback unavailable"),
-                refused_by_chokepoint: false,
-            })?;
+            let mut drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    if pending_disable {
+                        self.torque_transition = None;
+                        self.core.begin_transition(Err("FEEDBACK_UNAVAILABLE"));
+                    }
+                    return Err(RequestDisableError {
+                        code: "FEEDBACK_UNAVAILABLE",
+                        message: crate::safety::BoundedText::new("Feedback unavailable"),
+                        refused_by_chokepoint: false,
+                    });
+                }
+            };
             if self.rt_executor_owned {
+                let drv_now = drv.clock_now();
                 let res = match drv.begin_disable_torque_budgeted(kind, 0) {
                     Ok(p) => p,
                     Err(e) => {
@@ -1241,15 +1258,22 @@ impl SupervisorInner {
                         let mut message = crate::safety::BoundedText::empty();
                         message.push_str("Torque disable transmission failed: ");
                         e.write_bounded(&mut message);
-                        let code = crate::driver::handshake::rt_progress(false, Err(e))
-                            .err()
-                            .unwrap_or("HARDWARE_FAULT");
                         drop(drv);
-                        if refused {
-                            self.disable_pending = false;
-                            self.active_disable_kind = None;
-                            self.last_disable_attempt = None;
-                        }
+                        let code = if pending_disable {
+                            self.torque_transition = None;
+                            let code = self.disable_step_failed(e);
+                            self.core.begin_transition(Err(code));
+                            code
+                        } else {
+                            if refused {
+                                self.disable_pending = false;
+                                self.active_disable_kind = None;
+                                self.last_disable_attempt = None;
+                            }
+                            crate::driver::handshake::rt_progress(false, Err(e))
+                                .err()
+                                .unwrap_or("HARDWARE_FAULT")
+                        };
                         return Err(RequestDisableError {
                             code,
                             message,
@@ -1257,13 +1281,29 @@ impl SupervisorInner {
                         });
                     }
                 };
-                let confirmed_now = matches!(res, crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
-                    && DisableConfirm::confirmed(&**drv);
+                let confirmed_now = matches!(
+                    res,
+                    crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
+                ) && DisableConfirm::confirmed(&**drv);
+                let done_unconfirmed = matches!(res, crate::driver::TorqueProgress::Done(_)) && !confirmed_now;
                 drop(drv);
                 if confirmed_now {
                     self.disable_confirmed();
+                    if pending_disable {
+                        self.torque_transition = None;
+                        let terminal = self
+                            .torque_off_finish_in_place()
+                            .map(|()| Rt::Done)
+                            .map_err(|e| torque_error_code(&e));
+                        self.core.begin_transition(terminal);
+                    }
                 } else {
                     self.is_torqued = true;
+                    if pending_disable {
+                        self.torque_transition = Some(TorqueTransition::Disable {
+                            confirm: done_unconfirmed.then(|| DisableConfirm::start(drv_now)),
+                        });
+                    }
                 }
                 return Ok(());
             }
@@ -1276,15 +1316,22 @@ impl SupervisorInner {
                 let mut message = crate::safety::BoundedText::empty();
                 message.push_str("Torque disable transmission failed: ");
                 e.write_bounded(&mut message);
-                let code = crate::driver::handshake::rt_progress(false, Err(e))
-                    .err()
-                    .unwrap_or("HARDWARE_FAULT");
                 drop(drv);
-                if refused {
-                    self.disable_pending = false;
-                    self.active_disable_kind = None;
-                    self.last_disable_attempt = None;
-                }
+                let code = if pending_disable {
+                    self.torque_transition = None;
+                    let code = self.disable_step_failed(e);
+                    self.core.begin_transition(Err(code));
+                    code
+                } else {
+                    if refused {
+                        self.disable_pending = false;
+                        self.active_disable_kind = None;
+                        self.last_disable_attempt = None;
+                    }
+                    crate::driver::handshake::rt_progress(false, Err(e))
+                        .err()
+                        .unwrap_or("HARDWARE_FAULT")
+                };
                 return Err(RequestDisableError {
                     code,
                     message,
@@ -1296,6 +1343,11 @@ impl SupervisorInner {
                 drv.clock_pause(DISABLE_CONFIRM_SERVICE);
             }
             if !DisableConfirm::confirmed(&**drv) {
+                drop(drv);
+                if pending_disable {
+                    self.torque_transition = None;
+                    self.core.begin_transition(Err("FEEDBACK_UNCONFIRMED"));
+                }
                 return Err(RequestDisableError {
                     code: "FEEDBACK_UNCONFIRMED",
                     message: crate::safety::BoundedText::new(
@@ -1306,6 +1358,14 @@ impl SupervisorInner {
             }
         }
         self.disable_confirmed();
+        if pending_disable {
+            self.torque_transition = None;
+            let terminal = self
+                .torque_off_finish_in_place()
+                .map(|()| Rt::Done)
+                .map_err(|e| torque_error_code(&e));
+            self.core.begin_transition(terminal);
+        }
         Ok(())
     }
 
@@ -2002,6 +2062,9 @@ impl SupervisorInner {
     /// status (while `ThermalTrip` retains highest display precedence), and ends any pending RT
     /// `TorqueOn` command with `THERMAL_TRIP` before thermal protection starts `DisableProtective`.
     pub(crate) fn interrupt_enable_for_thermal(&mut self) {
+        if !matches!(self.torque_transition, Some(TorqueTransition::Enable(_))) {
+            return;
+        }
         let Some(TorqueTransition::Enable(reducer)) = self.torque_transition.take() else {
             return;
         };
