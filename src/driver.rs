@@ -8823,16 +8823,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// A failed or abandoned enable: the arm needs a full rearm.
-    /// L2: preserves `pos_force_verified` whenever J7 has already passed causal `RID_CTRL_MODE`
-    /// readback (`verified_modes[pf.joint] == Some(PosForce)`), so `FailedHold` continues to hold
-    /// J7 through the single J7 emitter without clearing causal verification.
+    /// L2: leaves `pos_force_verified` untouched — if enable failed before `finish_pos_force_readback`
+    /// succeeded, `readback_or_enable` already cleared it to `false` (leaving capped operation
+    /// unavailable); if enable failed after `finish_pos_force_readback` causally verified J7 and
+    /// emitted its pre-enable hold, `pos_force_verified` stays `true` so `FailedHold` keeps holding
+    /// J7 through the single J7 emitter.
     fn enable_failed(&mut self) {
         self.is_enabling = false;
         self.is_enabled = false;
         self.pending_rearm = true;
-        self.pos_force_verified = self.pos_force.as_ref().is_some_and(|pf| {
-            self.verified_modes.get(pf.joint).copied().flatten() == Some(DamiaoControlMode::PosForce)
-        });
         self.refresh_capture = None;
         self.enable_stop_stamp = None;
     }
