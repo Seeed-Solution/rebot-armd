@@ -124,6 +124,9 @@ impl ZeroOffsetDriver {
 impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn all_motors_confirmed_off_after_enable_writes(&self) -> bool {
+        self.inner.all_motors_confirmed_off_after_enable_writes()
+    }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
     fn feedback_instants(&self) -> Vec<Option<Instant>> { self.inner.feedback_instants() }
     fn feedback_seqs(&self) -> Vec<u64> { self.inner.feedback_seqs() }

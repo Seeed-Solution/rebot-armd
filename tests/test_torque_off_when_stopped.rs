@@ -2567,6 +2567,9 @@ fn partial_enable_at_raised_pose_then_enable_error_refuses_rollback_holds_and_la
         fn enable_state(&self) -> EnableState {
             self.inner.enable_state()
         }
+        fn all_motors_confirmed_off_after_enable_writes(&self) -> bool {
+            self.inner.all_motors_confirmed_off_after_enable_writes()
+        }
         fn has_any_joint_enabled(&self) -> bool {
             self.inner.has_any_joint_enabled()
         }
@@ -2941,4 +2944,202 @@ fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off
         actual, expected,
         "ONLY thermal trip and process-exit/panic paths may construct DisableProtective; found: {protective_constructions:#?}"
     );
+}
+
+/// Round 6 (Decision 2): `enable_state()` and `SupervisorInner::sync_torque_state_after_stop()`
+/// share ONE helper and NEVER conclude "torque off, stop holding" from feedback received before
+/// ANY motor's latest enable write (including deferred and retried enable writes).
+#[test]
+fn stopped_reconciliation_never_trusts_pre_write_off_feedback_after_deferred_or_retried_enable() {
+    use armd::driver::{TorqueProgress, TxBudget};
+
+    // Case A: Deferred enable write (TX budget = 1 frame/tick) moves motor 2's boundary.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        // Limit TX to 1 frame per tick so motors 2..7 are deferred past tick 1.
+        dm.set_tx_budget(TxBudget {
+            max_frames: 1,
+            max_duration: Duration::from_millis(10),
+            ..TxBudget::default()
+        });
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            s.rx.clear();
+            s.pending.clear();
+            for m in &mut s.motors {
+                m.q = 0.40;
+                m.enabled = false;
+                m.drop_torque_frames = 10; // keep motors reporting 0x0 on enable frames
+            }
+            s.push_all_feedback();
+        });
+        dm.read_joint_states().unwrap();
+
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(dm));
+        inner.lease_enabled = false;
+
+        // Tick 1: begin_torque(true) sends CMD_ENABLE to motor 1 only; motors 2..7 deferred.
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            assert!(matches!(
+                drv.begin_torque(true).unwrap(),
+                TorqueProgress::Pending { .. }
+            ));
+        }
+
+        // All 7 motors report fresh 0x0 BEFORE motor 2's deferred CMD_ENABLE transmits!
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| s.push_all_feedback());
+
+        // Tick 2: poll_torque drains those 0x0 replies, then sends deferred CMD_ENABLE to motor 2.
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let dl = clock.now() + Duration::from_millis(5);
+            assert!(matches!(
+                drv.poll_torque(dl).unwrap(),
+                TorqueProgress::Pending { .. }
+            ));
+            // Abort enable + drop budget back to normal so hold targets can transmit cleanly.
+            drv.abort_enable();
+        }
+        // Simulate E-stop with torque on (arm holding at raised pose) right after motor 2's deferred write.
+        inner.is_torqued = true;
+        inner.disable_pending = false;
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+        // `sync_torque_state_after_stop()` runs inside `tick()`: motor 2 only has PRE-write 0x0,
+        // so enable_state MUST be Unknown and `is_torqued` MUST stay true (arm keeps holding!).
+        {
+            let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            assert_eq!(drv.enable_state(), EnableState::Unknown);
+            assert!(!drv.all_motors_confirmed_off_after_enable_writes());
+        }
+        bus.clear_log();
+        inner.tick(0.02);
+        assert!(
+            inner.is_torqued,
+            "sync_torque_state_after_stop MUST NOT drop holding from pre-deferred-write 0x0"
+        );
+        assert!(
+            bus.tx_log().iter().any(|f| f.id >= 0x101 && f.id <= 0x107),
+            "arm must keep transmitting hold targets while motor 2's enable write is unconfirmed"
+        );
+
+        // Now push a fresh post-write 0x0 reply from motor 2 (all other motors already had post-write 0x0):
+        // reconciliation now sees EVERY motor off strictly after its last enable write!
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| {
+            s.motors[1].enabled = false;
+            s.push_feedback(1);
+        });
+        inner.tick(0.02);
+        {
+            let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            assert!(drv.all_motors_confirmed_off_after_enable_writes());
+            assert_eq!(drv.enable_state(), EnableState::Disabled);
+        }
+        assert!(
+            !inner.is_torqued,
+            "once every motor reports 0x0 strictly after its last enable write, reconciliation sets is_torqued=false"
+        );
+    }
+
+    // Case B: Retried enable write (`Service::Retry` at +25 ms) moves write boundary for all unconfirmed motors.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            s.rx.clear();
+            s.pending.clear();
+            for m in &mut s.motors {
+                m.q = 0.40;
+                m.enabled = false;
+                m.drop_torque_frames = 10;
+            }
+            s.push_all_feedback();
+        });
+        dm.read_joint_states().unwrap();
+
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(dm));
+        inner.lease_enabled = false;
+
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            assert!(matches!(
+                drv.begin_torque(true).unwrap(),
+                TorqueProgress::Pending { .. }
+            ));
+        }
+        // At +20 ms, all 7 motors reply 0x0 (after initial write, BEFORE +25 ms retry).
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let dl = clock.now() + Duration::from_millis(5);
+            assert!(matches!(drv.poll_torque(dl).unwrap(), TorqueProgress::Pending { .. }));
+        }
+        // At +30 ms, poll_torque retries CMD_ENABLE to all 7 motors (updating every motor's boundary!).
+        clock.advance(Duration::from_millis(10));
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let dl = clock.now() + Duration::from_millis(5);
+            assert!(matches!(drv.poll_torque(dl).unwrap(), TorqueProgress::Pending { .. }));
+            drv.abort_enable();
+        }
+        inner.is_torqued = true;
+        inner.disable_pending = false;
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+        // Even if motors 1..6 emit fresh post-retry 0x0 while motor 7 still has ONLY pre-retry 0x0:
+        // enable_state MUST stay Unknown and `sync_torque_state_after_stop()` MUST keep holding!
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| {
+            for j in 0..6 {
+                s.push_feedback(j);
+            }
+        });
+        inner.tick(0.02);
+        {
+            let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            assert_eq!(drv.enable_state(), EnableState::Unknown);
+            assert!(!drv.all_motors_confirmed_off_after_enable_writes());
+        }
+        assert!(
+            inner.is_torqued,
+            "pre-retry 0x0 on motor 7 must prevent stopped reconciliation from dropping holding"
+        );
+
+        // Once motor 7 ALSO emits post-retry 0x0 -> reconciliation sets is_torqued = false!
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| s.push_feedback(6));
+        inner.tick(0.02);
+        {
+            let drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            assert!(drv.all_motors_confirmed_off_after_enable_writes());
+            assert_eq!(drv.enable_state(), EnableState::Disabled);
+        }
+        assert!(!inner.is_torqued);
+    }
 }

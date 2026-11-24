@@ -2063,20 +2063,20 @@ impl SupervisorInner {
         }
     }
 
-    /// In Fault / EStop with torque on: fresh feedback from every motor reporting Disabled
-    /// (Damiao: all fresh 0xCC / feedback states 0) means the motors lost torque, e.g. a
-    /// motor power reset during a bus loss (real arm, 2026-11-12: all seven motors came
-    /// back Disabled after BusLoss and armd kept `is_torqued: true`). armd then records
-    /// torque off (`is_torqued` false, re-arm needs the full enable handshake) and keeps the
-    /// Fault until `clear_fault`. Not applied during gravity compensation (its exit path
-    /// owns the motor modes) or while a disable is pending.
+    /// In Fault / EStop with torque on: fresh feedback from EVERY motor reporting Disabled
+    /// strictly after that motor's last enable write (consulted through the single shared
+    /// [`crate::driver::ArmDriver::all_motors_confirmed_off_after_enable_writes`] helper also
+    /// used by `enable_state()`) means the motors lost torque, e.g. a motor power reset during
+    /// a bus loss (real arm, 2026-11-12: all seven motors came back Disabled after BusLoss and
+    /// armd kept `is_torqued: true`). Otherwise fails closed and keeps holding. Not applied
+    /// during gravity compensation (its exit path owns the motor modes) or while a disable is
+    /// pending.
     pub(super) fn sync_torque_state_after_stop(&mut self) {
         if !self.is_torqued || self.disable_pending || self.gravity_comp.is_some() || !self.safety.state().is_stopped() {
             return;
         }
         let Some(d) = self.driver.as_ref() else { return; };
-        let off = d.lock().is_ok_and(|drv| drv.capabilities().enable_feedback && drv.is_feedback_valid()
-            && drv.enable_state() == EnableState::Disabled);
+        let off = d.lock().is_ok_and(|drv| drv.all_motors_confirmed_off_after_enable_writes());
         if !off || !self.hardware_feedback_fresh(Duration::from_millis(250)) { return; }
         if let Ok(mut drv) = d.lock() { drv.set_torque_flag(false); }
         tracing::warn!("Motors report Disabled with fresh feedback in {:?}: torque is off (is_torqued = false); the fault stays latched until clear_fault",

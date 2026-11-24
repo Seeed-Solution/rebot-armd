@@ -532,6 +532,17 @@ pub trait ArmDriver: Send {
 
     fn enable_state(&self) -> EnableState { EnableState::Unknown }
 
+    /// Single authoritative torque-off reconciliation helper consulted by BOTH
+    /// [`Self::enable_state`] and `SupervisorInner::sync_torque_state_after_stop`: returns
+    /// `true` ONLY when this driver reports enable feedback and fresh feedback from EVERY motor
+    /// proves torque is off strictly after that motor's last enable write (including deferred
+    /// and retried writes). Fails closed (`false`) otherwise so the arm keeps holding.
+    fn all_motors_confirmed_off_after_enable_writes(&self) -> bool {
+        self.capabilities().enable_feedback
+            && self.is_feedback_valid()
+            && self.enable_state() == EnableState::Disabled
+    }
+
     /// Age of the last received sample for each joint. Reading a cache does not refresh it.
     fn feedback_ages(&self) -> Vec<Option<Duration>> { Vec::new() }
 
@@ -7303,6 +7314,34 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake: poll_start })
     }
 
+    /// True when joint `i`'s latest decoded feedback arrived strictly after the RX sequence
+    /// snapshot recorded right after that motor's most recent `CMD_ENABLE` `can.transmit()`
+    /// returned (including deferred and retried enable writes).
+    #[inline]
+    fn motor_feedback_after_enable_write(&self, i: usize) -> bool {
+        self.last_enable_write_seq
+            .get(i)
+            .copied()
+            .flatten()
+            .is_none_or(|seq| self.last_feedback_seq.get(i).copied().unwrap_or(0) > seq)
+    }
+
+    /// Single authoritative post-enable-write off-reconciliation helper consulted by BOTH
+    /// [`ArmDriver::enable_state`] and [`ArmDriver::all_motors_confirmed_off_after_enable_writes`]
+    /// (called by `SupervisorInner::sync_torque_state_after_stop`). Returns `true` ONLY when
+    /// EVERY motor reported `state == 0` in fresh feedback received strictly after both the
+    /// handshake boundary and that motor's own latest `CMD_ENABLE` write; fails closed otherwise.
+    fn all_motors_confirmed_off_after_enable_writes_inner(&self) -> bool {
+        if self.awaiting_rx_boundary || self.motor_status.is_empty() || !self.is_feedback_valid() {
+            return false;
+        }
+        (0..self.motor_ids.len()).all(|i| {
+            self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+                && self.motor_feedback_after_enable_write(i)
+                && self.motor_status[i] == 0
+        })
+    }
+
     /// Single per-motor post-command feedback boundary shared by [`Self::enable_state`],
     /// [`Self::fresh_state_mask`] (`poll_enable`/`poll_disable`), MIT recovery, TIMEOUT
     /// commissioning, and `set_zero_position`.
@@ -7664,6 +7703,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    fn all_motors_confirmed_off_after_enable_writes(&self) -> bool {
+        self.all_motors_confirmed_off_after_enable_writes_inner()
+    }
+
     fn enable_state(&self) -> EnableState {
         if self.awaiting_rx_boundary || self.motor_status.is_empty() {
             return EnableState::Unknown;
@@ -7671,28 +7714,31 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // A disable confirmed by post-command feedback is sticky for shutdown: `enable_state()`
         // stays `Disabled` until a later enable request (or non-zero motor feedback) arrives,
         // even when no newer polls can be sent (e.g. after an unacknowledged MIT fence trip).
+        // Still require every motor's feedback to be strictly after its last enable write.
         if self.disable_confirmed_sticky
             && !self.is_enabled
             && !self.is_enabling
-            && self.motor_status.iter().all(|&state| state == 0)
+            && (0..self.motor_ids.len()).all(|i| {
+                self.motor_feedback_after_enable_write(i) && self.motor_status[i] == 0
+            })
         {
+            return EnableState::Disabled;
+        }
+        // Concluding `Disabled` goes through the ONE shared post-enable-write helper so neither
+        // `enable_state()` nor `sync_torque_state_after_stop()` can ever trust pre-write 0x0.
+        if self.all_motors_confirmed_off_after_enable_writes_inner() {
             return EnableState::Disabled;
         }
         if !self.is_feedback_valid() {
             return EnableState::Unknown;
         }
-        // Every motor must have reported current feedback since startup, and (once an enable or
-        // disable request has been issued) strictly after that request using the exact same
-        // per-motor boundary as `fresh_state_mask`. Initial zeroed `motor_status`, pre-command
-        // samples, or stale feedback after CAN silence never prove `Disabled`.
-        if (0..self.motor_ids.len()).any(|i| {
-            !self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-        }) {
-            return EnableState::Unknown;
-        }
-        if self.motor_status.iter().all(|&state| state == 0) {
-            EnableState::Disabled
-        } else if self.is_enabled && self.motor_status.iter().all(|&state| state == 1) {
+        if self.is_enabled
+            && (0..self.motor_ids.len()).all(|i| {
+                self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+                    && self.motor_feedback_after_enable_write(i)
+                    && self.motor_status[i] == 1
+            })
+        {
             EnableState::Enabled
         } else {
             EnableState::Unknown
@@ -7725,12 +7771,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         let all_known_non_fault = (0..self.motor_ids.len()).all(|i| {
             self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-                && self
-                    .last_enable_write_seq
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .is_none_or(|seq| self.last_feedback_seq.get(i).copied().unwrap_or(0) > seq)
+                && self.motor_feedback_after_enable_write(i)
                 && (self.motor_status[i] == 0 || self.motor_status[i] == 1)
         });
         all_known_non_fault
@@ -9565,13 +9606,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.last_command_was_disable
             && !self.is_enabled
             && !self.is_enabling
-            && !self.awaiting_rx_boundary
-            && !self.motor_status.is_empty()
-            && self.is_feedback_valid()
-            && (0..self.motor_ids.len()).all(|i| {
-                self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-                    && self.motor_status[i] == 0
-            })
+            && self.all_motors_confirmed_off_after_enable_writes_inner()
         {
             self.disable_confirmed_sticky = true;
         }
@@ -10940,6 +10975,104 @@ mod tx_chokepoint_tests {
             })
             .is_ok());
         assert_eq!(bus.tx_len(), 1);
+    }
+
+    #[test]
+    fn deferred_and_retried_enable_write_keeps_enable_state_unknown_until_post_write_off_feedback() {
+        let limits = damiao::DamiaoLimits::default();
+
+        // Part 1: Deferred enable write (TX budget = 1 frame/tick) moves motor 2's write boundary.
+        let (bus, clock) = TestBus::new();
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3])
+            .with_joint_limits(vec![limits; 3])
+            .unwrap();
+        drv.set_tx_budget(TxBudget {
+            max_frames: 1,
+            max_duration: Duration::from_millis(10),
+            ..TxBudget::default()
+        });
+        drv.read_joint_states().unwrap();
+        for id in 1..=3 {
+            bus.push_feedback(id, 0.50, 0x0, &limits);
+        }
+        drv.read_joint_states().unwrap();
+        assert_eq!(drv.enable_state(), EnableState::Disabled);
+        assert!(drv.all_motors_confirmed_off_after_enable_writes());
+
+        // Tick 1: CMD_ENABLE sent to motor 1 only; motors 2 & 3 deferred.
+        bus.clear_tx();
+        assert!(matches!(drv.begin_torque(true).unwrap(), TorqueProgress::Pending { .. }));
+        assert_eq!(bus.tx_len(), 1);
+
+        // Fresh 0x0 feedback arrives for ALL 3 motors BEFORE motor 2's deferred enable write!
+        clock.advance(Duration::from_millis(5));
+        for id in 1..=3 {
+            bus.push_feedback(id, 0.50, 0x0, &limits);
+        }
+        // Tick 2: poll_torque drains the 0x0 feedback for motors 1..3, THEN transmits the deferred
+        // CMD_ENABLE to motor 2 (updating last_enable_write_seq[1] right after transmit returns).
+        bus.clear_tx();
+        let dl = clock.now() + Duration::from_millis(5);
+        assert!(matches!(drv.poll_torque(dl).unwrap(), TorqueProgress::Pending { .. }));
+        assert_eq!(bus.tx_len(), 1, "deferred CMD_ENABLE sent to motor 2");
+
+        // Abort enable (as on E-stop/Fault): ALL 3 motors have fresh 0x0 after `send_enable()`,
+        // EXCEPT motor 2's 0x0 arrived BEFORE motor 2's deferred CMD_ENABLE -> MUST be Unknown!
+        drv.abort_enable();
+        assert_eq!(
+            drv.enable_state(),
+            EnableState::Unknown,
+            "pre-write 0x0 before deferred CMD_ENABLE must NOT prove Disabled"
+        );
+        assert!(
+            !drv.all_motors_confirmed_off_after_enable_writes(),
+            "shared reconciliation helper must return false while motor 2 lacks post-write 0x0"
+        );
+
+        // Once motor 2 emits a NEW 0x0 strictly after its deferred CMD_ENABLE write, BOTH agree Disabled!
+        clock.advance(Duration::from_millis(5));
+        bus.push_feedback(2, 0.50, 0x0, &limits);
+        drv.read_joint_states().unwrap();
+        assert!(drv.all_motors_confirmed_off_after_enable_writes());
+        assert_eq!(drv.enable_state(), EnableState::Disabled);
+
+        // Part 2: Retried enable write (`Service::Retry` at +25 ms) ALSO moves motor 2's boundary!
+        let (bus_r, clock_r) = TestBus::new();
+        let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2])
+            .with_joint_limits(vec![limits; 2])
+            .unwrap();
+        drv_r.read_joint_states().unwrap();
+        bus_r.push_feedback(1, 0.50, 0x0, &limits);
+        bus_r.push_feedback(2, 0.50, 0x0, &limits);
+        drv_r.read_joint_states().unwrap();
+        assert!(matches!(drv_r.begin_torque(true).unwrap(), TorqueProgress::Pending { .. }));
+        // Both motors reply 0x0 at +20 ms (after initial write, BEFORE the 25 ms retry).
+        clock_r.advance(Duration::from_millis(20));
+        bus_r.push_feedback(1, 0.50, 0x0, &limits);
+        bus_r.push_feedback(2, 0.50, 0x0, &limits);
+        let dl1 = clock_r.now() + Duration::from_millis(5);
+        assert!(matches!(drv_r.poll_torque(dl1).unwrap(), TorqueProgress::Pending { .. }));
+        // At +30 ms, poll_torque retries CMD_ENABLE to motors 1 & 2, moving both write boundaries!
+        clock_r.advance(Duration::from_millis(10));
+        bus_r.clear_tx();
+        let dl2 = clock_r.now() + Duration::from_millis(5);
+        assert!(matches!(drv_r.poll_torque(dl2).unwrap(), TorqueProgress::Pending { .. }));
+        assert_eq!(bus_r.tx_len(), 2, "retried CMD_ENABLE sent to both motors");
+        drv_r.abort_enable();
+
+        // Even if motor 1 reports post-retry 0x0, motor 2 still has only pre-retry 0x0 -> Unknown!
+        clock_r.advance(Duration::from_millis(5));
+        bus_r.push_feedback(1, 0.50, 0x0, &limits);
+        drv_r.read_joint_states().unwrap();
+        assert_eq!(drv_r.enable_state(), EnableState::Unknown);
+        assert!(!drv_r.all_motors_confirmed_off_after_enable_writes());
+
+        // Once motor 2 ALSO reports post-retry 0x0 -> Disabled!
+        clock_r.advance(Duration::from_millis(5));
+        bus_r.push_feedback(2, 0.50, 0x0, &limits);
+        drv_r.read_joint_states().unwrap();
+        assert!(drv_r.all_motors_confirmed_off_after_enable_writes());
+        assert_eq!(drv_r.enable_state(), EnableState::Disabled);
     }
 
     #[test]
