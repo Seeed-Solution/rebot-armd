@@ -157,20 +157,20 @@ pub fn all_scenarios() -> Vec<ScenarioSpec> {
     // 06: presets all variants
     out.push(ScenarioSpec {
         id: "06_presets_all_variants", family: "presets",
-        description: "preset home, park, unload, custom jog with positions + speed_scale, missing positions reject",
+        description: "preset park (NOT_ARMED), custom jog with positions + speed_scale, home, missing positions reject, unload armed",
         setup: dm_setup(),
         steps: [
             vec![conn("c0")],
             acquire("c0", "ctrl", 1),
+            vec![
+                send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"park"})), expect("c0", 1),
+            ],
             torque_on("c0", 1),
             vec![
                 send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"custom","positions":[0.05,0.0,0.0,0.0,0.0,0.0,0.0],"speed_scale":0.8})), expect_act("c0", "p1"), terminal("c0", Some("p1")),
                 send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"home"})), expect_act("c0", "p2"), terminal("c0", Some("p2")),
-                send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"park"})), expect_act("c0", "p3"),
-                terminal("c0", Some("p3")),
-                cmd("c0", 2, "/api/v1/torque", json!({"enable":true})), expect("c0", 1),
-                send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"unload"})), expect("c0", 1),
                 send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"bad_custom"})), expect("c0", 1),
+                send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"unload"})), expect("c0", 1),
                 close_client("c0"),
             ],
         ].concat(),
