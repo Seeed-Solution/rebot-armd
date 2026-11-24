@@ -43,12 +43,32 @@ loop, 20 Hz `GET /observation`):
 - `DEFAULT_PRIORITY` in `src/rt_core/sched.rs` stays `45` until stage-3 step-1 lands and
   bus-service starvation under combined CAN, SD/eMMC, and USB gadget load is verified on device;
   use `ARMD_RT_PRIORITY=50` for on-device qualification A/B runs.
-- Bounded per-tick CAN TX (`src/driver.rs`, `TxBudget`: default 16 attempts, 5 ms start-cutoff,
-  45 ms inclusive queued-frame expiry) removes the 3 × 100 µs `WouldBlock` retry sleeps, maps
-  SocketCAN `ENOBUFS` to `TransportError::NoBufferSpace`, keeps MIT partial-batch / preflight /
-  flush failures fail-closed (tripping the fence and clearing cached frames), and exposes per-frame
-  wall and `CLOCK_THREAD_CPUTIME_ID` timing plus queue-pressure counters in
+- Bounded per-tick CAN TX (`src/driver.rs`, `TxBudget`: default 16 attempts, 10 ms start-cutoff
+  overridable via profile `tx_budget_ms`, 45 ms inclusive queued-frame expiry) removes the
+  3 × 100 µs `WouldBlock` retry sleeps, maps SocketCAN `ENOBUFS` to `TransportError::NoBufferSpace`,
+  treats bounded deferral as carry-over on both legacy and RT executor owners (latching
+  `CAN_TX_STALLED` only on 45 ms expiry or consecutive deferred ticks), keeps MIT partial-batch /
+  preflight / flush failures fail-closed (tripping the fence and clearing cached frames), and
+  exposes per-frame wall and `CLOCK_THREAD_CPUTIME_ID` timing plus queue-pressure counters in
   `GET /api/v1/diagnostics/tick` (`tx.*`, `max_tx`, and `tx_*` fields on `max_tick` / `max_lock`).
+
+### Measured B601-DM TX budget sizing (2026-11-24)
+
+Run `qual-smoke-20261124T000133Z` (`1.6.0-dev11` / `df7487d`, SG2002 B601-DM, `can0` `mcp251xfd`
+over SPI at 1 Mbit/s, `SCHED_FIFO` 45, ERROR-ACTIVE, `berr 0/0`, `bus-off 0`):
+
+| Metric | p50 | p99 | max | Notes |
+|---|---:|---:|---:|---|
+| `tx_us` (TX phase) | 3.915 ms | 8.123 ms | 13.383 ms | 7-motor SPI CAN under `SCHED_FIFO` 45 |
+| `tx.send_us` (1000-tick window) | 3.622 ms | 7.763 ms | 13.184 ms | `send_cpu_us`: p50 0.593 / p99 0.757 / max 1.259 ms |
+| `tx.frame_max_us` | 1.058 ms | 6.104 ms | 11.554 ms | `max_tick`: 7 frames in 3.114 ms (`frame_max_us` 0.994 ms) |
+
+With the earlier 5 ms start-cutoff, healthy 7-motor + refresh batches tripped `TxDeferred` 6 s into
+the load run during `home`, followed by 174 repeated hold write errors in Fault. Raising the default
+start-cutoff (`DAMIAO_TX_MAX_DURATION` and `rebot-b601dm.json` `tx_budget_ms`) to **10 ms** (keeping
+`DAMIAO_TX_MAX_FRAMES = 16` and `DAMIAO_TX_FRAME_MAX_AGE = 45 ms`) covers 7 target frames plus 1
+refresh at ~1 ms/frame (~8 ms) with margin inside the 20 ms release period; isolated >10 ms SPI
+tails defer cleanly to the next tick instead of faulting.
 
 ## What armd enforces
 

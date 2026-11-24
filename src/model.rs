@@ -1403,6 +1403,9 @@ pub struct ArmConfig {
     /// POS_VEL base mode without being reported (profiles from before this field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damiao_gripper: Option<DamiaoGripperDrive>,
+    /// Per-tick Damiao CAN TX start-cutoff budget (ms); None uses `DAMIAO_TX_MAX_DURATION` (10 ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_budget_ms: Option<u64>,
     /// Maximum consecutive control ticks with a pending CAN TX deferral before latching
     /// `CAN_TX_STALLED`. None defaults to `ceil(45 ms / period)` (3 ticks at 50 Hz).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1555,6 +1558,7 @@ impl Default for ArmConfig {
             joint_tracking: None,
             damiao_ranges: None,
             damiao_gripper: None,
+            tx_budget_ms: None,
             tx_stall_ticks: None,
             speed_cap: None,
             backlash_approach: None,
@@ -1592,6 +1596,17 @@ impl ArmConfig {
             let hz = u64::from(self.control_frequency_hz.max(1));
             ((45u64.saturating_mul(hz).saturating_add(999)) / 1000).max(1) as u32
         })
+    }
+
+    /// Damiao per-tick CAN TX budget derived from this profile (`tx_budget_ms` overrides
+    /// `DAMIAO_TX_MAX_DURATION`; `max_frames = 16`, `frame_max_age = 45 ms`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn damiao_tx_budget(&self) -> crate::driver::TxBudget {
+        let mut budget = crate::driver::TxBudget::default();
+        if let Some(ms) = self.tx_budget_ms {
+            budget.max_duration = std::time::Duration::from_millis(ms);
+        }
+        budget
     }
 
     /// Convert an `end_link` pose into the active TCP pose (`p_tcp = p_end + R_end * tcp_offset`).
@@ -1954,6 +1969,13 @@ impl ArmConfig {
             || self.following_error.persistence_ms == 0
             || self.max_jerk.is_some_and(|j| !j.is_finite() || j <= 0.0) {
             return Err("Invalid control, temperature, following-error or jerk configuration".into());
+        }
+        if let Some(ms) = self.tx_budget_ms {
+            let period_ms = (1000 / u64::from(self.control_frequency_hz.max(1))).max(1);
+            let max_ms = period_ms.min(45);
+            if ms == 0 || ms > max_ms {
+                return Err(format!("tx_budget_ms must be in 1..={max_ms} (control period {period_ms} ms, frame max age 45 ms)"));
+            }
         }
         if self.tx_stall_ticks == Some(0) {
             return Err("tx_stall_ticks must be >= 1".into());
@@ -2335,6 +2357,7 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             damiao_gripper: Some(DamiaoGripperDrive::rebot_dm()),
+            tx_budget_ms: Some(10),
             tx_stall_ticks: None,
             speed_cap: None,
             // J1 backlash 0.28-0.30 deg (camera, real arm 2026-11-18): every saved-pose move and the

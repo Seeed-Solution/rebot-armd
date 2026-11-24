@@ -251,7 +251,22 @@ pub enum TxBatchOutcome {
 pub const DAMIAO_TX_MAX_FRAMES: usize = 16;
 /// Default cutoff elapsed time for starting new CAN transmit attempts in one tick. An in-flight
 /// `transmit()` or `flush()` started before this cutoff may complete after it.
-pub const DAMIAO_TX_MAX_DURATION: Duration = Duration::from_millis(5);
+///
+/// Sized from real SG2002 B601-DM measurements (`qual-smoke-20261124T000133Z`, `1.6.0-dev11` /
+/// `df7487d`, `can0` `mcp251xfd` over SPI at 1 Mbit/s, `SCHED_FIFO` 45, ERROR-ACTIVE, `berr 0/0`,
+/// `bus-off 0`):
+/// - `tx_us`: p50 3.915 ms, p99 8.123 ms, max 13.383 ms
+/// - `tx.send_us` (1000-tick window): p50 3.622 ms, p99 7.763 ms, max 13.184 ms
+///   (`send_cpu_us`: p50 0.593 ms, p99 0.757 ms, max 1.259 ms)
+/// - `tx.frame_max_us`: p50 1.058 ms, p99 6.104 ms, max 11.554 ms
+/// - `max_tick`: 7 target frames in `tx_send_us` 3.114 ms (`tx_frame_max_us` 0.994 ms)
+///
+/// The previous 5 ms cutoff deferred healthy 7-motor + refresh batches under normal SPI
+/// preemption (`SCHED_FIFO` 45 vs SPI IRQ 50). 10 ms covers 7 target frames plus 1 refresh at
+/// ~1 ms/frame (~8 ms) with margin inside the 20 ms release period while isolated >10 ms tails
+/// defer cleanly to the next tick (bounded by `DAMIAO_TX_FRAME_MAX_AGE` = 45 ms). Overridable
+/// per profile via `ArmConfig::tx_budget_ms`.
+pub const DAMIAO_TX_MAX_DURATION: Duration = Duration::from_millis(10);
 /// Default inclusive maximum age of a queued target frame before it is dropped as stale
 /// (`age >= frame_max_age` drops).
 pub const DAMIAO_TX_FRAME_MAX_AGE: Duration = Duration::from_millis(45);

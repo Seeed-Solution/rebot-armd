@@ -595,6 +595,7 @@
     "close_speed_rad_s": 0.3,
     "calibrated": false
   },
+  "tx_budget_ms": 10,
   "backlash_approach": {
     "enabled": true,
     "delta_deg": 0.5,

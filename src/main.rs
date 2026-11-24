@@ -486,6 +486,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gripper_index = config.gripper_index();
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let gripper_drive = armd::driver::gripper_drive_from_profile(&config)?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let damiao_tx_budget = config.damiao_tx_budget();
     let supervisor = Arc::new(ArmSupervisor::new(config));
     // before the control loop: frees retired observations, feeds telemetry and recordings
     supervisor.start_dispatcher()?;
@@ -520,7 +522,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let port = cli.follower_port.as_deref().unwrap_or("can0");
                 let can = armd::transport::SocketCanTransport::open(port)?;
                 if follower == "rebot-dm" {
-                    let mut driver = armd::driver::DamiaoArmDriver::new(can, (1..=7).collect());
+                    let mut driver = armd::driver::DamiaoArmDriver::new(can, (1..=7).collect())
+                        .with_tx_budget(damiao_tx_budget);
                     if let Some(limits) = damiao_limits {
                         driver = driver.with_joint_limits(limits)?;
                     }
