@@ -330,10 +330,78 @@ fn all_family_slices() -> &'static [&'static [DispatchEntry]] {
     ]
 }
 
+/// Validate that every table row's `(handler, admission, lease, reply)` metadata is mutually
+/// consistent with executable routing at table initialization time.
+fn validate_entry(entry: &DispatchEntry) {
+    match entry.handler {
+        DispatchHandler::UrgentEStop(_) => {
+            assert_eq!(entry.admission, AdmissionClass::UrgentEStop, "{:?}", entry.key);
+            assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::UrgentEStop, "{:?}", entry.key);
+        }
+        DispatchHandler::UrgentStop(_) => {
+            assert_eq!(entry.admission, AdmissionClass::UrgentStop, "{:?}", entry.key);
+            assert_eq!(entry.lease, LeaseRequirement::Required, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::UrgentStop, "{:?}", entry.key);
+        }
+        DispatchHandler::Auth(_) => {
+            assert_eq!(entry.admission, AdmissionClass::Auth, "{:?}", entry.key);
+            assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::AuthAck, "{:?}", entry.key);
+        }
+        DispatchHandler::Heartbeat(_) => {
+            assert_eq!(entry.admission, AdmissionClass::Heartbeat, "{:?}", entry.key);
+            assert_eq!(
+                entry.lease,
+                LeaseRequirement::RequiredAllowZeroGeneration,
+                "{:?}",
+                entry.key
+            );
+            assert_eq!(
+                entry.reply,
+                ReplyPolicy::SilentOrLossOrEpochSync,
+                "{:?}",
+                entry.key
+            );
+        }
+        DispatchHandler::LeaseFree(_) => {
+            assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);
+            assert_eq!(entry.lease, LeaseRequirement::None, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::CommandDeferred, "{:?}", entry.key);
+        }
+        DispatchHandler::Owner(_) => {
+            assert!(
+                matches!(
+                    entry.admission,
+                    AdmissionClass::OrdinarySession
+                        | AdmissionClass::OrdinaryTorqueOrStopExempt
+                        | AdmissionClass::Ordinary
+                        | AdmissionClass::OrdinaryServo
+                ),
+                "Owner handler must use Ordinary* admission: {:?}",
+                entry.key
+            );
+            assert!(
+                matches!(
+                    entry.reply,
+                    ReplyPolicy::LeaseReply
+                        | ReplyPolicy::CommandImmediate
+                        | ReplyPolicy::CommandDeferred
+                        | ReplyPolicy::PresetReply
+                        | ReplyPolicy::ServoRejectOnly
+                ),
+                "Owner handler has incompatible reply policy: {:?}",
+                entry.key
+            );
+        }
+    }
+}
+
 static DISPATCH_TABLE: LazyLock<HashMap<DispatchKey, &'static DispatchEntry>> = LazyLock::new(|| {
     let mut table = HashMap::new();
     for slice in all_family_slices() {
         for entry in *slice {
+            validate_entry(entry);
             let prev = table.insert(entry.key, entry);
             assert!(
                 prev.is_none(),
@@ -511,6 +579,34 @@ mod tests {
             .expect("AuthRequirement::Operator must reject non-operator on lease-free path");
         assert_eq!(lf_err.code.as_deref(), Some("OPERATOR_REQUIRED"));
         assert!(lf_err.message.contains("/api/v1/synthetic_lease_free_op"));
+
+        // Clear-fault pending E-stop interleaving (R2 Major 1): when an E-stop is pending with an
+        // outdated epoch, viewer clear_fault must consume it and return EPOCH_MISMATCH (409), not
+        // OPERATOR_REQUIRED (403).
+        let old_epoch = inner.safety.epoch_id();
+        let _ticket = sup.begin_e_stop_checked();
+        let clear_entry = lookup(FrameKind::Command, Some("/api/v1/safety/clear_fault")).unwrap();
+        let cf_err = clear_entry
+            .auth
+            .check_owner(&viewer, &mut inner, "/api/v1/safety/clear_fault", &json!({}), old_epoch)
+            .expect("pending E-stop must reject clear_fault");
+        assert_eq!(cf_err.code.as_deref(), Some("EPOCH_MISMATCH"));
+        assert_eq!(cf_err.status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    #[should_panic]
+    fn validate_entry_rejects_mismatched_lease_free_metadata() {
+        fn dummy(_ctx: LeaseFreeCtx<'_>) {}
+        let bad = DispatchEntry {
+            key: DispatchKey::command("/api/v1/bad_lease_free"),
+            handler: DispatchHandler::LeaseFree(dummy),
+            admission: AdmissionClass::Ordinary,
+            lease: LeaseRequirement::Required,
+            auth: AuthRequirement::None,
+            reply: ReplyPolicy::CommandDeferred,
+        };
+        validate_entry(&bad);
     }
 
     #[test]

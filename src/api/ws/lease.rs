@@ -79,6 +79,17 @@ fn clear_fault_auth_check(
     if ws_auth.is_operator() {
         return None;
     }
+    // Re-check pending E-stop after `ws_auth.is_operator()` (preserving baseline parity when an
+    // atomic E-stop latches concurrently during session-table verification).
+    if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
+        return Some(
+            ArmError::Safety(SafetyError::EpochMismatch {
+                expected: inner.safety.epoch_id(),
+                received: epoch,
+            })
+            .into(),
+        );
+    }
     if inner.e_stop_latched.load(Ordering::SeqCst) {
         return Some(ApiError::operator_required("clear_fault (EStop latched)"));
     }

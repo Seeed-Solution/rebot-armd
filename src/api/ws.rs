@@ -2694,21 +2694,33 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let has_policy = action_pending.policy.is_some();
                 #[cfg(not(feature = "policy-runtime"))]
                 let has_policy = false;
+                let unexpected_deferred = action_pending.plan.is_some()
+                    || action_pending.macro_action.is_some()
+                    || action_pending.replay.is_some()
+                    || has_policy
+                    || action_pending.dry_run_grasp.is_some()
+                    || pending_calibration.is_some()
+                    || pending_config_write.is_some();
                 debug_assert!(
-                    action_pending.plan.is_none()
-                        && action_pending.macro_action.is_none()
-                        && action_pending.replay.is_none()
-                        && !has_policy
-                        && action_pending.dry_run_grasp.is_none()
-                        && pending_calibration.is_none()
-                        && pending_config_write.is_none(),
+                    !unexpected_deferred,
                     "non-CommandDeferred entry populated a deferred async slot"
                 );
-                if entry.is_some_and(|e| e.reply == ReplyPolicy::CommandImmediate) {
-                    debug_assert!(
-                        response.is_some(),
-                        "CommandImmediate entry must return an immediate response"
+                if unexpected_deferred
+                    || (entry.is_some_and(|e| e.reply == ReplyPolicy::CommandImmediate)
+                        && response.is_none())
+                {
+                    tracing::error!(
+                        "WS dispatch contract violation: immediate entry {:?} produced no immediate reply or populated deferred slot",
+                        entry.map(|e| e.key)
                     );
+                    response = Some(json!({
+                        "type": "command_reject",
+                        "request_id": value.get("request_id"),
+                        "status": 500,
+                        "code": "INTERNAL_ERROR",
+                        "error": "INTERNAL_ERROR",
+                        "message": "Command handler violated immediate reply policy"
+                    }));
                 }
             }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
