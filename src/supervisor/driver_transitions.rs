@@ -2556,6 +2556,31 @@ impl SupervisorInner {
         deadline: Instant,
         expected_epoch: Option<u64>,
     ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        self.clear_fault_executor_inner(None, deadline, expected_epoch)
+    }
+
+    /// Release-bounded, allocation-free fault clearing for Step 2b of an RT release: caps every
+    /// TX (0xCC probe and motor fault reset) at `release_deadline - tx_release_publish_margin()`.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    pub fn clear_fault_executor_bounded_for_release(
+        &mut self,
+        now: Instant,
+        release_deadline: Instant,
+        expected_epoch: Option<u64>,
+    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        let tx_deadline = release_deadline
+            .checked_sub(self.tx_release_publish_margin())
+            .unwrap_or(now);
+        self.clear_fault_executor_inner(Some(now), tx_deadline, expected_epoch)
+    }
+
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    fn clear_fault_executor_inner(
+        &mut self,
+        now_override: Option<Instant>,
+        deadline: Instant,
+        expected_epoch: Option<u64>,
+    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
         use crate::safety::{ClearFaultError as E, ClearRefusal as R};
         let apply_estop_refusal = |this: &mut Self| -> E {
             this.consume_pending_estop();
@@ -2695,7 +2720,7 @@ impl SupervisorInner {
             // reset, or concurrent E-stop / config mutation.
             let mut clear_res = self.safety.clear_check(&ctx);
             if clear_res == Err(R::TxProbeRequired) {
-                let now = Instant::now();
+                let now = now_override.unwrap_or_else(Instant::now);
                 if now >= deadline {
                     return Err(E::Rejected(R::BudgetExpired));
                 }
@@ -2709,7 +2734,9 @@ impl SupervisorInner {
                         }
                     };
                     let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
+                    drv.set_tx_release_deadline(Some(drv_deadline));
                     let res = drv.probe_tx_ready_budgeted(drv_deadline);
+                    drv.set_tx_release_deadline(None);
                     drv.feedback_ages_into(&mut scratch_ages);
                     let ages_ok = scratch_ages.len() == self.config.dof
                         && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
@@ -2754,14 +2781,17 @@ impl SupervisorInner {
                 Err(R::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
                     // so a budgeted motor reset is now permitted; re-evaluate `clear_check` after.
-                    let now = Instant::now();
+                    let now = now_override.unwrap_or_else(Instant::now);
                     if now >= deadline {
                         return Err(E::Rejected(R::BudgetExpired));
                     }
                     let reset_res = {
                         let mut drv = d.lock().map_err(|_| E::FeedbackUnavailable)?;
                         let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
-                        drv.clear_fault_budgeted(drv_deadline)
+                        drv.set_tx_release_deadline(Some(drv_deadline));
+                        let res = drv.clear_fault_budgeted(drv_deadline);
+                        drv.set_tx_release_deadline(None);
+                        res
                     };
                     ctx.hardware_reset_required = false;
                     ctx.pending_estop = self.estop_request_unapplied();

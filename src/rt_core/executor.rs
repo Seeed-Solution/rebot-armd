@@ -1484,7 +1484,11 @@ impl ControlState {
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
             MaintenanceOp::ClearFault { expected_epoch } => {
                 self.shutdown_committed = false;
-                let res = core.clear_fault_executor_bounded_for_epoch(release_deadline, expected_epoch);
+                let res = core.clear_fault_executor_bounded_for_release(
+                    ctx.now,
+                    release_deadline,
+                    expected_epoch,
+                );
                 if res.is_ok() {
                     *release_flags |= RELEASE_FLAG_CLEAR_OK;
                 } else {

@@ -3039,6 +3039,34 @@ impl SupervisorInner {
         drv_now + remaining
     }
 
+    /// Installs `driver.set_tx_release_deadline(Some(cap))` for `(now, release_deadline)` and
+    /// returns `true` when a driver cap was installed.
+    pub(crate) fn install_driver_tx_release_cap(
+        &self,
+        now: Instant,
+        release_deadline: Instant,
+    ) -> bool {
+        let Some(ref d) = self.driver else {
+            return false;
+        };
+        let Ok(mut driver) = d.lock() else {
+            return false;
+        };
+        let drv_now = driver.clock_now();
+        let cap = self.driver_tx_release_cap(drv_now, now, release_deadline);
+        driver.set_tx_release_deadline(Some(cap));
+        true
+    }
+
+    /// Clears any active per-release TX deadline cap on the attached driver.
+    pub(crate) fn clear_driver_tx_release_cap(&self) {
+        if let Some(ref d) = self.driver {
+            if let Ok(mut driver) = d.lock() {
+                driver.set_tx_release_deadline(None);
+            }
+        }
+    }
+
     /// One control tick and its observation ([`Self::tick_control`], then
     /// [`Self::current_observation`] at the tick's timestamp).
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
@@ -3070,6 +3098,10 @@ impl SupervisorInner {
         release_deadline: Option<Instant>,
     ) -> crate::rt_core::ops::HardwarePoll {
         let was_torqued_or_disabling = self.is_torqued || self.disable_pending;
+        // Install the release publish-margin TX cap BEFORE enable-transition polling, background
+        // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
+        let applied_step2_tx_cap = release_deadline
+            .is_some_and(|rd| self.install_driver_tx_release_cap(budget.now, rd));
         let trans = self.service_torque_transition(budget);
         let transition_rx = if let Some(tp) = trans {
             self.core.begin_transition(tp.progress);
@@ -3077,7 +3109,10 @@ impl SupervisorInner {
         } else {
             self.service_background_disable(budget)
         };
-        let rx = self.poll_hardware_rx(Some(budget), transition_rx, release_deadline);
+        let rx = self.poll_hardware_rx(Some(budget), transition_rx, None);
+        if applied_step2_tx_cap {
+            self.clear_driver_tx_release_cap();
+        }
         let rx_frames = rx.rx_frames;
         let rx_exhausted = rx.budget_exhausted;
         self.pending_rx_poll = rx;

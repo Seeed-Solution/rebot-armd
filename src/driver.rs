@@ -4925,7 +4925,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(ArmDriverError::Transport(TransportError::WouldBlock));
             }
         }
-        if deadline.is_some_and(|d| d.passed(self.now())) {
+        let release_cap_passed = |d: &Self| d.tx_release_deadline.is_some_and(|cap| d.now() >= cap);
+        if deadline.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
         // Drain pre-existing queued RX frames to establish an empty-queue sequence boundary so
@@ -4944,11 +4945,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let boundary_seq = self.rx_empty_seq;
         self.pending_stop_check(Some(start_stamp))?;
-        if deadline.is_some_and(|d| d.passed(self.now())) {
+        if deadline.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
         self.tx_probe = None;
-        self.tx_release_deadline = None;
+        // Preserve any active `self.tx_release_deadline` cap installed by the release owner so
+        // the clear-fault probe uses the exact same `release_deadline - publish_margin` cutoff
+        // as every other TX in the release.
         self.begin_tx_tick();
         let probe_joint = 0usize;
         match self.send(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
@@ -4962,6 +4965,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(ArmDriverError::EstopInhibited);
             }
             Err(TxRefusal::Deferred) => {
+                if release_cap_passed(self) {
+                    return Err(ArmDriverError::Transport(TransportError::Timeout));
+                }
                 return Err(ArmDriverError::TxDeferred { pending: 1 });
             }
             Err(TxRefusal::Transport(e)) => {
@@ -4972,7 +4978,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         self.pending_stop_check(Some(start_stamp))?;
-        if deadline.is_some_and(|d| d.passed(self.now())) {
+        if deadline.is_some_and(|d| d.passed(self.now())) || self.flush_cutoff_exceeded() {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
         if let Err(e) = self.can.flush() {
@@ -6692,12 +6698,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             Service::Retry { mask, wake } => {
                 unsent_mask = self.send_enable_masked(unsent_mask | mask, false, Some(deadline))?;
-                let wake = if unsent_mask != 0 { self.now() } else { wake };
+                let wake = if unsent_mask != 0
+                    && self.tx_release_deadline.is_none_or(|cap| self.now() < cap)
+                {
+                    self.now()
+                } else {
+                    wake
+                };
                 self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
                 Ok(TorqueProgress::Pending { wake })
             }
             Service::Wait { wake } => {
-                let wake = if unsent_mask != 0 { self.now() } else { wake };
+                let wake = if unsent_mask != 0
+                    && self.tx_release_deadline.is_none_or(|cap| self.now() < cap)
+                {
+                    self.now()
+                } else {
+                    wake
+                };
                 self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
                 Ok(TorqueProgress::Pending { wake })
             }

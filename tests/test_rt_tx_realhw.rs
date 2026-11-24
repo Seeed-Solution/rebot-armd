@@ -2049,3 +2049,183 @@ async fn legacy_control_tick_with_deadline_uses_scheduled_grid_not_started_plus_
         obs.fault
     );
 }
+
+/// Round-3 Item 3:
+/// Every TX in a release uses the same margin-capped deadline (`release_deadline - margin`):
+/// (a) Enable-transition commit (Step 3) and enable-transition polling (Step 2 + sub-release wake)
+///     stop transmitting at `release_deadline - margin` and carry remaining enable frames cleanly.
+/// (b) `probe_tx_ready_inner` preserves an active `tx_release_deadline` cap (does not clear it),
+///     and Step 2b `clear_fault_executor_bounded_for_release` refuses without transmitting inside
+///     the publish margin window (`now >= release_deadline - margin`).
+#[test]
+fn enable_transition_polling_and_clear_fault_probe_obey_release_margin_cap() {
+    use armd::rt_core::ops::{CoreOps, ServiceBudget};
+
+    // Part A: Enable-transition commit (Step 3), Step 2 polling, and sub-release wake all obey
+    // `release_deadline - margin`.
+    let mut rig = DualRig::new(Owner::Executor, base_cfg(), None);
+    // Start from torque off (Idle) so we can exercise an enable handshake under late releases.
+    rig.inner_mut().set_torque(false).expect("torque off before enable test");
+    rig.bus.with(|s| {
+        s.tx_step = ms(1);
+        s.tx_spike_every = 0;
+        s.tx_spike_step = Duration::ZERO;
+        s.push_all_feedback();
+    });
+
+    // Submit TorqueOn via the RT broker; Step 3 runs at +16 ms into a 20 ms release ->
+    // 2 ms left before `release_deadline - 2 ms` -> at 1 ms/frame, at most 2 enable frames start
+    // (NOT all 7!) and the transition remains pending.
+    let late_clock = rig.clock.clone();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let armed_cb = Arc::clone(&armed);
+    rig.bus.clear_log();
+    if let RigOwner::Executor { fx, broker, next_req } = &mut rig.owner {
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        let id = *next_req;
+        *next_req += 1;
+        broker
+            .submit(
+                ClientId(1),
+                id,
+                auth,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .expect("submit TorqueOn");
+        fx.on_checkpoint(move |cp| {
+            if cp == Checkpoint::BeforeCommit && armed_cb.swap(false, Ordering::SeqCst) {
+                late_clock.advance(ms(16));
+            }
+        });
+        fx.dt = DT;
+        let rep = fx.step();
+        fx.on_checkpoint(|_| {});
+        assert!(rep.command.as_ref().is_some_and(|(_, r)| r.is_ok()), "TorqueOn commit: {rep:?}");
+        assert!(
+            fx.core.torque_transition_pending(),
+            "late Step 3 TorqueOn commit must cap enable TX and keep transition pending"
+        );
+    }
+    let step3_enables: Vec<u32> = rig
+        .bus
+        .tx_log()
+        .into_iter()
+        .filter(|f| f.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC])
+        .map(|f| f.id)
+        .collect();
+    assert!(
+        step3_enables.len() <= 2,
+        "late Step 3 (+16 ms, 2 ms margin, 1 ms/frame) must send <= 2 enable frames, sent {step3_enables:?}"
+    );
+
+    // Step 2 enable-transition polling starting at +19 ms (past `release_deadline - 2 ms = +18 ms`):
+    // MUST transmit 0 enable frames and keep the transition pending without faulting!
+    rig.bus.clear_log();
+    rig.bus.with(|s| s.push_all_feedback());
+    let late_now = rig.clock.now();
+    let late_release_deadline = late_now + ms(1); // 1 ms left <= 2 ms publish margin
+    let late_budget = ServiceBudget::for_release(late_now, late_release_deadline);
+    let poll = rig.inner_mut().poll_hardware_for_release(&late_budget, late_release_deadline);
+    assert!(
+        rig.bus.tx_log().is_empty(),
+        "Step 2 enable-transition polling past release_deadline - margin must transmit 0 frames, sent {:?}",
+        rig.bus.tx_log()
+    );
+    assert!(
+        rig.inner().torque_transition_pending(),
+        "deferred late Step 2 enable poll must keep transition pending (poll={poll:?})"
+    );
+    // Also verify sub-release wake past `release_deadline - margin` transmits 0 frames.
+    let wake_poll = rig
+        .inner_mut()
+        .poll_transition_wake_for_release(&late_budget, late_release_deadline);
+    assert!(
+        rig.bus.tx_log().is_empty(),
+        "sub-release transition wake past release_deadline - margin must transmit 0 frames (poll={wake_poll:?})"
+    );
+    assert!(rig.inner().torque_transition_pending());
+
+    // Next on-time releases finish the remaining enable frames and confirm enabled with 0 faults.
+    rig.bus.with(|s| s.tx_step = Duration::ZERO);
+    for _ in 0..6 {
+        rig.step();
+    }
+    assert!(!rig.inner().torque_transition_pending(), "on-time releases must complete enable transition");
+    assert!(rig.inner().safety.state().is_operational(), "enable must complete operational: {:?}", rig.inner().safety.state());
+
+    // Part B1: Direct driver `probe_tx_ready_budgeted` preserves an active `tx_release_deadline`
+    // (must NOT clear it) and transmits 0 frames once `clock.now() >= tx_release_deadline`.
+    let limits = dm_limits();
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    bus.clear_log();
+    let cap = clock.now(); // already elapsed
+    drv.set_tx_release_deadline(Some(cap));
+    let probe_err = drv.probe_tx_ready_budgeted(clock.now() + ms(200)).unwrap_err();
+    assert!(
+        matches!(probe_err, armd::driver::ArmDriverError::Transport(armd::transport::TransportError::Timeout)),
+        "probe_tx_ready_budgeted must respect active tx_release_deadline cap, got {probe_err:?}"
+    );
+    assert!(
+        bus.tx_log().is_empty(),
+        "probe_tx_ready_budgeted past tx_release_deadline must transmit 0 frames"
+    );
+    drv.set_tx_release_deadline(None);
+
+    // Part B2: Executor Step 2b `clear_fault_executor_bounded_for_release` refuses with
+    // BudgetExpired and 0 TX frames when called inside the 2 ms publish margin window, then
+    // succeeds on an on-time release.
+    let mut rig_cf = DualRig::new(Owner::Executor, base_cfg(), None);
+    rig_cf.bus.with(|s| s.tx_enobufs = true);
+    for _ in 0..5 {
+        rig_cf.step();
+        if rig_cf.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
+            break;
+        }
+    }
+    assert_eq!(rig_cf.inner().safety.fault_code(), Some(FaultCode::CanTxStalled));
+    rig_cf.bus.with(|s| {
+        s.tx_enobufs = false;
+        s.push_all_feedback();
+    });
+    rig_cf.step();
+    rig_cf.bus.clear_log();
+    rig_cf.bus.with(|s| s.push_all_feedback());
+    let now = rig_cf.clock.now();
+    // Only 1 ms left before release_deadline (<= 2 ms publish margin) -> BudgetExpired, 0 TX!
+    let res_late = rig_cf
+        .inner_mut()
+        .clear_fault_executor_bounded_for_release(now, now + ms(1), None);
+    assert_eq!(
+        res_late,
+        Err(armd::safety::ClearFaultError::Rejected(
+            armd::safety::ClearRefusal::BudgetExpired
+        )),
+        "clear_fault probe inside publish margin must fail with BudgetExpired"
+    );
+    assert!(
+        rig_cf.bus.tx_log().is_empty(),
+        "clear_fault probe inside publish margin must transmit 0 frames, sent {:?}",
+        rig_cf.bus.tx_log()
+    );
+
+    // On-time release (20 ms left -> 18 ms TX budget) runs the 0xCC probe and clears to Idle!
+    rig_cf.bus.with(|s| s.push_all_feedback());
+    let res_ok = rig_cf
+        .inner_mut()
+        .clear_fault_executor_bounded_for_release(now, now + ms(20), None);
+    assert_eq!(res_ok, Ok(SafetyState::Idle));
+    assert!(
+        rig_cf.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+        "on-time clear_fault_executor_bounded_for_release must transmit the 0xCC probe"
+    );
+}

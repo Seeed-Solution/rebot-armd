@@ -473,6 +473,17 @@ pub trait CoreOps {
     /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
     /// the transition (the adapter uses the request id's value).
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Release-bounded [`Self::commit_transition`] carrying the absolute control `release_deadline`
+    /// so initial handshake TX frames are capped at `release_deadline - margin`.
+    fn commit_transition_for_release(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        _release_deadline: Instant,
+    ) -> Result<Committed, &'static str> {
+        self.commit_transition(d, op, ctx)
+    }
     /// Applies one target after rechecking it ([`TargetFrame::check`] against the core's
     /// [`super::mailbox::TargetAuthority`], then the configuration hold).
     ///
@@ -501,6 +512,15 @@ pub trait CoreOps {
     /// feedback pass). Default delegates to [`Self::poll_hardware`].
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
         self.poll_hardware(budget)
+    }
+    /// Release-bounded [`Self::poll_transition_wake`] carrying the absolute control
+    /// `release_deadline` so sub-release transition TX obeys `release_deadline - margin`.
+    fn poll_transition_wake_for_release(
+        &mut self,
+        budget: &ServiceBudget,
+        _release_deadline: Instant,
+    ) -> HardwarePoll {
+        self.poll_transition_wake(budget)
     }
     /// One release of the control tick (`generation`: the publication's lock generation).
     fn advance(&mut self, dt: f64, generation: u64);
@@ -870,6 +890,21 @@ impl CoreOps for SupervisorInner {
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
     }
 
+    fn commit_transition_for_release(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        release_deadline: Instant,
+    ) -> Result<Committed, &'static str> {
+        let applied = self.install_driver_tx_release_cap(ctx.now, release_deadline);
+        let res = self.commit_transition(d, op, ctx);
+        if applied {
+            self.clear_driver_tx_release_cap();
+        }
+        res
+    }
+
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
         // track D: identity, deadline, authority, stream, policy generation, input / camera
         // ages, config hold, then the servo / policy step checks (supervisor::streams::targets)
@@ -896,6 +931,19 @@ impl CoreOps for SupervisorInner {
 
     fn poll_hardware_for_release(&mut self, budget: &ServiceBudget, release_deadline: Instant) -> HardwarePoll {
         self.poll_hardware_with_release_deadline(budget, Some(release_deadline))
+    }
+
+    fn poll_transition_wake_for_release(
+        &mut self,
+        budget: &ServiceBudget,
+        release_deadline: Instant,
+    ) -> HardwarePoll {
+        let applied = self.install_driver_tx_release_cap(budget.now, release_deadline);
+        let poll = self.poll_transition_wake(budget);
+        if applied {
+            self.clear_driver_tx_release_cap();
+        }
+        poll
     }
 
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
@@ -1284,7 +1332,7 @@ impl ReleaseEngine {
                     Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
                 CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
-                CommandKind::Transition(op) => core.commit_transition(&d, op, &ctx),
+                CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
             };
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
@@ -1362,7 +1410,7 @@ impl ReleaseEngine {
         let urgent_applied = self.apply_pending_urgent(core);
         if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
-        report.poll = core.poll_transition_wake(&budget);
+        report.poll = core.poll_transition_wake_for_release(&budget, release_deadline);
         let finished = self.take_finished_transition(report);
         if urgent_applied || finished.is_some() {
             let ts = core.now_timestamp();
