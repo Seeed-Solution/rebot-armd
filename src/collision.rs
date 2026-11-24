@@ -421,7 +421,7 @@ impl SupervisorInner {
             &supported,
         );
         if result.released {
-            tracing::info!("Collision hold ended after quiet period");
+            self.safety.log_collision_hold_released();
         }
         if let Some((j, residual, threshold)) = result.trip {
             self.collision_trip(j, residual, threshold, &p, now, result.escalated);
@@ -432,10 +432,14 @@ impl SupervisorInner {
     /// and latch Fault `COLLISION` when this trip exceeds `max_auto_resumes` in the window.
     fn collision_trip(&mut self, j: usize, residual: f32, threshold: f32, p: &CollisionPolicy, now: f64, escalated: bool) {
         let trips = self.collision.trips_in_window(now, p.escalate_window_s);
-        let message = format!("Collision on joint {}: residual {residual:.2} N·m above threshold {threshold:.2} N·m", j + 1);
-        tracing::warn!("{message} (trip {trips} within {:.0} s); protective stop", p.escalate_window_s);
+        let mut message = crate::safety::BoundedText::<160>::empty();
+        let _ = core::fmt::write(
+            &mut message,
+            format_args!("Collision on joint {}: residual {residual:.2} N·m above threshold {threshold:.2} N·m", j + 1),
+        );
+        self.safety.log_collision_trip(j as u8, residual, threshold, trips, p.escalate_window_s);
         if let Some(id) = self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id) {
-            self.finish_action(id, "failed", Some("COLLISION"), Some(message.clone()), None, None, None);
+            self.finish_action(id, "failed", Some("COLLISION"), Some(message.as_str().to_owned()), None, None, None);
         }
         self.drop_macro_run("failed", Some("COLLISION"));
         // Hold commanded = measured; the gripper keeps its command so a held object stays held.
@@ -451,14 +455,14 @@ impl SupervisorInner {
             }
         }
         if let (Some(g), Some(c)) = (gripper_idx, grip_cmd) { self.commanded_positions[g] = c; }
-        self.target_positions.clone_from(&self.commanded_positions);
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
         self.servo_lead_stall.fill(None);
         self.safety.mark_motion_finished();
         if escalated {
-            tracing::error!("Collision guard: {trips} trips within {:.0} s; latching Fault COLLISION", p.escalate_window_s);
+            self.safety.log_collision_escalated(trips, p.escalate_window_s);
             self.safety.latch(
                 crate::safety::FaultKind::CollisionLatched,
                 crate::safety::FaultDetail::formatted(FaultCode::Collision, |buf| {

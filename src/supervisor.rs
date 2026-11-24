@@ -199,6 +199,9 @@ pub const PREEMPT_COOLDOWN: Duration = Duration::from_secs(3);
 /// A ThermalTrip can be cleared only once every joint reports a temperature at or below
 /// `max_temperature` minus this margin (°C).
 pub const THERMAL_CLEAR_MARGIN_C: f32 = 5.0;
+/// Maximum allowed gap between consecutive fresh temperature samples before thermal cooldown
+/// dwell restarts from the next fresh sample.
+pub const THERMAL_FEEDBACK_FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
 /// Outward tolerance (rad) when checking whether measured joint positions are back within
 /// configured limits before clearing [`crate::safety::FaultKind::JointLimit`].
 pub const JOINT_LIMIT_CLEAR_MARGIN_RAD: f32 = 0.01;
@@ -612,9 +615,10 @@ pub struct SupervisorInner {
     /// Required continuous duration below `max_temperature - THERMAL_CLEAR_MARGIN_C` before
     /// `ThermalTrip` may clear (default `Duration::ZERO`).
     pub thermal_cooldown_duration: Duration,
-    /// Instant since which all joint temperatures have continuously remained at or below the
-    /// thermal reset threshold (`None` while any joint is above threshold or non-finite).
-    pub(crate) thermal_below_since: Option<Instant>,
+    /// Consecutive fresh-sample thermal cooldown tracker (zero heap allocations; restarts
+    /// whenever any joint's gap between consecutive fresh samples exceeds
+    /// [`THERMAL_FEEDBACK_FRESHNESS_LIMIT`]).
+    pub(crate) thermal_cooldown: ThermalCooldown,
     /// Running zero check parameters (id, store_offset, threshold_rad, base_closed_rad).
     pub zero_check_params: Option<ZeroCheckParams>,
     /// Monotonic revision for gripper calibration (starts at 1).
@@ -673,6 +677,124 @@ pub struct SupervisorInner {
     pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
     pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Zero-allocation tracker of continuous thermal cooldown dwell across consecutive fresh
+/// temperature samples. Dwell is the span between consecutive fresh cool samples; any unobserved
+/// gap longer than [`THERMAL_FEEDBACK_FRESHNESS_LIMIT`] between consecutive fresh samples restarts
+/// the dwell from the next fresh sample.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ThermalCooldown {
+    first_sample_at: Option<Instant>,
+    last_oldest_sample_at: Option<Instant>,
+    last_joint_samples: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
+    joint_count: usize,
+}
+
+impl ThermalCooldown {
+    pub(crate) fn reset(&mut self) {
+        self.first_sample_at = None;
+        self.last_oldest_sample_at = None;
+        self.last_joint_samples.fill(None);
+        self.joint_count = 0;
+    }
+
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        match (self.first_sample_at, self.last_oldest_sample_at) {
+            (Some(first), Some(last)) => last
+                .saturating_duration_since(first)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn record_fresh_cool_samples(&mut self, samples: &[Instant]) {
+        let (Some(oldest), Some(newest)) = (samples.iter().copied().min(), samples.iter().copied().max()) else {
+            self.reset();
+            return;
+        };
+        let track_joints = samples.len() <= crate::rt_core::mailbox::MAX_DOF;
+        match (self.first_sample_at, self.last_oldest_sample_at) {
+            (Some(first), Some(prev_oldest)) => {
+                let oldest_gapped =
+                    oldest.saturating_duration_since(prev_oldest) > THERMAL_FEEDBACK_FRESHNESS_LIMIT;
+                let joint_gapped = track_joints
+                    && self.joint_count == samples.len()
+                    && samples.iter().enumerate().any(|(i, &t)| {
+                        self.last_joint_samples[i].is_none_or(|prev| {
+                            t.saturating_duration_since(prev) > THERMAL_FEEDBACK_FRESHNESS_LIMIT
+                        })
+                    });
+                let gapped = oldest_gapped || joint_gapped;
+                if gapped {
+                    // Continuity across all joints is only proven from the newest sample on: a joint
+                    // that resumed late must not credit dwell from an older joint's timestamp.
+                    self.first_sample_at = Some(newest);
+                    self.last_oldest_sample_at = Some(oldest);
+                } else {
+                    self.first_sample_at = Some(first);
+                    self.last_oldest_sample_at = Some(prev_oldest.max(oldest));
+                }
+                if track_joints {
+                    if gapped || self.joint_count != samples.len() {
+                        self.last_joint_samples.fill(None);
+                        for (slot, &t) in self.last_joint_samples.iter_mut().zip(samples.iter()) {
+                            *slot = Some(t);
+                        }
+                    } else {
+                        for (slot, &t) in self.last_joint_samples.iter_mut().zip(samples.iter()) {
+                            *slot = Some(slot.map_or(t, |prev| prev.max(t)));
+                        }
+                    }
+                    self.joint_count = samples.len();
+                } else {
+                    self.last_joint_samples.fill(None);
+                    self.joint_count = 0;
+                }
+            }
+            _ => {
+                self.first_sample_at = Some(oldest);
+                self.last_oldest_sample_at = Some(oldest);
+                self.last_joint_samples.fill(None);
+                if track_joints {
+                    for (slot, &t) in self.last_joint_samples.iter_mut().zip(samples.iter()) {
+                        *slot = Some(t);
+                    }
+                    self.joint_count = samples.len();
+                } else {
+                    self.joint_count = 0;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record_fresh_cool_at(&mut self, sample_at: Instant) {
+        self.record_fresh_cool_samples(std::slice::from_ref(&sample_at));
+    }
+}
+
+#[cfg(test)]
+mod thermal_cooldown_tests {
+    use super::{ThermalCooldown, THERMAL_FEEDBACK_FRESHNESS_LIMIT};
+    use std::time::{Duration, Instant};
+
+    /// A joint that resumes after a stale gap restarts the dwell from the newest sample: dwell is
+    /// never credited from an older joint's timestamp (2026-11-24 review: J1 resumes at 300 ms,
+    /// J2's last sample was at 240 ms, both sample at 330 ms -> dwell 30 ms, not 90 ms).
+    #[test]
+    fn staggered_gap_restarts_dwell_from_newest_sample() {
+        let t0 = Instant::now();
+        let ms = |v: u64| t0 + Duration::from_millis(v);
+        let mut c = ThermalCooldown::default();
+        c.record_fresh_cool_samples(&[ms(0), ms(0)]);
+        c.record_fresh_cool_samples(&[ms(40), ms(240)]);
+        assert!(Duration::from_millis(300 - 40) > THERMAL_FEEDBACK_FRESHNESS_LIMIT);
+        c.record_fresh_cool_samples(&[ms(300), ms(240)]); // J1 gap 260 ms > 250 ms
+        assert_eq!(c.elapsed_ms(), 0);
+        c.record_fresh_cool_samples(&[ms(330), ms(330)]);
+        assert_eq!(c.elapsed_ms(), 30);
+    }
 }
 
 /// Summary of the release's Step-2 hardware poll passed into Step-5 `tick_control`
@@ -942,7 +1064,7 @@ impl SupervisorInner {
             driver_config_error: None,
             retired_driver_config_error: None,
             thermal_cooldown_duration: Duration::ZERO,
-            thermal_below_since: None,
+            thermal_cooldown: ThermalCooldown::default(),
             zero_check_params: None,
             gripper_calib_revision: 1,
             grasp_setup_revision: 1,
@@ -1804,13 +1926,71 @@ impl SupervisorInner {
         }
     }
 
-    /// Updates continuous cooldown tracking from `temps` against `max_temperature - THERMAL_CLEAR_MARGIN_C`.
-    pub(crate) fn update_thermal_cooldown_from_temps(&mut self, temps: &[f32]) {
+    /// Pure, allocation-free evaluation of the next [`ThermalCooldown`] state from fresh driver
+    /// feedback timestamps without mutating `self`. Any gap between consecutive fresh samples
+    /// exceeding [`THERMAL_FEEDBACK_FRESHNESS_LIMIT`] restarts the dwell from the new sample.
+    pub(crate) fn evaluate_thermal_cooldown_with_driver(
+        &self,
+        drv: &dyn ArmDriver,
+        ages: &[Option<Duration>],
+        thermal_below: bool,
+        rx_scratch: &mut Vec<Option<Instant>>,
+    ) -> ThermalCooldown {
+        if !thermal_below {
+            return ThermalCooldown::default();
+        }
+        let dof = self.config.dof;
+        if dof == 0 {
+            return ThermalCooldown::default();
+        }
+        let mut next = self.thermal_cooldown;
+        drv.feedback_receive_instants_into(rx_scratch);
+        if rx_scratch.len() != dof || rx_scratch.iter().any(Option::is_none) {
+            drv.feedback_instants_into(rx_scratch);
+        }
+        if rx_scratch.len() == dof && rx_scratch.iter().all(Option::is_some) {
+            if dof <= crate::rt_core::mailbox::MAX_DOF {
+                let mut buf = [rx_scratch[0].unwrap(); crate::rt_core::mailbox::MAX_DOF];
+                for (dst, src) in buf.iter_mut().take(dof).zip(rx_scratch.iter()) {
+                    *dst = src.unwrap();
+                }
+                next.record_fresh_cool_samples(&buf[..dof]);
+            } else if let Some(oldest) = rx_scratch.iter().filter_map(|t| *t).min() {
+                next.record_fresh_cool_at(oldest);
+            } else {
+                next.reset();
+            }
+            return next;
+        }
+        if ages.len() == dof && ages.iter().all(Option::is_some) {
+            let drv_now = drv.clock_now();
+            if dof <= crate::rt_core::mailbox::MAX_DOF {
+                let mut buf = [drv_now; crate::rt_core::mailbox::MAX_DOF];
+                for (dst, age) in buf.iter_mut().take(dof).zip(ages.iter()) {
+                    let a = age.unwrap();
+                    *dst = drv_now.checked_sub(a).unwrap_or(drv_now);
+                }
+                next.record_fresh_cool_samples(&buf[..dof]);
+            } else if let Some(oldest_age) = ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t))) {
+                let oldest = drv_now.checked_sub(oldest_age).unwrap_or(drv_now);
+                next.record_fresh_cool_at(oldest);
+            } else {
+                next.reset();
+            }
+            return next;
+        }
+        ThermalCooldown::default()
+    }
+
+    /// Updates continuous thermal cooldown tracking from driverless simulation temperatures at `now`.
+    pub(crate) fn update_thermal_cooldown_driverless(&mut self, now: Instant) {
         let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
-        if !temps.is_empty() && temps.iter().all(|t| t.is_finite() && *t <= threshold) {
-            self.thermal_below_since.get_or_insert_with(Instant::now);
+        if !self.temperatures.is_empty()
+            && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
+        {
+            self.thermal_cooldown.record_fresh_cool_at(now);
         } else {
-            self.thermal_below_since = None;
+            self.thermal_cooldown.reset();
         }
     }
 
@@ -1861,35 +2041,49 @@ impl SupervisorInner {
     /// `was_active` preserves thermal protection when a torque transition confirmed disable on
     /// the exact same Step 2 poll that delivered an over-temperature sample.
     ///
-    /// Thermal cooldown accrues ONLY while temperature feedback is fresh; stale or unavailable
-    /// temperature feedback resets the cooldown timer (`thermal_below_since = None`).
+    /// Thermal cooldown accrues ONLY across consecutive fresh temperature samples; stale,
+    /// unavailable, or gapped (> [`THERMAL_FEEDBACK_FRESHNESS_LIMIT`]) feedback resets or
+    /// restarts the cooldown dwell.
     pub(crate) fn check_thermal_protection(&mut self, was_active: bool) {
-        let (temperature_available, temperature_fresh) = match self.driver.as_ref() {
-            None => (true, true),
-            Some(d) => match d.lock() {
-                Ok(drv) => {
-                    let avail = drv.capabilities().temperature_feedback;
-                    let fresh = avail
-                        && self.feedback_numeric_valid
-                        && drv.is_feedback_valid()
-                        && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
-                    (avail, fresh)
-                }
-                Err(_) => (false, false),
-            },
-        };
-        if temperature_fresh {
-            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
-            if !self.temperatures.is_empty()
-                && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
-            {
-                self.thermal_below_since.get_or_insert_with(Instant::now);
-            } else {
-                self.thermal_below_since = None;
+        let temperature_available = match self.driver.as_ref() {
+            None => {
+                self.update_thermal_cooldown_driverless(Instant::now());
+                true
             }
-        } else {
-            self.thermal_below_since = None;
-        }
+            Some(d) => {
+                let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+                let mut scratch_rx = std::mem::take(&mut self.scratch.rx);
+                let (avail, next_cd) = match d.lock() {
+                    Ok(drv) => {
+                        let avail = drv.capabilities().temperature_feedback;
+                        drv.feedback_ages_into(&mut scratch_ages);
+                        let fresh = avail
+                            && self.feedback_numeric_valid
+                            && drv.is_feedback_valid()
+                            && scratch_ages.len() == self.config.dof
+                            && scratch_ages
+                                .iter()
+                                .all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT));
+                        let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                        let thermal_below = fresh
+                            && !self.temperatures.is_empty()
+                            && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+                        let cd = self.evaluate_thermal_cooldown_with_driver(
+                            drv.as_ref(),
+                            &scratch_ages,
+                            thermal_below,
+                            &mut scratch_rx,
+                        );
+                        (avail, cd)
+                    }
+                    Err(_) => (false, ThermalCooldown::default()),
+                };
+                self.scratch.ages = scratch_ages;
+                self.scratch.rx = scratch_rx;
+                self.thermal_cooldown = next_cd;
+                avail
+            }
+        };
         if (self.is_torqued || self.disable_pending || was_active)
             && temperature_available
             && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip)
@@ -2350,26 +2544,24 @@ impl SupervisorInner {
                                     sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
                                     out.hw_rx = true;
                                 }
-                                if driver.capabilities().temperature_feedback {
-                                    let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
-                                    if !self.temperatures.is_empty()
-                                        && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
-                                    {
-                                        self.thermal_below_since.get_or_insert_with(Instant::now);
-                                    } else {
-                                        self.thermal_below_since = None;
-                                    }
-                                } else {
-                                    self.thermal_below_since = None;
-                                }
+                                let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                                let thermal_below = driver.capabilities().temperature_feedback
+                                    && !self.temperatures.is_empty()
+                                    && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+                                self.thermal_cooldown = self.evaluate_thermal_cooldown_with_driver(
+                                    driver.as_ref(),
+                                    &sc.ages,
+                                    thermal_below,
+                                    &mut sc.rx,
+                                );
                             } else {
                                 // Stale or invalid temperature feedback resets thermal cooldown.
-                                self.thermal_below_since = None;
+                                self.thermal_cooldown.reset();
                             }
                         }
                         Err(_) => {
                             self.last_can_feedback_instant = None;
-                            self.thermal_below_since = None;
+                            self.thermal_cooldown.reset();
                             out.reset_stillness_on_read_err = true;
                         }
                     }
@@ -2408,7 +2600,7 @@ impl SupervisorInner {
                 }
                 Err(_) => {
                     self.last_can_feedback_instant = None;
-                    self.thermal_below_since = None;
+                    self.thermal_cooldown.reset();
                     out.reset_stillness_on_read_err = true;
                 }
             }
@@ -3769,7 +3961,7 @@ impl SupervisorInner {
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
             if self.driver.is_none() {
                 tick_output_accepted = true;
-            } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
+            } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), self.driver.as_ref()) {
                 if let Ok(mut driver) = d.lock() {
                     if driver.enable_state() != EnableState::Disabled {
                         let write_res = if self.safety.state().is_stopped() {
@@ -5381,10 +5573,14 @@ impl ArmSupervisor {
     }
 
     pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
+        self.clear_fault_for_epoch(None).await
+    }
+
+    pub async fn clear_fault_for_epoch(&self, expected_epoch: Option<u64>) -> Result<SafetyState, ArmError> {
         match self.owner_mode() {
             OWNER_EXECUTOR => {
                 let h = self.executor_handle().ok_or_else(executor_unavailable)?;
-                let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                let res = h.clear_fault_for_epoch_async(expected_epoch).await.map_err(ArmError::from)?;
                 res.map_err(ArmError::Safety)
             }
             OWNER_LEGACY => {
@@ -5393,14 +5589,14 @@ impl ArmSupervisor {
                     drop(inner);
                     if self.owner_mode() == OWNER_EXECUTOR {
                         let h = self.executor_handle().ok_or_else(executor_unavailable)?;
-                        let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                        let res = h.clear_fault_for_epoch_async(expected_epoch).await.map_err(ArmError::from)?;
                         return res.map_err(ArmError::Safety);
                     }
                     return Err(executor_unavailable());
                 }
                 let estop_reg = Arc::clone(&self.estop_reg);
                 let res = tokio::task::spawn_blocking(move || {
-                    let r = inner.clear_fault();
+                    let r = inner.clear_fault_for_epoch(expected_epoch);
                     inner.safety.drain_retired_state_arcs_off_thread();
                     ArmSupervisor::flush_legacy_estop_acks_into(&estop_reg, &mut inner);
                     r

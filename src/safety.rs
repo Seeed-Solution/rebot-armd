@@ -740,7 +740,11 @@ pub enum SafetyLogEvent {
     Cleared,
     GravityCompEstopExit,
     GravityCompHoldWriteFailed(BoundedText<160>),
+    GravityCompRampComplete,
     WatchdogParkBlocked(BoundedText<160>),
+    CollisionHoldReleased,
+    CollisionTrip { joint: u8, residual: f32, threshold: f32, trips: u32, window_s: f64 },
+    CollisionEscalated { trips: u32, window_s: f64 },
 }
 
 impl SafetyLogEvent {
@@ -753,7 +757,18 @@ impl SafetyLogEvent {
             Self::Cleared => tracing::info!(target: "armd::safety", "Safety: cleared -> Idle"),
             Self::GravityCompEstopExit => tracing::warn!(target: "armd::supervisor::motion", "Gravity compensation exit: ESTOP E-stop"),
             Self::GravityCompHoldWriteFailed(err) => tracing::error!(target: "armd::supervisor::motion", "Gravity comp hold write failed: {err}"),
+            Self::GravityCompRampComplete => tracing::info!(target: "armd::gravity_comp", "Gravity compensation ramp complete"),
             Self::WatchdogParkBlocked(reason) => tracing::warn!(target: "armd::supervisor", "Watchdog: lease expired while torqued, not parking ({reason}); holding torque and latching WatchdogTimeout"),
+            Self::CollisionHoldReleased => tracing::info!(target: "armd::collision", "Collision hold ended after quiet period"),
+            Self::CollisionTrip { joint, residual, threshold, trips, window_s } => tracing::warn!(
+                target: "armd::collision",
+                "Collision on joint {}: residual {residual:.2} N·m above threshold {threshold:.2} N·m (trip {trips} within {window_s:.0} s); protective stop",
+                usize::from(*joint) + 1
+            ),
+            Self::CollisionEscalated { trips, window_s } => tracing::error!(
+                target: "armd::collision",
+                "Collision guard: {trips} trips within {window_s:.0} s; latching Fault COLLISION"
+            ),
         }
     }
 }
@@ -1479,6 +1494,49 @@ impl SafetyManager {
             self.queue_log_event(SafetyLogEvent::GravityCompHoldWriteFailed(msg));
         } else {
             tracing::error!(target: "armd::supervisor::motion", "Gravity comp hold write failed: {msg}");
+        }
+    }
+
+    /// Emits or defers the gravity-compensation ramp completion notice without RT heap allocation.
+    pub fn log_gravity_comp_ramp_complete(&mut self) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::GravityCompRampComplete);
+        } else {
+            tracing::info!(target: "armd::gravity_comp", "Gravity compensation ramp complete");
+        }
+    }
+
+    /// Emits or defers the collision hold release notice without RT heap allocation.
+    pub fn log_collision_hold_released(&mut self) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::CollisionHoldReleased);
+        } else {
+            tracing::info!(target: "armd::collision", "Collision hold ended after quiet period");
+        }
+    }
+
+    /// Emits or defers a collision protective-stop warning without RT heap allocation.
+    pub fn log_collision_trip(&mut self, joint: u8, residual: f32, threshold: f32, trips: u32, window_s: f64) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::CollisionTrip { joint, residual, threshold, trips, window_s });
+        } else {
+            tracing::warn!(
+                target: "armd::collision",
+                "Collision on joint {}: residual {residual:.2} N·m above threshold {threshold:.2} N·m (trip {trips} within {window_s:.0} s); protective stop",
+                usize::from(joint) + 1
+            );
+        }
+    }
+
+    /// Emits or defers a collision escalation error without RT heap allocation.
+    pub fn log_collision_escalated(&mut self, trips: u32, window_s: f64) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::CollisionEscalated { trips, window_s });
+        } else {
+            tracing::error!(
+                target: "armd::collision",
+                "Collision guard: {trips} trips within {window_s:.0} s; latching Fault COLLISION"
+            );
         }
     }
 

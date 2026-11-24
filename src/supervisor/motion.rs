@@ -408,7 +408,7 @@ impl SupervisorInner {
                 self.stop_motion();
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
-                self.thermal_below_since = None;
+                self.thermal_cooldown.reset();
                 let (joint_idx, temperature) = self.temperatures.iter().copied().enumerate()
                     .filter(|(_, t)| t.is_finite()).max_by(|a,b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
                 self.safety.latch(
