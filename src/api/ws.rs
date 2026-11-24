@@ -899,12 +899,13 @@ async fn flush_urgent_then_fatal_and_close(
     let mut socket_closed = false;
 
     // 1. Attempt all already-queued urgent E-stop and Stop replies BEFORE fatal error + Close.
+    //    Always check the remaining urgent budget BEFORE dequeuing a reply.
     while !socket_closed {
+        let r = urgent_rem();
+        if r.is_zero() {
+            break;
+        }
         if let Ok(mut val) = estop_out_rx.try_recv() {
-            let r = urgent_rem();
-            if r.is_zero() {
-                break;
-            }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
             match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await {
                 Ok(()) => { *estop_replies_delivered += 1; }
@@ -912,10 +913,6 @@ async fn flush_urgent_then_fatal_and_close(
                 Err(WriteErr::Closed) => { socket_closed = true; }
             }
         } else if let Ok(mut val) = stop_out_rx.try_recv() {
-            let r = urgent_rem();
-            if r.is_zero() {
-                break;
-            }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
             if matches!(
                 write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await,
@@ -930,19 +927,19 @@ async fn flush_urgent_then_fatal_and_close(
 
     // 2. If urgent E-stop/Stop replies admitted before close are still in-flight, wait within
     //    the bounded urgent budget so they are attempted BEFORE the fatal error frame and Close.
+    //    Check the deadline arm first under `biased;` so an expired budget never dequeues a reply.
     while !socket_closed
         && (in_flight_estops.load(Ordering::SeqCst) > 0 || in_flight_stops.load(Ordering::SeqCst) > 0)
     {
-        let r = urgent_rem();
-        if r.is_zero() {
+        if urgent_rem().is_zero() {
             break;
         }
         tokio::select! {
             biased;
+            _ = tokio::time::sleep_until(urgent_deadline) => { break; }
             msg = estop_out_rx.recv() => match msg {
                 Some(mut val) => {
-                    let r2 = urgent_rem();
-                    if r2.is_zero() { break; }
+                    let r2 = urgent_rem().max(Duration::from_millis(1));
                     enforce_monotonic_epoch(last_wire_epoch, &mut val);
                     match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r2)).await {
                         Ok(()) => { *estop_replies_delivered += 1; }
@@ -954,8 +951,7 @@ async fn flush_urgent_then_fatal_and_close(
             },
             msg = stop_out_rx.recv() => match msg {
                 Some(mut val) => {
-                    let r2 = urgent_rem();
-                    if r2.is_zero() { break; }
+                    let r2 = urgent_rem().max(Duration::from_millis(1));
                     enforce_monotonic_epoch(last_wire_epoch, &mut val);
                     if matches!(
                         write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r2)).await,
@@ -967,15 +963,17 @@ async fn flush_urgent_then_fatal_and_close(
                 None => break,
             },
             _ = urgent_done_notify.notified() => {}
-            _ = tokio::time::sleep(r) => { break; }
         }
     }
 
-    // Drain any final urgent reply pushed right before the in-flight guard dropped.
+    // Drain any final urgent reply pushed right before the in-flight guard dropped (check budget
+    // BEFORE dequeuing).
     while !socket_closed {
+        let r = urgent_rem();
+        if r.is_zero() {
+            break;
+        }
         if let Ok(mut val) = estop_out_rx.try_recv() {
-            let r = urgent_rem();
-            if r.is_zero() { break; }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
             match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await {
                 Ok(()) => { *estop_replies_delivered += 1; }
@@ -983,8 +981,6 @@ async fn flush_urgent_then_fatal_and_close(
                 Err(WriteErr::Closed) => { socket_closed = true; }
             }
         } else if let Ok(mut val) = stop_out_rx.try_recv() {
-            let r = urgent_rem();
-            if r.is_zero() { break; }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
             if matches!(
                 write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await,

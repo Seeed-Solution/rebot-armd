@@ -5035,15 +5035,15 @@ impl TerminalBroadcaster {
             return false;
         }
         let cap = g.capacity;
-        let seen_cap = cap.max(128);
         let mut enqueued = false;
         for q in &mut g.sinks {
             if q.seen.contains(&action.id) {
                 continue;
             }
-            if q.fifo.len() >= cap {
-                continue;
-            }
+            // Never drop or skip a finished action's terminal even if `q.fifo.len() >= cap`:
+            // `can_start_action` refuses NEW starts with `TERMINALS_BUSY` once `len >= cap`,
+            // while any already-running action's terminal is preserved in strict FIFO order.
+            let seen_cap = cap.max(128).max(q.fifo.len() + 1);
             if q.seen.len() >= seen_cap {
                 q.seen.pop_front();
             }
@@ -5096,17 +5096,21 @@ impl TerminalBroadcaster {
             return;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.sinks.retain_mut(|q| {
-            while let Some(finished) = q.fifo.pop_front() {
+        // Pop a terminal ONLY after its sink confirms a successful enqueue. On failure
+        // (e.g., outbound queue full -> fatal close triggered), keep the terminal at the
+        // head of the FIFO and keep the subscriber until connection teardown unsubscribes it.
+        for q in &mut g.sinks {
+            while let Some(finished) = q.fifo.front() {
                 let mut obs = base_obs.clone();
-                obs.action = Some(finished);
+                obs.action = Some(finished.clone());
                 obs.previous_action = None;
-                if !(q.sink)(&obs) {
-                    return false;
+                if (q.sink)(&obs) {
+                    q.fifo.pop_front();
+                } else {
+                    break;
                 }
             }
-            true
-        });
+        }
         self.recompute_atomics(&g);
     }
 
@@ -7307,5 +7311,58 @@ mod observation_snapshot_tests {
         drop(guard);
         let outcome = stop_task.await.unwrap();
         assert!(matches!(outcome, crate::rt_core::urgent::UrgentStopOutcome::Applied { stop_generation: 1, .. }));
+    }
+
+    #[test]
+    fn terminal_broadcaster_never_skips_or_pops_on_full_fifo_or_failed_enqueue() {
+        let tb = TerminalBroadcaster::default();
+        tb.set_capacity(2);
+        let accept = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let accept_c = Arc::clone(&accept);
+        let delivered_c = Arc::clone(&delivered);
+        let sub_id = tb.subscribe(Box::new(move |obs| {
+            if !accept_c.load(Ordering::SeqCst) {
+                return false;
+            }
+            if let Some(a) = obs.action.as_ref() {
+                delivered_c.lock().unwrap().push(a.id);
+            }
+            true
+        }));
+        let mut factory = SupervisorInner::new(ArmConfig::rebot_dm());
+        let mut mk_done = || {
+            let id = factory.begin_action("jog", None);
+            factory.finish_action(id, "done", None, None, None, None, None);
+            factory.last_action.clone().unwrap()
+        };
+        let a1 = mk_done();
+        let a2 = mk_done();
+        let a3 = mk_done();
+        assert!(tb.can_start_action(false, false));
+        assert!(tb.record_finished(&a1));
+        assert!(tb.record_finished(&a2));
+        // FIFO is now at capacity (2/2): NEW starts must be refused (`TERMINALS_BUSY`).
+        assert!(!tb.can_start_action(false, false));
+        assert!(!tb.can_start_action(false, true));
+        // An already-running action finishing while FIFO is full MUST NOT be skipped/dropped.
+        assert!(tb.record_finished(&a3));
+        assert_eq!(tb.pending_total(), 3);
+        assert!(!tb.can_start_action(false, false));
+
+        // Sink rejects (outbound queue full): drain_all MUST NOT pop action 1 and MUST NOT remove
+        // the subscriber.
+        let base_obs = factory.current_observation();
+        tb.drain_all(&base_obs);
+        assert_eq!(tb.pending_total(), 3, "failed enqueue must not pop terminal or drop subscriber");
+        assert!(delivered.lock().unwrap().is_empty());
+
+        // Once sink accepts again, all 3 terminals pop and deliver in exact FIFO order.
+        accept.store(true, Ordering::SeqCst);
+        tb.drain_all(&base_obs);
+        assert_eq!(tb.pending_total(), 0);
+        assert_eq!(*delivered.lock().unwrap(), vec![a1.id, a2.id, a3.id]);
+        assert!(tb.can_start_action(false, false));
+        tb.unsubscribe(sub_id);
     }
 }
