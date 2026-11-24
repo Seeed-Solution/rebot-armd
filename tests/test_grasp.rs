@@ -404,7 +404,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
             arm.0.lock().unwrap().q = q;
             inner.driver = Some(std::sync::Mutex::new(Box::new(arm.clone())));
         }
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.commanded_positions = q.to_vec();
         inner.measured_positions = q.to_vec();
         inner.target_positions = q.to_vec();
@@ -719,7 +719,7 @@ async fn grasp_superseded_by_jog() {
         let mut inner = rig.sup.inner().write().await;
         let mut q = inner.commanded_positions.clone();
         q[0] += 0.02;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, q, None, None)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, None, None)) } }.unwrap();
     }).await;
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("cancelled", Some("SUPERSEDED")), "{a:?}");
 }
@@ -732,7 +732,7 @@ async fn grasp_rejects_servo_frames_while_running() {
     let mut inner = rig.sup.inner().write().await;
     let q = inner.commanded_positions.clone();
     let epoch = inner.safety.epoch_id();
-    assert_eq!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, q, epoch)) } }, Err(armd::SafetyError::MotionBusy));
+    assert_eq!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, q, epoch)) } }, Err(armd::SafetyError::MotionBusy));
 }
 
 // ---- WS: ack, lease loss, workspace rejection, setup ----
@@ -1031,7 +1031,7 @@ fn camera_tilt_change_is_busy_while_a_macro_runs() {
     let mut inner = common::sim_at(ArmConfig::rebot_dm(), &common::INSPECT);
     inner.set_grasp_setup(GraspSetup::default());
     let input = inner.plan_input().unwrap();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_macro(__a, "grasp", &input, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_macro(__a, "grasp", &input, None)) } }.unwrap();
     let err = grasp::update_setup(&mut inner, &json!({"camera_tilt_deg": 25.0})).unwrap_err();
     assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("MOTION_BUSY"));
     assert_eq!(inner.config.camera_mount.tilt_deg, 0.0);

@@ -106,7 +106,7 @@ fn rig_with(config: ArmConfig, load: Load) -> (SupervisorInner, Arc<Mutex<Rig>>)
     let mut inner = SupervisorInner::new(config).with_driver(Box::new(RigDriver(rig.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     (inner, rig)
 }
 
@@ -182,7 +182,7 @@ fn incident_profile_breaks_the_finger_without_the_cap() {
     if let Some(p) = config.gripper_policy.as_mut() { p.max_close_torque_nm = None; p.contact_torque_nm = None; }
     let (mut inner, rig) = rig_with(config, Load::Incident);
     let epoch = inner.safety.epoch_id();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, close(true), epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close(true), epoch)) } }.unwrap();
     let a = run(&mut inner, id, 12.0);
     let r = rig.lock().unwrap();
     eprintln!("no cap: peak {:.3} N·m, broke {}, holding {:?}", r.peak_tau, r.broke, a.holding);
@@ -194,7 +194,7 @@ fn incident_profile_breaks_the_finger_without_the_cap() {
 fn incident_grasp_latches_at_the_cap_and_holds() {
     let (mut inner, rig) = rig(Load::Incident);
     let epoch = inner.safety.epoch_id();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, close(true), epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close(true), epoch)) } }.unwrap();
     let a = run(&mut inner, id, 12.0);
     let (peak, broke) = { let r = rig.lock().unwrap(); (r.peak_tau, r.broke) };
     eprintln!("incident grasp: peak {peak:.3} N·m, J7 {:.3} rad, holding {:?}", inner.measured_positions[6], a.holding);
@@ -216,7 +216,7 @@ fn incident_grasp_latches_at_the_cap_and_holds() {
 fn incident_close_without_grasp_detection_stops_at_the_cap() {
     let (mut inner, rig) = rig(Load::Incident);
     let epoch = inner.safety.epoch_id();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, close(false), epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close(false), epoch)) } }.unwrap();
     let a = run(&mut inner, id, 12.0);
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
     { let r = rig.lock().unwrap(); assert!(!r.broke && r.peak_tau < cap() + CAP_MARGIN_NM, "peak {:.3} N·m", r.peak_tau); }
@@ -240,7 +240,7 @@ fn incident_servo_stream_is_capped() {
     for _ in 0..(8.0 / DT) as usize {
         g = (g + DT as f32).min(0.0);
         target[6] = g;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap();
         inner.tick(DT);
     }
     let r = rig.lock().unwrap();
@@ -266,7 +266,7 @@ fn incident_joint_move_is_capped() {
     let mut target = INSPECT.to_vec();
     target[6] = 0.0;
     armd::poses::save(&mut inner, &serde_json::json!({"name": "closed", "positions": target})).unwrap();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.move_to_pose(__a, "closed", true, 1.0, None, epoch)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::move_to_pose(__a, "closed", true, 1.0, None, epoch)) } }.unwrap();
     for _ in 0..(10.0 / DT) as usize { inner.tick(DT); }
     let r = rig.lock().unwrap();
     assert!(!r.broke, "finger broke");
@@ -280,7 +280,7 @@ fn stiff_object_still_holding_under_the_cap() {
     for stiffness in [3.0_f32, 10.0, 30.0] {
         let (mut inner, rig) = rig(Load::Rigid(-2.0, stiffness));
         let epoch = inner.safety.epoch_id();
-        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, close(true), epoch)) } }.unwrap();
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close(true), epoch)) } }.unwrap();
         let a = run(&mut inner, id, 12.0);
         assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "stiffness {stiffness}: {a:?}");
         reset_stats(&rig);
@@ -295,7 +295,7 @@ fn stiff_object_still_holding_under_the_cap() {
 fn free_close_reaches_closed() {
     let (mut inner, rig) = rig(Load::Free);
     let epoch = inner.safety.epoch_id();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, close(true), epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close(true), epoch)) } }.unwrap();
     let a = run(&mut inner, id, 12.0);
     assert_eq!((a.state.as_str(), a.holding), ("done", Some(false)), "{a:?}");
     assert!(inner.measured_positions[6] > -0.1, "J7 {}", inner.measured_positions[6]);
@@ -310,7 +310,7 @@ fn open_is_unaffected() {
     jaw_closed(&mut inner, &rig);
     let epoch = inner.safety.epoch_id();
     let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(10.0), tag: None };
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, open, epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, open, epoch)) } }.unwrap();
     let a = run(&mut inner, id, 12.0);
     assert_eq!(a.state, "done", "{a:?}");
     assert!((inner.measured_positions[6] - GripperPolicy::rebot_dm().open_rad).abs() < 0.05);
@@ -328,7 +328,7 @@ fn gripper_motion(inner: &SupervisorInner) -> Option<&armd::motion::GripperMotio
 /// contact was detected).
 fn grasp_tracking_contact(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>) -> (armd::motion::ActionStatus, Option<f32>, Option<f32>, f32) {
     let epoch = inner.safety.epoch_id();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, close(true), epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close(true), epoch)) } }.unwrap();
     let (mut contact, mut stop) = (None, None);
     for _ in 0..(12.0 / DT) as usize {
         inner.tick(DT);
@@ -440,7 +440,7 @@ fn blocked_servo_stream_lead_is_capped() {
     target[6] = 0.0;
     reset_stats(&rig);
     for _ in 0..(6.0 / DT) as usize {
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap();
         inner.tick(DT);
     }
     let r = rig.lock().unwrap();
@@ -454,7 +454,7 @@ fn blocked_servo_stream_lead_is_capped() {
 fn lead_cap_leaves_free_motion_alone() {
     let (mut inner, rig) = rig(Load::Free);
     let epoch = inner.safety.epoch_id();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, close(false), epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close(false), epoch)) } }.unwrap();
     let a = run(&mut inner, id, 12.0);
     assert_eq!(a.state, "done", "{a:?}");
     assert!(inner.measured_positions[6] > -0.06);
@@ -468,7 +468,7 @@ fn open_command_ramps() {
     jaw_closed(&mut inner, &rig);
     let epoch = inner.safety.epoch_id();
     let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(10.0), tag: None };
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, open, epoch)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, open, epoch)) } }.unwrap();
     for _ in 0..5 { inner.tick(DT); }
     assert!(inner.commanded_positions[6] > -0.2, "J7 command {}", inner.commanded_positions[6]);
 }
@@ -486,7 +486,7 @@ mod policy_stream {
         inner.lease_enabled = true;
         let gen = inner.acquire_lease("policy-rig").unwrap();
         let epoch = inner.safety.epoch_id();
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch, connection_id: "policy-rig".into(), lease_generation: gen, policy_id: "rig".into(),
             artifact_digest: "0".repeat(64), backend: "mlp".into(), mode: PolicyMode::Live, sim_only: false,
             max_first_step_rad: None, max_step_rad: None, tag: None, i_am_at_the_arm: false, verified_release_gate: None,
@@ -577,7 +577,7 @@ fn close_stream(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>, speed: f32, 
         if t >= next_frame - 1e-9 {
             next_frame += 1.0 / 30.0;
             target[6] = (INSPECT[6] + speed * t as f32).min(0.0);
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap();
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap();
         }
         inner.tick(DT);
         t += DT;
@@ -676,15 +676,15 @@ fn open_after_stream_hold_is_immediate() {
         let hold = inner.commanded_positions[6];
         let mut target = INSPECT.to_vec();
         target[6] = -3.0;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap();
         assert!(!inner.gripper_stalled, "an open frame releases the latch");
         // the jerk-limited stepper reverses within a few ticks (it may still creep closed at
         // 0.02 rad/s under the contact regulator): 3 ticks = 60 ms
         for _ in 0..3 { inner.tick(DT); }
         assert!(inner.commanded_positions[6] < hold - 1e-4, "command {} hold {hold}", inner.commanded_positions[6]);
-        for _ in 0..7 { { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap(); inner.tick(DT); }
+        for _ in 0..7 { { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap(); inner.tick(DT); }
         assert!(inner.commanded_positions[6] < hold - 0.05, "after 0.2 s (jerk-limited start): command {} hold {hold}", inner.commanded_positions[6]);
-        for _ in 0..100 { { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap(); inner.tick(DT); }
+        for _ in 0..100 { { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap(); inner.tick(DT); }
         assert!((rig.lock().unwrap().q[6] + 3.0).abs() < 0.05, "J7 {}", rig.lock().unwrap().q[6]);
     }
 }
@@ -699,7 +699,7 @@ fn small_open_keeps_the_stream_latch() {
     let hold = inner.commanded_positions[6];
     let mut target = INSPECT.to_vec();
     target[6] = hold - 0.5 * armd::supervisor::GRIPPER_FORCE_RELEASE_MARGIN_RAD;
-    for _ in 0..20 { { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap(); inner.tick(DT); }
+    for _ in 0..20 { { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap(); inner.tick(DT); }
     assert!(inner.gripper_stalled && inner.gripper_force_capped);
     assert!((inner.commanded_positions[6] - hold).abs() < 1e-5);
 }
@@ -735,7 +735,7 @@ fn rigid_policy_stream_is_regulated() {
         inner.lease_enabled = true;
         let gen = inner.acquire_lease("policy-rig").unwrap();
         let epoch = inner.safety.epoch_id();
-        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch, connection_id: "policy-rig".into(), lease_generation: gen, policy_id: "rig".into(),
             artifact_digest: "0".repeat(64), backend: "mlp".into(), mode: PolicyMode::Live, sim_only: false,
             max_first_step_rad: None, max_step_rad: None, tag: None, i_am_at_the_arm: false, verified_release_gate: None,
@@ -773,7 +773,7 @@ fn stop_and_estop_end_the_stream_gripper_state() {
             target[6] = g;
             let stamp = inner.current_admission_stamp();
             let admitted = inner.check_admission(stamp).unwrap();
-            inner.servo(admitted, target.clone(), epoch).unwrap();
+            armd::SupervisorInner::servo(admitted, target.clone(), epoch).unwrap();
             inner.tick(DT);
             if inner.gripper_force_trips > 0 { tripped_for += 1; }
             if tripped_for >= 5 { break; }
@@ -841,7 +841,7 @@ fn very_stiff_grasp_stays_under_the_cap_after_the_impact() {
         let epoch = inner.safety.epoch_id();
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
-        let (id, _) = inner.start_gripper(admitted, close(true), epoch).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper(admitted, close(true), epoch).unwrap();
         let a = run(&mut inner, id, 12.0);
         for _ in 0..100 { inner.tick(DT); }
         let (impact, after, n) = post_impact(&rig);
@@ -898,7 +898,7 @@ fn third_cap_trip_stops_the_stream() {
         target = t.clone();
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
-        inner.servo(admitted, t, epoch).unwrap();
+        armd::SupervisorInner::servo(admitted, t, epoch).unwrap();
         inner.tick(DT);
     };
     while inner.gripper_force_trips == 0 { g = (g + DT as f32).min(0.0); send(&mut inner, g); }
@@ -933,7 +933,7 @@ fn stop_during_a_gripper_action_holds_the_measured_jaw() {
         let epoch = inner.safety.epoch_id();
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
-        let (_id, _) = inner.start_gripper(admitted, close(false), epoch).unwrap();
+        let (_id, _) = armd::SupervisorInner::start_gripper(admitted, close(false), epoch).unwrap();
         let mut lead = 0.0;
         for _ in 0..(10.0 / DT) as usize {
             inner.tick(DT);

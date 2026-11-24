@@ -275,7 +275,7 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
     let (id, duration) = {
         let mut inner = supervisor.inner().write().await;
         let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-        let id = inner.begin_macro(admitted, "place", &planned.input, planned.request.tag.clone())?;
+        let id = SupervisorInner::begin_macro(admitted, "place", &planned.input, planned.request.tag.clone())?;
         if planned.orientation_levelled {
             inner.update_action(id, |a| {
                 a.orientation = Some("levelled".into());

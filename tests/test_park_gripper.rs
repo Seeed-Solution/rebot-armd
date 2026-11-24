@@ -14,7 +14,7 @@ const MOCK_K: f32 = 2.0;
 fn sim_holding(q: [f32; 7]) -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();

@@ -342,6 +342,9 @@ impl From<ArmError> for ApiError {
                 crate::safety::SafetyError::TerminalsBusy => {
                     ApiError(StatusCode::SERVICE_UNAVAILABLE, safety_err.to_string(), "TERMINALS_BUSY".to_string())
                 }
+                crate::safety::SafetyError::StampAlreadyConsumed => {
+                    ApiError(StatusCode::CONFLICT, safety_err.to_string(), "STAMP_REUSED".to_string())
+                }
                 _ => ApiError(StatusCode::BAD_REQUEST, safety_err.to_string(), "SAFETY_ERROR".to_string()),
             },
             ArmError::Trajectory(traj_err) => {

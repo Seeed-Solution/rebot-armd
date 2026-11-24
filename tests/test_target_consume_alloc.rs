@@ -53,7 +53,7 @@ const CONN: &str = "conn-alloc";
 fn supervisor() -> (SupervisorInner, u64) {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.tick(0.02);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     let gen = inner.acquire_lease(CONN).expect("lease");
     (inner, gen)
 }
@@ -72,7 +72,7 @@ fn frame(inner: &SupervisorInner, stream: StreamId, authority: Authority, policy
 #[test]
 fn consuming_servo_targets_does_not_allocate_in_steady_streaming() {
     let (mut inner, gen) = supervisor();
-    { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); inner.authorize_servo_stream(a, gen).unwrap(); }
+    { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); armd::SupervisorInner::authorize_servo_stream(a, gen).unwrap(); }
     let stream = inner.core.target_authority().stream.expect("authorized");
     let base = inner.commanded_positions.clone();
     let now = Instant::now();
@@ -115,7 +115,7 @@ fn consuming_live_policy_targets_does_not_allocate_in_steady_streaming() {
     use armd::policy_runtime::{PolicyMode, PolicyRunStart};
     let (mut inner, gen) = supervisor();
     let epoch = inner.safety.epoch_id();
-    let action_id = { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); inner.begin_policy_run(a, PolicyRunStart {
+    let action_id = { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); armd::SupervisorInner::begin_policy_run(a, PolicyRunStart {
         epoch_id: epoch, connection_id: CONN.into(), lease_generation: gen, policy_id: "p".into(), artifact_digest: "d".into(),
         backend: "mlp".into(), mode: PolicyMode::Live, sim_only: false, max_first_step_rad: None, max_step_rad: None, tag: None,
         i_am_at_the_arm: false, verified_release_gate: None,
@@ -144,7 +144,7 @@ fn consuming_live_policy_targets_does_not_allocate_in_steady_streaming() {
 #[test]
 fn a_stop_and_the_next_servo_target_do_not_touch_the_allocator() {
     let (mut inner, gen) = supervisor();
-    { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); inner.authorize_servo_stream(a, gen).unwrap(); }
+    { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); armd::SupervisorInner::authorize_servo_stream(a, gen).unwrap(); }
     let stream = inner.core.target_authority().stream.expect("authorized");
     let base = inner.commanded_positions.clone();
     let now = Instant::now();

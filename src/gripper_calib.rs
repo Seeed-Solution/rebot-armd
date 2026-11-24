@@ -422,8 +422,9 @@ pub fn strokes(close_speed: f64) -> Vec<Stroke> {
 /// CALIBRATION_MAX_TORQUE_FRACTION x cap, and every bin within the profile of the earlier
 /// strokes; otherwise the action fails CALIBRATION_OBSTRUCTED and the baseline stays as it was.
 /// When all strokes pass, the baseline is replaced by the one learned from them.
-pub fn begin_calibration(inner: &mut SupervisorInner, admitted: crate::supervisor::Admitted, sup: &std::sync::Arc<ArmSupervisor>, epoch: u64, tag: Option<String>) -> Result<(u64, f64), ArmError> {
-    let stamp = inner.verify_admitted(&admitted)?;
+pub fn begin_calibration(admitted: crate::supervisor::Admitted<'_>, sup: &std::sync::Arc<ArmSupervisor>, epoch: u64, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+    let (inner, proof) = admitted.consume()?;
+    let stamp = proof.stamp();
     let (Some(_), Some(policy)) = (inner.config.gripper_index(), inner.config.gripper_policy.clone()) else {
         return Err(MotionError::Unsupported("Gripper calibration needs a profile with a gripper joint and policy".into()).into());
     };
@@ -431,7 +432,7 @@ pub fn begin_calibration(inner: &mut SupervisorInner, admitted: crate::superviso
     if !torque_feedback {
         return Err(MotionError::Unsupported("Gripper calibration needs torque feedback".into()).into());
     }
-    let id = inner.begin_orchestrated_action(admitted, "gripper_calibrate", tag, epoch)?;
+    let id = inner.begin_orchestrated_action_inner(&proof, "gripper_calibrate", tag, epoch)?;
     let list = strokes(inner.effective_planned_close_speed());
     inner.gripper_calibration = Some(crate::supervisor::GripperCalibrationRun { id, records: Vec::with_capacity(list.len() + 2) });
     let span = f64::from((policy.open_rad - policy.closed_rad).abs());
@@ -456,7 +457,7 @@ pub async fn start_calibration(
     let mut inner = sup.inner().write().await;
     let epoch = inner.safety.epoch_id();
     let admitted = inner.check_admission(stamp)?;
-    begin_calibration(&mut inner, admitted, sup, epoch, None)
+    begin_calibration(admitted, sup, epoch, None)
 }
 
 async fn run_calibration(
@@ -526,12 +527,14 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
             let mut inner = ctx.sup.inner().write().await;
             if !inner.macro_alive(ctx.id) { return Err(crate::macro_action::Stop::Cancelled); }
             let before = inner.gripper_calibration.as_ref().map_or(0, |c| c.records.len());
-            let admitted = inner
-                .check_admission(ctx.stamp)
-                .map_err(|e| ctx.map_install_err(&mut inner, e.into()))?;
-            let (duration, timeout_s, is_pos_force_close) = inner
-                .start_macro_gripper_learning_within(admitted, ctx.id, request, crate::motion::LearnMode::Calibration, None, false)
-                .map_err(|e| ctx.map_install_err(&mut inner, e))?;
+            let admitted = match inner.check_admission(ctx.next_child_stamp()) {
+                Ok(a) => a,
+                Err(e) => return Err(ctx.map_install_err(&mut inner, e.into())),
+            };
+            let (duration, timeout_s, is_pos_force_close) = SupervisorInner::start_macro_gripper_learning_within(
+                admitted, ctx.id, request, crate::motion::LearnMode::Calibration, None, false,
+            )
+            .map_err(|e| ctx.map_install_err(&mut inner, e))?;
             let limit_s = if is_pos_force_close { timeout_s + 10.0 } else { duration + 10.0 };
             let ticket = ctx.arm_child(&mut inner, &phase, limit_s);
             (ticket, before)

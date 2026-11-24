@@ -1560,7 +1560,7 @@ fn bounded_clear_fault_budgeted_deadlines_flush_estop_and_latch_preservation() {
 
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2));
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     // Inject motor 0 over-temperature error and poll -> latches hardware fault.
     raw_bus2.with(|s| {
         s.motors[0].state_override = Some(0x0A);
@@ -1720,7 +1720,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(60)).await;
     let mut saw_motion_leg = false;
@@ -1752,7 +1752,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     }
     let h_wd = sup_wd
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
@@ -1850,7 +1850,7 @@ async fn prepare_zero_check_supervisor(path: std::path::PathBuf) -> (Arc<ArmSupe
     let action_id = {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
@@ -1860,7 +1860,7 @@ async fn prepare_zero_check_supervisor(path: std::path::PathBuf) -> (Arc<ArmSupe
         inner.gripper_calib_path = Some(path);
         inner.set_mock_gripper_stall_offset(Some(0.05));
         let epoch = inner.safety.epoch_id();
-        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper_zero_check(__a, &json!({"threshold_rad": 0.10, "store_offset": true}), epoch)) } }
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check(__a, &json!({"threshold_rad": 0.10, "store_offset": true}), epoch)) } }
             .unwrap();
         id
     };
@@ -2119,7 +2119,7 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     // (i) Persistence saturation / unavailable fails immediately with PERSIST_FAILED and no stranding.
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.measured_positions = INSPECT.to_vec();
     inner.commanded_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
@@ -2131,7 +2131,7 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     inner.persist_capacity_available = false;
     let rev_before = ConfigAuthority::revision(&inner, ConfigDomain::GripperCalibration);
     let ep = inner.safety.epoch_id();
-    let (sat_id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper_zero_check(__a, &json!({"threshold_rad": 0.10, "store_offset": true}), ep)) } }
+    let (sat_id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check(__a, &json!({"threshold_rad": 0.10, "store_offset": true}), ep)) } }
         .unwrap();
     for _ in 0..200 {
         inner.tick(0.02);
@@ -2584,7 +2584,7 @@ async fn two_phase_persistence_rechecks_operator_auth_before_rename_and_drops_pa
     let id_a = {
         let mut inner = sup_a.inner().write().await;
         inner.lease_enabled = false;
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
@@ -2594,7 +2594,7 @@ async fn two_phase_persistence_rechecks_operator_auth_before_rename_and_drops_pa
         inner.gripper_calib_path = Some(path_a.clone());
         inner.set_mock_gripper_stall_offset(Some(0.05));
         let epoch = inner.safety.epoch_id();
-        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper_zero_check_with_auth(__a,
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check_with_auth(__a,
                 &json!({"threshold_rad": 0.10, "store_offset": true}),
                 epoch,
                 Some((auth.clone(), Some(token.clone()))),
@@ -2900,7 +2900,7 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
         match case {
             "idle" => {}
             "armed" => {
-                { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+                { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
             }
             "estop" => {
                 inner.safety.trigger_e_stop();
@@ -3293,7 +3293,7 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
 fn superseded_install_delivers_terminal_and_ack_strictly_after_publish() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(0.02);
 
     let (mut engine, mut broker, _tw, _stop) =

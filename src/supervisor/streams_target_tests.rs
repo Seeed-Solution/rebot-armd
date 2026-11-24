@@ -33,12 +33,12 @@ fn rig() -> Rig {
     inner.tick(0.02);
     let stamp = inner.current_admission_stamp();
     let admitted = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(admitted).expect("arm");
+    SupervisorInner::enable_torque(admitted).expect("arm");
     let gen = inner.acquire_lease(CONN).expect("lease");
     // the connection got the lease: its servo stream is the one consumed
     let st = inner.current_admission_stamp();
     let adm = inner.check_admission(st).unwrap();
-    inner.authorize_servo_stream(adm, gen).expect("authorize servo stream");
+    SupervisorInner::authorize_servo_stream(adm, gen).expect("authorize servo stream");
     let (fx, broker, tw, stop) = ReleaseFixture::new(inner, BOOT, Capacities::default());
     let mut stream = ServoStream::new();
     stream.lease_granted(gen);
@@ -147,7 +147,7 @@ fn frames_of_a_stream_that_is_not_authorized_are_refused_and_the_stream_hears_le
     assert_eq!(r.target0(), None);
     let st = r.fx.core.current_admission_stamp();
     let adm = r.fx.core.check_admission(st).unwrap();
-    r.fx.core.authorize_servo_stream(adm, r.gen).expect("authorize");
+    SupervisorInner::authorize_servo_stream(adm, r.gen).expect("authorize");
     assert_eq!(r.servo(Some(2), 0.002), None);
     assert_eq!(r.step_reply(), (None, None));
     assert!(r.target0().is_some());
@@ -267,9 +267,11 @@ fn a_refused_servo_target_gets_the_legacy_reply_fields() {
     // joint 1 far outside its soft limit
     assert_eq!(r.servo(Some(1), 100.0), None);
     let (refusal, reply) = r.step_reply();
+    let twin_q = twin.pose(100.0);
+    let twin_ep = twin.epoch();
     let twin_stamp = twin.fx.core.current_admission_stamp();
     let twin_adm = twin.fx.core.check_admission(twin_stamp).unwrap();
-    let legacy = crate::api::rest::ApiError::from(ArmError::from(twin.fx.core.servo(twin_adm, twin.pose(100.0), twin.epoch()).unwrap_err()));
+    let legacy = crate::api::rest::ApiError::from(ArmError::from(SupervisorInner::servo(twin_adm, twin_q, twin_ep).unwrap_err()));
     let reply = reply.unwrap();
     assert_eq!(refusal, Some(Refusal { code: "SOFT_LIMIT_EXCEEDED", detail: RefusalDetail::Limit { joint: Some(0) } }));
     assert_eq!(
@@ -296,10 +298,12 @@ mod policy {
     use crate::policy_runtime::{PolicyMode, PolicyRunStart};
 
     fn begin(r: &mut Rig, mode: PolicyMode) -> u64 {
+        let ep = r.epoch();
+        let gen = r.gen;
         let stamp = r.fx.core.current_admission_stamp();
         let admitted = r.fx.core.check_admission(stamp).unwrap();
-        r.fx.core.begin_policy_run(admitted, PolicyRunStart {
-            epoch_id: r.epoch(), connection_id: CONN.into(), lease_generation: r.gen, policy_id: "p".into(),
+        SupervisorInner::begin_policy_run(admitted, PolicyRunStart {
+            epoch_id: ep, connection_id: CONN.into(), lease_generation: gen, policy_id: "p".into(),
             artifact_digest: "d".into(), backend: "mlp".into(), mode, sim_only: false, max_first_step_rad: None,
             max_step_rad: None, tag: None, i_am_at_the_arm: false, verified_release_gate: None,
         }).expect("policy run")

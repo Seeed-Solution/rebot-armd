@@ -226,7 +226,7 @@ fn supervisor(with_driver: bool) -> SupervisorInner {
     }
     inner.lease_enabled = false;
     inner.tick(0.02);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     warm(&mut inner, 5);
     inner
 }
@@ -261,7 +261,7 @@ fn scenarios(with_driver: bool) {
     q[0] += 0.4;
     q[2] -= 0.3;
     let epoch = inner.safety.epoch_id();
-    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.jog(a, q, Some(2.0), Some(epoch)) }.expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, q, Some(2.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     assert!(inner.active_trajectory.is_some());
     assert_zero(&format!("{tag} quintic"), &count_ticks(&mut inner, 50, |_, _| {}));
@@ -274,14 +274,14 @@ fn scenarios(with_driver: bool) {
     for i in 0..10 {
         let mut t = base.clone();
         t[0] += 0.002 * i as f32;
-        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.servo(a, t, epoch) }.unwrap();
+        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::servo(a, t, epoch) }.unwrap();
         warm(&mut inner, 1);
     }
     let targets: Vec<Vec<f32>> = (10..60).map(|i| { let mut t = base.clone(); t[0] += 0.002 * i as f32; t }).collect();
     let mut targets = targets.into_iter();
     let mut servo_counts = Vec::new();
     for _ in 0..50 {
-        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.servo(a, targets.next().unwrap(), epoch) }.unwrap();
+        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::servo(a, targets.next().unwrap(), epoch) }.unwrap();
         servo_counts.push(tick_counted(&mut inner));
     }
     assert_zero(&format!("{tag} servo stream"), &servo_counts);
@@ -289,11 +289,11 @@ fn scenarios(with_driver: bool) {
     // gripper close (from fully open, slowly)
     let mut inner = supervisor(with_driver);
     let epoch = inner.safety.epoch_id();
-    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.start_gripper(a, GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 2.0, timeout_s: None, tag: None }, epoch) }
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::start_gripper(a, GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 2.0, timeout_s: None, tag: None }, epoch) }
         .expect("gripper open");
     for _ in 0..200 { if inner.active_trajectory.is_none() { break; } warm(&mut inner, 1); }
     assert!(inner.active_trajectory.is_none(), "gripper open finished");
-    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.start_gripper(a, GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 0.3, timeout_s: None, tag: None }, epoch) }
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::start_gripper(a, GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 0.3, timeout_s: None, tag: None }, epoch) }
         .expect("gripper close");
     warm(&mut inner, 5);
     assert!(inner.active_trajectory.is_some());
@@ -315,7 +315,7 @@ fn scenarios(with_driver: bool) {
     let mut q = inner.commanded_positions.clone();
     q[1] += 0.3;
     let epoch = inner.safety.epoch_id();
-    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.jog(a, q, Some(2.0), Some(epoch)) }.expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, q, Some(2.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     let counts = count_ticks(&mut inner, 50, |inner, i| {
         // the dispatcher drains the ring off the control thread
@@ -367,7 +367,7 @@ fn ticks_do_not_touch_the_allocator_with_stalled_readers_and_dispatcher() {
     let mut q = inner.commanded_positions.clone();
     q[1] += 0.3;
     let epoch = inner.safety.epoch_id();
-    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.jog(a, q, Some(8.0), Some(epoch)) }.expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, q, Some(8.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     let hub = inner.core.hub().clone();
     let ring = inner.core.record_ring().unwrap().clone();
@@ -452,7 +452,7 @@ fn observation_stop_reason_and_phase_transitions_do_not_touch_the_allocator() {
     let mut inner = supervisor(false);
     let gen = inner.acquire_lease("alloc").expect("lease");
     let epoch = inner.safety.epoch_id();
-    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.begin_policy_run(a, PolicyRunStart {
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::begin_policy_run(a, PolicyRunStart {
         epoch_id: epoch, connection_id: "alloc".into(), lease_generation: gen, policy_id: "p".into(), artifact_digest: "d".into(),
         backend: "mlp".into(), mode: PolicyMode::Shadow, sim_only: false, max_first_step_rad: None, max_step_rad: None, tag: None,
         i_am_at_the_arm: false, verified_release_gate: None,
@@ -614,10 +614,10 @@ fn watchdog_park_supervisor() -> SupervisorInner {
     });
     let mut inner = SupervisorInner::new(cfg);
     inner.tick(0.02);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     let _gen = inner.acquire_lease("client").expect("lease");
     let epoch = inner.safety.epoch_id();
-    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.jog(a, vec![0.5, 0.2], Some(0.2), Some(epoch)) }.expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, vec![0.5, 0.2], Some(0.2), Some(epoch)) }.expect("jog");
     for _ in 0..40 {
         inner.active_lease.as_mut().unwrap().acquired_at = Instant::now();
         inner.last_heartbeat = Instant::now();
@@ -658,7 +658,7 @@ fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
     let mut idle = supervisor(false);
     let q = idle.commanded_positions.clone();
     let ep = idle.safety.epoch_id();
-    { let a = idle.check_admission(idle.current_admission_stamp()).unwrap(); idle.servo(a, q, ep) }.expect("servo");
+    { let a = idle.check_admission(idle.current_admission_stamp()).unwrap(); armd::SupervisorInner::servo(a, q, ep) }.expect("servo");
     let (stopped_idle, a2, f2) = counted(|| idle.authorized_stop());
     assert!(stopped_idle);
     assert_eq!((a2, f2), (0, 0), "idle/servo authorized_stop touched allocator");
@@ -891,12 +891,13 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
 
     // 3. In-place path and replay target activation perform (0, 0) allocs/frees.
     let epoch = fx.core.safety.epoch_id();
-    let stamp = fx.core.current_admission_stamp();
+    let stamp1 = fx.core.current_admission_stamp();
+    let stamp2 = fx.core.current_admission_stamp();
     let (res, a_act, f_act) = counted(|| {
-        let admitted1 = fx.core.check_admission(stamp).unwrap();
-        let d1 = fx.core.start_path_motion_slice(admitted1, epoch, &goal[..dof], 0.5).unwrap();
-        let admitted2 = fx.core.check_admission(stamp).unwrap();
-        fx.core.start_replay_motion(admitted2, &start[..dof]).unwrap();
+        let admitted1 = fx.core.check_admission(stamp1).unwrap();
+        let d1 = armd::SupervisorInner::start_path_motion_slice(admitted1, epoch, &goal[..dof], 0.5).unwrap();
+        let admitted2 = fx.core.check_admission(stamp2).unwrap();
+        armd::SupervisorInner::start_replay_motion(admitted2, &start[..dof]).unwrap();
         d1
     });
     assert_eq!(res, 0.5);

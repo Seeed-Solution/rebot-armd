@@ -3273,9 +3273,10 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
 
 /// Begin a planned grasp under the write lock: the action record (with its `task`) and the
 /// orchestrator. Returns (action id, expected duration).
-pub fn begin(inner: &mut SupervisorInner, admitted: crate::supervisor::Admitted, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
-    let stamp = admitted.stamp();
-    let id = inner.begin_macro(admitted, "grasp", &planned.input, planned.request.tag.clone())?;
+pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
+    let (inner, proof) = admitted.consume()?;
+    let stamp = proof.stamp();
+    let id = inner.begin_macro_inner(&proof, "grasp", &planned.input, planned.request.tag.clone())?;
     if let Some(task) = &planned.request.task {
         inner.update_action(id, |a| a.task = Some(task.clone()));
     }
@@ -3297,7 +3298,7 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
     preflight(source.as_ref(), &mut planned).await?;
     let mut inner = supervisor.inner().write().await;
     let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-    Ok(begin(&mut inner, admitted, supervisor, source, planned)?)
+    Ok(begin(admitted, supervisor, source, planned)?)
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "grasp", ..)`.
@@ -6143,14 +6144,14 @@ mod tests {
             inner.lease_enabled = false;
             let stamp = inner.current_admission_stamp();
             let admitted = inner.check_admission(stamp).unwrap();
-            inner.enable_torque(admitted).unwrap();
+            SupervisorInner::enable_torque(admitted).unwrap();
             inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.loads = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.35];
             let stamp = inner.current_admission_stamp();
             let plan_in = inner.plan_input().unwrap();
             let admitted = inner.check_admission(stamp).unwrap();
-            (inner.begin_macro(admitted, "grasp", &plan_in, None).unwrap(), stamp)
+            (SupervisorInner::begin_macro(admitted, "grasp", &plan_in, None).unwrap(), stamp)
         };
 
         let source = Arc::new(DummyDetectionSource);

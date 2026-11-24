@@ -178,7 +178,7 @@ fn rig(finger: Finger) -> (SupervisorInner, Arc<Mutex<Rig>>) {
     inner.tick(DT);
     let stamp = inner.current_admission_stamp();
     let admitted = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(admitted).unwrap();
+    armd::SupervisorInner::enable_torque(admitted).unwrap();
     (inner, rig)
 }
 
@@ -192,7 +192,7 @@ fn run_with(inner: &mut SupervisorInner, request: GripperRequest, cmd: GripperBa
     let epoch = inner.safety.epoch_id();
     let stamp = inner.current_admission_stamp();
     let admitted = inner.check_admission(stamp).unwrap();
-    let (id, _) = inner.start_gripper_with_baseline(admitted, request, epoch, cmd).unwrap();
+    let (id, _) = armd::SupervisorInner::start_gripper_with_baseline(admitted, request, epoch, cmd).unwrap();
     for i in 0..(30.0 / DT) as usize {
         inner.tick(DT);
         let a = inner.last_action.clone().unwrap();
@@ -377,7 +377,7 @@ fn old_finger_contact_unchanged_by_the_baseline() {
         let epoch = inner.safety.epoch_id();
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
-        let (id, _) = inner.start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
         let mut first = None;
         loop {
             inner.tick(DT);
@@ -476,7 +476,7 @@ fn reset_happens_only_after_admission() {
     let epoch = inner.safety.epoch_id();
     let stamp = inner.current_admission_stamp();
     let admitted = inner.check_admission(stamp).unwrap();
-    assert!(inner.start_gripper_with_baseline(admitted, req(GripperCommand::Open, None, 1.0), epoch + 1, GripperBaselineCmd::Reset).is_err());
+    assert!(armd::SupervisorInner::start_gripper_with_baseline(admitted, req(GripperCommand::Open, None, 1.0), epoch + 1, GripperBaselineCmd::Reset).is_err());
     assert_eq!(inner.gripper_baseline, before);
     let (a, _) = run_with(&mut inner, req(GripperCommand::Open, None, 1.0), GripperBaselineCmd::Reset);
     assert_eq!(a.state, "done");
@@ -507,7 +507,7 @@ fn slipped_object_is_not_held() {
             let epoch = inner.safety.epoch_id();
             let stamp = inner.current_admission_stamp();
             let admitted = inner.check_admission(stamp).unwrap();
-            let (id, _) = inner.start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
+            let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
             let mut first = None;
             let a = loop {
                 inner.tick(DT);
@@ -639,7 +639,7 @@ async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>
         inner.tick(DT);
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
-        inner.enable_torque(admitted).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
     }
     let ticker = sup.clone();
     tokio::spawn(async move {
@@ -740,7 +740,7 @@ fn gripper_zero_change_invalidates_the_baseline() {
     inner.tick(DT);
     let stamp = inner.current_admission_stamp();
     let admitted = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(admitted).unwrap();
+    armd::SupervisorInner::enable_torque(admitted).unwrap();
     // a moved stroke (gripper calibration offset): the next motion starts unlearned
     learn(&mut inner, &rig, 1);
     let p = inner.config.gripper_policy.as_mut().unwrap();
@@ -798,7 +798,7 @@ fn move_that_stops_short_on_an_object_releases_its_lead() {
         let epoch = inner.safety.epoch_id();
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
-        let (id, _) = inner.start_gripper(admitted, req(GripperCommand::Move, Some(0.05), 0.3), epoch).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Move, Some(0.05), 0.3), epoch).unwrap();
         let a = loop {
             inner.tick(DT);
             let a = inner.last_action.clone().unwrap();

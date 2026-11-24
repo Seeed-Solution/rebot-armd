@@ -2420,7 +2420,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         let mut sup = SupervisorInner::new(cfg).with_driver(Box::new(d));
         sup.lease_enabled = false;
         sup.tick(DT);
-        { let __s = sup.current_admission_stamp(); sup.check_admission(__s).and_then(|__a| sup.enable_torque(__a)) }.unwrap();
+        { let __s = sup.current_admission_stamp(); sup.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         sup.tick(DT);
         (sup, inner_bus, clock)
     };
@@ -2445,7 +2445,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         let (mut sup, inner_bus, clock) = make_sup(Some(0.30), -5.7);
         inner_bus.clear_log();
         let epoch = sup.safety.epoch_id();
-        let (id, expected) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a, req.clone(), epoch)) } }.unwrap();
+        let (id, expected) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, req.clone(), epoch)) } }.unwrap();
         assert!(expected >= 5.7 / 0.30, "req={req:?}: expected_duration {expected:.2} s < {:.2} s", 5.7 / 0.30);
         let a = run_to_end(&mut sup, &clock, id, 25.0);
         assert_eq!(a.state, "done", "req={req:?}: {a:?}");
@@ -2464,7 +2464,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
     inner_open.clear_log();
     let epoch = sup.safety.epoch_id();
     let open_req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None };
-    let (id, expected_open) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a, open_req, epoch)) } }.unwrap();
+    let (id, expected_open) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, open_req, epoch)) } }.unwrap();
     assert!(expected_open > 5.7 && expected_open < 8.0, "opening slowed unexpectedly: {expected_open:.2} s");
     let a = run_to_end(&mut sup, &clock, id, 10.0);
     assert_eq!(a.state, "done", "{a:?}");
@@ -2476,7 +2476,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
     let (mut sup, _inner_bus, clock) = make_sup(None, -5.7);
     let epoch = sup.safety.epoch_id();
     let close_req = GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None };
-    let (id, expected_pv) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a, close_req, epoch)) } }.unwrap();
+    let (id, expected_pv) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, close_req, epoch)) } }.unwrap();
     assert!(expected_pv > 5.7 && expected_pv < 8.0, "pos_vel expected_duration changed: {expected_pv:.2} s");
     let a = run_to_end(&mut sup, &clock, id, 10.0);
     assert_eq!(a.state, "done", "{a:?}");
@@ -2488,7 +2488,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
     assert_eq!(damiao::pos_force_vel_raw(0.03), 2);
     let (mut sup_full, _, _) = make_sup(Some(0.03), -5.7);
     let ep_full = sup_full.safety.epoch_id();
-    let (_, expected_full_q) = { let s = sup_full.current_admission_stamp(); { let __s = s; sup_full.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_full.start_gripper(__a,
+    let (_, expected_full_q) = { let s = sup_full.current_admission_stamp(); { let __s = s; sup_full.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
         GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None },
         ep_full,
     )) } }.unwrap();
@@ -2499,7 +2499,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
     let (mut sup_q, inner_q, clock_q) = make_sup(Some(0.03), -0.20);
     inner_q.clear_log();
     let ep_q = sup_q.safety.epoch_id();
-    let (id_q, expected_q) = { let s = sup_q.current_admission_stamp(); { let __s = s; sup_q.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_q.start_gripper(__a,
+    let (id_q, expected_q) = { let s = sup_q.current_admission_stamp(); { let __s = s; sup_q.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
         GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None },
         ep_q,
     )) } }.unwrap();
@@ -2539,7 +2539,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             let ep = sup_bad.safety.epoch_id();
             let prev_targets = sup_bad.target_positions.clone();
             let prev_releasing = sup_bad.releasing;
-            let err = { let s = sup_bad.current_admission_stamp(); { let __s = s; sup_bad.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_bad.start_gripper(__a,
+            let err = { let s = sup_bad.current_admission_stamp(); { let __s = s; sup_bad.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
                 GripperRequest { command: cmd, fraction: None, grasp: false, speed: f64::from(bad_speed), timeout_s: None, tag: None },
                 ep,
             )) } };
@@ -2619,7 +2619,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         let mut goal = sup_qnt.commanded_positions.clone();
         goal[J7] = -0.8;
         inner_qnt.clear_log();
-        let (_, id, _) = { let s = sup_qnt.current_admission_stamp(); { let __s = s; sup_qnt.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_qnt.jog_action(__a, goal, Some(1.0), Some(ep), "jog")) } }.unwrap();
+        let (_, id, _) = { let s = sup_qnt.current_admission_stamp(); { let __s = s; sup_qnt.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, goal, Some(1.0), Some(ep), "jog")) } }.unwrap();
         let a = run_to_end(&mut sup_qnt, &clock_qnt, id, 5.0);
         assert_eq!(a.state, "done", "whole-arm quintic moving J7 failed: {a:?}");
         let qnt_raws: Vec<u16> = j7_commands(&inner_qnt.tx_log()).iter()
@@ -2665,7 +2665,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         inner_g.with(|s| s.motors[J7].stop_at = Some(-0.50));
         inner_g.clear_log();
         let ep = sup_g.safety.epoch_id();
-        let (gid, _) = { let s = sup_g.current_admission_stamp(); { let __s = s; sup_g.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_g.start_gripper(__a,
+        let (gid, _) = { let s = sup_g.current_admission_stamp(); { let __s = s; sup_g.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 0.025, timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();
@@ -2719,7 +2719,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         sup_g.tick(DT);
         inner_g.clear_log();
         let ep_open = sup_g.safety.epoch_id();
-        let (oid, _) = { let s = sup_g.current_admission_stamp(); { let __s = s; sup_g.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_g.start_gripper(__a,
+        let (oid, _) = { let s = sup_g.current_admission_stamp(); { let __s = s; sup_g.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None },
             ep_open,
         )) } }.unwrap();
@@ -2790,7 +2790,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                 *inner = sup_inner;
                 let ep = inner.safety.epoch_id();
                 let stamp = inner.current_admission_stamp();
-                ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
+                ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
             };
             let ctx = armd::macro_action::MacroCtx {
                 sup: sup.clone(),
@@ -2819,7 +2819,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                 *inner = sup_inner2;
                 let ep = inner.safety.epoch_id();
                 let stamp = inner.current_admission_stamp();
-                ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
+                ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
             };
             let ctx2 = armd::macro_action::MacroCtx {
                 sup: sup2.clone(),
@@ -2862,7 +2862,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                     *inner = sup_inner3;
                     let ep = inner.safety.epoch_id();
                     let stamp = inner.current_admission_stamp();
-                    ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
+                    ({ let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep)) }.unwrap(), stamp)
                 };
                 let ctx3 = armd::macro_action::MacroCtx {
                     sup: sup3.clone(),
@@ -2921,7 +2921,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                 let ep = sup_m.safety.epoch_id();
                 let stamp = sup_m.current_admission_stamp();
                 let adm_seq = sup_m.check_admission(stamp).unwrap();
-                let id_m = sup_m.begin_sequence_action(adm_seq, None, ep).unwrap();
+                let id_m = SupervisorInner::begin_sequence_action(adm_seq, None, ep).unwrap();
                 let req = GripperRequest {
                     command: GripperCommand::Close,
                     fraction: None,
@@ -2930,8 +2930,8 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                     timeout_s: None,
                     tag: None,
                 };
-                let adm_g = sup_m.check_admission(stamp).unwrap();
-                sup_m.start_macro_gripper_within(adm_g, id_m, req, Some(60.0), true).unwrap();
+                let adm_g = sup_m.check_admission(stamp.for_macro_child()).unwrap();
+                SupervisorInner::start_macro_gripper_within(adm_g, id_m, req, Some(60.0), true).unwrap();
                 match &sup_m.active_trajectory.as_ref().unwrap().reference {
                     armd::motion::Reference::Gripper(gm) => {
                         assert!((gm.planned_speed - expect_planned).abs() < 1e-9,
@@ -2957,9 +2957,9 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             {
                 let (mut sup_exp, _, _) = make_sup(Some(0.30), -5.7);
                 let ep_exp = sup_exp.safety.epoch_id();
-                let id_exp = { let s = sup_exp.current_admission_stamp(); { let __s = s; sup_exp.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_exp.begin_sequence_action(__a, None, ep_exp)) } }.unwrap();
+                let id_exp = { let s = sup_exp.current_admission_stamp(); { let __s = s; sup_exp.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep_exp)) } }.unwrap();
                 let exp_req = GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
-                { let s = sup_exp.current_admission_stamp(); { let __s = s; sup_exp.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_exp.start_macro_gripper(__a, id_exp, exp_req)) } }.unwrap();
+                { let s = sup_exp.current_admission_stamp(); { let __s = s; sup_exp.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_macro_gripper(__a, id_exp, exp_req)) } }.unwrap();
                 match &sup_exp.active_trajectory.as_ref().unwrap().reference {
                     armd::motion::Reference::Gripper(gm) => assert_eq!(gm.timeout_s, 2.0),
                     other => panic!("expected Gripper reference, got {other:?}"),
@@ -2980,11 +2980,11 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                     let mut inner = sup_inner_b;
                     let ep = inner.safety.epoch_id();
                     let stamp = inner.current_admission_stamp();
-                    let id = { let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_sequence_action(__a, None, ep)) }.unwrap();
+                    let id = { let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_sequence_action(__a, None, ep)) }.unwrap();
                     // Direct zero / negative budget checks before installing any trajectory.
                     let req = GripperRequest { command: cmd, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(8.0), tag: None };
                     for bad_budget in [0.0_f64, -1.0_f64] {
-                        let err = { let __s = stamp; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_macro_gripper_within(__a, id, req.clone(), Some(bad_budget), true)) }.unwrap_err();
+                        let err = { let __s = stamp.for_macro_child(); inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_macro_gripper_within(__a, id, req.clone(), Some(bad_budget), true)) }.unwrap_err();
                         assert!(err.to_string().contains("remaining macro budget"), "{label} budget={bad_budget}: {err}");
                         assert!(inner.active_trajectory.is_none());
                         assert_ne!(inner.macro_sub(id), Some(armd::macro_action::SubState::Running));
@@ -3045,7 +3045,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         assert_eq!(damiao::pos_force_vel_raw(0.299), 29);
         inner_c.clear_log();
         let ep_c = sup_c.safety.epoch_id();
-        let (id_c, _) = { let s = sup_c.current_admission_stamp(); { let __s = s; sup_c.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_c.start_gripper(__a,
+        let (id_c, _) = { let s = sup_c.current_admission_stamp(); { let __s = s; sup_c.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None },
             ep_c,
         )) } }.unwrap();
@@ -3102,7 +3102,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         inner_g.with(|s| s.motors[J7].stop_at = Some(-2.0));
         inner_g.clear_log();
         let ep_g = sup_g.safety.epoch_id();
-        let (id_g, expected_g) = { let s = sup_g.current_admission_stamp(); { let __s = s; sup_g.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_g.start_gripper(__a,
+        let (id_g, expected_g) = { let s = sup_g.current_admission_stamp(); { let __s = s; sup_g.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
             ep_g,
         )) } }.unwrap();
@@ -3255,10 +3255,10 @@ fn stalled_empty_jaw_close_c300_pattern_fails_instead_of_done() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(state.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let epoch = inner.safety.epoch_id();
     let req = GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None };
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a, req, epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a, req, epoch)) } }.unwrap();
     let mut finished = None;
     for _ in 0..200 {
         inner.tick(DT);
@@ -3285,9 +3285,9 @@ fn stalled_empty_jaw_close_c300_pattern_fails_instead_of_done() {
     let mut grasp_sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(grasp_state)));
     grasp_sup.lease_enabled = false;
     grasp_sup.tick(DT);
-    { let __s = grasp_sup.current_admission_stamp(); grasp_sup.check_admission(__s).and_then(|__a| grasp_sup.enable_torque(__a)) }.unwrap();
+    { let __s = grasp_sup.current_admission_stamp(); grasp_sup.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let ep = grasp_sup.safety.epoch_id();
-    let (gid, _) = { let s = grasp_sup.current_admission_stamp(); { let __s = s; grasp_sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| grasp_sup.start_gripper(__a,
+    let (gid, _) = { let s = grasp_sup.current_admission_stamp(); { let __s = s; grasp_sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
         GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None }, ep
     )) } }.unwrap();
     let mut ga = None;
@@ -3351,7 +3351,7 @@ fn stalled_empty_jaw_close_c300_pattern_fails_instead_of_done() {
     let mut park_sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(park_state)));
     park_sup.lease_enabled = false;
     park_sup.tick(DT);
-    { let __s = park_sup.current_admission_stamp(); park_sup.check_admission(__s).and_then(|__a| park_sup.enable_torque(__a)) }.unwrap();
+    { let __s = park_sup.current_admission_stamp(); park_sup.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     park_sup.pending_normal_unload = true;
     park_sup.park_gripper_contact = true;
     park_sup.held = Some(HeldObject { label: "box".into(), spill_safe: false });
@@ -3483,7 +3483,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         let mut sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(SlowTravelDriver(st.clone())));
         sup.lease_enabled = false;
         sup.tick(0.02);
-        { let __s = sup.current_admission_stamp(); sup.check_admission(__s).and_then(|__a| sup.enable_torque(__a)) }.unwrap();
+        { let __s = sup.current_admission_stamp(); sup.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         sup.tick(0.02);
         (sup, st)
     };
@@ -3493,7 +3493,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
     {
         let (mut sup, _) = make_sup(-0.5, 0.06, None, 0.55, 0.55, 1, 0.0);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 0.06, timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();
@@ -3514,7 +3514,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
     {
         let (mut sup, _) = make_sup(-2.5, 0.06, Some(-2.0), 0.55, 0.55, 1, 0.0);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 0.06, timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();
@@ -3544,7 +3544,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
     for speed in [0.01_f32, 0.02, 0.03] {
         let (mut sup, st) = make_sup(-0.12, speed, None, 0.55, 0.55, 2, 0.0);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: f64::from(speed), timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();
@@ -3566,7 +3566,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
     {
         let (mut sup, st) = make_sup(-0.50, 0.01, Some(-0.40), 0.55, 0.55, 2, 0.0);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 0.01, timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();
@@ -3596,7 +3596,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
     {
         let (mut sup, st) = make_sup(-5.6401, 0.30, Some(-5.547), 0.35, 0.56, 1, 0.0004);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: Some(30.0), tag: None },
             ep,
         )) } }.unwrap();
@@ -3632,7 +3632,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         let (mut sup, st) = make_sup(-3.10, 0.30, Some(-3.0), 0.35, 0.65, 1, 0.005);
         st.lock().unwrap().close_speed_cap = cap_opt;
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: planned_speed, timeout_s: Some(30.0), tag: None },
             ep,
         )) } }.unwrap();
@@ -3665,7 +3665,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         let (mut sup, st) = make_sup(-2.0, 0.29, None, 0.75, 0.75, 1, 0.0);
         st.lock().unwrap().close_speed_cap = Some(0.30);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp, speed: 1.0, timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();
@@ -3698,7 +3698,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         let (mut sup, st) = make_sup(-2.5, 0.29, Some(-2.0), 0.35, 0.65, 1, 0.0);
         st.lock().unwrap().close_speed_cap = Some(0.30);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();
@@ -3721,7 +3721,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         let (mut sup, st) = make_sup(-2.0, 0.06, None, 0.78, 0.78, 1, 0.0);
         st.lock().unwrap().close_speed_cap = Some(0.299);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: Some(45.0), tag: None },
             ep,
         )) } }.unwrap();
@@ -3750,7 +3750,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         let (mut sup, st) = make_sup(-2.6, 0.06, Some(-2.0), 0.55, 0.55, 1, 0.0);
         st.lock().unwrap().close_speed_cap = Some(0.299);
         let ep = sup.safety.epoch_id();
-        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper(__a,
+        let (id, _) = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
             ep,
         )) } }.unwrap();

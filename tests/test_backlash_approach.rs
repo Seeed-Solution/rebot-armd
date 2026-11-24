@@ -64,7 +64,7 @@ fn move_to_pose_ends_from_the_same_side_with_an_approach_phase() {
     let mut target = READY;
     target[0] = on().limits[0].min_position + 0.004;
     save_pose(&mut inner, "edge", &target);
-    let (id, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.move_to_pose(__a, "edge", false, 1.0, Some("t".into()), inner.safety.epoch_id())) } }.unwrap();
+    let (id, duration) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::move_to_pose(__a, "edge", false, 1.0, Some("t".into()), ep)) }.unwrap();
     let a = inner.last_action.clone().unwrap();
     assert_eq!(a.approach.as_deref(), Some("same_side"), "{a:?}");
     assert_eq!(a.approach_signs.as_deref(), Some(&[-1i8, 1, 1, 1, 1, 1][..]));
@@ -98,7 +98,7 @@ fn direct_request_and_disabled_setting_record_and_move_as_before() {
     ].into_iter().map(|b| {
         let mut inner = common::sim_at(config(b), &INSPECT);
         save_pose(&mut inner, "ready", &READY);
-        let (id, d) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.move_to_pose(__a, "ready", false, 1.0, None, inner.safety.epoch_id())) } }.unwrap();
+        let (id, d) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::move_to_pose(__a, "ready", false, 1.0, None, ep)) }.unwrap();
         let (a, trace) = run(&mut inner, id, d + 4.0);
         assert_eq!((a.state.as_str(), a.approach.as_deref(), a.phase.as_deref()), ("done", None, None), "{a:?}");
         trace.into_iter().map(|(_, q)| q).collect()
@@ -108,13 +108,13 @@ fn direct_request_and_disabled_setting_record_and_move_as_before() {
     // the request wins over the profile in both directions
     let mut inner = common::sim_at(on(), &INSPECT);
     save_pose(&mut inner, "ready", &READY);
-    let (id, d) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.move_to_pose_ex(__a, "ready", false, 1.0, None, inner.safety.epoch_id(), Request::Direct)) } }.unwrap();
+    let (id, d) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::move_to_pose_ex(__a, "ready", false, 1.0, None, ep, Request::Direct)) }.unwrap();
     let (a, trace) = run(&mut inner, id, d + 4.0);
     assert_eq!((a.approach.as_deref(), a.approach_reason.as_deref()), (Some("direct"), Some("request")));
     assert_eq!(trace.into_iter().map(|(_, q)| q).collect::<Vec<_>>(), traces[0], "direct = the motion without the feature");
     let mut inner = common::sim_at(config(None), &INSPECT);
     save_pose(&mut inner, "ready", &READY);
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.move_to_pose_ex(__a, "ready", false, 1.0, None, inner.safety.epoch_id(), Request::SameSide)) } }.unwrap();
+    let (id, _) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::move_to_pose_ex(__a, "ready", false, 1.0, None, ep, Request::SameSide)) }.unwrap();
     assert_eq!(inner.last_action.as_ref().unwrap().approach.as_deref(), Some("same_side"));
     let _ = id;
 }
@@ -139,7 +139,7 @@ fn keepout_at_the_pre_target_falls_back_to_the_direct_approach() {
     start[1] += 0.3;
     let mut inner = common::sim_at(c, &start);
     save_pose(&mut inner, "ready", &READY);
-    let (id, d) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.move_to_pose(__a, "ready", false, 1.0, None, inner.safety.epoch_id())) } }.unwrap();
+    let (id, d) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::move_to_pose(__a, "ready", false, 1.0, None, ep)) }.unwrap();
     let a = inner.last_action.clone().unwrap();
     assert_eq!(a.approach.as_deref(), Some("direct"), "{a:?}");
     let reason = a.approach_reason.clone().unwrap();
@@ -221,8 +221,8 @@ fn macro_descent_records_the_outcome_and_runs_the_final_approach_phase() {
     let plan = inner.approach_plan("place_final", Request::Profile).unwrap();
     let pre = backlash::plan_cartesian_pre(&input, &direct, &plan, Some(&backlash::DescentRules::tcp()), speed, false);
     let target = direct.last_slice().to_vec();
-    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_macro(__a, "place", &input, None)) } }.unwrap();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_macro_path_same_side(__a, id, &input, direct, pre, Some(&plan))) } }.unwrap();
+    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_macro(__a, "place", &input, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_macro_path_same_side(__a, id, &input, direct, pre, Some(&plan))) } }.unwrap();
     let a = inner.last_action.clone().unwrap();
     assert_eq!(a.approach.as_deref(), Some("same_side"), "{a:?}");
     let mut phases = Vec::new();
@@ -253,7 +253,7 @@ fn move_to_precise_ends_with_the_short_segment_and_plain_move_to_does_not() {
         let target = direct.last_slice().to_vec();
         let plan = if precise { inner.approach_plan("move_to_precise", Request::Profile) } else { Err(None) };
         let pre = match &plan { Ok(p) => backlash::plan_cartesian_pre(&input, &direct, p, None, Speed::default(), false), _ => Pre::Off };
-        let (id, d) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path_same_side(__a, &input, direct, pre, plan.as_ref().ok(), "move_to", None)) } }.unwrap();
+        let (id, d) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path_same_side(__a, &input, direct, pre, plan.as_ref().ok(), "move_to", None)) } }.unwrap();
         let (a, trace) = run(&mut inner, id, d + 4.0);
         assert_eq!(a.state, "done", "{a:?}");
         assert_eq!(a.approach.as_deref(), precise.then_some("same_side"));

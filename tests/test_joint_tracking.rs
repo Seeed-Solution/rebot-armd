@@ -281,7 +281,7 @@ fn rig_at(config: ArmConfig, q0: &[f32], tau_s: Vec<f32>) -> (SupervisorInner, T
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(DT);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, drv)
@@ -364,7 +364,7 @@ fn tracking_off_wire_equivalence() {
             goal[i] = f64::from(q0[i]);
         }
         goal[0] += 0.12;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
         step(&mut inner, 120);
 
         // 2. Cartesian path move
@@ -372,7 +372,7 @@ fn tracking_off_wire_equivalence() {
         let mut pose = inner.config.arm_model.fk_f32(&inner.commanded_positions).unwrap();
         pose.p[1] += 0.03;
         let path = plan_cartesian(&inp, pose, Speed::default()).unwrap();
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &inp, path, "move_to", None)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path(__a, &inp, path, "move_to", None)) } }.unwrap();
         step(&mut inner, 120);
 
         // 3. Replay move
@@ -394,7 +394,7 @@ fn tracking_off_wire_equivalence() {
             )
             .unwrap();
         let r_plan = plan_frames(r_in, &replay_frames).unwrap();
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_replay(__a, r_plan)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_replay(__a, r_plan)) } }.unwrap();
         step(&mut inner, 120);
 
         // 4. Servo streaming + 5. Braking (dropping servo target mid-motion)
@@ -402,7 +402,7 @@ fn tracking_off_wire_equivalence() {
         let mut target = inner.commanded_positions.clone();
         for _ in 0..20 {
             target[0] += 0.004;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.clone(), epoch)) } }.unwrap();
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.clone(), epoch)) } }.unwrap();
             step(&mut inner, 1);
         }
         inner.servo_target = None; // begin controlled braking
@@ -411,7 +411,7 @@ fn tracking_off_wire_equivalence() {
         // 6. Jaw contact (rigid object at -1.75 rad)
         drv.with(|s| s.gripper_block = Some((6, -1.75, 25.0)));
         let epoch = inner.safety.epoch_id();
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a,
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
                 GripperRequest {
                     command: GripperCommand::Close,
                     fraction: None,
@@ -1122,7 +1122,7 @@ fn tracking_safety_references() {
         let mut goal = inner.config.arm_model.fk_f32(&q0).unwrap();
         goal.p[1] += 0.12;
         let path = plan_cartesian(&inp, goal, Speed::default()).unwrap();
-        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &inp, path, "move_to", None)) } }.unwrap();
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path(__a, &inp, path, "move_to", None)) } }.unwrap();
 
         // Pin J1 0.50 rad away (> LAG_STOP 0.45 rad) so path rate drops to 0 and stalls after 1.0 s.
         drv.with(|s| s.pinned[0] = Some(q0[0] - 0.50));
@@ -1249,7 +1249,7 @@ fn tracking_safety_references() {
             let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.22]);
             drv.with(|s| s.gripper_block = Some((6, -1.75, 25.0)));
             let epoch = inner.safety.epoch_id();
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a,
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
                     GripperRequest {
                         command: GripperCommand::Close,
                         fraction: None,
@@ -1308,7 +1308,7 @@ fn tracking_safety_references() {
             let (mut inner, drv) = rig_at(cfg, &q0, vec![0.40, 0.0, 0.0, 0.0, 0.0, 0.15]);
             drv.with(|s| s.include_gravity_torque = false);
             let epoch = inner.safety.epoch_id();
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a,
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
                     GripperRequest {
                         command: GripperCommand::Close,
                         fraction: None,
@@ -1444,7 +1444,7 @@ fn tracking_stream_braking_enforces_measured_lead_allowance() {
         for _ in 0..80 {
             let mut tgt = inner.commanded_positions.clone();
             tgt[0] = (tgt[0] + 0.05).min(0.25);
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, tgt, epoch)) } }.unwrap();
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, tgt, epoch)) } }.unwrap();
             let obs = inner.tick(DT);
             let q_out = drv.with(|s| s.written.last().unwrap()[0].position);
             assert!(
@@ -1728,7 +1728,7 @@ fn tracking_damiao_recovery_suspends_compensated_writes() {
         .unwrap();
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(DT);
 
     // Start smooth J1 quintic so active lead is being transmitted on 0x101.
@@ -2122,7 +2122,7 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         };
         let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap();
         assert!(inner.gravity_comp.is_some());
         inner.tick(DT);
         inner.exit_gravity_comp("REQUESTED", "test");
@@ -2168,7 +2168,7 @@ fn tracking_defers_action_done_until_final_output_accepted() {
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         let epoch = inner.safety.epoch_id();
         let cur_frac = cur_gripper_frac(&inner, q0[6]);
-        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a,
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
                 GripperRequest {
                     command: GripperCommand::Move,
                     fraction: Some(cur_frac),
@@ -2268,7 +2268,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         inner.measured_positions = q0.to_vec();
         inner.target_positions = q0.to_vec();
         inner.tick(DT);
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.tick(DT);
         assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
         let epoch = inner.safety.epoch_id();
@@ -2375,7 +2375,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         // Unpin, clear fault, and confirm first frame after is clean stationary baseline.
         drv.with(|s| s.pinned[0] = None);
         inner.clear_fault().unwrap();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2408,7 +2408,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         }
 
         inner.clear_fault().unwrap();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2527,7 +2527,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         for _ in 0..80 {
             let epoch = inner.safety.epoch_id();
             inner.heartbeat(CLIENT_A, epoch).unwrap();
-            let _ = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, retreat.clone(), epoch)) } };
+            let _ = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, retreat.clone(), epoch)) } };
             inner.tick(DT);
             if inner.torque_guard.hold.is_none() {
                 break;
@@ -2580,7 +2580,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         if matches!(inner.safety.state(), SafetyState::Fault(_)) {
             inner.clear_fault().unwrap();
         }
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_B);
         let obs_after = inner.tick(DT);
@@ -2624,7 +2624,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
             prev_pos = frame[0].position;
         }
         // Re-arm -> first frame after is clean stationary hold at parked pose.
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2659,7 +2659,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         // Let plant settle before re-enabling, then verify first frame after holds actual post-partial-write pose.
         drv.with(|s| s.v.fill(0.0));
         inner.clear_fault().unwrap();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2693,7 +2693,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         if matches!(inner.safety.state(), SafetyState::Fault(_)) {
             inner.clear_fault().unwrap();
         }
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2755,7 +2755,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         hb(&mut inner, CLIENT_A);
         inner.tick(DT);
 
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap();
         let enter_switches = drv.with(|s| s.mode_hold_frames.len());
         assert_eq!(enter_switches, 1, "entering gravity comp must send MIT mode-switch hold frame");
         assert_eq!(drv.with(|s| s.mode_hold_frames[0].0[0]), JointMode::Mit);
@@ -2809,7 +2809,7 @@ fn tracking_off_gravity_comp_exit_restores_pre_change_stale_rx_behavior() {
             ..ArmConfig::rebot_dm()
         };
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap();
         inner.tick(DT);
         inner.exit_gravity_comp("REQUESTED", "t1_off");
         drv.with(|s| s.feedback_age = Duration::from_millis(150));
@@ -2836,7 +2836,7 @@ fn tracking_off_gravity_comp_exit_restores_pre_change_stale_rx_behavior() {
             ..ArmConfig::rebot_dm()
         };
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap();
         inner.tick(DT);
         inner.exit_gravity_comp("REQUESTED", "t1_on");
         drv.with(|s| s.feedback_age = Duration::from_millis(150));
@@ -3079,7 +3079,7 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
     inner.commanded_positions = q0.to_vec();
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(DT);
     assert!(inner.safety.state().is_operational());
 
@@ -3327,7 +3327,7 @@ fn tracking_reenable_already_torqued_checks_stationarity_and_preserves_history()
         assert!(issued_before - meas_before >= 0.020, "must have active lead before re-enable");
 
         // Call set_torque(true) while already torqued and moving!
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         assert_eq!(
             inner.tracking.last_issued_positions.as_ref().map(|v| v[0]),
             Some(issued_before),
@@ -3363,7 +3363,7 @@ fn tracking_reenable_already_torqued_checks_stationarity_and_preserves_history()
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         inner.tracking.invalidate();
         drv.with(|s| s.v[0] = 0.25);
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         assert_eq!(
             inner.tracking.history_state,
             TrackingHistoryState::Unknown,
@@ -3389,7 +3389,7 @@ fn tracking_final_braking_tick_keeps_stream_ownership_through_residual_ramp() {
     let epoch = inner.safety.epoch_id();
     let mut tgt = q0.to_vec();
     tgt[0] += 0.05;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, tgt, epoch)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, tgt, epoch)) } }.unwrap();
     let obs = inner.tick(DT);
     assert!(obs.safety_state.is_operational(), "stream start faulted: {:?}", obs.fault);
     assert!(inner.servo_stream_active);
@@ -3569,7 +3569,7 @@ fn tracking_speed_scale_limits_and_torque_hold_ramp_accel_recheck() {
             goal[i] = f64::from(q0[i]);
         }
         goal[0] += 0.20;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
         let active = inner.active_tracking_limits(DT, 1.0);
         assert!(
             (active[0].max_velocity - base_v * 0.25).abs() < 1e-4,
@@ -3652,7 +3652,7 @@ fn tracking_failed_gravity_comp_entry_rollback_invalidates_old_baseline() {
     inner.tracking.record_issued(old_issued, vec![0.0; 7]);
 
     drv.with(|s| s.fail_mode_switch = true);
-    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } };
+    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } };
     assert!(err.is_err(), "simulated mode-switch failure must reject entry");
     assert!(inner.gravity_comp.is_none());
     assert!(inner.safety.state().is_operational(), "clean rollback leaves arm operational");
@@ -3686,7 +3686,7 @@ fn tracking_action_done_not_published_when_output_skipped_by_disable_or_torque_o
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         let epoch = inner.safety.epoch_id();
         let cur_frac = cur_gripper_frac(&inner, q0[6]);
-        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a,
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
                 GripperRequest {
                     command: GripperCommand::Move,
                     fraction: Some(cur_frac),
@@ -4008,7 +4008,7 @@ fn tracking_seeds_only_on_positive_stationarity_evidence() {
         inner.measured_positions = q0.to_vec();
         inner.target_positions = q0.to_vec();
         inner.tick(DT);
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         assert_eq!(
             inner.tracking.history_state,
             TrackingHistoryState::Unknown,
@@ -4089,7 +4089,7 @@ fn tracking_keeps_motion_caps_through_final_tick_and_settling() {
         goal[i] = f64::from(q0[i]);
     }
     goal[0] += 0.20;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
 
     let mut finished_at = None;
     for k in 0..800 {
@@ -4139,7 +4139,7 @@ fn tracking_braking_fallback_keeps_rejected_motion_caps() {
         goal[i] = f64::from(q0[i]);
     }
     goal[0] += 0.20;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
     for _ in 0..60 {
         let obs = inner.tick(DT);
         assert!(obs.safety_state.is_operational());
@@ -4196,7 +4196,7 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     // Receive instants 5 ms apart per tick: every pair of samples so far lies less than one
     // control period (20 ms) apart.
     for k in 0..4u32 {
@@ -4229,7 +4229,7 @@ fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
             let epoch = inner.safety.epoch_id();
             let policy = inner.config.gripper_policy.clone().unwrap();
             let frac = f64::from(((q0[6] - policy.closed_rad) / (policy.open_rad - policy.closed_rad)).clamp(0.0, 1.0));
-            let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper(__a,
+            let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper(__a,
                     GripperRequest {
                         command: GripperCommand::Move,
                         fraction: Some(frac),
@@ -4292,7 +4292,7 @@ fn tracking_rest_reference_survives_staggered_joint_replies() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
     let mut seeded_at = None;
     for k in 0..4u64 {
@@ -4330,7 +4330,7 @@ fn tracking_braking_fallback_follows_governor_scale_drop() {
         goal[i] = f64::from(q0[i]);
     }
     goal[0] += 0.20;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.25, "joint_move", None, None)) } }.unwrap();
     for _ in 0..60 {
         assert!(inner.tick(DT).safety_state.is_operational());
     }
@@ -4414,7 +4414,7 @@ fn tracking_rest_reference_expires_across_control_loop_pause() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(DT);
     assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
     // The control loop pauses; the next sample arrives 300 ms after the reference.
@@ -4505,7 +4505,7 @@ fn tracking_rest_reference_age_spans_oldest_reference_reply() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(DT);
     // Current sample: all joints at base + 110 ms (90 ms after the reference's newest reply).
     drv.with(|s| s.feedback_instants = Some(vec![base + ms(110); 7]));
@@ -4599,7 +4599,7 @@ fn b601_joint_move(inner: &mut SupervisorInner, xyz: [f64; 3]) -> u64 {
     let (goal, opts) = armd::motion::resolve_goal_opts(&input, &spec);
     let seeds = armd::motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
     let q = armd::motion::solve_goal_joints(&input, &goal, opts, &seeds).unwrap();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &input, &q, 0.3, "move_to", tag, None)) } }.unwrap().0
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &input, &q, 0.3, "move_to", tag, None)) } }.unwrap().0
 }
 
 /// home -> A, then A -> B -> A three times with 3 s holds, on the lag plant, through

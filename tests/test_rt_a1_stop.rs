@@ -468,9 +468,9 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         c.rt_executor_owned = true;
         c.prewarm_rt_buffers();
         let lg = c.acquire_lease(conn).unwrap();
-        { let __s = c.current_admission_stamp(); c.check_admission(__s).and_then(|__a| c.enable_torque(__a)) }.unwrap();
+        { let __s = c.current_admission_stamp(); c.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let e = c.safety.epoch_id();
-        { let a = c.check_admission(c.current_admission_stamp()).unwrap(); c.jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
+        { let a = c.check_admission(c.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
         for k in 1..=4 { let _ = c.tick_publish(0.005, k, false); let _ = c.core.hub().latest(); }
         let stops = armd::rt_core::urgent::StopRequests::new();
         let _ = armd::diagnostics::alloc::take();
@@ -490,9 +490,9 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     let gen = {
         let mut inner = sup.inner().write().await;
         let g = inner.acquire_lease(conn).unwrap();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let ep = inner.safety.epoch_id();
-        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
+        { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); armd::SupervisorInner::jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
         assert!(inner.active_trajectory.as_ref().unwrap().has_heap_storage(), "test requires heap trajectory");
         g
     };
@@ -528,9 +528,9 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         ce.rt_executor_owned = true;
         ce.prewarm_rt_buffers();
         let _lg = ce.acquire_lease(conn).unwrap();
-        { let __s = ce.current_admission_stamp(); ce.check_admission(__s).and_then(|__a| ce.enable_torque(__a)) }.unwrap();
+        { let __s = ce.current_admission_stamp(); ce.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let e = ce.safety.epoch_id();
-        { let a = ce.check_admission(ce.current_admission_stamp()).unwrap(); ce.jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
+        { let a = ce.check_admission(ce.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
         assert!(ce.active_trajectory.as_ref().unwrap().has_heap_storage());
         for k in 1..=4 { let _ = ce.tick_publish(0.005, k, false); let _ = ce.core.hub().latest(); }
         ce.requested_estop_count.fetch_add(1, Ordering::SeqCst);
@@ -546,9 +546,9 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     {
         let mut inner = sup_e.inner().write().await;
         let _g = inner.acquire_lease(conn).unwrap();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let ep = inner.safety.epoch_id();
-        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
+        { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); armd::SupervisorInner::jog_action_with_speed_scale(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
     }
     let h_e = sup_e.start_executor(ecfg_alloc).await.unwrap();
     wait_until(Duration::from_secs(1), || sup_e.tick_samples().len() >= 3).await;
@@ -588,7 +588,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     // (c) Watchdog park preserved by `authorized_stop`.
     let mut park_core = SupervisorInner::new(ArmConfig { lease_timeout_ms: 30, ..ArmConfig::rebot_dm() });
     let _g = park_core.acquire_lease("connection:park").unwrap();
-    { let __s = park_core.current_admission_stamp(); park_core.check_admission(__s).and_then(|__a| park_core.enable_torque(__a)) }.unwrap();
+    { let __s = park_core.current_admission_stamp(); park_core.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     park_core.commanded_positions = INSPECT.to_vec();
     park_core.measured_positions = INSPECT.to_vec();
     park_core.target_positions = INSPECT.to_vec();
@@ -603,7 +603,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     let gen_p = {
         let mut inner = sup_p.inner().write().await;
         let g = inner.acquire_lease(conn).unwrap();
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         g
     };
     let stop_watch: Arc<Mutex<Option<armd::rt_core::urgent::StopRequests>>> = Arc::new(Mutex::new(None));
@@ -826,7 +826,7 @@ async fn stalled_writer_and_full_ordinary_queue_still_latches_estop_and_reaches_
     // Block worker inside `dry_run_task` (`mode_info().await`), start active motion, stall writer, and fill inbound ordinary queue (64/64) + 1 BACKLOG_FULL.
     send(&mut ws_l, json!({"type": "command", "request_id": 300, "generation": gen_l, "epoch_id": ep_l, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
     wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
-    { let mut i = sup_l.inner().write().await; let a = i.check_admission(sup_l.capture_admission_stamp()).unwrap(); i.jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_l), "legacy_jog") }.unwrap();
+    { let mut i = sup_l.inner().write().await; let a = i.check_admission(sup_l.capture_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_l), "legacy_jog") }.unwrap();
     assert!(sup_l.inner().read().await.active_trajectory.is_some());
     armd::api::ws::set_test_ws_write_paused(&conn_l, true);
     for k in 0..65u64 {
@@ -874,7 +874,7 @@ async fn slow_dry_run_detector_does_not_block_estop_or_stop_on_same_socket() {
     send(&mut ws, json!({"type": "command", "request_id": 500, "generation": gen, "epoch_id": ep1, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
     wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
     // Start active motion while worker is blocked on the detector so Stop has live motion to halt.
-    { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); i.jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep1), "slow_dry_run_jog") }.unwrap();
+    { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep1), "slow_dry_run_jog") }.unwrap();
     assert!(sup.inner().read().await.active_trajectory.is_some());
 
     // While worker is blocked on the detector, Stop on the SAME socket applies immediately and stops motion.
@@ -979,7 +979,7 @@ async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
         // Preempt Client 1 BEFORE its queued Stop acquires `inner.write()`, and start new motion for Client 2.
         let (gen2, evicted) = inner.preempt_lease("connection:takeover", "client-2").unwrap();
         assert!(gen2 > gen1 && evicted.is_some());
-        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "client2_jog") }.unwrap();
+        { let s = inner.current_admission_stamp(); let a = inner.check_admission(s).unwrap(); armd::SupervisorInner::jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "client2_jog") }.unwrap();
     }
     let r1 = next_of(&mut ws1, &["command_ack", "command_reject"]).await;
     let r2 = next_of(&mut ws1, &["command_ack", "command_reject"]).await;
@@ -990,9 +990,9 @@ async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
     // (b) Executor path (`ReleaseEngine` + `UrgentStopIntake`): queued Stop from Owner 1 rejected after preemption.
     let mut core = SupervisorInner::new(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() });
     let g1 = core.acquire_lease("connection:owner1").unwrap();
-    { let __s = core.current_admission_stamp(); core.check_admission(__s).and_then(|__a| core.enable_torque(__a)) }.unwrap();
+    { let __s = core.current_admission_stamp(); core.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let ep_e = core.safety.epoch_id();
-    { let a = core.check_admission(core.current_admission_stamp()).unwrap(); core.jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner1_jog") }.unwrap();
+    { let a = core.check_admission(core.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action(a, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner1_jog") }.unwrap();
     let (mut engine, _broker, _tw, stops) = ReleaseEngine::new(BootId::fresh(), Capacities::default());
     let (client, intake) = urgent_stop_channel(4, Arc::new(AtomicBool::new(false)));
     engine.attach_urgent_stops(intake);
@@ -1008,7 +1008,7 @@ async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
     let (g2, _) = core.preempt_lease("connection:owner2", "owner2").unwrap();
     assert!(g2 > g1);
     core.handover_settling_since = None;
-    { let a = core.check_admission(core.current_admission_stamp()).unwrap(); core.jog_action(a, vec![0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner2_jog") }.unwrap();
+    { let a = core.check_admission(core.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action(a, vec![0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner2_jog") }.unwrap();
     let _rep = engine.step(&mut core, Instant::now, 0.005, Instant::now() + Duration::from_millis(5), 1);
     client.drain_replies();
     assert_eq!(rx.try_recv().unwrap().unwrap(), UrgentStopOutcome::LeaseLost { epoch: ep_e });
@@ -1573,16 +1573,18 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
         cfg.lease_timeout_ms = 30_000;
         let arm = TestArm::new();
         let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(arm)));
+        let stops = armd::rt_core::urgent::StopRequests::new();
         let gen = sup.acquire_lease("conn:gate").await.unwrap();
         sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         {
             let mut inner = sup.inner().write().await;
+            inner.attach_stop_requests(stops.clone());
             inner.commanded_positions = INSPECT.to_vec();
             inner.measured_positions = INSPECT.to_vec();
             inner.target_positions = INSPECT.to_vec();
         }
         let ep = sup.get_observation().await.epoch_id;
-        (sup, gen, ep)
+        (sup, stops, gen, ep)
     };
 
     let mut covered = HashSet::new();
@@ -1590,44 +1592,55 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
         covered.insert(kind);
         match kind {
             MotionStartKind::Jog => {
-                let (sup, _, ep) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.check_admission(stamp).unwrap_err().into(), "check_admission(Jog)");
+                let (sup, stops, _, ep) = make_armed().await;
                 let mut goal = INSPECT.to_vec();
                 goal[0] += 0.2;
-                assert_stopped(inner.jog(adm1, goal.clone(), Some(0.5), Some(ep)).unwrap_err(), "jog");
-                assert_stopped(
-                    inner.jog_action_with_speed_scale(adm2, goal, Some(0.5), Some(ep), "joint_move", None).unwrap_err(),
-                    "jog_action_with_speed_scale",
-                );
-                assert_no_motion(&inner, None, "Jog");
-            }
-            MotionStartKind::Home => {
-                let (sup, _, ep) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
+                let s1 = sup.capture_admission_stamp();
                 {
                     let mut inner = sup.inner().write().await;
-                    let adm = inner.check_admission(stamp).unwrap();
-                    assert!(inner.authorized_stop());
+                    let adm1 = inner.check_admission(s1).unwrap();
+                    let _ = stops.request();
+                    assert_stopped(SupervisorInner::jog(adm1, goal.clone(), Some(0.5), Some(ep)).unwrap_err(), "jog");
+                    assert_no_motion(&inner, None, "Jog(1)");
+                }
+                let (sup, stops, _, ep) = make_armed().await;
+                let s2 = sup.capture_admission_stamp();
+                let s_check = sup.capture_admission_stamp();
+                {
+                    let mut inner = sup.inner().write().await;
+                    let adm2 = inner.check_admission(s2).unwrap();
+                    let _ = stops.request();
+                    assert_stopped(
+                        SupervisorInner::jog_action_with_speed_scale(adm2, goal, Some(0.5), Some(ep), "joint_move", None).unwrap_err(),
+                        "jog_action_with_speed_scale",
+                    );
+                    assert_stopped(inner.check_admission(s_check).unwrap_err().into(), "check_admission(Jog)");
+                    assert_no_motion(&inner, None, "Jog(2)");
+                }
+            }
+            MotionStartKind::Home => {
+                let (sup, stops, _, ep) = make_armed().await;
+                let s1 = sup.capture_admission_stamp();
+                let s2 = sup.capture_admission_stamp();
+                {
+                    let mut inner = sup.inner().write().await;
                     let home = inner.config.home_positions.clone();
-                    assert_stopped(inner.jog_action(adm, home, Some(0.5), Some(ep), "home").unwrap_err(), "home_inner");
+                    let adm = inner.check_admission(s1).unwrap();
+                    let _ = stops.request();
+                    assert_stopped(SupervisorInner::jog_action(adm, home, Some(0.5), Some(ep), "home").unwrap_err(), "home_inner");
                     assert_no_motion(&inner, None, "Home(inner)");
                 }
-                assert_stopped(sup.home(stamp, Some(0.5), Some(ep)).await.unwrap_err(), "sup.home");
+                assert_stopped(sup.home(s2, Some(0.5), Some(ep)).await.unwrap_err(), "sup.home");
                 let inner = sup.inner().read().await;
                 assert_no_motion(&inner, None, "Home(sup)");
             }
             MotionStartKind::Park => {
-                let (sup, _, _) = make_armed().await;
+                let (sup, stops, _, _) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.unload_action(adm).unwrap_err(), "unload_action");
+                let _ = stops.request();
+                assert_stopped(SupervisorInner::unload_action(adm).unwrap_err(), "unload_action");
                 assert_no_motion(&inner, None, "Park");
             }
             MotionStartKind::Preset => {
@@ -1657,264 +1670,253 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
                 assert_no_motion(&inner, None, "Preset");
             }
             MotionStartKind::MoveTo => {
-                let (sup, _, _) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let input = inner.plan_input().unwrap();
-                let path = dummy_path();
                 let goal: [f64; 6] = std::array::from_fn(|i| f64::from(INSPECT[i]));
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                let adm3 = inner.check_admission(stamp).unwrap();
-                let ep_cur = inner.safety.epoch_id();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.install_path(adm1, &input, path, "move_to", None).unwrap_err(), "install_path");
-                assert_stopped(
-                    inner.install_joint_goal(adm2, &input, &goal, 0.5, "move_to", None, None).unwrap_err(),
-                    "install_joint_goal",
-                );
-                assert_stopped(
-                    inner.start_path_motion_slice(adm3, ep_cur, &INSPECT, 0.5).unwrap_err(),
-                    "start_path_motion_slice",
-                );
-                assert_no_motion(&inner, None, "MoveTo");
+                for sub in 0..3 {
+                    let (sup, stops, _, _) = make_armed().await;
+                    let stamp = sup.capture_admission_stamp();
+                    let mut inner = sup.inner().write().await;
+                    let input = inner.plan_input().unwrap();
+                    let path = dummy_path();
+                    let ep_cur = inner.safety.epoch_id();
+                    let adm = inner.check_admission(stamp).unwrap();
+                    let _ = stops.request();
+                    match sub {
+                        0 => assert_stopped(SupervisorInner::install_path(adm, &input, path, "move_to", None).unwrap_err(), "install_path"),
+                        1 => assert_stopped(SupervisorInner::install_joint_goal(adm, &input, &goal, 0.5, "move_to", None, None).unwrap_err(), "install_joint_goal"),
+                        _ => assert_stopped(SupervisorInner::start_path_motion_slice(adm, ep_cur, &INSPECT, 0.5).unwrap_err(), "start_path_motion_slice"),
+                    }
+                    assert_no_motion(&inner, None, "MoveTo");
+                }
             }
             MotionStartKind::MoveRelative => {
-                let (sup, _, _) = make_armed().await;
+                let (sup, stops, _, _) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let input = inner.plan_input().unwrap();
                 let path = dummy_path();
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
+                let _ = stops.request();
                 assert_stopped(
-                    inner.install_path_same_side(adm, &input, path, Pre::Off, None, "move_relative", None).unwrap_err(),
+                    SupervisorInner::install_path_same_side(adm, &input, path, Pre::Off, None, "move_relative", None).unwrap_err(),
                     "install_path_same_side",
                 );
                 assert_no_motion(&inner, None, "MoveRelative");
             }
             MotionStartKind::MoveToPose => {
-                let (sup, _, ep) = make_armed().await;
-                {
+                for sub in 0..2 {
+                    let (sup, stops, _, ep) = make_armed().await;
+                    {
+                        let mut inner = sup.inner().write().await;
+                        let mut p = INSPECT.to_vec();
+                        p[0] += 0.15;
+                        armd::poses::save(&mut inner, &json!({"name": "gate_pose", "positions": p})).unwrap();
+                    }
+                    let stamp = sup.capture_admission_stamp();
                     let mut inner = sup.inner().write().await;
-                    let mut p = INSPECT.to_vec();
-                    p[0] += 0.15;
-                    armd::poses::save(&mut inner, &json!({"name": "gate_pose", "positions": p})).unwrap();
+                    let adm = inner.check_admission(stamp).unwrap();
+                    let _ = stops.request();
+                    if sub == 0 {
+                        assert_stopped(SupervisorInner::move_to_pose(adm, "gate_pose", false, 0.5, None, ep).unwrap_err(), "move_to_pose");
+                    } else {
+                        assert_stopped(armd::poses::start_action(adm, &json!({"name": "gate_pose"}), ep).unwrap_err(), "poses::start_action");
+                    }
+                    assert_no_motion(&inner, None, "MoveToPose");
                 }
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(
-                    inner.move_to_pose(adm1, "gate_pose", false, 0.5, None, ep).unwrap_err(),
-                    "move_to_pose",
-                );
-                assert_stopped(
-                    armd::poses::start_action(&mut inner, adm2, &json!({"name": "gate_pose"}), ep).unwrap_err(),
-                    "poses::start_action",
-                );
-                assert_no_motion(&inner, None, "MoveToPose");
             }
             MotionStartKind::Place => {
-                let (sup, _, _) = make_armed().await;
+                let (sup, stops, _, _) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let input = inner.plan_input().unwrap();
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.begin_macro(adm, "place", &input, None).unwrap_err(), "begin_macro(place)");
+                let _ = stops.request();
+                assert_stopped(SupervisorInner::begin_macro(adm, "place", &input, None).unwrap_err(), "begin_macro(place)");
                 assert_no_motion(&inner, None, "Place");
             }
             MotionStartKind::Grasp => {
-                let (sup, _, _) = make_armed().await;
+                let (sup, stops, _, _) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let input = inner.plan_input().unwrap();
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.begin_macro(adm, "grasp", &input, None).unwrap_err(), "begin_macro(grasp)");
+                let _ = stops.request();
+                assert_stopped(SupervisorInner::begin_macro(adm, "grasp", &input, None).unwrap_err(), "begin_macro(grasp)");
                 assert_no_motion(&inner, None, "Grasp");
             }
             MotionStartKind::Replay => {
-                let (sup, _, ep) = make_armed().await;
-                let dir = tempfile::tempdir().unwrap();
-                let (plan, req) = {
-                    let mut inner = sup.inner().write().await;
-                    inner.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
-                    let frames = vec![
-                        RecordFrame { timestamp: 0.0, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
-                        RecordFrame { timestamp: 0.1, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
-                    ];
-                    let sidecar = EpisodeSidecar {
-                        id: "gate_ep".into(),
-                        dataset: "gate".into(),
-                        task: "gate".into(),
-                        source: "sdk".into(),
-                        sequence_id: None,
-                        repeat_index: None,
-                        outcome: "ok".into(),
-                        recorded_at: "2026-11-24T00:00:00Z".into(),
-                        duration_s: 0.1,
-                        frames: frames.len(),
-                        joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
-                        units: "rad".into(),
-                        joint_zero: armd::recording::JointZeroStamp::of(&inner.joint_zero_offsets),
-                        profile_id: inner.config.profile_id.clone(),
-                        armd_version: "test".into(),
-                        fps_nominal: 10.0,
-                        truncated: false,
-                        stopped_by: None,
-                        arm_dof: Some(6),
-                        gripper_joint: Some(6),
-                        tool_id: Some(inner.config.active_tool.id.clone()),
-                        tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
-                        has_gripper_motion: Some(false),
-                        recovered: None,
-                        frames_dropped: None,
-                        first_state: Some(INSPECT.to_vec()),
-                        last_state: Some(INSPECT.to_vec()),
+                for sub in 0..2 {
+                    let (sup, stops, _, ep) = make_armed().await;
+                    let dir = tempfile::tempdir().unwrap();
+                    let (plan, req) = {
+                        let mut inner = sup.inner().write().await;
+                        inner.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+                        let frames = vec![
+                            RecordFrame { timestamp: 0.0, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+                            RecordFrame { timestamp: 0.1, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+                        ];
+                        let sidecar = EpisodeSidecar {
+                            id: "gate_ep".into(),
+                            dataset: "gate".into(),
+                            task: "gate".into(),
+                            source: "sdk".into(),
+                            sequence_id: None,
+                            repeat_index: None,
+                            outcome: "ok".into(),
+                            recorded_at: "2026-11-24T00:00:00Z".into(),
+                            duration_s: 0.1,
+                            frames: frames.len(),
+                            joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
+                            units: "rad".into(),
+                            joint_zero: armd::recording::JointZeroStamp::of(&inner.joint_zero_offsets),
+                            profile_id: inner.config.profile_id.clone(),
+                            armd_version: "test".into(),
+                            fps_nominal: 10.0,
+                            truncated: false,
+                            stopped_by: None,
+                            arm_dof: Some(6),
+                            gripper_joint: Some(6),
+                            tool_id: Some(inner.config.active_tool.id.clone()),
+                            tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+                            has_gripper_motion: Some(false),
+                            recovered: None,
+                            frames_dropped: None,
+                            first_state: Some(INSPECT.to_vec()),
+                            last_state: Some(INSPECT.to_vec()),
+                        };
+                        inner.episodes.write_episode(&sidecar, &frames, None).unwrap();
+                        let req = ReplayRequest { episode: "gate_ep".into(), speed: 1.0, gripper: false, tag: None, allow_stale: true };
+                        let inp = inner.replay_input(req.clone(), ep).unwrap();
+                        (armd::replay::plan(inp).unwrap(), req)
                     };
-                    inner.episodes.write_episode(&sidecar, &frames, None).unwrap();
-                    let req = ReplayRequest { episode: "gate_ep".into(), speed: 1.0, gripper: false, tag: None, allow_stale: true };
-                    let inp = inner.replay_input(req.clone(), ep).unwrap();
-                    (armd::replay::plan(inp).unwrap(), req)
-                };
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.install_replay(adm1, plan).unwrap_err(), "install_replay");
-                assert_stopped(inner.start_replay(adm2, req, ep).unwrap_err(), "start_replay");
-                assert_no_motion(&inner, None, "Replay");
+                    let stamp = sup.capture_admission_stamp();
+                    let mut inner = sup.inner().write().await;
+                    let adm = inner.check_admission(stamp).unwrap();
+                    let _ = stops.request();
+                    if sub == 0 {
+                        assert_stopped(SupervisorInner::install_replay(adm, plan).unwrap_err(), "install_replay");
+                    } else {
+                        assert_stopped(SupervisorInner::start_replay(adm, req, ep).unwrap_err(), "start_replay");
+                    }
+                    assert_no_motion(&inner, None, "Replay");
+                }
             }
             MotionStartKind::Sequence => {
-                let (sup, _, ep) = make_armed().await;
-                let run_plan = {
+                for sub in 0..2 {
+                    let (sup, stops, _, ep) = make_armed().await;
+                    let run_plan = {
+                        let mut inner = sup.inner().write().await;
+                        let (saved_pose, _) = armd::poses::save(&mut inner, &json!({"name": "seq_p", "positions": INSPECT.to_vec()})).unwrap();
+                        let (seq, _) = armd::sequences::save(&mut inner, &json!({
+                            "name": "gate_seq",
+                            "steps": [{"type": "pose", "pose_id": saved_pose.id}]
+                        })).unwrap();
+                        armd::sequences::prepare_run(&inner, &json!({"id": seq.id}), ep).unwrap()
+                    };
+                    let stamp = sup.capture_admission_stamp();
                     let mut inner = sup.inner().write().await;
-                    let (saved_pose, _) = armd::poses::save(&mut inner, &json!({"name": "seq_p", "positions": INSPECT.to_vec()})).unwrap();
-                    let (seq, _) = armd::sequences::save(&mut inner, &json!({
-                        "name": "gate_seq",
-                        "steps": [{"type": "pose", "pose_id": saved_pose.id}]
-                    })).unwrap();
-                    armd::sequences::prepare_run(&inner, &json!({"id": seq.id}), ep).unwrap()
-                };
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.begin_sequence_action(adm1, None, ep).unwrap_err(), "begin_sequence_action");
-                assert_stopped(armd::sequences::begin(&mut inner, adm2, &sup, run_plan).unwrap_err(), "sequences::begin");
-                assert_no_motion(&inner, None, "Sequence");
+                    let adm = inner.check_admission(stamp).unwrap();
+                    let _ = stops.request();
+                    if sub == 0 {
+                        assert_stopped(SupervisorInner::begin_sequence_action(adm, None, ep).unwrap_err(), "begin_sequence_action");
+                    } else {
+                        assert_stopped(armd::sequences::begin(adm, &sup, run_plan).unwrap_err(), "sequences::begin");
+                    }
+                    assert_no_motion(&inner, None, "Sequence");
+                }
             }
             MotionStartKind::CalibHover => {
-                let (sup, _, ep) = make_armed().await;
+                let (sup, stops, _, ep) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
+                let _ = stops.request();
                 assert_stopped(
-                    inner.begin_orchestrated_action(adm, "calib_hover", None, ep).unwrap_err(),
+                    SupervisorInner::begin_orchestrated_action(adm, "calib_hover", None, ep).unwrap_err(),
                     "begin_orchestrated_action(calib_hover)",
                 );
                 assert_no_motion(&inner, None, "CalibHover");
             }
             MotionStartKind::MeasureMultiview => {
-                let (sup, _, ep) = make_armed().await;
+                let (sup, stops, _, ep) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
+                let _ = stops.request();
                 assert_stopped(
-                    inner.begin_orchestrated_action(adm, "measure_multiview", None, ep).unwrap_err(),
+                    SupervisorInner::begin_orchestrated_action(adm, "measure_multiview", None, ep).unwrap_err(),
                     "begin_orchestrated_action(measure_multiview)",
                 );
                 assert_no_motion(&inner, None, "MeasureMultiview");
             }
             MotionStartKind::MacroStart => {
-                let (sup, _, _) = make_armed().await;
+                let (sup, stops, _, _) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let input = inner.plan_input().unwrap();
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.begin_macro(adm, "grasp", &input, None).unwrap_err(), "MacroStart");
+                let _ = stops.request();
+                assert_stopped(SupervisorInner::begin_macro(adm, "grasp", &input, None).unwrap_err(), "MacroStart");
                 assert_no_motion(&inner, None, "MacroStart");
             }
             MotionStartKind::MacroChildPath => {
-                let (sup, _, _) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let input = inner.plan_input().unwrap();
-                let adm0 = inner.check_admission(stamp).unwrap();
-                let macro_id = inner.begin_macro(adm0, "grasp", &input, None).unwrap();
-                let path = dummy_path();
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(
-                    inner.install_macro_path(adm1, macro_id, &input, path.clone()).unwrap_err(),
-                    "install_macro_path",
-                );
-                assert_stopped(
-                    inner.install_macro_path_same_side(adm2, macro_id, &input, path, Pre::Off, None).unwrap_err(),
-                    "install_macro_path_same_side",
-                );
-                assert_no_motion(&inner, Some(macro_id), "MacroChildPath");
+                for sub in 0..2 {
+                    let (sup, stops, _, _) = make_armed().await;
+                    let parent_stamp = sup.capture_admission_stamp();
+                    let mut inner = sup.inner().write().await;
+                    let input = inner.plan_input().unwrap();
+                    let adm0 = inner.check_admission(parent_stamp).unwrap();
+                    let macro_id = SupervisorInner::begin_macro(adm0, "grasp", &input, None).unwrap();
+                    let path = dummy_path();
+                    let adm = inner.check_admission(parent_stamp.for_macro_child()).unwrap();
+                    let _ = stops.request();
+                    if sub == 0 {
+                        assert_stopped(SupervisorInner::install_macro_path(adm, macro_id, &input, path).unwrap_err(), "install_macro_path");
+                    } else {
+                        assert_stopped(SupervisorInner::install_macro_path_same_side(adm, macro_id, &input, path, Pre::Off, None).unwrap_err(), "install_macro_path_same_side");
+                    }
+                    assert_no_motion(&inner, Some(macro_id), "MacroChildPath");
+                }
             }
             MotionStartKind::MacroChildQuintic => {
-                let (sup, _, _) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
+                let (sup, stops, _, _) = make_armed().await;
+                let parent_stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let input = inner.plan_input().unwrap();
-                let adm0 = inner.check_admission(stamp).unwrap();
-                let macro_id = inner.begin_macro(adm0, "grasp", &input, None).unwrap();
+                let adm0 = inner.check_admission(parent_stamp).unwrap();
+                let macro_id = SupervisorInner::begin_macro(adm0, "grasp", &input, None).unwrap();
                 let limits = inner.config.limits.clone();
-                let adm1 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
+                let adm1 = inner.check_admission(parent_stamp.for_macro_child()).unwrap();
+                let _ = stops.request();
                 assert_stopped(
-                    inner.install_macro_quintic(adm1, macro_id, INSPECT.to_vec(), &limits).unwrap_err(),
+                    SupervisorInner::install_macro_quintic(adm1, macro_id, INSPECT.to_vec(), &limits).unwrap_err(),
                     "install_macro_quintic",
                 );
                 assert_no_motion(&inner, Some(macro_id), "MacroChildQuintic");
             }
             MotionStartKind::MacroChildGripper => {
-                let (sup, _, _) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let input = inner.plan_input().unwrap();
-                let adm0 = inner.check_admission(stamp).unwrap();
-                let macro_id = inner.begin_macro(adm0, "grasp", &input, None).unwrap();
                 let greq = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                let adm3 = inner.check_admission(stamp).unwrap();
-                let adm4 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(
-                    inner.start_macro_gripper(adm1, macro_id, greq.clone()).unwrap_err(),
-                    "start_macro_gripper",
-                );
-                assert_stopped(
-                    inner.start_macro_gripper_within(adm2, macro_id, greq.clone(), Some(5.0), true).unwrap_err(),
-                    "start_macro_gripper_within",
-                );
-                assert_stopped(
-                    inner.start_macro_gripper_learning(adm3, macro_id, greq.clone(), armd::motion::LearnMode::Calibration).unwrap_err(),
-                    "start_macro_gripper_learning",
-                );
-                assert_stopped(
-                    inner.start_macro_gripper_learning_within(adm4, macro_id, greq, armd::motion::LearnMode::Calibration, Some(5.0), false).unwrap_err(),
-                    "start_macro_gripper_learning_within",
-                );
-                assert_no_motion(&inner, Some(macro_id), "MacroChildGripper");
+                for sub in 0..4 {
+                    let (sup, stops, _, _) = make_armed().await;
+                    let parent_stamp = sup.capture_admission_stamp();
+                    let mut inner = sup.inner().write().await;
+                    let input = inner.plan_input().unwrap();
+                    let adm0 = inner.check_admission(parent_stamp).unwrap();
+                    let macro_id = SupervisorInner::begin_macro(adm0, "grasp", &input, None).unwrap();
+                    let adm = inner.check_admission(parent_stamp.for_macro_child()).unwrap();
+                    let _ = stops.request();
+                    match sub {
+                        0 => assert_stopped(SupervisorInner::start_macro_gripper(adm, macro_id, greq.clone()).unwrap_err(), "start_macro_gripper"),
+                        1 => assert_stopped(SupervisorInner::start_macro_gripper_within(adm, macro_id, greq.clone(), Some(5.0), true).unwrap_err(), "start_macro_gripper_within"),
+                        2 => assert_stopped(SupervisorInner::start_macro_gripper_learning(adm, macro_id, greq.clone(), armd::motion::LearnMode::Calibration).unwrap_err(), "start_macro_gripper_learning"),
+                        _ => assert_stopped(SupervisorInner::start_macro_gripper_learning_within(adm, macro_id, greq.clone(), armd::motion::LearnMode::Calibration, Some(5.0), false).unwrap_err(), "start_macro_gripper_learning_within"),
+                    }
+                    assert_no_motion(&inner, Some(macro_id), "MacroChildGripper");
+                }
             }
             MotionStartKind::MacroChildReplay => {
-                let (sup, _, ep) = make_armed().await;
+                let (sup, stops, _, ep) = make_armed().await;
                 let dir = tempfile::tempdir().unwrap();
-                let (macro_id, plan, stamp) = {
+                let (macro_id, plan, parent_stamp) = {
                     let mut inner = sup.inner().write().await;
                     inner.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
                     let frames = vec![
@@ -1953,39 +1955,41 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
                     inner.episodes.write_episode(&sidecar, &frames, None).unwrap();
                     let stamp = inner.current_admission_stamp();
                     let adm0 = inner.check_admission(stamp).unwrap();
-                    let id = inner.begin_sequence_action(adm0, None, ep).unwrap();
+                    let id = SupervisorInner::begin_sequence_action(adm0, None, ep).unwrap();
                     let req = ReplayRequest { episode: "gate_ep_child".into(), speed: 1.0, gripper: false, tag: None, allow_stale: true };
                     let inp = inner.replay_input(req, ep).unwrap();
                     (id, armd::replay::plan(inp).unwrap(), stamp)
                 };
                 let mut inner = sup.inner().write().await;
-                let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.install_macro_replay(adm, macro_id, plan).unwrap_err(), "install_macro_replay");
+                let adm = inner.check_admission(parent_stamp.for_macro_child()).unwrap();
+                let _ = stops.request();
+                assert_stopped(SupervisorInner::install_macro_replay(adm, macro_id, plan).unwrap_err(), "install_macro_replay");
                 assert_no_motion(&inner, Some(macro_id), "MacroChildReplay");
             }
             MotionStartKind::Servo => {
-                let (sup, gen, ep) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                let adm3 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.servo(adm1, INSPECT.to_vec(), ep).unwrap_err().into(), "servo");
-                assert_stopped(inner.servo_slice(adm2, &INSPECT, ep).unwrap_err().into(), "servo_slice");
-                assert_stopped(inner.authorize_servo_stream(adm3, gen).unwrap_err().into(), "authorize_servo_stream");
-                assert_no_motion(&inner, None, "Servo");
+                for sub in 0..3 {
+                    let (sup, stops, gen, ep) = make_armed().await;
+                    let stamp = sup.capture_admission_stamp();
+                    let mut inner = sup.inner().write().await;
+                    let adm = inner.check_admission(stamp).unwrap();
+                    let _ = stops.request();
+                    match sub {
+                        0 => assert_stopped(SupervisorInner::servo(adm, INSPECT.to_vec(), ep).unwrap_err().into(), "servo"),
+                        1 => assert_stopped(SupervisorInner::servo_slice(adm, &INSPECT, ep).unwrap_err().into(), "servo_slice"),
+                        _ => assert_stopped(SupervisorInner::authorize_servo_stream(adm, gen).unwrap_err().into(), "authorize_servo_stream"),
+                    }
+                    assert_no_motion(&inner, None, "Servo");
+                }
             }
             MotionStartKind::PolicyShadow => {
                 #[cfg(feature = "policy-runtime")]
                 {
-                    let (sup, gen, ep) = make_armed().await;
+                    let (sup, stops, gen, ep) = make_armed().await;
                     let stamp = sup.capture_admission_stamp();
                     let mut inner = sup.inner().write().await;
                     let adm = inner.check_admission(stamp).unwrap();
-                    assert!(inner.authorized_stop());
-                    let err = inner.begin_policy_run(adm, armd::policy_runtime::PolicyRunStart {
+                    let _ = stops.request();
+                    let err = SupervisorInner::begin_policy_run(adm, armd::policy_runtime::PolicyRunStart {
                         epoch_id: ep,
                         connection_id: "conn:gate".into(),
                         lease_generation: gen,
@@ -2007,12 +2011,12 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
             MotionStartKind::PolicyLive => {
                 #[cfg(feature = "policy-runtime")]
                 {
-                    let (sup, gen, ep) = make_armed().await;
+                    let (sup, stops, gen, ep) = make_armed().await;
                     let stamp = sup.capture_admission_stamp();
                     let mut inner = sup.inner().write().await;
                     let adm = inner.check_admission(stamp).unwrap();
-                    assert!(inner.authorized_stop());
-                    let err = inner.begin_policy_run(adm, armd::policy_runtime::PolicyRunStart {
+                    let _ = stops.request();
+                    let err = SupervisorInner::begin_policy_run(adm, armd::policy_runtime::PolicyRunStart {
                         epoch_id: ep,
                         connection_id: "conn:gate".into(),
                         lease_generation: gen,
@@ -2032,60 +2036,62 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
                 }
             }
             MotionStartKind::GravityComp => {
-                let (sup, _, _) = make_armed().await;
+                let (sup, stops, _, _) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
+                let _ = stops.request();
                 assert_stopped(
-                    inner.enter_gravity_comp(adm, GravityCompRequest { scale: None, damping_kd: None }).unwrap_err(),
+                    SupervisorInner::enter_gravity_comp(adm, GravityCompRequest { scale: None, damping_kd: None }).unwrap_err(),
                     "enter_gravity_comp",
                 );
                 assert_no_motion(&inner, None, "GravityComp");
             }
             MotionStartKind::Gripper => {
-                let (sup, _, ep) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
-                let mut inner = sup.inner().write().await;
                 let greq = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
-                let adm1 = inner.check_admission(stamp).unwrap();
-                let adm2 = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
-                assert_stopped(inner.start_gripper(adm1, greq.clone(), ep).unwrap_err(), "start_gripper");
-                assert_stopped(
-                    inner.start_gripper_with_baseline(adm2, greq, ep, armd::supervisor::GripperBaselineCmd::Reset).unwrap_err(),
-                    "start_gripper_with_baseline",
-                );
-                assert_no_motion(&inner, None, "Gripper");
-            }
-            MotionStartKind::GripperCalibrate => {
-                let (sup, _, ep) = make_armed().await;
-                let stamp = sup.capture_admission_stamp();
-                {
+                for sub in 0..2 {
+                    let (sup, stops, _, ep) = make_armed().await;
+                    let stamp = sup.capture_admission_stamp();
                     let mut inner = sup.inner().write().await;
                     let adm = inner.check_admission(stamp).unwrap();
-                    assert!(inner.authorized_stop());
+                    let _ = stops.request();
+                    if sub == 0 {
+                        assert_stopped(SupervisorInner::start_gripper(adm, greq.clone(), ep).unwrap_err(), "start_gripper");
+                    } else {
+                        assert_stopped(SupervisorInner::start_gripper_with_baseline(adm, greq.clone(), ep, armd::supervisor::GripperBaselineCmd::Reset).unwrap_err(), "start_gripper_with_baseline");
+                    }
+                    assert_no_motion(&inner, None, "Gripper");
+                }
+            }
+            MotionStartKind::GripperCalibrate => {
+                let (sup, stops, _, ep) = make_armed().await;
+                let s1 = sup.capture_admission_stamp();
+                let s2 = sup.capture_admission_stamp();
+                {
+                    let mut inner = sup.inner().write().await;
+                    let adm = inner.check_admission(s1).unwrap();
+                    let _ = stops.request();
                     assert_stopped(
-                        armd::gripper_calib::begin_calibration(&mut inner, adm, &sup, ep, None).unwrap_err(),
+                        armd::gripper_calib::begin_calibration(adm, &sup, ep, None).unwrap_err(),
                         "gripper_calib::begin_calibration",
                     );
                     assert_no_motion(&inner, None, "GripperCalibrate(begin)");
                 }
                 assert_stopped(
-                    armd::gripper_calib::start_calibration(&sup, stamp).await.unwrap_err(),
+                    armd::gripper_calib::start_calibration(&sup, s2).await.unwrap_err(),
                     "gripper_calib::start_calibration",
                 );
                 let inner = sup.inner().read().await;
                 assert_no_motion(&inner, None, "GripperCalibrate(start)");
             }
             MotionStartKind::GripperZeroCheck => {
-                let (sup, _, ep) = make_armed().await;
+                let (sup, stops, _, ep) = make_armed().await;
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let adm = inner.check_admission(stamp).unwrap();
-                assert!(inner.authorized_stop());
+                let _ = stops.request();
                 assert_stopped(
-                    inner.start_gripper_zero_check(adm, &json!({}), ep).unwrap_err(),
+                    SupervisorInner::start_gripper_zero_check(adm, &json!({}), ep).unwrap_err(),
                     "start_gripper_zero_check",
                 );
                 assert_no_motion(&inner, None, "GripperZeroCheck");
@@ -2096,19 +2102,26 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
                 let mut cfg = ArmConfig::rebot_dm();
                 cfg.lease_timeout_ms = 30_000;
                 let sup = Arc::new(ArmSupervisor::new(cfg));
+                let stops = armd::rt_core::urgent::StopRequests::new();
+                sup.inner().write().await.attach_stop_requests(stops.clone());
                 let _gen = sup.acquire_lease("conn:torque-gate").await.unwrap();
-                let stale_stamp = sup.capture_admission_stamp();
+                let s1 = sup.capture_admission_stamp();
+                let s2 = sup.capture_admission_stamp();
                 {
                     let mut inner = sup.inner().write().await;
-                    let adm = inner.check_admission(stale_stamp).unwrap();
-                    assert!(inner.authorized_stop());
-                    assert_stopped(ArmError::from(inner.enable_torque(adm).unwrap_err()), "enable_torque(inner)");
+                    let adm = inner.check_admission(s1).unwrap();
+                    let _ = stops.request();
+                    assert_stopped(ArmError::from(SupervisorInner::enable_torque(adm).unwrap_err()), "enable_torque(inner)");
                     assert!(!inner.is_torqued, "stale enable_torque must not enable torque");
                 }
-                assert_stopped(sup.enable_torque(stale_stamp).await.unwrap_err(), "enable_torque(sup)");
+                assert_stopped(sup.enable_torque(s2).await.unwrap_err(), "enable_torque(sup)");
                 assert!(!sup.get_observation().await.is_torqued);
 
                 // Enable cleanly with fresh stamp, then verify disable_torque stays unstamped after Stop.
+                {
+                    let mut inner = sup.inner().write().await;
+                    inner.authorized_stop();
+                }
                 let fresh_stamp = sup.capture_admission_stamp();
                 sup.enable_torque(fresh_stamp).await.unwrap();
                 assert!(sup.get_observation().await.is_torqued);
@@ -2270,17 +2283,26 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
 
     // Also verify lease_gen mismatch -> LEASE_LOST and estop_epoch mismatch -> ESTOP_ACTIVE / EPOCH_MISMATCH.
     {
-        let (sup, gen, ep) = make_armed().await;
-        let inner = sup.inner().read().await;
+        let (sup, _stops, gen, ep) = make_armed().await;
+        let mut inner = sup.inner().write().await;
         let sg = inner.current_stop_gen();
-        let err_lease = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen + 1, connection_id: 0 }).unwrap_err();
+        let err_lease = inner.check_admission(AdmissionStamp {
+            stop_gen: sg, estop_epoch: ep, lease_gen: gen + 1, connection_id: 0,
+            request_id: armd::supervisor::next_admission_request_id(),
+        }).unwrap_err();
         assert_eq!(ApiError::from(ArmError::from(err_lease)).code.as_deref(), Some("LEASE_LOST"));
-        let err_ep = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep + 9, lease_gen: gen, connection_id: 0 }).unwrap_err();
+        let err_ep = inner.check_admission(AdmissionStamp {
+            stop_gen: sg, estop_epoch: ep + 9, lease_gen: gen, connection_id: 0,
+            request_id: armd::supervisor::next_admission_request_id(),
+        }).unwrap_err();
         assert_eq!(ApiError::from(ArmError::from(err_ep)).code.as_deref(), Some("EPOCH_MISMATCH"));
         drop(inner);
         let _ = sup.trigger_e_stop_checked().await.unwrap();
-        let inner = sup.inner().read().await;
-        let err_estop = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen, connection_id: 0 }).unwrap_err();
+        let mut inner = sup.inner().write().await;
+        let err_estop = inner.check_admission(AdmissionStamp {
+            stop_gen: sg, estop_epoch: ep, lease_gen: gen, connection_id: 0,
+            request_id: armd::supervisor::next_admission_request_id(),
+        }).unwrap_err();
         assert_eq!(ApiError::from(ArmError::from(err_estop)).code.as_deref(), Some("ESTOP_ACTIVE"));
     }
     let _ = BacklashRequest::Profile;
@@ -2300,13 +2322,15 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
     impl MotionStartOp for CountedOp {
         type Output = AdmissionStamp;
         fn kind(&self) -> MotionStartKind { self.kind }
-        fn execute(self, _inner: &mut SupervisorInner, admitted: Admitted) -> Result<Self::Output, ArmError> {
+        fn execute(self, admitted: Admitted<'_>) -> Result<Self::Output, ArmError> {
             self.executed.store(true, Ordering::SeqCst);
             Ok(admitted.stamp())
         }
     }
 
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+    let stops = armd::rt_core::urgent::StopRequests::new();
+    inner.attach_stop_requests(stops.clone());
     let gen = inner.acquire_lease("conn:op").unwrap();
     let stamp = inner.current_admission_stamp();
     assert_eq!(stamp.lease_gen, gen);
@@ -2314,18 +2338,24 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
     // Valid stamp produces single-use Admitted, runs `execute`, and returns the validated stamp.
     let ran = Arc::new(AtomicBool::new(false));
     let admitted = inner.check_admission(stamp).unwrap();
-    let out = inner.start_motion(admitted, CountedOp { kind: MotionStartKind::Jog, executed: ran.clone() }).unwrap();
+    let out = SupervisorInner::start_motion(admitted, CountedOp { kind: MotionStartKind::Jog, executed: ran.clone() }).unwrap();
     assert!(ran.load(Ordering::SeqCst));
     assert_eq!(out, stamp);
 
-    // Even an Admitted created before Stop is refused after Stop and NEVER invokes `execute`.
-    let stale_admitted = inner.check_admission(stamp).unwrap();
-    assert!(inner.authorized_stop());
+    // Second use of the same copyable stamp MUST be refused with STAMP_REUSED.
+    let err_reuse = inner.check_admission(stamp).unwrap_err();
+    assert_eq!(ApiError::from(ArmError::from(err_reuse)).code.as_deref(), Some("STAMP_REUSED"));
+
+    // Even an Admitted created before a lock-free Stop is refused after Stop and NEVER invokes `execute`.
+    let stamp_before_stop = inner.current_admission_stamp();
+    let stamp_check_after_stop = inner.current_admission_stamp();
+    let stale_admitted = inner.check_admission(stamp_before_stop).unwrap();
+    let _ = stops.request();
     let ran_stop = Arc::new(AtomicBool::new(false));
-    let err = inner.start_motion(stale_admitted, CountedOp { kind: MotionStartKind::PolicyLive, executed: ran_stop.clone() }).unwrap_err();
+    let err = SupervisorInner::start_motion(stale_admitted, CountedOp { kind: MotionStartKind::PolicyLive, executed: ran_stop.clone() }).unwrap_err();
     assert!(!ran_stop.load(Ordering::SeqCst), "execute must NOT run on stale stop_gen");
     assert_eq!(ApiError::from(err).code.as_deref(), Some("STOPPED"));
-    assert_eq!(ApiError::from(ArmError::from(inner.check_admission(stamp).unwrap_err())).code.as_deref(), Some("STOPPED"));
+    assert_eq!(ApiError::from(ArmError::from(inner.check_admission(stamp_check_after_stop).unwrap_err())).code.as_deref(), Some("STOPPED"));
 
     // Stale lease_gen refuses at check_admission with LEASE_LOST.
     let fresh = inner.current_admission_stamp();
@@ -3197,19 +3227,26 @@ async fn teardown_closes_connection_under_owner_lock_and_acquire_release_stops_m
     use armd::api::rest::ApiError;
     use armd::AdmissionStamp;
 
-    // (a) Owner-lock connection-closed flag refuses stale `Admitted` and `AdmissionStamp`.
+    // (a) Owner-lock connection-closed flag refuses `AdmissionStamp` from a closed connection
+    //     (and `Admitted<'g>` itself cannot outlive the owner lock guard or span `mark_connection_closed`).
     {
         let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() });
         let gen = inner.acquire_lease("connection:42").unwrap();
         let s0 = AdmissionStamp { connection_id: 42, ..inner.current_admission_stamp() };
         let a_en = inner.check_admission(s0).unwrap();
-        inner.enable_torque(a_en).unwrap();
+        SupervisorInner::enable_torque(a_en).unwrap();
         let ep = inner.safety.epoch_id();
-        let stamp_conn42 = AdmissionStamp { stop_gen: inner.current_stop_gen(), estop_epoch: ep, lease_gen: gen, connection_id: 42 };
-        // Pre-create valid `Admitted` tokens BEFORE teardown marks connection 42 closed.
-        let stale_admitted_jog = inner.check_admission(stamp_conn42).unwrap();
-        #[cfg(feature = "policy-runtime")]
-        let stale_admitted_pol = inner.check_admission(stamp_conn42).unwrap();
+        let stamp_conn42 = AdmissionStamp {
+            stop_gen: inner.current_stop_gen(),
+            estop_epoch: ep,
+            lease_gen: gen,
+            connection_id: 42,
+            request_id: armd::supervisor::next_admission_request_id(),
+        };
+        let stamp_conn42_second = AdmissionStamp {
+            request_id: armd::supervisor::next_admission_request_id(),
+            ..stamp_conn42
+        };
 
         // Teardown marks connection 42 closed under the owner lock (and also exercise coalescing).
         inner.mark_connection_closed(41);
@@ -3218,30 +3255,44 @@ async fn teardown_closes_connection_under_owner_lock_and_acquire_release_stops_m
         assert!(inner.is_connection_closed(41) && inner.is_connection_closed(42) && inner.is_connection_closed(43));
         assert!(!inner.is_connection_closed(40) && !inner.is_connection_closed(44) && !inner.is_connection_closed(0));
 
-        // Even while lease/epoch/stop_gen still match, BOTH `check_admission` AND pre-created
-        // `Admitted` tokens for connection 42 MUST be refused with LEASE_LOST!
+        // Even while lease/epoch/stop_gen still match, `check_admission` and `preflight_admission`
+        // for connection 42 MUST be refused with LEASE_LOST and leave zero motion installed.
+        let err_pre = inner.preflight_admission(stamp_conn42).unwrap_err();
+        assert_eq!(ApiError::from(ArmError::from(err_pre)).code.as_deref(), Some("LEASE_LOST"));
         let err_check = inner.check_admission(stamp_conn42).unwrap_err();
         assert_eq!(ApiError::from(ArmError::from(err_check)).code.as_deref(), Some("LEASE_LOST"));
-        let err_jog = inner.jog_action(stale_admitted_jog, INSPECT.to_vec(), Some(1.0), Some(ep), "closed_jog").unwrap_err();
+        let err_jog = inner
+            .check_admission(stamp_conn42_second)
+            .map_err(ArmError::from)
+            .and_then(|adm| SupervisorInner::jog_action(adm, INSPECT.to_vec(), Some(1.0), Some(ep), "closed_jog"))
+            .unwrap_err();
         assert_eq!(ApiError::from(err_jog).code.as_deref(), Some("LEASE_LOST"));
         assert!(inner.active_trajectory.is_none());
         #[cfg(feature = "policy-runtime")]
         {
-            let err_pol = inner.begin_policy_run(stale_admitted_pol, armd::policy_runtime::PolicyRunStart {
-                epoch_id: ep,
-                connection_id: "connection:42".into(),
-                lease_generation: gen,
-                policy_id: "closed_pol".into(),
-                artifact_digest: "sha256:0000".into(),
-                backend: "mlp".into(),
-                mode: armd::policy_runtime::PolicyMode::Shadow,
-                sim_only: false,
-                max_first_step_rad: None,
-                max_step_rad: None,
-                tag: None,
-                i_am_at_the_arm: false,
-                verified_release_gate: None,
-            }).unwrap_err();
+            let stamp_pol = AdmissionStamp {
+                request_id: armd::supervisor::next_admission_request_id(),
+                ..stamp_conn42
+            };
+            let err_pol = inner
+                .check_admission(stamp_pol)
+                .map_err(ArmError::from)
+                .and_then(|adm| SupervisorInner::begin_policy_run(adm, armd::policy_runtime::PolicyRunStart {
+                    epoch_id: ep,
+                    connection_id: "connection:42".into(),
+                    lease_generation: gen,
+                    policy_id: "closed_pol".into(),
+                    artifact_digest: "sha256:0000".into(),
+                    backend: "mlp".into(),
+                    mode: armd::policy_runtime::PolicyMode::Shadow,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
+                }))
+                .unwrap_err();
             assert_eq!(ApiError::from(err_pol).code.as_deref(), Some("LEASE_LOST"));
             assert!(inner.policy_run.is_none());
         }
@@ -3386,10 +3437,10 @@ async fn teardown_closes_connection_under_owner_lock_and_acquire_release_stops_m
         let mut direct = SupervisorInner::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() });
         let g = direct.acquire_lease("connection:99").unwrap();
         let a1 = direct.check_admission(direct.current_admission_stamp()).unwrap();
-        direct.enable_torque(a1).unwrap();
+        SupervisorInner::enable_torque(a1).unwrap();
         let ep_d = direct.safety.epoch_id();
         let a2 = direct.check_admission(direct.current_admission_stamp()).unwrap();
-        direct.jog_action(a2, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_d), "direct_jog").unwrap();
+        SupervisorInner::jog_action(a2, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_d), "direct_jog").unwrap();
         assert!(direct.active_trajectory.is_some());
         assert!(direct.release_lease_for_connection_and_stop("connection:99"));
         assert!(direct.active_lease.is_none());
@@ -3398,7 +3449,7 @@ async fn teardown_closes_connection_under_owner_lock_and_acquire_release_stops_m
         let g2 = direct.acquire_lease("connection:100").unwrap();
         assert!(g2 > g);
         let a3 = direct.check_admission(direct.current_admission_stamp()).unwrap();
-        direct.jog_action(a3, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_d), "direct_jog2").unwrap();
+        SupervisorInner::jog_action(a3, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_d), "direct_jog2").unwrap();
         assert!(direct.active_trajectory.is_some());
         assert!(direct.release_lease_and_stop("connection:100", g2));
         assert!(direct.active_lease.is_none());
@@ -3801,7 +3852,7 @@ async fn teardown_marks_connection_closed_under_owner_lock_before_awaiting_joins
         "expected connection_closed to be set BEFORE writer_task finished joining"
     );
     {
-        let inner = sup.inner().write().await;
+        let mut inner = sup.inner().write().await;
         assert!(inner.is_connection_closed(numeric_conn_id));
         assert!(matches!(inner.check_admission(stamp), Err(armd::SafetyError::LeaseLost)));
     }
@@ -3891,7 +3942,7 @@ async fn stop_never_cancels_or_blocks_queued_torque_disable_on_ws_and_rt_broker(
         core.lease_enabled = false;
         let st = core.current_admission_stamp();
         let adm = core.check_admission(st).unwrap();
-        core.enable_torque(adm).unwrap();
+        armd::SupervisorInner::enable_torque(adm).unwrap();
         assert!(core.is_torqued);
 
         let (mut fx, mut broker, _tw, stop) = ReleaseFixture::new(core, BootId(1), Capacities::default());
@@ -3946,7 +3997,7 @@ async fn stop_never_cancels_or_blocks_queued_torque_disable_on_ws_and_rt_broker(
         core_drv.tick(0.02);
         let st = core_drv.current_admission_stamp();
         let adm = core_drv.check_admission(st).unwrap();
-        core_drv.enable_torque(adm).unwrap();
+        armd::SupervisorInner::enable_torque(adm).unwrap();
         assert!(core_drv.is_torqued);
 
         let (mut fx_d, mut broker_d, _tw_d, stop_d) = ReleaseFixture::new(core_drv, BootId(2), Capacities::default());
@@ -3976,4 +4027,125 @@ async fn stop_never_cancels_or_blocks_queued_torque_disable_on_ws_and_rt_broker(
         assert!(matches!(rep_d_on.command, Some((_, Err("STOPPED")))), "stale TransitionOp::TorqueOn must fail STOPPED: {:?}", rep_d_on.command);
         assert!(!fx_d.core.is_torqued);
     }
+}
+
+// 25. Round-6 item 4: AdmissionStamp is copyable yet single-use (consuming its request_id under
+//     the owner lock refuses a second use, refuses request_id == 0 fail-closed, refuses RT
+//     broker RequestId replay, and never forgets consumed IDs across > 300 out-of-order stamps).
+#[test]
+fn single_use_admission_stamp_refuses_second_use_zero_id_and_broker_replay() {
+    use armd::api::rest::ApiError;
+    use armd::rt_core::broker::{Authority, BootId, ClientId, CommandKind, Descriptor, ImmediateOp, RequestId, Stamp};
+    use armd::rt_core::ops::{CommitCtx, CoreOps};
+    use armd::{AdmissionStamp, SafetyError};
+
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 30_000, ..ArmConfig::rebot_dm() });
+    let gen = inner.acquire_lease("conn:single-use").unwrap();
+
+    // (a) Copyable AdmissionStamp succeeds once and is refused on its second use.
+    let s1 = inner.current_admission_stamp();
+    let s1_copy = s1; // AdmissionStamp remains Copy
+    assert_eq!(s1, s1_copy);
+    assert_ne!(s1.request_id, 0);
+    // preflight_admission is read-only and does not consume the stamp.
+    inner.preflight_admission(s1).unwrap();
+    inner.preflight_admission(s1_copy).unwrap();
+    {
+        let admitted = inner.check_admission(s1).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
+    }
+    assert!(inner.is_torqued);
+    // Second check_admission and preflight_admission with the copied stamp MUST fail STAMP_REUSED.
+    let err_pre = inner.preflight_admission(s1_copy).unwrap_err();
+    assert_eq!(err_pre, SafetyError::StampAlreadyConsumed);
+    let err_2nd = inner.check_admission(s1_copy).unwrap_err();
+    assert_eq!(err_2nd, SafetyError::StampAlreadyConsumed);
+    assert_eq!(ApiError::from(ArmError::from(err_2nd)).code.as_deref(), Some("STAMP_REUSED"));
+
+    // (b) request_id == 0 is refused fail-closed, and for_macro_child preserves authority
+    //     without laundering request_id == 0.
+    let zero_stamp = AdmissionStamp { request_id: 0, ..inner.current_admission_stamp() };
+    assert_eq!(inner.check_admission(zero_stamp).unwrap_err(), SafetyError::StampAlreadyConsumed);
+    assert_eq!(zero_stamp.for_macro_child().request_id, 0);
+    assert_eq!(
+        inner.check_admission(zero_stamp.for_macro_child()).unwrap_err(),
+        SafetyError::StampAlreadyConsumed,
+    );
+    let child = s1.for_macro_child();
+    assert_eq!((child.stop_gen, child.estop_epoch, child.lease_gen, child.connection_id),
+        (s1.stop_gen, s1.estop_epoch, s1.lease_gen, s1.connection_id));
+    assert_ne!(child.request_id, s1.request_id);
+    assert!(inner.check_admission(child).is_ok());
+    assert_eq!(inner.check_admission(child).unwrap_err(), SafetyError::StampAlreadyConsumed);
+
+    // (c) Failed authority check does NOT consume a fresh stamp's request_id.
+    let bad_lease = AdmissionStamp { lease_gen: gen + 99, ..inner.current_admission_stamp() };
+    assert_eq!(inner.check_admission(bad_lease).unwrap_err(), SafetyError::LeaseLost);
+    let repaired = AdmissionStamp { lease_gen: gen, ..bad_lease };
+    assert!(inner.check_admission(repaired).is_ok());
+    assert_eq!(inner.check_admission(repaired).unwrap_err(), SafetyError::StampAlreadyConsumed);
+
+    // (d) > 300 non-contiguous out-of-order stamps (> 256 interval cap): every consumed ID
+    //     remains refused fail-closed and fresh IDs above the high-water mark succeed.
+    let mut base = inner.current_admission_stamp();
+    let start_id = base.request_id + 1000;
+    let mut consumed_ids = Vec::new();
+    for k in 0..320u64 {
+        let id = start_id + k * 2;
+        base.request_id = id;
+        assert!(inner.check_admission(base).is_ok(), "fresh out-of-order id {id} must succeed");
+        consumed_ids.push(id);
+    }
+    for &id in &consumed_ids {
+        base.request_id = id;
+        assert_eq!(
+            inner.check_admission(base).unwrap_err(),
+            SafetyError::StampAlreadyConsumed,
+            "consumed id {id} must never be forgotten",
+        );
+    }
+    base.request_id = start_id + 320 * 2 + 10;
+    assert!(inner.check_admission(base).is_ok());
+
+    // (e) RT broker RequestId namespace is single-use and isolated from global request_ids.
+    inner.disable_torque().unwrap();
+    let now = Instant::now();
+    let boot = BootId(7);
+    let ctx = CommitCtx { arm: ArmId::LOCAL, boot, now, stop_generation: inner.current_stop_gen() };
+    let auth = Authority {
+        lease_generation: gen,
+        epoch: inner.safety.epoch_id(),
+        stop_generation: inner.current_stop_gen(),
+        config_revision: inner.workspace_revision,
+        parent_generation: 0,
+    };
+    let make_desc = |req: u64| Descriptor {
+        stamp: Stamp {
+            arm: ArmId::LOCAL,
+            boot,
+            request: RequestId(req),
+            client: ClientId(1),
+            client_seq: req,
+            authority: auth,
+            deadline: now + Duration::from_secs(5),
+        },
+        kind: CommandKind::Immediate(ImmediateOp::TorqueOn),
+    };
+    assert_eq!(
+        inner.commit_immediate(&make_desc(0), ImmediateOp::TorqueOn, &ctx),
+        Err("STAMP_REUSED"),
+        "broker RequestId(0) must be refused fail-closed",
+    );
+    let d1 = make_desc(1);
+    assert!(inner.commit_immediate(&d1, ImmediateOp::TorqueOn, &ctx).is_ok());
+    assert!(inner.is_torqued);
+    inner.disable_torque().unwrap();
+    assert_eq!(
+        inner.commit_immediate(&d1, ImmediateOp::TorqueOn, &ctx),
+        Err("STAMP_REUSED"),
+        "replaying broker RequestId(1) must be refused with STAMP_REUSED",
+    );
+    assert!(!inner.is_torqued);
+    assert!(inner.commit_immediate(&make_desc(2), ImmediateOp::TorqueOn, &ctx).is_ok());
+    assert!(inner.is_torqued);
 }

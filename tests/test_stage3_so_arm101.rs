@@ -469,7 +469,7 @@ async fn test_5dof_place_execution_lateral_target() {
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     }
 
     let ticker = sup.clone();
@@ -564,7 +564,7 @@ fn test_so_arm_default_grasp_no_workspace_violation() {
         // 3. Test grasp::plan at nominal target
         let mut inner = SupervisorInner::new(config.clone());
         inner.lease_enabled = false;
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let target_nom = [0.22, 0.0, setup.table_z_m + setup.grasp_height_m];
         let r_down = grasp::look_down(&kinematics::IDENTITY);
         let goal = Pose::new(r_down, [target_nom[0], target_nom[1], setup.table_z_m + setup.approach_height_m]);
@@ -615,7 +615,7 @@ fn test_5dof_grasp_off_axis_yaw_free_orchestrator_and_plan() {
     // 2. Test grasp::plan feasibility check on off-axis target
     let mut inner = SupervisorInner::new(config.clone());
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let q32: Vec<f32> = sol.q.iter().map(|&x| x as f32).collect();
     inner.commanded_positions = q32.clone();
     inner.measured_positions = q32;
@@ -745,7 +745,7 @@ async fn test_so101_park_uses_folded_resting_pose_and_load_limits() {
 
     // 1. Verify NormalUnload (park) targets resting_positions()
     let mut inner = armd::supervisor::SupervisorInner::new(config.clone());
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = config.home_positions.clone();
     inner.measured_positions = config.home_positions.clone();
     inner.apply_stop_policy(armd::safety::StopPolicy::NormalUnload);
@@ -862,7 +862,7 @@ fn test_5dof_grasp_plan_from_tilted_scan_to_off_axis_target_no_branch_flip() {
 
     let mut inner = SupervisorInner::new(config.clone());
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let q32: Vec<f32> = q_scan.iter().map(|&x| x as f32).collect();
     inner.commanded_positions = q32.clone();
     inner.measured_positions = q32;
@@ -1410,7 +1410,7 @@ async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze
     {
         let mut inner = supervisor.inner().write().await;
         inner.lease_enabled = false;
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.target_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];

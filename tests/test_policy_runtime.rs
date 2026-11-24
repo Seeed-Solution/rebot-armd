@@ -162,7 +162,7 @@ async fn shadow_mode_runs_and_never_mutates_servo_target() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-shadow".into(),
                 lease_generation: gen,
@@ -248,7 +248,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-live".into(),
                 lease_generation: gen,
@@ -313,7 +313,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
 
     let jump_action = {
         let mut inner = sup2.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch2,
                 connection_id: "conn-jump".into(),
                 lease_generation: gen2,
@@ -351,7 +351,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
 
     // Part C: tighter contract.max_first_step_rad (0.05) and max_step_rad (0.04) enforced.
     let mut inner = sup2.inner().write().await;
-    let id_c = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+    let id_c = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch2,
             connection_id: "conn-jump".into(),
             lease_generation: gen2,
@@ -395,7 +395,7 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
     // 1. After stop + newer jog action started: late policy_step must fail and NOT clear newer action or mutate servo_target.
     let id1 = {
         let mut inner = sup.inner().write().await;
-        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch1,
                 connection_id: "conn-1".into(),
                 lease_generation: gen1,
@@ -413,7 +413,7 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
             .unwrap();
         assert!(inner.stop_policy_run(Some(id), "STOPPED"));
         // Start a newer jog action.
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0.5), Some(epoch1), "joint_move")) } }
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0.5), Some(epoch1), "joint_move")) } }
             .unwrap();
         let active_traj_before = inner.active_trajectory.is_some();
         assert!(active_traj_before);
@@ -433,7 +433,7 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
     // 2. After lease preemption: late policy_step rejected, stop_reason = LEASE_LOST, servo_target untouched.
     let id2 = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch1,
                 connection_id: "conn-1".into(),
                 lease_generation: gen1,
@@ -475,7 +475,7 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
     // 3. After servo_blocked_hold: policy_step MUST NOT clear servo_blocked_hold and must reject with BLOCKED_HOLD.
     let id3 = {
         let mut inner = sup.inner().write().await;
-        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch3,
                 connection_id: "conn-2".into(),
                 lease_generation: gen3,
@@ -516,7 +516,7 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
     // 4. After e_stop: policy_step rejected, stop_reason = ESTOP, servo_target None.
     let id4 = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch3,
                 connection_id: "conn-2".into(),
                 lease_generation: gen3,
@@ -561,7 +561,7 @@ async fn policy_frames_do_not_renew_external_lease_watchdog() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-wd".into(),
                 lease_generation: gen,
@@ -649,7 +649,7 @@ async fn real_driver_rejects_live_mode_but_allows_shadow() {
     let epoch = sup.get_observation().await.epoch_id;
 
     let mut inner = sup.inner().write().await;
-    let live_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+    let live_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch,
             connection_id: "conn-real".into(),
             lease_generation: gen,
@@ -670,7 +670,7 @@ async fn real_driver_rejects_live_mode_but_allows_shadow() {
         "expected OPERATOR_CONFIRMATION_REQUIRED, got {live_err:?}"
     );
 
-    let shadow_id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+    let shadow_id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch,
             connection_id: "conn-real".into(),
             lease_generation: gen,
@@ -702,7 +702,7 @@ async fn mutual_exclusion_between_policy_and_other_motions() {
     let epoch = sup.get_observation().await.epoch_id;
 
     let mut inner = sup.inner().write().await;
-    let pid = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+    let pid = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch,
             connection_id: "conn-mx".into(),
             lease_generation: gen,
@@ -721,14 +721,14 @@ async fn mutual_exclusion_between_policy_and_other_motions() {
 
     // servo, jog, second policy must all fail with MotionBusy.
     assert_eq!(
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, vec![0.0; 6], epoch)) } }.unwrap_err(),
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, vec![0.0; 6], epoch)) } }.unwrap_err(),
         SafetyError::MotionBusy
     );
-    let jog_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0.5), Some(epoch))) } }
+    let jog_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0.5), Some(epoch))) } }
         .unwrap_err();
     assert!(matches!(jog_err, ArmError::Motion(_)), "{jog_err:?}");
 
-    let second_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+    let second_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch,
             connection_id: "conn-mx".into(),
             lease_generation: gen,
@@ -752,9 +752,9 @@ async fn mutual_exclusion_between_policy_and_other_motions() {
     assert!(inner.stop_policy_run(Some(pid), "STOPPED"));
 
     // Start a jog trajectory, then verify begin_policy_run returns MotionBusy.
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0.5), Some(epoch))) } }
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0.5), Some(epoch))) } }
         .unwrap();
-    let busy_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+    let busy_err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch,
             connection_id: "conn-mx".into(),
             lease_generation: gen,
@@ -1007,7 +1007,7 @@ async fn blocked_hold_during_tick_terminates_live_policy_and_is_not_cleared() {
 
     let id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch,
             connection_id: "conn-bh".into(),
             lease_generation: gen,
@@ -1359,7 +1359,7 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
     let action_id = {
         let mut inner = sup.inner().write().await;
         inner.measured_positions[0] = f32::NAN;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-nan".into(),
                 lease_generation: gen,
@@ -1412,7 +1412,7 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
     let epoch2 = sup2.get_observation().await.epoch_id;
     let action_id2 = {
         let mut inner = sup2.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch2,
                 connection_id: "conn-fail".into(),
                 lease_generation: gen2,
@@ -1471,7 +1471,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
     let epoch_a = sup_a.get_observation().await.epoch_id;
     let id_a = {
         let mut inner = sup_a.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch_a,
                 connection_id: "conn-dl-a".into(),
                 lease_generation: gen_a,
@@ -1534,7 +1534,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
     let epoch_b = sup_b.get_observation().await.epoch_id;
     let id_b = {
         let mut inner = sup_b.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch_b,
                 connection_id: "conn-dl-b".into(),
                 lease_generation: gen_b,
@@ -1592,7 +1592,7 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
     let epoch_a = sup_a.get_observation().await.epoch_id;
     let id_a = {
         let mut inner = sup_a.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch_a,
                 connection_id: "conn-race-tick".into(),
                 lease_generation: gen_a,
@@ -1656,7 +1656,7 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
     let epoch_b = sup_b.get_observation().await.epoch_id;
     let id_b = {
         let mut inner = sup_b.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch_b,
                 connection_id: "conn-race-infer".into(),
                 lease_generation: gen_b,
@@ -1712,7 +1712,7 @@ async fn live_policy_start_rejected_while_arm_braking_and_succeeds_when_settled(
     // Drive nonzero velocity via servo + tick, then drop servo_target so the arm enters braking.
     {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, vec![0.25, 0.0, 0.0, 0.0, 0.0, 0.0], epoch)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, vec![0.25, 0.0, 0.0, 0.0, 0.0, 0.0], epoch)) } }.unwrap();
     }
     for _ in 0..3 {
         sup.tick(0.02).await;
@@ -1730,7 +1730,7 @@ async fn live_policy_start_rejected_while_arm_braking_and_succeeds_when_settled(
             Err(ArmError::Safety(SafetyError::MotionBusy))
         ));
         assert!(matches!(
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-brake".into(),
                 lease_generation: gen,
@@ -1773,7 +1773,7 @@ async fn live_policy_start_rejected_while_arm_braking_and_succeeds_when_settled(
     inner
         .check_policy_start_preconditions(PolicyMode::Live, epoch)
         .expect("live policy start preconditions must pass once settled");
-    let action_id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+    let action_id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
             epoch_id: epoch,
             connection_id: "conn-brake".into(),
             lease_generation: gen,
@@ -2034,7 +2034,7 @@ async fn overlapping_policy_load_is_rejected_with_motion_busy() {
             Err(ArmError::Safety(SafetyError::MotionBusy))
         ));
         assert!(matches!(
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-load".into(),
                 lease_generation: gen,
@@ -2052,7 +2052,7 @@ async fn overlapping_policy_load_is_rejected_with_motion_busy() {
             Err(ArmError::Safety(SafetyError::MotionBusy))
         ));
         assert!(matches!(
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, vec![0.0; 6], epoch)) } },
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, vec![0.0; 6], epoch)) } },
             Err(SafetyError::MotionBusy)
         ));
         inner.policy_loading = false;
@@ -2263,7 +2263,7 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
     // 1. Active Shadow policy blocks gravity comp entry.
     let action_id = {
         let mut inner = sup.inner().write().await;
-        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-gc".into(),
                 lease_generation: gen,
@@ -2281,7 +2281,7 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
             .unwrap();
         let blocker = inner.gravity_comp_blocker().expect("shadow policy must block gravity_comp");
         assert_eq!(blocker.code, "MOTION_BUSY");
-        let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap_err();
+        let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap_err();
         assert!(
             matches!(err, ArmError::Rejected { ref code, .. } if code == "MOTION_BUSY"),
             "expected MOTION_BUSY, got {err:?}"
@@ -2298,7 +2298,7 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
         inner.policy_loading = true;
         let blocker = inner.gravity_comp_blocker().expect("policy_loading must block gravity_comp");
         assert_eq!(blocker.code, "MOTION_BUSY");
-        let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap_err();
+        let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap_err();
         assert!(
             matches!(err, ArmError::Rejected { ref code, .. } if code == "MOTION_BUSY"),
             "expected MOTION_BUSY, got {err:?}"
@@ -2309,7 +2309,7 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
     // 2. Active gravity comp blocks starting either Shadow or Live policy.
     {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap();
         assert!(matches!(
             inner.check_policy_start_preconditions(PolicyMode::Shadow, epoch),
             Err(ArmError::Safety(SafetyError::MotionBusy))
@@ -2319,7 +2319,7 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
             Err(ArmError::Safety(SafetyError::MotionBusy))
         ));
         assert!(matches!(
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-gc".into(),
                 lease_generation: gen,
@@ -2407,7 +2407,7 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
     let epoch = sup.get_observation().await.epoch_id;
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-slow-ct".into(),
                 lease_generation: gen,
@@ -2498,7 +2498,7 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
     let epoch_none = sup_none.get_observation().await.epoch_id;
     let action_none = {
         let mut inner = sup_none.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch_none,
                 connection_id: "conn-none-age".into(),
                 lease_generation: gen_none,
@@ -2692,7 +2692,7 @@ mod tract_e2e {
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-tract".into(),
                     lease_generation: gen,
@@ -2954,7 +2954,7 @@ async fn live_policy_rejects_stale_joint_measurement_from_slow_inference() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-slow-infer".into(),
                 lease_generation: gen,
@@ -3231,7 +3231,7 @@ mod phase2_vision {
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-vis-e2e".into(),
                     lease_generation: gen,
@@ -3306,7 +3306,7 @@ mod phase2_vision {
         let epoch2 = sup2.get_observation().await.epoch_id;
         let action_id2 = {
             let mut inner = sup2.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch2,
                     connection_id: "conn-vis-unavail".into(),
                     lease_generation: gen2,
@@ -3491,7 +3491,7 @@ mod phase2_vision {
             let epoch = sup.get_observation().await.epoch_id;
             let action_id = {
                 let mut inner = sup.inner().write().await;
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                         epoch_id: epoch,
                         connection_id: "conn-stale".into(),
                         lease_generation: gen,
@@ -3540,7 +3540,7 @@ mod phase2_vision {
             let epoch = sup.get_observation().await.epoch_id;
             let action_id = {
                 let mut inner = sup.inner().write().await;
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                         epoch_id: epoch,
                         connection_id: "conn-missing-ts".into(),
                         lease_generation: gen,
@@ -3587,7 +3587,7 @@ mod phase2_vision {
             let epoch = sup.get_observation().await.epoch_id;
             let action_id = {
                 let mut inner = sup.inner().write().await;
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                         epoch_id: epoch,
                         connection_id: "conn-skew".into(),
                         lease_generation: gen,
@@ -3653,7 +3653,7 @@ mod phase2_vision {
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-gen".into(),
                     lease_generation: gen,
@@ -3718,7 +3718,7 @@ mod phase2_vision {
         let epoch_m = sup_m.get_observation().await.epoch_id;
         let id_m = {
             let mut inner = sup_m.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch_m,
                     connection_id: "conn-gen-miss".into(),
                     lease_generation: gen_m,
@@ -3802,7 +3802,7 @@ mod phase2_vision {
             let epoch = sup.get_observation().await.epoch_id;
             let id = {
                 let mut inner = sup.inner().write().await;
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                         epoch_id: epoch,
                         connection_id: "conn-zero".into(),
                         lease_generation: gen,
@@ -3864,7 +3864,7 @@ mod phase2_vision {
             let epoch = sup.get_observation().await.epoch_id;
             let id = {
                 let mut inner = sup.inner().write().await;
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                         epoch_id: epoch,
                         connection_id: "conn-hold".into(),
                         lease_generation: gen,
@@ -3923,7 +3923,7 @@ mod phase2_vision {
             let epoch = sup.get_observation().await.epoch_id;
             let id = {
                 let mut inner = sup.inner().write().await;
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                         epoch_id: epoch,
                         connection_id: "conn-stop".into(),
                         lease_generation: gen,
@@ -3976,7 +3976,7 @@ mod phase2_vision {
         let epoch = sup.get_observation().await.epoch_id;
         let id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-repeat".into(),
                     lease_generation: gen,
@@ -4124,7 +4124,7 @@ mod phase2_vision {
             let epoch = sup.get_observation().await.epoch_id;
             let action_id = {
                 let mut inner = sup.inner().write().await;
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                         epoch_id: epoch,
                         connection_id: format!("conn-{case_name}"),
                         lease_generation: gen,
@@ -4229,7 +4229,7 @@ mod phase2_vision {
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-lock-stale".into(),
                     lease_generation: gen,
@@ -4600,7 +4600,7 @@ mod phase2_vision {
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-http-delay".into(),
                     lease_generation: gen,
@@ -4693,7 +4693,7 @@ mod phase2_vision {
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-slow-gen".into(),
                     lease_generation: gen,
@@ -4855,7 +4855,7 @@ mod phase2_vision {
 
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-vis-hold-clear".into(),
                     lease_generation: gen,
@@ -5363,7 +5363,7 @@ mod phase3_release_gate_tests {
             let mut inner = sup.inner().write().await;
 
             // 1. Live without i_am_at_the_arm -> OPERATOR_CONFIRMATION_REQUIRED (403)
-            let err1 = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            let err1 = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-triple".into(),
                     lease_generation: gen,
@@ -5385,7 +5385,7 @@ mod phase3_release_gate_tests {
             );
 
             // 2. Live with i_am_at_the_arm: true but no release_gate (or mismatched digest) -> RELEASE_GATE_REQUIRED (403)
-            let err2 = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            let err2 = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-triple".into(),
                     lease_generation: gen,
@@ -5406,7 +5406,7 @@ mod phase3_release_gate_tests {
                 "expected RELEASE_GATE_REQUIRED, got {err2:?}"
             );
 
-            let err2b = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            let err2b = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-triple".into(),
                     lease_generation: gen,
@@ -5429,7 +5429,7 @@ mod phase3_release_gate_tests {
 
             // 3. Live with i_am_at_the_arm: true + valid release_gate, but unconfirmed feedback -> FEEDBACK_UNCONFIRMED (409)
             inner.feedback_numeric_valid = false;
-            let err3a = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            let err3a = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-triple".into(),
                     lease_generation: gen,
@@ -5452,7 +5452,7 @@ mod phase3_release_gate_tests {
             inner.feedback_numeric_valid = true;
 
             drv_fb_valid.store(false, Ordering::SeqCst);
-            let err3b = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            let err3b = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-triple".into(),
                     lease_generation: gen,
@@ -5478,7 +5478,7 @@ mod phase3_release_gate_tests {
         // 4. All 3 satisfied -> SUCCEEDS and executes cleanly!
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-triple".into(),
                     lease_generation: gen,
@@ -5935,7 +5935,7 @@ mod phase3_release_gate_tests {
 
         let action_id = {
             let mut inner = sup.inner().write().await;
-            let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-speed-cap".into(),
                     lease_generation: gen,
@@ -6268,7 +6268,7 @@ mod phase3_release_gate_tests {
         // Direct SupervisorInner check: sim_only rejected even with i_am_at_the_arm and valid gate.
         {
             let mut inner = sup.inner().write().await;
-            let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+            let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                     epoch_id: 1,
                     connection_id: "direct".into(),
                     lease_generation: gen,
@@ -6589,32 +6589,32 @@ mod device_qualification_tests {
         let mut inner = sup.inner().write().await;
         // no ledger configured: refused
         inner.policy_ledger_path = None;
-        let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
+        let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
         assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "{e:?}");
 
         // empty ledger: the caller's own run record does not count
         inner.policy_ledger_path = Some(ledger.clone());
-        let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
+        let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
         assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "{e:?}");
 
         // supervised runs that end at their deadline are recorded as passes
         for i in 0..MIN_SUPERVISED_PASSES {
-            let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, start(epoch, gen, &digest, &supervised))) } }.unwrap();
+            let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, start(epoch, gen, &digest, &supervised))) } }.unwrap();
             assert!(inner.finish_policy_run(id, "MAX_SECONDS"));
             if i + 1 < MIN_SUPERVISED_PASSES {
-                let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
+                let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
                 assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "after {} passes: {e:?}", i + 1);
             }
         }
-        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.expect("qualified");
+        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.expect("qualified");
         assert!(inner.stop_policy_run(Some(id), "STOPPED"));
 
         // a supervised run that is stopped is recorded as a failure and revokes the release
-        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, start(epoch, gen, &digest, &supervised))) } }.unwrap();
+        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, start(epoch, gen, &digest, &supervised))) } }.unwrap();
         inner.set_policy_period_us(id, 40_000);
         inner.record_policy_step_timing(id, 1_500, 60_000);
         assert!(inner.stop_policy_run(Some(id), "STOPPED"));
-        let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
+        let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, start(epoch, gen, &digest, &production))) } }.unwrap_err();
         assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "{e:?}");
 
         let records = load_records(&ledger).unwrap();
@@ -6762,7 +6762,7 @@ mod review_fix_tests {
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
         let mut inner = sup.inner().write().await;
-        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: conn.into(),
                 lease_generation: gen,
@@ -7182,7 +7182,7 @@ mod policy_stats_tests {
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-stats".into(),
                 lease_generation: gen,

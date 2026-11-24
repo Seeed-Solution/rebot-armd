@@ -289,7 +289,7 @@ async fn lease_expiry_mid_action_then_close_still_parks_to_idle() {
     {
         let mut inner = supervisor.inner().write().await;
         let epoch = inner.safety.epoch_id();
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, vec![1.0, 0.5], Some(2.0), Some(epoch), "joint_move")) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, vec![1.0, 0.5], Some(2.0), Some(epoch), "joint_move")) } }.unwrap();
     }
     for _ in 0..5 { supervisor.tick(0.02).await; }
     let obs = expire_lease(&supervisor).await;

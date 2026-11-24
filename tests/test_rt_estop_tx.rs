@@ -112,12 +112,12 @@ fn rig() -> (SupervisorInner, Arc<Mutex<Shared>>) {
     shared.lock().unwrap().requested = Some((inner.requested_estop_count.clone(), inner.e_stop_latched.clone()));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     for _ in 0..5 { inner.tick(0.02); }
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.5;
     let epoch = inner.safety.epoch_id();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, q, Some(2.0), Some(epoch))) } }.expect("jog");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, Some(2.0), Some(epoch))) } }.expect("jog");
     for _ in 0..10 { inner.tick(0.02); }
     assert!(inner.active_trajectory.is_some());
     (inner, shared)

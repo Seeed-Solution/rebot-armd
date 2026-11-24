@@ -20,7 +20,7 @@ fn supervisor() -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
     inner.tick(0.02);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     inner
 }
 
@@ -248,7 +248,7 @@ fn leased_with(lease_timeout_ms: u64, caps: Capacities) -> (Fx, u64) {
     inner.lease_enabled = true;
     inner.tick(0.02);
     let generation = inner.acquire_lease("client").expect("lease");
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     (ReleaseFixture::new(inner, BOOT, caps), generation)
 }
 
@@ -466,7 +466,7 @@ fn a_config_reservation_needs_current_authority_and_inhibits_motion_until_it_end
     let code = |e: armd::ArmError| armd::api::rest::ApiError::from(e).code;
     let mut q = fx.core.commanded_positions.clone();
     q[0] += 0.05;
-    assert_eq!({ let __s = fx.core.current_admission_stamp(); fx.core.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| fx.core.jog_action(__a, q.clone(), Some(0.5), None, "jog")) }.map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
+    assert_eq!({ let __s = fx.core.current_admission_stamp(); fx.core.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, q.clone(), Some(0.5), None, "jog")) }.map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
     assert_eq!(fx.core.plan_input_tcp().map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
     assert!(fx.core.active_trajectory.is_none());
     // nothing was applied for this candidate: activation hands the reservation back, released
@@ -565,7 +565,7 @@ fn parking_arm() -> (Fx, u64) {
         max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100 });
     let mut inner = SupervisorInner::new(config);
     inner.tick(0.02);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     let generation = inner.acquire_lease("client-a").expect("lease");
     (ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 2, replies: 8 }), generation)
 }
@@ -778,7 +778,7 @@ fn child_primitives_of_a_running_macro_commit_through_the_release() {
     use armd::rt_core::ops::{ChildSpec, ChildTicket};
     let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
     let epoch = fx.core.safety.epoch_id();
-    let id = { let __s = fx.core.current_admission_stamp(); fx.core.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| fx.core.begin_orchestrated_action(__a, "sequence", None, epoch)) }.unwrap();
+    let id = { let __s = fx.core.current_admission_stamp(); fx.core.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_orchestrated_action(__a, "sequence", None, epoch)) }.unwrap();
     let parent = armd::rt_core::broker::ActionId(id);
     let a = auth(&fx);
     assert_eq!(a.parent_generation, id);

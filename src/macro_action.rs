@@ -171,6 +171,13 @@ pub struct MacroCtx {
 }
 
 impl MacroCtx {
+    /// Derives a fresh single-use child [`AdmissionStamp`] preserving the parent macro's
+    /// admission-captured authority without re-sampling live owner state.
+    #[inline]
+    pub fn next_child_stamp(&self) -> AdmissionStamp {
+        self.stamp.for_macro_child()
+    }
+
     pub async fn alive(&self) -> bool { self.sup.inner().read().await.macro_alive(self.id) }
 
     /// Map a child motion-install error under the owner write lock: admission-stamp refusal
@@ -361,11 +368,11 @@ impl MacroCtx {
         let ticket = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
-            let admitted = match inner.check_admission(self.stamp) {
+            let admitted = match inner.check_admission(self.next_child_stamp()) {
                 Ok(a) => a,
                 Err(e) => return Err(before(self.map_install_err(&mut inner, e.into()))),
             };
-            match inner.install_macro_path_same_side_with_rules(admitted, self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
+            match SupervisorInner::install_macro_path_same_side_with_rules(admitted, self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
                 Ok(l) => self.arm_child(&mut inner, phase, l * 2.0 + 5.0),
                 Err(e) => {
                     if let Some(detail) = e.workspace_detail() {
@@ -441,13 +448,11 @@ impl MacroCtx {
             let (speed, timeout_s) = if closes { (close_speed, None) } else { (1.0, Some(8.0)) };
             let request = GripperRequest { command, fraction, grasp, speed, timeout_s, tag: None };
             let remaining_s = self.deadline.duration_since(now).as_secs_f64();
-            let admitted = match inner.check_admission(self.stamp) {
+            let admitted = match inner.check_admission(self.next_child_stamp()) {
                 Ok(a) => a,
                 Err(e) => return Err(self.map_install_err(&mut inner, e.into())),
             };
-            let (duration, timeout_s, is_pos_force_close) = match inner
-                .start_macro_gripper_within(admitted, self.id, request, Some(remaining_s), true)
-            {
+            let (duration, timeout_s, is_pos_force_close) = match SupervisorInner::start_macro_gripper_within(admitted, self.id, request, Some(remaining_s), true) {
                 Ok(v) => v,
                 Err(ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg)))
                     if msg.contains("remaining macro budget") =>

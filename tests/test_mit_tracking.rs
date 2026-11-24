@@ -152,7 +152,7 @@ fn mit_timeout_command_through_the_supervisor_is_torque_off_only() {
     assert_eq!(done["commissioning"][0]["readback"]["timeout_raw"], json!(2400), "{done}");
     assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 2400);
     with_record(&mut inner, record_j4(2400));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let e = inner.mit_timeout_command(&json!({"joints": [4]})).unwrap_err();
     assert_eq!(e.code, "MIT_TIMEOUT_ARMED");
     assert_no_flash_write(&bus.tx_log());
@@ -201,7 +201,7 @@ fn mit_gate_refuses_to_arm_unqualified_hardware() {
         let (mut inner, bus) = mit_rig(timeout, rec);
         mutate(&mut inner, &bus);
         bus.with(|s| s.tx_log.clear());
-        let err = { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect_err(label);
+        let err = { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect_err(label);
         assert!(err.to_string().contains("MIT_UNQUALIFIED"), "{label}: {err}");
         assert!(!inner.is_torqued, "{label}: armed");
         assert_eq!(enable_frames(&bus), 0, "{label}: an enable frame was sent");
@@ -214,11 +214,11 @@ fn mit_gate_refuses_to_arm_unqualified_hardware() {
 #[test]
 fn mit_gate_passes_qualified_hardware_and_rechecks_on_every_arm() {
     let (mut inner, bus) = mit_rig(2000, Some(record_j4(2000)));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("qualified J4 arms");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("qualified J4 arms");
     assert!(inner.is_torqued && inner.mit_gate_error.is_none());
     // the motor lost its RAM TIMEOUT (power dip): the rearm refuses
     bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 0));
-    let err = { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap_err();
+    let err = { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap_err();
     assert!(err.to_string().contains("TIMEOUT readback is 0"), "{err}");
     assert_no_flash_write(&bus.tx_log());
 }
@@ -234,7 +234,7 @@ fn mit_not_requested_sends_no_register_reads_at_arm() {
         inner.lease_enabled = false;
         inner.tick(0.02);
         bus.with(|s| s.tx_log.clear());
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let reads = bus.tx_log().iter().filter(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ).count();
         assert_eq!(reads, 0);
     }
@@ -346,7 +346,7 @@ fn active_rig_clocked(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4_zero(2000, zero_j4));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(DT);
     inner.tick(DT);
     assert!(inner.mit_active(), "handover: {:?}", inner.mit.handover_error);
@@ -382,7 +382,7 @@ fn mit_frame_fields_and_effort() {
         let mut goal = [0.0_f64; 6];
         for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
         goal[3] += f64::from(leg);
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.3, "joint_move", None, None)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.3, "joint_move", None, None)) } }.unwrap();
         for _ in 0..200 {
             inner.tick(DT);
             nominal.push((inner.commanded_positions[3], inner.commanded_velocities[3], inner.commanded_accelerations[3]));
@@ -472,7 +472,7 @@ fn mit_owner_handover() {
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4(2000));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     bus.with(|s| { s.follow_commands = false; s.motors[1].v = 0.3; });
     for _ in 0..5 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
     assert!(!inner.mit_active(), "handover while J2 moves");
@@ -493,7 +493,7 @@ fn mit_owner_handover() {
 
     // gravity compensation entry hands back first (POS_VEL, confirmed), exit, then a fresh handover
     bus.clear_log();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.expect("gravity comp entry");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.expect("gravity comp entry");
     assert!(!inner.mit_active() && inner.mit.owner == mit::MitOwner::Off);
     let log = bus.tx_log();
     let back = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data).expect("J4 back to POS_VEL");
@@ -636,7 +636,7 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     assert!(cleared, "clearance");
     assert!(!inner.is_torqued, "the expiry recovery leaves torque off");
     bus.clear_log();
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("rearm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x33, 9]), "TIMEOUT readback on the rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data), "J4 base mode restored");
     for _ in 0..3 { inner.tick(DT); }
@@ -679,12 +679,12 @@ fn mit_failed_readback_on_rearm_revokes_authorization() {
         bus.clear_log();
         let res = if label == "timeout zero" {
             bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 0));
-            { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }
+            { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }
         } else {
             // J4 answers the hand back, then nothing (readback unanswered)
             inner.mit_hand_back("test").unwrap();
             bus.with(|s| s.motors[3].silent = true);
-            { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }
+            { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }
         };
         assert!(res.is_err(), "{label}: rearm passed");
         assert!(!inner.mit_active(), "{label}: MIT still owns J4");
@@ -742,7 +742,7 @@ fn mit_effort_bound_holds_on_decoded_wire_fields() {
                 let mut goal = [0.0_f64; 6];
                 for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
                 goal[3] += f64::from(leg);
-                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.3, "joint_move", None, None)) } }.unwrap();
+                { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.3, "joint_move", None, None)) } }.unwrap();
                 for _ in 0..150 {
                     // the joint lags its command by a varying amount: pd is nonzero
                     bus.with(|s| s.follow_commands = false);
@@ -791,7 +791,7 @@ fn mit_gravity_entry_validates_before_the_hand_back() {
     let bad = [armd::gravity_comp::GravityCompRequest { scale: Some(9.0), damping_kd: None },
         armd::gravity_comp::GravityCompRequest { scale: None, damping_kd: Some(vec![99.0; 6]) }];
     for req in bad {
-        assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, req)) } }.is_err());
+        assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, req)) } }.is_err());
         assert!(inner.mit_active(), "a refused request changed the owner");
     }
     assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0x55), "mode write for a refused request");
@@ -816,7 +816,7 @@ fn mit_collision_trip_holds_through_the_tick() {
     let mut goal = [0.0_f64; 6];
     for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
     goal[3] -= 0.3;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.3, "joint_move", None, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.3, "joint_move", None, None)) } }.unwrap();
     for _ in 0..25 { inner.tick(DT); feed(&inner, 0.0); }
     let moving_tau = mit_frames(&bus.tx_log(), 4).last().unwrap().4;
     assert!(inner.active_trajectory.is_some(), "{:?}", inner.current_observation().action.map(|a| a.message));
@@ -885,15 +885,15 @@ fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4(2000));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     assert!(!inner.mit_active(), "no tick yet: handover pending");
     let epoch = inner.safety.epoch_id();
     let mut target = inner.commanded_positions.clone();
     target[3] += 0.05;
-    let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, target, None, Some(epoch), "joint_move")) } }.unwrap_err();
+    let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, target, None, Some(epoch), "joint_move")) } }.unwrap_err();
     assert!(e.to_string().contains("MIT tracking is not active"), "jog: {e}");
     let home = inner.config.home_positions.clone();
-    let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, home, None, Some(epoch), "home")) } }.unwrap_err();
+    let e = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, home, None, Some(epoch), "home")) } }.unwrap_err();
     assert!(e.to_string().contains("MIT tracking is not active"), "home: {e}");
     #[cfg(feature = "policy-runtime")]
     {
@@ -909,7 +909,7 @@ fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
     let mut target = inner.commanded_positions.clone();
     target[3] += 0.05;
     let epoch = inner.safety.epoch_id();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, target, None, Some(epoch), "joint_move")) } }.expect("jog once MIT owns J4");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, target, None, Some(epoch), "joint_move")) } }.expect("jog once MIT owns J4");
 }
 
 /// Review #12: a park requested while MIT moves the arm brakes to rest first, hands back through
@@ -922,7 +922,7 @@ fn mit_moving_park_brakes_hands_back_then_parks() {
     let mut goal = [0.0_f64; 6];
     for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
     goal[3] -= 0.3;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
     for _ in 0..15 { inner.tick(DT); }
     assert!(inner.commanded_velocities[3].abs() > 0.01, "moving");
     bus.clear_log();
@@ -1019,7 +1019,7 @@ fn mit_handover_is_fenced_from_the_first_switch_frame() {
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4(2000));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     bus.with(|s| s.motors[3].no_write_ack = true); // the switch happens, its ACK is lost
     bus.clear_log();
     inner.tick(DT);
@@ -1064,7 +1064,7 @@ fn mit_handover_hold_frame_obeys_the_decoded_effort_bound() {
         inner.tick(DT);
         inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
         with_record(&mut inner, record_j4(2000));
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         bus.clear_log();
         for _ in 0..3 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
         assert!(inner.mit_active(), "{:?}", inner.mit.handover_error);
@@ -1089,13 +1089,13 @@ fn mit_deferred_park_has_an_action_and_stop_cancels_it() {
         let mut goal = [0.0_f64; 6];
         for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
         goal[3] -= 0.3;
-        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
         for _ in 0..15 { inner.tick(DT); }
     };
     // park deferred, then STOP
     let (mut inner, _bus) = active_rig(mit_config_j4(), 0.0);
     moving(&mut inner);
-    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.unload_action(__a)) } }.unwrap().expect("the deferred park has an action id");
+    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::unload_action(__a)) } }.unwrap().expect("the deferred park has an action id");
     inner.stop_motion();
     for _ in 0..60 { inner.tick(DT); assert!(!inner.pending_normal_unload, "park launched after a STOP"); }
     let a = inner.current_observation().action.unwrap();
@@ -1103,7 +1103,7 @@ fn mit_deferred_park_has_an_action_and_stop_cancels_it() {
     // park deferred, no STOP: the same action carries the park
     let (mut inner, _bus) = active_rig(mit_config_j4(), 0.0);
     moving(&mut inner);
-    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.unload_action(__a)) } }.unwrap().expect("action id");
+    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::unload_action(__a)) } }.unwrap().expect("action id");
     let mut parked = false;
     for _ in 0..30 { inner.tick(DT); if inner.pending_normal_unload { parked = true; break; } }
     assert!(parked);
@@ -1121,10 +1121,10 @@ fn mit_rearm_while_moving_brakes_refuses_motion_and_hands_back() {
     let mut goal = [0.0_f64; 6];
     for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
     goal[3] -= 0.3;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_joint_goal(__a, &inp, &goal, 0.5, "joint_move", None, None)) } }.unwrap();
     for _ in 0..15 { inner.tick(DT); }
     assert!(inner.commanded_velocities[3].abs() > 0.01);
-    assert!({ let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.is_err(), "rearm accepted while MIT moves the arm");
+    assert!({ let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.is_err(), "rearm accepted while MIT moves the arm");
     assert!(inner.active_trajectory.is_none(), "the motion goes on after the refused rearm");
     assert!(inner.plan_input().is_err(), "motion accepted after the refused rearm");
     bus.clear_log();

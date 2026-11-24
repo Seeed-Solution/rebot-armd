@@ -250,8 +250,12 @@ impl SupervisorInner {
     }
 
     /// Enter gravity compensation. Idempotent while the mode is on.
-    pub fn enter_gravity_comp(&mut self, admitted: crate::supervisor::Admitted, request: GravityCompRequest) -> Result<(), ArmError> {
-        let _stamp = self.consume_admitted(admitted)?;
+    pub fn enter_gravity_comp(admitted: crate::supervisor::Admitted<'_>, request: GravityCompRequest) -> Result<(), ArmError> {
+        let (this, _proof) = admitted.consume()?;
+        this.enter_gravity_comp_inner(request)
+    }
+
+    fn enter_gravity_comp_inner(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
         if self.gravity_comp.is_some() { return Ok(()); }
         if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(r.code.as_str(), r.message.to_string())); }
         let policy = self.gravity_comp_policy().cloned().ok_or_else(|| Self::reject("UNSUPPORTED", "no policy".into()))?;

@@ -110,7 +110,7 @@ fn rig(config: ArmConfig, dir: &std::path::Path) -> (SupervisorInner, LagArm) {
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
     inner.episodes = armd::recording::EpisodeStore::new(Some(dir.to_path_buf()));
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, arm)
@@ -230,12 +230,12 @@ fn validation_rejects_with_codes_and_moves_nothing() {
 
     // a missing file, a bad id
     save(tmp.path(), "short", &ok[..1]);
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("nope", 0.5, true), epoch)) } }.unwrap_err()).1, "EPISODE_NOT_FOUND");
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("short", 0.5, true), epoch)) } }.unwrap_err()).1, "REPLAY_EMPTY");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("nope", 0.5, true), epoch)) } }.unwrap_err()).1, "EPISODE_NOT_FOUND");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("short", 0.5, true), epoch)) } }.unwrap_err()).1, "REPLAY_EMPTY");
     std::fs::write(tmp.path().join("junk.parquet"), b"no").unwrap();
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("junk", 0.5, true), epoch)) } }.unwrap_err()).1, "REPLAY_INVALID_EPISODE");
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("../a", 0.5, true), epoch)) } }.unwrap_err()).1, "INVALID_EPISODE_ID");
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("x", 0.5, true), epoch + 1)) } }.unwrap_err()).1, "EPOCH_MISMATCH");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("junk", 0.5, true), epoch)) } }.unwrap_err()).1, "REPLAY_INVALID_EPISODE");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("../a", 0.5, true), epoch)) } }.unwrap_err()).1, "INVALID_EPISODE_ID");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("x", 0.5, true), epoch + 1)) } }.unwrap_err()).1, "EPOCH_MISMATCH");
 
     // nothing moved and no action was recorded
     let obs = ticks(&mut inner, 5);
@@ -244,7 +244,7 @@ fn validation_rejects_with_codes_and_moves_nothing() {
 
     // storage off
     inner.episodes = armd::recording::EpisodeStore::new(None);
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("x", 0.5, true), epoch)) } }.unwrap_err()).1, "EPISODES_DISABLED");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("x", 0.5, true), epoch)) } }.unwrap_err()).1, "EPISODES_DISABLED");
 
     // parse
     assert!(parse_replay(&json!({"episode": "a", "speed": 0.25})).is_err());
@@ -261,25 +261,25 @@ fn replay_refused_while_recording_gravity_comp_collision_hold_or_moving() {
     let (mut inner, _arm) = rig(profile(), tmp.path());
     let epoch = inner.safety.epoch_id();
     inner.recorder.start(Some("rec".into()), Some(tmp.path().join("rec.parquet"))).unwrap();
-    let (status, code, msg) = code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err());
+    let (status, code, msg) = code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err());
     assert_eq!((status, code.as_str()), (409, "MOTION_BUSY"), "{msg}");
     assert!(msg.contains("recording"), "{msg}");
     inner.recorder.discard().unwrap();
     // another action
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, INSPECT.iter().enumerate().map(|(i, q)| if i == 0 { q + 0.2 } else { *q }).collect(), None, Some(epoch), "joint_move")) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, INSPECT.iter().enumerate().map(|(i, q)| if i == 0 { q + 0.2 } else { *q }).collect(), None, Some(epoch), "joint_move")) } }.unwrap();
     ticks(&mut inner, 2);
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err()).1, "MOTION_BUSY");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err()).1, "MOTION_BUSY");
     ticks(&mut inner, 150);
-    assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 0.5, true), epoch)) } }.is_ok(), "idle again: accepted");
+    assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 0.5, true), epoch)) } }.is_ok(), "idle again: accepted");
 
     // gravity compensation (needs a lease)
     let (mut inner, _arm) = rig(profile(), tmp.path());
     inner.lease_enabled = true;
     inner.acquire_lease("c").unwrap();
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::enter_gravity_comp(__a, Default::default())) } }.unwrap();
     ticks(&mut inner, 3);
     let epoch = inner.safety.epoch_id();
-    let (_, code, msg) = code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err());
+    let (_, code, msg) = code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err());
     assert_eq!(code, "MOTION_BUSY");
     assert!(msg.contains("gravity"), "{msg}");
 
@@ -290,13 +290,13 @@ fn replay_refused_while_recording_gravity_comp_collision_hold_or_moving() {
     ticks(&mut inner, 6);
     assert!(inner.collision.hold.is_some());
     let epoch = inner.safety.epoch_id();
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err()).1, "COLLISION_HOLD");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err()).1, "COLLISION_HOLD");
 
     // E-stop
     let (mut inner, _arm) = rig(profile(), tmp.path());
     inner.apply_stop_policy(armd::StopPolicy::EStopLatch);
     let epoch = inner.safety.epoch_id();
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err()).1, "ESTOP_ACTIVE");
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 0.5, true), epoch)) } }.unwrap_err()).1, "ESTOP_ACTIVE");
 }
 
 // ---------------------------------------------------------------- running a replay
@@ -330,7 +330,7 @@ fn approach_then_frames_gripper_on_and_off() {
     for gripper in [true, false] {
         let (mut inner, _arm) = rig(profile(), tmp.path());
         let epoch = inner.safety.epoch_id();
-        let (id, expected) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 1.0, gripper), epoch)) } }.unwrap();
+        let (id, expected) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 1.0, gripper), epoch)) } }.unwrap();
         let a = inner.last_action.clone().unwrap();
         assert_eq!((a.kind.as_str(), a.episode.as_deref(), a.phase.as_deref()), ("replay", Some("w"), Some("approach")));
         let mut first_follow: Option<Vec<f32>> = None;
@@ -391,7 +391,7 @@ fn stop_mid_replay_holds_estop_and_lease_loss_cancel() {
     // stop (the calls of the WS /api/v1/motion/stop command)
     let (mut inner, _arm) = rig(profile(), tmp.path());
     let epoch = inner.safety.epoch_id();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 1.0, true), epoch)) } }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 1.0, true), epoch)) } }.unwrap();
     until_t(&mut inner, id, 1.0);
     inner.exit_gravity_comp("STOPPED", "Stop command");
     inner.stop_motion();
@@ -410,7 +410,7 @@ fn stop_mid_replay_holds_estop_and_lease_loss_cancel() {
 
     // E-stop
     let (mut inner, _arm) = rig(profile(), tmp.path());
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 1.0, true), inner.safety.epoch_id())) } }.unwrap();
+    let (id, _) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 1.0, true), ep)) }.unwrap();
     until_t(&mut inner, id, 1.0);
     inner.e_stop_latched.store(true, std::sync::atomic::Ordering::SeqCst);
     let obs = ticks(&mut inner, 1);
@@ -421,7 +421,7 @@ fn stop_mid_replay_holds_estop_and_lease_loss_cancel() {
     // lease loss
     let (mut inner, _arm) = rig(profile(), tmp.path());
     let generation = inner.acquire_lease("c").unwrap();
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 1.0, true), inner.safety.epoch_id())) } }.unwrap();
+    let (id, _) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 1.0, true), ep)) }.unwrap();
     until_t(&mut inner, id, 0.5);
     assert!(inner.release_lease("c", generation));
     let obs = ticks(&mut inner, 1);
@@ -440,7 +440,7 @@ fn blocked_joint_stalls_and_holds_collision_trip_fails() {
     // J1 blocked early in the replay: the playback slows, pauses at the lag bound, then
     // fails TRACKING_STALL holding the measured pose (no Fault)
     let (mut inner, arm) = rig(profile(), tmp.path());
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("big", 1.0, true), inner.safety.epoch_id())) } }.unwrap();
+    let (id, _) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("big", 1.0, true), ep)) }.unwrap();
     until_t(&mut inner, id, 0.5);
     arm.0.lock().unwrap().blocked = Some(0);
     let mut max_lag = 0.0f32;
@@ -455,7 +455,7 @@ fn blocked_joint_stalls_and_holds_collision_trip_fails() {
     // collision guard trip during the replay
     let config = ArmConfig { collision: Some(CollisionPolicy { enabled: true, resume_after_s: 30.0, ..CollisionPolicy::default() }), ..profile() };
     let (mut inner, arm) = rig(config, tmp.path());
-    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_replay(__a, req("w", 1.0, true), inner.safety.epoch_id())) } }.unwrap();
+    let (id, _) = { let ep = inner.safety.epoch_id(); let s = inner.current_admission_stamp(); inner.check_admission(s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_replay(__a, req("w", 1.0, true), ep)) }.unwrap();
     until_t(&mut inner, id, 1.0);
     arm.0.lock().unwrap().residual[2] = -20.0;
     let r = run(&mut inner, id, 1.0, |_, _| {});
@@ -537,7 +537,7 @@ async fn record_jog_save_and_replay_matches_the_recording() {
     let back = { let mut b = INSPECT.to_vec(); b[0] += 0.1; b };
     for (target, secs) in [(out, 2.5), (back, 2.0)] {
         let epoch = sup.get_observation().await.epoch_id;
-        let (_, id, _) = { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); i.jog_action(a, target, Some(secs), Some(epoch), "joint_move") }.unwrap();
+        let (_, id, _) = { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::jog_action(a, target, Some(secs), Some(epoch), "joint_move") }.unwrap();
         wait_done(&sup, id, 400, |_| {}).await;
     }
     realtime(&sup, 10, |_| {}).await;
@@ -552,7 +552,7 @@ async fn record_jog_save_and_replay_matches_the_recording() {
 
     for speed in [0.5, 1.0] {
         let epoch = sup.get_observation().await.epoch_id;
-        let (id, expected) = { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); i.start_replay(a, req("jog", speed, true), epoch) }.unwrap();
+        let (id, expected) = { let mut i = sup.inner().write().await; let a = i.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::start_replay(a, req("jog", speed, true), epoch) }.unwrap();
         let mut phases: Vec<String> = Vec::new();
         let (mut cmd_err, mut path_err, mut aligned_err) = (0.0f32, 0.0f32, 0.0f32);
         let mut approach_end: Option<Vec<f32>> = None;

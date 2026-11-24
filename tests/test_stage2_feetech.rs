@@ -2920,7 +2920,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
     {
         let mut inner = supervisor.inner().write().await;
         inner.lease_enabled = false;
-        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.target_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];

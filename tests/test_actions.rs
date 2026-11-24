@@ -15,7 +15,7 @@ const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 fn sim_at(q: &[f32; 7]) -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();
@@ -28,7 +28,7 @@ fn start_move(inner: &mut SupervisorInner, spec: &GoalSpec, speed: Speed) -> Res
     let input = inner.plan_input()?;
     let goal = resolve_goal(&input, spec);
     let path = plan_cartesian(&input, goal, speed)?;
-    let (id, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &input, path, "move_to", Some("t".into()))) } }?;
+    let (id, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path(__a, &input, path, "move_to", Some("t".into()))) } }?;
     Ok((id, duration, goal))
 }
 
@@ -159,7 +159,7 @@ fn estop_stop_and_supersede_end_the_action() {
     let mut inner = sim_at(&INSPECT);
     let (id, _, _) = start_move(&mut inner, &GoalSpec::Absolute { p: p(&INSPECT), r: None }, Speed::default()).unwrap();
     for _ in 0..20 { inner.tick(DT); }
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, INSPECT.to_vec(), None, None)) } }.expect("jog over an action is allowed");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, INSPECT.to_vec(), None, None)) } }.expect("jog over an action is allowed");
     let obs = inner.tick(DT);
     let prev = obs.previous_action.expect("replaced action stays visible");
     assert_eq!((prev.id, prev.state.as_str(), prev.code.as_deref()), (id, "cancelled", Some("SUPERSEDED")));
@@ -182,7 +182,7 @@ fn busy_and_stale_preconditions() {
     let epoch = inner.safety.epoch_id();
     let mut lead = INSPECT.to_vec();
     lead[0] += 0.1;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, lead, epoch)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, lead, epoch)) } }.unwrap();
     let err = inner.plan_input().unwrap_err();
     assert!(matches!(err, ArmError::Motion(MotionError::MotionBusy(_))), "{err:?}");
     // a jog between plan and install makes the plan stale
@@ -192,22 +192,22 @@ fn busy_and_stale_preconditions() {
     let path = plan_cartesian(&input, resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.03, p0[1], p0[2]], r: None }), Speed::default()).unwrap();
     let mut jog_target = INSPECT.to_vec();
     jog_target[0] = 0.2;
-    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, jog_target, None, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, jog_target, None, None)) } }.unwrap();
     for _ in 0..400 { inner.tick(DT); }
-    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &input, path.clone(), "move_to", None)) } }.unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path(__a, &input, path.clone(), "move_to", None)) } }.unwrap_err();
     assert!(matches!(err, ArmError::Motion(MotionError::PlanStale(_))), "{err:?}");
     // epoch change
     let mut inner = sim_at(&INSPECT);
     let input = inner.plan_input().unwrap();
     inner.apply_stop_policy(StopPolicy::EStopLatch);
     inner.clear_fault().unwrap();
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
-    assert!(matches!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &input, path, "move_to", None)) } }, Err(ArmError::Motion(MotionError::PlanStale(_)))));
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
+    assert!(matches!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path(__a, &input, path, "move_to", None)) } }, Err(ArmError::Motion(MotionError::PlanStale(_)))));
     // no kinematics
     let mut config = ArmConfig::rebot_dm();
     config.kinematics = None;
     let mut inner = SupervisorInner::new(config);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     assert!(matches!(inner.plan_input(), Err(ArmError::Motion(MotionError::Unsupported(_)))));
 }
 
@@ -223,7 +223,7 @@ fn a_gripper_change_of_1e4_rad_makes_a_prepared_path_stale() {
         let input = inner.plan_input().unwrap();
         let path = plan_cartesian(&input, resolve_goal(&input, &goal), Speed::default()).unwrap();
         inner.commanded_positions[gripper] += dq;
-        let r = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &input, path, "move_to", None)) } };
+        let r = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path(__a, &input, path, "move_to", None)) } };
         if stale {
             assert!(matches!(r, Err(ArmError::Motion(MotionError::PlanStale(_)))), "{r:?}");
             assert!(inner.active_trajectory.is_none());
@@ -241,16 +241,16 @@ fn joint_move_home_and_park_create_action_records() {
     let mut inner = sim_at(&INSPECT);
     let mut target = INSPECT.to_vec();
     target[0] = 0.3;
-    let (_, id, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, target, None, None, "joint_move")) } }.unwrap();
+    let (_, id, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, target, None, None, "joint_move")) } }.unwrap();
     let a = run(&mut inner, id, duration + 3.0, |_| {});
     assert_eq!((a.kind.as_str(), a.state.as_str(), a.settled), ("joint_move", "done", Some(true)));
     let home = inner.config.home_positions.clone();
-    let (_, id, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, home, None, None, "home")) } }.unwrap();
+    let (_, id, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, home, None, None, "home")) } }.unwrap();
     let a = run(&mut inner, id, duration + 3.0, |_| {});
     assert_eq!((a.kind.as_str(), a.state.as_str()), ("home", "done"));
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
-    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.unload_action(__a)) } }.unwrap().expect("park starts");
+    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::unload_action(__a)) } }.unwrap().expect("park starts");
     let a = run(&mut inner, id, 15.0, |_| {});
     assert_eq!((a.kind.as_str(), a.state.as_str()), ("park", "done"), "{a:?}");
     assert!(!inner.is_torqued);
@@ -282,7 +282,7 @@ fn blocked_arm_fails_tracking_stall_without_a_fault() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(BlockedDriver(hw)));
     inner.lease_enabled = false;
     inner.tick(DT);
-    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let p0 = tcp(&INSPECT).p;
     let spec = GoalSpec::Absolute { p: [p0[0], p0[1] + 0.2, p0[2]], r: None }; // J1 turns ~0.7 rad
     let (id, duration, _) = start_move(&mut inner, &spec, Speed { linear: 0.15, angular: 1.0 }).unwrap();
@@ -439,7 +439,7 @@ async fn ws_rejections_unreachable_busy_stale_and_unsupported() {
         inner.before_install_hook = Some(Box::new(|inner: &mut SupervisorInner| {
             let mut q = inner.commanded_positions.clone();
             q[0] += 0.05;
-            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, q, None, None)) } }.unwrap();
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, None, None)) } }.unwrap();
         }));
     }
     let p = tcp(&rig.supervisor.get_observation().await.commanded_positions).p;

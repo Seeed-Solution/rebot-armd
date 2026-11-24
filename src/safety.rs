@@ -243,6 +243,9 @@ pub enum SafetyError {
 
     #[error("Action terminal queue is full; wait for pending action completions to drain before starting a new action")]
     TerminalsBusy,
+
+    #[error("Admission stamp has already been consumed or carries an invalid request id")]
+    StampAlreadyConsumed,
 }
 
 impl SafetyError {

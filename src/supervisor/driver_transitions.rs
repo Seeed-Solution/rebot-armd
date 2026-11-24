@@ -977,8 +977,12 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = None;
     }
 
-    pub fn enable_torque(&mut self, admitted: Admitted) -> Result<SafetyState, SafetyError> {
-        let _stamp = self.consume_admitted(admitted)?;
+    pub fn enable_torque(admitted: Admitted<'_>) -> Result<SafetyState, SafetyError> {
+        let (this, proof) = admitted.consume()?;
+        this.enable_torque_inner(&proof)
+    }
+
+    pub(crate) fn enable_torque_inner(&mut self, _proof: &crate::supervisor::AdmittedProof) -> Result<SafetyState, SafetyError> {
         if self.torque_transition.is_some() {
             return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into()));
         }
@@ -1446,9 +1450,13 @@ impl SupervisorInner {
 
     /// Starts a torque-enable transition without waiting for its confirmation (the RT's
     /// `commit_transition`). Requires a valid [`AdmissionStamp`] checked first under the owner lock.
-    pub(crate) fn begin_enable_torque_transition(&mut self, admitted: Admitted) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
+    pub(crate) fn begin_enable_torque_transition(admitted: Admitted<'_>) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
+        let (this, _proof) = admitted.consume()?;
+        this.begin_enable_torque_transition_inner()
+    }
+
+    fn begin_enable_torque_transition_inner(&mut self) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
         use crate::rt_core::ops::TorqueProgress as Rt;
-        let _stamp = self.consume_admitted(admitted)?;
         if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
         self.gravity_comp_servo_busy()?;
         let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false)?;

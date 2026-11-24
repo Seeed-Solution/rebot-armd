@@ -470,7 +470,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     inner.safety.set_off_thread_reclaim(true);
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(adm).unwrap();
+    armd::SupervisorInner::enable_torque(adm).unwrap();
     inner.tick(0.02);
 
     // (a) Missing/stale feedback -> 0 alloc, fault stays latched, identical API text.
@@ -894,11 +894,11 @@ async fn remaining_safety_paths_zero_alloc_fault_producers_gravity_comp_estop_an
     gc.lease_enabled = false;
     let stamp = gc.current_admission_stamp();
     let adm = gc.check_admission(stamp).unwrap();
-    gc.enable_torque(adm).unwrap();
+    armd::SupervisorInner::enable_torque(adm).unwrap();
     gc.tick(0.02);
     let stamp = gc.current_admission_stamp();
     let adm = gc.check_admission(stamp).unwrap();
-    gc.enter_gravity_comp(adm, armd::gravity_comp::GravityCompRequest::default()).unwrap();
+    armd::SupervisorInner::enter_gravity_comp(adm, armd::gravity_comp::GravityCompRequest::default()).unwrap();
     gc.tick(0.02);
     assert!(gc.gravity_comp.is_some());
     gc.safety.set_off_thread_reclaim(true);
@@ -1652,7 +1652,7 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     inner.lease_enabled = false;
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(adm).unwrap();
+    armd::SupervisorInner::enable_torque(adm).unwrap();
     for _ in 0..3 { inner.tick(DT); }
     assert!(inner.mit_active(), "MIT should be active before injected TX failure");
 
@@ -2418,7 +2418,7 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
         inner.lease_enabled = false;
         let stamp = inner.current_admission_stamp();
         let adm = inner.check_admission(stamp).unwrap();
-        inner.enable_torque(adm).unwrap();
+        armd::SupervisorInner::enable_torque(adm).unwrap();
         for _ in 0..3 { inner.tick(DT); }
         assert!(inner.mit_active());
         // Inject partial TX failure -> MIT enters MitOwner::Lost (BusLoss) and J4 command watchdog expires (0x0D).
@@ -2738,7 +2738,7 @@ fn step5_write_output_error_is_bounded_zero_alloc_on_normal_and_estop_hold() {
     inner.lease_enabled = false;
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(adm).unwrap();
+    armd::SupervisorInner::enable_torque(adm).unwrap();
     inner.safety.set_off_thread_reclaim(true);
     // Warm scratch buffers with two clean ticks.
     for _ in 0..2 {
@@ -2782,7 +2782,7 @@ fn step5_write_output_error_is_bounded_zero_alloc_on_normal_and_estop_hold() {
     assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(adm).unwrap();
+    armd::SupervisorInner::enable_torque(adm).unwrap();
     inner.tick_control(0.02);
     *mode.lock().unwrap() = WriteMode::EstopInhibited;
     let _ = alloc::take();
@@ -3197,7 +3197,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         inner.lease_enabled = false;
         let stamp = inner.current_admission_stamp();
         let adm = inner.check_admission(stamp).unwrap();
-        inner.enable_torque(adm).unwrap();
+        armd::SupervisorInner::enable_torque(adm).unwrap();
         for _ in 0..3 { inner.tick(DT); }
         assert!(inner.mit_active());
         bus.with(|s| s.fail_tx_after = Some(3));
@@ -3589,7 +3589,7 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
     inner.target_positions = q_init.to_vec();
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(adm).unwrap();
+    armd::SupervisorInner::enable_torque(adm).unwrap();
     inner.safety.set_off_thread_reclaim(true);
     // Warm up per-tick scratch buffers.
     for _ in 0..3 {
@@ -3649,11 +3649,11 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
     assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
-    inner.enable_torque(adm).unwrap();
+    armd::SupervisorInner::enable_torque(adm).unwrap();
     let _ = inner.tick_control(0.02);
     let stamp = inner.current_admission_stamp();
     let adm = inner.check_admission(stamp).unwrap();
-    inner.enter_gravity_comp(adm, armd::gravity_comp::GravityCompRequest::default()).unwrap();
+    armd::SupervisorInner::enter_gravity_comp(adm, armd::gravity_comp::GravityCompRequest::default()).unwrap();
     // Warm up one tick after entering gravity_comp (not strictly required, keeps measurement focused on steady/ramp RT path).
     let before_writes = write_count.load(Ordering::Relaxed);
     let _ = alloc::take();
