@@ -1432,6 +1432,13 @@ pub struct ArmConfig {
     /// POS_VEL base mode without being reported (profiles from before this field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damiao_gripper: Option<DamiaoGripperDrive>,
+    /// Per-tick Damiao CAN TX start-cutoff budget (ms); None uses `DAMIAO_TX_MAX_DURATION` (10 ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_budget_ms: Option<u64>,
+    /// Maximum consecutive control ticks with a pending CAN TX deferral before latching
+    /// `CAN_TX_STALLED`. None defaults to `ceil(45 ms / period)` (3 ticks at 50 Hz).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_stall_ticks: Option<u32>,
     /// Speed cap for every planned motion (actions, jog, home, park); None = no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_cap: Option<SpeedCap>,
@@ -1581,6 +1588,8 @@ impl Default for ArmConfig {
             joint_tracking: None,
             damiao_ranges: None,
             damiao_gripper: None,
+            tx_budget_ms: None,
+            tx_stall_ticks: None,
             speed_cap: None,
             backlash_approach: None,
             collision: None,
@@ -1610,6 +1619,41 @@ impl Default for ArmConfig {
 }
 
 impl ArmConfig {
+    /// Minimum (and default) consecutive deferred control ticks before latching `CAN_TX_STALLED`:
+    /// `ceil(frame_max_age / period) + 1` with `frame_max_age = 45 ms` (`DAMIAO_TX_FRAME_MAX_AGE`),
+    /// ensuring a single deferral never latches before a queued frame can reach 45 ms age
+    /// (e.g. 2 at 10 Hz, 3 at 25 Hz, 4 at 50 Hz, 6 at 100 Hz).
+    pub fn min_tx_stall_ticks(&self) -> u32 {
+        let hz = u64::from(self.control_frequency_hz.max(1));
+        let ceil_age_ticks = (45u64.saturating_mul(hz).saturating_add(999)) / 1000;
+        (ceil_age_ticks + 1) as u32
+    }
+
+    /// Consecutive ticks with a pending CAN TX deferral before latching `CAN_TX_STALLED`.
+    /// Defaults to [`Self::min_tx_stall_ticks`] (`ceil(45 ms / period) + 1`: 4 ticks at 50 Hz,
+    /// 2 ticks at 10 Hz). Values below the minimum are rejected by [`Self::validate`] and clamped
+    /// at runtime as defense-in-depth.
+    pub fn resolved_tx_stall_ticks(&self) -> u32 {
+        let min_ticks = self.min_tx_stall_ticks();
+        self.tx_stall_ticks.map_or(min_ticks, |ticks| ticks.max(min_ticks))
+    }
+
+    /// Effective Damiao per-tick CAN TX start-cutoff (ms): explicit `tx_budget_ms` when set,
+    /// otherwise the default `10` ms (`DAMIAO_TX_MAX_DURATION`).
+    pub fn resolved_tx_budget_ms(&self) -> u64 {
+        self.tx_budget_ms.unwrap_or(10)
+    }
+
+    /// Damiao per-tick CAN TX budget derived from this profile (`tx_budget_ms` overrides
+    /// `DAMIAO_TX_MAX_DURATION`; `max_frames = 16`, `frame_max_age = 45 ms`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn damiao_tx_budget(&self) -> crate::driver::TxBudget {
+        crate::driver::TxBudget {
+            max_duration: std::time::Duration::from_millis(self.resolved_tx_budget_ms()),
+            ..crate::driver::TxBudget::default()
+        }
+    }
+
     /// Convert an `end_link` pose into the active TCP pose (`p_tcp = p_end + R_end * tcp_offset`).
     pub fn end_to_tcp(&self, end: &crate::kinematics::Pose) -> crate::kinematics::Pose {
         if self.tcp_offset == [0.0; 3] {
@@ -1970,6 +2014,35 @@ impl ArmConfig {
             || self.following_error.persistence_ms == 0
             || self.max_jerk.is_some_and(|j| !j.is_finite() || j <= 0.0) {
             return Err("Invalid control, temperature, following-error or jerk configuration".into());
+        }
+        {
+            let period_ms = (1000 / u64::from(self.control_frequency_hz.max(1))).max(1);
+            let half_period_ms = period_ms / 2;
+            let max_ms = half_period_ms.min(45);
+            if max_ms == 0 {
+                return Err(format!(
+                    "control_frequency_hz ({}) has period {period_ms} ms; half control period is < 1 ms for tx_budget_ms",
+                    self.control_frequency_hz
+                ));
+            }
+            let ms = self.resolved_tx_budget_ms();
+            if ms == 0 || ms > max_ms {
+                return Err(format!(
+                    "effective tx_budget_ms ({ms} ms) must be in 1..={max_ms} (tx_budget_ms <= period/2 = {half_period_ms} ms at {} Hz, frame max age 45 ms)",
+                    self.control_frequency_hz
+                ));
+            }
+        }
+        {
+            let min_stall_ticks = self.min_tx_stall_ticks();
+            if let Some(ticks) = self.tx_stall_ticks {
+                if ticks < min_stall_ticks {
+                    return Err(format!(
+                        "tx_stall_ticks ({ticks}) must be >= {min_stall_ticks} (ceil(45 ms / period) + 1 at {} Hz)",
+                        self.control_frequency_hz
+                    ));
+                }
+            }
         }
         if let Some(cap) = self.planned_max_velocity {
             if !cap.is_finite() || cap <= 0.0 {
@@ -2362,6 +2435,8 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             damiao_gripper: Some(DamiaoGripperDrive::rebot_dm()),
+            tx_budget_ms: Some(10),
+            tx_stall_ticks: None,
             speed_cap: None,
             // J1 backlash 0.28-0.30 deg (camera, real arm 2026-11-18): every saved-pose move and the
             // final grasp / place descent end from the same side (src/backlash.rs)
@@ -2738,6 +2813,7 @@ impl ArmObservation {
                     SafetyState::EStop => SafetyState::EStop,
                     SafetyState::Fault(FaultReason::BusLoss) => SafetyState::Fault(FaultReason::BusLoss),
                     SafetyState::Fault(FaultReason::WatchdogTimeout) => SafetyState::Fault(FaultReason::WatchdogTimeout),
+                    SafetyState::Fault(FaultReason::CanTxStalled) => SafetyState::Fault(FaultReason::CanTxStalled),
                     SafetyState::Fault(FaultReason::ThermalTrip { joint_idx, temperature, limit }) => {
                         SafetyState::Fault(FaultReason::ThermalTrip {
                             joint_idx: *joint_idx,

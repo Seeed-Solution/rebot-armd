@@ -265,6 +265,7 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
     for st in [
         SafetyState::Booting, SafetyState::Idle, SafetyState::Armed, SafetyState::Moving, SafetyState::EStop,
         SafetyState::Fault(FaultReason::BusLoss), SafetyState::Fault(FaultReason::WatchdogTimeout),
+        SafetyState::Fault(FaultReason::CanTxStalled),
         SafetyState::Fault(FaultReason::ThermalTrip { joint_idx: 2, temperature: 92.5, limit: 85.0 }),
         SafetyState::Fault(FaultReason::JointLimitExceeded { joint_idx: 1, joint_name: "joint_2".into(), value: 3.1, min: -2.0, max: 2.0 }),
         SafetyState::Fault(FaultReason::Other("motor fault 0x0A".into())),
@@ -401,6 +402,7 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
     *temp_ctl.lock().unwrap() = 85.0;
     wait_until_async(Duration::from_secs(2), || {
         sup.hub().latest().is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })))
+            && handle.stats().last_fault_latch_release_seq.load(Ordering::Acquire) > 0
     }).await;
     let thermal_seq = handle.stats().last_fault_latch_release_seq.load(Ordering::Acquire);
     let thermal_sample = expect_release_sample(&sup, thermal_seq, "ThermalTrip latch").await;
@@ -804,6 +806,7 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     );
     let res_bus = sm.try_trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
     let res_wd = sm.try_trigger_fault_coded(FaultCode::WatchdogTimeout, FaultReason::WatchdogTimeout);
+    let res_tx = sm.try_trigger_fault_coded(FaultCode::CanTxStalled, FaultReason::CanTxStalled);
     let res_other = sm.try_trigger_fault_coded(FaultCode::HardwareFault, other);
     sm.latch(
         FaultKind::CollisionLatched,
@@ -813,7 +816,7 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     let rest_allocs = alloc::take();
     assert_eq!(rest_allocs.calls, 0, "latching all fault kinds with empty pool must do 0 heap ops: {rest_allocs:?}");
 
-    assert!(res_bus.is_ok() && res_wd.is_ok(), "cached BusLoss/WatchdogTimeout arcs do not need pool slots");
+    assert!(res_bus.is_ok() && res_wd.is_ok() && res_tx.is_ok(), "cached BusLoss/WatchdogTimeout/CanTxStalled arcs do not need pool slots");
     let (_, ret_jl) = res_jl.unwrap_err();
     let (_, ret_th) = res_th.unwrap_err();
     let (_, ret_other) = res_other.unwrap_err();
@@ -1208,6 +1211,45 @@ fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
             ClearRefusal::FreshFeedbackRequired,
             driver_met,
         ),
+        // CanTxStalled: pending frames in TX queue -> refused; drained + fresh feedback -> cleared
+        (
+            FaultKind::CanTxStalled,
+            FaultDetail::CanTxStalled(Some(armd::safety::TxStallDetail {
+                queued: 4,
+                dropped: 0,
+                age_ms: 60,
+                limit_ms: 45,
+                consecutive_ticks: 3,
+                is_hold: false,
+            })),
+            ClearContext { tx_queue_drained: false, ..driver_met },
+            ClearRefusal::TxQueueNotDrained,
+            driver_met,
+        ),
+        // CanTxStalled: drained queue but stale/missing feedback -> refused; both met -> cleared
+        (
+            FaultKind::CanTxStalled,
+            FaultDetail::CanTxStalled(None),
+            ClearContext { feedback_fresh: false, tx_queue_drained: true, ..driver_met },
+            ClearRefusal::FreshFeedbackRequired,
+            driver_met,
+        ),
+        // CanTxStalled: drained queue + fresh feedback, no TX probe yet -> TxProbeRequired
+        (
+            FaultKind::CanTxStalled,
+            FaultDetail::CanTxStalled(None),
+            ClearContext { tx_probe_confirmed: false, tx_probe_sent: false, ..driver_met },
+            ClearRefusal::TxProbeRequired,
+            driver_met,
+        ),
+        // CanTxStalled: TX probe sent, awaiting post-probe feedback -> TxProbeFeedbackRequired
+        (
+            FaultKind::CanTxStalled,
+            FaultDetail::CanTxStalled(None),
+            ClearContext { tx_probe_confirmed: false, tx_probe_sent: true, ..driver_met },
+            ClearRefusal::TxProbeFeedbackRequired,
+            driver_met,
+        ),
         // WatchdogTimeout: active lease with stale heartbeat -> refused; fresh heartbeat -> cleared
         (
             FaultKind::WatchdogTimeout,
@@ -1311,7 +1353,7 @@ fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
     // 2. Fail closed on any unknown kind bit without an explicit rule.
     let mut sm_unknown = SafetyManager::new();
     sm_unknown.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
-    sm_unknown.record_unknown_kind_bit_for_test(1u8 << 7);
+    sm_unknown.record_unknown_kind_bit_for_test(1u16 << FaultKind::COUNT);
     assert!(!sm_unknown.recoverable(), "unknown kind bit must be non-recoverable (fail closed)");
     assert_eq!(sm_unknown.clear_check(&base_met), Err(ClearRefusal::UnknownFaultKind));
     assert_eq!(sm_unknown.clear_with_check(&base_met), Err(ClearRefusal::UnknownFaultKind));
@@ -1837,6 +1879,7 @@ async fn watchdog_latch_and_executor_clear_retry_zero_alloc_on_tagged_live_relea
     let handle_wd = sup_wd.start_executor(exec_cfg.clone()).await.unwrap();
     wait_until_async(Duration::from_secs(2), || {
         sup_wd.hub().latest().is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Fault(FaultReason::WatchdogTimeout)))
+            && handle_wd.stats().last_fault_latch_release_seq.load(Ordering::Acquire) > 0
     }).await;
     let wd_seq = handle_wd.stats().last_fault_latch_release_seq.load(Ordering::Acquire);
     let wd_sample = expect_release_sample(&sup_wd, wd_seq, "watchdog latch").await;
@@ -3013,11 +3056,14 @@ async fn executor_clear_fault_carries_epoch_and_refuses_after_newer_estop() {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
-    // Warm up every StateHub slot and per-tick scratch buffer before measuring release allocations.
+    // Warm up every StateHub triple-buffer slot (including the reader front slot via `latest()`)
+    // and per-tick scratch buffer before measuring release allocations.
+    step_clock.wait_until_parked();
     let mut expected_steps = handle.stats().steps.load(Ordering::Acquire);
     for _ in 0..8 {
         expected_steps += 1;
         step_one(expected_steps);
+        let _ = sup.hub().latest();
     }
     step_clock.wait_until_parked();
 

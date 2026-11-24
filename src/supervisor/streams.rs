@@ -480,39 +480,44 @@ impl SupervisorInner {
     /// ramp going while the output is not at rest. When no step is feasible,
     /// latch a fault and send no frame this tick; the command stays on the last issued
     /// output so the following fault-hold frames repeat what the motors already hold.
-    /// Returns a driver write error.
+    /// Returns the classified [`crate::supervisor::TickOutput`].
     pub(super) fn apply_tracking_fallback_step(
         &mut self,
         pending: crate::tracking::PendingFallback,
         gravity_output_enabled: bool,
-    ) -> Option<crate::mit::OutputErrorText> {
-        let crate::tracking::PendingFallback { step, ramp, prev_confirmed, other_depths } = pending;
+    ) -> crate::supervisor::TickOutput {
+        use crate::supervisor::TickOutput;
+        let crate::tracking::PendingFallback { step, ramp, other_depths } = pending;
         match step {
             Ok(fb) => {
-                self.commanded_positions = fb.positions.clone();
-                self.target_positions = fb.positions.clone();
-                self.commanded_velocities = fb.velocities.clone();
+                crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &fb.positions);
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &fb.positions);
+                crate::rt_core::scratch::copy_into(&mut self.commanded_velocities, &fb.velocities);
                 self.commanded_accelerations.fill(0.0);
-                let targets: Vec<JointTarget> = fb
-                    .positions
-                    .iter()
-                    .zip(fb.velocities.iter())
-                    .enumerate()
-                    .map(|(i, (&p, &v))| JointTarget {
-                        position: p,
-                        velocity: Some(v),
-                        torque: if gravity_output_enabled {
-                            self.gravity_torques_ramped.get(i).copied()
-                        } else {
-                            Some(0.0)
-                        },
-                        kp: None,
-                        kd: None,
-                    })
-                    .collect();
-                let write_res = self.write_output_with_limits(targets, 1.0 / f64::from(self.config.control_frequency_hz.max(1)), &ramp.limits);
-                match write_res {
-                    Some(Ok(())) => {
+                let mut targets = std::mem::take(&mut self.scratch.targets);
+                targets.clear();
+                targets.extend(
+                    fb.positions
+                        .iter()
+                        .zip(fb.velocities.iter())
+                        .enumerate()
+                        .map(|(i, (&p, &v))| JointTarget {
+                            position: p,
+                            velocity: Some(v),
+                            torque: if gravity_output_enabled {
+                                self.gravity_torques_ramped.get(i).copied()
+                            } else {
+                                Some(0.0)
+                            },
+                            kp: None,
+                            kd: None,
+                        }),
+                );
+                self.scratch.targets = targets;
+                let dt = 1.0 / f64::from(self.config.control_frequency_hz.max(1));
+                let write_res = self.write_output_scratch_with_limits(dt, &ramp.limits);
+                match &write_res {
+                    TickOutput::Complete { .. } => {
                         let done = fb.done;
                         if done {
                             self.commanded_velocities.fill(0.0);
@@ -526,23 +531,33 @@ impl SupervisorInner {
                         };
                         self.tracking.record_issued_with_ws_depths(fb.positions, fb.velocities, full, park);
                         self.tracking.fallback_ramp = (!done).then_some(ramp);
-                        None
                     }
-                    Some(Err(e)) => {
-                        self.tracking.invalidate();
-                        Some(e)
+                    TickOutput::Deferred { .. } => {
+                        // Keep the in-progress braking ramp intact across transient deferral
+                        // without advancing issued history or marking the ramp done.
+                        self.tracking.fallback_ramp = Some(ramp);
                     }
-                    None => {
+                    TickOutput::Expired { .. }
+                    | TickOutput::Error { .. }
+                    | TickOutput::EstopInhibited { .. }
+                    | TickOutput::None => {
                         self.tracking.invalidate();
-                        None
                     }
                 }
+                write_res
             }
             Err(why) => {
                 tracing::error!("Joint tracking fallback cannot brake within the limits ({why}): no frame sent");
-                if let Some(pq) = prev_confirmed.as_deref().filter(|p| p.len() == self.commanded_positions.len()) {
+                if self.scratch.fallback_prev_confirmed_valid
+                    && self.scratch.fallback_prev_confirmed.len() == self.commanded_positions.len()
+                {
                     let gripper_idx = self.config.gripper_index();
-                    for (i, (c, &p)) in self.commanded_positions.iter_mut().zip(pq).enumerate() {
+                    for (i, (c, &p)) in self
+                        .commanded_positions
+                        .iter_mut()
+                        .zip(self.scratch.fallback_prev_confirmed.iter())
+                        .enumerate()
+                    {
                         if Some(i) != gripper_idx {
                             *c = p;
                         }
@@ -558,7 +573,7 @@ impl SupervisorInner {
                         let _ = core::fmt::write(buf, format_args!("Joint tracking fallback cannot brake within the limits: {why}"));
                     }),
                 );
-                None
+                TickOutput::None
             }
         }
     }
