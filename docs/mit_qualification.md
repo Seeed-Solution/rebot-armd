@@ -40,9 +40,33 @@ loop, 20 Hz `GET /observation`):
 - Raising the control thread to `ARMD_RT_PRIORITY=50` (same FIFO priority as the SPI/CAN threads;
   FIFO does not preempt equal priority) reduced `tx_us` p50 from 3.75 ms to 0.29 ms and p99 from
   14.7 ms to 4.3 ms.
-- `DEFAULT_PRIORITY` in `src/rt_core/sched.rs` stays `45` until stage-3 step-1 lands and
-  bus-service starvation under combined CAN, SD/eMMC, and USB gadget load is verified on device;
-  use `ARMD_RT_PRIORITY=50` for on-device qualification A/B runs.
+- Prior to the SG2002 priority layout below, `DEFAULT_PRIORITY` in `src/rt_core/sched.rs` stayed
+  at `45` and `ARMD_RT_PRIORITY=50` was used for on-device qualification A/B runs.
+
+### SG2002 RT priority layout (2026-11-24)
+
+The vendor SG2002 kernel (`linux_5.10/kernel/sched/cvi_sched.h`) caps non-`cvitask` tasks at
+priority `80` and pins `cvitask_isp_pre` / `cvitask_vpss_0` / `cvitask_vpss_1` at `90` and
+`cvitask_tpu_wor` at `85`. On SG2002, `armd` defaults to `SCHED_FIFO 79`
+(`DEFAULT_PRIORITY = 79` in `src/rt_core/sched.rs`, overridable via `ARMD_RT_PRIORITY`), and
+`K92rebot-teleop` applies the complementary layout at startup and whenever `rebot-vision` restarts:
+
+| Thread group | Policy / Priority | Notes |
+|---|---:|---|
+| Pinned `cvitask` (`cvitask_isp_pre`, `cvitask_vpss_0/1`, `cvitask_tpu_wor`) | `FIFO 90` / `RR 85` | Pinned by `cvi_sched.h`; untouched |
+| `spi0` and SPI/CAN IRQ threads (`irq/*spi*`, `irq/*mcp251*`) | `SCHED_FIFO 80` | Raised by `K92rebot-teleop` (at vendor cap) |
+| `armd-control` | `SCHED_FIFO 79` | Default in `armd` (`ARMD_RT_PRIORITY` overrides) |
+| 4 unpinned `cvitask` (`cvitask_vc_wt2`, `cvitask_vc_bh2`, `cvitask_isp_bla`, `cvitask_isp_err`) | `70` (keep FIFO/RR) | Lowered from `90`–`95` by `K92rebot-teleop` |
+| `rebot-vision` RT SDK threads (`ISP0_RUN`, `Thread_Venc0_Pr`, `Thread_Venc2_Pr`, `tz_event_handle`, `vi_dbg_handler`) | `SCHED_RR 70` | Lowered from `RR 80` by `K92rebot-teleop` |
+| Non-SPI IRQ threads (`irq/*mmc*`, `irq/*cviusb*`, `irq/*cd-gpio*`) | `SCHED_FIFO 50` | Stock kernel priority; untouched |
+
+Measured on the spare reCamera SG2002 (`ARMD_RT_OWNER=executor`, `--follower mock`, vision ON, all
+loads, 90 s, run `iso4-j`, 2026-11-24):
+
+| Layout | Wake lateness max | Wake `> 5 ms` | MIT watchdog budget (`< 45 ms`) | Vision |
+|---|---:|---:|---:|---|
+| Default (`armd-control` FIFO 45, stock `spi0`/vision/`cvitask`) | 14.4 ms | — | 52 ms (FAIL) | 15 fps |
+| Target (`armd-control` FIFO 79, SPI FIFO 80, vision & unpinned `cvitask` 70) | 5.6 ms | 2× | 35.7 ms (< 45 ms) | 15 fps, 0 errors |
 - Bounded per-tick CAN TX (`src/driver.rs`, `TxBudget`: default 16 attempts, 10 ms start-cutoff
   overridable via profile `tx_budget_ms <= period / 2`, 45 ms inclusive queued-frame expiry)
   removes the 3 × 100 µs `WouldBlock` retry sleeps, maps SocketCAN `ENOBUFS` to

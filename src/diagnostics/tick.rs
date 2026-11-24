@@ -489,7 +489,7 @@ pub struct ControlThreadSched {
     pub priority: i32,
     /// Whether the SCHED_FIFO request succeeded.
     pub realtime: bool,
-    /// Priority asked for (`ARMD_RT_PRIORITY`, default 45; `crate::rt_core::sched`).
+    /// Priority asked for (`ARMD_RT_PRIORITY`, default 79; `crate::rt_core::sched`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_priority: Option<i32>,
     /// CPU the executor is pinned to (`ARMD_RT_CPU`).
