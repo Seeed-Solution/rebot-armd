@@ -12,7 +12,7 @@
   "events": [
     {"ev":"upgrade_status","client":"bad","status":400},
     {"ev":"upgrade_status","client":"c0","status":101},
-    {"ev":"telemetry_summary","client":"c0","in_range":true,"has_all_timestamps":true,"monotonic":true,"dof":7,"is_torqued":false,"control_mode":"position","positions_mrad":[0,0,0,0,0,0,0],"safety_state":"Idle","epoch_id":1},
+    {"ev":"telemetry_summary","client":"c0","in_range":true,"has_all_timestamps":true,"monotonic":true,"all_samples_consistent":true,"dof":7,"is_torqued":false,"control_mode":"position","positions_mrad":[0,0,0,0,0,0,0],"safety_state":"Idle","epoch_id":1},
     {"ev":"client_closed","client":"c0"}
   ]
 }
