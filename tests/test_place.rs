@@ -26,13 +26,54 @@ fn tcp(q: &[f32]) -> Vec3 { kinematics::fk(&kinematics::q6(q)).p }
 
 fn dist(a: &Vec3, b: &Vec3) -> f64 { kinematics::norm(&kinematics::sub(a, b)) }
 
-struct Rig { ws: common::TestSocket, generation: u64, epoch: u64, sup: Arc<ArmSupervisor> }
+struct Rig {
+    ws: common::TestSocket,
+    generation: u64,
+    epoch: u64,
+    sup: Arc<ArmSupervisor>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        for t in self.tasks.drain(..) { t.abort(); }
+    }
+}
 
 async fn rig(boxes: Vec<KeepoutBox>) -> Rig {
     let mut config = profile();
     config.workspace.as_mut().unwrap().keepout_boxes = boxes;
-    let (ws, generation, epoch, sup, _) = common::torqued_rig(Arc::new(ArmSupervisor::new(config)), &START).await;
-    Rig { ws, generation, epoch, sup }
+    let sup = Arc::new(ArmSupervisor::new(config));
+    let router = armd::create_router(sup.clone(), armd::OperatorAuth::disabled());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let ticker = sup.clone();
+    // Advance 50 Hz simulated trajectories at accelerated wall-clock rate while moving.
+    let tick_task = tokio::spawn(async move {
+        loop {
+            let moving = ticker.inner().read().await.active_trajectory.is_some();
+            if moving {
+                ticker.tick(0.02).await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                ticker.tick(0.02).await;
+            }
+        }
+    });
+    let (mut ws, generation) = common::controller(addr).await;
+    let epoch = sup.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = START.to_vec();
+        inner.measured_positions = START.to_vec();
+        inner.target_positions = START.to_vec();
+    }
+    let epoch = sup.get_observation().await.epoch_id;
+    Rig { ws, generation, epoch, sup, tasks: vec![srv, tick_task] }
 }
 
 impl Rig {
@@ -55,15 +96,25 @@ impl Rig {
     async fn wait(&mut self, id: u64, mut each: impl FnMut(&ActionStatus, &[f32])) -> ActionStatus {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut last_hb = Instant::now();
+        let mut rx = self.sup.subscribe_telemetry().ok();
         loop {
             assert!(Instant::now() < deadline, "place {id} not finished");
             if last_hb.elapsed() > Duration::from_millis(200) { self.heartbeat().await; last_hb = Instant::now(); }
-            let obs = self.sup.get_observation().await;
-            let q = self.sup.inner().read().await.commanded_positions.clone();
-            let a = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id).expect("action record");
-            each(&a, &q);
-            if !a.is_running() { return a; }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let obs = match rx.as_mut() {
+                Some(rx) => match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                    Ok(Ok(obs)) => obs,
+                    _ => self.sup.get_observation().await,
+                },
+                None => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    self.sup.get_observation().await
+                }
+            };
+            let q = obs.commanded_positions.clone();
+            if let Some(a) = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id) {
+                each(&a, &q);
+                if !a.is_running() { return a; }
+            }
         }
     }
 
@@ -168,12 +219,15 @@ async fn motion_stop_cancels_mid_way() {
     let id = r.place(json!({"position": [p0[0] + 0.05, p0[1], p0[2] - 0.06]})).await;
     // until the approach motion runs
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_hb = Instant::now();
     loop {
         assert!(Instant::now() < deadline, "approach not reached");
-        r.heartbeat().await;
+        if last_hb.elapsed() > Duration::from_millis(200) { r.heartbeat().await; last_hb = Instant::now(); }
         let inner = r.sup.inner().read().await;
         let moving = inner.active_trajectory.as_ref().is_some_and(|t| t.action_id == Some(id));
         if inner.last_action.as_ref().unwrap().phase.as_deref() == Some("approach") && moving { break; }
+        drop(inner);
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
     let ack = r.rpc("/api/v1/motion/stop", json!({})).await;
     assert_eq!(ack["type"], "command_ack", "{ack}");
@@ -262,8 +316,8 @@ async fn place_spill_safe_cup_is_levelled_and_pen_is_kept() {
     let tilt = (-tool_z).clamp(-1.0, 1.0).acos().to_degrees();
     assert!(tilt > 15.0, "bin pose is tilted: {tilt:.2}°");
 
-    // 1. Holding a cup (spill_safe: true) -> levelled
-    {
+    // 1. Holding a cup (spill_safe: true) -> levelled; 2. Holding a pen (spill_safe: false) -> kept
+    let cup_case = async {
         let mut r = rig(vec![]).await;
         let ack = r.rpc("/api/v1/poses/save", json!({"name": "bin_tilted", "positions": bin})).await;
         assert_eq!(ack["type"], "command_ack", "{ack}");
@@ -280,10 +334,9 @@ async fn place_spill_safe_cup_is_levelled_and_pen_is_kept() {
         let cup_tilt = (-cup_tool_z).clamp(-1.0, 1.0).acos().to_degrees();
         assert!(cup_tilt < 1.0, "cup was levelled: {cup_tilt:.2}°");
         assert!(r.sup.inner().read().await.held.is_none());
-    }
+    };
 
-    // 2. Holding a pen (spill_safe: false) -> kept
-    {
+    let pen_case = async {
         let mut r = rig(vec![]).await;
         let ack = r.rpc("/api/v1/poses/save", json!({"name": "bin_tilted", "positions": bin})).await;
         assert_eq!(ack["type"], "command_ack", "{ack}");
@@ -298,7 +351,9 @@ async fn place_spill_safe_cup_is_levelled_and_pen_is_kept() {
         let r_pen = kinematics::fk(&kinematics::q6(&q)).r;
         assert!(kinematics::norm(&kinematics::log_v(&kinematics::mul_t(&r_pen, &r_pose))) < 0.02, "pen kept pose orientation");
         assert!(r.sup.inner().read().await.held.is_none());
-    }
+    };
+
+    tokio::join!(cup_case, pen_case);
 }
 
 
