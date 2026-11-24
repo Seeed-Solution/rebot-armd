@@ -61,7 +61,7 @@ RT_PROC_ROOT=${RT_PROC_ROOT:-/proc}
 RT_DT_COMPAT=${RT_DT_COMPAT:-/proc/device-tree/compatible}
 RT_CHRT_BIN=${RT_CHRT_BIN:-chrt}
 RT_SETTLE_PIDFILE=/var/run/rebot-teleop-rtsettle.pid
-RT_SETTLE_TICKS=${RT_SETTLE_TICKS:-20}
+RT_SETTLE_TICKS=${RT_SETTLE_TICKS:-30}
 
 # 默认配置参数
 FOLLOWER_MODEL="rebot-dm"
@@ -613,33 +613,36 @@ apply_rt_priorities() {
         [ -d "$pdir" ] || continue
         pid=${pdir##*/}
         comm=$(cat "$pdir/comm" 2>/dev/null) || continue
-        if [ ! -s "$pdir/cmdline" ]; then
-            case "$comm" in
-                spi[0-9]*|irq/*spi*|irq/*mcp251*|mcp251*)
-                    set_rt_prio "$pid" "$comm" "$pdir/stat" 1 80
-                    ;;
-                cvitask_vc_wt2|cvitask_vc_bh2|cvitask_isp_bla|cvitask_isp_err)
-                    case "$comm" in
-                        cvitask_vc_wt2|cvitask_vc_bh2) RT_VENC_KT_SEEN=$((RT_VENC_KT_SEEN + 1)) ;;
-                    esac
-                    set_rt_prio "$pid" "$comm" "$pdir/stat" keep 70
-                    ;;
-            esac
-        elif [ "$comm" = "rebot-vision" ]; then
-            for tdir in "$pdir"/task/[0-9]*; do
-                [ -d "$tdir" ] || continue
-                tid=${tdir##*/}
-                tcomm=$(cat "$tdir/comm" 2>/dev/null) || continue
-                tsched=$(rt_thread_sched "$tdir/stat") || continue
-                tpol=${tsched%% *}
-                case "$tpol" in
-                    1|2)
-                        RT_VISION_RT_SEEN=$((RT_VISION_RT_SEEN + 1))
-                        set_rt_prio "$tid" "$tcomm" "$tdir/stat" 2 70
-                        ;;
+        case "$comm" in
+            spi[0-9]*|irq/*spi*|irq/*mcp251*|mcp251*)
+                # procfs cmdline has st_size==0 for all processes; inspect contents instead of -s.
+                [ -z "$(tr '\000' ' ' < "$pdir/cmdline" 2>/dev/null)" ] || continue
+                set_rt_prio "$pid" "$comm" "$pdir/stat" 1 80
+                ;;
+            cvitask_vc_wt2|cvitask_vc_bh2|cvitask_isp_bla|cvitask_isp_err)
+                [ -z "$(tr '\000' ' ' < "$pdir/cmdline" 2>/dev/null)" ] || continue
+                case "$comm" in
+                    cvitask_vc_wt2|cvitask_vc_bh2) RT_VENC_KT_SEEN=$((RT_VENC_KT_SEEN + 1)) ;;
                 esac
-            done
-        fi
+                set_rt_prio "$pid" "$comm" "$pdir/stat" keep 70
+                ;;
+            rebot-vision)
+                [ -n "$(tr '\000' ' ' < "$pdir/cmdline" 2>/dev/null)" ] || continue
+                for tdir in "$pdir"/task/[0-9]*; do
+                    [ -d "$tdir" ] || continue
+                    tid=${tdir##*/}
+                    tcomm=$(cat "$tdir/comm" 2>/dev/null) || continue
+                    tsched=$(rt_thread_sched "$tdir/stat") || continue
+                    tpol=${tsched%% *}
+                    case "$tpol" in
+                        1|2)
+                            RT_VISION_RT_SEEN=$((RT_VISION_RT_SEEN + 1))
+                            set_rt_prio "$tid" "$tcomm" "$tdir/stat" 2 70
+                            ;;
+                    esac
+                done
+                ;;
+        esac
     done
     if [ -n "$RT_CHANGED" ]; then
         echo "[rebot-teleop] RT priorities:$RT_CHANGED"

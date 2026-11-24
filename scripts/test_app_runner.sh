@@ -433,12 +433,16 @@ CHEOF
         $RTSH -c '. "$1"; apply_rt_priorities' _ "$RT/rt_funcs.sh")
     check "rt-prio ($RTSH): vision restart re-applies only new vision RT threads" sh -c "[ \$(wc -l < '$RT/chrt.log') -eq 2 ] && grep -qx -- '-r -p 70 3110' '$RT/chrt.log' && grep -qx -- '-r -p 70 3111' '$RT/chrt.log' && printf '%s' \"\$1\" | grep -q 'ISP0_RUN(3110)'" _ "$out3"
 
+    # Regression: never rely on `[ -s "$pdir/cmdline" ]` (procfs virtual files report st_size==0)
+    check "rt-prio ($RTSH): does not use stat-size -s on procfs cmdline" sh -c "! grep -q -- '-s .*cmdline' '$RT/rt_funcs.sh'"
+
     # Missing threads: exits 0 cleanly
     mkdir -p "$RT/empty_proc"
     : > "$RT/chrt.log"
     RT_PROC_ROOT="$RT/empty_proc" RT_DT_COMPAT="$RT/compat_sg2002" RT_CHRT_BIN="$RT/fake_chrt" RT_CHRT_LOG="$RT/chrt.log" NAME=rebot-teleop \
         $RTSH -c '. "$1"; apply_rt_priorities' _ "$RT/rt_funcs.sh"
-    check "rt-prio ($RTSH): missing threads never fail (exit 0, 0 chrt calls)" sh -c "[ $? -eq 0 ] && [ ! -s '$RT/chrt.log' ]"
+    mrc=$?
+    check "rt-prio ($RTSH): missing threads never fail (exit 0, 0 chrt calls)" sh -c "[ $mrc -eq 0 ] && [ ! -s '$RT/chrt.log' ]"
     rm -rf "$RT"
 }
 
