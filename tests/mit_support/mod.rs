@@ -71,6 +71,9 @@ pub struct FakeMotor {
     /// The feedback answering an enable / disable frame reaches the receive queue this long
     /// after the frame (fake clock): a late confirmation.
     pub torque_reply_delay: Duration,
+    /// Earliest instant at which the motor's current delayed torque transition produces its
+    /// first reply (set on the initial delayed command so retries don't blackhole 0xCC probes).
+    pub torque_ready_at: Option<Instant>,
     /// Position-force plant: a jaw stop the joint cannot pass in +q (None: free).
     pub stop_at: Option<f32>,
     /// Torque per raw current unit (N·m / (1/10000 of the maximum phase current)).
@@ -97,7 +100,7 @@ impl FakeMotor {
         Self { id, q: 0.0, v: 0.0, tau: 0.0, enabled: false, state_override: None, limits, regs, reply_id: 0x10 + id,
             silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, ack_value_override_once: None, silent_after_mode_ack: false,
             mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0,
-            drop_torque_frames: 0, torque_reply_delay: Duration::ZERO,
+            drop_torque_frames: 0, torque_reply_delay: Duration::ZERO, torque_ready_at: None,
             stop_at: None, nm_per_raw: 0.0007, stop_stiffness: 250.0, last_pos_force: None, temperature_c: 30 }
     }
 
@@ -282,9 +285,17 @@ impl FakeBusState {
             let now = self.now();
             let poll_feeds = self.poll_feeds_watchdog;
             let has_delayed = now.is_some_and(|t| {
-                self.delayed
-                    .iter()
-                    .any(|(at, f)| *at > t && u16::from(damiao::feedback_motor_id(f)) == id)
+                let mut earliest: Option<Instant> = None;
+                for (at, f) in &self.delayed {
+                    if u16::from(damiao::feedback_motor_id(f)) == id {
+                        earliest = Some(earliest.map_or(*at, |e| e.min(*at)));
+                    }
+                }
+                // Suppress 0xCC only while the motor's first pending delayed reply has not yet
+                // matured; once any delayed reply has already been delivered (`ready_at <= t`),
+                // a retry's queued later duplicate must not blackhole live 0xCC probes.
+                earliest.is_some_and(|at| at > t)
+                    && self.motors[k].torque_ready_at.is_none_or(|ready| t < ready)
             });
             let m = &mut self.motors[k];
             if m.silent { return; }
@@ -338,10 +349,19 @@ impl FakeBusState {
             let delay = self.motors[k].torque_reply_delay;
             if torque_frame && !delay.is_zero() {
                 if let Some(now) = self.now() {
-                    let m = &self.motors[k];
-                    if !m.silent && !m.mute_feedback && !m.no_feedback { self.delayed.push((now + delay, m.feedback_frame())); }
+                    let deliver_at = now + delay;
+                    let m = &mut self.motors[k];
+                    if m.torque_ready_at.is_none_or(|prev| prev <= now && !self.delayed.iter().any(|(_, f)| u16::from(damiao::feedback_motor_id(f)) == m.id)) {
+                        m.torque_ready_at = Some(deliver_at);
+                    }
+                    if !m.silent && !m.mute_feedback && !m.no_feedback {
+                        let fb = m.feedback_frame();
+                        self.delayed.push((deliver_at, fb));
+                    }
                     return;
                 }
+            } else if torque_frame {
+                self.motors[k].torque_ready_at = None;
             }
             self.push_feedback(k);
             return;

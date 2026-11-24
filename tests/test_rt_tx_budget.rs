@@ -1865,7 +1865,7 @@ fn j7_pos_force_autonomous_recovery_obeys_estop_and_handshake_obeys_tx_budget() 
     // reads back, sends 0x307 pre-enable hold, and confirms enable.
     d.set_tx_budget(TxBudget::default());
     let mut confirmed = false;
-    for _ in 0..20 {
+    for _ in 0..50 {
         clock.advance(ms(2));
         match d.poll_torque(clock.now() + ms(5)).expect("poll_torque with restored budget") {
             armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed) => {
@@ -1984,7 +1984,7 @@ fn enable_and_retry_frames_obey_tx_budget_across_polls() {
 
     let mut confirmed = false;
     let mut total_enables = 0usize;
-    for step in 0..35 {
+    for step in 0..120 {
         bus.clear();
         clock.advance(ms(1));
         match d.poll_torque(clock.now() + ms(5)).expect("poll_torque under max_frames=1") {
@@ -2394,7 +2394,7 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
     };
 
     // Case A: Legacy `SupervisorInner::clear_fault()` resets motor fault while latched, then clears latch.
-    let (mut inner, bus, _clock) = make_faulted_estop_supervisor();
+    let (mut inner, bus, clock) = make_faulted_estop_supervisor();
     // Negative check: while a NEW stop is PENDING (requested > applied), clear_fault MUST refuse
     // and emit 0 CMD_CLEAR_FAULTS frames.
     bus.clear();
@@ -2441,8 +2441,14 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
         "latch must remain set until fresh fault-free feedback is verified on retry"
     );
 
-    // Next supervisor tick ingests the fault-free feedback replies from the reset while E-stop remains latched.
-    inner.tick(0.02);
+    // Next supervisor ticks ingest K=3 fault-free feedback replies across >= 20 ms while E-stop remains latched.
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(ms(10));
+            bus.with(|s| s.push_all_feedback());
+        }
+        inner.tick(0.02);
+    }
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert!(inner.e_stop_latched.load(Ordering::SeqCst));
 
@@ -2457,7 +2463,7 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
 
     // Case B: RT Executor `SupervisorInner::clear_fault_executor(deadline)` resets motor fault while
     // latched via `clear_fault_budgeted`, then clears the latch on the next call after Step 2 feedback.
-    let (mut inner_rt, bus_rt, _clock_rt) = make_faulted_estop_supervisor();
+    let (mut inner_rt, bus_rt, clock_rt) = make_faulted_estop_supervisor();
     bus_rt.clear();
     let step1_rt = inner_rt
         .clear_fault_executor(std::time::Instant::now() + ms(50))
@@ -2479,8 +2485,14 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
         "clear_fault_executor while latched must transmit CMD_CLEAR_FAULTS to all 7 motors: {clear_frames_rt:?}"
     );
     assert!(inner_rt.e_stop_latched.load(Ordering::SeqCst));
-    // Step 2 tick ingests fresh fault-free feedback from all 7 motors.
-    inner_rt.tick(0.02);
+    // Step 2 ticks ingest K=3 fresh fault-free feedback from all 7 motors across >= 20 ms.
+    for step in 0..3 {
+        if step > 0 {
+            clock_rt.advance(ms(10));
+            bus_rt.with(|s| s.push_all_feedback());
+        }
+        inner_rt.tick(0.02);
+    }
     let final_rt = inner_rt
         .clear_fault_executor(std::time::Instant::now() + ms(50))
         .expect("second clear_fault_executor after fresh feedback must clear E-stop latch");
@@ -2697,7 +2709,7 @@ fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() 
     let mut saw_j4_ctrl_mode = false;
     let mut saw_j4_hold = false;
     let mut total_enables = 0usize;
-    for step in 0..40 {
+    for step in 0..120 {
         let sent_prev = bus.with(|s| s.tx_log.clone());
         saw_j4_ctrl_mode |= sent_prev.iter().any(|f| {
             f.id == 0x7FF && f.data[0] == 4 && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_CTRL_MODE

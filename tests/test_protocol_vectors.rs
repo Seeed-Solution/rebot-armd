@@ -211,12 +211,14 @@ fn test_feetech_driver_mock_loopback() {
         let cs = feetech::calculate_checksum(id, length, 0x00, &params);
         enable_rx.extend_from_slice(&[0xFF, 0xFF, id, length, 0x00, 1, cs]);
     }
-    driver.transport_mut().provide_rx(&enable_rx);
+    for _ in 0..3 {
+        driver.transport_mut().provide_rx(&enable_rx);
+    }
 
     driver.set_torque(true).unwrap();
     let tx_bytes = driver.transport_mut().take_tx();
-    // Pre-seeding SYNC_WRITE (17 bytes) + 3 servos write (8 bytes each) + 3 servos read (8 bytes each) = 65 bytes
-    assert_eq!(tx_bytes.len(), 65);
+    // Pre-seeding SYNC_WRITE (17 bytes) + 3 servos write (8 bytes each) + 3 rounds * 3 servos read (8 bytes each) = 113 bytes
+    assert_eq!(tx_bytes.len(), 113);
 
     // 3. Test write_joint_targets
     let targets = vec![

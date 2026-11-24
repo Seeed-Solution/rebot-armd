@@ -146,8 +146,20 @@ fn damiao_disable_needs_feedback_and_failure_does_not_fabricate_disabled_status(
         EnableState::Unknown,
         "successful send alone is not disable confirmation"
     );
-    driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
-    driver.read_joint_states().unwrap();
+    for i in 0..3 {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(12));
+        }
+        driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
+        driver.read_joint_states().unwrap();
+        if i < 2 {
+            assert_eq!(
+                driver.enable_state(),
+                EnableState::Unknown,
+                "single/sub-20ms state-0 feedback must not confirm disable"
+            );
+        }
+    }
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 
@@ -199,8 +211,20 @@ fn queued_disabled_feedback_cannot_acknowledge_a_later_disable_command() {
         EnableState::Unknown,
         "pre-command state=0 is not a disable ACK"
     );
-    driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
-    driver.read_joint_states().unwrap();
+    for i in 0..3 {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(12));
+        }
+        driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
+        driver.read_joint_states().unwrap();
+        if i < 2 {
+            assert_eq!(
+                driver.enable_state(),
+                EnableState::Unknown,
+                "single/sub-20ms state-0 feedback must not confirm disable"
+            );
+        }
+    }
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 
@@ -234,8 +258,20 @@ fn overloaded_rx_still_sends_disable_but_requires_a_new_feedback_boundary() {
         EnableState::Unknown,
         "draining old frames cannot confirm disable"
     );
-    driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
-    driver.read_joint_states().unwrap();
+    for i in 0..3 {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(12));
+        }
+        driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
+        driver.read_joint_states().unwrap();
+        if i < 2 {
+            assert_eq!(
+                driver.enable_state(),
+                EnableState::Unknown,
+                "single/sub-20ms state-0 feedback must not confirm disable"
+            );
+        }
+    }
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 

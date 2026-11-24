@@ -214,8 +214,12 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     assert_eq!(inner2.safety.fault().map(|f| f.code), Some(armd::FaultCode::EnableFailed));
     assert!(!inner2.safety.recoverable());
 
-    // Explicit TorqueOff at the rest pose succeeds through the rest gate!
+    // Explicit TorqueOff at the rest pose succeeds through the rest gate (K=3 rest-pose ticks)!
     r2.bus.with(|s| s.motors[3].drop_torque_frames = 0);
+    for _ in 0..3 {
+        r2.bus.with(|s| s.push_all_feedback());
+        r2.step();
+    }
     r2.submit(TransitionOp::TorqueOff);
     assert!(r2.step().command.unwrap().1.is_ok());
     let (_, off_outcome, _) = r2.until_ended(30);

@@ -1589,10 +1589,15 @@ fn bounded_clear_fault_budgeted_deadlines_flush_estop_and_latch_preservation() {
     );
     assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
 
-    // Push fresh fault-free feedback and poll -> now `clear_fault_executor` clears cleanly to Idle!
-    raw_bus2.with(|s| s.push_all_feedback());
-    let poll = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
-    assert!(poll.feedback_valid);
+    // Push K=3 fresh fault-free feedback ticks spanning >= 20 ms -> now `clear_fault_executor` clears cleanly to Idle!
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        raw_bus2.with(|s| s.push_all_feedback());
+        let poll = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        assert!(poll.feedback_valid);
+    }
     let cleared = inner.clear_fault_executor(clock.now() + Duration::from_millis(50));
     assert_eq!(cleared.unwrap(), SafetyState::Idle);
 }
@@ -2547,11 +2552,15 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
         "failed enable at rest must send ZERO automatic rollback disable frames"
     );
 
-    // Explicit TorqueOff at rest goes through the rest gate and completes within the single RX budget.
+    // Explicit TorqueOff at rest goes through the rest gate (K=3 rest-pose ticks) and completes within the single RX budget.
     raw_bus.with(|s| {
         s.motors[3].drop_torque_frames = 0;
-        s.push_all_feedback();
     });
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(10));
+        raw_bus.with(|s| s.push_all_feedback());
+        let _ = fx.step();
+    }
     let auth_off = fx.core.authority(&fx.ctx(fx.now()));
     broker
         .submit(ClientId(1), 4, auth_off, fx.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOff))

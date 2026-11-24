@@ -352,6 +352,24 @@ impl StoppedDisableGate {
         out
     }
 
+    #[inline]
+    pub fn is_arm_joint(&self, joint: usize) -> bool {
+        self.arm_joints[..self.arm_joints_len].contains(&joint)
+    }
+
+    #[inline]
+    pub fn joint_at_rest(&self, joint: usize, position: f32) -> bool {
+        if !self.has_resting_pose
+            || !self.rest_pose_tolerance_rad.is_finite()
+            || self.rest_pose_tolerance_rad <= 0.0
+            || joint >= self.rest_positions.len()
+        {
+            return false;
+        }
+        let rest = self.rest_positions[joint];
+        position.is_finite() && rest.is_finite() && (position - rest).abs() <= self.rest_pose_tolerance_rad
+    }
+
     /// Evaluates Rule A′ pose check against fresh arm-joint positions matching `arm_joint_indices()`.
     #[inline]
     pub fn check_positions(&self, positions: &[f32]) -> bool {
@@ -557,10 +575,96 @@ pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
 /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for that motor's torque state,
 /// mode, or rest pose. An empty host RX queue or a no-op `flush()` is NOT a causal boundary.
 pub const TORQUE_CAUSAL_SETTLE_WINDOW: Duration = Duration::from_millis(20);
+/// Number of consecutive agreeing causal samples required before `OffConfirmed`, `OnConfirmed`,
+/// or `"at rest pose"` is confirmed (S2). A single sample never confirms.
+pub const EVIDENCE_WINDOW_SAMPLES: u8 = 3;
+/// Minimum time span between the 1st and K-th causal sample of an evidence window (spanning at
+/// least 2 control ticks at 50 Hz = 20 ms; prevents same-tick bursts from confirming).
+pub const EVIDENCE_WINDOW_MIN_SPAN: Duration = Duration::from_millis(20);
+/// Spacing between read-only causal status probes during torque confirmation handshakes so K=3
+/// samples span `>= 20 ms` across >= 2 ticks well within the 150 ms confirmation window.
+const EVIDENCE_PROBE_INTERVAL: Duration = Duration::from_millis(10);
 /// Time bound of one Damiao receive pass (with at most 64 frames).
 pub const DAMIAO_RX_PASS: Duration = Duration::from_millis(5);
 /// Maximum age for Damiao joint feedback to still be considered valid.
 const DAMIAO_FEEDBACK_VALID_WINDOW: Duration = Duration::from_millis(250);
+
+/// Zero-allocation status of a driver's K=3 causal rest-pose evidence window (S2 / L1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestPoseGateStatus {
+    /// Completed RX drain and every arm joint has K=3 consecutive causal samples spanning >= 2
+    /// control ticks within the rest-pose tolerance.
+    Confirmed,
+    /// No arm joint currently disagrees with the rest pose, but either RX drain did not finish
+    /// or at least one arm joint has fewer than K=3 agreeing samples / < 2 ticks span.
+    PendingEvidence,
+    /// Missing rest-pose configuration, non-finite feedback, or a real non-rest pose was observed.
+    RefusedNonRest,
+}
+
+/// Zero-allocation K=3 consecutive causal evidence accumulator shared across all drivers (S2).
+///
+/// Confirmation requires `count >= EVIDENCE_WINDOW_SAMPLES` (3), `distinct_passes >= 2`,
+/// `last_rx - first_rx >= EVIDENCE_WINDOW_MIN_SPAN` (20 ms, spanning >= 2 control ticks),
+/// and `now - last_rx <= max_age`. Any disagreeing sample or gap `> max_gap` resets the window.
+#[derive(Clone, Copy, Debug, Default)]
+struct CausalWindow {
+    count: u8,
+    first_rx: Option<Instant>,
+    last_rx: Option<Instant>,
+    last_pass: u64,
+    distinct_passes: u8,
+}
+
+impl CausalWindow {
+    #[inline]
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    #[inline]
+    fn record_agree(&mut self, rx_at: Instant, pass_id: u64, max_gap: Duration) {
+        if self.last_rx.is_some_and(|prev| rx_at < prev) {
+            return;
+        }
+        if self.count == 0
+            || self
+                .last_rx
+                .is_some_and(|prev| rx_at.saturating_duration_since(prev) > max_gap)
+        {
+            self.count = 1;
+            self.first_rx = Some(rx_at);
+            self.last_rx = Some(rx_at);
+            self.last_pass = pass_id;
+            self.distinct_passes = 1;
+        } else {
+            self.count = self.count.saturating_add(1);
+            if pass_id != self.last_pass {
+                self.distinct_passes = self.distinct_passes.saturating_add(1);
+                self.last_pass = pass_id;
+            }
+            self.last_rx = Some(rx_at);
+        }
+    }
+
+    #[inline]
+    fn record_disagree(&mut self) {
+        self.reset();
+    }
+
+    #[inline]
+    fn is_confirmed(&self, now: Instant, max_age: Duration) -> bool {
+        self.count >= EVIDENCE_WINDOW_SAMPLES
+            && self.distinct_passes >= 2
+            && self
+                .first_rx
+                .zip(self.last_rx)
+                .is_some_and(|(first, last)| {
+                    last.saturating_duration_since(first) >= EVIDENCE_WINDOW_MIN_SPAN
+                        && now.saturating_duration_since(last) <= max_age
+                })
+    }
+}
 
 /// Driver-owned causal evidence of one motor's physical torque state.
 ///
@@ -703,6 +807,11 @@ pub trait ArmDriver: Send {
     /// feedback continuity breaks (`> 100 ms` gap or non-finite feedback).
     fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
         self.fresh_measured_position_for(joint, max_age).map(|p| (p, 0))
+    }
+
+    /// Status of the driver's K=3 causal rest-pose evidence window for `StoppedDisableGate` (S2/L1).
+    fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
+        RestPoseGateStatus::Confirmed
     }
 
     /// True when `joint` has a verified hold mode capable of receiving stationary hold frames
@@ -1388,11 +1497,21 @@ pub struct FeetechArmDriver<T: Transport> {
     incomplete_chunk_idx: Option<usize>,
     incomplete_frame_started_at: Option<Instant>,
     partial_pos_rx: Vec<u8>,
+    /// Per-byte host monotonic receive timestamps aligned 1:1 with `partial_pos_rx` (S2).
+    partial_pos_rx_timestamps: Vec<Instant>,
     /// Per-byte host monotonic receive timestamps aligned 1:1 with `rx_buffer` (E3).
     rx_timestamps: Vec<Instant>,
     /// True after any Feetech request times out or observes an ambiguous duplicate reply; the next
-    /// request MUST discard RX bytes until continuous line idle before transmitting (E3).
+    /// request MUST discard RX bytes until continuous line idle (20 ms) before transmitting (S2).
     line_poisoned: bool,
+    /// Host monotonic instant when continuous silence on a poisoned serial line began (S2).
+    line_poison_quiet_since: Option<Instant>,
+    /// Monotonic pass counter distinguishing separate poll/readback ticks for S2 K-windows.
+    evidence_pass_id: u64,
+    /// Per-servo K=3 causal confirmation windows for `OffConfirmed`, `OnConfirmed`, and rest pose (S2).
+    torque_off_window: Vec<CausalWindow>,
+    torque_on_window: Vec<CausalWindow>,
+    rest_pose_window: Vec<CausalWindow>,
     /// Preallocated goal-position scratch buffer for zero-alloc `FailedHold` / stopped holds (R1).
     hold_positions_buf: Vec<(u8, u16)>,
     /// Preallocated `SYNC_WRITE` packet buffer for zero-alloc `FailedHold` / stopped holds (R1).
@@ -1450,8 +1569,14 @@ impl<T: Transport> FeetechArmDriver<T> {
             incomplete_chunk_idx: None,
             incomplete_frame_started_at: None,
             partial_pos_rx: Vec::with_capacity(64),
+            partial_pos_rx_timestamps: Vec::with_capacity(64),
             rx_timestamps: Vec::with_capacity(256),
             line_poisoned: false,
+            line_poison_quiet_since: None,
+            evidence_pass_id: 0,
+            torque_off_window: vec![CausalWindow::default(); dof],
+            torque_on_window: vec![CausalWindow::default(); dof],
+            rest_pose_window: vec![CausalWindow::default(); dof],
             hold_positions_buf: Vec::with_capacity(hold_cap),
             hold_sync_pkt_buf: Vec::with_capacity(16 + hold_cap * 3),
             consecutive_missed_echoes: 0,
@@ -1644,12 +1769,21 @@ impl<T: Transport> FeetechArmDriver<T> {
     #[doc(hidden)]
     pub fn set_partial_pos_rx(&mut self, bytes: &[u8]) {
         self.partial_pos_rx = bytes.to_vec();
+        let now = self.clock_now();
+        self.partial_pos_rx_timestamps = vec![now; bytes.len()];
     }
 
     pub(crate) fn invalidate_partial_pos_rx(&mut self) {
         self.partial_pos_rx.clear();
+        self.partial_pos_rx_timestamps.clear();
         self.incomplete_chunk_idx = None;
         self.incomplete_frame_started_at = None;
+    }
+
+    #[inline]
+    fn poison_line(&mut self) {
+        self.line_poisoned = true;
+        self.line_poison_quiet_since = Some(self.clock_now());
     }
 
     #[inline]
@@ -1672,26 +1806,63 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.rx_timestamps.drain(..ts_count);
     }
 
-    /// Continuous quiet period required to declare a poisoned half-duplex serial line idle (E3).
-    const LINE_IDLE_QUIET: Duration = Duration::from_millis(3);
-    /// Upper bound for draining a poisoned line before failing closed (E3).
-    const LINE_IDLE_MAX_WAIT: Duration = Duration::from_millis(30);
+    /// Continuous quiet period (no bytes) required to declare a poisoned half-duplex serial line idle (S2).
+    const LINE_IDLE_QUIET: Duration = Duration::from_millis(20);
+    /// Upper bound for draining a poisoned line before failing closed (S2).
+    const LINE_IDLE_MAX_WAIT: Duration = Duration::from_millis(80);
+
+    /// Non-blocking poison-drain check for bounded `read_joint_states` polls: drains any pending
+    /// bytes (resetting the 20 ms silence timer on any byte), clearing `line_poisoned` ONLY once
+    /// the line has remained continuously silent for [`Self::LINE_IDLE_QUIET`] (20 ms).
+    fn poll_poisoned_line_idle(&mut self) -> bool {
+        if !self.line_poisoned {
+            return true;
+        }
+        self.clear_rx();
+        let mut discard_buf = [0u8; 64];
+        let mut saw_bytes = false;
+        for _ in 0..8 {
+            match self.transport.read(&mut discard_buf) {
+                Ok(n) if n > 0 => {
+                    saw_bytes = true;
+                    self.line_poison_quiet_since = Some(self.clock_now());
+                }
+                _ => break,
+            }
+        }
+        if saw_bytes {
+            return false;
+        }
+        let now = self.clock_now();
+        let quiet_since = *self.line_poison_quiet_since.get_or_insert(now);
+        if self.elapsed_since(quiet_since) >= Self::LINE_IDLE_QUIET {
+            self.line_poisoned = false;
+            self.line_poison_quiet_since = None;
+            self.transport.clear_input_buffer();
+            self.clear_rx();
+            true
+        } else {
+            false
+        }
+    }
 
     /// Drains and discards all RX bytes until the serial line remains continuously quiet for
-    /// [`Self::LINE_IDLE_QUIET`], clearing `line_poisoned`. Fails closed if late traffic never
-    /// subsides within [`Self::LINE_IDLE_MAX_WAIT`].
+    /// [`Self::LINE_IDLE_QUIET`] (20 ms), clearing `line_poisoned`. Fails closed if late traffic
+    /// never subsides within [`Self::LINE_IDLE_MAX_WAIT`].
     fn discard_until_idle(&mut self) -> Result<(), ArmDriverError> {
         self.assert_clock_matches_transport();
         self.transport.clear_input_buffer();
         self.clear_rx();
         let start = self.clock_now();
-        let mut quiet_since = start;
+        let mut quiet_since = self.line_poison_quiet_since.unwrap_or(start);
         let mut discard_buf = [0u8; 64];
         loop {
             let before_read = self.clock_now();
             match self.transport.read(&mut discard_buf) {
                 Ok(n) if n > 0 => {
-                    quiet_since = self.clock_now();
+                    let now = self.clock_now();
+                    quiet_since = now;
+                    self.line_poison_quiet_since = Some(now);
                     if self.elapsed_since(start) >= Self::LINE_IDLE_MAX_WAIT {
                         return Err(ArmDriverError::Protocol(
                             "Feetech serial line remained busy while clearing timed-out request".into(),
@@ -1699,14 +1870,15 @@ impl<T: Transport> FeetechArmDriver<T> {
                     }
                 }
                 Ok(_) | Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
-                    if self.clock_now() == before_read {
-                        self.clock_sleep(Duration::from_micros(500));
-                    }
                     if self.elapsed_since(quiet_since) >= Self::LINE_IDLE_QUIET {
                         self.line_poisoned = false;
+                        self.line_poison_quiet_since = None;
                         self.transport.clear_input_buffer();
                         self.clear_rx();
                         return Ok(());
+                    }
+                    if self.clock_now() == before_read {
+                        self.clock_sleep(Duration::from_millis(1));
                     }
                     if self.elapsed_since(start) >= Self::LINE_IDLE_MAX_WAIT {
                         return Err(ArmDriverError::Protocol(
@@ -1746,6 +1918,52 @@ impl<T: Transport> FeetechArmDriver<T> {
             || self.estop_gate.as_ref().is_some_and(|g| g.pending())
     }
 
+    fn evaluate_rest_pose_gate(&self) -> RestPoseGateStatus {
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return RestPoseGateStatus::RefusedNonRest;
+        };
+        if !gate.has_resting_pose {
+            return RestPoseGateStatus::RefusedNonRest;
+        }
+        let arm_joints = gate.arm_joint_indices();
+        if arm_joints.is_empty() {
+            return RestPoseGateStatus::RefusedNonRest;
+        }
+        let now = self.clock_now();
+        let caps = self.capabilities();
+        let mut pending = false;
+        for &i in arm_joints {
+            let Some(s) = self.cached_states.get(i) else {
+                return RestPoseGateStatus::RefusedNonRest;
+            };
+            let fresh = self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| now.saturating_duration_since(t) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if fresh {
+                if !joint_state_valid(s, caps) || !gate.joint_at_rest(i, s.position) {
+                    return RestPoseGateStatus::RefusedNonRest;
+                }
+            } else {
+                pending = true;
+            }
+            if !self
+                .rest_pose_window
+                .get(i)
+                .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+            {
+                pending = true;
+            }
+        }
+        if self.line_poisoned || pending {
+            RestPoseGateStatus::PendingEvidence
+        } else {
+            RestPoseGateStatus::Confirmed
+        }
+    }
+
     fn check_stopped_disable_requested(
         &self,
         started_at: Instant,
@@ -1757,19 +1975,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         if self.elapsed_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(ArmDriverError::DisableRequestExpired);
         }
-        let Some(ref gate) = self.stopped_disable_gate else {
-            return Err(ArmDriverError::TorqueOffWouldDrop);
-        };
-        let arm_joints = gate.arm_joint_indices();
-        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        if !self.fresh_joint_positions_into(
-            arm_joints,
-            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-            &mut arm_positions[..arm_joints.len()],
-        ) {
-            return Err(ArmDriverError::TorqueOffWouldDrop);
-        }
-        if !gate.check_positions(&arm_positions[..arm_joints.len()]) {
+        if self.evaluate_rest_pose_gate() != RestPoseGateStatus::Confirmed {
             return Err(ArmDriverError::TorqueOffWouldDrop);
         }
         Ok(())
@@ -1787,10 +1993,14 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
             DisableKind::DisableProtective { .. } => {}
         }
-        // Invalidate per-motor torque evidence immediately BEFORE the torque-changing write
-        // reaches the transport; a gate refusal above leaves evidence intact.
+        // Invalidate per-motor torque windows immediately BEFORE the torque-changing write reaches
+        // the transport; a gate refusal above leaves evidence intact. (Keep `rest_pose_window`
+        // intact across the atomic multi-servo disable batch so servo 0's write does not poison
+        // servos 1..N microseconds later; non-rest feedback or >100 ms staleness still invalidates it.)
         if let Some(idx) = self.servo_ids.iter().position(|&id| id == servo_id) {
             self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+            self.torque_off_window[idx].reset();
+            self.torque_on_window[idx].reset();
         }
         // E3: Discard pending RX before transmitting (best-effort on protective cut so noisy RX
         // never blocks a thermal/exit disable write).
@@ -2063,7 +2273,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                 _ => self.clock_yield(),
             }
         }
-        self.line_poisoned = true;
+        self.poison_line();
         self.clear_rx();
         Err(ArmDriverError::Timeout(id))
     }
@@ -2071,7 +2281,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     /// Causally ordered `REG_TORQUE_ENABLE` readback for servo `idx`: if a previous 1-byte read
     /// timed out (`unmatched_1b_read[idx]`), requires a 0-byte `PING` FIFO barrier first so a
     /// late 1-byte reply cannot be misread as the new torque-register state. Returns `(value, rx_at)`
-    /// stamped with the reply's own host monotonic receive time (E3).
+    /// stamped with the reply's own host monotonic receive time (E3/S2).
     fn read_torque_enable_causal(&mut self, idx: usize, id: u8) -> Result<(u8, Instant), ArmDriverError> {
         if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
             self.ping_servo_barrier(id)?;
@@ -2083,37 +2293,101 @@ impl<T: Transport> FeetechArmDriver<T> {
         Ok((params[0], rx_at))
     }
 
-    /// Reads REG_TORQUE_ENABLE from each servo in `ids` (indexed like `servo_ids`), records
-    /// the per-motor causal torque evidence stamped with each reply's own receive time, and
-    /// returns (disabled count, enabled count, read errors).
-    fn read_torque_enable_states(&mut self, ids: &[u8]) -> (usize, usize, Vec<String>) {
-        let mut count_0 = 0;
-        let mut count_1 = 0;
+    /// S2: Feed one causal `REG_TORQUE_ENABLE` sample (stamped with its own receive time inside
+    /// its own request window) into motor `idx`'s K=3 confirmation windows. A single sample never
+    /// confirms `OffConfirmed` or `OnConfirmed`; any disagreeing sample resets the window.
+    fn record_torque_enable_sample(&mut self, idx: usize, val: u8, rx_at: Instant, pass_id: u64) {
+        const TORQUE_WINDOW_MAX_GAP: Duration = Duration::from_millis(600);
+        match val {
+            0 => {
+                self.torque_on_window[idx].record_disagree();
+                self.torque_off_window[idx].record_agree(rx_at, pass_id, TORQUE_WINDOW_MAX_GAP);
+                if self.torque_off_window[idx].is_confirmed(rx_at, TORQUE_WINDOW_MAX_GAP) {
+                    self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
+                } else {
+                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                }
+                self.last_enable_confirmed[idx] = Some(rx_at);
+                self.missed_enable_polls[idx] = 0;
+            }
+            1 => {
+                self.torque_off_window[idx].record_disagree();
+                self.torque_on_window[idx].record_agree(rx_at, pass_id, TORQUE_WINDOW_MAX_GAP);
+                if self.torque_on_window[idx].is_confirmed(rx_at, TORQUE_WINDOW_MAX_GAP) {
+                    self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
+                } else {
+                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                }
+                self.last_enable_confirmed[idx] = Some(rx_at);
+                self.missed_enable_polls[idx] = 0;
+            }
+            _ => {
+                self.torque_off_window[idx].record_disagree();
+                self.torque_on_window[idx].record_disagree();
+                self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+            }
+        }
+    }
+
+    /// Reads REG_TORQUE_ENABLE across `K = 3` spaced causal rounds spanning `>= 20 ms` (S2),
+    /// feeding each reply's own receive time into per-motor K-windows. Returns
+    /// `(off_confirmed_count, on_confirmed_count, read_errors)`.
+    fn read_torque_enable_window(
+        &mut self,
+        ids: &[u8],
+        stop_stamp: Option<(u64, u64)>,
+    ) -> Result<(usize, usize, Vec<String>), ArmDriverError> {
+        let mut errored = vec![false; ids.len()];
         let mut read_errors = Vec::new();
-        for (idx, &id) in ids.iter().enumerate() {
-            match self.read_torque_enable_causal(idx, id) {
-                Ok((v @ (0 | 1), rx_at)) => {
-                    if v == 0 {
-                        count_0 += 1;
-                        self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
-                    } else {
-                        count_1 += 1;
-                        self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
+        for round in 0..usize::from(EVIDENCE_WINDOW_SAMPLES) {
+            if round > 0 {
+                self.clock_sleep(EVIDENCE_PROBE_INTERVAL);
+            }
+            if let Some(stamp) = stop_stamp {
+                self.strict_stop_check(Some(stamp))?;
+            }
+            self.evidence_pass_id = self.evidence_pass_id.wrapping_add(1);
+            let pass_id = self.evidence_pass_id;
+            for (idx, &id) in ids.iter().enumerate() {
+                if errored[idx] {
+                    continue;
+                }
+                if let Some(stamp) = stop_stamp {
+                    self.strict_stop_check(Some(stamp))?;
+                }
+                match self.read_torque_enable_causal(idx, id) {
+                    Ok((v @ (0 | 1), rx_at)) => {
+                        self.record_torque_enable_sample(idx, v, rx_at, pass_id);
                     }
-                    self.last_enable_confirmed[idx] = Some(rx_at);
-                    self.missed_enable_polls[idx] = 0;
-                }
-                Ok((v, _)) => {
-                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
-                    read_errors.push(format!("servo {} returned unexpected value {}", id, v));
-                }
-                Err(e) => {
-                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
-                    read_errors.push(format!("servo {} read failed: {}", id, e));
+                    Ok((v, _)) => {
+                        self.torque_off_window[idx].record_disagree();
+                        self.torque_on_window[idx].record_disagree();
+                        self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                        errored[idx] = true;
+                        read_errors.push(format!("servo {} returned unexpected value {}", id, v));
+                    }
+                    Err(e) => {
+                        self.torque_off_window[idx].record_disagree();
+                        self.torque_on_window[idx].record_disagree();
+                        self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                        errored[idx] = true;
+                        read_errors.push(format!("servo {} read failed: {}", id, e));
+                    }
                 }
             }
         }
-        (count_0, count_1, read_errors)
+        let count_0 = (0..ids.len())
+            .filter(|&i| self.motor_evidence.get(i).copied() == Some(MotorTorqueEvidence::OffConfirmed))
+            .count();
+        let count_1 = (0..ids.len())
+            .filter(|&i| self.motor_evidence.get(i).copied() == Some(MotorTorqueEvidence::OnConfirmed))
+            .count();
+        self.last_enable_poll = Some(self.clock_now());
+        Ok((count_0, count_1, read_errors))
+    }
+
+    fn read_torque_enable_states(&mut self, ids: &[u8]) -> (usize, usize, Vec<String>) {
+        self.read_torque_enable_window(ids, None).unwrap_or_else(|e| (0, 0, vec![e.to_string()]))
     }
 
     pub fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
@@ -2194,7 +2468,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                                             scan = &scan[c..];
                                             if extra.id == id && extra.params.len() == 1 {
                                                 self.clear_rx();
-                                                self.line_poisoned = true;
+                                                self.poison_line();
                                                 if let Some(idx) = self.servo_ids.iter().position(|&sid| sid == id) {
                                                     self.unmatched_1b_read[idx] = true;
                                                 }
@@ -2240,8 +2514,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
         }
 
-        // E3: Timed-out request poisons the serial line until drained idle before the next request.
-        self.line_poisoned = true;
+        // E3/S2: Timed-out request poisons the serial line until drained idle (20 ms) before the next request.
+        self.poison_line();
         self.clear_rx();
         if len == 1 {
             if let Some(idx) = self.servo_ids.iter().position(|&sid| sid == id) {
@@ -2592,6 +2866,24 @@ impl<T: Transport> FeetechArmDriver<T> {
                                 }
                                 self.last_feedback_instant[joint_idx] = Some(pkt_rx_at);
                                 self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
+                                // S2: Feed causal position sample into per-joint K=3 rest-pose window.
+                                if let Some(ref gate) = self.stopped_disable_gate {
+                                    if gate.is_arm_joint(joint_idx) {
+                                        let pos = self.cached_states[joint_idx].position;
+                                        if joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
+                                            && gate.joint_at_rest(joint_idx, pos)
+                                        {
+                                            let pass_id = self.evidence_pass_id;
+                                            self.rest_pose_window[joint_idx].record_agree(
+                                                pkt_rx_at,
+                                                pass_id,
+                                                STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                            );
+                                        } else {
+                                            self.rest_pose_window[joint_idx].record_disagree();
+                                        }
+                                    }
+                                }
 
                                 replied_ids.insert(pkt.id);
                             }
@@ -2639,10 +2931,21 @@ impl<T: Transport> FeetechArmDriver<T> {
         expected_ids: &std::collections::HashSet<u8>,
         replied_ids: &mut std::collections::HashSet<u8>,
         inc_ts: Instant,
+        ttl: Duration,
     ) {
         let mut rx = std::mem::take(&mut self.partial_pos_rx);
-        self.decode_position_frames_from(&mut rx, None, expected_ids, replied_ids, inc_ts, None);
+        let mut ts = std::mem::take(&mut self.partial_pos_rx_timestamps);
+        ts.resize(rx.len(), inc_ts);
+        self.decode_position_frames_from(
+            &mut rx,
+            Some(&mut ts),
+            expected_ids,
+            replied_ids,
+            inc_ts,
+            Some((inc_ts, ttl)),
+        );
         self.partial_pos_rx = rx;
+        self.partial_pos_rx_timestamps = ts;
     }
 }
 
@@ -2650,6 +2953,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::unsupported("Feetech: the zero is the profile's feetech.joints calibration (zero_step, \
             homing_offset_steps), written by the SO-ARM calibration, not a motor command in armd")
+    }
+
+    fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
+        self.evaluate_rest_pose_gate()
     }
 
     fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
@@ -2703,6 +3010,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
         self.tx_release_deadline = deadline;
+    }
+
+    fn clock_now(&self) -> Instant {
+        FeetechArmDriver::clock_now(self)
+    }
+
+    fn clock_pause(&self, d: Duration) {
+        self.clock_sleep(d);
     }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
@@ -2935,6 +3250,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         }
         let ids = self.servo_ids.clone();
         let _ = self.read_torque_enable_states(&ids);
+        self.last_enable_poll = Some(self.clock_now());
         Ok(self.enable_state())
     }
 
@@ -3054,9 +3370,13 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                     write_err = Some(e);
                     break;
                 }
-                // Invalidate this motor's torque evidence BEFORE the write reaches the transport.
-                // Any servo whose write is skipped by abort above keeps its prior evidence intact.
+                // Invalidate this motor's torque and rest-pose windows BEFORE the write reaches
+                // the transport. Any servo whose write is skipped by abort above keeps its prior
+                // evidence intact.
                 self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                self.torque_off_window[idx].reset();
+                self.torque_on_window[idx].reset();
+                self.rest_pose_window[idx].reset();
                 if let Err(e) = self.discard_pending_rx_for_request() {
                     write_err = Some(e);
                     break;
@@ -3082,35 +3402,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
             self.strict_stop_check(Some(start_stamp))?;
 
-            let mut all_enabled = write_err.is_none();
-            let mut read_errors = Vec::new();
-            let mut one_count = 0;
-
-            for (idx, &id) in ids.iter().enumerate() {
-                self.strict_stop_check(Some(start_stamp))?;
-                match self.read_torque_enable_causal(idx, id) {
-                    Ok((1, rx_at)) => {
-                        one_count += 1;
-                        self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
-                        self.last_enable_confirmed[idx] = Some(rx_at);
-                        self.missed_enable_polls[idx] = 0;
-                    }
-                    Ok((0, rx_at)) => {
-                        all_enabled = false;
-                        self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
-                        self.last_enable_confirmed[idx] = Some(rx_at);
-                        self.missed_enable_polls[idx] = 0;
-                        read_errors.push(format!("servo {} returned 0", id));
-                    }
-                    Ok((v, _)) => {
-                        all_enabled = false;
-                        self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
-                        read_errors.push(format!("servo {} returned unexpected value {}", id, v));
-                    }
-                    Err(e) => {
-                        all_enabled = false;
-                        self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
-                        read_errors.push(format!("servo {} read failed: {}", id, e));
+            let (_, one_count, mut read_errors) = self.read_torque_enable_window(&ids, Some(start_stamp))?;
+            let all_enabled = write_err.is_none() && one_count == ids.len();
+            if !all_enabled && read_errors.is_empty() {
+                for (idx, &id) in ids.iter().enumerate() {
+                    if self.motor_evidence.get(idx).copied() != Some(MotorTorqueEvidence::OnConfirmed) {
+                        read_errors.push(format!("servo {} did not confirm enabled (K=3)", id));
                     }
                 }
             }
@@ -3277,8 +3574,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             self.hold_sync_pkt_buf = sync_pkt;
             tx_res?;
             if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
+                let fallback_ts = self.clock_now();
+                self.rx_timestamps.resize(self.rx_buffer.len(), fallback_ts);
                 self.partial_pos_rx.append(&mut self.rx_buffer);
-                self.rx_timestamps.clear();
+                self.partial_pos_rx_timestamps.append(&mut self.rx_timestamps);
             }
             for i in 0..dof {
                 if (held_mask & (1u64 << i)) != 0 {
@@ -3316,8 +3615,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.transport.flush()?;
         self.drain_tx_echo(&sync_pkt)?;
         if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
+            let fallback_ts = self.clock_now();
+            self.rx_timestamps.resize(self.rx_buffer.len(), fallback_ts);
             self.partial_pos_rx.append(&mut self.rx_buffer);
-            self.rx_timestamps.clear();
+            self.partial_pos_rx_timestamps.append(&mut self.rx_timestamps);
         }
         Ok(())
     }
@@ -3331,6 +3632,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
         const MAX_SYNC_READ_SERVOS: usize = 3;
         const MAX_READ_DURATION: Duration = Duration::from_millis(8);
+        self.read_poll_count += 1;
+        self.evidence_pass_id = self.evidence_pass_id.wrapping_add(1);
         let start_time = self.clock_now();
         let mut temp_chunk = [0u8; 1];
 
@@ -3339,11 +3642,11 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             let inc_ts = self.incomplete_frame_started_at.take().unwrap_or_else(|| self.clock_now());
             if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
                 self.invalidate_partial_pos_rx();
-                self.line_poisoned = true;
+                self.poison_line();
             } else if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
                 let expected_ids: std::collections::HashSet<u8> = inc_chunk.iter().copied().collect();
                 let mut replied_ids = std::collections::HashSet::new();
-                self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
+                self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts, INCOMPLETE_FRAME_TTL);
 
                 let reassembly_start = self.clock_now();
                 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(2);
@@ -3356,11 +3659,13 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 {
                     match self.transport.read(&mut drain_buf) {
                         Ok(n) if n > 0 => {
-                            if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
+                            let byte_rx_at = self.clock_now();
+                            if byte_rx_at.saturating_duration_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
                                 break;
                             }
                             self.partial_pos_rx.extend_from_slice(&drain_buf[..n]);
-                            self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
+                            self.partial_pos_rx_timestamps.resize(self.partial_pos_rx.len(), byte_rx_at);
+                            self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts, INCOMPLETE_FRAME_TTL);
                         }
                         _ => {
                             if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
@@ -3376,16 +3681,24 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
                 if !all_replied && !inc_timed_out {
                     if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.partial_pos_rx, &inc_chunk, 10) {
-                        self.partial_pos_rx = tail.to_vec();
+                        let tail_offset = self.partial_pos_rx.len() - tail.len();
+                        let tail_bytes = tail.to_vec();
+                        let tail_ts = if self.partial_pos_rx_timestamps.len() == self.partial_pos_rx.len() {
+                            self.partial_pos_rx_timestamps[tail_offset..].to_vec()
+                        } else {
+                            vec![inc_ts; tail_bytes.len()]
+                        };
+                        self.partial_pos_rx = tail_bytes;
+                        self.partial_pos_rx_timestamps = tail_ts;
                         self.incomplete_chunk_idx = Some(inc_idx);
                         self.incomplete_frame_started_at = Some(inc_ts);
                     } else {
                         self.invalidate_partial_pos_rx();
-                        self.line_poisoned = true;
+                        self.poison_line();
                     }
                 } else {
                     if !all_replied && inc_timed_out {
-                        self.line_poisoned = true;
+                        self.poison_line();
                     }
                     self.invalidate_partial_pos_rx();
                 }
@@ -3394,17 +3707,20 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
         }
 
-        self.read_poll_count += 1;
         let did_enable_poll = self.incomplete_chunk_idx.is_none()
             && self.motor_evidence.contains(&MotorTorqueEvidence::OnConfirmed)
             && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| self.elapsed_since(t) >= Duration::from_millis(200)));
         if did_enable_poll {
             self.last_enable_poll = Some(self.clock_now());
-            if self.discard_pending_rx_for_request().is_err() {
-                for ev in &mut self.motor_evidence {
-                    *ev = MotorTorqueEvidence::Unknown;
+            if !self.poll_poisoned_line_idle() {
+                for idx in 0..self.motor_evidence.len() {
+                    self.torque_off_window[idx].record_disagree();
+                    self.torque_on_window[idx].record_disagree();
+                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                 }
             } else if let Ok(sync_read) = feetech::build_sync_read(&self.servo_ids, feetech::REG_TORQUE_ENABLE, 1) {
+                self.transport.clear_input_buffer();
+                self.clear_rx();
                 let _ = self.transport.write_all(&sync_read);
                 let _ = self.transport.flush();
                 let req_written_at = self.clock_now();
@@ -3467,29 +3783,29 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
 
                 if replies.len() < self.servo_ids.len() || had_duplicate {
-                    // E3: Timed-out or ambiguous enable poll poisons the line until drained idle.
-                    self.line_poisoned = true;
+                    // S2/E3: Timed-out or ambiguous enable poll poisons the line until 20 ms idle.
+                    self.poison_line();
                 }
                 self.clear_rx();
 
                 let now = self.clock_now();
-                for (idx, &id) in self.servo_ids.iter().enumerate() {
+                let pass_id = self.evidence_pass_id;
+                let servo_ids_len = self.servo_ids.len();
+                for idx in 0..servo_ids_len {
+                    let id = self.servo_ids[idx];
                     if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
+                        self.torque_off_window[idx].record_disagree();
+                        self.torque_on_window[idx].record_disagree();
                         self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                         continue;
                     }
-                    match replies.get(&id) {
-                        Some(Some((0, reply_rx_at))) => {
-                            self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
-                            self.last_enable_confirmed[idx] = Some(*reply_rx_at);
-                            self.missed_enable_polls[idx] = 0;
-                        }
-                        Some(Some((1, reply_rx_at))) => {
-                            self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
-                            self.last_enable_confirmed[idx] = Some(*reply_rx_at);
-                            self.missed_enable_polls[idx] = 0;
+                    match replies.get(&id).copied() {
+                        Some(Some((v @ (0 | 1), reply_rx_at))) => {
+                            self.record_torque_enable_sample(idx, v, reply_rx_at, pass_id);
                         }
                         Some(_) => {
+                            self.torque_off_window[idx].record_disagree();
+                            self.torque_on_window[idx].record_disagree();
                             self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                         }
                         None => {
@@ -3497,6 +3813,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                             if self.missed_enable_polls[idx] >= 3
                                 || self.last_enable_confirmed[idx].is_none_or(|t| now.saturating_duration_since(t) > Duration::from_millis(600))
                             {
+                                self.torque_off_window[idx].record_disagree();
+                                self.torque_on_window[idx].record_disagree();
                                 self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                             }
                         }
@@ -3522,10 +3840,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 break 'chunk_loop;
             }
 
-            if self.discard_pending_rx_for_request().is_err() {
+            if !self.poll_poisoned_line_idle() {
                 self.poll_cursor = chunk_idx;
                 break 'chunk_loop;
             }
+            self.transport.clear_input_buffer();
+            self.clear_rx();
             if self.elapsed_since(start_time) >= MAX_READ_DURATION {
                 self.poll_cursor = chunk_idx;
                 break 'chunk_loop;
@@ -3584,7 +3904,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                     if tail_started_at >= req_written_at
                         && tail_started_at.saturating_duration_since(req_written_at) < CHUNK_TIMEOUT
                     {
-                        self.partial_pos_rx = tail.to_vec();
+                        let tail_bytes = tail.to_vec();
+                        let tail_ts = if self.rx_timestamps.len() == self.rx_buffer.len() {
+                            self.rx_timestamps[tail_offset..].to_vec()
+                        } else {
+                            vec![tail_started_at; tail_bytes.len()]
+                        };
+                        self.partial_pos_rx = tail_bytes;
+                        self.partial_pos_rx_timestamps = tail_ts;
                         self.incomplete_chunk_idx = Some(chunk_idx);
                         self.incomplete_frame_started_at = Some(tail_started_at);
                         self.clear_rx();
@@ -3592,13 +3919,13 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                         break 'chunk_loop;
                     }
                 }
-                // E3: Timed-out position chunk poisons the line so the next request discards
-                // until idle rather than misattributing a delayed reply as fresh.
-                self.line_poisoned = true;
+                // S2/E3: Timed-out position chunk poisons the line until 20 ms continuous idle.
+                self.poison_line();
             }
             self.incomplete_chunk_idx = None;
             self.incomplete_frame_started_at = None;
             self.partial_pos_rx.clear();
+            self.partial_pos_rx_timestamps.clear();
             self.clear_rx();
             self.poll_cursor = (chunk_idx + 1) % num_chunks;
         }
@@ -3626,6 +3953,9 @@ pub struct FashionStarArmDriver<T: Transport> {
     feedback_continuity_epoch: Vec<u64>,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
+    rx_timestamps: Vec<Instant>,
+    rx_pass_id: u64,
+    rest_pose_window: Vec<CausalWindow>,
     clock: Option<Arc<dyn crate::transport::DriverClock>>,
     abort_flag: Option<Arc<AtomicBool>>,
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
@@ -3647,6 +3977,9 @@ impl<T: Transport> FashionStarArmDriver<T> {
             feedback_continuity_epoch: vec![0; dof],
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
+            rx_timestamps: Vec::with_capacity(256),
+            rx_pass_id: 0,
+            rest_pose_window: vec![CausalWindow::default(); dof],
             clock,
             abort_flag: None,
             estop_gate: None,
@@ -3698,6 +4031,52 @@ impl<T: Transport> FashionStarArmDriver<T> {
         self.now().saturating_duration_since(earlier)
     }
 
+    fn evaluate_rest_pose_gate(&self) -> RestPoseGateStatus {
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return RestPoseGateStatus::RefusedNonRest;
+        };
+        if !gate.has_resting_pose {
+            return RestPoseGateStatus::RefusedNonRest;
+        }
+        let arm_joints = gate.arm_joint_indices();
+        if arm_joints.is_empty() {
+            return RestPoseGateStatus::RefusedNonRest;
+        }
+        let now = self.now();
+        let caps = self.capabilities();
+        let mut pending = false;
+        for &i in arm_joints {
+            let Some(s) = self.cached_states.get(i) else {
+                return RestPoseGateStatus::RefusedNonRest;
+            };
+            let fresh = self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| now.saturating_duration_since(t) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if fresh {
+                if !joint_state_valid(s, caps) || !gate.joint_at_rest(i, s.position) {
+                    return RestPoseGateStatus::RefusedNonRest;
+                }
+            } else {
+                pending = true;
+            }
+            if !self
+                .rest_pose_window
+                .get(i)
+                .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+            {
+                pending = true;
+            }
+        }
+        if pending {
+            RestPoseGateStatus::PendingEvidence
+        } else {
+            RestPoseGateStatus::Confirmed
+        }
+    }
+
     fn check_disable_requested(
         &self,
         started_at: Instant,
@@ -3715,24 +4094,15 @@ impl<T: Transport> FashionStarArmDriver<T> {
         if self.since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(ArmDriverError::DisableRequestExpired);
         }
-        let Some(ref gate) = self.stopped_disable_gate else {
-            return Err(ArmDriverError::TorqueOffWouldDrop);
-        };
-        let arm_joints = gate.arm_joint_indices();
-        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        if !self.fresh_joint_positions_into(
-            arm_joints,
-            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-            &mut arm_positions[..arm_joints.len()],
-        ) || !gate.check_positions(&arm_positions[..arm_joints.len()])
-        {
+        if self.evaluate_rest_pose_gate() != RestPoseGateStatus::Confirmed {
             return Err(ArmDriverError::TorqueOffWouldDrop);
         }
         Ok(())
     }
 
     /// Per-write transmit choke point for FashionStar torque-off writes: re-evaluates stop state,
-    /// freshness, rest pose, and 1 s request lifetime immediately before each `transport.write_all`.
+    /// freshness, rest pose (K=3 window), and 1 s request lifetime immediately before each
+    /// `transport.write_all`.
     fn write_torque_off(&mut self, id: u8, kind: DisableKind) -> Result<(), ArmDriverError> {
         let pkt = fashionstar::build_set_torque(id, false);
         if let DisableKind::DisableRequested { started_at, rollback } = kind {
@@ -3763,6 +4133,10 @@ impl<T: Transport> FashionStarArmDriver<T> {
 impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::unsupported("FashionStar: armd implements no zero command for these servos")
+    }
+
+    fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
+        self.evaluate_rest_pose_gate()
     }
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
@@ -3891,10 +4265,11 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             })
         } else {
             let start_stamp = self.current_stop_stamp();
-            for &id in &self.servo_ids {
+            for (idx, &id) in self.servo_ids.iter().enumerate() {
                 self.strict_stop_check(Some(start_stamp))?;
                 let pkt = fashionstar::build_set_torque(id, true);
                 self.strict_stop_check(Some(start_stamp))?;
+                self.rest_pose_window[idx].reset();
                 self.transport.write_all(&pkt)?;
             }
             self.strict_stop_check(Some(start_stamp))?;
@@ -4039,6 +4414,8 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
         let mut temp_chunk = [0u8; 1];
         let start_time = self.now();
+        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
+        let pass_id = self.rx_pass_id;
         const MAX_READ_DURATION: Duration = Duration::from_millis(3);
         const MAX_TOTAL_BYTES: usize = 256;
         let mut total_bytes_read = 0;
@@ -4056,6 +4433,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             let query = fashionstar::build_query_angle(id);
             self.transport.write_all(&query)?;
             self.transport.flush()?;
+            let req_written_at = self.now();
 
             let mut attempts = 0;
             while attempts < 10 {
@@ -4066,7 +4444,14 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
                 match fashionstar::parse_packet(&self.rx_buffer) {
                     Ok((FashionStarPacket { header, id: pkt_id, cmd_id, content }, consumed)) => {
+                        let pkt_rx_at = self
+                            .rx_timestamps
+                            .get(consumed.saturating_sub(1))
+                            .copied()
+                            .unwrap_or(req_written_at);
                         self.rx_buffer.drain(..consumed);
+                        let ts_drain = consumed.min(self.rx_timestamps.len());
+                        self.rx_timestamps.drain(..ts_drain);
                         // Filter out local echo of request frame ([0x12, 0x4C]) on half-duplex RS485 bus
                         if header == fashionstar::FASHIONSTAR_REQUEST_HEADER {
                             continue;
@@ -4077,18 +4462,32 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                             && content.len() >= 2
                         {
                             let tenth_deg = i16::from_le_bytes([content[0], content[1]]);
-                            let now = self.now();
                             let pos = fashionstar::tenth_deg_to_rad(tenth_deg);
                             self.cached_states[joint_idx].position = pos;
                             if self.last_feedback_instant[joint_idx].is_none_or(|prev| {
-                                now.saturating_duration_since(prev) > STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                                pkt_rx_at.saturating_duration_since(prev) > STOPPED_DISABLE_FEEDBACK_MAX_AGE
                             }) || !pos.is_finite()
                             {
                                 self.feedback_continuity_epoch[joint_idx] =
                                     self.feedback_continuity_epoch[joint_idx].wrapping_add(1);
                             }
-                            self.last_feedback_instant[joint_idx] = Some(now);
+                            self.last_feedback_instant[joint_idx] = Some(pkt_rx_at);
                             self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
+                            if let Some(ref gate) = self.stopped_disable_gate {
+                                if gate.is_arm_joint(joint_idx) {
+                                    if joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
+                                        && gate.joint_at_rest(joint_idx, pos)
+                                    {
+                                        self.rest_pose_window[joint_idx].record_agree(
+                                            pkt_rx_at,
+                                            pass_id,
+                                            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                        );
+                                    } else {
+                                        self.rest_pose_window[joint_idx].record_disagree();
+                                    }
+                                }
+                            }
                             break;
                         }
                     }
@@ -4099,6 +4498,9 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                         // Checksum mismatch or corruption: slide window by 1 byte to recover
                         if !self.rx_buffer.is_empty() {
                             self.rx_buffer.remove(0);
+                            if !self.rx_timestamps.is_empty() {
+                                self.rx_timestamps.remove(0);
+                            }
                         }
                     }
                 }
@@ -4107,12 +4509,16 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                 if self.rx_buffer.len() > 1024 {
                     let trim = self.rx_buffer.len() - 256;
                     self.rx_buffer.drain(..trim);
+                    let ts_trim = trim.min(self.rx_timestamps.len());
+                    self.rx_timestamps.drain(..ts_trim);
                 }
 
                 match self.transport.read(&mut temp_chunk) {
                     Ok(n) if n > 0 => {
+                        let rx_at = self.now();
                         total_bytes_read += n;
                         self.rx_buffer.extend_from_slice(&temp_chunk[..n]);
+                        self.rx_timestamps.resize(self.rx_buffer.len(), rx_at);
                     }
                     _ => {
                         attempts += 1;
@@ -4322,6 +4728,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for that motor's torque
     /// state, mode, or rest pose.
     motor_torque_settle_until: Vec<Option<MotorTorqueSettle>>,
+    /// Monotonic RX drain/poll pass id distinguishing separate ticks for S2 K-windows.
+    rx_pass_id: u64,
+    /// Per-motor K=3 causal confirmation windows for `OffConfirmed`, `OnConfirmed`, and rest pose (S2).
+    motor_off_window: Vec<CausalWindow>,
+    motor_on_window: Vec<CausalWindow>,
+    rest_pose_window: Vec<CausalWindow>,
     /// True once motor `i` has received causal feedback strictly after its latest `CMD_ENABLE`
     /// transmit (any state, including fault states, so `poll_enable` detects faults causally).
     motor_post_enable_feedback: Vec<bool>,
@@ -4406,14 +4818,23 @@ pub struct DamiaoArmDriver<C: CanTransport> {
 struct MotorTorqueSettle {
     /// Host monotonic instant captured AFTER `can.transmit()` returned `Ok(())`.
     write_done: Instant,
-    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`: host monotonic wake/probe anchor.
+    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`: host monotonic settle anchor.
     settle_until: Instant,
+    /// Earliest host monotonic instant for the next read-only `0x7FF 0xCC` status probe (initially
+    /// `settle_until + 1 µs`, then advanced by `EVIDENCE_PROBE_INTERVAL` after each probe so K=3
+    /// samples span `>= 20 ms` across >= 2 ticks).
+    next_probe_at: Instant,
     /// Kernel or transport receive-clock timestamp captured immediately when `can.transmit()`
     /// returned `Ok(())`. Causal evidence requires `rx_time > write_done_rx_clock + SETTLE` on
     /// this exact clock domain (`None` fails closed).
     write_done_rx_clock: Option<CanRxTime>,
-    /// True until one read-only `0x7FF 0xCC` status refresh probe is sent once `now > settle_until`.
+    /// True until the first post-settle `0x7FF 0xCC` status probe has been transmitted.
     probe_needed: bool,
+    /// Scheduling-only hint: true if a frame timestamped `>= write_done_rx_clock` during the
+    /// settle window already echoed the target state (never counts as causal evidence; only tells
+    /// `Service::Retry` to send the first post-settle `0xCC` probe before resending the torque
+    /// command and resetting settle on fixed-cadence buses).
+    saw_target_during_settle: bool,
 }
 
 /// S1: True iff `rx_time` is a present kernel/transport receive timestamp strictly after
@@ -4964,6 +5385,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             motor_disable_tx: vec![None; dof],
             motor_enable_tx: vec![None; dof],
             motor_torque_settle_until: vec![None; dof],
+            rx_pass_id: 0,
+            motor_off_window: vec![CausalWindow::default(); dof],
+            motor_on_window: vec![CausalWindow::default(); dof],
+            rest_pose_window: vec![CausalWindow::default(); dof],
             motor_post_enable_feedback: vec![false; dof],
             motor_disable_confirmed: vec![false; dof],
             rx_empty_seq: 0,
@@ -5297,54 +5722,62 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             || self.is_stop_pending()
     }
 
-    /// Zero-allocation fresh pose reader for send-time Rule A′ evaluation: requires both
-    /// `pose_feedback_instant` (preserved across `send_enable`, cleared on RX boundary reset)
-    /// and `feedback_queue_bound` to be within `max_age`, plus valid finite joint states.
-    fn fresh_pose_positions_into(
-        &self,
-        joints: &[usize],
-        max_age: Duration,
-        out: &mut [f32],
-    ) -> bool {
-        if joints.is_empty() || out.len() < joints.len() {
-            return false;
+    /// Zero-allocation evaluation of the Damiao K=3 rest-pose evidence gate (S2/L1).
+    fn evaluate_rest_pose_gate(&self) -> RestPoseGateStatus {
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return RestPoseGateStatus::RefusedNonRest;
+        };
+        if !gate.has_resting_pose {
+            return RestPoseGateStatus::RefusedNonRest;
         }
-        // E2: The rest-pose disable gate requires a completed RX drain. A cached resting pose
-        // never authorizes a disable while newer frames may still be queued.
-        if self.awaiting_rx_boundary || !self.last_read_drained {
-            return false;
+        let arm_joints = gate.arm_joint_indices();
+        if arm_joints.is_empty() {
+            return RestPoseGateStatus::RefusedNonRest;
         }
+        let now = self.now();
         let caps = self.capabilities();
-        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
-            let fresh = self
+        let mut pending = self.awaiting_rx_boundary || !self.last_read_drained;
+        for &i in arm_joints {
+            let Some(s) = self.cached_states.get(i) else {
+                return RestPoseGateStatus::RefusedNonRest;
+            };
+            let fresh_pose = self
                 .pose_feedback_instant
                 .get(i)
                 .copied()
                 .flatten()
-                .is_some_and(|t| self.since(t) <= max_age)
+                .is_some_and(|t| now.saturating_duration_since(t) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE)
                 && self
                     .feedback_queue_bound
                     .get(i)
                     .copied()
                     .flatten()
-                    .is_some_and(|b| self.since(b) <= max_age);
-            if !fresh {
-                return false;
+                    .is_some_and(|b| now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if fresh_pose {
+                if !joint_state_valid(s, caps) || !gate.joint_at_rest(i, s.position) {
+                    return RestPoseGateStatus::RefusedNonRest;
+                }
+            } else {
+                pending = true;
             }
-            let Some(s) = self.cached_states.get(i) else {
-                return false;
-            };
-            if !joint_state_valid(s, caps) {
-                return false;
+            if !self
+                .rest_pose_window
+                .get(i)
+                .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+            {
+                pending = true;
             }
-            *slot = s.position;
         }
-        true
+        if pending {
+            RestPoseGateStatus::PendingEvidence
+        } else {
+            RestPoseGateStatus::Confirmed
+        }
     }
 
-    /// Evaluates Rule A′ and the single 1 s request lifetime at send time for `DisableRequested`
-    /// while the safety state is stopped (Fault or E-stop) OR unconditionally in every safety state
-    /// when `rollback` is true. Zero heap allocations.
+    /// Evaluates Rule A′ (K=3 rest-pose window) and the single 1 s request lifetime at send time
+    /// for `DisableRequested` while the safety state is stopped (Fault or E-stop) OR
+    /// unconditionally in every safety state when `rollback` is true. Zero heap allocations.
     fn check_stopped_disable_requested(
         &self,
         started_at: Instant,
@@ -5356,19 +5789,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.now().saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(TxRefusal::DisableRequestExpired);
         }
-        let Some(ref gate) = self.stopped_disable_gate else {
-            return Err(TxRefusal::TorqueOffWouldDrop);
-        };
-        let arm_joints = gate.arm_joint_indices();
-        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        if !self.fresh_pose_positions_into(
-            arm_joints,
-            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-            &mut arm_positions[..arm_joints.len()],
-        ) {
-            return Err(TxRefusal::TorqueOffWouldDrop);
-        }
-        if !gate.check_positions(&arm_positions[..arm_joints.len()]) {
+        if self.evaluate_rest_pose_gate() != RestPoseGateStatus::Confirmed {
             return Err(TxRefusal::TorqueOffWouldDrop);
         }
         Ok(())
@@ -5490,6 +5911,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if frame.data == damiao::CMD_ENABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
                     self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                    self.motor_off_window[idx].reset();
+                    self.motor_on_window[idx].reset();
+                    self.rest_pose_window[idx].reset();
                     self.motor_enable_attempted[idx] = true;
                     self.motor_disable_tx[idx] = None;
                     self.motor_enable_tx[idx] = None;
@@ -5501,6 +5925,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             } else if frame.data == damiao::CMD_DISABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
                     self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                    self.motor_off_window[idx].reset();
+                    self.motor_on_window[idx].reset();
                     self.motor_enable_tx[idx] = None;
                     self.motor_disable_tx[idx] = None;
                     self.motor_post_enable_feedback[idx] = false;
@@ -5539,8 +5965,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     let boundary = MotorTorqueSettle {
                         write_done,
                         settle_until,
+                        next_probe_at: settle_until + Duration::from_micros(1),
                         write_done_rx_clock,
                         probe_needed: true,
+                        saw_target_during_settle: false,
                     };
                     self.motor_torque_settle_until[idx] = Some(boundary);
                     if is_enable {
@@ -6586,6 +7014,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Pure RX-only drain (no autonomous recovery/refresh TX, no `begin_tx_tick`, zero heap
     /// allocation). Returns `true` when the transport explicitly reported an empty RX queue.
     fn drain_rx_frames_only(&mut self, deadline: Option<Deadline>, max_frames: usize) -> bool {
+        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let mut frames = 0usize;
         while frames < max_frames {
             if deadline.is_some_and(|d| d.passed(self.now())) {
@@ -7713,6 +8142,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// `deadline`, stopping on `Timeout` / `WouldBlock` and marking the empty-queue boundary.
     /// Every frame consumed counts against the release's RX budget and `last_poll_rx`.
     fn drain_rx_for_boundary(&mut self, deadline: Deadline) -> bool {
+        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let max_frames = self.remaining_rx_frame_limit();
         self.last_read_drained = false;
         let t0 = self.now();
@@ -8364,7 +8794,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let wake = if unsent_mask != 0 {
             poll_start
         } else {
-            Self::earliest_settle_wake(&self.motor_enable_tx, 0, poll_start, window.wake())
+            Self::earliest_settle_wake(&self.motor_enable_tx, &self.motor_on_window, 0, poll_start, window.wake())
         };
         self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
         Ok(TorqueProgress::Pending { wake })
@@ -8436,6 +8866,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     fn earliest_settle_wake(
         boundaries: &[Option<MotorTorqueSettle>],
+        windows: &[CausalWindow],
         confirmed_mask: u32,
         now: Instant,
         base_wake: Instant,
@@ -8446,11 +8877,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 continue;
             }
             if let Some(b) = *slot {
-                // Wake strictly past `settle_until` (`write_done + 20 ms`) because S1 causality
-                // requires strict `rx_time > write_done + SETTLE`.
-                let after_settle = b.settle_until + Duration::from_micros(1);
-                if now < after_settle {
-                    wake = wake.min(after_settle);
+                let has_progress = windows.get(i).is_some_and(|w| w.count > 0);
+                // Only schedule a probe wake for the first post-settle probe (`probe_needed`) or
+                // while a responding motor is actively accumulating its K=3 window (`has_progress`);
+                // silent motors wait for the next retry/deadline instead of waking every 10 ms.
+                if (b.probe_needed || has_progress) && now < b.next_probe_at {
+                    wake = wake.min(b.next_probe_at);
                 }
             }
         }
@@ -8549,12 +8981,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             {
                 continue;
             }
+            let has_progress = self.motor_on_window.get(i).is_some_and(|w| w.count > 0);
             let needs_probe = self
                 .motor_enable_tx
                 .get(i)
                 .copied()
                 .flatten()
-                .is_some_and(|b| b.probe_needed && now > b.settle_until);
+                .is_some_and(|b| (b.probe_needed || has_progress) && now > b.settle_until && now >= b.next_probe_at);
             if !needs_probe {
                 continue;
             }
@@ -8563,8 +8996,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Some(damiao::build_refresh_frame(id))
             }) {
                 Ok(_) => {
+                    let probe_sent = self.now();
                     if let Some(Some(b)) = self.motor_enable_tx.get_mut(i) {
                         b.probe_needed = false;
+                        b.next_probe_at = probe_sent + EVIDENCE_PROBE_INTERVAL;
                     }
                     probed_any = true;
                 }
@@ -8617,14 +9052,37 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             Service::Retry { mask, wake } => {
                 // Motors deferred by TX budget (`unsent_mask`) may not yet be 25 ms past their
-                // own `write_done`: probe them if settled rather than prematurely resetting their
-                // settle window with another `CMD_ENABLE`.
+                // own `write_done`, motors that ALREADY produced >= 1 post-settle agreeing sample
+                // (`motor_on_window[i].count > 0`) are accumulating their K=3 window, and motors
+                // that already echoed `state == 1` during settle but have not yet had their first
+                // post-settle probe (`b.probe_needed`) need a read-only `0xCC` probe before any
+                // redundant `CMD_ENABLE` resets their settle window.
                 let mut retry_now_mask = 0u32;
                 let mut probe_instead_mask = 0u32;
                 for i in handshake::mask_joints(mask) {
+                    if !self.pf_enable_feedback_fresh(i) {
+                        retry_now_mask |= 1 << i;
+                        continue;
+                    }
+                    if self.motor_on_window.get(i).is_some_and(|w| w.count > 0) {
+                        if let Some(b) = self.motor_enable_tx.get(i).copied().flatten() {
+                            if now > b.settle_until && now >= b.next_probe_at {
+                                probe_instead_mask |= 1 << i;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(b) = self.motor_enable_tx.get(i).copied().flatten() {
+                        if b.probe_needed
+                            && b.saw_target_during_settle
+                            && now > b.settle_until
+                            && now >= b.next_probe_at
+                        {
+                            probe_instead_mask |= 1 << i;
+                            continue;
+                        }
                         if now.saturating_duration_since(b.write_done) < DAMIAO_ENABLE_RETRY_AT[0] {
-                            if now > b.settle_until && b.probe_needed {
+                            if now > b.settle_until && now >= b.next_probe_at {
                                 probe_instead_mask |= 1 << i;
                             }
                             continue;
@@ -8658,7 +9116,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 {
                     after
                 } else {
-                    Self::earliest_settle_wake(&self.motor_enable_tx, cm_after, after, wake)
+                    Self::earliest_settle_wake(&self.motor_enable_tx, &self.motor_on_window, cm_after, after, wake)
                 };
                 self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
                 Ok(TorqueProgress::Pending { wake })
@@ -8686,7 +9144,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 {
                     after
                 } else {
-                    Self::earliest_settle_wake(&self.motor_enable_tx, cm_after, after, wake)
+                    Self::earliest_settle_wake(&self.motor_enable_tx, &self.motor_on_window, cm_after, after, wake)
                 };
                 self.torque_hs = Some(DamiaoTorque::Enable { window, unsent_mask });
                 Ok(TorqueProgress::Pending { wake })
@@ -8798,7 +9256,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let poll_start = self.now();
         let window = ConfirmWindow::new(TorqueDirection::Disable, self.motor_ids.len(), cmd_start, poll_start,
             DAMIAO_DISABLE_CONFIRM, &DAMIAO_ENABLE_RETRY_AT);
-        let wake = Self::earliest_settle_wake(&self.motor_disable_tx, 0, poll_start, window.wake());
+        let wake = Self::earliest_settle_wake(&self.motor_disable_tx, &self.motor_off_window, 0, poll_start, window.wake());
         self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
         Ok(TorqueProgress::Pending { wake })
     }
@@ -8846,9 +9304,57 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             // carrying the original `DisableKind` into `send`. A send-time choke-point refusal
             // (`TorqueOffWouldDrop` / `DisableRequestExpired`) aborts the handshake immediately.
             Service::Retry { mask: retry_mask, wake } => {
-                let mut sent_any = false;
-                let mut refused = None;
+                // Motors that ALREADY produced >= 1 post-settle agreeing state-0 sample are
+                // accumulating their K=3 window, and motors that already echoed `state == 0`
+                // during settle without yet receiving their first post-settle probe (`probe_needed`)
+                // get a read-only `0x7FF 0xCC` probe rather than resending `CMD_DISABLE` and
+                // resetting their settle boundary / window.
+                let deadline = Deadline { at: window.deadline };
+                let mut retry_now_mask = 0u32;
+                let mut probe_instead_mask = 0u32;
                 for i in handshake::mask_joints(retry_mask) {
+                    if self.motor_off_window.get(i).is_some_and(|w| w.count > 0) {
+                        if let Some(b) = self.motor_disable_tx.get(i).copied().flatten() {
+                            if now > b.settle_until && now >= b.next_probe_at {
+                                probe_instead_mask |= 1 << i;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(b) = self.motor_disable_tx.get(i).copied().flatten() {
+                        if b.probe_needed
+                            && b.saw_target_during_settle
+                            && now > b.settle_until
+                            && now >= b.next_probe_at
+                        {
+                            probe_instead_mask |= 1 << i;
+                            continue;
+                        }
+                    }
+                    retry_now_mask |= 1 << i;
+                }
+                let mut probed_any = false;
+                if probe_instead_mask != 0 && self.last_read_drained {
+                    for i in handshake::mask_joints(probe_instead_mask) {
+                        let Some(&id) = self.motor_ids.get(i) else { continue };
+                        match self.send(TxKind::DisableProbe, None, Some(deadline), false, |_| {
+                            Some(damiao::build_refresh_frame(id))
+                        }) {
+                            Ok(_) => {
+                                let probe_sent = self.now();
+                                if let Some(Some(b)) = self.motor_disable_tx.get_mut(i) {
+                                    b.probe_needed = false;
+                                    b.next_probe_at = probe_sent + EVIDENCE_PROBE_INTERVAL;
+                                }
+                                probed_any = true;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let mut sent_any = probed_any;
+                let mut refused = None;
+                for i in handshake::mask_joints(retry_now_mask) {
                     let Some(&id) = self.motor_ids.get(i) else { continue };
                     tracing::debug!("Retrying disable for motor {} (CAN ID 0x{:X})", i, id);
                     let tx_kind = Self::disable_tx_kind(kind);
@@ -8873,16 +9379,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         tracing::warn!("Retry flush failed: {:?}", e);
                     }
                 }
+                if probed_any {
+                    let _ = self.receive_feedback();
+                    let (_, all_off_after) = self.disable_confirm_snapshot();
+                    if all_off_after {
+                        tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(window.started));
+                        self.disable_confirmed_sticky = true;
+                        if mit_fenced { self.mit_fence = None; }
+                        return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+                    }
+                }
                 if let Some(r) = refused {
                     return Err(Self::refusal_to_driver_err(r));
                 }
-                let wake = Self::earliest_settle_wake(&self.motor_disable_tx, mask, self.now(), wake);
+                let (mask_after, _) = self.disable_confirm_snapshot();
+                let wake = Self::earliest_settle_wake(&self.motor_disable_tx, &self.motor_off_window, mask_after, self.now(), wake);
                 self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
                 Ok(TorqueProgress::Pending { wake })
             }
-            // Inside Wait (between settle_until and the next retry), send ONE read-only `0x7FF 0xCC`
-            // status refresh probe per settled unconfirmed motor and immediately drain its reply so
-            // fast buses confirm at `write_done + 20 ms`.
+            // Inside Wait (between settle_until and the next retry), send spaced read-only
+            // `0x7FF 0xCC` status refresh probes per settled unconfirmed motor to accumulate
+            // the K=3 causal window across >= 2 control ticks.
             Service::Wait { .. } | Service::Fault { .. } => {
                 if self.last_read_drained {
                     let deadline = Deadline { at: window.deadline };
@@ -8891,12 +9408,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
                             continue;
                         }
+                        let has_progress = self.motor_off_window.get(i).is_some_and(|w| w.count > 0);
                         let needs_probe = self
                             .motor_disable_tx
                             .get(i)
                             .copied()
                             .flatten()
-                            .is_some_and(|b| b.probe_needed && now > b.settle_until);
+                            .is_some_and(|b| (b.probe_needed || has_progress) && now > b.settle_until && now >= b.next_probe_at);
                         if !needs_probe {
                             continue;
                         }
@@ -8905,8 +9423,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             Some(damiao::build_refresh_frame(id))
                         }) {
                             Ok(_) => {
+                                let probe_sent = self.now();
                                 if let Some(Some(b)) = self.motor_disable_tx.get_mut(i) {
                                     b.probe_needed = false;
+                                    b.next_probe_at = probe_sent + EVIDENCE_PROBE_INTERVAL;
                                 }
                                 probed_any = true;
                             }
@@ -8926,7 +9446,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                 }
                 let (mask_after, _) = self.disable_confirm_snapshot();
-                let wake = Self::earliest_settle_wake(&self.motor_disable_tx, mask_after, self.now(), window.wake());
+                let wake = Self::earliest_settle_wake(&self.motor_disable_tx, &self.motor_off_window, mask_after, self.now(), window.wake());
                 self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
                 Ok(TorqueProgress::Pending { wake })
             }
@@ -8957,6 +9477,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn drain_rx_before_command_limit(&mut self, max_frames: usize) -> bool {
+        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let limit = self.rx_frame_limit.map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
         self.last_read_drained = false;
         let start = self.now();
@@ -9067,6 +9588,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let pos = self.fresh_measured_position(joint, max_age)?;
         let epoch = self.feedback_continuity_epoch.get(joint).copied().unwrap_or(0);
         Some((pos, epoch))
+    }
+
+    fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
+        self.evaluate_rest_pose_gate()
     }
 
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
@@ -9749,11 +10274,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         for i in unconfirmed_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
             let boundary = self.motor_disable_tx.get(i).copied().flatten();
+            let has_window_progress = self.motor_off_window.get(i).is_some_and(|w| w.count > 0);
             let send_disable = first
                 || boundary.is_none()
-                || boundary.is_some_and(|b| now >= b.settle_until + Duration::from_millis(25));
+                || (!has_window_progress
+                    && boundary.is_some_and(|b| now >= b.settle_until + Duration::from_millis(25)));
             let send_probe = !send_disable
-                && boundary.is_some_and(|b| b.probe_needed && now >= b.settle_until);
+                && boundary.is_some_and(|b| {
+                    (b.probe_needed || has_window_progress) && now > b.settle_until && now >= b.next_probe_at
+                });
             if !send_disable && !send_probe {
                 continue;
             }
@@ -9766,8 +10295,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 Ok(_) => {
                     sent_any = true;
                     if send_probe {
+                        let probe_sent = self.now();
                         if let Some(Some(b)) = self.motor_disable_tx.get_mut(i) {
                             b.probe_needed = false;
+                            b.next_probe_at = probe_sent + EVIDENCE_PROBE_INTERVAL;
                         }
                     }
                 }
@@ -11451,11 +11982,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 // `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` (20 ms) are never evidence for that
                 // motor's torque state, mode, or rest pose. Still update temperature so protective
                 // thermal cutoffs observe overheating without waiting for the settle window.
-                if self.motor_torque_settle_until[idx]
-                    .is_some_and(|boundary| !Self::boundary_satisfied(boundary, Some(rx_t), decode_now))
-                {
-                    self.cached_states[idx].temperature = feedback.t_mos.max(feedback.t_rotor);
-                    return;
+                if let Some(boundary) = self.motor_torque_settle_until[idx] {
+                    if !Self::boundary_satisfied(boundary, Some(rx_t), decode_now) {
+                        self.cached_states[idx].temperature = feedback.t_mos.max(feedback.t_rotor);
+                        let at_or_after_tx = boundary
+                            .write_done_rx_clock
+                            .is_some_and(|w| rx_t.checked_duration_since(w).is_some());
+                        if at_or_after_tx {
+                            if feedback.state_or_error == 1 {
+                                if let Some(en) = self.motor_enable_tx[idx].as_mut() {
+                                    en.saw_target_during_settle = true;
+                                }
+                            } else if feedback.state_or_error == 0 {
+                                if let Some(dis) = self.motor_disable_tx[idx].as_mut() {
+                                    dis.saw_target_during_settle = true;
+                                }
+                            }
+                        }
+                        return;
+                    }
                 }
                 let rx_at = can_rx_time_to_monotonic(&self.can, rx_t, decode_now);
                 let queue_bound = self.rx_empty_instant;
@@ -11504,29 +12049,39 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         dis_boundary.probe_needed = false;
                     }
                 }
-                // Single owner of per-motor causal torque evidence strictly per §1 + S1:
-                // - OffConfirmed ONLY on a verified disable transaction whose kernel/transport
-                //   receive time strictly exceeds `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`.
-                // - OnConfirmed ONLY on a verified enable transaction whose kernel/transport
-                //   receive time strictly exceeds `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`.
+                // Single owner of per-motor causal torque evidence strictly per §1 + S1 + S2:
+                // - OffConfirmed ONLY after K=3 consecutive causal post-settle state-0 samples
+                //   spanning >= 2 control ticks (>= 20 ms). Any disagreeing sample resets count.
+                // - OnConfirmed ONLY after K=3 consecutive causal post-settle state-1 samples
+                //   spanning >= 2 control ticks (>= 20 ms). Any disagreeing sample resets count.
+                let pass_id = self.rx_pass_id;
                 match feedback.state_or_error {
                     0 => {
+                        self.motor_on_window[idx].record_disagree();
                         if let Some(boundary) = self.motor_disable_tx[idx] {
                             if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, Some(rx_t), decode_now) {
-                                self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
-                                self.motor_disable_confirmed[idx] = true;
-                                self.motor_enable_attempted[idx] = false;
+                                self.motor_off_window[idx].record_agree(rx_at, pass_id, DAMIAO_FEEDBACK_VALID_WINDOW);
+                                if self.motor_off_window[idx].is_confirmed(rx_at, DAMIAO_FEEDBACK_VALID_WINDOW) {
+                                    self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
+                                    self.motor_disable_confirmed[idx] = true;
+                                    self.motor_enable_attempted[idx] = false;
+                                }
                             }
                         } else {
                             // Startup unsolicited 0x0 or post-enable 0x0: NEVER confirms
                             // OffConfirmed; invalidates OnConfirmed to Unknown.
+                            self.motor_off_window[idx].record_disagree();
                             self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                         }
                     }
                     1 => {
+                        self.motor_off_window[idx].record_disagree();
                         if let Some(boundary) = self.motor_enable_tx[idx] {
                             if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, Some(rx_t), decode_now) {
-                                self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
+                                self.motor_on_window[idx].record_agree(rx_at, pass_id, DAMIAO_FEEDBACK_VALID_WINDOW);
+                                if self.motor_on_window[idx].is_confirmed(rx_at, DAMIAO_FEEDBACK_VALID_WINDOW) {
+                                    self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
+                                }
                             }
                         } else if self.motor_evidence[idx] == MotorTorqueEvidence::OffConfirmed {
                             // Motor unexpectedly reports state 1 without a verified enable
@@ -11536,7 +12091,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                     _ => {
                         // Motor reports a fault/error state: torque state is Unknown.
+                        self.motor_off_window[idx].record_disagree();
+                        self.motor_on_window[idx].record_disagree();
                         self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                    }
+                }
+                // S2: Per-motor K=3 causal rest-pose window for arm joints under StoppedDisableGate.
+                if let Some(ref gate) = self.stopped_disable_gate {
+                    if gate.is_arm_joint(idx) {
+                        if !self.awaiting_rx_boundary
+                            && queue_bound.is_some()
+                            && joint_state_valid(&self.cached_states[idx], self.capabilities())
+                            && gate.joint_at_rest(idx, feedback.position)
+                        {
+                            self.rest_pose_window[idx].record_agree(
+                                rx_at,
+                                pass_id,
+                                STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                            );
+                        } else {
+                            self.rest_pose_window[idx].record_disagree();
+                        }
                     }
                 }
                 if let Some(cap) = self.refresh_capture.as_mut() {
@@ -11579,6 +12154,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.awaiting_rx_boundary = false;
             self.last_feedback_instant.fill(None);
             self.pose_feedback_instant.fill(None);
+            self.rest_pose_window.fill(CausalWindow::default());
             self.pf_last_fresh_feedback = None;
             let boundary_now = self.now();
             self.last_enable_command = Some(boundary_now);
@@ -11590,6 +12166,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // Every hardware receive pass opens a fresh per-tick TX budget window; recovery writes,
         // 0xCC refreshes, J7 handshakes, and the tick's target batch share one TickTxPass once any TX starts.
         self.begin_tx_tick();
+        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let max_frames = self.remaining_rx_frame_limit();
         let t0 = self.now();
         let mut frames_processed = 0;
@@ -11893,6 +12470,10 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for that motor's torque
     /// state, mode, or rest pose.
     motor_torque_settle_until: Vec<Option<MotorTorqueSettle>>,
+    /// Monotonic RX drain pass counter for S2 K-windows.
+    rx_pass_id: u64,
+    /// Per-motor K=3 causal rest-pose evidence window (S2).
+    rest_pose_window: Vec<CausalWindow>,
     /// True once the most recent RX receive/drain pass reached an empty queue (`Timeout`/`WouldBlock`).
     last_read_drained: bool,
     /// True while a pre-disable RX drain did not complete (zero budget without drained state, or
@@ -11924,6 +12505,8 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             rx_empty_instant: None,
             feedback_queue_bound: vec![None; dof],
             motor_torque_settle_until: vec![None; dof],
+            rx_pass_id: 0,
+            rest_pose_window: vec![CausalWindow::default(); dof],
             last_read_drained: false,
             awaiting_rx_boundary: false,
             fault_flags: vec![0; dof],
@@ -11978,6 +12561,58 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         self.now().saturating_duration_since(earlier)
     }
 
+    fn evaluate_rest_pose_gate(&self) -> RestPoseGateStatus {
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return RestPoseGateStatus::RefusedNonRest;
+        };
+        if !gate.has_resting_pose {
+            return RestPoseGateStatus::RefusedNonRest;
+        }
+        let arm_joints = gate.arm_joint_indices();
+        if arm_joints.is_empty() {
+            return RestPoseGateStatus::RefusedNonRest;
+        }
+        let now = self.now();
+        let caps = self.capabilities();
+        let mut pending = self.awaiting_rx_boundary || !self.last_read_drained;
+        for &i in arm_joints {
+            let Some(s) = self.cached_states.get(i) else {
+                return RestPoseGateStatus::RefusedNonRest;
+            };
+            let fresh = self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| now.saturating_duration_since(t) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                && self
+                    .feedback_queue_bound
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|b| now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if fresh {
+                if !joint_state_valid(s, caps) || !gate.joint_at_rest(i, s.position) {
+                    return RestPoseGateStatus::RefusedNonRest;
+                }
+            } else {
+                pending = true;
+            }
+            if !self
+                .rest_pose_window
+                .get(i)
+                .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+            {
+                pending = true;
+            }
+        }
+        if pending {
+            RestPoseGateStatus::PendingEvidence
+        } else {
+            RestPoseGateStatus::Confirmed
+        }
+    }
+
     fn check_disable_requested(
         &self,
         started_at: Instant,
@@ -11995,26 +12630,16 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         if self.since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(ArmDriverError::DisableRequestExpired);
         }
-        let Some(ref gate) = self.stopped_disable_gate else {
-            return Err(ArmDriverError::TorqueOffWouldDrop);
-        };
-        let arm_joints = gate.arm_joint_indices();
-        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        if !self.fresh_joint_positions_into(
-            arm_joints,
-            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-            &mut arm_positions[..arm_joints.len()],
-        ) || !gate.check_positions(&arm_positions[..arm_joints.len()])
-        {
+        if self.evaluate_rest_pose_gate() != RestPoseGateStatus::Confirmed {
             return Err(ArmDriverError::TorqueOffWouldDrop);
         }
         Ok(())
     }
 
     /// Per-write transmit choke point for RobStride type-4 stop / fault-clear CAN frames:
-    /// re-evaluates stop state, freshness, rest pose, and 1 s request lifetime immediately
-    /// before each `can.transmit`, and arms the per-motor causal settle window after `transmit()`
-    /// returns.
+    /// re-evaluates stop state, freshness, rest pose (K=3 window), and 1 s request lifetime
+    /// immediately before each `can.transmit`, and arms the per-motor causal settle window after
+    /// `transmit()` returns.
     fn send_type4_frame(&mut self, idx: usize, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
         if let DisableKind::DisableRequested { started_at, rollback } = kind {
             self.check_disable_requested(started_at, rollback)?;
@@ -12023,11 +12648,14 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         let write_done = self.now();
         let write_done_rx_clock = Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)));
         if let Some(slot) = self.motor_torque_settle_until.get_mut(idx) {
+            let settle_until = write_done + TORQUE_CAUSAL_SETTLE_WINDOW;
             *slot = Some(MotorTorqueSettle {
                 write_done,
-                settle_until: write_done + TORQUE_CAUSAL_SETTLE_WINDOW,
+                settle_until,
+                next_probe_at: settle_until + Duration::from_micros(1),
                 write_done_rx_clock,
                 probe_needed: false,
+                saw_target_during_settle: false,
             });
         }
         Ok(())
@@ -12044,6 +12672,8 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
     /// drains to `Timeout | WouldBlock`.
     fn drain_rx_bounded(&mut self, max_frames: usize, deadline: Option<Instant>, max_span: Duration) -> (u16, bool, bool) {
         self.last_read_drained = false;
+        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
+        let pass_id = self.rx_pass_id;
         let t0 = self.now();
         let mut frames_processed = 0usize;
         let mut rx_drained = false;
@@ -12064,6 +12694,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                             let Some(rx_t) = rx_time else {
                                 self.last_feedback_instant[idx] = None;
                                 self.feedback_queue_bound[idx] = None;
+                                self.rest_pose_window[idx].reset();
                                 self.feedback_continuity_epoch[idx] =
                                     self.feedback_continuity_epoch[idx].wrapping_add(1);
                                 continue;
@@ -12083,6 +12714,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                 // cannot authorize a stopped disable.
                                 self.last_feedback_instant[idx] = None;
                                 self.feedback_queue_bound[idx] = None;
+                                self.rest_pose_window[idx].reset();
                                 self.feedback_continuity_epoch[idx] =
                                     self.feedback_continuity_epoch[idx].wrapping_add(1);
                                 continue;
@@ -12100,6 +12732,23 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                             self.last_feedback_instant[idx] = Some(rx_at);
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
+                            if let Some(ref gate) = self.stopped_disable_gate {
+                                if gate.is_arm_joint(idx) {
+                                    if !self.awaiting_rx_boundary
+                                        && self.rx_empty_instant.is_some()
+                                        && joint_state_valid(&self.cached_states[idx], self.capabilities())
+                                        && gate.joint_at_rest(idx, feedback.position)
+                                    {
+                                        self.rest_pose_window[idx].record_agree(
+                                            rx_at,
+                                            pass_id,
+                                            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                        );
+                                    } else {
+                                        self.rest_pose_window[idx].record_disagree();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -12107,7 +12756,10 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                     rx_drained = true;
                     self.rx_empty_instant = Some(attempt);
                     self.last_read_drained = true;
-                    self.awaiting_rx_boundary = false;
+                    if self.awaiting_rx_boundary {
+                        self.awaiting_rx_boundary = false;
+                        self.rest_pose_window.fill(CausalWindow::default());
+                    }
                     break;
                 }
                 Err(_) => {
@@ -12185,6 +12837,10 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             verified zero sequence: motorbridge, the SDK of the official reBotArm_control_py, lists RobStride zero calibration \
             as unresolved (device-side zero_sta / mechPos verification can fail), and whether type 6 persists without \
             type 22 (save parameters) is not checked")
+    }
+
+    fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
+        self.evaluate_rest_pose_gate()
     }
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false, load_feedback: false } }
@@ -12433,14 +13089,18 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 self.strict_stop_check(Some(start_stamp))?;
                 let frame = robstride::build_enable_frame(id, self.master_id);
                 self.strict_stop_check(Some(start_stamp))?;
+                self.rest_pose_window[idx].reset();
                 self.can.transmit(&frame)?;
                 let write_done = self.now();
                 let write_done_rx_clock = Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)));
+                let settle_until = write_done + TORQUE_CAUSAL_SETTLE_WINDOW;
                 self.motor_torque_settle_until[idx] = Some(MotorTorqueSettle {
                     write_done,
-                    settle_until: write_done + TORQUE_CAUSAL_SETTLE_WINDOW,
+                    settle_until,
+                    next_probe_at: settle_until + Duration::from_micros(1),
                     write_done_rx_clock,
                     probe_needed: false,
+                    saw_target_during_settle: false,
                 });
             }
             self.strict_stop_check(Some(start_stamp))?;
@@ -12794,23 +13454,13 @@ mod tx_chokepoint_tests {
                 for &budget in &[BudgetCase::Available, BudgetCase::Exhausted] {
                     for &deadline_case in &[DeadlineCase::Ok, DeadlineCase::Passed] {
                         let (bus, clock) = TestBus::new();
-                        let kind = match kind {
-                            TxKind::DisableRequested { rollback, .. } => {
-                                TxKind::DisableRequested { started_at: clock.now(), rollback }
-                            }
-                            other => other,
-                        };
                         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1])
                             .with_limits(limits);
 
-                        // Establish an empty-queue receive bound + fresh feedback on J1 so
-                        // RollbackHold(0) satisfies step 4 freshness whenever step 3 admits it.
-                        drv.read_joint_states().unwrap();
-                        bus.push_feedback(1, 0.25, 1, &limits);
-                        drv.read_joint_states().unwrap();
-                        bus.clear_tx();
-
-                        // Configure stop/E-stop state.
+                        // Configure stop/E-stop state and resting-pose gate matching J1's fresh
+                        // feedback (0.25 rad) BEFORE feeding K=3 spaced rest samples (S2) so
+                        // `DisableRequested` passes Rule A′ in this table; separate tests below
+                        // verify raised/stale/expired/no-gate refusals on `DisableRequested`.
                         let req = Arc::new(AtomicU64::new(match stop {
                             StopCase::NoStop => 0,
                             StopCase::Pending | StopCase::Latched => 1,
@@ -12823,9 +13473,6 @@ mod tx_chokepoint_tests {
                         let latched = Arc::new(AtomicBool::new(stop == StopCase::Latched));
                         drv.set_estop_gate(EstopGate::new(req, app));
                         drv.set_abort_flag(latched);
-                        // Configure a resting-pose gate matching J1's fresh feedback (0.25 rad) so
-                        // `DisableRequested` passes Rule A′ in this table; separate tests below
-                        // verify raised/stale/expired/no-gate refusals on `DisableRequested`.
                         let mut rest_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
                         rest_positions[0] = 0.25;
                         drv.set_stopped_disable_gate(StoppedDisableGate {
@@ -12836,6 +13483,24 @@ mod tx_chokepoint_tests {
                             rest_positions,
                             rest_pose_tolerance_rad: 0.05,
                         });
+
+                        // Establish an empty-queue receive bound + K=3 spaced fresh samples on J1
+                        // so both RollbackHold(0) freshness and S2 rest-pose K-window are satisfied.
+                        drv.read_joint_states().unwrap();
+                        for step in 0..3 {
+                            if step > 0 {
+                                clock.advance(Duration::from_millis(10));
+                            }
+                            bus.push_feedback(1, 0.25, 1, &limits);
+                            drv.read_joint_states().unwrap();
+                        }
+                        bus.clear_tx();
+                        let kind = match kind {
+                            TxKind::DisableRequested { rollback, .. } => {
+                                TxKind::DisableRequested { started_at: clock.now(), rollback }
+                            }
+                            other => other,
+                        };
 
                         // Configure per-tick TX budget.
                         drv.set_tx_budget(TxBudget {
@@ -13202,10 +13867,15 @@ mod tx_chokepoint_tests {
         ));
         assert_eq!(bus.tx_len(), 0);
 
-        // 2. At rest with fresh feedback -> sent.
+        // 2. At rest with K=3 spaced causal samples (S2) -> sent.
         drv.read_joint_states().unwrap();
-        bus.push_feedback(1, 0.01, 1, &limits);
-        drv.read_joint_states().unwrap();
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(10));
+            }
+            bus.push_feedback(1, 0.01, 1, &limits);
+            drv.read_joint_states().unwrap();
+        }
         bus.clear_tx();
         assert!(drv
             .send(TxKind::DisableRequested { started_at: t0, rollback: false }, None, None, false, |d| {
@@ -13228,8 +13898,13 @@ mod tx_chokepoint_tests {
         // 4. Fresh feedback at rest, but 1 s total request lifetime elapsed -> DisableRequestExpired, 0 TX.
         clock.advance(Duration::from_millis(950));
         drv.read_joint_states().unwrap();
-        bus.push_feedback(1, 0.0, 1, &limits);
-        drv.read_joint_states().unwrap();
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(10));
+            }
+            bus.push_feedback(1, 0.0, 1, &limits);
+            drv.read_joint_states().unwrap();
+        }
         bus.clear_tx();
         assert!(matches!(
             drv.send(TxKind::DisableRequested { started_at: t0, rollback: false }, None, None, false, |d| {
@@ -13343,15 +14018,24 @@ mod tx_chokepoint_tests {
             drv.poll_torque(dl_early).unwrap(),
             TorqueProgress::Pending { .. }
         ));
-        clock.advance(Duration::from_millis(25));
-        for id in 1..=3 {
-            bus.push_feedback(id, 0.50, 0x0, &limits);
+        // S2: K=3 consecutive post-settle state-0 samples spanning >= 2 ticks (>= 20 ms) confirm OffConfirmed.
+        for step in 0..3 {
+            clock.advance(if step == 0 {
+                Duration::from_millis(25)
+            } else {
+                Duration::from_millis(10)
+            });
+            for id in 1..=3 {
+                bus.push_feedback(id, 0.50, 0x0, &limits);
+            }
+            let dl_off = clock.now() + Duration::from_millis(5);
+            let prog = drv.poll_torque(dl_off).unwrap();
+            if step < 2 {
+                assert!(matches!(prog, TorqueProgress::Pending { .. }));
+            } else {
+                assert_eq!(prog, TorqueProgress::Done(TorqueOutcome::Confirmed));
+            }
         }
-        let dl_off = clock.now() + Duration::from_millis(5);
-        assert_eq!(
-            drv.poll_torque(dl_off).unwrap(),
-            TorqueProgress::Done(TorqueOutcome::Confirmed)
-        );
         assert_eq!(drv.enable_state(), EnableState::Disabled);
         drv.motor_torque_evidence_into(&mut ev);
         assert_eq!(ev, [MotorTorqueEvidence::OffConfirmed; 3]);
@@ -13504,6 +14188,16 @@ mod tx_chokepoint_tests {
         arm3[0] = 0;
         arm3[1] = 1;
         arm3[2] = 2;
+        let seed_rest_window = |windows: &mut [CausalWindow], now: Instant| {
+            let t0 = now.checked_sub(Duration::from_millis(20)).unwrap_or(now);
+            let t1 = now.checked_sub(Duration::from_millis(10)).unwrap_or(now);
+            for w in windows.iter_mut() {
+                w.reset();
+                w.record_agree(t0, 1, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+                w.record_agree(t1, 2, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+                w.record_agree(now, 3, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            }
+        };
 
         // --- A. FashionStarArmDriver per-write gating ---
         {
@@ -13543,11 +14237,13 @@ mod tx_chokepoint_tests {
 
             // 2. Mid-batch freshness cutoff (> 100 ms) while stopped at rest -> writes #2,#3 refused!
             serial.clear_writes();
+            clock.advance(Duration::from_millis(20));
             let t1 = clock.now();
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t1);
             }
+            seed_rest_window(&mut drv.rest_pose_window, t1);
             let clk_cb = clock.clone();
             serial.set_on_write(move |n| {
                 if n == 1 {
@@ -13573,6 +14269,7 @@ mod tx_chokepoint_tests {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t_fb);
             }
+            seed_rest_window(&mut drv.rest_pose_window, t_fb);
             let clk_cb2 = clock.clone();
             serial.set_on_write(move |n| {
                 if n == 1 {
@@ -13640,12 +14337,14 @@ mod tx_chokepoint_tests {
 
             // 2. Mid-batch freshness cutoff (> 100 ms) while stopped at rest -> frames #2,#3 refused!
             bus.clear_tx();
+            clock.advance(Duration::from_millis(20));
             let t1 = clock.now();
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t1);
                 drv.feedback_queue_bound[i] = Some(t1);
             }
+            seed_rest_window(&mut drv.rest_pose_window, t1);
             let clk_cb = clock.clone();
             let mut count2 = 0usize;
             bus.set_on_tx(move |_| {
@@ -13675,6 +14374,7 @@ mod tx_chokepoint_tests {
                 drv.last_feedback_instant[i] = Some(t_fb);
                 drv.feedback_queue_bound[i] = Some(t_fb);
             }
+            seed_rest_window(&mut drv.rest_pose_window, t_fb);
             let clk_cb2 = clock.clone();
             let mut count3 = 0usize;
             bus.set_on_tx(move |_| {
@@ -13757,12 +14457,14 @@ mod tx_chokepoint_tests {
             assert_eq!(bus.tx_len(), 1, "RobStride clear_fault must stop after frame #1 on mid-batch E-stop");
 
             // Mid-batch freshness cutoff (> 100 ms) while stopped at rest stops after frame #1.
+            clock.advance(Duration::from_millis(20));
             let t_cf3 = clock.now();
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t_cf3);
                 drv.feedback_queue_bound[i] = Some(t_cf3);
             }
+            seed_rest_window(&mut drv.rest_pose_window, t_cf3);
             let clk_cf = clock.clone();
             let mut count_cf2 = 0usize;
             bus.set_on_tx(move |_| {
@@ -13780,12 +14482,14 @@ mod tx_chokepoint_tests {
             assert_eq!(bus.tx_len(), 1, "RobStride clear_fault must stop after frame #1 on mid-batch staleness");
 
             // Fresh rest pose while stopped -> transmits all 3 type-4 clear-fault frames.
+            clock.advance(Duration::from_millis(20));
             let t_cf4 = clock.now();
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t_cf4);
                 drv.feedback_queue_bound[i] = Some(t_cf4);
             }
+            seed_rest_window(&mut drv.rest_pose_window, t_cf4);
             bus.set_on_tx(|_| Ok(()));
             bus.clear_tx();
             drv.clear_fault().expect("RobStride clear_fault at fresh rest pose must succeed");

@@ -1749,14 +1749,22 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
     assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
     assert!(inner.safety.has_latched_fault_kind(FaultKind::BusLoss));
 
-    // Cool motor 0 below reset threshold -> confirmed MIT recovery now passes clear_check and clears all at once!
+    // Cool motor 0 below reset threshold and accumulate K=3 rest-pose samples across >= 20 ms ->
+    // confirmed MIT recovery now passes clear_check and clears all at once!
     bus.with(|s| s.motors[0].temperature_c = 35);
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(Duration::from_millis(12));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(DT);
+    }
     let mut cleared = false;
     for _ in 0..6 {
         match inner.clear_fault_confirmed(true) {
             Ok(SafetyState::Idle) => { cleared = true; break; }
             Ok(other) => panic!("unexpected state after MIT recovery: {other:?}"),
-            Err(_) => { clock.advance(Duration::from_millis(120)); inner.tick(DT); }
+            Err(_) => { clock.advance(Duration::from_millis(20)); inner.tick(DT); }
         }
     }
     assert!(cleared, "MIT recovery must succeed once ThermalTrip cooled down: {:?}", inner.clear_fault_confirmed(true));
@@ -2393,12 +2401,18 @@ fn clear_check_runs_before_motor_reset_on_legacy_and_executor_paths() {
         }
         assert!(count_resets() >= 1, "use_executor={use_executor}: permitted reset must transmit CMD_CLEAR_FAULTS");
 
-        // 5. Motor clears fault bit & sends fresh fault-free feedback -> subsequent clear passes full clear_check!
+        // 5. Motor clears fault bit & sends K=3 fresh fault-free feedback samples across >= 20 ms ->
+        // subsequent clear passes full clear_check!
         bus.with(|s| {
             s.motors[0].state_override = None;
-            s.push_all_feedback();
         });
-        let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        }
         // Two-stage clear because step 3 consumed pending E-stop into `e_stop_latched`.
         if use_executor {
             let s1 = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap();
@@ -2509,13 +2523,13 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
             inner.tick(DT);
         }
         assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled));
-        (inner, bus, cfg)
+        (inner, bus, clock, cfg)
     };
 
     // (a) Motor 0 is cool (35 C) BEFORE recovery, then jumps to 85 C DURING `mit_expiry_recover()` ->
     // final check MUST inspect post-recovery temperatures and refuse to clear!
     {
-        let (mut inner, bus, _cfg) = setup_expired_mit();
+        let (mut inner, bus, clock, _cfg) = setup_expired_mit();
         inner.safety.latch(
             FaultKind::ThermalTrip,
             FaultDetail::ThermalTrip { joint_idx: 0, temperature: 80.0, limit: 75.0 },
@@ -2527,6 +2541,13 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
                 st.motors[0].temperature_c = 85;
             }));
         });
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
         let err = inner.clear_fault_confirmed(true).unwrap_err();
         assert!(
             err.to_string().contains("Temperature must be confirmed below the reset threshold"),
@@ -2539,7 +2560,7 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
     // (b) Joint 0 is at home BEFORE recovery, then moves beyond soft limit DURING `mit_expiry_recover()` ->
     // final check MUST inspect post-recovery joint positions and refuse to clear!
     {
-        let (mut inner, bus, cfg) = setup_expired_mit();
+        let (mut inner, bus, clock, cfg) = setup_expired_mit();
         inner.safety.latch(
             FaultKind::JointLimit,
             FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("joint 1 out of limits")),
@@ -2551,6 +2572,13 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
                 st.motors[0].q = over_limit;
             }));
         });
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
         let err = inner.clear_fault_confirmed(true).unwrap_err();
         assert!(
             err.to_string().contains("within limits"),
@@ -3380,8 +3408,9 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
         );
 
         // (d) Cool motor 0 to 35 C and nudge J0 to 0.03 rad (within the 0.05 rad rest tolerance
-        //     so Rule A' allows recovery, while distinct from 0.0 to detect state mutation), but
-        //     omit confirmation -> refused with RECOVERY_CONFIRM_CODE, still ZERO fence ack and
+        //     so Rule A' allows recovery, while distinct from 0.0 to detect state mutation), feed K=3
+        //     causal rest samples to the driver without mutating supervisor state, and omit
+        //     confirmation -> refused with RECOVERY_CONFIRM_CODE, still ZERO fence ack and
         //     ZERO state mutation!
         let pos_before_unconf = inner.measured_positions.clone();
         let temps_before_unconf = inner.temperatures.clone();
@@ -3389,6 +3418,13 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             s.motors[0].temperature_c = 35;
             s.motors[0].q = 0.03;
         });
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.driver.as_ref().unwrap().lock().unwrap().read_joint_states().unwrap();
+        }
         let err_unconf = inner.clear_fault_confirmed(false).unwrap_err();
         assert!(matches!(err_unconf, ArmError::Rejected { ref code, .. } if code == mit::RECOVERY_CONFIRM_CODE), "{err_unconf}");
         assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
@@ -3407,6 +3443,13 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
 
         // (e) Now full clear_check passes + confirmed -> recovery succeeds, clears to Idle,
         //     mit.owner becomes Off, and fence is now acknowledged so read-only polls may resume.
+        for i in 0..3 {
+            if i > 0 {
+                clock.advance(Duration::from_millis(12));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
         let cleared = inner.clear_fault_confirmed(true).unwrap();
         assert_eq!(cleared, SafetyState::Idle);
         assert_eq!(inner.mit.owner, mit::MitOwner::Off);

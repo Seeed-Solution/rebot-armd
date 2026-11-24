@@ -75,33 +75,40 @@ fn missing_enable_confirmation_retries_only_the_silent_joint_and_fails_at_the_de
 #[test]
 fn late_and_lost_confirmations() {
     // a reply 30 ms late (B601-DM J3 after a set-zero) confirms inside the window;
-    // after the 25 ms retry resets J3's settle window to 45 ms, the retry reply confirms at 55 ms
+    // after the 25 ms retry resets J3's settle window to 45 ms, the initial 30 ms reply arrives
+    // during settle and K=3 post-settle 0xCC probes across >= 20 ms confirm at ~66 ms
     let (mut d, bus, clock) = rig();
     bus.with(|s| s.motors[2].torque_reply_delay = ms(30));
     let t0 = clock.now();
     d.set_torque(true).expect("late reply inside the window");
     let took = clock.now().saturating_duration_since(t0);
-    assert!(took >= ms(55) && took < ms(57), "{took:?}");
+    assert!(took >= ms(65) && took < ms(67), "{took:?}");
     assert_eq!(ids(&torque_frames(&bus, t0)), vec![1, 2, 3, 4, 5, 6, 7, 3], "the 25 ms retry goes to J3 only");
 
-    // the first enable frame to J2 is lost: the retry at 25 ms confirms after the 20 ms settle window (45 ms)
+    // the first enable frame to J2 is lost: the retry at 25 ms sets settle to 45 ms, then K=3
+    // post-settle probes across >= 20 ms confirm at ~66 ms
     let (mut d, bus, clock) = rig();
     bus.with(|s| s.motors[1].drop_torque_frames = 1);
     let t0 = clock.now();
     d.set_torque(true).expect("confirmed by the retry");
     let took = clock.now().saturating_duration_since(t0);
-    assert!(took >= ms(45) && took <= ms(47), "{took:?}");
+    assert!(took >= ms(65) && took <= ms(67), "{took:?}");
 
-    // a reply arriving exactly at the deadline does not count (window end exclusive) ...
+    // a reply arriving at the deadline or too late for K=3 spanning >= 20 ms before 150 ms does not confirm ...
     let (mut d, bus, clock) = rig();
     bus.with(|s| { s.motors[2].torque_reply_delay = ms(150); });
     let t0 = clock.now();
     assert!(d.set_torque(true).is_err(), "a confirmation at 150 ms counted");
     assert!(clock.now().saturating_duration_since(t0) < ms(151));
-    // ... one received before it does
+    let (mut d, bus, clock) = rig();
+    bus.with(|s| { s.motors[2].torque_reply_delay = ms(130); });
+    let t0 = clock.now();
+    assert!(d.set_torque(true).is_err(), "130 ms leaves < 20 ms for K=3 span before 150 ms");
+    assert!(clock.now().saturating_duration_since(t0) < ms(151));
+    // ... one received early enough for K=3 probes across >= 20 ms before 150 ms does
     let (mut d, bus, _) = rig();
-    bus.with(|s| { s.motors[2].torque_reply_delay = ms(149); });
-    d.set_torque(true).expect("a confirmation at 149 ms");
+    bus.with(|s| { s.motors[2].torque_reply_delay = ms(128); });
+    d.set_torque(true).expect("K=3 confirmation starting at 128 ms finishes before 150 ms");
 }
 
 #[test]
@@ -127,7 +134,7 @@ fn partial_disable_confirmation_is_unconfirmed_not_success() {
     assert_eq!(f[7].2, ms(25));
     assert_eq!(f[8].2, ms(75));
     assert_eq!(clock.now().saturating_duration_since(t0), ms(150), "served at its deadline");
-    assert!(served <= 7, "woken only at the post-settle probes, retries, and deadline: {served} services");
+    assert!(served <= 9, "woken only at the K=3 post-settle probes, retries, and deadline: {served} services");
 }
 
 #[test]
@@ -152,16 +159,30 @@ fn success_is_withheld_until_confirmation() {
     clock.advance(ms(10));
     assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
-    // At 22 ms: J3's post-settle reply arrives and settled J1,J2,J4..J7 get their post-settle probe;
-    // on an async (`immediate_replies == false`) bus their probe replies arrive on the next poll.
+    // At 22 ms: J3's post-settle reply arrives and settled J1,J2,J4..J7 get their 1st post-settle probe;
+    // under S2, confirmation is still withheld until K=3 samples spanning >= 20 ms arrive.
     clock.advance(ms(2));
-    let p22 = d.poll_torque(clock.now() + RX_PASS).unwrap();
-    if matches!(p22, TorqueProgress::Pending { .. }) {
-        clock.advance(ms(1));
-        assert_eq!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Done(TorqueOutcome::Confirmed));
-    } else {
-        assert_eq!(p22, TorqueProgress::Done(TorqueOutcome::Confirmed));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    clock.advance(ms(1));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    // At 33 ms: 2nd post-settle sample (~10 ms span < 20 ms) -> still withheld.
+    clock.advance(ms(10));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
+    assert!(!d.is_enabled());
+    // Follow remaining probe wakes across >= 20 ms span (~43 ms) until Confirmed.
+    let mut p = d.poll_torque(clock.now() + RX_PASS).unwrap();
+    for _ in 0..8 {
+        if let TorqueProgress::Done(TorqueOutcome::Confirmed) = p {
+            break;
+        }
+        let TorqueProgress::Pending { wake } = p else { break };
+        let now = clock.now();
+        clock.advance(if wake > now { wake - now } else { Duration::from_micros(500) });
+        p = d.poll_torque(clock.now() + RX_PASS).unwrap();
     }
+    assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
     assert!(d.is_enabled());
     d.write_joint_targets(&hold).expect("targets after the confirmation");
     assert!(d.poll_torque(clock.now() + RX_PASS).is_err(), "nothing pending");
@@ -336,6 +357,14 @@ fn disable_is_not_inhibited_by_a_pending_estop() {
         rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
         rest_pose_tolerance_rad: 0.05,
     });
+    // Establish K=3 causal rest-pose evidence spanning >= 20 ms after arming the gate.
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(ms(11));
+        }
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+    }
     d.set_estop_gate(EstopGate::new(requested, applied));
     let t0 = clock.now();
     d.set_torque(false).expect("disable at rest under pending E-stop");
@@ -358,11 +387,14 @@ fn service_deadline_caps_the_receive_pass() {
     assert!(matches!(d.poll_torque(before).unwrap(), TorqueProgress::Pending { .. }), "confirmed without a receive pass");
     assert_eq!(clock.now(), before, "frames read past the service deadline");
     assert!(!d.is_enabled());
-    // within budget: the post-settle replies confirm the enable
+    // within budget: K=3 post-settle samples spanning >= 20 ms confirm the enable
     let mut p = d.poll_torque(clock.now() + RX_PASS).unwrap();
-    for _ in 0..4 {
-        if p == TorqueProgress::Done(TorqueOutcome::Confirmed) { break; }
-        clock.advance(Duration::from_micros(500));
+    assert!(matches!(p, TorqueProgress::Pending { .. }), "single sample must not confirm enable");
+    for _ in 0..16 {
+        if let TorqueProgress::Done(TorqueOutcome::Confirmed) = p { break; }
+        let TorqueProgress::Pending { wake } = p else { break };
+        let now = clock.now();
+        clock.advance(if wake > now { wake - now } else { Duration::from_micros(500) });
         p = d.poll_torque(clock.now() + RX_PASS).unwrap();
     }
     assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));

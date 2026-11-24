@@ -1220,15 +1220,22 @@ fn expired_after_loss() -> (SupervisorInner, FakeBus, armd::transport::MockClock
 }
 
 /// Same MIT-expired stuck state with the arm at the resting pose (0.0 rad) so Rule A′ allows
-/// torque-off recovery.
+/// torque-off recovery (K=3 causal rest-pose samples spanning >= 20 ms).
 fn expired_after_loss_at_rest() -> (SupervisorInner, FakeBus, armd::transport::MockClock) {
-    let (inner, bus, clock) = expired_after_loss();
+    let (mut inner, bus, clock) = expired_after_loss();
     bus.with(|s| {
         s.follow_commands = false;
         for m in s.motors.iter_mut() {
             m.q = 0.0;
         }
     });
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(std::time::Duration::from_millis(12));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(DT);
+    }
     (inner, bus, clock)
 }
 
@@ -1485,7 +1492,7 @@ fn mit_expiry_recovery_refuses_raised_even_when_all_motors_report_0_or_0xd_and_s
         assert_eq!(inner.safety.epoch_id(), epoch_before);
     }
 
-    // 2. At rest with fresh feedback -> proceeds and clears to Idle with torque off.
+    // 2. At rest with fresh K=3 feedback spanning >= 20 ms -> proceeds and clears to Idle with torque off.
     let (mut inner, bus, clock) = expired_after_loss();
     bus.with(|s| {
         s.follow_commands = false;
@@ -1494,9 +1501,14 @@ fn mit_expiry_recovery_refuses_raised_even_when_all_motors_report_0_or_0xd_and_s
             m.enabled = false;
             m.state_override = Some(if j % 2 == 0 { 0xD } else { 0 });
         }
-        s.push_all_feedback();
     });
-    inner.tick(DT);
+    for i in 0..3 {
+        if i > 0 {
+            clock.advance(std::time::Duration::from_millis(12));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(DT);
+    }
     let mut cleared = None;
     for _ in 0..6 {
         match inner.clear_fault_confirmed(true) {
@@ -1505,7 +1517,7 @@ fn mit_expiry_recovery_refuses_raised_even_when_all_motors_report_0_or_0xd_and_s
                 break;
             }
             Err(_) => {
-                clock.advance(std::time::Duration::from_millis(120));
+                clock.advance(std::time::Duration::from_millis(20));
                 inner.tick(DT);
             }
         }

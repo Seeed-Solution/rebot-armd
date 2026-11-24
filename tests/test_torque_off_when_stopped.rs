@@ -208,6 +208,7 @@ fn legacy_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
     enable_torque_admitted(&mut inner).unwrap();
 
     // Gripper wide open (-3.0 rad), all arm joints within 0.05 rad of rest (0.0).
+    // S2: supply K=3 consecutive causal samples spanning >= 2 ticks (>= 20 ms) at rest.
     bus.with(|s| {
         s.follow_commands = false;
         s.rx.clear();
@@ -216,9 +217,14 @@ fn legacy_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
             s.motors[j].q = 0.03;
         }
         s.motors[6].q = -3.0;
-        s.push_all_feedback();
     });
-    inner.tick(0.02);
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
     assert!((inner.measured_positions[6] + 3.0).abs() < 0.01, "gripper must be measured open");
     assert!((inner.measured_positions[1] - 0.03).abs() < 0.01, "J2 must be measured at 0.03 rad");
 
@@ -257,7 +263,7 @@ fn executor_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
     let mut r = ExecRig::new();
     r.arm_now();
 
-    // Gripper wide open (-3.0 rad), arm joints within 0.05 rad of rest.
+    // Gripper wide open (-3.0 rad), arm joints within 0.05 rad of rest (S2: K=3 across >= 2 ticks).
     r.bus.with(|s| {
         s.follow_commands = false;
         s.rx.clear();
@@ -266,9 +272,10 @@ fn executor_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
             s.motors[j].q = -0.04;
         }
         s.motors[6].q = -3.0;
-        s.push_all_feedback();
     });
-    r.step();
+    for _ in 0..3 {
+        r.step_with_feedback();
+    }
     assert!((r.fx.core.measured_positions[6] + 3.0).abs() < 0.01, "gripper must be measured open");
     assert!((r.fx.core.measured_positions[1] + 0.04).abs() < 0.01, "J2 must be measured at -0.04 rad");
 
@@ -518,11 +525,16 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
     assert!(matches!(err, SafetyError::TorqueOffWouldDrop { joint: None, .. }), "{err:?}");
     assert!(inner.is_torqued);
 
-    // Once fresh feedback arrives after an observed-empty queue boundary (<= 100 ms),
-    // disable succeeds and keeps Fault latch.
+    // Once K=3 fresh causal samples arrive after an observed-empty queue boundary (<= 100 ms,
+    // spanning >= 20 ms per S2), disable succeeds and keeps Fault latch.
     inner.tick(0.02); // observe empty RX queue at current time
-    bus.with(|s| s.push_all_feedback());
-    inner.tick(0.02);
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
     assert!(matches!(inner.disable_torque(), Ok(SafetyState::Fault(_))));
     assert!(!inner.is_torqued);
 
@@ -582,16 +594,21 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     assert_eq!(inner.safety.latched_fault_kinds(), kinds_before);
     assert_eq!(inner.safety.fault(), fault_before);
 
-    // At rest + fresh feedback in pure E-Stop:
+    // At rest + fresh feedback in pure E-Stop (S2: K=3 spaced rest samples):
     // First inject a disable TX failure while in EStop: sticky disable stays pending and
     // SafetyState::EStop, fault record, and epoch must NOT be mutated.
     bus.with(|s| {
         s.rx.clear();
         s.pending.clear();
         s.motors[0].q = 0.0;
-        s.push_all_feedback();
     });
-    inner.tick(0.02);
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert_eq!(inner.safety.epoch_id(), epoch_before);
     bus.with(|s| s.tx_error = true);
@@ -620,8 +637,13 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
         let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
         let _ = drv.read_joint_states(); // observe empty RX queue after 150 ms stall
     }
-    bus.with(|s| s.push_all_feedback());
-    inner.tick(0.02);
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert_eq!(inner.safety.epoch_id(), epoch_before);
     let st = inner.disable_torque().expect("disable at rest in E-Stop must succeed");
@@ -674,12 +696,13 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     assert_eq!(r.fx.core.safety.latched_fault_kinds(), exec_kinds_before);
     assert_eq!(r.fx.core.safety.fault(), exec_fault_before);
 
-    // Move to rest with fresh feedback -> allowed; EStop latch, fault record, and epoch kept.
+    // Move to rest with K=3 fresh feedback samples -> allowed; EStop latch, fault record, and epoch kept.
     r.bus.with(|s| {
         s.motors[1].q = 0.0;
-        s.push_all_feedback();
     });
-    r.step();
+    for _ in 0..3 {
+        r.step_with_feedback();
+    }
     r.bus.with(|s| s.push_all_feedback());
     r.submit_transition(TransitionOp::TorqueOff);
     assert!(r.step().command.unwrap().1.is_ok());
@@ -701,13 +724,16 @@ fn relatching_deferral_fault_loop_allows_disable_at_rest_on_both_owners() {
     // still succeed on both owners even when faults re-latch every tick.
 
     // 1. Legacy owner
-    let (mut inner, bus, _clock) = make_driver_rig();
+    let (mut inner, bus, clock) = make_driver_rig();
     enable_torque_admitted(&mut inner).unwrap();
     bus.with(|s| s.tx_step = Duration::from_millis(2));
 
-    // Run ticks at rest: write_joint_targets defers -> latches DriverWriteFailed; subsequent
-    // ticks keep failing write_estop_hold / re-latching fault.
-    for _ in 0..3 {
+    // Run ticks at rest (spanning >= 20 ms for S2 K=3 rest window): write_joint_targets defers ->
+    // latches DriverWriteFailed; subsequent ticks keep failing write_estop_hold / re-latching fault.
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
         bus.with(|s| s.push_all_feedback());
         inner.tick(0.02);
         // Simulate a fault that re-latches on every tick.
@@ -889,12 +915,17 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
     });
     clock.advance(Duration::from_millis(150));
     inner.tick(0.02); // observe empty RX queue at current time
-    bus.with(|s| {
-        for j in 0..6 {
-            s.push_feedback(j);
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
         }
-    });
-    inner.tick(0.02);
+        bus.with(|s| {
+            for j in 0..6 {
+                s.push_feedback(j);
+            }
+        });
+        inner.tick(0.02);
+    }
     assert_eq!(
         inner.may_disable_torque_while_stopped(),
         Ok(()),
@@ -1063,10 +1094,12 @@ fn queued_old_can_frames_exceeding_queue_bound_are_rejected_as_stale() {
         "frames decoded after a >100 ms gap without a fresh empty-queue boundary must be rejected"
     );
     // After the previous tick drained the queue to WouldBlock, rx_empty_instant is now fresh.
-    // A new frame arriving now has a fresh queue bound (<= 100 ms) and passes admission.
-    clock.advance(Duration::from_millis(20));
-    bus.with(|s| s.push_all_feedback());
-    inner.tick(0.02);
+    // K=3 new causal rest frames arriving across >= 2 ticks (>= 20 ms) pass admission (S2).
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(10));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
     assert_eq!(inner.may_disable_torque_while_stopped(), Ok(()));
 }
 
@@ -1127,23 +1160,28 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     }
     assert!(inner.is_torqued);
 
-    // Move J2 back to rest with fresh J1..J6 feedback (gripper STILL silent, feedback_numeric_valid
-    // forced false): admission MUST succeed using fresh J1..J6 driver positions.
+    // Move J2 back to rest with K=3 fresh J1..J6 feedback samples (gripper STILL silent,
+    // feedback_numeric_valid forced false): admission MUST succeed using fresh J1..J6 driver positions.
     inner.feedback_numeric_valid = false;
     bus.with(|s| {
         s.motors[1].q = 0.0;
-        for j in 0..6 {
-            s.push_feedback(j);
-        }
     });
-    {
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| {
+            for j in 0..6 {
+                s.push_feedback(j);
+            }
+        });
         let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
         let _ = drv.read_joint_states();
     }
     assert_eq!(inner.may_disable_torque_while_stopped(), Ok(()));
 
     // 2. ZeroOffsetDriver must apply joint-zero offsets in fresh_joint_positions_into.
-    let (mut inner_z, bus_z, _clock_z) = make_driver_rig();
+    let (mut inner_z, bus_z, clock_z) = make_driver_rig();
     let mut offsets = vec![0.0; 7];
     offsets[1] = 0.40;
     inner_z.set_joint_zero_offsets(&offsets).unwrap();
@@ -1161,12 +1199,19 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
         Err(StoppedTorqueOffRefusal::JointOutsideRest { joint_index: 1, position, .. })
             if (position + 0.40).abs() < 0.02
     ));
-    // Motor raw q = 0.40 with offset 0.40 => logical q = 0.0 (at rest).
+    // Motor raw q = 0.40 with offset 0.40 => logical q = 0.0 (at rest, K=3 samples spanning >= 20 ms).
     bus_z.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
         s.motors[1].q = 0.40;
-        s.push_all_feedback();
     });
-    inner_z.tick(0.02);
+    for step in 0..3 {
+        if step > 0 {
+            clock_z.advance(Duration::from_millis(10));
+        }
+        bus_z.with(|s| s.push_all_feedback());
+        inner_z.tick(0.02);
+    }
     assert_eq!(inner_z.may_disable_torque_while_stopped(), Ok(()));
 }
 
@@ -1279,9 +1324,19 @@ fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_c
     inner.apply_stop_policy(StopPolicy::EStopLatch);
     let epoch_before = inner.safety.epoch_id();
 
-    // Authorize a stopped disable at rest whose TX fails -> sets disable_pending with DisableRequested.
+    // Authorize a stopped disable at rest (S2: K=3 spaced rest samples) whose TX fails ->
+    // sets disable_pending with DisableRequested.
     bus.with(|s| {
         s.follow_commands = false;
+    });
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
+    bus.with(|s| {
         s.tx_error = true;
         s.push_all_feedback();
     });
@@ -1293,12 +1348,17 @@ fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_c
     ));
 
     // Within the 1 s lifetime, periodic retry (>= 250 ms since last attempt) still tries to complete it.
-    // Refresh the empty-queue RX bound before crossing 100 ms so feedback stays provably fresh (<= 50 ms).
+    // Refresh the empty-queue RX bound + K=3 rest window before crossing 100 ms so feedback stays fresh.
     clock.advance(Duration::from_millis(200));
     inner.last_disable_attempt = Some(Instant::now());
-    bus.with(|s| s.push_all_feedback());
-    inner.tick(0.02);
-    clock.advance(Duration::from_millis(50));
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
+    clock.advance(Duration::from_millis(30));
     inner.last_disable_attempt = Some(Instant::now() - Duration::from_millis(300));
     bus.with(|s| {
         s.tx_log.clear();
@@ -1307,14 +1367,18 @@ fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_c
     inner.tick(0.02);
     assert!(inner.disable_pending, "still pending while TX fails within 1 s lifetime");
 
-    // Once the single 1 s lifetime elapses (checked inside `send`), even with fresh feedback at rest
-    // (fresh receive-queue bound <= 25 ms), no disable frames are sent, disable_pending clears,
-    // is_torqued and EStop latch + epoch stay intact, and a new request needs a fresh rest check.
-    clock.advance(Duration::from_millis(740));
+    // Once the single 1 s lifetime elapses (checked inside `send`), even with fresh K=3 rest feedback,
+    // no disable frames are sent, disable_pending clears, is_torqued and EStop latch + epoch stay intact.
+    clock.advance(Duration::from_millis(720));
     inner.last_disable_attempt = Some(Instant::now());
-    bus.with(|s| s.push_all_feedback());
-    inner.tick(0.02); // refreshes empty-queue RX bound at t+990 ms
-    clock.advance(Duration::from_millis(25)); // now t+1015 ms (> 1 s), feedback & queue bound <= 25 ms
+    for step in 0..3 {
+        if step > 0 {
+            clock.advance(Duration::from_millis(10));
+        }
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+    }
+    clock.advance(Duration::from_millis(25)); // now > 1 s, feedback & rest window fresh
     inner.last_disable_attempt = Some(Instant::now() - Duration::from_millis(300));
     bus.with(|s| {
         s.tx_error = false;
@@ -1861,15 +1925,20 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
         enable_torque_admitted(&mut inner).unwrap();
         inner.apply_stop_policy(StopPolicy::EStopLatch);
 
-        // Start a DisableRequested handshake at rest while motor 2 stays silent (never replies
-        // state-0), so DamiaoTorque::Disable stays pending waiting for the 25 ms retry.
+        // Start a DisableRequested handshake at rest (S2: K=3 spaced rest samples) while motor 2
+        // stays silent (never replies state-0), so DamiaoTorque::Disable waits for the 25 ms retry.
         bus.with(|s| {
             s.follow_commands = false;
             s.rx.clear();
             s.pending.clear();
-            s.push_all_feedback();
         });
-        inner.tick(0.02);
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(10));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+        }
         bus.with(|s| {
             s.motors[1].torque_reply_delay = Duration::from_secs(10);
             s.tx_log.clear();
@@ -1956,12 +2025,14 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
         clock.advance(Duration::from_millis(950));
         bus.with(|s| s.push_all_feedback());
         inner.tick(0.02);
-        clock.advance(Duration::from_millis(35));
-        bus.with(|s| {
-            s.motors[1].torque_reply_delay = Duration::from_secs(10);
-            s.push_all_feedback();
-        });
-        inner.tick(0.02);
+        for step in 0..2 {
+            clock.advance(Duration::from_millis(if step == 0 { 15 } else { 20 }));
+            if step == 1 {
+                bus.with(|s| s.motors[1].torque_reply_delay = Duration::from_secs(10));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+        }
         {
             let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
             let p = drv
@@ -2003,9 +2074,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             s.follow_commands = false;
             s.rx.clear();
             s.pending.clear();
-            s.push_all_feedback();
         });
-        r.step();
+        for _ in 0..3 {
+            r.step_with_feedback();
+        }
         r.bus.with(|s| {
             s.motors[2].torque_reply_delay = Duration::from_secs(10);
             s.push_all_feedback();
@@ -2069,9 +2141,14 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 s.follow_commands = false;
                 s.rx.clear();
                 s.pending.clear();
-                s.push_all_feedback();
             });
-            inner.tick(0.02);
+            for step in 0..3 {
+                if step > 0 {
+                    clock.advance(Duration::from_millis(10));
+                }
+                bus.with(|s| s.push_all_feedback());
+                inner.tick(0.02);
+            }
 
             if !started_before_stop {
                 inner.apply_stop_policy(StopPolicy::EStopLatch);
@@ -2274,8 +2351,14 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             rx_fb.push(cs);
         }
         // Feetech read_joint_states loops over both 3-servo chunks in one call.
-        drv.transport_mut().provide_rx(&rx_fb);
-        drv.read_joint_states().unwrap();
+        // S2: provide K=3 causal position reads spanning >= 20 ms for rest-pose window.
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(10));
+            }
+            drv.transport_mut().provide_rx(&rx_fb);
+            drv.read_joint_states().unwrap();
+        }
         let _ = drv.transport_mut().take_tx();
 
         if pose == PoseCase::Stale {
@@ -2288,7 +2371,9 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             let cs = calculate_checksum(id, 3, 0x00, &[0]);
             rx_rb.extend_from_slice(&[0xFF, 0xFF, id, 3, 0x00, 0, cs]);
         }
-        drv.transport_mut().provide_rx(&rx_rb);
+        for _ in 0..3 {
+            drv.transport_mut().provide_rx(&rx_rb);
+        }
         let cf_res = drv.clear_fault();
         let cf_tx = drv.transport_mut().take_tx();
         let cf_disables = count_feetech_torque_off_writes(&cf_tx);
@@ -2310,7 +2395,9 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
         }
 
         // 5b. Feetech `disable_torque(DisableRequested)` vs `DisableProtective`.
-        drv.transport_mut().provide_rx(&rx_rb);
+        for _ in 0..3 {
+            drv.transport_mut().provide_rx(&rx_rb);
+        }
         let req_res = drv.disable_torque(DisableKind::DisableRequested {
             started_at: drv.clock_now(),
             rollback: false,
@@ -2336,7 +2423,9 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             DisableProtectiveReason::Thermal,
             DisableProtectiveReason::ProcessExit,
         ] {
-            drv.transport_mut().provide_rx(&rx_rb);
+            for _ in 0..3 {
+                drv.transport_mut().provide_rx(&rx_rb);
+            }
             drv.disable_torque(DisableKind::DisableProtective { reason })
                 .unwrap();
             let prot_tx = drv.transport_mut().take_tx();
@@ -2641,20 +2730,27 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
                 // per-motor evidence recorded, then return `Ok(())` so the unified enable reducer
                 // enters `step_enable_validate` while `safety.state()` is STILL `Idle`.
                 let _ = self.inner.begin_torque(true)?;
-                // Advance past the 20 ms E1 causal settle window so J1..J6 post-enable feedback
-                // establishes causal `OnConfirmed` evidence before `step_enable_validate`.
-                self.bus.with(|s| {
-                    if let Some(c) = &s.clock {
-                        c.advance(Duration::from_millis(22));
-                    }
-                    for j in 0..6 {
-                        s.motors[j].state_override = None;
-                        s.motors[j].enabled = true;
-                        s.push_feedback(j);
-                    }
-                });
-                let dl = self.inner.clock_now() + Duration::from_millis(5);
-                let _ = self.inner.poll_torque(dl);
+                // Advance past the 20 ms E1/S1 causal settle window and deliver K=3 consecutive
+                // post-settle state-1 samples spanning >= 2 ticks (>= 20 ms, S2) so J1..J6
+                // establish causal `OnConfirmed` evidence before `step_enable_validate`.
+                for step in 0..3 {
+                    self.bus.with(|s| {
+                        if let Some(c) = &s.clock {
+                            c.advance(if step == 0 {
+                                Duration::from_millis(22)
+                            } else {
+                                Duration::from_millis(10)
+                            });
+                        }
+                        for j in 0..6 {
+                            s.motors[j].state_override = None;
+                            s.motors[j].enabled = true;
+                            s.push_feedback(j);
+                        }
+                    });
+                    let dl = self.inner.clock_now() + Duration::from_millis(5);
+                    let _ = self.inner.poll_torque(dl);
+                }
                 self.inner.abort_enable();
                 self.in_post_enable = true;
                 return Ok(());
@@ -2787,10 +2883,10 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
                 for j in 0..7 {
                     s.motors[j].state_override = None;
                 }
-                s.push_all_feedback();
             });
             bus.clear_log();
-            clock.advance(Duration::from_millis(10));
+            clock.advance(Duration::from_millis(25));
+            bus.with(|s| s.push_all_feedback());
             inner.tick(0.02);
             let hold_frames: Vec<u32> = bus
                 .tx_log()
@@ -3328,14 +3424,16 @@ fn robstride_clear_fault_routes_through_rest_pose_gate_and_refuses_raised() {
     assert_eq!(inner.safety.epoch_id(), epoch_before);
     assert!(inner.is_torqued);
 
-    // 2. At rest pose (all 6 joints 0.0 rad) with fresh feedback -> clear_fault transmits type-4
-    //    clear-fault frames to all 6 motors!
-    clock.advance(Duration::from_millis(10));
-    for id in 1..=6u8 {
-        let flags = if id == 2 { 0x04 } else { 0x00 };
-        can.push_rx(make_fb_frame(id, 0.0, flags));
+    // 2. At rest pose (all 6 joints 0.0 rad) with K=3 fresh feedback samples spanning >= 20 ms (S2)
+    //    -> clear_fault transmits type-4 clear-fault frames to all 6 motors!
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(10));
+        for id in 1..=6u8 {
+            let flags = if id == 2 { 0x04 } else { 0x00 };
+            can.push_rx(make_fb_frame(id, 0.0, flags));
+        }
+        inner.tick(0.02);
     }
-    inner.tick(0.02);
     let _ = can.take_tx();
     for id in 1..=6u8 {
         let flags = if id == 2 { 0x04 } else { 0x00 };
@@ -4360,13 +4458,15 @@ fn spec_7_failed_enable_at_rest_pose_does_not_roll_back_automatically() {
         assert!(!inner.safety.recoverable());
 
         // Later explicit disable at the rest pose passes the rest gate and disables torque cleanly
-        // once fresh (<= 100 ms) rest-pose feedback is read.
+        // once K=3 fresh (<= 100 ms) rest-pose feedback samples spanning >= 20 ms are read (S2).
         bus.with(|s| {
             s.motors[3].drop_torque_frames = 0;
-            s.push_all_feedback();
         });
-        clock.advance(Duration::from_millis(5));
-        inner.tick(0.02);
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(10));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+        }
         bus.clear_log();
         let state = inner.disable_torque().expect("explicit disable at rest must succeed");
         assert!(matches!(state, SafetyState::Fault(_)), "explicit disable preserves ENABLE_FAILED latch");
@@ -5240,19 +5340,33 @@ fn e1_damiao_causal_settle_window_rejects_5ms_in_flight_and_accepts_25ms() {
             );
         }
 
-        // Deliver the exact same 0x0 frame at +25 ms (past write_done + 20 ms) -> OffConfirmed!
-        clock.advance(Duration::from_millis(14)); // total +25 ms from write_done
-        bus.with(|s| {
-            for id in 1..=7u16 {
-                s.rx.push_back(make_dm_fb(id, 0, 0.0));
+        // Deliver K=3 consecutive post-settle 0x0 frames spanning >= 2 ticks (>= 20 ms, S2) -> OffConfirmed!
+        for step in 0..3 {
+            clock.advance(if step == 0 {
+                Duration::from_millis(14) // total +25 ms from write_done
+            } else {
+                Duration::from_millis(10)
+            });
+            bus.with(|s| {
+                for id in 1..=7u16 {
+                    s.rx.push_back(make_dm_fb(id, 0, 0.0));
+                }
+            });
+            let p = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            if step < 2 {
+                assert!(
+                    matches!(p, TorqueProgress::Pending { .. }),
+                    "S2: sample {} of 3 must stay Pending, got {p:?}",
+                    step + 1
+                );
+            } else {
+                assert_eq!(
+                    p,
+                    TorqueProgress::Done(TorqueOutcome::Confirmed),
+                    "K=3 post-settle 0x0 samples spanning >= 20 ms must confirm disable"
+                );
             }
-        });
-        let p25 = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
-        assert_eq!(
-            p25,
-            TorqueProgress::Done(TorqueOutcome::Confirmed),
-            "25 ms post-settle 0x0 must confirm disable"
-        );
+        }
         drv.motor_torque_evidence_into(&mut ev);
         assert_eq!(ev, [MotorTorqueEvidence::OffConfirmed; 7]);
         assert_eq!(drv.enable_state(), EnableState::Disabled);
@@ -5291,14 +5405,25 @@ fn e1_damiao_causal_settle_window_rejects_5ms_in_flight_and_accepts_25ms() {
         drv.motor_torque_evidence_into(&mut ev);
         assert_eq!(ev, [MotorTorqueEvidence::Unknown; 7], "5 ms in-flight 0x1 must not confirm OnConfirmed");
 
-        clock.advance(Duration::from_millis(20)); // total +25 ms
-        bus.with(|s| {
-            for id in 1..=7u16 {
-                s.rx.push_back(make_dm_fb(id, 1, 0.0));
+        // S2: K=3 post-settle 0x1 samples spanning >= 2 ticks (>= 20 ms) confirm OnConfirmed!
+        for step in 0..3 {
+            clock.advance(if step == 0 {
+                Duration::from_millis(20) // total +25 ms
+            } else {
+                Duration::from_millis(10)
+            });
+            bus.with(|s| {
+                for id in 1..=7u16 {
+                    s.rx.push_back(make_dm_fb(id, 1, 0.0));
+                }
+            });
+            let p = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            if step < 2 {
+                assert!(matches!(p, TorqueProgress::Pending { .. }));
+            } else {
+                assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
             }
-        });
-        let p25 = drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
-        assert_eq!(p25, TorqueProgress::Done(TorqueOutcome::Confirmed));
+        }
         drv.motor_torque_evidence_into(&mut ev);
         assert_eq!(ev, [MotorTorqueEvidence::OnConfirmed; 7]);
     }
@@ -5378,7 +5503,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         enable_torque_admitted(&mut inner).unwrap();
         inner.apply_stop_policy(StopPolicy::EStopLatch);
 
-        // Fresh resting pose (0.0 rad) with completed drain.
+        // Fresh resting pose (0.0 rad) with completed drain and K=3 spaced causal samples (S2).
         bus.with(|s| {
             s.follow_commands = false;
             s.rx.clear();
@@ -5386,9 +5511,14 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             for m in &mut s.motors {
                 m.q = 0.0;
             }
-            s.push_all_feedback();
         });
-        inner.tick(0.02);
+        for step in 0..3 {
+            if step > 0 {
+                clock.advance(Duration::from_millis(10));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+        }
         assert_eq!(inner.may_disable_torque_while_stopped(), Ok(()));
 
         // Enqueue 70 unrelated bus frames followed by a REAL raised-pose frame for J1 (q = 0.45 rad).
@@ -5528,12 +5658,17 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop));
             assert_eq!(bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(), 0);
 
-            // Tick 2 (within 1 s lifetime): drain completes, fresh post-boundary rest feedback
-            // arrives -> ALLOWED!
+            // Tick 2+ (within 1 s lifetime): drain completes, K=3 fresh post-boundary rest samples
+            // spanning >= 20 ms arrive -> ALLOWED!
             clock.advance(Duration::from_millis(20));
             let _ = drv.read_joint_states().unwrap();
-            bus.with(|s| s.push_all_feedback());
-            let _ = drv.read_joint_states().unwrap();
+            for step in 0..3 {
+                if step > 0 {
+                    clock.advance(Duration::from_millis(10));
+                }
+                bus.with(|s| s.push_all_feedback());
+                let _ = drv.read_joint_states().unwrap();
+            }
             let p = drv
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
@@ -6689,5 +6824,276 @@ fn s1_can_kernel_rx_timestamp_rejects_pre_write_frame_dequeued_25ms_later() {
             drv.feedback_ages()[0].is_some(),
             "S1 RobStride: frame with kernel rx > write_done + 20 ms must be accepted"
         );
+    }
+}
+
+#[test]
+fn s2_evidence_window_requires_three_causal_samples_across_all_drivers() {
+    use armd::driver::{
+        ArmDriver, DamiaoArmDriver, DisableKind, FashionStarArmDriver, FeetechArmDriver,
+        MotorTorqueEvidence, RestPoseGateStatus, RobStrideArmDriver, StoppedDisableGate,
+    };
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::protocol::fashionstar;
+    use armd::protocol::feetech;
+    use armd::protocol::robstride::{self, RobStrideLimits};
+    use armd::transport::{CanFrame, MockCanTransport, MockClock, MockTransport};
+
+    let make_gate = |dof: usize| -> StoppedDisableGate {
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for (i, slot) in arm_joints.iter_mut().take(dof).enumerate() {
+            *slot = i;
+        }
+        StoppedDisableGate {
+            safety_stopped: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: dof,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        }
+    };
+
+    // 1. Damiao: 1 or 2 post-settle samples or 3 same-tick burst samples NEVER confirm
+    //    OffConfirmed, OnConfirmed, or "at rest pose"; a disagreeing sample resets count;
+    //    K=3 consecutive causal samples spanning >= 2 ticks (>= 20 ms) DO confirm.
+    {
+        let dm_limits = DamiaoLimits::default();
+        let dm_fb = |id: u16, state: u8, pos: f32| -> CanFrame {
+            let p = damiao::float_to_uint(pos, dm_limits.p_min, dm_limits.p_max, 16);
+            let v = damiao::float_to_uint(0.0, dm_limits.v_min, dm_limits.v_max, 12);
+            let t = damiao::float_to_uint(0.0, dm_limits.t_min, dm_limits.t_max, 12);
+            let data = [
+                ((state & 0x0f) << 4) | (id as u8 & 0x0f),
+                (p >> 8) as u8,
+                p as u8,
+                (v >> 4) as u8,
+                (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+                t as u8,
+                30,
+                30,
+            ];
+            CanFrame::new_standard(0x10 + id, &data).unwrap()
+        };
+
+        let clock = MockClock::new();
+        let can = MockCanTransport::new().with_clock(clock.clone());
+        let mut drv = DamiaoArmDriver::new(can, vec![1]).with_limits(dm_limits);
+        drv.set_stopped_disable_gate(make_gate(1));
+        drv.read_joint_states().unwrap(); // establish empty RX boundary
+
+        // Single rest sample -> NEVER confirms rest pose.
+        drv.can_mut().provide_rx_frame(dm_fb(1, 1, 0.0));
+        drv.read_joint_states().unwrap();
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+        assert!(drv.disable_torque(DisableKind::DisableRequested { started_at: clock.now(), rollback: false }).is_err());
+
+        // Same-tick burst of 3 samples (span = 0 ms, 1 pass) -> STILL never confirms!
+        drv.can_mut().provide_rx_frames(&[dm_fb(1, 1, 0.0), dm_fb(1, 1, 0.0), dm_fb(1, 1, 0.0)]);
+        drv.read_joint_states().unwrap();
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+
+        // Disagreeing non-rest sample resets the window.
+        clock.advance(Duration::from_millis(20));
+        drv.can_mut().provide_rx_frame(dm_fb(1, 1, 0.40));
+        drv.read_joint_states().unwrap();
+        assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::RefusedNonRest);
+
+        // 3 consecutive rest samples across 3 ticks spanning 40 ms -> Confirmed!
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(20));
+            drv.can_mut().provide_rx_frame(dm_fb(1, 1, 0.0));
+            drv.read_joint_states().unwrap();
+        }
+        assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed);
+
+        // Disable sent -> 1 or 2 post-settle state=0 samples NEVER confirm OffConfirmed;
+        // a disagreeing state=1 resets; K=3 spanning >= 20 ms confirms OffConfirmed.
+        let started_at = clock.now();
+        let _ = drv.begin_disable_torque(DisableKind::DisableRequested { started_at, rollback: false }).unwrap();
+        clock.advance(Duration::from_millis(25));
+        drv.can_mut().provide_rx_frame(dm_fb(1, 0, 0.0));
+        drv.read_joint_states().unwrap();
+        let mut ev = [MotorTorqueEvidence::Unknown; 1];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev[0], MotorTorqueEvidence::Unknown, "S2 Damiao: 1 post-settle state=0 must NOT confirm OffConfirmed");
+
+        clock.advance(Duration::from_millis(10));
+        drv.can_mut().provide_rx_frame(dm_fb(1, 0, 0.0));
+        drv.read_joint_states().unwrap();
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev[0], MotorTorqueEvidence::Unknown, "S2 Damiao: 2 post-settle state=0 must NOT confirm OffConfirmed");
+
+        // Disagreeing state=1 resets count to 0.
+        clock.advance(Duration::from_millis(10));
+        drv.can_mut().provide_rx_frame(dm_fb(1, 1, 0.0));
+        drv.read_joint_states().unwrap();
+        clock.advance(Duration::from_millis(10));
+        drv.can_mut().provide_rx_frame(dm_fb(1, 0, 0.0));
+        drv.read_joint_states().unwrap();
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev[0], MotorTorqueEvidence::Unknown, "S2 Damiao: disagreeing state=1 must reset window");
+
+        // Complete 3 consecutive state=0 samples spanning >= 20 ms.
+        clock.advance(Duration::from_millis(10));
+        drv.can_mut().provide_rx_frame(dm_fb(1, 0, 0.0));
+        drv.read_joint_states().unwrap();
+        clock.advance(Duration::from_millis(10));
+        drv.can_mut().provide_rx_frame(dm_fb(1, 0, 0.0));
+        drv.read_joint_states().unwrap();
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev[0], MotorTorqueEvidence::OffConfirmed, "S2 Damiao: K=3 causal samples spanning 20 ms confirms OffConfirmed");
+    }
+
+    // 2. RobStride: 1 or 2 rest samples NEVER confirm rest pose; K=3 spanning >= 20 ms confirms.
+    {
+        let rs_limits = RobStrideLimits::default();
+        let rs_fb = |pos_rad: f32| -> CanFrame {
+            let id = robstride::build_feedback_extended_id(0, 1, 0xFD);
+            let p_raw = ((pos_rad - rs_limits.p_min) / (rs_limits.p_max - rs_limits.p_min) * 65535.0)
+                .clamp(0.0, 65535.0) as u16;
+            CanFrame::new_extended(id, &[(p_raw >> 8) as u8, p_raw as u8, 0x80, 0, 0x80, 0, 1, 0x2C]).unwrap()
+        };
+        let clock = MockClock::new();
+        let can = MockCanTransport::new().with_clock(clock.clone());
+        let mut drv = RobStrideArmDriver::new(can, vec![1]);
+        drv.set_stopped_disable_gate(make_gate(1));
+        let mut out = Vec::new();
+        let _ = drv.read_joint_states_budgeted(&mut out, clock.now() + Duration::from_millis(5), 64);
+
+        drv.can_mut().provide_rx_frame(rs_fb(0.0));
+        let _ = drv.read_joint_states_budgeted(&mut out, clock.now() + Duration::from_millis(5), 64);
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 RobStride: 1 sample must not confirm");
+
+        clock.advance(Duration::from_millis(20));
+        drv.can_mut().provide_rx_frame(rs_fb(0.0));
+        let _ = drv.read_joint_states_budgeted(&mut out, clock.now() + Duration::from_millis(5), 64);
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 RobStride: 2 samples must not confirm");
+
+        clock.advance(Duration::from_millis(20));
+        drv.can_mut().provide_rx_frame(rs_fb(0.0));
+        let _ = drv.read_joint_states_budgeted(&mut out, clock.now() + Duration::from_millis(5), 64);
+        assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 RobStride: K=3 spanning >= 20 ms confirms");
+    }
+
+    // 3. Feetech:
+    //    (a) 1 stale/delayed torque reply NEVER confirms OffConfirmed/OnConfirmed;
+    //    (b) after a timeout, line stays poisoned until continuously quiet for 20 ms;
+    //    (c) 1 or 2 rest samples NEVER confirm rest pose; K=3 spanning >= 20 ms confirms.
+    {
+        let ft_pos_reply = |id: u8, steps: u16| -> Vec<u8> {
+            let p = steps.to_le_bytes();
+            let params = [p[0], p[1], 0, 0, 0, 0, 70, 35];
+            let cs = feetech::calculate_checksum(id, 10, 0, &params);
+            let mut v = vec![0xFF, 0xFF, id, 10, 0];
+            v.extend_from_slice(&params);
+            v.push(cs);
+            v
+        };
+        let ft_u8_reply = |id: u8, val: u8| -> Vec<u8> {
+            let cs = feetech::calculate_checksum(id, 3, 0, &[val]);
+            vec![0xFF, 0xFF, id, 3, 0, val, cs]
+        };
+
+        let clock = MockClock::new();
+        let mock = MockTransport::new_preserving().with_clock(clock.clone());
+        let mut drv = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
+        drv.set_stopped_disable_gate(make_gate(1));
+
+        // 1 rest sample -> NOT confirmed.
+        drv.transport_mut().provide_rx(&ft_pos_reply(1, 2048));
+        drv.read_joint_states().unwrap();
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 Feetech: 1 rest sample must not confirm");
+
+        // 2nd rest sample -> still NOT confirmed.
+        clock.advance(Duration::from_millis(20));
+        drv.transport_mut().provide_rx(&ft_pos_reply(1, 2048));
+        drv.read_joint_states().unwrap();
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 Feetech: 2 rest samples must not confirm");
+
+        // 3rd rest sample -> Confirmed!
+        clock.advance(Duration::from_millis(20));
+        drv.transport_mut().provide_rx(&ft_pos_reply(1, 2048));
+        drv.read_joint_states().unwrap();
+        assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 Feetech: K=3 rest samples confirm");
+
+        // Timeout poisons line -> must stay poisoned until idle for 20 ms (10 ms quiet is NOT enough!).
+        // Trigger a chunk timeout by reading with empty RX.
+        drv.read_joint_states().unwrap();
+        clock.advance(Duration::from_millis(10));
+        // Provide a valid reply while still inside the 20 ms poison quiet window -> must be discarded / ignored!
+        drv.transport_mut().provide_rx(&ft_pos_reply(1, 2500));
+        let prev_seq = drv.feedback_seqs()[0];
+        drv.read_joint_states().unwrap();
+        assert_eq!(
+            drv.feedback_seqs()[0],
+            prev_seq,
+            "S2 Feetech: poisoned line must NOT accept replies before 20 ms of continuous silence"
+        );
+        // After 20 ms continuous silence with no bytes, line clears and accepts new samples.
+        clock.advance(Duration::from_millis(25));
+        drv.read_joint_states().unwrap(); // drains 0 bytes -> clears poison (timeout if empty, wait: provide reply via respond_to_write!)
+        // Verify single torque-off reply NEVER confirms OffConfirmed (only 1 reply queued, rounds 2 & 3 time out).
+        let read_req = feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1);
+        let _ = read_req;
+        drv.transport_mut().clear();
+        clock.advance(Duration::from_millis(25));
+        drv.transport_mut().provide_rx(&ft_u8_reply(1, 0));
+        let _ = drv.disable_torque(DisableKind::DisableProtective {
+            reason: armd::driver::DisableProtectiveReason::ProcessExit,
+        });
+        let mut ev = [MotorTorqueEvidence::Unknown; 1];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev[0],
+            MotorTorqueEvidence::Unknown,
+            "S2 Feetech: single REG_TORQUE_ENABLE=0 reply must NEVER confirm OffConfirmed"
+        );
+
+        // 3 causal REG_TORQUE_ENABLE=0 replies across 3 spaced rounds -> OffConfirmed!
+        clock.advance(Duration::from_millis(25));
+        let ping_req = feetech::build_ping(1);
+        let ping_cs = feetech::calculate_checksum(1, 2, 0, &[]);
+        drv.transport_mut().respond_to_write(&ping_req, &[0xFF, 0xFF, 1, 2, 0, ping_cs]);
+        drv.transport_mut().respond_to_write(&feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1), &ft_u8_reply(1, 0));
+        drv.disable_torque(DisableKind::DisableProtective {
+            reason: armd::driver::DisableProtectiveReason::ProcessExit,
+        })
+        .unwrap();
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev[0],
+            MotorTorqueEvidence::OffConfirmed,
+            "S2 Feetech: K=3 causal REG_TORQUE_ENABLE=0 replies spanning >= 20 ms confirms OffConfirmed"
+        );
+    }
+
+    // 4. FashionStar: 1 or 2 rest samples NEVER confirm rest pose; K=3 spanning >= 20 ms confirms.
+    {
+        let fs_angle_reply = |id: u8, tenth_deg: i16| -> Vec<u8> {
+            let [lo, hi] = tenth_deg.to_le_bytes();
+            let mut pkt = vec![0x05, 0x1C, fashionstar::CMD_QUERY_SERVO_ANGLE, 3, id, lo, hi];
+            let cs: u8 = pkt.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+            pkt.push(cs);
+            pkt
+        };
+        let clock = MockClock::new();
+        let mock = MockTransport::new_preserving().with_clock(clock.clone());
+        let mut drv = FashionStarArmDriver::new(mock, vec![0]);
+        drv.set_stopped_disable_gate(make_gate(1));
+
+        drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+        drv.read_joint_states().unwrap();
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 FashionStar: 1 sample must not confirm");
+
+        clock.advance(Duration::from_millis(20));
+        drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+        drv.read_joint_states().unwrap();
+        assert_ne!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 FashionStar: 2 samples must not confirm");
+
+        clock.advance(Duration::from_millis(20));
+        drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
+        drv.read_joint_states().unwrap();
+        assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 FashionStar: K=3 spanning >= 20 ms confirms");
     }
 }

@@ -164,14 +164,19 @@ impl SupervisorInner {
         // `feedback_numeric_valid` are ignored.
         // Driverless mock (`None`): keeps working for tests without hardware timestamps
         // (`last_can_feedback_instant.is_none()` allowed), judging position finiteness on J1..J6.
-        let positions_fresh = match self.driver.as_ref() {
-            Some(d) => d.lock().is_ok_and(|drv| {
-                drv.fresh_joint_positions_into(
-                    &arm_joints,
-                    STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE,
-                    &mut arm_positions[..arm_joints.len()],
-                )
-            }),
+        let (positions_fresh, rest_gate_status) = match self.driver.as_ref() {
+            Some(d) => match d.lock() {
+                Ok(drv) => {
+                    let fresh = drv.fresh_joint_positions_into(
+                        &arm_joints,
+                        STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE,
+                        &mut arm_positions[..arm_joints.len()],
+                    );
+                    let status = drv.rest_pose_gate_status();
+                    (fresh, status)
+                }
+                Err(_) => (false, crate::driver::RestPoseGateStatus::RefusedNonRest),
+            },
             None => {
                 if !self.feedback_numeric_valid
                     || self.measured_positions.len() < self.config.dof
@@ -179,7 +184,7 @@ impl SupervisorInner {
                         .last_can_feedback_instant
                         .is_none_or(|t| t.elapsed() <= STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE)
                 {
-                    false
+                    (false, crate::driver::RestPoseGateStatus::RefusedNonRest)
                 } else {
                     let mut ok = true;
                     for (slot, &i) in arm_positions[..arm_joints.len()].iter_mut().zip(arm_joints.iter()) {
@@ -190,7 +195,7 @@ impl SupervisorInner {
                         }
                         *slot = p;
                     }
-                    ok
+                    (ok, crate::driver::RestPoseGateStatus::Confirmed)
                 }
             }
         };
@@ -211,6 +216,9 @@ impl SupervisorInner {
                     tolerance: tol,
                 });
             }
+        }
+        if rest_gate_status != crate::driver::RestPoseGateStatus::Confirmed {
+            return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
         }
         Ok(())
     }
