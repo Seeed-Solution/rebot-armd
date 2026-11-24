@@ -473,14 +473,37 @@ the header).
   a progress bar with the phase and recording time, Stop, and Delete with an in-page confirm.
   The list refreshes after a save; rejections show as a toast with the code.
 
-The cockpit does not take the lease when it opens. It acquires it on the first control input
-(jog, stick, key, Cartesian input, preset, enable, gripper, grasp, gravity compensation, park
-or home) and releases it after 30 s without input, only while torque is off and no action,
-gravity compensation, stream or motion is running: armd parks a torqued arm whose lease is
-released. An agent can therefore take the lease while a cockpit page is open. When another
-client holds the lease, the cockpit switches to observer mode, names the holder from the
-observation's `lease_holder` (another cockpit page, the AI agent `rebot-mcp`, or the client's
-label) and offers a takeover with confirmation. E-stop works without the lease.
+- **Cockpit lease**:
+  - Opening, reloading, or reconnecting the cockpit page never acquires the control lease. The
+    page connects read-only (observation and telemetry) and shows the current lease holder (or
+    read-only / no holder), so an agent can take the lease while a cockpit page is open.
+  - The cockpit acquires the lease only on an explicit operator action: holding **Enable** (or
+    tapping it to reset E-stop or clear a fault), or attempting a motion, torque, or other
+    lease-gated action while unleased. Attempting a lease-gated action while unleased first
+    opens an in-page **"Take control?"** confirmation prompt (not `window.confirm`); confirming
+    acquires the lease without auto-replaying the prior motion or torque action, so the operator
+    then repeats the action or starts a fresh input.
+  - If another client holds the lease, the cockpit switches to read-only observer mode, names
+    the holder from `observation.lease_holder` (another cockpit page with its id on takeover
+    confirmation, an AI agent, or the client's label / unnamed client), and offers an explicit
+    **"Take control"** button (`force: true`). Forced takeover requires operator authentication
+    when auth is enforced, is never automatic, and its confirmation authorizes preemption based
+    on the latest observed `lease_holder` label (the cockpit invalidates confirmation if the
+    observed holder changes or clears before click).
+  - A page that held the lease and reconnects (or whose lease expires) does not silently
+    re-acquire it; it shows a **"Control released"** banner with an explicit button to take
+    control again.
+  - Idle release: the cockpit releases an idle lease after 30 s without input only while torque
+    is off and no action, gravity compensation, stream, or motion is running (because `armd` runs
+    the lease watchdog park or holds with `WatchdogTimeout` if a lease is released while
+    torqued). After idle release, control is not re-acquired automatically — the operator uses
+    **Enable** or confirms **"Take control?"** when needed.
+  - Ordinary **Stop** (`#btn-stop` and the `Stop` button inside lease confirmation and operator
+    PIN dialogs) never acquires a lease: when leased it sends `/api/v1/motion/stop` and confirms
+    `"Stopped, holding position"` only on ACK; in observer mode (no lease) or when no active
+    lease / WebSocket session is available it stays actionable to cancel local intents, sends no
+    `acquire_lease`, warns that Stop could not be confirmed, and points to **E-Stop** (which always works without
+    a lease, including via `Space` and the modal E-Stop button).
 
 ### Calibration wizard
 
