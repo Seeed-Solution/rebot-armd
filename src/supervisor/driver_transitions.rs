@@ -2330,6 +2330,17 @@ impl SupervisorInner {
                     ctx.pending_estop = self.estop_request_unapplied();
                     match reset_res {
                         Ok(()) => ctx.hardware_reset_sent = true,
+                        Err(
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                            | crate::driver::ArmDriverError::DisableRequestExpired,
+                        ) => {
+                            let r = self
+                                .may_disable_torque_while_stopped()
+                                .err()
+                                .unwrap_or(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                            self.last_stopped_torque_off_refusal = Some(r);
+                            return Err(r.into_safety_error(&self.config.joint_names));
+                        }
                         Err(e) => ctx.hardware_error = Some(clear_fault_driver_error(&e)),
                     }
                     let post_refusal = self.safety.clear_check(&ctx).unwrap_err();
@@ -2798,6 +2809,17 @@ impl SupervisorInner {
                     ctx.pending_estop = self.estop_request_unapplied();
                     match reset_res {
                         Ok(()) => ctx.hardware_reset_sent = true,
+                        Err(
+                            crate::driver::ArmDriverError::TorqueOffWouldDrop
+                            | crate::driver::ArmDriverError::DisableRequestExpired,
+                        ) => {
+                            let r = self
+                                .may_disable_torque_while_stopped()
+                                .err()
+                                .unwrap_or(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback);
+                            self.last_stopped_torque_off_refusal = Some(r);
+                            return Err(r.into_clear_fault_error());
+                        }
                         Err(e) => ctx.hardware_error = Some(clear_fault_driver_error(&e)),
                     }
                     let post_refusal = self.safety.clear_check(&ctx).unwrap_err();

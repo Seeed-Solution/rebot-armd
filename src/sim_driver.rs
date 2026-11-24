@@ -370,6 +370,42 @@ impl SimArmDriver {
         Ok(())
     }
 
+    /// Enforces Rule A′ and the single 1 s request lifetime at send time for `DisableRequested`
+    /// while safety state is stopped (Fault or E-stop), reading timestamp & positions from the
+    /// same coherent simulator feedback packet. Zero heap allocations.
+    fn check_stopped_disable_requested(&self, started_at: Instant) -> Result<(), ArmDriverError> {
+        let stopped = self
+            .stopped_disable_gate
+            .as_ref()
+            .is_some_and(crate::driver::StoppedDisableGate::is_safety_stopped)
+            || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
+            || self.estop_gate.as_ref().is_some_and(|g| g.pending());
+        if !stopped {
+            return Ok(());
+        }
+        if Instant::now().saturating_duration_since(started_at)
+            >= crate::driver::STOPPED_DISABLE_REQUEST_LIFETIME
+        {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        };
+        let arm_joints = gate.arm_joint_indices();
+        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        if !self.fresh_joint_positions_into(
+            arm_joints,
+            crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+            &mut arm_positions[..arm_joints.len()],
+        ) {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        }
+        if !gate.check_positions(&arm_positions[..arm_joints.len()]) {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        }
+        Ok(())
+    }
+
     fn send_ref(&mut self, with_targets: bool, enable: Option<bool>, gate: SendGate) -> Result<u64, ArmDriverError> {
         let next_seq = self.seq + 1;
         let cmd = SimCommandRef {
@@ -384,11 +420,14 @@ impl SimArmDriver {
         if let Some(hook) = self.before_send_hook.as_ref() {
             hook();
         }
-        // Final pending-E-stop gate right before the socket send.
+        // Final send-time stop & Rule A′ gate right before the socket send.
         match gate {
             SendGate::Target => self.estop_check()?,
             SendGate::Enable => self.enable_estop_inhibited()?,
-            SendGate::DisableRequested { .. } | SendGate::DisableProtective { .. } => {}
+            SendGate::DisableRequested { started_at } => {
+                self.check_stopped_disable_requested(started_at)?;
+            }
+            SendGate::DisableProtective { .. } => {}
         }
         self.seq = next_seq;
         if serialized {
