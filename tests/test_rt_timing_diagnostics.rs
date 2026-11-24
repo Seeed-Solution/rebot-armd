@@ -2244,3 +2244,198 @@ async fn tail_stall_sub_release_overrun_in_flight_stall_and_load_py_boundaries()
         jh.join().unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_published_strictly_last_never_visible_during_tail_both_owners() {
+    /// Allocation-free wrapper clock that pauses inside `sleep()` when armed so the test thread
+    /// can poll `sup.tick_stats()` deterministically while post-push/post-step tail work is open.
+    struct TailBarrierClock {
+        inner: Arc<LatenessClock>,
+        arm_barrier: AtomicBool,
+        barrier_state: Mutex<(bool, bool)>, // (entered, released)
+        barrier_cv: Condvar,
+    }
+
+    impl TailBarrierClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: LatenessClock::new(),
+                arm_barrier: AtomicBool::new(false),
+                barrier_state: Mutex::new((false, false)),
+                barrier_cv: Condvar::new(),
+            })
+        }
+
+        fn wait_entered(&self) {
+            let mut g = self.barrier_state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !g.0 {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                assert!(!rem.is_zero(), "timed out waiting for tail barrier entry");
+                g = self.barrier_cv.wait_timeout(g, rem).unwrap().0;
+            }
+        }
+
+        fn release_barrier(&self) {
+            let mut g = self.barrier_state.lock().unwrap();
+            g.1 = true;
+            self.barrier_cv.notify_all();
+        }
+    }
+
+    impl ExecutorClock for TailBarrierClock {
+        fn now(&self) -> Instant { self.inner.now() }
+        fn now_ns(&self) -> u64 { self.inner.now_ns() }
+        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+            self.inner.sleep_until_ns(target_ns, stop);
+        }
+        fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+            self.inner.sleep(dur, stop);
+            if self.arm_barrier.swap(false, Ordering::AcqRel) {
+                let mut g = self.barrier_state.lock().unwrap();
+                g.0 = true;
+                self.barrier_cv.notify_all();
+                while !g.1 && !stop.load(Ordering::Acquire) {
+                    g = self.barrier_cv.wait(g).unwrap();
+                }
+            }
+        }
+        fn wake(&self) {
+            self.inner.wake();
+            self.release_barrier();
+        }
+    }
+
+    // (a) Legacy owner: poll during open tail stall MUST see releases_started == 1, releases_total == 0,
+    //     in_flight_release_us > 0, and NEVER releases_total == 1 before the tail seals.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = TailBarrierClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+            });
+        });
+
+        loop_stats.post_stats_delay_once_ns.store(25_000_000, Ordering::Release);
+        clock.arm_barrier.store(true, Ordering::Release);
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.inner.cv.notify_all();
+        }
+        clock.wait_entered();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        for _ in 0..8 {
+            let mid = sup.tick_stats();
+            assert!(mid.loop_active);
+            assert_eq!(mid.releases_started, 1, "release started must be visible during tail: {mid:?}");
+            assert_eq!(mid.releases_total, 0, "completion MUST NOT publish before tail finishes: {mid:?}");
+            assert!(mid.in_flight_release_us > 0, "in_flight_release_us must stay nonzero during tail: {mid:?}");
+            assert!(!mid.stats_snapshot_lapped);
+        }
+
+        clock.release_barrier();
+        // Wait until parked for release #2.
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while (s.completed_sleeps < 1 || s.waiting_for_ns.is_none()) && Instant::now() < deadline {
+                let (next, _) = clock.inner.cv.wait_timeout(s, Duration::from_millis(20)).unwrap();
+                s = next;
+            }
+            assert!(s.waiting_for_ns.is_some());
+        }
+        let sealed = sup.tick_stats();
+        assert!(sealed.loop_active);
+        assert_eq!(sealed.releases_started, 1);
+        assert_eq!(sealed.releases_total, 1);
+        assert_eq!(sealed.in_flight_release_us, 0);
+        assert!(sealed.release_us.max >= 25_000);
+        assert!(sealed.release_us_max_ever >= 25_000);
+        assert_eq!(sealed.releases_over_20ms, 1);
+        assert_eq!(sealed.skipped_releases, 1);
+
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+        let after_stop = sup.tick_stats();
+        assert!(!after_stop.loop_active);
+        assert_eq!(after_stop.in_flight_release_us, 0);
+    }
+
+    // (b) Executor owner: poll during open post-diag_tx.push tail MUST see releases_started == 1,
+    //     releases_total == 0, in_flight_release_us > 0, and NEVER releases_total == 1 until sealed.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = TailBarrierClock::new();
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(20));
+        cfg.alloc_timing = true;
+        let handle = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        handle.stats().post_stats_delay_once_ns.store(25_000_000, Ordering::Release);
+        clock.arm_barrier.store(true, Ordering::Release);
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.inner.cv.notify_all();
+        }
+        clock.wait_entered();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        for _ in 0..8 {
+            let mid = sup.tick_stats();
+            assert!(mid.loop_active);
+            assert_eq!(mid.releases_started, 1);
+            assert_eq!(mid.releases_total, 0, "executor completion MUST NOT publish before tail finishes: {mid:?}");
+            assert!(mid.in_flight_release_us > 0, "executor in_flight_release_us must stay nonzero during tail: {mid:?}");
+            assert!(!mid.stats_snapshot_lapped);
+        }
+
+        clock.release_barrier();
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while (s.completed_sleeps < 1 || s.waiting_for_ns.is_none()) && Instant::now() < deadline {
+                let (next, _) = clock.inner.cv.wait_timeout(s, Duration::from_millis(20)).unwrap();
+                s = next;
+            }
+            assert!(s.waiting_for_ns.is_some());
+        }
+        let sealed = sup.tick_stats();
+        assert!(sealed.loop_active);
+        assert_eq!(sealed.releases_started, 1);
+        assert_eq!(sealed.releases_total, 1);
+        assert_eq!(sealed.in_flight_release_us, 0);
+        assert!(sealed.release_us.max >= 25_000);
+        assert!(sealed.release_us_max_ever >= 25_000);
+        assert_eq!(sealed.releases_over_20ms, 1);
+        assert_eq!(sealed.skipped_releases, 1);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+        handle.stop_and_join();
+        let after_stop = sup.tick_stats();
+        assert!(!after_stop.loop_active);
+        assert_eq!(after_stop.in_flight_release_us, 0);
+    }
+}

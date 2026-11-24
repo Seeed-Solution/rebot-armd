@@ -659,6 +659,9 @@ pub struct TickSnapshot {
     pub diag_dropped: u64,
     /// Active control-loop owner mode (`"legacy"`, `"transferring"`, `"executor"`, `"failed"`).
     pub owner_mode: &'static str,
+    /// True while the owning periodic control loop is actively running.
+    #[serde(default)]
+    pub loop_active: bool,
     /// Longest read-lock hold by another task per tick interval (includes preemption of that task).
     pub reader_hold_us: Percentiles,
     /// Longest write-lock hold by another task per tick interval.
@@ -1334,9 +1337,11 @@ impl LockFreeTickStats {
 
     /// Wait-free single-writer tail amendment by executor `release_seq` (called only by off-thread
     /// `drain_diag` under the `diag_rx` consumer mutex so `LockFreeTickStats` stays single-writer).
-    pub fn amend_release_us_by_release_seq(&self, release_seq: u64, release_us: u32) {
+    /// Scans up to [`TICK_WINDOW`] recent slots (`1000 > DIAG_RING_CAPACITY`) and returns `true`
+    /// if the target sample was found in the ring, or `false` if evicted or contended.
+    pub fn amend_release_us_by_release_seq(&self, release_seq: u64, release_us: u32) -> bool {
         if release_seq == 0 {
-            return;
+            return false;
         }
         if self
             .writer_busy
@@ -1344,7 +1349,7 @@ impl LockFreeTickStats {
             .is_err()
         {
             self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         struct BusyGuard<'a>(&'a AtomicBool);
         impl Drop for BusyGuard<'_> {
@@ -1356,7 +1361,7 @@ impl LockFreeTickStats {
         let _busy = BusyGuard(&self.writer_busy);
 
         let end_seq = self.write_seq.load(Ordering::Relaxed);
-        let scan = (end_seq as usize).min(16);
+        let scan = (end_seq as usize).min(TICK_WINDOW);
         for back in 0..scan {
             let seq = end_seq - back as u64;
             let slot = &self.slots[((seq - 1) as usize) & (LOCK_FREE_RING_CAPACITY - 1)];
@@ -1370,9 +1375,10 @@ impl LockFreeTickStats {
                     slot.release_us.store(release_us, Ordering::Relaxed);
                     slot.seq.store(s0.wrapping_add(2), Ordering::Release);
                 }
-                break;
+                return true;
             }
         }
+        false
     }
 
     fn read_meta_seqlock(&self) -> Option<(u64, u64, TxTotals)> {
@@ -1519,6 +1525,9 @@ impl TickWindow {
     /// The samples, oldest first.
     pub fn samples(&self) -> &[TickSample] { &self.rows }
 
+    /// Returns `true` when this window exhausted bounded seqlock retries.
+    pub fn is_lapped(&self) -> bool { self.snapshot_lapped }
+
     fn col(&self, f: impl Fn(&TickSample) -> u32) -> Percentiles {
         let mut v: Vec<u32> = self.rows.iter().map(f).collect();
         percentiles(&mut v)
@@ -1562,6 +1571,7 @@ impl TickWindow {
             skipped_releases: 0,
             diag_dropped: 0,
             owner_mode: "legacy",
+            loop_active: false,
             reader_hold_us: self.col(|r| r.reader_hold_us),
             writer_hold_us: self.col(|r| r.writer_hold_us),
             stats_wait_us: self.col(|r| r.stats_wait_us),
@@ -1919,17 +1929,27 @@ mod tests {
         lf.amend_slot_release_us(seq1, 25_200);
         assert_eq!(lf.window().samples()[0].release_us, 25_200);
 
-        // Executor release_seq-based amendment updates the recorded slot monotonically.
+        // Executor release_seq-based amendment updates the recorded slot monotonically even > 16 slots deep.
         let _ = lf.record(&TickSample {
             tick_us: 900,
             release_us: 1_100,
             release_seq: 202,
             ..Default::default()
         });
-        lf.amend_release_us_by_release_seq(202, 26_700);
+        for k in 0..32u64 {
+            let _ = lf.record(&TickSample {
+                tick_us: 500,
+                release_us: 600,
+                release_seq: 203 + k,
+                ..Default::default()
+            });
+        }
+        assert!(lf.amend_release_us_by_release_seq(202, 26_700));
         let samples = lf.window().samples().to_vec();
         assert_eq!(samples[1].release_seq, 202);
         assert_eq!(samples[1].release_us, 26_700);
+        // Unknown / evicted sequence returns `false` so callers record explicit coverage loss.
+        assert!(!lf.amend_release_us_by_release_seq(999_999, 10_000));
         assert_eq!(lf.writer_contention_drops(), 0);
     }
 }

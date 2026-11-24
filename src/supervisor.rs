@@ -6042,10 +6042,7 @@ impl ArmSupervisor {
     /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). Reads the lock-free ring
     /// without ever blocking the control thread.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
-        self.drain_diag();
-        let mut snap = self.tick_stats.snapshot();
-        snap.instance_id = self.instance_id.clone();
-        snap.owner_mode = self.owner_mode_name();
+        const MAX_ALIGN_ATTEMPTS: usize = 4;
         let active_stats = if let Some(h) = self.executor_handle() {
             Some(Arc::clone(h.stats()))
         } else {
@@ -6054,11 +6051,52 @@ impl ArmSupervisor {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         };
-        if let Some(s) = active_stats {
-            let mono = s.snapshot_monotonic();
-            if !mono.coherent {
+
+        let mut snap = if let Some(s) = active_stats {
+            // Bounded alignment loop: read monotonic snapshot FIRST (Acquire on `stats_seq`),
+            // drain off-thread diagnostics (guaranteed to include all samples & amendments
+            // published before `mono1`), copy the lock-free window (fast memcpy, no sort),
+            // and re-read monotonic snapshot to confirm no release crossed the capture window.
+            let mut chosen: Option<(
+                crate::diagnostics::tick::TickWindow,
+                crate::rt_core::executor::MonotonicStatsSnapshot,
+            )> = None;
+            let mut last_attempt = None;
+            for _ in 0..MAX_ALIGN_ATTEMPTS {
+                let mono1 = s.snapshot_monotonic();
+                self.drain_diag();
+                let win = self.tick_stats.window();
+                let mono2 = s.snapshot_monotonic();
+                let aligned = mono1.coherent
+                    && mono2.coherent
+                    && !win.is_lapped()
+                    && mono1.releases_started == mono2.releases_started
+                    && mono1.releases_total == mono2.releases_total
+                    && mono1.skipped_releases == mono2.skipped_releases
+                    && mono1.loop_active == mono2.loop_active;
+                if aligned {
+                    chosen = Some((win, mono2));
+                    break;
+                }
+                last_attempt = Some((win, mono2));
+            }
+            let (win, mono, align_lapped) = match chosen {
+                Some((win, mono)) => (win, mono, false),
+                None => {
+                    let (win, mono) = last_attempt.expect("MAX_ALIGN_ATTEMPTS > 0");
+                    (win, mono, true)
+                }
+            };
+            let mut snap = win.snapshot();
+            snap.stats_reader_retries = self.tick_stats.reader_retries();
+            snap.stats_writer_drops = self
+                .tick_stats
+                .writer_contention_drops()
+                .saturating_add(s.amend_missed.load(Ordering::Relaxed));
+            if !mono.coherent || align_lapped {
                 snap.stats_snapshot_lapped = true;
             }
+            snap.loop_active = mono.loop_active;
             snap.releases_started = mono.releases_started;
             snap.releases_total = mono.releases_total;
             snap.in_flight_release_us = mono.in_flight_release_us;
@@ -6073,7 +6111,13 @@ impl ArmSupervisor {
             snap.wake_lateness_over_5ms = mono.wake_lateness_over_5ms;
             snap.wake_lateness_over_10ms = mono.wake_lateness_over_10ms;
             snap.since_marker = mono.since_marker;
-        }
+            snap
+        } else {
+            self.drain_diag();
+            self.tick_stats.snapshot()
+        };
+        snap.instance_id = self.instance_id.clone();
+        snap.owner_mode = self.owner_mode_name();
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),
