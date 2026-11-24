@@ -200,6 +200,7 @@ impl CollisionGuard {
     }
 
     /// Clears any active collision hold and consecutive-tick counters (zero allocation).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn clear_hold(&mut self) {
         self.hold = None;
         self.over = [0; 6];

@@ -151,11 +151,13 @@ impl SupervisorInner {
 impl ArmSupervisor {
     /// Load the episode catalog (boot recovery) once; later calls do nothing.
     pub async fn ensure_episodes_loaded(&self) -> Result<Option<store::RecoveryReport>, ArmError> {
-        let (st, offsets, names, profile, fps) = {
-            let inner = self.inner().read().await;
-            (inner.episodes.clone(), inner.joint_zero_offsets.clone(), inner.joint_names(), inner.config.profile_id.clone(), f64::from(inner.config.control_frequency_hz))
-        };
+        let pub_cfg = self.published_config().await?;
+        let st = pub_cfg.episodes.clone();
         if !st.enabled() || st.is_loaded() { return Ok(None); }
+        let offsets = pub_cfg.joint_zero_offsets.clone();
+        let names = pub_cfg.joint_names();
+        let profile = pub_cfg.config.profile_id.clone();
+        let fps = f64::from(pub_cfg.config.control_frequency_hz);
         let report = tokio::task::spawn_blocking(move || st.load(&offsets, &names, profile.as_deref(), fps)).await
             .map_err(|e| ArmError::Internal(format!("episode load failed: {e}")))??;
         Ok(Some(report))
@@ -298,6 +300,9 @@ impl ArmSupervisor {
     }
 
     pub async fn episode_store(&self) -> crate::recording::EpisodeStore {
+        if let Ok(pub_cfg) = self.published_config().await {
+            return pub_cfg.episodes.clone();
+        }
         self.inner().read().await.episodes.clone()
     }
 }

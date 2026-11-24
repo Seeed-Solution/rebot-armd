@@ -754,9 +754,9 @@ pub async fn episodes_import(
 /// `GET /api/v1/sequences`: `{sequences: [sequence + stale_steps + missing_steps + running]}`.
 pub async fn get_sequences(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let inner = supervisor.inner().read().await;
-    let list: Vec<_> = inner.sequences.file.sequences.iter().map(|s| crate::sequences::view(&inner, s)).collect();
-    Ok(Json(serde_json::json!({"sequences": list, "revision": inner.sequences.revision})))
+    let pub_cfg = supervisor.published_config().await?;
+    let list: Vec<_> = pub_cfg.sequences.file.sequences.iter().map(|s| pub_cfg.sequence_view(s)).collect();
+    Ok(Json(serde_json::json!({"sequences": list, "revision": pub_cfg.sequences.revision})))
 }
 
 /// `GET /api/v1/sequences/{id}`.
@@ -765,10 +765,10 @@ pub async fn get_sequence(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let inner = supervisor.inner().read().await;
-    let s = inner.sequences.get(&id)
+    let pub_cfg = supervisor.published_config().await?;
+    let s = pub_cfg.sequences.get(&id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("No sequence with id '{id}'"), "SEQUENCE_NOT_FOUND".into()))?;
-    Ok(Json(crate::sequences::view(&inner, s)))
+    Ok(Json(pub_cfg.sequence_view(s)))
 }
 
 /// `GET /api/v1/datasets`: `{datasets: [{name, episodes, duration_s, bytes, created_at, description}]}`.
@@ -786,16 +786,14 @@ pub async fn get_datasets(State(supervisor): State<Arc<ArmSupervisor>>) -> Resul
 pub async fn get_grasp_setup(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
-) -> Response {
-    let (setup, revision, camera_down, width_check) = {
-        let inner = supervisor.inner().read().await;
-        let setup = inner.grasp_setup();
-        let camera_down = setup.as_ref().map(|s| crate::grasp::camera_down_mode(s, &inner.config.camera_mount));
-        let width_check = setup.as_ref().map(|s| crate::grasp::grasp_width_check_json(&inner, s.max_grasp_width_m));
-        (setup, inner.grasp_setup_revision, camera_down, width_check)
-    };
+) -> Result<Response, ApiError> {
+    let pub_cfg = supervisor.published_config().await?;
+    let setup = pub_cfg.grasp_setup();
+    let camera_down = setup.as_ref().map(|s| crate::grasp::camera_down_mode(s, &pub_cfg.config.camera_mount));
+    let width_check = setup.as_ref().map(|s| crate::grasp::grasp_width_check_json_from_published(&pub_cfg, s.max_grasp_width_m));
+    let revision = pub_cfg.grasp_setup_revision;
     let path = deps.setup_path.as_ref().map(|p| p.display().to_string());
-    match setup {
+    Ok(match setup {
         Some(s) => {
             let mut v = serde_json::json!({"supported": true, "setup": s, "path": path, "revision": revision,
                 "width_check": width_check});
@@ -807,7 +805,7 @@ pub async fn get_grasp_setup(
             Json(v).into_response()
         }
         None => Json(serde_json::json!({"supported": false, "setup": null, "path": path, "revision": revision})).into_response(),
-    }
+    })
 }
 
 /// `POST /api/v1/grasp/measure`: one depth measurement at the current pose, no lease and no
@@ -828,89 +826,70 @@ pub async fn post_grasp_measure(
 pub async fn get_calibration(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::calibration::CalibrationDeps>,
-) -> Response {
-    Json(crate::calibration::status(&supervisor, &deps).await).into_response()
+) -> Result<Response, ApiError> {
+    Ok(Json(crate::calibration::status_result(&supervisor, &deps).await?).into_response())
 }
 
 /// `GET /api/v1/workspace/keepout`: effective keep-out boxes and their source.
-pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    Json(supervisor.inner().read().await.keepout_state()).into_response()
+pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Response, ApiError> {
+    let pub_cfg = supervisor.published_config().await?;
+    Ok(Json(pub_cfg.keepout_state()).into_response())
 }
 
 /// `GET /api/v1/poses`: stored named poses (no lease).
-pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    let (list, revision, default_joint_names) = {
-        let inner = supervisor.inner().read().await;
-        let default_joint_names = inner
-            .poses
-            .list
-            .joint_names
-            .clone()
-            .unwrap_or_else(|| inner.joint_names());
-        (
-            inner.poses.list.clone(),
-            inner.poses.revision,
-            default_joint_names,
-        )
-    };
-    let poses: Vec<serde_json::Value> = list
-        .poses
-        .iter()
-        .map(|p| crate::poses::pose_response_value(p, &default_joint_names))
-        .collect();
-    let mut obj = serde_json::Map::new();
-    if let Some(profile_id) = list.profile_id {
-        obj.insert("profile_id".into(), serde_json::Value::String(profile_id));
-    }
-    if let Some(arm_dof) = list.arm_dof {
-        obj.insert("arm_dof".into(), serde_json::json!(arm_dof));
-    }
-    if let Some(gripper_joint) = list.gripper_joint {
-        obj.insert("gripper_joint".into(), serde_json::json!(gripper_joint));
-    }
-    obj.insert(
-        "joint_names".into(),
-        serde_json::json!(list.joint_names.unwrap_or(default_joint_names)),
-    );
-    obj.insert("poses".into(), serde_json::Value::Array(poses));
-    obj.insert("revision".into(), serde_json::json!(revision));
-    Json(serde_json::Value::Object(obj)).into_response()
+pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Response, ApiError> {
+    let pub_cfg = supervisor.published_config().await?;
+    Ok(Json(pub_cfg.poses_response()).into_response())
 }
 
 /// `GET /api/v1/safety/collision`: effective collision guard config (scaled thresholds).
-pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    Json(supervisor.inner().read().await.collision_config()).into_response()
+pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Response, ApiError> {
+    let pub_cfg = supervisor.published_config().await?;
+    let live_active = supervisor
+        .hub()
+        .latest()
+        .map(|s| s.obs.collision.is_some_and(|c| c.active));
+    Ok(Json(pub_cfg.collision_config(live_active)).into_response())
 }
 
 /// `GET /api/v1/safety/describe`: limits, stops and faults of this armd (no lease).
 pub async fn get_safety_describe(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
-) -> Response {
-    let mut val = supervisor.inner().read().await.safety_describe();
+) -> Result<Response, ApiError> {
+    let pub_cfg = supervisor.published_config().await?;
+    let mut val = crate::safety_describe::build_safety_describe(&pub_cfg);
     if let Some(hw) = val.get_mut("hardware").and_then(serde_json::Value::as_object_mut) {
         hw.insert("operator_auth_enforced".into(), serde_json::json!(auth.is_enforced()));
     }
-    Json(val).into_response()
+    Ok(Json(val).into_response())
 }
 
 /// `GET /api/v1/gripper/calibration`: current gripper calibration and effective policy (no lease).
-/// GET /api/v1/gripper/calibration
-pub async fn get_gripper_calibration(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    Json(supervisor.inner().read().await.gripper_calibration_response()).into_response()
+pub async fn get_gripper_calibration(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Response, ApiError> {
+    let pub_cfg = supervisor.published_config().await?;
+    Ok(Json(pub_cfg.gripper_calibration_response()).into_response())
 }
 
 /// GET /api/v1/tool/commissioning
-pub async fn get_tool_commissioning(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    Json(supervisor.inner().read().await.tool_commissioning_response()).into_response()
+pub async fn get_tool_commissioning(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Response, ApiError> {
+    let pub_cfg = supervisor.published_config().await?;
+    Ok(Json(pub_cfg.tool_commissioning_response()).into_response())
 }
 
 /// POST /api/v1/tool/commissioning/confirm
 pub async fn post_tool_commissioning_confirm(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    headers: axum::http::HeaderMap,
     payload: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
+    use crate::model::HolderLabel;
+    use crate::rt_core::config_iface::ConfigDomain;
+    use crate::rt_core::requests::config::{
+        build_config_proposal, capture_config_admission, run_config_commit, ConfigAuthContext,
+        ConfigCandidate, ConfigCommitPlan, ReservePrecheck,
+    };
     let Json(body) = payload.map_err(|e| {
         ApiError(
             StatusCode::BAD_REQUEST,
@@ -918,64 +897,75 @@ pub async fn post_tool_commissioning_confirm(
             "INVALID_COMMAND".into(),
         )
     })?;
-    let cw_lock = supervisor.config_write_lock();
-    let _cw = cw_lock.lock().await;
-    let mut prepared = {
-        let inner = supervisor.inner().read().await;
-        crate::tool::prepare_commissioning_confirm(&inner, &body, auth.is_enforced())?
-    };
+    let token = crate::auth::OperatorAuth::extract_token(&headers);
+    let admission = capture_config_admission(&supervisor, 0, 0, None);
+    let pub_cfg = supervisor.published_config().await?;
+    let mut prepared = crate::tool::prepare_commissioning_confirm_off_thread(
+        &pub_cfg,
+        &body,
+        auth.is_enforced(),
+    )
+    .await?;
+    let mut active_tool = pub_cfg.config.active_tool.clone();
+    active_tool.commissioning_required = false;
     let write = prepared.write.take();
-    let (ds, active_tool, revision) = if let Some(w) = write {
-        let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(w.path, w.text))
-            .await
-            .map_err(|e| ApiError::persist_failed(format!("commissioning stage task: {e}")))?
-            .map_err(|e| ApiError::persist_failed(format!("commissioning stage failed: {e}")))?;
-        let mut inner = supervisor.inner().write().await;
-        if let Err(e) = crate::tool::precheck_commissioning_confirm(&inner, &prepared) {
-            staged.abort();
-            return Err(e.into());
-        }
-        // versioned change (track B): reserve at the candidate's revision, rename, apply + activate
-        let reservation = match inner.reserve_config(crate::rt_core::config_iface::ConfigDomain::ToolCommissioning, prepared.base_revision, 0) {
-            Ok(r) => r,
-            Err(e) => {
-                staged.abort();
-                return Err(e.into());
-            }
-        };
-        let ds = match staged.rename_only() {
-            Ok(ds) => ds,
-            Err(e) => {
-                let _ = crate::rt_core::config_iface::ConfigAuthority::release(&mut *inner, reservation);
-                return Err(ApiError::persist_failed(format!("commissioning rename failed: {e}")));
-            }
-        };
-        let reservation = inner.config_persisted(reservation, crate::rt_core::config_iface::Durability::DurableUnconfirmed)?;
-        let ((active_tool, _), revision) = inner.activate_config_candidate(reservation, |inner| crate::tool::commit_commissioning_confirm(inner, prepared))?;
-        (ds, active_tool, revision)
-    } else {
-        let mut inner = supervisor.inner().write().await;
-        crate::tool::precheck_commissioning_confirm(&inner, &prepared)?;
-        let base = prepared.base_revision;
-        let ((active_tool, _), revision) = inner.commit_config(crate::rt_core::config_iface::ConfigDomain::ToolCommissioning, base, 0, |inner| crate::tool::commit_commissioning_confirm(inner, prepared))?;
-        return Ok(Json(serde_json::json!({
-            "active_tool": active_tool,
-            "commissioning_required": active_tool.commissioning_required,
-            "revision": revision,
-            "durability_confirmed": true,
-        }))
-        .into_response());
+    let confirmed_at_pub = prepared.confirmed_at.clone();
+    let proposal = build_config_proposal(
+        &supervisor,
+        ConfigDomain::ToolCommissioning,
+        prepared.base_revision,
+        admission,
+        0,
+        pub_cfg.workspace_revision,
+    );
+    let plan = ConfigCommitPlan {
+        proposal,
+        auth: ConfigAuthContext {
+            admission,
+            lease_holder: None,
+        },
+        precheck: ReservePrecheck::ToolCommissioning {
+            tool_id: HolderLabel::new(&prepared.tool_id),
+            tool_config_digest: HolderLabel::new(&prepared.tool_config_digest),
+        },
+        candidate: ConfigCandidate::ToolCommissioning {
+            tool_id: HolderLabel::new(&prepared.tool_id),
+            tool_config_digest: HolderLabel::new(&prepared.tool_config_digest),
+            confirmed_at: prepared.confirmed_at,
+        },
+        write,
     };
-    let outcome = tokio::task::spawn_blocking(move || ds.sync_parent_dir())
-        .await
-        .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
+    let outcome = run_config_commit(
+        &supervisor,
+        plan,
+        || {
+            if auth.is_enforced() && !auth.is_operator(token.as_deref()) {
+                Err((
+                    "OPERATOR_REQUIRED",
+                    crate::supervisor::ArmError::Rejected {
+                        status: 403,
+                        code: "OPERATOR_REQUIRED".into(),
+                        message: "Operator session expired or locked before tool commissioning persisted".into(),
+                    },
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        |cfg, act| {
+            cfg.config.active_tool.commissioning_required = false;
+            cfg.tool_commissioning_confirmed_at = Some(confirmed_at_pub);
+            cfg.tool_commissioning_revision = act.revision;
+        },
+    )
+    .await?;
     let mut resp = serde_json::json!({
         "active_tool": active_tool,
         "commissioning_required": active_tool.commissioning_required,
-        "revision": revision,
-        "durability_confirmed": matches!(outcome, crate::persist::PublishOutcome::Published),
+        "revision": outcome.activated.revision,
+        "durability_confirmed": outcome.durability_confirmed,
     });
-    if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
+    if let Some(w) = outcome.durability_warning {
         resp["durability_warning"] = serde_json::json!(w);
     }
     Ok(Json(resp).into_response())
