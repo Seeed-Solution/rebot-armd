@@ -1627,18 +1627,20 @@ impl ControlState {
     /// `armd-control` into the bounded SPSC rings, and replenishes clean recycled fault slots
     /// without allocating or dropping on `armd-control`.
     fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
-        while core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY
-            || core.safety.formatted_fault_arc_pool_len() < FORMATTED_FAULT_ARC_POOL_CAPACITY
-            || core.safety.joint_limit_arc_pool_len() < JOINT_LIMIT_ARC_POOL_CAPACITY
+        let mut drained = false;
+        while !self.reclaim_state_tx.is_full()
+            && (core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY
+                || core.safety.formatted_fault_arc_pool_len() < FORMATTED_FAULT_ARC_POOL_CAPACITY
+                || core.safety.joint_limit_arc_pool_len() < JOINT_LIMIT_ARC_POOL_CAPACITY)
         {
             let Ok(arc) = self.reclaim_return_rx.pop() else {
                 break;
             };
             if let Err(unusable) = core.safety.return_fault_arc(arc) {
                 let _ = self.reclaim_state_tx.push(unusable);
+                drained = true;
             }
         }
-        let mut drained = false;
         while !self.reclaim_state_tx.is_full() {
             let Some(arc) = core.safety.pop_retired_state_arc() else {
                 break;
@@ -3706,10 +3708,20 @@ mod tests {
     fn saturated_estop_and_reclaim_rings_retain_retired_fault_and_offload_on_drain_or_exit() {
         let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
         core.safety.set_off_thread_reclaim(true);
+        // Consume 1 slot from `fault_arc_pool` so `drain_retired_states` wants to replenish it,
+        // then clear back to `Idle` and drain the retired arc off-thread.
+        core.safety.trigger_fault(crate::safety::FaultReason::ThermalTrip {
+            joint_idx: 0,
+            temperature: 95.0,
+            limit: 85.0,
+        });
+        let _ = core.safety.clear_fault_bounded().unwrap();
+        while let Some(a) = core.safety.pop_retired_state_arc() { drop(a); }
+        assert!(core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY);
 
         let (mut estop_ack_tx, mut estop_ack_rx) = RingBuffer::<EstopAck>::new(2);
         let (mut reclaim_state_tx, mut reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
-        let (_reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (mut reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
         let (_, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
         let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
@@ -3782,17 +3794,34 @@ mod tests {
         assert!(weak_a.upgrade().is_some(), "fault_a must stay alive in reclaim_state_tx");
         assert!(weak_b.upgrade().is_some(), "fault_b must stay alive in pending_estop_acks");
 
+        // With `reclaim_state_tx` full and a pool wanting replenishment, a returned `Arc` that
+        // `return_fault_arc` would reject must NOT be popped or dropped on RT.
+        let rejected_ret = Arc::new(SafetyState::Fault(crate::safety::FaultReason::Other("rejected-ret".into())));
+        let weak_ret = Arc::downgrade(&rejected_ret);
+        reclaim_return_tx.push(rejected_ret).unwrap();
+        state.drain_retired_states(&mut core);
+        assert_eq!(reclaim_return_tx.slots(), 1, "rejected return must stay queued while reclaim_state_tx is full");
+        assert!(weak_ret.upgrade().is_some(), "rejected return must not drop on RT");
+
+        // Free 1 slot in `reclaim_state_rx`: `drain_retired_states` pops the rejected return and
+        // forwards it into `reclaim_state_tx` (still alive until off-thread drain).
+        let _ = reclaim_state_rx.pop().unwrap();
+        state.drain_retired_states(&mut core);
+        assert_eq!(reclaim_return_tx.slots(), 2, "rejected return popped once reclaim_state_tx had a free slot");
+        assert!(weak_ret.upgrade().is_some(), "rejected return must stay alive in reclaim_state_tx");
+
         // Clean-exit drain while both rings remain full moves fault_b into lock-free `offload_reclaim_tx`.
         state.drain_estop_and_retired_stopped(&mut core);
         assert!(core.pending_estop_acks.is_empty());
         assert!(weak_b.upgrade().is_some(), "fault_b must stay alive until off-thread drain");
 
-        // Off-thread drain drops both cleanly.
+        // Off-thread drain drops all three cleanly.
         while let Ok(a) = estop_ack_rx.pop() { drop(a); }
         while let Ok(a) = reclaim_state_rx.pop() { drop(a); }
         while let Ok(item) = offload_reclaim_rx.pop() { drop(item); }
         assert!(weak_a.upgrade().is_none(), "fault_a dropped off-thread");
         assert!(weak_b.upgrade().is_none(), "fault_b dropped off-thread");
+        assert!(weak_ret.upgrade().is_none(), "rejected return dropped off-thread");
     }
 
     #[test]

@@ -1061,9 +1061,19 @@ async fn first_idle_to_estop_transition_zero_alloc() {
         .unwrap();
     clock.run_steps(period_ns, 3);
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    let snap0 = sup.hub().latest().expect("initial published observation");
+    assert_eq!(snap0.obs.safety_state, armd::safety::SafetyState::Idle);
+    let epoch0 = snap0.obs.epoch_id;
 
     req_ctr.fetch_add(1, Ordering::SeqCst);
     clock.run_steps(period_ns, 3);
+    let snap1 = sup.hub().latest().expect("post-estop published observation");
+    assert_eq!(
+        snap1.obs.safety_state,
+        armd::safety::SafetyState::EStop,
+        "first E-stop request must transition Idle -> EStop"
+    );
+    assert!(snap1.obs.epoch_id > epoch0, "E-stop latch must advance safety epoch ({} <= {epoch0})", snap1.obs.epoch_id);
     let counts = handle.stats().total_allocs();
     handle.stop_and_join();
     assert_eq!(counts, AllocCounts::ZERO, "first Idle->EStop allocated: {counts:?}");
@@ -1088,10 +1098,26 @@ async fn clear_fault_refusal_zero_alloc() {
     wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= 4).await;
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
 
-    let res = handle.clear_fault_async().await.unwrap();
-    assert!(res.is_err(), "expected ClearFault refusal while ThermalTrip temperature exceeds cooldown");
+    let err = handle
+        .clear_fault_async()
+        .await
+        .unwrap()
+        .expect_err("expected ClearFault refusal while ThermalTrip temperature exceeds cooldown");
+    let expected = armd::safety::SafetyError::from(armd::safety::ClearFaultError::from(
+        armd::safety::ClearRefusal::TemperatureAboveThreshold,
+    ));
+    assert_eq!(err, expected, "expected exact driverless TemperatureAboveThreshold refusal");
     let after = handle.stats().completed_releases.load(Ordering::Acquire);
     wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= after + 2).await;
+    let snap = sup.hub().latest().expect("published observation after ClearFault refusal");
+    assert!(
+        matches!(
+            snap.obs.safety_state,
+            armd::safety::SafetyState::Fault(armd::safety::FaultReason::ThermalTrip { .. })
+        ),
+        "ThermalTrip fault must remain latched after refusal: {:?}",
+        snap.obs.safety_state
+    );
     let counts = handle.stats().total_allocs();
     handle.stop_and_join();
     assert_eq!(counts, AllocCounts::ZERO, "ClearFault refusal allocated: {counts:?}");
@@ -1099,9 +1125,23 @@ async fn clear_fault_refusal_zero_alloc() {
 
 #[test]
 fn logwriter_tracing_on_rt_zero_alloc() {
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     thread::spawn(|| {
-        let writer = armd::diagnostics::logwriter::NonBlocking::spawn("b2-test", std::io::sink()).unwrap();
-        let sub = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
+        let sink = SharedBuf::default();
+        let captured = Arc::clone(&sink.0);
+        let writer = armd::diagnostics::logwriter::NonBlocking::spawn_unregistered("b2-test", sink, 64).unwrap();
+        let sub = tracing_subscriber::fmt().with_writer(writer.clone()).with_ansi(false).finish();
         let _guard = tracing::subscriber::set_default(sub);
         tracing::callsite::rebuild_interest_cache();
         let mut inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
@@ -1111,6 +1151,14 @@ fn logwriter_tracing_on_rt_zero_alloc() {
         inner.safety.trigger_e_stop();
         let delta = alloc::snapshot_counts().delta_since(before);
         assert_eq!(delta, AllocCounts::ZERO, "safety log via LogWriter allocated: {delta:?}");
+
+        // Verify the E-stop log event was actually queued, drained off the measured path,
+        // and delivered to the underlying writer sink.
+        let ev = inner.safety.pop_log_event().expect("deferred E-stop log event must be queued");
+        ev.emit();
+        assert!(writer.flush(Duration::from_secs(2)), "LogWriter failed to flush deferred event");
+        let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("Safety: Idle -> EStop"), "expected E-stop log in sink, got: {text:?}");
     })
     .join()
     .unwrap();
