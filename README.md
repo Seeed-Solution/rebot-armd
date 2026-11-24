@@ -181,7 +181,7 @@ TODO / roadmap:
 │   lease + epoch checks → planner (quintic / S-curve, Cartesian IK)     │
 │   safety state machine: Booting, Idle, Armed, Moving, EStop, Fault     │
 │   watchdog, joint limits, workspace box, speed caps, tracking error    │
-│        │ control tick, 50 Hz default (SCHED_FIFO 50 when permitted)    │
+│        │ control tick, 50 Hz default (SCHED_FIFO 79 on SG2002)         │
 │ driver: Damiao / RobStride (SocketCAN), Feetech / FashionStar (serial) │
 └────────────────────────────────────────────────────────────────────────┘
         │ CAN 1 Mbit/s
@@ -191,8 +191,16 @@ TODO / roadmap:
 
 - **Control loop**: a fixed-period tick (`control_frequency_hz`, 50 Hz in the built-in
   profiles, accepted range 1..1000). A tick later than 80 ms latches a safety hold instead of
-  continuing an old trajectory. Video is not handled by armd: the cockpit plays the camera's
-  H.264 WebSocket stream (`ws://<host>:8001/`) directly with JMuxer.
+  continuing an old trajectory. On SG2002, the vendor kernel (`cvi_sched.h`) caps non-`cvitask`
+  tasks at priority 80 and pins `cvitask_isp_pre`, `cvitask_vpss_0/1` (90) and `cvitask_tpu_wor`
+  (85). `armd-control` defaults to `SCHED_FIFO 79` (`ARMD_RT_PRIORITY` overrides), while
+  `K92rebot-teleop` sets `spi0` / SPI-CAN IRQ threads to `SCHED_FIFO 80` and lowers the 4 unpinned
+  `cvitask` threads (`cvitask_vc_wt2`, `cvitask_vc_bh2`, `cvitask_isp_bla`, `cvitask_isp_err`) and
+  `rebot-vision`'s RT SDK threads to `70` (leaving pinned `cvitask` threads untouched). Measured on
+  SG2002 with vision ON and all loads over 90 s (executor owner, `iso4-j`): wake lateness max
+  changed from 14.4 ms (MIT budget 52 ms, FAIL) at FIFO 45 to 5.6 ms (`>5 ms` 2×, MIT budget
+  35.7 ms < 45 ms) with vision at 15 fps and 0 errors. Video is not handled by armd: the cockpit
+  plays the camera's H.264 WebSocket stream (`ws://<host>:8001/`) directly with JMuxer.
 - **Lease**: actuator authority belongs to the WebSocket connection that sent `acquire_lease`
   and keeps sending `heartbeat` (lease timeout 2500 ms). Every `command` carries the lease
   `generation`, the current safety `epoch_id` and a strictly increasing `request_id`. REST

@@ -145,7 +145,7 @@ TODO / 路线图：
 │   租约 + epoch 校验 → 规划（五次多项式 / S 曲线、笛卡尔 IK）           │
 │   安全状态机：Booting、Idle、Armed、Moving、EStop、Fault               │
 │   看门狗、关节限位、工作空间盒、限速、跟踪误差                         │
-│        │ 控制 tick，默认 50 Hz（权限允许时 SCHED_FIFO 50）             │
+│        │ 控制 tick，默认 50 Hz（SG2002 默认 SCHED_FIFO 79）            │
 │ 驱动：达妙 / RobStride（SocketCAN），飞特 / FashionStar（串口）        │
 └────────────────────────────────────────────────────────────────────────┘
         │ CAN 1 Mbit/s
@@ -153,7 +153,7 @@ TODO / 路线图：
    reBot B601-DM 电机
 ```
 
-- **控制循环**：固定周期 tick（`control_frequency_hz`，内置 profile 为 50 Hz，允许范围 1..1000）。tick 晚于 80 ms 时锁存安全保持，不继续执行旧轨迹。视频不经过 armd：驾驶舱用 JMuxer 直接播放摄像头的 H.264 WebSocket 流（`ws://<host>:8001/`）。
+- **控制循环**：固定周期 tick（`control_frequency_hz`，内置 profile 为 50 Hz，允许范围 1..1000）。tick 晚于 80 ms 时锁存安全保持，不继续执行旧轨迹。在 SG2002 上，厂商内核（`cvi_sched.h`）将非 `cvitask` 任务优先级上限固定为 80，并锁定 `cvitask_isp_pre`、`cvitask_vpss_0/1`（90）和 `cvitask_tpu_wor`（85）。`armd-control` 默认使用 `SCHED_FIFO 79`（可用 `ARMD_RT_PRIORITY` 覆盖），`K92rebot-teleop` 将 `spi0` / SPI-CAN 中断线程设为 `SCHED_FIFO 80`，将 4 个未锁定 `cvitask` 线程（`cvitask_vc_wt2`、`cvitask_vc_bh2`、`cvitask_isp_bla`、`cvitask_isp_err`）和 `rebot-vision` 的实时 SDK 线程降至 `70`（不触碰已锁定 `cvitask` 线程）。在 SG2002 开启视觉与全负载的 90 s 实测中（executor 模式，`iso4-j`），默认 FIFO 45 布局的最大唤醒延迟为 14.4 ms（MIT 预算 52 ms 未通过），目标布局下最大唤醒延迟为 5.6 ms（`>5 ms` 2 次），MIT 预算 35.7 ms < 45 ms，视觉维持 15 fps 且无错误。视频不经过 armd：驾驶舱用 JMuxer 直接播放摄像头的 H.264 WebSocket 流（`ws://<host>:8001/`）。
 - **租约**：执行器权限属于发送了 `acquire_lease` 并持续发送 `heartbeat` 的 WebSocket 连接（租约超时 2500 ms）。每条 `command` 都带租约 `generation`、当前安全 `epoch_id` 和严格递增的 `request_id`。REST 执行器路由（`torque`、`motion/*`、`action/*`、`clear_fault`）返回 `409 LEASE_REQUIRED`，不执行动作。急停例外：REST 与 WebSocket 都不需要租约。其他客户端可用 `force` 接管，接管后在机械臂稳定前拒绝运动（`HANDOVER_SETTLING`）。
 - **安全层**（详见 [docs/control_safety_contract.md](docs/control_safety_contract.md)）：关节位置、速度、加速度限位；`max_temperature` 温度保护（内置 profile 为 70 °C）；反馈新鲜度（250 ms）；跟随误差故障（`max_error_rad` 0.5，持续 500 ms）及动作的 `TRACKING_STALL`；规划运动限速（`planned_max_velocity`，rebot-dm 为 0.45 rad/s）；servo 流式限速与领先量上限（`servo_max_velocity`、`servo_max_lead_rad` 0.2），关节跟不上时保持位置而不报 Fault，并在观测 `motion_limit` 中报告；力矩保护（J1–J6 的 |力矩| ≥ `torque_guard.ratio` × TMAX 持续 100 ms 时停止运动并保持力矩，动作码 `TORQUE_LIMIT`；rebot-dm 的 ratio 为 0.60：J1–J3 16.8 N·m，J4–J6 6.0 N·m）；电源功率预算（`power_budget`：由电机力矩和速度按数据手册参数估算电源电流，无电流传感器；超过电源额定值 80 % 时降速，超过 95 % 时保持，动作码 `POWER_LIMIT`；规划运动用 URDF 逆动力学做时间缩放以保持在 75 % 以下，否则以 `POWER_BUDGET` 拒绝；rebot-dm 为 6.5 A 的 LRS-150-24；驾驶舱显示电源负载条）；Fault 期间电机以 Disabled 恢复时 `is_torqued` 置为 false；笛卡尔工作空间检查（地面、包围盒、伸展范围）；租约看门狗自动收纳；不在收纳位时拒绝断力矩（`ARM_NOT_AT_RESTING_POSE`），避免机械臂下坠。
 
