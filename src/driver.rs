@@ -10966,7 +10966,7 @@ mod tx_chokepoint_tests {
         let limits = damiao::DamiaoLimits::default();
         let (bus, clock) = TestBus::new();
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3])
-            .with_joint_limits(vec![limits.clone(); 3])
+            .with_joint_limits(vec![limits; 3])
             .unwrap();
         // Limit each tick to 1 frame so motor 2 & 3 enables are deferred to subsequent polls.
         drv.set_tx_budget(TxBudget {
@@ -11053,7 +11053,7 @@ mod tx_chokepoint_tests {
         // Part 2: Retried enable (`Service::Retry` at +25 ms) ALSO invalidates pre-retry 0x0!
         let (bus_r, clock_r) = TestBus::new();
         let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2])
-            .with_joint_limits(vec![limits.clone(); 2])
+            .with_joint_limits(vec![limits; 2])
             .unwrap();
         let stopped_r = Arc::new(AtomicBool::new(false));
         let mut arm_r = [0usize; crate::rt_core::mailbox::MAX_DOF];
