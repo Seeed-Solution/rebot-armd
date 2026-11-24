@@ -1961,4 +1961,171 @@ mod tests {
         assert!(!lf.amend_release_us_by_release_seq(999_999, 10_000));
         assert_eq!(lf.writer_contention_drops(), 0);
     }
+
+    #[test]
+    fn lock_free_tick_stats_multithreaded_tear_free_and_writer_nonblocking() {
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let lf = Arc::new(LockFreeTickStats::new());
+        let loc_read: &'static std::panic::Location<'static> = std::panic::Location::caller();
+        let loc_write: &'static std::panic::Location<'static> = std::panic::Location::caller();
+
+        let make_sample = move |k: u64| -> TickSample {
+            let ku = k as u32;
+            let waited_for = if k % 2 == 0 {
+                Some(Holder {
+                    kind: "read",
+                    location: loc_read,
+                    hold_us: ku * 7 + 1,
+                    acquire_us: ku * 3 + 2,
+                    acquired_before_wait_us: k as i64 * 11,
+                    released_before_lock_us: -(k as i64),
+                })
+            } else {
+                None
+            };
+            let longest_hold = if k % 3 == 0 {
+                Some(Holder {
+                    kind: "write",
+                    location: loc_write,
+                    hold_us: ku * 13 + 5,
+                    acquire_us: ku * 5 + 4,
+                    acquired_before_wait_us: -(k as i64 * 2),
+                    released_before_lock_us: k as i64 * 17,
+                })
+            } else {
+                None
+            };
+            TickSample {
+                tick_us: ku * 10 + 1,
+                release_us: ku * 10 + 7,
+                wait_us: ku % 97,
+                lock_us: ku * 4 + 3,
+                post_us: ku % 53,
+                period_us: 20_000 + (ku % 113),
+                wake_lateness_us: ku % 887,
+                reader_hold_us: ku % 311,
+                writer_hold_us: ku % 211,
+                reader_acquire_us: ku % 41,
+                writer_acquire_us: ku % 43,
+                stats_wait_us: 0,
+                phases: LockPhases {
+                    pre_us: ku % 19,
+                    rx_us: ku % 23,
+                    control_us: ku % 29,
+                    tx_us: ku % 31,
+                    finish_us: ku % 37,
+                    obs_us: ku % 41,
+                    publish_us: ku % 43,
+                },
+                usage: ThreadUsage {
+                    lock_cpu_us: ku % 500,
+                    tx_frames: 2,
+                    tx_would_block: u32::from(k % 5 == 0),
+                    tx_enobufs: u32::from(k % 11 == 0),
+                    tx_deferred: u32::from(k % 13 == 0),
+                    tx_pending: ku % 7,
+                    tx_dropped_stale: u32::from(k % 17 == 0),
+                    tx_dropped_stopped: u32::from(k % 19 == 0),
+                    tx_send_us: ku % 600,
+                    tx_send_cpu_us: ku % 200,
+                    tx_frame_max_us: ku % 300,
+                    tx_frame_cpu_max_us: ku % 100,
+                    ..Default::default()
+                },
+                waited_for,
+                longest_hold,
+                late: k % 7 == 0,
+                release_seq: k,
+                safety_epoch: k * 3 + 1,
+                maint_req_id: k * 5 + 2,
+                release_flags: ku & 0x7f,
+            }
+        };
+
+        // Pre-populate 16 samples so a frozen reader immediately enters the slot loop.
+        for k in 1..=16u64 {
+            assert!(lf.record(&make_sample(k)));
+        }
+
+        // Freeze one reader mid-window while the writer publishes 6,000 samples (wrapping 2048-slot ring ~3x).
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let lf_frozen = Arc::clone(&lf);
+        let frozen_jh = thread::spawn(move || {
+            let mut paused_once = false;
+            lf_frozen.window_with_hook(|slot_i| {
+                if slot_i == 2 && !paused_once {
+                    paused_once = true;
+                    let _ = paused_tx.send(());
+                    let _ = resume_rx.recv();
+                }
+            })
+        });
+        paused_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("frozen reader entered hook");
+
+        // Spawn 4 concurrent readers hammering `window()` and checking tear-freedom on every field + pointer.
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let verified_windows = Arc::new(AtomicU64::new(0));
+        let mut reader_jhs = Vec::new();
+        for _ in 0..4 {
+            let lf_r = Arc::clone(&lf);
+            let done_r = Arc::clone(&writer_done);
+            let verified_r = Arc::clone(&verified_windows);
+            reader_jhs.push(thread::spawn(move || {
+                while !done_r.load(Ordering::Acquire) || verified_r.load(Ordering::Relaxed) < 40 {
+                    let win = lf_r.window();
+                    if win.snapshot_lapped || win.rows.is_empty() {
+                        continue;
+                    }
+                    let end_seq = win.ticks;
+                    let expected_len = (end_seq as usize).min(TICK_WINDOW);
+                    assert_eq!(win.rows.len(), expected_len, "window length must match ticks");
+                    assert_eq!(win.late_count, end_seq / 7, "late_count torn against ticks={end_seq}");
+                    assert_eq!(win.tx_totals.frames, end_seq * 2, "tx_frames torn against ticks={end_seq}");
+                    assert_eq!(win.tx_totals.would_block, end_seq / 5);
+                    assert_eq!(win.tx_totals.enobufs, end_seq / 11);
+                    assert_eq!(win.tx_totals.deferred, end_seq / 13);
+                    assert_eq!(win.tx_totals.dropped_stale, end_seq / 17);
+                    assert_eq!(win.tx_totals.dropped_stopped, end_seq / 19);
+
+                    let first_k = end_seq - (expected_len as u64) + 1;
+                    for (idx, got) in win.rows.iter().enumerate() {
+                        let k = first_k + idx as u64;
+                        let expected = make_sample(k);
+                        assert_eq!(
+                            *got, expected,
+                            "torn read detected in slot idx={idx}, expected release_seq={k}"
+                        );
+                    }
+                    verified_r.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // Single writer runs to completion BEFORE the frozen reader is allowed to resume!
+        const TOTAL_SAMPLES: u64 = 6_000;
+        for k in 17..=TOTAL_SAMPLES {
+            assert!(lf.record(&make_sample(k)));
+            if k % 64 == 0 {
+                thread::yield_now();
+            }
+        }
+        writer_done.store(true, Ordering::Release);
+        for jh in reader_jhs {
+            jh.join().expect("reader thread panicked on torn read");
+        }
+        // Writer completed all 6,000 samples while frozen reader was parked: zero blocking, zero drops!
+        assert_eq!(lf.writer_contention_drops(), 0);
+        assert!(verified_windows.load(Ordering::Relaxed) >= 40);
+
+        resume_tx.send(()).unwrap();
+        let frozen_win = frozen_jh.join().expect("frozen reader panicked");
+        // Frozen reader detected slot reuse, retried coherently, and returned an intact final window.
+        assert!(!frozen_win.snapshot_lapped);
+        assert_eq!(frozen_win.ticks, TOTAL_SAMPLES);
+        assert_eq!(frozen_win.rows.len(), TICK_WINDOW);
+        assert_eq!(*frozen_win.rows.last().unwrap(), make_sample(TOTAL_SAMPLES));
+    }
 }

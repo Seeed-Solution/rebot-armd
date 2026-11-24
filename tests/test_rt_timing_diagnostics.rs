@@ -1578,7 +1578,9 @@ async fn legacy_lock_free_stats_under_concurrent_http_readers_never_blocks_contr
     let snap = sup.tick_stats();
     assert!(snap.releases_total >= 150, "releases_total={}", snap.releases_total);
     assert!(reads_ok.load(Ordering::Relaxed) >= 40);
-    assert_eq!(snap.stats_wait_us.max, 0, "control thread must never wait for tick_stats");
+    // Serialization compatibility field (causal non-blocking progress is proved by the paused-reader
+    // hook above where >= 20 releases publish while a reader thread is frozen mid-snapshot).
+    assert_eq!(snap.stats_wait_us.max, 0, "legacy stats_wait_us compatibility field must stay 0");
     assert_eq!(snap.stats_writer_drops, 0, "single legacy control thread must have 0 writer drops");
     assert!(!snap.stats_snapshot_lapped);
 }
@@ -3153,4 +3155,232 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
 
         handle.stop_and_join();
     }
+}
+
+// ============================================================================
+// 12. Monotonic write/reset exclusivity under concurrent HTTP GET + POST /mark flood,
+//     and executor 32-release paused-consumer amendment retention + saturation accounting
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monotonic_counters_exclusive_and_mark_resets_only_since_marker_both_owners() {
+    async fn run_owner_mark_flood(use_executor: bool) {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut legacy_jh: Option<thread::JoinHandle<()>> = None;
+        let mut exec_handle = None;
+
+        if use_executor {
+            let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+            cfg.alloc_timing = true;
+            let h = sup
+                .start_executor_with_hooks(
+                    cfg,
+                    PersistTestHooks {
+                        post_publish_delay_once: Some(Arc::new(Mutex::new(Some(Duration::from_millis(25))))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let wait_spike = Instant::now() + Duration::from_secs(3);
+            while h.stats().releases_over_20ms.load(Ordering::Acquire) == 0 && Instant::now() < wait_spike {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(h.stats().releases_over_20ms.load(Ordering::Acquire) >= 1);
+            exec_handle = Some(h);
+        } else {
+            let loop_stats = Arc::new(ExecutorStats::default());
+            sup.attach_legacy_loop_stats(loop_stats.clone());
+            loop_stats.post_stats_delay_once_ns.store(25_000_000, Ordering::Release);
+            let rt = tokio::runtime::Handle::current();
+            let sup_t = sup.clone();
+            let stop_t = stop.clone();
+            let stats_t = loop_stats.clone();
+            legacy_jh = Some(
+                thread::Builder::new()
+                    .name("armd-control".into())
+                    .spawn(move || {
+                        armd::rt_core::executor::run_periodic(
+                            Duration::from_millis(5),
+                            &stop_t,
+                            &stats_t,
+                            |dt| {
+                                rt.block_on(sup_t.control_tick(dt));
+                            },
+                        );
+                    })
+                    .unwrap(),
+            );
+            let wait_spike = Instant::now() + Duration::from_secs(3);
+            while loop_stats.releases_over_20ms.load(Ordering::Acquire) == 0 && Instant::now() < wait_spike {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(loop_stats.releases_over_20ms.load(Ordering::Acquire) >= 1);
+        }
+
+        let addr = serve(sup.clone()).await;
+        let tick_url = format!("http://{addr}/api/v1/diagnostics/tick");
+        let mark_url = format!("http://{addr}/api/v1/diagnostics/tick/mark");
+
+        let flood_stop = Arc::new(AtomicBool::new(false));
+        let marks_issued = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let marker_task = {
+            let stop_m = flood_stop.clone();
+            let count_m = marks_issued.clone();
+            let url_m = mark_url.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                while !stop_m.load(Ordering::Acquire) {
+                    let resp = client.post(&url_m).send().await.unwrap();
+                    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+                    count_m.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(12)).await;
+                }
+            })
+        };
+
+        let client = reqwest::Client::new();
+        let keys = [
+            "releases_started",
+            "releases_total",
+            "release_us_max_ever",
+            "releases_over_10ms",
+            "releases_over_15ms",
+            "releases_over_20ms",
+            "wake_late_max_ever",
+            "skipped_releases",
+            "diag_dropped",
+            "wake_lateness_over_1ms",
+            "wake_lateness_over_5ms",
+            "wake_lateness_over_10ms",
+        ];
+        let mut prev = [0u64; 12];
+        let mut saw_active_clean_marker = false;
+        let mut polls = 0u32;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (polls < 35 || marks_issued.load(Ordering::Relaxed) < 5 || !saw_active_clean_marker)
+            && Instant::now() < deadline
+        {
+            let body: serde_json::Value = client
+                .get(&tick_url)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            for (i, k) in keys.iter().enumerate() {
+                let v = body[*k].as_u64().expect(k);
+                assert!(
+                    v >= prev[i],
+                    "process-lifetime monotonic counter `{k}` decreased ({} -> {v}) under GET+POST /mark flood",
+                    prev[i]
+                );
+                prev[i] = v;
+            }
+            // Initial 25 ms spike must NEVER be erased from lifetime counters by POST /mark.
+            assert!(body["release_us_max_ever"].as_u64().unwrap() >= 25_000);
+            assert!(body["releases_over_20ms"].as_u64().unwrap() >= 1);
+            assert!(body["skipped_releases"].as_u64().unwrap() >= 1);
+            assert_eq!(body["stats_writer_drops"], 0);
+            if let Some(sm) = body["since_marker"].as_object() {
+                if sm.get("status").and_then(|v| v.as_str()) == Some("active")
+                    && sm.get("releases_total_delta").and_then(|v| v.as_u64()).unwrap_or(0) >= 1
+                    && sm.get("releases_over_20ms_delta").and_then(|v| v.as_u64()) == Some(0)
+                    && sm.get("release_us_max").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) < 20_000
+                {
+                    saw_active_clean_marker = true;
+                }
+            }
+            polls += 1;
+            tokio::time::sleep(Duration::from_millis(8)).await;
+        }
+        assert!(saw_active_clean_marker, "explicit POST /mark must reset since_marker interval cleanly while keeping lifetime peaks");
+
+        flood_stop.store(true, Ordering::Release);
+        marker_task.await.unwrap();
+        if let Some(h) = exec_handle {
+            assert_eq!(h.stats().total_allocs(), AllocCounts::ZERO);
+            h.stop_and_join();
+        } else {
+            stop.store(true, Ordering::Release);
+            legacy_jh.unwrap().join().unwrap();
+        }
+    }
+
+    run_owner_mark_flood(false).await;
+    run_owner_mark_flood(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_amend_ring_retains_32_paused_releases_and_accounts_saturation() {
+    // 1. Genuinely pause `armd-dispatch` via `pause_hub(&sup)` for 32 consecutive executor releases
+    //    (> old 16-slot table) with distinct tail amendments: all 32 samples and all 32 amendments
+    //    accumulate undrained in `diag_tx` / `diag_amend_tx`, and draining preserves every amended
+    //    `release_us` in `LockFreeTickStats` with `diag_dropped == 0` and `stats_writer_drops == 0`.
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let clock = LatenessClock::new();
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(20));
+    cfg.alloc_timing = true;
+    let handle = sup
+        .start_executor_with_hooks(
+            cfg,
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    const COUNT: usize = 32;
+    let (rel_hub1, hub_jh1) = pause_hub(&sup);
+    for i in 0..COUNT {
+        let delay_ns = 2_000_000u64 + (i as u64) * 100_000;
+        handle.stats().post_stats_delay_once_ns.store(delay_ns, Ordering::Release);
+        clock.run_schedule(&[0]);
+    }
+    rel_hub1.send(()).unwrap();
+    hub_jh1.join().unwrap();
+
+    let snap = sup.tick_stats();
+    assert_eq!(snap.releases_total, COUNT as u64);
+    assert_eq!(snap.diag_dropped, 0, "32 paused amended releases must not overflow 256-slot diag/amend rings");
+    assert_eq!(snap.stats_writer_drops, 0);
+    assert!(!snap.stats_snapshot_lapped);
+    let samples = sup.tick_samples();
+    assert_eq!(samples.len(), COUNT);
+    for (i, s) in samples.iter().enumerate() {
+        let expected_min_us = 2_000u32 + (i as u32) * 100;
+        assert!(
+            s.release_us >= expected_min_us,
+            "release #{i} (seq={}) lost tail amendment: got {} us, expected >= {expected_min_us} us",
+            s.release_seq,
+            s.release_us
+        );
+    }
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    // 2. Overflow test: pause `armd-dispatch` and burst > DIAG_RING_CAPACITY (256) amended releases
+    //    so ring saturation is deterministically accounted in `diag_dropped` with 0 heap allocs.
+    let (rel_hub2, hub_jh2) = pause_hub(&sup);
+    for _ in 0..(DIAG_RING_CAPACITY + 32) {
+        handle.stats().post_stats_delay_once_ns.store(1_500_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+    }
+    rel_hub2.send(()).unwrap();
+    hub_jh2.join().unwrap();
+
+    let after = sup.tick_stats();
+    assert_eq!(after.releases_total, COUNT as u64 + (DIAG_RING_CAPACITY + 32) as u64);
+    assert!(
+        after.diag_dropped >= 32,
+        "overflowing 256-slot diag/amend rings must increment diag_dropped, got {}",
+        after.diag_dropped
+    );
+    assert_eq!(after.stats_writer_drops, 0);
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    handle.stop_and_join();
 }
