@@ -332,7 +332,8 @@ async fn ramp_in_fades_stiffness_out_and_model_in_then_exit_holds() {
         assert!(run.tau_ff[2].abs() > 1.0, "feed-forward kept while exiting");
     }
     let n = until_position(&r, 20, true).await;
-    assert_eq!(n, 5, "100 ms MIT hold, then POS_VEL");
+    // 5 ticks (100 ms) of confirmed stiff MIT holds + 1 dedicated POS_VEL transition release.
+    assert_eq!(n, 6, "100 ms MIT hold (5 ticks), then scheduled POS_VEL transition release");
     assert_eq!(r.modes(), [JointMode::Position; 7]);
     r.ticks(20).await;
     let obs = r.sup.get_observation().await;

@@ -61,14 +61,16 @@ over SPI at 1 Mbit/s, `SCHED_FIFO` 45, ERROR-ACTIVE, `berr 0/0`, `bus-off 0`):
 |---|---:|---:|---:|---|
 | `tx_us` (TX phase) | 3.915 ms | 8.123 ms | 13.383 ms | 7-motor SPI CAN under `SCHED_FIFO` 45 |
 | `tx.send_us` (1000-tick window) | 3.622 ms | 7.763 ms | 13.184 ms | `send_cpu_us`: p50 0.593 / p99 0.757 / max 1.259 ms |
-| `tx.frame_max_us` | 1.058 ms | 6.104 ms | 11.554 ms | `max_tick`: 7 frames in 3.114 ms (`frame_max_us` 0.994 ms) |
+| `tx.frame_max_us` | 1.058 ms | 6.104 ms | 11.554 ms | `max_tx` peak frame 11.381 ms; `max_tick` 7 frames in 3.114 ms (`frame_max_us` 0.994 ms) |
 
 With the earlier 5 ms start-cutoff, healthy 7-motor + refresh batches tripped `TxDeferred` 6 s into
 the load run during `home`, followed by 174 repeated hold write errors in Fault. Raising the default
-start-cutoff (`DAMIAO_TX_MAX_DURATION` and `rebot-b601dm.json` `tx_budget_ms`) to **10 ms** (keeping
-`DAMIAO_TX_MAX_FRAMES = 16` and `DAMIAO_TX_FRAME_MAX_AGE = 45 ms`) covers 7 target frames plus 1
-refresh at ~1 ms/frame (~8 ms) with margin inside the 20 ms release period; isolated >10 ms SPI
-tails defer cleanly to the next tick instead of faulting.
+frame-start cutoff (`DAMIAO_TX_MAX_DURATION` and `rebot-b601dm.json` `tx_budget_ms`) to **10 ms**
+(keeping `DAMIAO_TX_MAX_FRAMES = 16` and `DAMIAO_TX_FRAME_MAX_AGE = 45 ms`) sizes the start window
+for the common 7-target + 1-refresh case (~8 ms with margin inside the 20 ms release period). The
+cutoff governs starting new `transmit()` calls (and any non-no-op `flush()`), not interrupting an
+in-flight syscall: an isolated >10 ms SPI transmit tail (such as an 11.4 ms frame) finishes cleanly
+and defers any remaining unstarted frames to the next tick instead of faulting.
 
 ## What armd enforces
 

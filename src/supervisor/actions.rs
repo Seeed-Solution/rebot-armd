@@ -118,7 +118,16 @@ impl SupervisorInner {
                 }
                 old.finished_at = Some(now);
             }
-            self.previous_action = Some((old, now + 2.0));
+            if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
+                if let Some(msg) = prev.message.take() {
+                    if msg.capacity() > self.action_msg_spare.capacity() {
+                        self.action_msg_spare = msg;
+                    }
+                }
+            }
+        }
+        if format_superseded_msg && self.action_msg_spare.capacity() < 256 {
+            self.action_msg_spare = String::with_capacity(256);
         }
         self.next_action_id += 1;
         let id = self.next_action_id;
@@ -468,9 +477,9 @@ impl SupervisorInner {
     }
 
     /// Stop the running sub-motion of macro action `id` where the arm is (J1..J6 commanded to
-    /// the measured positions, the gripper keeps its command) and report it done to the
-    /// orchestrator. False when no sub-motion of `id` is running.
-    pub fn end_macro_motion_at_measured(&mut self, id: u64) -> bool {
+    /// the measured positions, the gripper keeps its command) without publishing `SubState::Done`.
+    /// False when no sub-motion of `id` is running or pending deferred TX acceptance.
+    fn stop_macro_motion_at_measured(&mut self, id: u64) -> bool {
         if !self.macro_alive(id) || !self.macro_child_active_or_pending(id) { return false; }
         self.stop_motion();
         let n = self.measured_positions.len().min(self.commanded_positions.len()).min(6);
@@ -482,7 +491,15 @@ impl SupervisorInner {
         }
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
-        self.target_positions = self.commanded_positions.clone();
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+        true
+    }
+
+    /// Stop the running sub-motion of macro action `id` where the arm is (J1..J6 commanded to
+    /// the measured positions, the gripper keeps its command) and report it done to the
+    /// orchestrator. False when no sub-motion of `id` is running.
+    pub fn end_macro_motion_at_measured(&mut self, id: u64) -> bool {
+        if !self.stop_macro_motion_at_measured(id) { return false; }
         self.safety.mark_motion_finished();
         if let Some(m) = self.macro_run.as_mut() {
             m.sub = SubState::Done(SubDone { settled: None, holding: None, gripper_gap_rad: None, at: Instant::now() });
@@ -590,13 +607,28 @@ impl SupervisorInner {
         let over = (0..r.len().min(guard.max_residual_nm.len()))
             .find(|&j| guard.max_residual_nm[j] > 0.0 && r[j].abs() > guard.max_residual_nm[j]);
         let Some(joint) = over.filter(|_| w.contact_joint.is_none()) else { return; };
-        if !self.end_macro_motion_at_measured(id) { return; }
+        let ticket = self.macro_run.as_ref().and_then(|m| m.ticket());
+        if !self.stop_macro_motion_at_measured(id) { return; }
         let z = self.config.tcp_pose_f32(&self.measured_positions).map(|p| p.p[2]);
         if let Some(m) = self.macro_run.as_mut() {
             m.child.watch.contact_joint = Some(joint);
             m.child.watch.contact_tcp_z_m = z;
             if let Some(code) = guard.stop_code {
+                self.safety.mark_motion_finished();
                 m.sub = SubState::Failed { code: code.into(), message: format!("contact on J{}", joint + 1) };
+            } else if let Some(ticket) = ticket {
+                // Success-on-contact: motion is stopped and locked to measured immediately,
+                // while `SubState::Done` commits strictly through the shared post-output
+                // accepted-output gate once the replacement hold completes on the bus.
+                self.pending_deferred_done = Some(super::DeferredActionDone {
+                    target: super::DeferredCompletionTarget::MacroSub { action_id: id, ticket },
+                    epoch_id: self.safety.epoch_id(),
+                    lease_generation: self.active_lease.as_ref().map(|l| l.generation),
+                    settled: None,
+                    holding: None,
+                    gripper_gap_rad: None,
+                    clear_releasing: false,
+                });
             }
         }
     }
@@ -1127,24 +1159,62 @@ impl SupervisorInner {
         let is_policy = false;
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let lease_now = self.active_lease.as_ref().map(|l| l.generation);
-        let cause: Option<(&str, &str, String)> = match self.safety.state() {
-            SafetyState::EStop => Some(("failed", "ESTOP_ACTIVE", "E-stop latched".into())),
-            SafetyState::Fault(FaultReason::WatchdogTimeout) => Some(("failed", "WATCHDOG", "Lease watchdog expired".into())),
-            SafetyState::Fault(FaultReason::CanTxStalled) => Some((
-                "failed",
-                "CAN_TX_STALLED",
-                self.safety.fault().map_or_else(|| "CAN TX stalled".into(), |f| f.message),
-            )),
-            SafetyState::Fault(r) => Some(("failed", "FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
-            _ if !is_park && self.watchdog_park.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
-            _ if lease_now != self.action_lease_generation => Some(("cancelled", "LEASE_LOST", "Control lease lost or released".into())),
+        enum ReconcileCause {
+            Static(&'static str, &'static str, &'static str),
+            SafetyMessage(&'static str, &'static str),
+            SafetyDebug(&'static str, &'static str),
+        }
+        let cause = match self.safety.state() {
+            SafetyState::EStop => Some(ReconcileCause::Static("failed", "ESTOP_ACTIVE", "E-stop latched")),
+            SafetyState::Fault(FaultReason::WatchdogTimeout) => {
+                Some(ReconcileCause::Static("failed", "WATCHDOG", "Lease watchdog expired"))
+            }
+            SafetyState::Fault(FaultReason::CanTxStalled) => {
+                Some(ReconcileCause::SafetyMessage("failed", "CAN_TX_STALLED"))
+            }
+            SafetyState::Fault(FaultReason::Other(_)) => {
+                Some(ReconcileCause::SafetyMessage("failed", "FAULT"))
+            }
+            SafetyState::Fault(_) => Some(ReconcileCause::SafetyDebug("failed", "FAULT")),
+            _ if !is_park && self.watchdog_park.is_some() => {
+                Some(ReconcileCause::Static("failed", "WATCHDOG", "Lease watchdog expired; parking"))
+            }
+            _ if lease_now != self.action_lease_generation => {
+                Some(ReconcileCause::Static("cancelled", "LEASE_LOST", "Control lease lost or released"))
+            }
             _ => None,
         };
-        if let Some((state, code, message)) = cause {
+        if let Some(cause) = cause {
+            let (state, code) = match cause {
+                ReconcileCause::Static(s, c, _)
+                | ReconcileCause::SafetyMessage(s, c)
+                | ReconcileCause::SafetyDebug(s, c) => (s, c),
+            };
             // a macro sub-motion or a replay must not outlive its action
             if (is_macro || is_replay) && carried { self.stop_motion(); }
             self.pending_deferred_done = None;
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
+            let mut message = self
+                .last_action
+                .as_mut()
+                .filter(|a| a.id == id)
+                .and_then(|a| a.message.take())
+                .unwrap_or_else(|| std::mem::take(&mut self.action_msg_spare));
+            message.clear();
+            match cause {
+                ReconcileCause::Static(_, _, text) => message.push_str(text),
+                ReconcileCause::SafetyMessage(_, _) => {
+                    if self.safety.write_fault_message(&mut message).is_none() {
+                        message.push_str("CAN TX stalled");
+                    }
+                }
+                ReconcileCause::SafetyDebug(_, _) => {
+                    if let SafetyState::Fault(r) = self.safety.state() {
+                        use std::fmt::Write;
+                        let _ = write!(message, "{r:?}");
+                    }
+                }
+            }
             #[cfg(feature = "policy-runtime")]
             if is_policy {
                 let reason = match code {
@@ -1164,8 +1234,6 @@ impl SupervisorInner {
             return;
         }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
-            // decisions before further movement: contact stop, child deadline
-            self.step_macro_contact();
             self.expire_macro_child(Instant::now());
         }
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));

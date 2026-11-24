@@ -748,7 +748,9 @@ impl crate::supervisor::SupervisorInner {
                 Err(e) => return TickOutput::Error {
                     message: format!("MIT output refused: {e}"),
                     now: self.mit_now(),
+                    max_age: crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
                     is_hold,
+                    sent_any: false,
                 },
             },
         };
@@ -824,10 +826,15 @@ impl crate::supervisor::SupervisorInner {
                         is_hold,
                         sent_any: hold_sent_any,
                     },
+                    Err(crate::driver::ArmDriverError::EstopInhibited) => {
+                        TickOutput::EstopInhibited { is_hold }
+                    }
                     Err(e) => TickOutput::Error {
                         message: e.to_string(),
                         now,
+                        max_age,
                         is_hold,
+                        sent_any: hold_sent_any,
                     },
                 }
             })
@@ -837,6 +844,12 @@ impl crate::supervisor::SupervisorInner {
                 TickOutput::Complete { .. } => {
                     self.mit.last_ff = ff;
                     self.mit.last_output = Some(self.mit_now());
+                }
+                TickOutput::EstopInhibited { .. } => {
+                    self.mit_lose(
+                        format!("MIT batch write failed: {}", crate::driver::ESTOP_INHIBITED),
+                        crate::safety::FaultCode::BusLoss,
+                    );
                 }
                 TickOutput::Error { message, .. } => {
                     self.mit_lose(format!("MIT batch write failed: {message}"), crate::safety::FaultCode::BusLoss);

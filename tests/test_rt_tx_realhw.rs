@@ -225,6 +225,10 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
     //   frame 6 -> starts at 4.70 ms, finishes at 5.15 ms -> if a 2-frame spike or 0.45 ms + 1 ms
     //   every 2nd frame runs: frame 0=0.45, frame 1=1.90, frame 2=2.35, frame 3=3.80,
     //   frame 4=4.25, frame 5=5.70 -> frame 6 start is 5.70 ms (>= 5 ms cutoff, < 10 ms cutoff)!
+    // Part A1: Direct driver 7 targets + 1 due 0xCC refresh (8 frames total, ~0.45 ms/frame +
+    // 1 ms spike every 2nd frame) under 5 ms cutoff vs 10 ms default.
+    // Make J1 silent during read_joint_states after advancing > refresh threshold so 0xCC refresh
+    // consumes 1 attempt inside the same tick's TX pass before the 7 target frames.
     for (budget_ms, expect_deferred) in [(5u64, true), (10u64, false)] {
         let limits = dm_limits();
         let clock = MockClock::new();
@@ -243,22 +247,78 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
             });
         drv.read_joint_states().unwrap();
         drv.set_torque(true).unwrap();
+        // Advance clock past the 150 ms feedback-refresh threshold so read_joint_states emits a
+        // due 0xCC status refresh for J1 (keeping J2..J7 fresh via push_feedback).
+        clock.advance(ms(160));
         bus.with(|s| {
+            for i in 1..7 { s.push_feedback(i); }
+            s.tx_log.clear();
             s.tx_attempts = 0;
             s.tx_step = us(450);
             s.tx_spike_every = 2;
             s.tx_spike_step = ms(1);
         });
-        drv.begin_tx_tick();
         reset_tx_metrics();
+        drv.read_joint_states().unwrap();
+        let refresh_sent = bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC);
+        assert!(refresh_sent, "budget={budget_ms}ms: expected a due 0xCC refresh frame in this tick");
         let targets: Vec<JointTarget> = (0..7).map(|_| JointTarget::position(0.1)).collect();
         let out = drv.write_joint_targets_bounded(&targets).unwrap();
         if expect_deferred {
-            assert_eq!(out, TxBatchOutcome::Deferred { pending: 1 }, "5 ms cutoff must defer frame 6");
+            assert!(
+                matches!(out, TxBatchOutcome::Deferred { pending } if pending >= 1),
+                "5 ms cutoff must defer with 1 due refresh + 7 targets, got {out:?}"
+            );
+            assert!(take_tx_metrics().deferred > 0, "5 ms cutoff must record deferred frames");
         } else {
-            assert_eq!(out, TxBatchOutcome::Complete, "10 ms default must complete 7 frames without deferring");
+            assert_eq!(out, TxBatchOutcome::Complete, "10 ms default must complete due refresh + 7 targets");
             assert_eq!(take_tx_metrics().deferred, 0);
         }
+    }
+
+    // Part A2: Isolated 11 ms in-flight frame tail (matching real B601-DM `max_tx` 11.381 ms)
+    // started before the 10 ms cutoff finishes cleanly and rejects starting the next frame
+    // (`Deferred { pending: 6 }`), then drains cleanly on the next tick with 0 faults.
+    {
+        let limits = dm_limits();
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_tx_budget(TxBudget {
+                max_frames: DAMIAO_TX_MAX_FRAMES,
+                max_duration: ms(10),
+                frame_max_age: DAMIAO_TX_FRAME_MAX_AGE,
+            });
+        drv.read_joint_states().unwrap();
+        drv.set_torque(true).unwrap();
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.tx_attempts = 0;
+            s.tx_step = ms(11);
+        });
+        drv.begin_tx_tick();
+        let targets: Vec<JointTarget> = (0..7).map(|_| JointTarget::position(0.1)).collect();
+        let out = drv.write_joint_targets_bounded(&targets).unwrap();
+        assert_eq!(
+            out,
+            TxBatchOutcome::Deferred { pending: 6 },
+            "11 ms in-flight frame 0 must finish cleanly and reject starting frame 1"
+        );
+        assert_eq!(bus.tx_log().len(), 1, "only frame 0 started before 10 ms cutoff");
+        // Next tick (normal 0.45 ms/frame): drains carried + fresh batch cleanly!
+        clock.advance(ms(9));
+        bus.with(|s| {
+            s.tx_step = us(450);
+            s.push_all_feedback();
+        });
+        drv.read_joint_states().unwrap();
+        assert_eq!(drv.write_joint_targets_bounded(&targets).unwrap(), TxBatchOutcome::Complete);
     }
 
     // Part B: 7-motor jog + home under realistic 0.45 ms/frame + periodic spikes on BOTH owners.
@@ -268,7 +328,7 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
     for owner in [Owner::Legacy, Owner::Executor] {
         for (budget_ms, spike_every, spike_step) in [
             (10u64, 2usize, ms(1)),
-            (5u64, 14usize, us(2_500)),
+            (5u64, 10usize, us(2_500)),
         ] {
             let mut cfg = base_cfg();
             cfg.tx_budget_ms = Some(budget_ms);
@@ -279,6 +339,7 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
                 s.tx_spike_every = spike_every;
                 s.tx_spike_step = spike_step;
             });
+            reset_tx_metrics();
 
             // 1. 7-motor jog to nonzero pose across all 7 joints (including gripper).
             let jog_goal = vec![0.18, -0.15, -0.18, 0.20, -0.15, 0.22, -0.60];
@@ -341,14 +402,83 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
                     rig.inner().measured_positions[j]
                 );
             }
+            let m = take_tx_metrics();
             if budget_ms == 10 {
                 assert_eq!(
-                    take_tx_metrics().deferred,
+                    m.deferred,
                     0,
                     "{owner:?} 10 ms default should complete 0.45 ms/frame + 1 ms spike with 0 deferrals"
                 );
+            } else {
+                assert!(
+                    m.deferred > 0,
+                    "{owner:?} 5 ms budget with 2.5 ms spikes must actually exercise deferral carryover"
+                );
             }
         }
+    }
+
+    // Part C: Exercise the real `ArmSupervisor::home` async entry point under 10 ms default with
+    // 0.45 ms/frame + 1 ms spikes: completes back to `config.home_positions` with 0 faults.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        rt.block_on(async {
+            let limits = dm_limits();
+            let clock = MockClock::new();
+            let bus = FakeBus::with_clock(&limits, clock.clone());
+            bus.with(|s| {
+                s.immediate_replies = true;
+                s.follow_commands = true;
+                s.push_all_feedback();
+            });
+            let cfg = base_cfg();
+            let home_goal = cfg.home_positions.clone();
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(limits)
+                .unwrap()
+                .with_tx_budget(cfg.damiao_tx_budget());
+            drv.read_joint_states().unwrap();
+            drv.check_mapping_ranges();
+            let sup = armd::ArmSupervisor::new(cfg).with_driver(Box::new(drv));
+            {
+                let mut inner = sup.inner().write().await;
+                inner.lease_enabled = false;
+                inner.tick(DT);
+                inner.set_torque(true).expect("arm");
+                inner.jog_action(vec![0.15, -0.1, -0.1, 0.1, 0.0, 0.0, 0.0], Some(0.2), None, "joint_move").unwrap();
+                for _ in 0..20 {
+                    clock.advance(ms(20));
+                    bus.with(|s| s.push_all_feedback());
+                    inner.tick(DT);
+                }
+            }
+            bus.with(|s| {
+                s.tx_attempts = 0;
+                s.tx_step = us(450);
+                s.tx_spike_every = 2;
+                s.tx_spike_step = ms(1);
+            });
+            reset_tx_metrics();
+            sup.home(Some(0.4), None).await.expect("ArmSupervisor::home");
+            let mut home_done = false;
+            for _ in 0..50 {
+                clock.advance(ms(20));
+                bus.with(|s| s.push_all_feedback());
+                let mut inner = sup.inner().write().await;
+                inner.tick(DT);
+                assert!(inner.safety.state().is_operational(), "home faulted: {:?}", inner.safety.fault());
+                if inner.last_action.as_ref().is_some_and(|a| a.kind == "home" && a.state == "done") {
+                    home_done = true;
+                    break;
+                }
+            }
+            assert!(home_done, "ArmSupervisor::home did not finish");
+            let inner = sup.inner().read().await;
+            for (j, &goal) in home_goal.iter().enumerate() {
+                assert!((inner.measured_positions[j] - goal).abs() < 0.03, "home J{} drifted", j + 1);
+            }
+            assert_eq!(take_tx_metrics().deferred, 0);
+        });
     }
 }
 
@@ -574,8 +704,9 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
             assert!(slow_ids.contains(&(0x100 + j)), "{owner:?}: slow-cadence hold_cursor starved joint {j}");
         }
 
-        // (c) Zero-progress hold > 45 ms -> latches CAN_TX_STALLED ONCE, resumes when bus clears,
-        //     and clear_fault + enable recovers.
+        // (c) Zero-progress hold > 45 ms -> latches CAN_TX_STALLED ONCE with a SINGLE log event
+        //     on transition and <= 1/s log rate across 60 subsequent stalled ticks (1.2 s),
+        //     resumes when bus clears, and clear_fault + enable recovers.
         let mut rig_stall = DualRig::new(owner, base_cfg(), None);
         rig_stall.inner_mut()
             .safety
@@ -583,27 +714,65 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
         let init_epoch = rig_stall.inner().safety.epoch_id();
         rig_stall.bus.with(|s| s.tx_enobufs = true);
 
-        rig_stall.step(); // t = 20 (age 0)
-        assert_eq!(rig_stall.inner().safety.epoch_id(), init_epoch);
-        rig_stall.step(); // t = 40 (age 20)
-        assert_eq!(rig_stall.inner().safety.epoch_id(), init_epoch);
-        rig_stall.step(); // t = 60 (age 40)
-        assert_eq!(rig_stall.inner().safety.epoch_id(), init_epoch);
-        rig_stall.step(); // t = 80 (age 60 >= 45) -> escalates ONCE to CAN_TX_STALLED!
-        assert_eq!(
-            rig_stall.inner().safety.fault().map(|f| f.code),
-            Some(FaultCode::CanTxStalled),
-            "{owner:?}: zero-progress hold > 45 ms must latch CAN_TX_STALLED"
-        );
-        let stalled_epoch = rig_stall.inner().safety.epoch_id();
-        assert_eq!(stalled_epoch, init_epoch + 1);
-
-        // Next 10 ticks remain stalled: epoch must never advance again.
-        for _ in 0..10 {
-            rig_stall.step();
-            assert_eq!(rig_stall.inner().safety.epoch_id(), stalled_epoch);
-            assert_eq!(rig_stall.inner().safety.fault().map(|f| f.code), Some(FaultCode::CanTxStalled));
+        struct CountWarnErrorSubscriber(Arc<AtomicU64>);
+        impl tracing::Subscriber for CountWarnErrorSubscriber {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                *meta.level() <= tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() <= tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
         }
+
+        let log_events = Arc::new(AtomicU64::new(0));
+        let sub = CountWarnErrorSubscriber(Arc::clone(&log_events));
+        let stalled_epoch = tracing::subscriber::with_default(sub, || {
+            rig_stall.step(); // t = 20 (age 0)
+            assert_eq!(rig_stall.inner().safety.epoch_id(), init_epoch);
+            rig_stall.step(); // t = 40 (age 20)
+            assert_eq!(rig_stall.inner().safety.epoch_id(), init_epoch);
+            rig_stall.step(); // t = 60 (age 40)
+            assert_eq!(rig_stall.inner().safety.epoch_id(), init_epoch);
+            assert_eq!(log_events.load(Ordering::SeqCst), 0, "{owner:?}: no stall logs before 45 ms");
+
+            rig_stall.step(); // t = 80 (age 60 >= 45) -> escalates ONCE to CAN_TX_STALLED!
+            assert_eq!(
+                rig_stall.inner().safety.fault().map(|f| f.code),
+                Some(FaultCode::CanTxStalled),
+                "{owner:?}: zero-progress hold > 45 ms must latch CAN_TX_STALLED"
+            );
+            let stalled_epoch = rig_stall.inner().safety.epoch_id();
+            assert_eq!(stalled_epoch, init_epoch + 1);
+            assert_eq!(
+                log_events.load(Ordering::SeqCst),
+                1,
+                "{owner:?}: first stopped-hold escalation must emit exactly 1 log event (no duplicate WARN+ERROR)"
+            );
+
+            // Next 60 stalled ticks (1.2 s on driver clock): epoch never advances again, and
+            // rate-limited logs emit at most once more (~1.0 s after transition -> <= 2 total).
+            for _ in 0..60 {
+                rig_stall.step();
+                assert_eq!(rig_stall.inner().safety.epoch_id(), stalled_epoch);
+                assert_eq!(rig_stall.inner().safety.fault().map(|f| f.code), Some(FaultCode::CanTxStalled));
+            }
+            let total_events = log_events.load(Ordering::SeqCst);
+            assert!(
+                total_events <= 2,
+                "{owner:?}: expected <= 2 stall log events across 1.2 s (<= 1/s), got {total_events}"
+            );
+            stalled_epoch
+        });
+        assert_eq!(stalled_epoch, init_epoch + 1);
 
         // Bus clears -> fresh holds resume immediately, and clear_fault + enable succeeds!
         rig_stall.bus.with(|s| s.tx_enobufs = false);
@@ -614,6 +783,47 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
             assert!(resumed_ids.contains(&(0x100 + j)), "{owner:?}: joint {j} did not resume hold after bus cleared");
         }
         rig_stall.clear_fault_and_enable();
+
+        // (c2) Major 5: Hard transport errors (`tx_error = true`) while stopped with fresh RX:
+        //      - Zero progress (`sent_any == false`) >= 45 ms escalates ONCE to CAN_TX_STALLED.
+        //      - Partial submission (`fail_tx_after = Some(2)` on no-op flush bus, `sent_any == true`)
+        //        resets the no-progress timer and does NOT escalate.
+        {
+            let mut rig_err = DualRig::new(owner, base_cfg(), None);
+            rig_err.inner_mut()
+                .safety
+                .trigger_fault_coded(FaultCode::Other, FaultReason::Other("hard-error hold test".into()));
+            let e0 = rig_err.inner().safety.epoch_id();
+            // Partial submission: 2 frames accepted then hard error on frame 3 across 6 ticks (120 ms) ->
+            // must NOT escalate to CAN_TX_STALLED because sent_any == true every tick!
+            for _ in 0..6 {
+                rig_err.bus.with(|s| s.fail_tx_after = Some(2));
+                rig_err.step();
+                assert_eq!(rig_err.inner().safety.epoch_id(), e0, "{owner:?}: partial hard-error submission must not escalate");
+                assert_eq!(rig_err.inner().safety.fault().map(|f| f.code), Some(FaultCode::Other));
+            }
+            // Zero progress: every transmit returns hard error -> escalates ONCE after >= 45 ms!
+            rig_err.bus.with(|s| {
+                s.fail_tx_after = None;
+                s.tx_error = true;
+            });
+            for _ in 0..3 {
+                rig_err.step(); // t = 0, 20, 40 ms -> < 45 ms
+                assert_eq!(rig_err.inner().safety.epoch_id(), e0);
+            }
+            rig_err.step(); // t = 60 ms >= 45 ms -> escalates ONCE!
+            assert_eq!(
+                rig_err.inner().safety.fault().map(|f| f.code),
+                Some(FaultCode::CanTxStalled),
+                "{owner:?}: persistent hard TX errors with 0 progress >= 45 ms must escalate once to CAN_TX_STALLED"
+            );
+            let e1 = rig_err.inner().safety.epoch_id();
+            assert_eq!(e1, e0 + 1);
+            for _ in 0..5 {
+                rig_err.step();
+                assert_eq!(rig_err.inner().safety.epoch_id(), e1, "{owner:?}: hard-error escalation must latch only once");
+            }
+        }
 
         // (d) Fault precedence: EStop, ThermalTrip, and MitOwner::Lost are NEVER overwritten.
         for kind in ["estop", "thermal", "mit_lost"] {
@@ -809,6 +1019,164 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
         let settle = rig_pk.inner().unload_settle.as_ref().expect("settle still active");
         assert_eq!(settle.held_s, 0.0, "{owner:?}: output gap must invalidate continuous settle held_s");
         assert!(settle.samples.is_empty(), "{owner:?}: output gap must clear continuous settle samples");
+
+        // 4. Major 1: Macro contact guard (success-on-contact, `stop_code: None`) on a Deferred
+        //    tick stops the trajectory and locks target to measured immediately, but withholds
+        //    `SubState::Done` until the replacement hold completes (`Complete`).
+        {
+            let mut rig_mc = DualRig::new(owner, base_cfg(), None);
+            let epoch = rig_mc.inner().safety.epoch_id();
+            let id = rig_mc
+                .inner_mut()
+                .begin_orchestrated_action("grasp", None, epoch)
+                .expect("begin macro");
+            let mut max_res = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+            max_res[1] = 2.0; // J2 contact threshold 2.0 N·m
+            let guard = armd::macro_action::ContactGuard { max_residual_nm: max_res, stop_code: None };
+            rig_mc.inner_mut().guard_next_macro_child(id, Some(guard));
+            let mut goal = rig_mc.inner().commanded_positions.clone();
+            goal[0] += 0.35;
+            let limits = rig_mc.inner().planning_limits();
+            rig_mc
+                .inner_mut()
+                .install_macro_quintic(id, goal, &limits)
+                .expect("install macro child");
+            let ticket = rig_mc.inner().macro_run.as_ref().unwrap().ticket().unwrap();
+            rig_mc.step();
+            assert_eq!(rig_mc.inner().macro_child_state(ticket), Some(armd::macro_action::SubState::Running));
+
+            // Inject high J2 torque (creating residual > 2.0 N·m) AND transient ENOBUFS deferral!
+            rig_mc.bus.with(|s| {
+                s.motors[1].tau = 8.0;
+                s.tx_enobufs = true;
+            });
+            rig_mc.step();
+            assert!(rig_mc.inner().safety.state().is_operational());
+            assert!(
+                rig_mc.inner().active_trajectory.is_none(),
+                "{owner:?}: contact guard must immediately stop descent trajectory even when TX defers"
+            );
+            assert_eq!(
+                rig_mc.inner().macro_child_watch(ticket).and_then(|w| w.contact_joint),
+                Some(1),
+                "{owner:?}: contact_joint must be recorded on contact tick"
+            );
+            assert_eq!(
+                rig_mc.inner().macro_child_state(ticket),
+                Some(armd::macro_action::SubState::Running),
+                "{owner:?}: SubState::Done must be withheld while replacement hold TX is Deferred"
+            );
+            // Bus clears -> replacement hold completes -> SubState::Done commits!
+            rig_mc.bus.with(|s| s.tx_enobufs = false);
+            rig_mc.step();
+            assert!(
+                matches!(rig_mc.inner().macro_child_state(ticket), Some(armd::macro_action::SubState::Done(_))),
+                "{owner:?}: SubState::Done must commit once replacement hold completes, got {:?}",
+                rig_mc.inner().macro_child_state(ticket)
+            );
+        }
+
+        // 5. Major 2: Gravity-comp with tracking enabled + arm moving past `exit_hold_ms`:
+        //    on the first stationary tick, if stiff hold TX returns `Deferred`, POS_VEL handback
+        //    must NOT start before TX acceptance; once `Complete`, the dedicated transition
+        //    release completes handback without resetting the active TX pass.
+        {
+            let mut jt = armd::model::JointTrackingConfig::rebot_dm();
+            jt.enabled = true;
+            let cfg_jt = ArmConfig {
+                joint_tracking: Some(jt),
+                ..base_cfg()
+            };
+            let mut rig_jt = DualRig::new(owner, cfg_jt, None);
+            rig_jt.inner_mut().enter_gravity_comp(Default::default()).expect("enter gravity comp");
+            rig_jt.step();
+            rig_jt.inner_mut().exit_gravity_comp("REQUESTED", "major2");
+            // Keep arm moving for 6 ticks (120 ms > 100 ms exit_hold_ms).
+            rig_jt.bus.with(|s| {
+                s.follow_commands = false;
+                s.motors[0].v = 0.20;
+            });
+            for _ in 0..6 {
+                rig_jt.step();
+                assert!(rig_jt.inner().gravity_comp.is_some());
+            }
+            // First stationary tick, BUT TX returns Deferred -> must NOT hand back to POS_VEL!
+            rig_jt.bus.with(|s| {
+                s.motors[0].v = 0.0;
+                s.tx_enobufs = true;
+            });
+            rig_jt.step();
+            assert!(
+                rig_jt.inner().gravity_comp.is_some(),
+                "{owner:?}: stationary tick whose stiff hold deferred must NOT start POS_VEL handback"
+            );
+            assert!(rig_jt.inner().safety.state().is_operational());
+            // Bus clears -> 1 Complete tick arms handback + 1 dedicated transition release completes it.
+            rig_jt.bus.with(|s| s.tx_enobufs = false);
+            rig_jt.step();
+            assert!(rig_jt.inner().gravity_comp.is_some(), "{owner:?}: handback waits for scheduled transition release");
+            rig_jt.step();
+            assert!(rig_jt.inner().gravity_comp.is_none(), "{owner:?}: scheduled transition release completes handback");
+            assert!(rig_jt.inner().safety.state().is_operational());
+        }
+
+        // 6. Major 8: Off-tick gravity exit deferral must NOT count toward periodic `tx_stall_ticks`,
+        //    and an intervening unattempted release (`TickOutput::None` with no pending motion)
+        //    resets the periodic deferral streak.
+        {
+            let mut cfg_s2 = base_cfg();
+            cfg_s2.tx_stall_ticks = Some(2);
+            let mut rig_s2 = DualRig::new(owner, cfg_s2, None);
+            rig_s2.inner_mut().enter_gravity_comp(Default::default()).expect("enter gravity comp");
+            rig_s2.step();
+            // Inject ENOBUFS during off-tick `exit_gravity_comp` -> immediate write defers,
+            // must NOT increment periodic `tx_deferral_streak`!
+            rig_s2.bus.with(|s| s.tx_enobufs = true);
+            rig_s2.inner_mut().exit_gravity_comp("REQUESTED", "major8");
+            // 1st periodic deferred release (streak = 1 < tx_stall_ticks = 2): MUST stay operational!
+            rig_s2.step();
+            assert!(
+                rig_s2.inner().safety.state().is_operational(),
+                "{owner:?}: off-tick exit deferral + 1 control release must not trip tx_stall_ticks=2"
+            );
+            // Bus clears -> recovers cleanly!
+            rig_s2.bus.with(|s| s.tx_enobufs = false);
+            for _ in 0..7 {
+                rig_s2.step();
+            }
+            assert!(rig_s2.inner().gravity_comp.is_none());
+            assert!(rig_s2.inner().safety.state().is_operational());
+
+            // Also verify `TickOutput::None` with no pending motion resets an active streak:
+            // with tracking enabled, `recovery_suspended = true` produces `TickOutput::None`
+            // while torqued and operational. 1 deferred release -> discard pending & skip output ->
+            // next deferred release is streak 1 again (< 2), NOT streak 2!
+            let mut jt = armd::model::JointTrackingConfig::rebot_dm();
+            jt.enabled = true;
+            let mut cfg_none = base_cfg();
+            cfg_none.tx_stall_ticks = Some(2);
+            cfg_none.joint_tracking = Some(jt);
+            let mut rig_none = DualRig::new(owner, cfg_none, None);
+            rig_none.bus.with(|s| s.tx_enobufs = true);
+            rig_none.step(); // streak = 1 (< 2)
+            assert!(rig_none.inner().safety.state().is_operational());
+            if let Some(d) = rig_none.inner().driver.as_ref() {
+                d.lock().unwrap().discard_pending_tx();
+            }
+            rig_none.inner_mut().tracking.recovery_suspended = true;
+            rig_none.inner_mut().tracking.recovery_joints.push((0, std::time::Instant::now()));
+            // Advance 20 ms without pushing fresh feedback (age = 20 ms > recovery since.elapsed()
+            // while still < 250 ms BusLoss), so recovery stays suspended -> TickOutput::None!
+            rig_none.step_dt(0.02, false);
+            rig_none.inner_mut().tracking.recovery_joints.clear();
+            rig_none.inner_mut().tracking.recovery_suspended = false;
+            rig_none.step(); // streak = 1 (< 2) -> still operational!
+            assert!(
+                rig_none.inner().safety.state().is_operational(),
+                "{owner:?}: TickOutput::None without pending motion must reset tx_deferral_streak: {:?}",
+                rig_none.inner().safety.fault()
+            );
+        }
     }
 }
 
@@ -817,6 +1185,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
 fn profile_tx_budget_and_stall_ticks_validation() {
     let dm = ArmConfig::rebot_dm();
     assert_eq!(dm.tx_budget_ms, Some(10));
+    assert_eq!(dm.resolved_tx_budget_ms(), 10);
     assert_eq!(dm.resolved_tx_stall_ticks(), 3);
     let b = dm.damiao_tx_budget();
     assert_eq!(b.max_duration, DAMIAO_TX_MAX_DURATION);
@@ -829,6 +1198,14 @@ fn profile_tx_budget_and_stall_ticks_validation() {
     assert!(cfg.validate().is_err(), "tx_budget_ms = 0 must be rejected");
     cfg.tx_budget_ms = Some(21); // > 20 ms control period at 50 Hz
     assert!(cfg.validate().is_err(), "tx_budget_ms > period must be rejected");
+    cfg.control_frequency_hz = 200; // 5 ms period
+    cfg.tx_budget_ms = None; // omitted default (10 ms) exceeds 5 ms period -> must be rejected!
+    assert!(cfg.validate().is_err(), "200 Hz profile omitting tx_budget_ms (effective 10 ms > 5 ms) must be rejected");
+    cfg.tx_budget_ms = Some(10);
+    assert!(cfg.validate().is_err(), "200 Hz profile with explicit tx_budget_ms = 10 must be rejected");
+    cfg.tx_budget_ms = Some(5);
+    assert!(cfg.validate().is_ok(), "200 Hz profile with tx_budget_ms = 5 must pass");
+    assert_eq!(cfg.damiao_tx_budget().max_duration, ms(5));
     cfg.control_frequency_hz = 10; // 100 ms period, still capped by 45 ms frame max age
     cfg.tx_budget_ms = Some(46);
     assert!(cfg.validate().is_err(), "tx_budget_ms > 45 ms must be rejected");

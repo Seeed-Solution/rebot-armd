@@ -249,8 +249,9 @@ pub enum TxBatchOutcome {
 /// Default maximum CAN transmit attempts started in one tick (shared across RX recovery/refresh,
 /// J7 handshake TX, and target writes; safety disable / fault-clear frames are exempt).
 pub const DAMIAO_TX_MAX_FRAMES: usize = 16;
-/// Default cutoff elapsed time for starting new CAN transmit attempts in one tick. An in-flight
-/// `transmit()` or `flush()` started before this cutoff may complete after it.
+/// Default cutoff elapsed time for starting new CAN transmit attempts in one tick (and any
+/// non-no-op transport `flush()`). An in-flight `transmit()` started before this cutoff may
+/// complete after it.
 ///
 /// Sized from real SG2002 B601-DM measurements (`qual-smoke-20261124T000133Z`, `1.6.0-dev11` /
 /// `df7487d`, `can0` `mcp251xfd` over SPI at 1 Mbit/s, `SCHED_FIFO` 45, ERROR-ACTIVE, `berr 0/0`,
@@ -258,14 +259,16 @@ pub const DAMIAO_TX_MAX_FRAMES: usize = 16;
 /// - `tx_us`: p50 3.915 ms, p99 8.123 ms, max 13.383 ms
 /// - `tx.send_us` (1000-tick window): p50 3.622 ms, p99 7.763 ms, max 13.184 ms
 ///   (`send_cpu_us`: p50 0.593 ms, p99 0.757 ms, max 1.259 ms)
-/// - `tx.frame_max_us`: p50 1.058 ms, p99 6.104 ms, max 11.554 ms
+/// - `tx.frame_max_us`: p50 1.058 ms, p99 6.104 ms, window max 11.554 ms
+///   (`max_tx` peak frame 11.381 ms)
 /// - `max_tick`: 7 target frames in `tx_send_us` 3.114 ms (`tx_frame_max_us` 0.994 ms)
 ///
 /// The previous 5 ms cutoff deferred healthy 7-motor + refresh batches under normal SPI
-/// preemption (`SCHED_FIFO` 45 vs SPI IRQ 50). 10 ms covers 7 target frames plus 1 refresh at
-/// ~1 ms/frame (~8 ms) with margin inside the 20 ms release period while isolated >10 ms tails
-/// defer cleanly to the next tick (bounded by `DAMIAO_TX_FRAME_MAX_AGE` = 45 ms). Overridable
-/// per profile via `ArmConfig::tx_budget_ms`.
+/// preemption (`SCHED_FIFO` 45 vs SPI IRQ 50). 10 ms is a frame-start cutoff sized for the
+/// common 7-target + 1-refresh case (~8 ms with margin inside the 20 ms release period); an
+/// isolated >10 ms in-flight SPI tail completes cleanly and defers any remaining unstarted
+/// frames to the next tick (bounded by `DAMIAO_TX_FRAME_MAX_AGE` = 45 ms). Overridable per
+/// profile via `ArmConfig::tx_budget_ms`.
 pub const DAMIAO_TX_MAX_DURATION: Duration = Duration::from_millis(10);
 /// Default inclusive maximum age of a queued target frame before it is dropped as stale
 /// (`age >= frame_max_age` drops).
@@ -480,6 +483,9 @@ pub trait ArmDriver: Send {
     /// Observed age of the oldest frame currently queued in the pending TX queue.
     fn oldest_pending_tx_age(&self) -> Option<Duration> { None }
 
+    /// Number of unsent motion target frames currently queued in the bounded TX carry-over queue.
+    fn pending_motion_tx_len(&self) -> usize { 0 }
+
     /// Enable or disable torque / power across all joints
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError>;
 
@@ -661,6 +667,13 @@ pub trait ArmDriver: Send {
     /// and an MIT frame on every write until a later switch confirms them.
     fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         Err(ArmDriverError::Protocol("joint mode switching is not supported by this driver".into()))
+    }
+
+    /// [`Self::set_joint_modes`] invoked from within an active control release: shares the
+    /// release's existing per-tick TX pass instead of opening a fresh pass and bypassing any
+    /// budget/cutoff already consumed in that release.
+    fn set_joint_modes_in_tick(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        self.set_joint_modes(modes, hold)
     }
 
     /// At least one joint is in an unconfirmed control mode after a failed switch.
@@ -3398,6 +3411,73 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.can_start_tick_tx_n(1)
     }
 
+    /// True when a transport with a real (`!flush_is_noop()`) flush cannot start `flush()`
+    /// because the current tick TX pass deadline has already elapsed.
+    #[inline]
+    fn flush_cutoff_exceeded(&self) -> bool {
+        !self.can.flush_is_noop()
+            && self.tick_tx.is_some_and(|pass| self.now() >= pass.deadline)
+    }
+
+    /// Shared mode-switch implementation used by both off-tick [`ArmDriver::set_joint_modes`]
+    /// (which opens a fresh TX pass) and in-tick [`ArmDriver::set_joint_modes_in_tick`] (which
+    /// shares the active release's TX pass).
+    fn set_joint_modes_impl(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let start_stamp = self.current_stop_stamp();
+        let n = self.motor_ids.len();
+        if modes.len() != n || hold.len() != n {
+            return Err(ArmDriverError::JointCountMismatch { expected: n, actual: modes.len().min(hold.len()) });
+        }
+        if !self.supports_mit_mode_switch() {
+            return Err(ArmDriverError::Protocol("joint mode switching needs the POS_VEL base mode".into()));
+        }
+        let target: Vec<DamiaoControlMode> = modes.iter().enumerate().map(|(i, m)| match m {
+            JointMode::Position => self.base_mode(i),
+            JointMode::Mit => DamiaoControlMode::Mit,
+        }).collect();
+        let changing: Vec<usize> = (0..n).filter(|&i| self.joint_modes[i] != Some(target[i])).collect();
+        if changing.is_empty() { return Ok(()); }
+        let is_base_restore = changing.iter().all(|&i| target[i] == self.base_mode(i));
+        // CTRL_MODE writes (forward and rollback alike) are refused while a stop/E-stop is pending OR latched.
+        self.strict_stop_check(Some(start_stamp))?;
+        let forward_policy = if !is_base_restore {
+            ModeWritePolicy::Strict(start_stamp)
+        } else {
+            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
+        };
+        let effective_hold = hold.to_vec();
+        self.validate_pos_force_holds(&changing, &target, &effective_hold, false)?;
+        let to_mit: Vec<usize> = changing.iter().copied()
+            .filter(|&i| target[i] == DamiaoControlMode::Mit && !self.mit_limits_verified[i]).collect();
+        if !to_mit.is_empty() { self.verify_mit_limits(&to_mit, start_stamp)?; }
+        let previous = self.joint_modes.clone();
+        let failed = self.write_modes(&changing, &target, &effective_hold, false, forward_policy)?;
+        if failed.is_empty() {
+            tracing::info!("Damiao control mode switched for joints {:?}", changing.iter().map(|i| i + 1).collect::<Vec<_>>());
+            return Ok(());
+        }
+        // Not confirmed: switch every changed joint back to its previous mode, holding it
+        // with both frame kinds meanwhile so it holds whichever mode it is actually in.
+        for &i in &changing { self.joint_modes[i] = None; }
+        let back: Vec<DamiaoControlMode> = (0..n).map(|i| previous[i].unwrap_or(self.base_mode(i))).collect();
+        let back_is_base = changing.iter().all(|&i| back[i] == self.base_mode(i));
+        // Rollback CTRL_MODE writes are also ModeWrite: refused while pending, latched, or after a stop.
+        self.strict_stop_check(Some(start_stamp))?;
+        let rollback_policy = if !back_is_base {
+            ModeWritePolicy::Strict(start_stamp)
+        } else {
+            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
+        };
+        let rollback_hold = hold.to_vec();
+        let unrecovered = self.write_modes(&changing, &back, &rollback_hold, true, rollback_policy)?;
+        Err(ArmDriverError::HardwareFault(format!(
+            "Control-mode switch not confirmed for joints {:?}; switched back{}",
+            failed.iter().map(|i| i + 1).collect::<Vec<_>>(),
+            if unrecovered.is_empty() { String::new() } else {
+                format!(", joints {:?} still unconfirmed", unrecovered.iter().map(|i| i + 1).collect::<Vec<_>>())
+            })))
+    }
+
     #[inline]
     fn can_start_tick_tx_n(&self, needed: usize) -> bool {
         let Some(pass) = self.tick_tx else { return needed <= self.tx_budget.max_frames; };
@@ -3567,13 +3647,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::BuildRefused);
         };
 
-        // 5. Re-read deadline, physical stop latch, pending gate, and stop-generation stamp AFTER
-        //    `build`, immediately before `can.transmit` (host submission boundary). Checking only
-        //    the generation stamp would miss an E-stop latch flip before `requested_estop_count`
-        //    advances; re-checking `deadline` rejects frames whose age limit elapsed during `build`;
+        // 5. Re-read deadline, tick TX cutoff, physical stop latch, pending gate, and
+        //    stop-generation stamp AFTER `build`, immediately before `can.transmit` (host
+        //    submission boundary). Checking only the generation stamp would miss an E-stop latch
+        //    flip before `requested_estop_count` advances; re-checking `deadline` and the tick
+        //    cutoff rejects frames whose age limit or TX start window elapsed during `build`;
         //    also reject `RollbackHold` if the latch transitioned false -> true during `build`.
         if deadline.is_some_and(|d| d.passed(self.now())) {
             return Err(TxRefusal::DeadlinePassed);
+        }
+        if budgeted && !self.can_start_tick_tx() {
+            return Err(TxRefusal::Deferred);
         }
         let latched_after = self.stop_gate_for_kind(kind)?;
         if matches!(kind, TxKind::RollbackHold(_)) && !latched_before && latched_after {
@@ -4782,6 +4866,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(e);
         }
         if sent_any {
+            if self.flush_cutoff_exceeded() {
+                self.mark_tx_pass_backpressured();
+                self.discard_pending_tx_stopped();
+                return Err(TransportError::Timeout.into());
+            }
             if let Err(e) = self.can.flush() {
                 // Flush failure or backpressure is fail-closed: never report Complete and never
                 // replay already-submitted frames.
@@ -6601,59 +6690,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         self.discard_all_pending_tx();
         self.begin_tx_tick();
-        let start_stamp = self.current_stop_stamp();
-        let n = self.motor_ids.len();
-        if modes.len() != n || hold.len() != n {
-            return Err(ArmDriverError::JointCountMismatch { expected: n, actual: modes.len().min(hold.len()) });
+        self.set_joint_modes_impl(modes, hold)
+    }
+
+    fn set_joint_modes_in_tick(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+            return Err(ArmDriverError::HardwareFault("MIT tracking holds the deadline fence: plain mode switch refused".into()));
         }
-        if !self.supports_mit_mode_switch() {
-            return Err(ArmDriverError::Protocol("joint mode switching needs the POS_VEL base mode".into()));
-        }
-        let target: Vec<DamiaoControlMode> = modes.iter().enumerate().map(|(i, m)| match m {
-            JointMode::Position => self.base_mode(i),
-            JointMode::Mit => DamiaoControlMode::Mit,
-        }).collect();
-        let changing: Vec<usize> = (0..n).filter(|&i| self.joint_modes[i] != Some(target[i])).collect();
-        if changing.is_empty() { return Ok(()); }
-        let is_base_restore = changing.iter().all(|&i| target[i] == self.base_mode(i));
-        // CTRL_MODE writes (forward and rollback alike) are refused while a stop/E-stop is pending OR latched.
-        self.strict_stop_check(Some(start_stamp))?;
-        let forward_policy = if !is_base_restore {
-            ModeWritePolicy::Strict(start_stamp)
-        } else {
-            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
-        };
-        let effective_hold = hold.to_vec();
-        self.validate_pos_force_holds(&changing, &target, &effective_hold, false)?;
-        let to_mit: Vec<usize> = changing.iter().copied()
-            .filter(|&i| target[i] == DamiaoControlMode::Mit && !self.mit_limits_verified[i]).collect();
-        if !to_mit.is_empty() { self.verify_mit_limits(&to_mit, start_stamp)?; }
-        let previous = self.joint_modes.clone();
-        let failed = self.write_modes(&changing, &target, &effective_hold, false, forward_policy)?;
-        if failed.is_empty() {
-            tracing::info!("Damiao control mode switched for joints {:?}", changing.iter().map(|i| i + 1).collect::<Vec<_>>());
-            return Ok(());
-        }
-        // Not confirmed: switch every changed joint back to its previous mode, holding it
-        // with both frame kinds meanwhile so it holds whichever mode it is actually in.
-        for &i in &changing { self.joint_modes[i] = None; }
-        let back: Vec<DamiaoControlMode> = (0..n).map(|i| previous[i].unwrap_or(self.base_mode(i))).collect();
-        let back_is_base = changing.iter().all(|&i| back[i] == self.base_mode(i));
-        // Rollback CTRL_MODE writes are also ModeWrite: refused while pending, latched, or after a stop.
-        self.strict_stop_check(Some(start_stamp))?;
-        let rollback_policy = if !back_is_base {
-            ModeWritePolicy::Strict(start_stamp)
-        } else {
-            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
-        };
-        let rollback_hold = hold.to_vec();
-        let unrecovered = self.write_modes(&changing, &back, &rollback_hold, true, rollback_policy)?;
-        Err(ArmDriverError::HardwareFault(format!(
-            "Control-mode switch not confirmed for joints {:?}; switched back{}",
-            failed.iter().map(|i| i + 1).collect::<Vec<_>>(),
-            if unrecovered.is_empty() { String::new() } else {
-                format!(", joints {:?} still unconfirmed", unrecovered.iter().map(|i| i + 1).collect::<Vec<_>>())
-            })))
+        self.discard_all_pending_tx();
+        let _ = self.ensure_tx_pass();
+        self.set_joint_modes_impl(modes, hold)
+    }
+
+    fn pending_motion_tx_len(&self) -> usize {
+        self.pending_tx.len()
     }
 
     fn set_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -7377,8 +7427,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 return Err(ArmDriverError::EstopInhibited);
             }
             if sent_any {
+                if self.flush_cutoff_exceeded() {
+                    self.mark_tx_pass_backpressured();
+                    self.last_hold_tx_sent_any = false;
+                    self.trip_fence(MitFenceTripReason::FlushFailed {
+                        kind: TxFailKind::Timeout,
+                    });
+                    return Err(TransportError::Timeout.into());
+                }
                 if let Err(e) = self.can.flush() {
                     self.mark_tx_pass_backpressured();
+                    self.last_hold_tx_sent_any = false;
                     if self.pending_stop_check(Some(start_stamp)).is_err() {
                         self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
                         return Err(ArmDriverError::EstopInhibited);
@@ -7402,8 +7461,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         // Unfenced bounded stopped-hold path: carries deferred holds inline in `pending_hold_tx`
-        // with round-robin `hold_cursor` rotation across slow-cadence partial passes, rebuilding
-        // every frame fresh at send time from `fresh_measured_position(<= 100 ms)`.
+        // with round-robin `hold_cursor` rotation over `(joint, slot)` frame keys so slow-cadence
+        // partial passes never starve an unconfirmed joint's second (MIT) slot, rebuilding every
+        // frame fresh at send time from `fresh_measured_position(<= 100 ms)`.
+        self.last_hold_tx_sent_any = false;
         if let Err(e) = self.pending_stop_check(None) {
             self.discard_pending_hold_tx();
             return Err(e);
@@ -7414,7 +7475,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             crate::diagnostics::tick::record_tx_dropped_stopped(stopped_carry as u32);
         }
         // Drop stale carried-over holds without resetting `hold_cursor`, then still stage fresh
-        // holds so a slow cadence (e.g. 100 ms) rotates across all joints instead of stalling.
+        // holds so a slow cadence (e.g. 100 ms) rotates across all frame keys instead of stalling.
         let (pre_dropped_stale, mut oldest_expired) =
             self.pending_hold_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
         if pre_dropped_stale > 0 {
@@ -7422,6 +7483,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         let n = targets.len();
+        if n > MAX_MODE_JOINTS {
+            self.discard_pending_hold_tx();
+            return Err(ArmDriverError::JointCountMismatch { expected: MAX_MODE_JOINTS, actual: n });
+        }
+        let mut staged_ids: [[Option<u32>; 2]; MAX_MODE_JOINTS] = [[None; 2]; MAX_MODE_JOINTS];
         let mut new_keys = 0usize;
         for (i, target) in targets.iter().enumerate() {
             let (frames, _) = match self.target_frames_checked(i, target) {
@@ -7431,9 +7497,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     return Err(e);
                 }
             };
-            for frame in frames.into_iter().flatten() {
-                if self.pending_hold_tx.find_key(i, frame.id).is_none() {
-                    new_keys += 1;
+            for (slot, maybe_frame) in frames.into_iter().enumerate() {
+                if let Some(frame) = maybe_frame {
+                    staged_ids[i][slot] = Some(frame.id);
+                    if self.pending_hold_tx.find_key(i, frame.id).is_none() {
+                        new_keys += 1;
+                    }
                 }
             }
         }
@@ -7448,28 +7517,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         let batch_ts = self.now();
-        let start_joint = if n > 0 { self.hold_cursor % n } else { 0 };
-        for offset in 0..n {
-            let i = (start_joint + offset) % n;
-            let target = &targets[i];
-            let (frames, _) = match self.target_frames_checked(i, target) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.discard_pending_hold_tx();
-                    return Err(e);
-                }
-            };
-            for (slot, maybe_frame) in frames.into_iter().enumerate() {
-                if let Some(frame) = maybe_frame {
-                    let cmd = PendingTargetCmd::RollbackHold {
-                        kp: target.kp,
-                        kd: target.kd,
-                        torque: target.torque,
-                        slot: slot as u8,
-                    };
-                    let ok = self.pending_hold_tx.upsert(i, frame.id, cmd, batch_ts, start_stamp);
-                    debug_assert!(ok, "preflight checked pending_hold_tx capacity");
-                }
+        let total_slots = n.saturating_mul(2);
+        let start_flat = if total_slots > 0 { self.hold_cursor % total_slots } else { 0 };
+        for offset in 0..total_slots {
+            let flat = (start_flat + offset) % total_slots;
+            let i = flat / 2;
+            let slot = flat % 2;
+            if let Some(frame_id) = staged_ids[i][slot] {
+                let target = &targets[i];
+                let cmd = PendingTargetCmd::RollbackHold {
+                    kp: target.kp,
+                    kd: target.kd,
+                    torque: target.torque,
+                    slot: slot as u8,
+                };
+                let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp);
+                debug_assert!(ok, "preflight checked pending_hold_tx capacity");
             }
         }
 
@@ -7518,8 +7581,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     );
                     self.record_sent_target(i, sent_frame, Some(mit_params));
                     sent_any = true;
-                    if n > 0 {
-                        self.hold_cursor = (i + 1) % n;
+                    if total_slots > 0 {
+                        self.hold_cursor = (i * 2 + usize::from(slot) + 1) % total_slots;
                     }
                 }
                 Err(TxRefusal::DeadlinePassed) => {
@@ -7531,10 +7594,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::Deferred) => break,
                 Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                     self.discard_pending_hold_tx();
                     return Err(ArmDriverError::EstopInhibited);
                 }
                 Err(TxRefusal::BuildRefused) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                     self.discard_pending_hold_tx();
                     if self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
                         return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
@@ -7542,23 +7607,27 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     return Err(ArmDriverError::PosForceTargetUnavailable { joint: i });
                 }
                 Err(TxRefusal::MitFenceTripped(reason)) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                     self.discard_pending_hold_tx();
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
                 Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
                     if self.pending_stop_check(Some(start_stamp)).is_err() {
+                        self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                         self.discard_pending_hold_tx();
                         return Err(ArmDriverError::EstopInhibited);
                     }
                     if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce)
                         && self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
                     {
+                        self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                         self.discard_pending_hold_tx();
                         return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
                     }
                     break;
                 }
                 Err(TxRefusal::Transport(e)) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                     self.mark_tx_pass_backpressured();
                     self.discard_pending_hold_tx();
                     if self.pending_stop_check(Some(start_stamp)).is_err() {
@@ -7570,13 +7639,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         if self.pending_stop_check(Some(start_stamp)).is_err() {
+            self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
             self.discard_pending_hold_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
         if sent_any {
+            if self.flush_cutoff_exceeded() {
+                self.mark_tx_pass_backpressured();
+                self.discard_pending_hold_tx();
+                self.last_hold_tx_sent_any = false;
+                return Err(TransportError::Timeout.into());
+            }
             if let Err(e) = self.can.flush() {
                 self.mark_tx_pass_backpressured();
                 self.discard_pending_hold_tx();
+                self.last_hold_tx_sent_any = false;
                 if self.pending_stop_check(Some(start_stamp)).is_err() {
                     return Err(ArmDriverError::EstopInhibited);
                 }
@@ -7797,6 +7874,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if self.strict_stop_check(Some(start_stamp)).is_err() {
                 self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
                 return Err(ArmDriverError::EstopInhibited);
+            }
+            if self.flush_cutoff_exceeded() {
+                self.mark_tx_pass_backpressured();
+                self.trip_fence(MitFenceTripReason::FlushFailed {
+                    kind: TxFailKind::Timeout,
+                });
+                return Err(TransportError::Timeout.into());
             }
             if let Err(e) = self.can.flush() {
                 self.mark_tx_pass_backpressured();
@@ -8375,6 +8459,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         && !stopped_during_refresh
                         && self.pending_stop_check(Some(rx_stop_stamp)).is_ok()
                     {
+                        if self.flush_cutoff_exceeded() {
+                            self.mark_tx_pass_backpressured();
+                            self.discard_all_pending_tx();
+                            return Err(TransportError::Timeout.into());
+                        }
                         if let Err(e) = self.can.flush() {
                             self.mark_tx_pass_backpressured();
                             self.discard_all_pending_tx();

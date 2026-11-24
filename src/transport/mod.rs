@@ -339,6 +339,14 @@ pub trait CanTransport: Send {
         false
     }
 
+    /// True when [`Self::flush`] performs no transport I/O and cannot block or consume TX budget
+    /// (e.g. Linux SocketCAN, where each `transmit()` submits directly to the kernel socket).
+    /// Transports with a real flush default to `false` so the driver enforces the tick TX
+    /// start-cutoff before starting `flush()`.
+    fn flush_is_noop(&self) -> bool {
+        false
+    }
+
     /// True when [`Self::receive`], [`Self::transmit`], and [`Self::flush`] are all non-blocking
     /// and safe to drive directly from the synchronous RT executor (`armd-control`).
     /// Blocking serial transports (`SlcanTransport`) default to `false`.

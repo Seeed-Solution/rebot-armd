@@ -194,6 +194,9 @@ pub struct FakeBusState {
     pub tx_attempts: usize,
     /// The next `n` flushes fail.
     pub fail_flushes: usize,
+    /// When true, `CanTransport::flush_is_noop()` returns `false` so the driver enforces the
+    /// tick TX cutoff before starting `flush()`.
+    pub real_flush: bool,
     /// The 0xCC status poll refreshes the motor watchdog (unknown on the device).
     pub poll_feeds_watchdog: bool,
     /// The motor plant follows the commanded position at once.
@@ -392,6 +395,7 @@ impl FakeBus {
             tx_spike_step: Duration::ZERO,
             tx_attempts: 0,
             fail_flushes: 0,
+            real_flush: false,
             poll_feeds_watchdog: false,
             follow_commands: true,
             delayed: Vec::with_capacity(64),
@@ -503,6 +507,9 @@ impl CanTransport for FakeBus {
         let mut s = self.0.lock().unwrap();
         if s.fail_flushes > 0 { s.fail_flushes -= 1; return Err(TransportError::Can("injected flush error".into())); }
         Ok(())
+    }
+    fn flush_is_noop(&self) -> bool {
+        !self.0.lock().unwrap().real_flush
     }
 }
 

@@ -536,7 +536,10 @@ impl SupervisorInner {
                         // without advancing issued history or marking the ramp done.
                         self.tracking.fallback_ramp = Some(ramp);
                     }
-                    TickOutput::Expired { .. } | TickOutput::Error { .. } | TickOutput::None => {
+                    TickOutput::Expired { .. }
+                    | TickOutput::Error { .. }
+                    | TickOutput::EstopInhibited { .. }
+                    | TickOutput::None => {
                         self.tracking.invalidate();
                     }
                 }

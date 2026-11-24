@@ -78,10 +78,12 @@ impl SupervisorInner {
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
-        self.active_trajectory = None;
+        if let Some(old_traj) = self.active_trajectory.take() {
+            self.retire_active_trajectory(old_traj);
+        }
         self.pending_deferred_done = None;
         self.pending_normal_unload = false;
-        self.unload_settle = None;
+        self.clear_unload_settle();
         self.zero_check_persisting = None;
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
     }
@@ -159,6 +161,7 @@ impl SupervisorInner {
                 let mut hold = [0.0f32; 6];
                 for (dst, &src) in hold.iter_mut().zip(&self.commanded_positions) { *dst = src; }
                 run.phase = crate::gravity_comp::GravityCompPhase::Exiting { hold, elapsed_s: 0.0 };
+                self.gravity_comp_handback_ready = false;
                 run.position = hold;
                 for (dst, &src) in run.kp.iter_mut().zip(&run.policy.hold_kp) { *dst = src; }
                 for (dst, &src) in run.kd.iter_mut().zip(&run.policy.hold_kd) { *dst = src; }
@@ -186,15 +189,14 @@ impl SupervisorInner {
         };
         self.safety.trigger_e_stop();
         // If an urgent E-stop request is still pending (requested != applied), `pending_stop_check`
-        // intentionally returns `ESTOP_INHIBITED` and defers the hold to the first eligible stopped
+        // intentionally returns `EstopInhibited` and defers the hold to the first eligible stopped
         // release; do not log or classify that as a hold write failure.
         let suppress_pending_estop = matches!(
             &hold_out,
-            crate::supervisor::TickOutput::Error { message, .. }
-                if message.contains(crate::driver::ESTOP_INHIBITED)
+            crate::supervisor::TickOutput::EstopInhibited { .. }
         );
         if !suppress_pending_estop {
-            let _ = self.classify_tick_output(hold_out);
+            let _ = self.classify_tick_output(hold_out, false, false);
         }
     }
 

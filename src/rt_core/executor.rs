@@ -710,6 +710,7 @@ pub(crate) struct OffThreadSinks {
     diag_rx: Mutex<Consumer<TickSample>>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
+    reclaim_traj_rx: Mutex<Consumer<crate::motion::ActiveTrajectory>>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
@@ -738,6 +739,12 @@ impl OffThreadSinks {
             let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(arc) = rx.pop() {
                 drop(arc);
+            }
+        }
+        {
+            let mut rx = self.reclaim_traj_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(traj) = rx.pop() {
+                drop(traj);
             }
         }
         self.maint_client.drain_replies();
@@ -1100,6 +1107,7 @@ pub(crate) fn spawn_executor(
     let (maint_rep_tx, maint_rep_rx) = RingBuffer::<MaintReply>::new(MAINT_QUEUE_CAPACITY);
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
+    let (reclaim_traj_tx, reclaim_traj_rx) = RingBuffer::<crate::motion::ActiveTrajectory>::new(8);
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -1120,6 +1128,7 @@ pub(crate) fn spawn_executor(
         diag_rx: Mutex::new(diag_rx),
         estop_reg: estop_reg.clone(),
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
+        reclaim_traj_rx: Mutex::new(reclaim_traj_rx),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
@@ -1176,6 +1185,7 @@ pub(crate) fn spawn_executor(
                 estop_ack_tx,
                 estop_overflow_gen,
                 reclaim_state_tx,
+                reclaim_traj_tx,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
@@ -1258,6 +1268,7 @@ struct ControlState {
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     /// Reply for a maintenance op serviced before Step 3 commit / Step 6 publish, held until
@@ -1294,8 +1305,9 @@ impl ControlState {
         }
     }
 
-    /// Moves retired fault `Arc<SafetyState>` snapshots off `armd-control` into the bounded SPSC
-    /// reclamation ring (never pops when the ring is full so no `Arc` can drop on `armd-control`).
+    /// Moves retired fault `Arc<SafetyState>` snapshots and retired `ActiveTrajectory` instances
+    /// off `armd-control` into bounded SPSC reclamation rings (never pops when full so nothing
+    /// heap-backed drops on `armd-control`).
     fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
         let mut drained = false;
         while !self.reclaim_state_tx.is_full() {
@@ -1303,6 +1315,13 @@ impl ControlState {
                 break;
             };
             let _ = self.reclaim_state_tx.push(arc);
+            drained = true;
+        }
+        while !self.reclaim_traj_tx.is_full() {
+            let Some(traj) = core.pop_retired_trajectory() else {
+                break;
+            };
+            let _ = self.reclaim_traj_tx.push(traj);
             drained = true;
         }
         if drained {
@@ -2182,6 +2201,7 @@ fn control_thread_main(
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -2246,6 +2266,7 @@ fn control_thread_main(
         estop_ack_tx,
         estop_overflow_gen,
         reclaim_state_tx,
+        reclaim_traj_tx,
         maint_req_rx,
         maint_rep_tx,
         pending_maint_reply: None,
@@ -2829,6 +2850,7 @@ mod tests {
         let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
         let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -2855,6 +2877,7 @@ mod tests {
             estop_ack_tx,
             estop_overflow_gen: Arc::new(AtomicU64::new(0)),
             reclaim_state_tx,
+            reclaim_traj_tx,
             maint_req_rx,
             maint_rep_tx,
             pending_maint_reply: None,

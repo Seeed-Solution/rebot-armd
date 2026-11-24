@@ -433,6 +433,10 @@ impl CanTransport for MockCanTransport {
         true
     }
 
+    fn flush_is_noop(&self) -> bool {
+        true
+    }
+
     fn supports_nonblocking_rt(&self) -> bool {
         true
     }

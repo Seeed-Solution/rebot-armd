@@ -237,6 +237,7 @@ impl CanTransport for NoAllocDamiaoBus {
     }
 
     fn supports_bounded_flush(&self) -> bool { true }
+    fn flush_is_noop(&self) -> bool { true }
     fn supports_nonblocking_rt(&self) -> bool { true }
 }
 
@@ -804,6 +805,9 @@ impl CanTransport for SharedNoAllocBus {
     fn supports_bounded_flush(&self) -> bool {
         true
     }
+    fn flush_is_noop(&self) -> bool {
+        true
+    }
     fn supports_nonblocking_rt(&self) -> bool {
         true
     }
@@ -1059,4 +1063,121 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     let _ = gc_inner.core.hub().latest();
     assert!(gc_inner.gravity_comp.is_some());
     assert_eq!((a, f), (0, 0), "Active gravity-comp tick_publish touched allocator");
+
+    // (f) Major 6A: Running jog action stalls into CAN_TX_STALLED (3 deferred ticks), terminates
+    //     the action (`failed` / `CAN_TX_STALLED` with non-empty message) and publishes observation
+    //     — whole release must do 0 allocs, 0 frees!
+    let (mut jog_inner, jog_bus) = mk_rt_supervisor();
+    let epoch = jog_inner.safety.epoch_id();
+    let (_, jog_id, _) = jog_inner
+        .jog_action(vec![0.15, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(epoch), "joint_move")
+        .expect("start jog");
+    // Warm up running action across all 3 triple-buffer slots before counting.
+    for _ in 0..4 {
+        let _ = jog_inner.tick_publish(0.02, 1, false);
+        let _ = jog_inner.core.hub().latest();
+    }
+    assert_eq!(jog_inner.last_action.as_ref().map(|a| (a.id, a.state.as_str())), Some((jog_id, "running")));
+    {
+        let mut guard = jog_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(2);
+        guard.tx_count = 0;
+    }
+    for tick in 1..=3 {
+        jog_bus.0.lock().unwrap().tx_count = 0;
+        let (published, a, f) = counted(|| jog_inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "running-jog deferral/stall tick {tick} touched allocator"
+        );
+    }
+    assert_eq!(jog_inner.safety.fault_code(), Some(FaultCode::CanTxStalled));
+    let snap = jog_inner.core.hub().latest().expect("published observation after jog stall");
+    let act = snap.obs.action.as_ref().expect("published action after jog stall");
+    assert_eq!(act.id, jog_id);
+    assert_eq!(act.state.as_str(), "failed");
+    assert_eq!(act.code.as_deref(), Some("CAN_TX_STALLED"));
+    assert!(
+        act.message.as_deref().is_some_and(|m| m.contains("CAN TX stalled")),
+        "expected CAN TX stalled action message, got {:?}",
+        act.message
+    );
+    drop(snap);
+
+    // (g) Major 6B: Escalating a stopped hold from an existing heap-backed `Fault(Other(String))`
+    //     to `Fault(CanTxStalled)` retires the old state arc and recycles `safety_reason` spare
+    //     with 0 allocs, 0 frees across the whole release.
+    let (mut esc_inner, esc_bus) = mk_rt_supervisor();
+    esc_inner
+        .safety
+        .trigger_fault_coded(FaultCode::Other, FaultReason::Other("existing heap-backed fault".into()));
+    // Warm up the existing heap-backed Fault(Other) across all 3 triple-buffer slots.
+    for _ in 0..4 {
+        let _ = esc_inner.tick_publish(0.02, 1, false);
+        let _ = esc_inner.core.hub().latest();
+    }
+    {
+        let mut guard = esc_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(0);
+        guard.tx_count = 0;
+    }
+    // Advance clock >= 45 ms across ticks so stopped hold escalates from Fault(Other) -> CanTxStalled.
+    for tick in 0..4 {
+        {
+            let mut guard = esc_bus.0.lock().unwrap();
+            guard.clock.advance(Duration::from_millis(20));
+            guard.push_all_feedback();
+            guard.tx_count = 0;
+        }
+        let (published, a, f) = counted(|| esc_inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "Fault(Other) -> CanTxStalled stopped-hold escalation tick {tick} touched allocator"
+        );
+    }
+    assert_eq!(esc_inner.safety.fault_code(), Some(FaultCode::CanTxStalled));
+    assert!(
+        esc_inner.safety.retired_state_arcs_len() >= 1,
+        "prior heap-backed Fault(Other) state arc must be retired off-thread"
+    );
+    let esc_snap = esc_inner.core.hub().latest().expect("published observation after escalation");
+    assert_eq!(esc_snap.obs.safety_state, SafetyState::Fault(FaultReason::CanTxStalled));
+    assert_eq!(esc_snap.obs.fault.as_ref().map(|f| f.code), Some(FaultCode::CanTxStalled));
+    drop(esc_snap);
+
+    // (h) Major 7: Park `unload_settle` populated with accepted stationary samples followed by a
+    //     transient `Deferred` output-gap release clearing `settle.samples` — 0 allocs, 0 frees!
+    let (mut pk_inner, pk_bus) = mk_rt_supervisor();
+    pk_inner.pending_normal_unload = true;
+    // Populate settle history and warm all 3 triple-buffer slots.
+    for _ in 0..6 {
+        let _ = pk_inner.tick_publish(0.02, 1, false);
+        let _ = pk_inner.core.hub().latest();
+    }
+    assert!(
+        pk_inner.unload_settle.as_ref().is_some_and(|s| !s.samples.is_empty()),
+        "unload_settle should hold accepted stationary samples before the output gap"
+    );
+    {
+        let mut guard = pk_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(2);
+        guard.tx_count = 0;
+    }
+    let (published, a, f) = counted(|| pk_inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    assert_eq!(
+        (a, f),
+        (0, 0),
+        "park unload_settle Deferred output-gap release touched allocator"
+    );
+    let settle = pk_inner.unload_settle.as_ref().expect("settle remains active after transient gap");
+    assert_eq!(settle.held_s, 0.0);
+    assert!(settle.samples.is_empty(), "output gap must clear settle samples without freeing");
 }

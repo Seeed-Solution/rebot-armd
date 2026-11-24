@@ -1598,15 +1598,20 @@ impl ArmConfig {
         })
     }
 
+    /// Effective Damiao per-tick CAN TX start-cutoff (ms): explicit `tx_budget_ms` when set,
+    /// otherwise the default `10` ms (`DAMIAO_TX_MAX_DURATION`).
+    pub fn resolved_tx_budget_ms(&self) -> u64 {
+        self.tx_budget_ms.unwrap_or(10)
+    }
+
     /// Damiao per-tick CAN TX budget derived from this profile (`tx_budget_ms` overrides
     /// `DAMIAO_TX_MAX_DURATION`; `max_frames = 16`, `frame_max_age = 45 ms`).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn damiao_tx_budget(&self) -> crate::driver::TxBudget {
-        let mut budget = crate::driver::TxBudget::default();
-        if let Some(ms) = self.tx_budget_ms {
-            budget.max_duration = std::time::Duration::from_millis(ms);
+        crate::driver::TxBudget {
+            max_duration: std::time::Duration::from_millis(self.resolved_tx_budget_ms()),
+            ..crate::driver::TxBudget::default()
         }
-        budget
     }
 
     /// Convert an `end_link` pose into the active TCP pose (`p_tcp = p_end + R_end * tcp_offset`).
@@ -1970,11 +1975,14 @@ impl ArmConfig {
             || self.max_jerk.is_some_and(|j| !j.is_finite() || j <= 0.0) {
             return Err("Invalid control, temperature, following-error or jerk configuration".into());
         }
-        if let Some(ms) = self.tx_budget_ms {
+        {
             let period_ms = (1000 / u64::from(self.control_frequency_hz.max(1))).max(1);
             let max_ms = period_ms.min(45);
+            let ms = self.resolved_tx_budget_ms();
             if ms == 0 || ms > max_ms {
-                return Err(format!("tx_budget_ms must be in 1..={max_ms} (control period {period_ms} ms, frame max age 45 ms)"));
+                return Err(format!(
+                    "effective tx_budget_ms ({ms} ms) must be in 1..={max_ms} (control period {period_ms} ms, frame max age 45 ms)"
+                ));
             }
         }
         if self.tx_stall_ticks == Some(0) {

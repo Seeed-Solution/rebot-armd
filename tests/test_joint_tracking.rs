@@ -2105,12 +2105,18 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         }
         assert!(inner.gravity_comp.is_some(), "must stay in Exiting while arm is still moving");
 
-        // Once stationary and fresh, handback succeeds, seeds a confirmed baseline, and the same
-        // tick's tracking output validates and issues the stationary hold frame.
+        // Once stationary and fresh:
+        // - Tick 1: stiff MIT hold completes cleanly while stationary and schedules the handback release.
+        // - Tick 2: dedicated transition release executes POS_VEL handback within its TX pass and seeds Stationary.
+        // - Tick 3: tracking owns POS_VEL output, validates, and issues the confirmed stationary baseline.
         drv.with(|s| s.v[0] = 0.0);
         inner.tick(DT);
-        assert!(inner.gravity_comp.is_none(), "stationary fresh feedback should complete handback");
+        assert!(inner.gravity_comp.is_some(), "handback must wait for the scheduled transition release after stiff hold completes");
+        inner.tick(DT);
+        assert!(inner.gravity_comp.is_none(), "scheduled transition release should complete handback");
         assert!(inner.safety.state().is_operational(), "clean handback must stay operational");
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Stationary);
+        inner.tick(DT);
         assert_eq!(inner.tracking.history_state, TrackingHistoryState::Issued);
         let issued = inner.tracking.last_issued_positions.as_ref().expect("confirmed baseline issued");
         for i in 0..6 {

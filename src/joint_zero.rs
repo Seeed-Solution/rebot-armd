@@ -275,6 +275,13 @@ impl ArmDriver for ZeroOffsetDriver {
             Some(m) => self.inner.set_joint_modes(modes, &m),
         }
     }
+    fn set_joint_modes_in_tick(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        match self.to_motor(hold) {
+            None => self.inner.set_joint_modes_in_tick(modes, hold),
+            Some(m) => self.inner.set_joint_modes_in_tick(modes, &m),
+        }
+    }
+    fn pending_motion_tx_len(&self) -> usize { self.inner.pending_motion_tx_len() }
     fn joint_modes_uncertain(&self) -> bool { self.inner.joint_modes_uncertain() }
     fn range_check(&self) -> Option<DriverRangeCheck> { self.inner.range_check() }
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }

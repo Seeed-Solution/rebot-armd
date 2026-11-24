@@ -8,7 +8,7 @@ use super::config_iface::{ConfigDomain, ConfigHold, HeldConfig};
 use super::mailbox::TargetAuthority;
 use super::ops::TorqueProgress;
 use super::ids::{ArmId, BusId};
-use super::publish::{state_channel, RtInputs, StateHub, StatePublisher};
+use super::publish::{state_channel, ObservationSpares, RtInputs, StateHub, StatePublisher};
 use super::record_ring::{Fence, Finished, RecordProducer, RecordRing};
 use crate::driver::ArmDriver;
 use crate::model::ArmObservation;
@@ -17,11 +17,11 @@ use crate::rt_core::scratch::{copy_into, FeedbackScratch};
 /// The publication slot's observation, out for filling ([`ArmCore::take_observation_buffer`]);
 /// only [`ArmCore::publish`] takes it back.
 #[derive(Debug)]
-pub struct ObservationBuffer(ArmObservation, String);
+pub struct ObservationBuffer(ArmObservation, ObservationSpares);
 
 impl ObservationBuffer {
-    /// Borrows the observation and its preallocated fault-message spare together (0 alloc).
-    pub fn split_mut(&mut self) -> (&mut ArmObservation, &mut String) {
+    /// Borrows the observation and its preallocated string spares together (0 alloc).
+    pub fn split_mut(&mut self) -> (&mut ArmObservation, &mut ObservationSpares) {
         (&mut self.0, &mut self.1)
     }
 }
@@ -176,8 +176,8 @@ impl ArmCore {
     pub fn take_observation_buffer(&mut self) -> ObservationBuffer {
         self.buffer_out = true;
         let obs = self.publisher.take_back_observation().unwrap_or_else(ArmObservation::blank);
-        let spare = self.publisher.take_back_fault_spare();
-        ObservationBuffer(obs, spare)
+        let spares = self.publisher.take_back_spares();
+        ObservationBuffer(obs, spares)
     }
 
     /// Publishes one tick's observation, filled in place, back into the slot it came from:
@@ -185,7 +185,7 @@ impl ArmCore {
     /// and the retire ring do).
     pub fn publish(&mut self, buffer: ObservationBuffer, generation: u64, sampled_at: Instant, valid_until: Instant, positions: &[f32], velocities: &[f32]) {
         self.buffer_out = false;
-        self.publisher.restore_back_fault_spare(buffer.1);
+        self.publisher.restore_back_spares(buffer.1);
         let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
         let displaced = self.publisher.publish(generation, sampled_at, valid_until, buffer.0, rt);
         // the slot was emptied by take_observation_buffer and nothing wrote it since
