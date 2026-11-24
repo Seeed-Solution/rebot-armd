@@ -106,7 +106,9 @@ pub const RETIRE_CAPACITY: usize = 8;
 /// be freed there: a single-producer (the tick) single-consumer (the holder of the hub
 /// mutex) ring of preallocated `Option` slots, so neither side allocates or waits.
 struct RetireRing {
-    slots: [UnsafeCell<Option<ArmObservation>>; RETIRE_CAPACITY],
+    /// Heap-allocated once at channel creation so constructing `StateHub` does not place
+    /// `RETIRE_CAPACITY` full `ArmObservation` values on the caller's stack.
+    slots: Box<[UnsafeCell<Option<ArmObservation>>]>,
     head: AtomicU64,
     tail: AtomicU64,
 }
@@ -118,7 +120,11 @@ unsafe impl Sync for RetireRing {}
 
 impl RetireRing {
     fn new() -> Self {
-        Self { slots: std::array::from_fn(|_| UnsafeCell::new(None)), head: AtomicU64::new(0), tail: AtomicU64::new(0) }
+        let mut slots = Vec::with_capacity(RETIRE_CAPACITY);
+        for _ in 0..RETIRE_CAPACITY {
+            slots.push(UnsafeCell::new(None));
+        }
+        Self { slots: slots.into_boxed_slice(), head: AtomicU64::new(0), tail: AtomicU64::new(0) }
     }
 
     /// Producer: hands `obs` over (None), or gives it back when the ring is full.

@@ -1367,9 +1367,6 @@ impl GripperContactDetector {
     pub fn step(&mut self, input: &GripperContactInput<'_>) -> GripperContactEval {
         let window_s = gripper_progress_window_s(input.window_speed, 0.10);
         let (progressed, progress_stopped) = self.progress.update(input.measured_pos, input.dir, input.dt, window_s);
-        if progressed {
-            self.stopped_ticks = 0;
-        }
         let (base_thresh, threshold_source, baseline_nm) = match crate::gripper_baseline::closing_contact_threshold(
             input.baseline,
             input.measured_pos,
@@ -1401,9 +1398,12 @@ impl GripperContactDetector {
             ThresholdSource::ContactTorqueNm | ThresholdSource::None => None,
         };
         let can_hit = input.torque_feedback && input.active && input.tau_abs.is_finite();
-        if !progressed && can_hit && stopped_thresh.is_some_and(|t| input.tau_abs >= t) {
-            self.stopped_ticks = self.stopped_ticks.saturating_add(1);
-        } else if progressed || !can_hit || !stopped_thresh.is_some_and(|t| input.tau_abs >= t) {
+        let stopped_hit = can_hit && stopped_thresh.is_some_and(|t| input.tau_abs >= t);
+        if stopped_hit {
+            // Seed at 1 on anchor initialization (`progressed == true`) to match
+            // `GripperProgressWindow::step_sustained` with zero 1-tick skew when `dt >= window_s`.
+            self.stopped_ticks = if progressed { 1 } else { self.stopped_ticks.saturating_add(1) };
+        } else {
             self.stopped_ticks = 0;
         }
         if can_hit && moving_thresh.is_some_and(|t| input.tau_abs >= t) {
@@ -2525,6 +2525,10 @@ impl ActiveTrajectory {
     }
 }
 
+/// Bounded inline action status message stored on [`ActionStatus::message`] so terminal
+/// action failure and observation publication never heap-allocate `String` on `armd-control`.
+pub type ActionMessage = crate::safety::BoundedText<256>;
+
 /// Status of the most recent action, published in every observation.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
@@ -2535,7 +2539,7 @@ pub struct ActionStatus {
     /// running | done | failed | cancelled
     pub state: crate::model::HolderLabel,
     pub code: Option<crate::model::HolderLabel>,
-    pub message: Option<String>,
+    pub message: Option<ActionMessage>,
     pub progress: f32,
     pub started_at: f64,
     pub finished_at: Option<f64>,

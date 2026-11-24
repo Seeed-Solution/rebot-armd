@@ -113,7 +113,7 @@ impl SupervisorInner {
                 old.state = "cancelled".into();
                 old.code = Some("SUPERSEDED".into());
                 if format_superseded_msg {
-                    old.message = Some(format!("Replaced by a new {kind} action"));
+                    old.message = Some(format!("Replaced by a new {kind} action").into());
                 }
                 old.finished_at = Some(now);
             }
@@ -145,6 +145,20 @@ impl SupervisorInner {
 
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
+        let bounded = message.as_deref().map(crate::motion::ActionMessage::new);
+        self.finish_action_bounded(id, state, code, bounded, settled, holding, gap);
+    }
+
+    pub(crate) fn finish_action_bounded(
+        &mut self,
+        id: u64,
+        state: &str,
+        code: Option<&str>,
+        message: Option<crate::motion::ActionMessage>,
+        settled: Option<bool>,
+        holding: Option<bool>,
+        gap: Option<f32>,
+    ) {
         let now = self.now_s();
         let mut store_offset_req: Option<(f32, Option<(crate::auth::OperatorAuth, Option<String>)>)> = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
@@ -200,7 +214,7 @@ impl SupervisorInner {
                     if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
                         a.state = "failed".into();
                         a.code = Some("INVALID_CALIBRATION".into());
-                        a.message = Some(format!("Gripper calibration rejected: {e}"));
+                        a.message = Some(format!("Gripper calibration rejected: {e}").into());
                     }
                 }
                 Ok((cand, _)) => {
@@ -259,7 +273,7 @@ impl SupervisorInner {
                                     if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
                                         a.state = "failed".into();
                                         a.code = Some("PERSIST_FAILED".into());
-                                        a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                                        a.message = Some(format!("Failed to persist gripper calibration: {e}").into());
                                     }
                                 }
                                 Ok(staged) => match staged.rename_only() {
@@ -268,7 +282,7 @@ impl SupervisorInner {
                                         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
                                             a.state = "failed".into();
                                             a.code = Some("PERSIST_FAILED".into());
-                                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                                            a.message = Some(format!("Failed to persist gripper calibration: {e}").into());
                                         }
                                     }
                                     Ok(dir_sync) => {
@@ -1443,7 +1457,15 @@ impl SupervisorInner {
                         };
                     }
                 } else if let Some(id) = action_id {
-                    self.finish_action(id, "failed", Some(code), Some(message.as_str().to_owned()), None, None, None);
+                    self.finish_action_bounded(
+                        id,
+                        "failed",
+                        Some(code),
+                        Some(crate::motion::ActionMessage::new(message.as_str())),
+                        None,
+                        None,
+                        None,
+                    );
                 }
                 None
             }

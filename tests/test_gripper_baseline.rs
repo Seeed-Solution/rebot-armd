@@ -9,6 +9,10 @@
 //! 0.55-0.7 N·m near open, with tick-to-tick noise and a run-to-run offset.
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[global_allocator]
+static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
+
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
 use armd::gripper_baseline::{ContactSource, Direction, ThresholdSource};
 use armd::model::{ArmConfig, GripperPolicy, JointState};
@@ -116,12 +120,39 @@ impl ArmDriver for RigDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { true }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.resize(7, Some(Duration::ZERO));
+    }
+    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool { dof == 7 }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        out.clear();
+        out.resize(7, Some(0));
+    }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) {
+        out.clear();
+        out.resize(7, Some(std::time::Instant::now()));
+    }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { out.clear(); }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) { out.clear(); }
+    fn clear_fault_disables_arm_joint(&self, _arm_dof: usize) -> bool { false }
+    fn has_hardware_fault(&self) -> bool { false }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let mut out = Vec::with_capacity(7);
+        self.read_joint_states_into(&mut out)?;
+        Ok(out)
+    }
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         let r = self.0.lock().unwrap();
-        Ok((0..7).map(|i| JointState { position: r.q[i], velocity: r.v[i], torque: r.tau[i], temperature: 30.0 }).collect())
+        out.clear();
+        for i in 0..7 {
+            out.push(JointState { position: r.q[i], velocity: r.v[i], torque: r.tau[i], temperature: 30.0 });
+        }
+        Ok(())
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut r = self.0.lock().unwrap();
@@ -1021,6 +1052,7 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
         let epoch = inner.safety.epoch_id();
         let mut target = INSPECT.to_vec();
         let mut g = INSPECT[6];
+        let mut saw_spike_tau = false;
         for tick in 0..80 {
             g = (g + 0.30 * DT as f32).min(0.0);
             target[6] = g;
@@ -1032,6 +1064,9 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
             };
             inner.servo(target.clone(), epoch).unwrap();
             inner.tick(DT);
+            if rig.lock().unwrap().tau[6].abs() >= 0.85 {
+                saw_spike_tau = true;
+            }
             assert!(
                 inner.gripper_stream_contact.is_none(),
                 "stream 2-tick spike learned={learned} tick={tick}: false contact {:?}",
@@ -1039,6 +1074,7 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
             );
             assert!(!inner.gripper_stalled, "stream 2-tick spike learned={learned} tick={tick}: false stall");
         }
+        assert!(saw_spike_tau, "stream 2-tick spike learned={learned}: never observed >= 0.85 N·m spike");
     }
 
     //    3c. Stopped jaw on a rigid block under a closing stream: once net progress stops over the
@@ -1119,12 +1155,27 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
 
 /// I16 Item 4: Automatic baseline learning must consume queued `MoveRecord`s off the control
 /// thread under BOTH `RtOwner::Executor` and `RtOwner::Legacy`, without allocating on
-/// `armd-control`, updating the owner's live baseline observation and persisting to disk.
+/// `armd-control`, enforcing tool/follower isolation, updating the owner's live baseline
+/// observation, and persisting to disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
     use armd::gripper_baseline::{FreeTorqueBaseline, MoveRecord, MoveSamples};
     use armd::rt_core::executor::ExecutorConfig;
     use armd::ArmSupervisor;
+
+    // Positive control proving `TimedAlloc` is active as #[global_allocator] in this test binary
+    // so `lock_alloc_calls == 0` below cannot be vacuously zero.
+    std::thread::spawn(|| {
+        armd::diagnostics::alloc::time_this_thread();
+        let _ = armd::diagnostics::alloc::take();
+        let probe: Vec<u8> = vec![0xAB; 64];
+        std::hint::black_box(&probe);
+        drop(probe);
+        let stats = armd::diagnostics::alloc::take();
+        assert!(stats.calls > 0, "TimedAlloc positive control failed: calls={}", stats.calls);
+    })
+    .join()
+    .unwrap();
 
     let make_open_record = |tau_nm: f32| -> MoveRecord {
         let mut samples = MoveSamples::default();
@@ -1141,27 +1192,40 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
         }
     };
 
-    // 1. Executor owner: records queued on the owner (both pre-queued and produced by a live
-    //    unloaded opening GripperMotion completing on `armd-control`) are consumed off-thread
-    //    by `spawn_baseline_persister_with_interval`, stored back onto the owner with zero
-    //    control-thread allocations, reflected in published observations, and written to disk.
+    // 1. Executor owner: a live unloaded full opening move (0.0 -> -5.7) finishes on `armd-control`
+    //    with `RigDriver` (Finger::Old = 0.40 N·m, torque_feedback = true) and queues a real
+    //    `MoveRecord` into `core.gripper_baseline_pending`. A foreign-tool baseline (`"other-tool"`,
+    //    0.99 N·m, 7 open moves) is seeded on the owner right before executor start so
+    //    `TakeBaselinePending` MUST filter it out via `belongs_to` and `StoreBaseline` MUST return
+    //    it off-thread for zero-free reclamation on `armd-control`.
     let dir = tempfile::tempdir().unwrap();
-    let baseline_path = dir.path().join("gripper_baseline.mock.json");
+    let baseline_path = dir.path().join("gripper_baseline.rig.json");
 
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let mut q_closed = INSPECT;
+    q_closed[6] = 0.0;
+    let live_rig = Arc::new(Mutex::new(Rig {
+        q: q_closed,
+        v: [0.0; 7],
+        tau: [0.0; 7],
+        enabled: EnableState::Disabled,
+        finger: Finger::Old,
+        load: Load::Free,
+        seed: 7,
+        offset: 0.0,
+        broke: false,
+        peak_tau: 0.0,
+        pressed: 0,
+    }));
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(RigDriver(live_rig.clone()))),
+    );
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        inner.follower = Some("mock".into());
+        inner.follower = Some("rig".into());
         inner.gripper_baseline_path = Some(baseline_path.clone());
+        inner.tick(DT);
         inner.set_torque(true).unwrap();
-        // Start an unloaded opening move from closed (0.0) to open (-5.7) so `armd-control`
-        // finishes it and queues a real `MoveRecord` into `core.gripper_baseline_pending`,
-        // plus one pre-queued unloaded open record with known 0.35 N·m torque.
-        inner.gripper_baseline_pending.push(make_open_record(0.35));
-        inner.commanded_positions[6] = -5.4;
-        inner.measured_positions[6] = -5.4;
-        inner.target_positions[6] = -5.4;
         let ep = inner.safety.epoch_id();
         inner
             .start_gripper(
@@ -1169,23 +1233,36 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
                     command: GripperCommand::Open,
                     fraction: None,
                     grasp: false,
-                    speed: 2.0,
-                    timeout_s: Some(5.0),
+                    speed: 3.0,
+                    timeout_s: Some(10.0),
                     tag: None,
                 },
                 ep,
             )
             .unwrap();
+        // Seed the foreign-tool baseline AFTER `start_gripper` (which calls
+        // `gripper_baseline_for_motion`) so it is genuinely present in `core.gripper_baseline`
+        // when `TakeBaselinePending` and `StoreBaseline` execute on `armd-control`.
+        let mut foreign = FreeTorqueBaseline::new(
+            0.0,
+            -5.7,
+            Some("other-tool".into()),
+            Some("deadbeef".into()),
+            Some("rig".into()),
+        );
+        foreign.learn(&make_open_record(0.99), 2.0);
+        foreign.open_moves = 7;
+        inner.gripper_baseline = Some(foreign);
     }
 
     let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
     cfg.alloc_timing = true;
     let handle = sup.start_executor(cfg).await.unwrap();
 
-    // Let the live opening motion finish on `armd-control` first: the control thread only
-    // queues the MoveRecord (never learns synchronously on `armd-control`), so `open_moves`
+    // Let the live full-stroke opening motion finish on `armd-control` first: the control thread
+    // only queues the MoveRecord (never learns synchronously on `armd-control`), so `open_moves`
     // stays 0 until the off-thread consumer starts.
-    let motion_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let motion_deadline = std::time::Instant::now() + Duration::from_secs(6);
     while std::time::Instant::now() < motion_deadline {
         let obs = sup.get_observation().await;
         if obs.action.as_ref().is_some_and(|a| !a.is_running()) {
@@ -1202,7 +1279,7 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
         Duration::from_millis(20),
     );
 
-    // Wait until the consumer drains the queued records, updates the owner's live baseline,
+    // Wait until the consumer drains the live queued record, updates the owner's live baseline,
     // and persists the JSON file to disk (read published StateHub observations so every
     // maintenance release in `tick_samples` is a baseline op).
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1218,16 +1295,18 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
     let obs_b = learned_obs.expect("executor baseline consumer did not drain/learn/persist queued records");
-    assert!(obs_b.open_moves >= 1, "{obs_b:?}");
+    assert_eq!(obs_b.open_moves, 1, "expected 1 live open move (not foreign tool's 7): {obs_b:?}");
     assert_eq!(obs_b.state.as_str(), "learning", "{obs_b:?}");
 
-    // Persisted file parses cleanly and learned the 0.35 N·m opening profile.
+    // Persisted file parses cleanly, belongs to the active tool (not "other-tool"), and learned
+    // the live Finger::Old opening stroke (~0.40 N·m, not the foreign 0.99 N·m table).
     let raw = std::fs::read_to_string(&baseline_path).unwrap();
     let persisted: FreeTorqueBaseline = serde_json::from_str(&raw).unwrap();
     persisted.validate().unwrap();
-    assert!(persisted.open_moves >= 1, "{persisted:?}");
-    let est = persisted.estimate(-3.0, Direction::Open, 1.0).expect("open bin learned");
-    assert!((est.baseline_nm - 0.35).abs() < 0.05, "unexpected learned torque: {est:?}");
+    assert_eq!(persisted.open_moves, 1, "{persisted:?}");
+    assert_ne!(persisted.tool_id.as_deref(), Some("other-tool"));
+    let est = persisted.estimate(-3.0, Direction::Open, 1.0).expect("open bin learned from live stroke");
+    assert!((est.baseline_nm - 0.40).abs() < 0.08, "expected ~0.40 N·m live open baseline (not foreign 0.99): {est:?}");
 
     // Queue must now be empty on the executor owner, and a stale-generation StoreBaseline must
     // be refused without mutating live state.
@@ -1244,7 +1323,7 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
     assert!(!stale_stored, "stale generation StoreBaseline must be refused");
 
     // Verify EVERY maintenance release servicing TakeBaselinePending / StoreBaseline did 0
-    // allocations on `armd-control`.
+    // allocations/frees on `armd-control` (measured by active `TimedAlloc` global allocator).
     tokio::time::sleep(Duration::from_millis(20)).await;
     let samples = sup.tick_samples();
     let maint_allocs: Vec<(u64, u32)> = samples

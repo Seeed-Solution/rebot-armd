@@ -2810,18 +2810,19 @@ impl SupervisorInner {
             self.end_gripper_stream();
         }
         if let Some(g_idx) = self.config.gripper_index() {
-            let (is_bus_fresh, has_torque_feedback, has_load_feedback) = if let Some(ref d) = self.driver {
+            let (is_bus_fresh, has_torque_feedback, has_load_feedback, pos_force_info) = if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
                     let fresh = self.feedback_numeric_valid
                         && self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50))
                         && driver.is_feedback_valid();
                     let caps = driver.capabilities();
-                    (fresh, caps.torque_feedback, caps.load_feedback)
+                    let pf = driver.gripper_pos_force_info().filter(|info| info.joint == g_idx);
+                    (fresh, caps.torque_feedback, caps.load_feedback, pf)
                 } else {
-                    (false, false, false)
+                    (false, false, false, None)
                 }
             } else {
-                (true, true, false) // In simulation without a physical driver
+                (true, true, false, None) // In simulation without a physical driver
             };
 
             let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
@@ -2894,13 +2895,17 @@ impl SupervisorInner {
                     (d.clamp(c, c + GRIPPER_STREAM_TARGET_RAISE_MAX_NM), speed)
                 })
                 .filter(|_| has_torque_feedback && self.is_torqued);
-            let ceiling_est_nm = self.gripper_ceiling_torque_estimate();
+            let ceiling_est_nm = pos_force_info
+                .and_then(|info| info.ceiling_torque_estimate_nm)
+                .filter(|v| v.is_finite() && *v > 0.0);
             let stream_window_speed = {
                 let v = f64::from(v_cmd.abs());
                 if v > 1e-4 {
                     Some(v)
                 } else {
-                    self.gripper_close_speed_limit().map(f64::from)
+                    pos_force_info
+                        .map(|info| f64::from(info.close_speed_rad_s))
+                        .filter(|v| v.is_finite() && *v > 0.0)
                 }
             };
             match (regulator, self.gripper_stream_target) {
@@ -5699,7 +5704,7 @@ impl ArmSupervisor {
                         if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
                             a.state = "failed".into();
                             a.code = Some("PERSIST_FAILED".into());
-                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                            a.message = Some(format!("Failed to persist gripper calibration: {e}").into());
                             a.finished_at = Some(now);
                         }
                         return;
@@ -5714,7 +5719,7 @@ impl ArmSupervisor {
                         if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
                             a.state = "failed".into();
                             a.code = Some("PERSIST_FAILED".into());
-                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                            a.message = Some(format!("Failed to persist gripper calibration: {e}").into());
                             a.finished_at = Some(now);
                         }
                         return;
@@ -5797,7 +5802,7 @@ impl ArmSupervisor {
                             if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
                                 a.state = "failed".into();
                                 a.code = Some("INVALID_CALIBRATION".into());
-                                a.message = Some(format!("Gripper calibration rejected: {e}"));
+                                a.message = Some(format!("Gripper calibration rejected: {e}").into());
                                 a.finished_at = Some(now);
                             }
                             return;
@@ -5853,7 +5858,7 @@ impl ArmSupervisor {
                             if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
                                 a.state = "failed".into();
                                 a.code = Some("PERSIST_FAILED".into());
-                                a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                                a.message = Some(format!("Failed to persist gripper calibration: {e}").into());
                                 a.finished_at = Some(now);
                             }
                             return;

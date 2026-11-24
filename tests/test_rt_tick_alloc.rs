@@ -1375,42 +1375,126 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
     assert_eq!(holding, Some(true));
     assert!((gap.unwrap() - 2.0).abs() < 1e-3);
 
-    // 3. Full SupervisorInner::tick_publish during grasp squeeze (including entry and all squeeze
-    //    ticks prior to final Box<GripperMotion> retirement) performs (0, 0) allocs/frees, and
-    //    an obstructed calibration macro stroke short-stall tick performs 0 allocations.
-    let mut inner = supervisor(false);
-    inner.commanded_positions[g_idx] = -2.0;
-    inner.measured_positions[g_idx] = -2.0;
-    inner.target_positions[g_idx] = -2.0;
-    let ep = inner.safety.epoch_id();
-    let cal_id = inner.begin_orchestrated_action("gripper_calibrate", None, ep).unwrap();
-    inner
-        .start_macro_gripper_learning_within(
-            cal_id,
-            GripperRequest {
-                command: GripperCommand::Move,
-                fraction: Some(0.05),
-                grasp: false,
-                speed: 0.30,
-                timeout_s: None,
-                tag: None,
-            },
-            LearnMode::Calibration,
-            None,
-            false,
-        )
-        .unwrap();
-    warm(&mut inner, 3);
-    // Simulate a travel-direction stall far short of the 5% (-0.285) target.
-    inner.gripper_stalled = true;
-    inner.gripper_stall_sign = 1.0;
-    let (a_fail, _f_fail) = tick_counted(&mut inner);
-    assert_eq!(a_fail, 0, "obstructed calibration short-stall tick allocated on control thread");
-    match inner.macro_run.as_ref().map(|m| &m.sub) {
-        Some(armd::macro_action::SubState::Failed { code, message }) => {
-            assert_eq!(code.as_str(), "GRIPPER_TIMEOUT");
-            assert!(message.as_str().contains("Gripper stalled short of target"), "{message}");
+    // 3. Full `SupervisorInner::tick_publish` coverage:
+    //    3a. Grasp squeeze entry and all steady squeeze ticks prior to final `Box<GripperMotion>`
+    //        retirement perform `(0, 0)` allocs/frees, and the settle completion tick performs `0`
+    //        allocations (only retiring the boxed `GripperMotion` on `active_trajectory = None`).
+    {
+        let mut inner = supervisor(false);
+        inner.commanded_positions[g_idx] = -2.0;
+        inner.measured_positions[g_idx] = -2.0;
+        inner.target_positions[g_idx] = -2.0;
+        let ep = inner.safety.epoch_id();
+        let (grasp_id, _) = inner
+            .start_gripper(
+                GripperRequest {
+                    command: GripperCommand::Close,
+                    fraction: None,
+                    grasp: true,
+                    speed: 0.30,
+                    timeout_s: Some(10.0),
+                    tag: None,
+                },
+                ep,
+            )
+            .unwrap();
+        warm(&mut inner, 3);
+        // Latch stall so the next tick enters `GripPhase::Squeeze`, then step through all settle ticks.
+        inner.gripper_stalled = true;
+        inner.gripper_stall_sign = 1.0;
+        let mut steady_squeeze_ticks = 0usize;
+        let mut done_status = None;
+        for _ in 0..80 {
+            let (a, f) = tick_counted(&mut inner);
+            let act = inner.last_action.as_ref().unwrap();
+            assert_eq!(act.id, grasp_id);
+            if act.is_running() {
+                assert_eq!((a, f), (0, 0), "grasp squeeze tick_publish touched allocator");
+                steady_squeeze_ticks += 1;
+            } else {
+                assert_eq!(a, 0, "grasp squeeze settle completion tick allocated on control thread");
+                done_status = Some(act.clone());
+                break;
+            }
         }
-        other => panic!("expected macro SubState::Failed(GRIPPER_TIMEOUT), got {other:?}"),
+        assert!(steady_squeeze_ticks >= 10, "expected >= 10 steady squeeze ticks, got {steady_squeeze_ticks}");
+        let done = done_status.expect("grasp squeeze did not finish via tick_publish");
+        assert_eq!(done.state.as_str(), "done", "{done:?}");
+    }
+
+    //    3b. Obstructed calibration macro stroke short-stall tick performs `0` allocations
+    //        (only retiring `Box<GripperMotion>` + `Box<MoveSamples>` on `active_trajectory = None`).
+    {
+        let mut inner = supervisor(false);
+        inner.commanded_positions[g_idx] = -2.0;
+        inner.measured_positions[g_idx] = -2.0;
+        inner.target_positions[g_idx] = -2.0;
+        let ep = inner.safety.epoch_id();
+        let cal_id = inner.begin_orchestrated_action("gripper_calibrate", None, ep).unwrap();
+        inner
+            .start_macro_gripper_learning_within(
+                cal_id,
+                GripperRequest {
+                    command: GripperCommand::Move,
+                    fraction: Some(0.05),
+                    grasp: false,
+                    speed: 0.30,
+                    timeout_s: None,
+                    tag: None,
+                },
+                LearnMode::Calibration,
+                None,
+                false,
+            )
+            .unwrap();
+        warm(&mut inner, 3);
+        inner.gripper_stalled = true;
+        inner.gripper_stall_sign = 1.0;
+        let (a_fail, _f_box_retire) = tick_counted(&mut inner);
+        assert_eq!(a_fail, 0, "obstructed calibration short-stall tick allocated on control thread");
+        match inner.macro_run.as_ref().map(|m| &m.sub) {
+            Some(armd::macro_action::SubState::Failed { code, message }) => {
+                assert_eq!(code.as_str(), "GRIPPER_TIMEOUT");
+                assert!(message.as_str().contains("Gripper stalled short of target"), "{message}");
+            }
+            other => panic!("expected macro SubState::Failed(GRIPPER_TIMEOUT), got {other:?}"),
+        }
+    }
+
+    //    3c. Non-macro direct gripper short-stall tick (`apply_action_step` -> `finish_action_bounded`
+    //        + `ActionStatus.message` publication) ALSO performs `0` allocations on `armd-control`.
+    {
+        let mut inner = supervisor(false);
+        inner.commanded_positions[g_idx] = -2.0;
+        inner.measured_positions[g_idx] = -2.0;
+        inner.target_positions[g_idx] = -2.0;
+        let ep = inner.safety.epoch_id();
+        let (act_id, _) = inner
+            .start_gripper(
+                GripperRequest {
+                    command: GripperCommand::Move,
+                    fraction: Some(0.0),
+                    grasp: false,
+                    speed: 0.30,
+                    timeout_s: None,
+                    tag: None,
+                },
+                ep,
+            )
+            .unwrap();
+        warm(&mut inner, 3);
+        inner.gripper_stalled = true;
+        inner.gripper_stall_sign = 1.0;
+        let (a_fail, _f_box_retire) = tick_counted(&mut inner);
+        assert_eq!(a_fail, 0, "non-macro gripper short-stall tick allocated on control thread");
+        let act = inner.last_action.as_ref().unwrap();
+        assert_eq!(act.id, act_id);
+        assert_eq!(act.state.as_str(), "failed");
+        assert_eq!(act.code.as_deref(), Some("GRIPPER_TIMEOUT"));
+        assert!(
+            act.message.as_deref().is_some_and(|m| m.contains("Gripper stalled short of target")),
+            "{:?}",
+            act.message
+        );
     }
 }

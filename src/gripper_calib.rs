@@ -345,18 +345,6 @@ pub async fn step_baseline_persister_once(supervisor: &ArmSupervisor) -> bool {
                         Err(crate::rt_core::executor::OwnerError::Stopped) => return false,
                         Err(_) => return true,
                     }
-                } else if taken.dirty {
-                    if let (Some(path), Some(data)) = (id.path.clone(), taken.current) {
-                        to_persist = Some((
-                            path,
-                            crate::gripper_baseline::FreeTorqueBaseline::from_data(
-                                data,
-                                Some(id.tool_id.clone()),
-                                Some(id.tool_config_digest.clone()),
-                                id.follower.clone(),
-                            ),
-                        ));
-                    }
                 }
             }
         } else if taken.dirty {
@@ -371,10 +359,17 @@ pub async fn step_baseline_persister_once(supervisor: &ArmSupervisor) -> bool {
             }
         }
         if let Some((path, b)) = to_persist {
-            let Ok(text) = serde_json::to_string_pretty(&b) else { return true };
-            if let Err(e) = PendingWrite::new(path.clone(), text).run().await {
-                tracing::warn!("Failed to write gripper baseline {}: {e}", path.display());
-                let _ = handle.mark_baseline_dirty_async().await;
+            match serde_json::to_string_pretty(&b) {
+                Ok(text) => {
+                    if let Err(e) = PendingWrite::new(path.clone(), text).run().await {
+                        tracing::warn!("Failed to write gripper baseline {}: {e}", path.display());
+                        let _ = handle.mark_baseline_dirty_async().await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize gripper baseline {}: {e}", path.display());
+                    let _ = handle.mark_baseline_dirty_async().await;
+                }
             }
         }
         return true;
@@ -424,7 +419,7 @@ pub fn spawn_baseline_persister_with_interval(
 /// Learning and JSON serialization always run off the control thread and without holding the
 /// supervisor lock.
 pub fn spawn_baseline_persister(supervisor: std::sync::Arc<ArmSupervisor>) {
-    let _ = spawn_baseline_persister_with_interval(supervisor, BASELINE_PERSIST_INTERVAL);
+    drop(spawn_baseline_persister_with_interval(supervisor, BASELINE_PERSIST_INTERVAL));
 }
 
 /// Load the persisted baseline. It applies only to the tool (id and config digest) and the

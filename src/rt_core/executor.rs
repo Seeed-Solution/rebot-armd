@@ -1603,8 +1603,27 @@ impl ControlState {
                 } else {
                     std::mem::replace(&mut core.gripper_baseline_pending, fresh_pending)
                 };
+                let tool = &core.config.active_tool;
+                let stroke = core
+                    .config
+                    .gripper_policy
+                    .as_ref()
+                    .map(|p| (p.closed_rad.min(p.open_rad), p.closed_rad.max(p.open_rad)));
+                let current = core
+                    .gripper_baseline
+                    .as_ref()
+                    .filter(|b| {
+                        b.belongs_to(&tool.id, &tool.config_digest, core.follower.as_deref())
+                            && stroke.is_some_and(|(lo, hi)| {
+                                (b.lo_rad - lo).abs() < 1e-3 && (b.hi_rad - hi).abs() < 1e-3
+                            })
+                    })
+                    .map(crate::gripper_baseline::FreeTorqueBaseline::data_snapshot);
                 let dirty = core.gripper_baseline_dirty;
-                if dirty && clear_dirty {
+                // Only clear `dirty` here when draining an idle dirty flush (`moves.is_empty()`)
+                // with a matching baseline to persist; non-empty `moves` clear `dirty` atomically
+                // in `StoreBaseline` so transient maintenance/policy errors never drop dirty state.
+                if moves.is_empty() && dirty && clear_dirty && current.is_some() {
                     core.gripper_baseline_dirty = false;
                 }
                 let policy = core.config.gripper_policy.as_ref().map(|p| {
@@ -1615,10 +1634,6 @@ impl ControlState {
                         crate::gripper_calib::calibration_initial_max_nm(core),
                     )
                 });
-                let current = core
-                    .gripper_baseline
-                    .as_ref()
-                    .map(crate::gripper_baseline::FreeTorqueBaseline::data_snapshot);
                 MaintenanceResult::BaselineTaken(BaselineTakeReply {
                     moves,
                     current,
@@ -3106,6 +3121,8 @@ mod tests {
                     returned_offsets: None,
                     returned_probe: None,
                     returned_driver_config_error: None,
+                    returned_pending: None,
+                    returned_baseline: None,
                 })
                 .unwrap();
             exited.store(true, Ordering::Release);
