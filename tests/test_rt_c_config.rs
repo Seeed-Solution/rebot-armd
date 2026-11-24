@@ -2065,69 +2065,10 @@ async fn codex_review_regression_invariants_executor() {
         "stopped executor must reject published_config() with 503 CONFIG_UNAVAILABLE, got {stopped_err:?}"
     );
 
-    // 9e. Automatic gravity-comp exit on lease timeout executes with 0 allocations on armd-control.
-    // Clear `resting_pose` so post-exit lease watchdog latches `WatchdogTimeout` instead of
-    // invoking the unmigrated `StopPolicy::NormalUnload` trajectory planner.
-    let mut cfg_gc = ArmConfig::rebot_dm();
-    cfg_gc.resting_pose = None;
-    let sup_gc = Arc::new(ArmSupervisor::new(cfg_gc));
-    let lease_conn = "gc-auto-exit";
-    let (lease_gen, epoch) = {
-        let mut inner = sup_gc.inner().write().await;
-        inner.lease_timeout = Duration::from_millis(60);
-        inner.measured_positions = INSPECT.to_vec();
-        inner.commanded_positions = INSPECT.to_vec();
-        inner.target_positions = INSPECT.to_vec();
-        let lgen = inner.acquire_lease(lease_conn).unwrap();
-        let ep = inner.safety.epoch_id();
-        let adm = sup_gc.capture_admission_stamp();
-        let admitted = inner.check_admission(adm).unwrap();
-        armd::SupervisorInner::enable_torque(admitted).unwrap();
-        (lgen, ep)
-    };
-    let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
-    ecfg.alloc_timing = true;
-    let handle_gc = sup_gc.start_executor(ecfg).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while sup_gc.hub().latest().is_none() {
-        assert!(Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let _detached_gc = sup_gc.inner().write().await;
-    let adm = capture_config_admission(&sup_gc, 77, lease_gen, Some(epoch));
-    let enter = gravity_comp_command(
-        &sup_gc,
-        adm,
-        Some((HolderLabel::new(lease_conn), lease_gen)),
-        true,
-        Some(0.8),
-        Some(vec![0.2; 6]),
-    )
-    .await
-    .expect("enter gravity comp");
-    assert!(enter.active);
-    // Wait for lease watchdog (> 60 ms) to trigger automatic gravity-comp exit on armd-control.
-    let wait_exit = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Some(s) = sup_gc.hub().latest() {
-            if s.obs.control_mode != armd::model::ControlMode::GravityComp {
-                break;
-            }
-        }
-        assert!(Instant::now() < wait_exit, "timed out waiting for automatic gravity_comp exit");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        handle_gc.stats().total_allocs(),
-        AllocCounts::ZERO,
-        "automatic gravity-comp exit allocated on armd-control: {:?}",
-        handle_gc.stats().total_allocs()
-    );
-    assert_eq!(sup_gc.inner().control_thread_attempts(), 0);
-    drop(_detached_gc);
-    tokio::task::spawn_blocking(move || handle_gc.stop_and_join())
-        .await
-        .unwrap();
+    // 9e. Automatic gravity-comp exit on lease timeout is split into two standalone tests below:
+    //     - `automatic_gravity_comp_exit_default_resting_pose_zero_alloc_executor` (default
+    //       `resting_pose` restored, marked #[ignore] while NormalUnload park allocates)
+    //     - `automatic_gravity_comp_exit_without_park_zero_alloc_executor` (no park, asserts ZERO)
 
     // 9f. Hardware driver gripper calibration validates against cached_driver_pos_limits (0 mutex lock, 0 alloc).
     let sup_hw = Arc::new(
@@ -2196,6 +2137,82 @@ async fn codex_review_regression_invariants_executor() {
     tokio::task::spawn_blocking(move || handle_hw.stop_and_join())
         .await
         .unwrap();
+}
+
+async fn run_automatic_gravity_comp_exit_alloc_test(clear_resting_pose: bool) {
+    let mut cfg_gc = ArmConfig::rebot_dm();
+    if clear_resting_pose {
+        cfg_gc.resting_pose = None;
+    }
+    let sup_gc = Arc::new(ArmSupervisor::new(cfg_gc));
+    let lease_conn = "gc-auto-exit";
+    let (lease_gen, epoch) = {
+        let mut inner = sup_gc.inner().write().await;
+        inner.lease_timeout = Duration::from_millis(60);
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let lgen = inner.acquire_lease(lease_conn).unwrap();
+        let ep = inner.safety.epoch_id();
+        let adm = sup_gc.capture_admission_stamp();
+        let admitted = inner.check_admission(adm).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+        (lgen, ep)
+    };
+    let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
+    ecfg.alloc_timing = true;
+    let handle_gc = sup_gc.start_executor(ecfg).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sup_gc.hub().latest().is_none() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _detached_gc = sup_gc.inner().write().await;
+    let adm = capture_config_admission(&sup_gc, 77, lease_gen, Some(epoch));
+    let enter = gravity_comp_command(
+        &sup_gc,
+        adm,
+        Some((HolderLabel::new(lease_conn), lease_gen)),
+        true,
+        Some(0.8),
+        Some(vec![0.2; 6]),
+    )
+    .await
+    .expect("enter gravity comp");
+    assert!(enter.active);
+    // Wait for lease watchdog (> 60 ms) to trigger automatic gravity-comp exit on armd-control.
+    let wait_exit = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(s) = sup_gc.hub().latest() {
+            if s.obs.control_mode != armd::model::ControlMode::GravityComp {
+                break;
+            }
+        }
+        assert!(Instant::now() < wait_exit, "timed out waiting for automatic gravity_comp exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        handle_gc.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "automatic gravity-comp exit allocated on armd-control: {:?}",
+        handle_gc.stats().total_allocs()
+    );
+    assert_eq!(sup_gc.inner().control_thread_attempts(), 0);
+    drop(_detached_gc);
+    tokio::task::spawn_blocking(move || handle_gc.stop_and_join())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "NormalUnload watchdog park allocates on armd-control; fixed by PR M (feat/rt-m-motion)"]
+async fn automatic_gravity_comp_exit_default_resting_pose_zero_alloc_executor() {
+    run_automatic_gravity_comp_exit_alloc_test(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_gravity_comp_exit_without_park_zero_alloc_executor() {
+    run_automatic_gravity_comp_exit_alloc_test(true).await;
 }
 
 // ============================================================================
