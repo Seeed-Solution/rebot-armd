@@ -556,8 +556,12 @@ pub enum TorqueTransition {
         authority: EnableAuthority,
     },
     /// Waiting for the driver's disable handshake (`confirm` None), then for fresh feedback
-    /// reporting every motor disabled.
-    Disable { confirm: Option<DisableConfirm> },
+    /// reporting every motor disabled, anchored to the original `DisableRequested` timestamp
+    /// (`requested_at`, driver clock) so any background retries keep the request's original lifetime.
+    Disable {
+        confirm: Option<DisableConfirm>,
+        requested_at: Instant,
+    },
 }
 
 /// Static protocol code for an admission refusal on RT torque paths (zero allocations).
@@ -1310,13 +1314,35 @@ impl SupervisorInner {
     }
 
     fn arm_background_disable_retry(&mut self, drv_now: Instant) {
+        let _ = self.arm_background_disable_retry_with_origin(drv_now, drv_now);
+    }
+
+    /// Arms bounded [`BackgroundDisableRetry`] preserving the original `DisableRequested`
+    /// timestamp (`requested_at`, driver clock) so retries stay bounded within the request's
+    /// original `BACKGROUND_DISABLE_MAX_WINDOW` lifetime (M4).
+    fn arm_background_disable_retry_with_origin(
+        &mut self,
+        requested_at: Instant,
+        drv_now: Instant,
+    ) -> bool {
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            return false;
+        }
+        if drv_now.saturating_duration_since(requested_at) >= BACKGROUND_DISABLE_MAX_WINDOW {
+            self.exhaust_background_disable_retry();
+            return false;
+        }
         if self.background_disable_retry.is_none() {
             self.background_disable_retry = Some(BackgroundDisableRetry::Active {
                 attempts: 0,
-                started_at: drv_now,
+                started_at: requested_at,
                 next_retry_at: drv_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
             });
         }
+        true
     }
 
     fn exhaust_background_disable_retry(&mut self) {
@@ -2268,13 +2294,21 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         self.background_disable_retry = None;
-        self.disable_requested();
         let started = match self.driver.as_ref() {
-            None => None,
+            None => {
+                self.disable_requested();
+                None
+            }
             Some(d) => {
-                let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
-                let drv_now = drv.clock_now();
-                Some((drv.begin_torque_budgeted(false, 0), drv_now))
+                let (res, requested_at, post_now) = {
+                    let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
+                    let requested_at = drv.clock_now();
+                    let res = drv.begin_torque_budgeted(false, 0);
+                    let post_now = drv.clock_now();
+                    (res, requested_at, post_now)
+                };
+                self.disable_requested_at(requested_at);
+                Some((res, requested_at, post_now))
             }
         };
         Ok(match started {
@@ -2282,19 +2316,23 @@ impl SupervisorInner {
                 self.disable_confirmed();
                 self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
-                self.torque_transition = Some(TorqueTransition::Disable { confirm: None });
-                Ok(Rt::Pending { wake: now })
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), requested_at, post_now)) => {
+                self.torque_transition = Some(TorqueTransition::Disable {
+                    confirm: None,
+                    requested_at,
+                });
+                Ok(Rt::Pending { wake: post_now })
             }
             // the frames went out: the supervisor's confirmation follows (as in request_disable)
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), now)) => {
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), requested_at, post_now)) => {
                 self.torque_transition = Some(TorqueTransition::Disable {
-                    confirm: Some(DisableConfirm::start(now)),
+                    confirm: Some(DisableConfirm::start(post_now)),
+                    requested_at,
                 });
-                Ok(Rt::Pending { wake: now })
+                Ok(Rt::Pending { wake: post_now })
             }
-            Some((Err(e), drv_now)) => {
-                self.arm_background_disable_retry(drv_now);
+            Some((Err(e), requested_at, post_now)) => {
+                let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
                 Err(self.disable_step_failed(e))
             }
         })
@@ -2555,7 +2593,10 @@ impl SupervisorInner {
                 };
                 Some(TransitionPoll { progress, rx })
             }
-            TorqueTransition::Disable { confirm: None } => {
+            TorqueTransition::Disable {
+                confirm: None,
+                requested_at,
+            } => {
                 let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
                 let rx = drv.take_last_poll_rx();
                 let post_now = drv.clock_now();
@@ -2574,6 +2615,7 @@ impl SupervisorInner {
                         drop(drv);
                         self.torque_transition = Some(TorqueTransition::Disable {
                             confirm: Some(DisableConfirm::start(post_now)),
+                            requested_at,
                         });
                         Some(TransitionPoll {
                             progress: Ok(Rt::Pending { wake: budget.now }),
@@ -2582,7 +2624,7 @@ impl SupervisorInner {
                     }
                     Err(e) => {
                         drop(drv);
-                        self.arm_background_disable_retry(post_now);
+                        let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
                         Some(TransitionPoll {
                             progress: Err(self.disable_step_failed(e)),
                             rx,
@@ -2590,15 +2632,22 @@ impl SupervisorInner {
                     }
                 }
             }
-            TorqueTransition::Disable { confirm: Some(mut c) } => {
+            TorqueTransition::Disable {
+                confirm: Some(mut c),
+                requested_at,
+            } => {
                 let mut states = std::mem::take(&mut self.scratch.states);
                 let served = c.serve_budgeted(&mut **drv, drv_now + span, budget.max_rx_frames, &mut states);
+                let post_now = drv.clock_now();
                 self.scratch.states = states;
                 drop(drv);
                 let rx = served.did_rx.then_some((served.rx_frames, served.budget_exhausted));
                 let progress = match served.outcome {
                     None => {
-                        self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(c) });
+                        self.torque_transition = Some(TorqueTransition::Disable {
+                            confirm: Some(c),
+                            requested_at,
+                        });
                         let wake = (drv_now + DISABLE_CONFIRM_SERVICE).min(c.deadline());
                         Ok(Rt::Pending { wake: to_exec(wake) })
                     }
@@ -2607,6 +2656,11 @@ impl SupervisorInner {
                         self.torque_off_finish_rt().map(|()| Rt::Done)
                     }
                     Some(false) => {
+                        // M4: Sends succeeded but confirmation timed out — arm bounded
+                        // BackgroundDisableRetry keeping the original DisableRequested timestamp
+                        // BEFORE latching the fault so background service keeps retrying within
+                        // the request's original lifetime.
+                        let _ = self.arm_background_disable_retry_with_origin(requested_at, post_now);
                         self.safety.latch(
                             crate::safety::FaultKind::Other,
                             crate::safety::FaultDetail::Static(
