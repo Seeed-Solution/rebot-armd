@@ -375,3 +375,97 @@ pub(super) async fn persist_and_activate(
         }
     }
 }
+
+pub(super) fn pose_ack_fields(
+    inner: &SupervisorInner,
+    pose: &crate::poses::NamedPose,
+    revision: u64,
+) -> Vec<(&'static str, Value)> {
+    let default_joint_names = inner
+        .poses
+        .list
+        .joint_names
+        .clone()
+        .unwrap_or_else(|| inner.joint_names());
+    let pose_val = crate::poses::pose_response_value(pose, &default_joint_names);
+    let pose_id = pose_val.get("pose_id").cloned().unwrap_or_else(|| json!(pose.id));
+    let content_sha256 = pose_val.get("content_sha256").cloned().unwrap_or(Value::Null);
+    let joint_names = pose_val
+        .get("joint_names")
+        .cloned()
+        .unwrap_or_else(|| json!(default_joint_names));
+    let stale = pose_val.get("stale").cloned().unwrap_or(Value::Null);
+    vec![
+        ("pose", pose_val),
+        ("pose_id", pose_id),
+        ("content_sha256", content_sha256),
+        ("joint_names", joint_names),
+        ("stale", stale),
+        ("revision", json!(revision)),
+    ]
+}
+
+/// Dispatch a staged/volatile configuration write command under the supervisor write lock.
+/// Returns `Some(response)` if handled synchronously or rejected; `None` if a staged disk
+/// write was queued into `pending_config_write`, or `Err(())` if `path` is not a config path.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_dispatch_config_write(
+    inner: &mut SupervisorInner,
+    path: &str,
+    value: &Value,
+    setup_path: Option<&std::path::PathBuf>,
+    require_expected_revision: bool,
+    local_generation: u64,
+    epoch: u64,
+    pending_config_write: &mut Option<(Value, PreparedConfigWrite, u64, u64)>,
+) -> Result<Option<Value>, ()> {
+    let Some(result) =
+        PreparedConfigWrite::prepare(inner, path, &value["body"], setup_path, require_expected_revision)
+    else {
+        return Err(());
+    };
+    Ok(match result {
+        Ok(prepared) if !prepared.has_write() => Some(match prepared.commit(inner) {
+            Ok(fields) => {
+                let mut ack = command_ack(inner, &value["request_id"], None);
+                for (key, field) in fields {
+                    ack[key] = field;
+                }
+                ack
+            }
+            Err(error) => command_reject(inner, &value["request_id"], error.into()),
+        }),
+        Ok(prepared) => {
+            *pending_config_write = Some((value["request_id"].clone(), prepared, local_generation, epoch));
+            None
+        }
+        Err(error) => Some(command_reject(inner, &value["request_id"], error.into())),
+    })
+}
+
+/// Spawn a tracked staged configuration persistence task and forward its reply to `ack_tx`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_config_write(
+    request_id: Value,
+    prepared: PreparedConfigWrite,
+    generation: u64,
+    epoch: u64,
+    recv_supervisor: &Arc<ArmSupervisor>,
+    ack_tx: &mpsc::Sender<Value>,
+    ws_auth: &WsAuth,
+    recv_connection: &str,
+    recv_generation: &Arc<AtomicU64>,
+    worker_tasks: &ConnectionTasks,
+) {
+    let sup = recv_supervisor.clone();
+    let tx = ack_tx.clone();
+    let (ws_auth_c, conn_c, gen_now) = (
+        ws_auth.clone(),
+        recv_connection.to_string(),
+        recv_generation.clone(),
+    );
+    worker_tasks.spawn(async move {
+        let reply = persist_and_activate(sup, request_id, prepared, generation, epoch, ws_auth_c, conn_c, gen_now).await;
+        let _ = tx.send(reply).await;
+    });
+}

@@ -1394,28 +1394,6 @@ fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) ->
     ack
 }
 
-fn pose_ack_fields(inner: &SupervisorInner, pose: &crate::poses::NamedPose, revision: u64) -> Vec<(&'static str, Value)> {
-    let default_joint_names = inner
-        .poses
-        .list
-        .joint_names
-        .clone()
-        .unwrap_or_else(|| inner.joint_names());
-    let pose_val = crate::poses::pose_response_value(pose, &default_joint_names);
-    let pose_id = pose_val.get("pose_id").cloned().unwrap_or_else(|| json!(pose.id));
-    let content_sha256 = pose_val.get("content_sha256").cloned().unwrap_or(Value::Null);
-    let joint_names = pose_val.get("joint_names").cloned().unwrap_or_else(|| json!(default_joint_names));
-    let stale = pose_val.get("stale").cloned().unwrap_or(Value::Null);
-    vec![
-        ("pose", pose_val),
-        ("pose_id", pose_id),
-        ("content_sha256", content_sha256),
-        ("joint_names", joint_names),
-        ("stale", stale),
-        ("revision", json!(revision)),
-    ]
-}
-
 struct WsAuthState {
     auth: crate::auth::OperatorAuth,
     token: Option<String>,
@@ -2540,32 +2518,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             &pending_policy_loads,
                                             &mut action_pending,
                                         );
-                                    } else if let Some(result) = PreparedConfigWrite::prepare(
+                                    } else if let Ok(cfg_resp) = config::try_dispatch_config_write(
                                         &mut inner,
                                         path,
-                                        &value["body"],
+                                        &value,
                                         recv_deps.setup_path.as_ref(),
                                         ws_auth.is_enforced(),
+                                        local_generation,
+                                        epoch,
+                                        &mut pending_config_write,
                                     ) {
-                                        match result {
-                                            Ok(prepared) if !prepared.has_write() => {
-                                                response = Some(match prepared.commit(&mut inner) {
-                                                    Ok(fields) => {
-                                                        let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                        for (key, field) in fields { ack[key] = field; }
-                                                        ack
-                                                    }
-                                                    Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                                });
-                                            }
-                                            Ok(prepared) => {
-                                                pending_config_write = Some((value["request_id"].clone(), prepared, local_generation, epoch));
-                                                response = None;
-                                            }
-                                            Err(error) => {
-                                                response = Some(command_reject(&inner, &value["request_id"], error.into()));
-                                            }
-                                        }
+                                        response = cfg_resp;
                                     } else {
                                         let result = execute_command(&mut inner, stamp, path, &value["body"], epoch);
                                         response = Some(match result {
@@ -2929,13 +2892,18 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 // Atomic two-phase persist-before-commit config writes (track B, `config::persist_and_activate`).
                 if let Some((request_id, prepared, generation, epoch)) = pending_config_write.take() {
-                    let sup = recv_supervisor.clone();
-                    let tx = ack_tx.clone();
-                    let (ws_auth_c, conn_c, gen_now) = (ws_auth.clone(), recv_connection.clone(), recv_generation.clone());
-                    worker_tasks.spawn(async move {
-                        let reply = persist_and_activate(sup, request_id, prepared, generation, epoch, ws_auth_c, conn_c, gen_now).await;
-                        let _ = tx.send(reply).await;
-                    });
+                    config::spawn_config_write(
+                        request_id,
+                        prepared,
+                        generation,
+                        epoch,
+                        &recv_supervisor,
+                        &ack_tx,
+                        &ws_auth,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_tasks,
+                    );
                 }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
                     lease::notify_evicted(evicted_conn, evicted_gen);
