@@ -1854,6 +1854,20 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
 fn test_feetech_partial_enable_holding_preservation() {
     let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    let mut rest_positions = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
+    rest_positions[0] = feetech::FeetechJointCalib::default().steps_to_rad(2048);
+    rest_positions[1] = feetech::FeetechJointCalib::default().steps_to_rad(2500);
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions,
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // 1. Simulate joint feedback so driver has valid feedback for both servos
     let pos_1 = 2048u16.to_le_bytes(); // 0 rad

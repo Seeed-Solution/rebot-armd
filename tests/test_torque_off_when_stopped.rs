@@ -2128,9 +2128,12 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Enable rollback with Unknown prior state vs EnableRollbackProven × {AtRest, Raised, Stale}
+    // 4. Enable rollback (BOTH previously-disabled AND Unknown prior state) × {AtRest, Raised, Stale}
+    //    Round 6 (Decision 1): EVERY enable rollback goes through `DisableRequested { rollback: true }`
+    //    with NO already-off bypass — allowed ONLY at rest from fresh feedback; refused raised/stale
+    //    with 0 disables, torque held, and recoverable `ENABLE_ROLLBACK_HELD` fault.
     // -------------------------------------------------------------------------
-    for proven_prior_off in [false, true] {
+    for prior_all_off in [false, true] {
         for pose in ALL_POSES {
             let clock = MockClock::new();
             let bus = FakeBus::with_clock(&limits(), clock.clone());
@@ -2147,12 +2150,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             .with_driver(Box::new(d));
             inner.lease_enabled = false;
 
-            // Set arm pose and prior enable provenance:
-            // - proven_prior_off = true: all 7 motors freshly report state 0 -> EnableState::Disabled
-            //   (was_torqued=false, prior_proven_off=true -> rollback uses EnableRollbackProven).
-            // - proven_prior_off = false: J1..J6 freshly report non-0x0/non-0xD/non-0x1 status 0x8
-            //   and J7 is silent -> EnableState::Unknown with has_any_joint_enabled()==false
-            //   (was_torqued=false, prior_proven_off=false -> rollback uses DisableRequested).
+            // Set arm pose and prior enable state:
+            // - prior_all_off = true: all 7 motors freshly report state 0 -> EnableState::Disabled.
+            // - prior_all_off = false: J1..J6 freshly report status 0x8 and J7 is silent -> Unknown.
+            // Both MUST follow the exact same `DisableRequested { rollback: true }` rule!
             let target_q = if pose == PoseCase::Raised { 0.40 } else { 0.0 };
             bus.with(|s| {
                 s.follow_commands = false;
@@ -2160,10 +2161,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 s.pending.clear();
                 for m in &mut s.motors {
                     m.enabled = false;
-                    m.state_override = if proven_prior_off { None } else { Some(0x8) };
+                    m.state_override = if prior_all_off { None } else { Some(0x8) };
                     m.q = target_q;
                 }
-                if proven_prior_off {
+                if prior_all_off {
                     s.push_all_feedback();
                 } else {
                     for j in 0..6 {
@@ -2175,17 +2176,14 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
                 drv.read_joint_states().unwrap();
                 let st = drv.enable_state();
-                if proven_prior_off {
+                if prior_all_off {
                     assert_eq!(st, EnableState::Disabled);
                 } else {
                     assert_eq!(st, EnableState::Unknown);
                 }
             }
 
-            // Now fail the enable handshake on motor 4 (CAN ID 4) so `enable_failed` triggers rollback!
-            // For Stale: keep feedback fresh at `enable_prepare` (so `prior_proven_off` is captured
-            // accurately), then advance clock by 40 ms per TX across motors 1..3 with `tx_lost=true`
-            // so feedback is genuinely > 100 ms stale by the time rollback runs.
+            // Fail the enable handshake on motor 4 (CAN ID 4) so `enable_failed` triggers rollback.
             if pose == PoseCase::Stale {
                 bus.with(|s| {
                     s.rx.clear();
@@ -2206,28 +2204,35 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 "expected enable failure, got {err:?}"
             );
             assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
-            // Clear fail_tx_ids so we inspect what rollback transmitted on the bus.
             let disables = count_damiao_disables(&bus);
-            if proven_prior_off {
-                assert!(
-                    disables > 0,
-                    "EnableRollbackProven ({pose:?}) must send disable frames"
-                );
-            } else {
-                match pose {
-                    PoseCase::AtRest => {
-                        assert!(
-                            disables > 0,
-                            "Unknown-prior rollback at rest must send disable frames"
-                        );
-                    }
-                    PoseCase::Raised | PoseCase::Stale => {
-                        assert_eq!(
-                            disables, 0,
-                            "Unknown-prior rollback ({pose:?}) must transmit ZERO disable frames"
-                        );
-                        assert!(inner.is_torqued);
-                    }
+            match pose {
+                PoseCase::AtRest => {
+                    assert!(
+                        disables > 0,
+                        "enable rollback at rest (prior_all_off={prior_all_off}) must send disable frames"
+                    );
+                    assert_eq!(
+                        inner.safety.fault().map(|f| f.code),
+                        Some(FaultCode::EnableFailed),
+                        "allowed at-rest rollback latches EnableFailed"
+                    );
+                }
+                PoseCase::Raised | PoseCase::Stale => {
+                    assert_eq!(
+                        disables, 0,
+                        "enable rollback (prior_all_off={prior_all_off}, {pose:?}) must transmit ZERO disable frames"
+                    );
+                    assert!(inner.is_torqued, "refused rollback must keep torque on");
+                    assert!(!inner.disable_pending, "refused rollback must clear disable_pending");
+                    assert_eq!(
+                        inner.safety.fault().map(|f| f.code),
+                        Some(FaultCode::EnableRollbackHeld),
+                        "refused rollback (prior_all_off={prior_all_off}, {pose:?}) must latch EnableRollbackHeld"
+                    );
+                    assert!(
+                        inner.safety.recoverable(),
+                        "EnableRollbackHeld must be recoverable through arm.recover()"
+                    );
                 }
             }
         }
@@ -2330,11 +2335,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             }
         }
 
-        // Protective reasons bypass Rule A′ on Feetech in all poses.
+        // Protective reasons (`Thermal`, `ProcessExit`) bypass Rule A′ on Feetech in all poses.
         for reason in [
             DisableProtectiveReason::Thermal,
             DisableProtectiveReason::ProcessExit,
-            DisableProtectiveReason::EnableRollbackProven,
         ] {
             drv.transport_mut().provide_rx(&rx_rb);
             drv.disable_torque(DisableKind::DisableProtective { reason })
@@ -2472,11 +2476,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             }
         }
 
-        // Protective reasons bypass Rule A′ on SimArmDriver across all poses.
+        // Protective reasons (`Thermal`, `ProcessExit`) bypass Rule A′ on SimArmDriver across all poses.
         for reason in [
             DisableProtectiveReason::Thermal,
             DisableProtectiveReason::ProcessExit,
-            DisableProtectiveReason::EnableRollbackProven,
         ] {
             disable_cmds.lock().unwrap().clear();
             sim.begin_disable_torque(DisableKind::DisableProtective { reason })
@@ -2500,12 +2503,11 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     }
 
     // -------------------------------------------------------------------------
-    // 7. Protective reasons (`Thermal`, `ProcessExit`, `EnableRollbackProven`) on Damiao × {AtRest, Raised, Stale}
+    // 7. Protective reasons (`Thermal`, `ProcessExit`) on Damiao × {AtRest, Raised, Stale}
     // -------------------------------------------------------------------------
     for reason in [
         DisableProtectiveReason::Thermal,
         DisableProtectiveReason::ProcessExit,
-        DisableProtectiveReason::EnableRollbackProven,
     ] {
         for pose in ALL_POSES {
             let (mut inner, bus, clock) = make_driver_rig();
@@ -2718,7 +2720,8 @@ fn partial_enable_at_raised_pose_then_enable_error_refuses_rollback_holds_and_la
             );
         }
 
-        // 3. A recoverable fault (`EnableFailed`) explains why rollback was refused!
+        // 3. A recoverable fault (`EnableRollbackHeld`, `recoverable() == true`) explains why
+        //    rollback was refused and allows recovery through `arm.recover()`!
         assert!(
             matches!(inner.safety.state(), SafetyState::Fault(_)),
             "fail_read_err={fail_read_err}: must latch recoverable Fault, got {:?}",
@@ -2726,33 +2729,216 @@ fn partial_enable_at_raised_pose_then_enable_error_refuses_rollback_holds_and_la
         );
         assert_eq!(
             inner.safety.fault().map(|f| f.code),
-            Some(FaultCode::EnableFailed),
-            "fault code must be EnableFailed"
+            Some(FaultCode::EnableRollbackHeld),
+            "fault code must be EnableRollbackHeld"
+        );
+        assert!(
+            inner.safety.recoverable(),
+            "EnableRollbackHeld must be recoverable through arm.recover()"
+        );
+        assert_eq!(
+            inner.safety.fault().map(|f| f.recoverable),
+            Some(true),
+            "observation fault.recoverable must be true"
         );
 
-        // 4. Recoverable: once arm is lowered to rest and all 7 motors respond, torque-off + clear_fault -> Idle!
-        bus.with(|s| {
-            s.motors[6].silent = false;
-            s.rx.clear();
-            s.pending.clear();
-            for j in 0..7 {
-                s.motors[j].q = 0.0;
-                s.motors[j].state_override = None;
-            }
-            s.push_all_feedback();
-        });
-        // Disable fail_read_err by clearing fault after lowering/confirming torque off on a fresh
-        // non-failing read path when `!fail_read_err`.
+        // 4. Holding targets are sent to all motors on tick() while held, and recovery via
+        //    `clear_fault()` succeeds AT THE RAISED POSE (keeping motors holding, partial enable
+        //    known) once all 7 motors respond with fresh feedback!
         if !fail_read_err {
+            bus.with(|s| {
+                s.motors[6].silent = false;
+                s.rx.clear();
+                s.pending.clear();
+                for j in 0..7 {
+                    s.motors[j].state_override = None;
+                }
+                s.push_all_feedback();
+            });
+            bus.clear_log();
             clock.advance(Duration::from_millis(10));
             inner.tick(0.02);
-            let st = inner.set_torque(false).expect("disable at rest must succeed");
-            assert!(matches!(st, SafetyState::Fault(_)));
-            assert!(!inner.is_torqued);
+            let hold_frames: Vec<u32> = bus
+                .tx_log()
+                .iter()
+                .filter(|f| f.id >= 0x101 && f.id <= 0x107)
+                .map(|f| f.id)
+                .collect();
+            assert_eq!(
+                hold_frames.len(),
+                7,
+                "tick() while in EnableRollbackHeld must send hold targets to all 7 motors, got {hold_frames:?}"
+            );
+            assert!(bus.with(|s| (0..6).all(|j| s.motors[j].enabled)));
+
+            // `clear_fault()` (arm.recover() step 1) succeeds while raised without dropping torque!
             clock.advance(Duration::from_millis(10));
             bus.with(|s| s.push_all_feedback());
-            let cleared = inner.clear_fault().expect("EnableFailed fault must be recoverable");
+            let cleared = inner
+                .clear_fault()
+                .expect("EnableRollbackHeld must be clearable via arm.recover() while raised");
             assert_eq!(cleared, SafetyState::Idle);
+            assert!(inner.is_torqued, "arm stays holding after clear_fault at raised pose");
         }
     }
+}
+
+/// Round 6 (Decision 1): enforce at source level that ONLY thermal trip and process-exit/panic
+/// paths construct `DisableProtective`, and ZERO already-off bypass mechanisms remain in `src/`.
+#[test]
+fn only_thermal_and_process_exit_construct_disable_protective_and_no_already_off_bypasses_exist() {
+    use std::path::{Path, PathBuf};
+
+    fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Returns `(1-based line_no, line)` for production lines in `src/`, skipping only
+    /// `#[cfg(test)]`-attributed items (tracked by brace depth) so production code following
+    /// an inline `#[cfg(test)]` helper is still inspected.
+    fn prod_lines(src: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut pending_cfg_test = false;
+        let mut skip_depth: usize = 0;
+        let mut in_skip = false;
+        for (idx, line) in src.lines().enumerate() {
+            let trimmed = line.trim();
+            if in_skip {
+                for ch in line.chars() {
+                    if ch == '{' {
+                        skip_depth += 1;
+                    } else if ch == '}' {
+                        skip_depth = skip_depth.saturating_sub(1);
+                    }
+                }
+                if skip_depth == 0 {
+                    in_skip = false;
+                }
+                continue;
+            }
+            if trimmed == "#[cfg(test)]" {
+                pending_cfg_test = true;
+                continue;
+            }
+            if pending_cfg_test {
+                if trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.is_empty() {
+                    continue;
+                }
+                let opens = line.chars().filter(|&c| c == '{').count();
+                let closes = line.chars().filter(|&c| c == '}').count();
+                if opens > closes {
+                    skip_depth = opens - closes;
+                    in_skip = true;
+                }
+                // Single-line item or `mod tests;` statement ends immediately.
+                pending_cfg_test = false;
+                continue;
+            }
+            out.push((idx + 1, line));
+        }
+        out
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = manifest_dir.join("src");
+    let mut files = Vec::new();
+    collect_rs(&src_dir, &mut files);
+    files.sort();
+
+    let forbidden = [
+        "EnableRollbackProven",
+        "prior_proven_off",
+        "motor_freshly_physically_off",
+        "all_motors_watchdog_expired_or_disabled",
+    ];
+    let mut protective_constructions: Vec<(String, usize, String)> = Vec::new();
+
+    for path in &files {
+        let rel = path
+            .strip_prefix(manifest_dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let full = std::fs::read_to_string(path).unwrap();
+        let prod = prod_lines(&full);
+
+        for needle in forbidden {
+            assert!(
+                !full.contains(needle),
+                "forbidden already-off symbol `{needle}` found in {rel}"
+            );
+        }
+
+        for (pos, &(line_no, line)) in prod.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains("DisableProtectiveReason::Thermal")
+                || trimmed.contains("DisableProtectiveReason::ProcessExit")
+            {
+                protective_constructions.push((rel.clone(), line_no, trimmed.to_string()));
+            }
+            if trimmed.contains("DisableProtective {")
+                && !trimmed.starts_with("DisableProtective {")
+                && !trimmed.contains("=>")
+                && !trimmed.contains("matches!(")
+                && !trimmed.contains("DisableProtective { .. }")
+            {
+                // Pure pass-through mappings from `DisableKind::DisableProtective { reason }`
+                // into driver-internal enums (`TxKind` / `SendGate`) are allowed ONLY in
+                // `src/driver.rs` and `src/sim_driver.rs`.
+                let is_allowed_passthrough = (rel == "src/driver.rs"
+                    && trimmed == "TxKind::DisableProtective { reason }")
+                    || (rel == "src/sim_driver.rs"
+                        && trimmed == "SendGate::DisableProtective { reason }");
+                if !is_allowed_passthrough && !trimmed.contains("DisableProtectiveReason::") {
+                    // Multiline construction; the `reason:` line below carries the variant.
+                    let next = prod.get(pos + 1).map(|(_, l)| l.trim()).unwrap_or("");
+                    assert!(
+                        next.contains("DisableProtectiveReason::Thermal")
+                            || next.contains("DisableProtectiveReason::ProcessExit"),
+                        "unexpected DisableProtective construction at {rel}:{line_no}: `{trimmed}` / `{next}`"
+                    );
+                }
+            }
+        }
+    }
+
+    // Exact exhaustive allowlist of every production `DisableProtective` construction in `src/`:
+    // 1. Thermal trip (`src/supervisor/motion.rs`)
+    // 2. Process exit / panic teardown (`src/driver.rs`, `src/supervisor.rs`, `src/supervisor/driver_transitions.rs` × 2)
+    let mut actual: Vec<(String, &'static str)> = protective_constructions
+        .iter()
+        .map(|(rel, _, line)| {
+            let kind = if line.contains("DisableProtectiveReason::Thermal") {
+                "Thermal"
+            } else {
+                "ProcessExit"
+            };
+            (rel.clone(), kind)
+        })
+        .collect();
+    actual.sort();
+
+    let mut expected: Vec<(String, &'static str)> = vec![
+        ("src/driver.rs".to_string(), "ProcessExit"),
+        ("src/supervisor.rs".to_string(), "ProcessExit"),
+        ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),
+        ("src/supervisor/driver_transitions.rs".to_string(), "ProcessExit"),
+        ("src/supervisor/motion.rs".to_string(), "Thermal"),
+    ];
+    expected.sort();
+
+    assert_eq!(
+        actual, expected,
+        "ONLY thermal trip and process-exit/panic paths may construct DisableProtective; found: {protective_constructions:#?}"
+    );
 }

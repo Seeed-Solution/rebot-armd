@@ -2486,9 +2486,18 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
     assert_eq!(r_off.command.unwrap().1, Err("UNSUPPORTED"));
     assert_eq!(raw_bus.tx_log().len(), 0, "refused ImmediateOp torque must transmit 0 bus frames");
 
-    // (b) Enable failure uses non-blocking `enable_failed_budgeted` (no blocking read_joint_states /
-    // sleep) and completes background disable through Step 2's single RX pass!
-    raw_bus.with(|s| s.motors[3].silent = true);
+    // (b) Enable failure at rest with fresh feedback uses non-blocking `enable_failed_budgeted`
+    // (no blocking read_joint_states / sleep) and completes background disable through Step 2's
+    // single RX pass!
+    raw_bus.with(|s| {
+        s.motors[3].drop_torque_frames = 10;
+        // Once rollback disable starts, hold motor 4 silent so disable stays pending for Step 2.
+        s.on_disable_state = Some(Arc::new(|st| {
+            st.motors[3].silent = true;
+            st.rx.clear();
+            st.pending.clear();
+        }));
+    });
     let auth_fail = fx.core.authority(&fx.ctx(fx.now()));
     broker
         .submit(ClientId(1), 3, auth_fail, fx.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn))
@@ -2496,10 +2505,12 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
     let r_start = fx.step();
     assert!(r_start.command.unwrap().1.is_ok());
 
-    // Advance past Damiao enable confirmation timeout -> transition fails without extra blocking RX!
+    // Advance past Damiao enable confirmation timeout while all motors report fresh feedback
+    // at rest -> transition fails without extra blocking RX, and at-rest rollback starts pending disable!
     let mut failed_outcome = None;
     for _ in 0..30 {
         clock.advance(Duration::from_millis(20));
+        raw_bus.with(|s| s.push_all_feedback());
         bus.rx_calls.store(0, Ordering::SeqCst);
         let r = fx.step();
         assert!(bus.rx_calls.load(Ordering::SeqCst) <= 64, "step exceeded single RX budget");
@@ -2509,12 +2520,14 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
         }
     }
     assert_eq!(failed_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
-    assert!(fx.core.disable_pending, "unconfirmed disable after enable failure must stay disable_pending");
+    assert!(fx.core.disable_pending, "unconfirmed disable after enable failure at rest must stay disable_pending");
 
-    // Motor 4 recovers and sends fresh disabled feedback -> Step 2's `service_background_disable`
-    // confirms disable cleanly within the single RX budget!
+    // Motor 4 recovers and confirms fresh disabled feedback -> Step 2's
+    // `service_background_disable` confirms disable cleanly within the single RX budget!
     raw_bus.with(|s| {
+        s.on_disable_state = None;
         s.motors[3].silent = false;
+        s.motors[3].drop_torque_frames = 0;
         s.push_all_feedback();
     });
     for _ in 0..10 {

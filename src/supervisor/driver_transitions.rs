@@ -414,7 +414,7 @@ impl DisableConfirm {
 #[derive(Debug, Clone, Copy)]
 pub enum TorqueTransition {
     /// Waiting for the driver's enable confirmation.
-    Enable { was_torqued: bool, prior_proven_off: bool, prev_gripper_cmd: Option<f32> },
+    Enable { was_torqued: bool, prev_gripper_cmd: Option<f32> },
     /// Waiting for the driver's disable handshake (`confirm` None), then for fresh feedback
     /// reporting every motor disabled.
     Disable { confirm: Option<DisableConfirm> },
@@ -1093,12 +1093,12 @@ impl SupervisorInner {
         // Torque changes and re-arming are refused in gravity compensation: exit first.
         self.gravity_comp_servo_busy()?;
         if enable {
-            let (was_torqued, prior_proven_off, prev_gripper_cmd) = self.enable_prepare()?;
+            let (was_torqued, prev_gripper_cmd) = self.enable_prepare()?;
             if let Some(ref d) = self.driver {
                 let r = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?.set_torque(true);
-                if let Err(e) = r { return Err(self.enable_failed(was_torqued, prior_proven_off, &e)); }
+                if let Err(e) = r { return Err(self.enable_failed(was_torqued, &e)); }
             }
-            self.enable_finish(was_torqued, prior_proven_off, prev_gripper_cmd)
+            self.enable_finish(was_torqued, prev_gripper_cmd)
         } else {
             self.torque_off(false)
         }
@@ -1106,12 +1106,12 @@ impl SupervisorInner {
 
     /// Enable, before the driver's handshake: every refusal (gravity compensation, driver
     /// limits, handover, pending disable, E-stop, fault, MIT gate), then the feedback read
-    /// that seeds the commanded state. Returns `(was_torqued, prior_proven_off, prev_gripper_cmd)`.
-    fn enable_prepare(&mut self) -> Result<(bool, bool, Option<f32>), SafetyError> {
+    /// that seeds the commanded state. Returns `(was_torqued, prev_gripper_cmd)`.
+    fn enable_prepare(&mut self) -> Result<(bool, Option<f32>), SafetyError> {
         self.enable_prepare_inner(true)
     }
 
-    fn enable_prepare_inner(&mut self, allow_bus_read: bool) -> Result<(bool, bool, Option<f32>), SafetyError> {
+    fn enable_prepare_inner(&mut self, allow_bus_read: bool) -> Result<(bool, Option<f32>), SafetyError> {
         if self.shutdown_committed {
             return Err(SafetyError::EStopActive);
         }
@@ -1178,11 +1178,7 @@ impl SupervisorInner {
         self.mit_gate_error = None;
 
         // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback.
-        // Capture prior enable provenance AFTER any initial bus feedback read so rollback ONLY uses
-        // `DisableProtective { reason: EnableRollbackProven }` when every motor was PROVEN torque-off;
-        // Unknown or mixed prior states go through `DisableRequested`.
         let mut any_driver_enabled = false;
-        let mut driver_proven_off = self.driver.is_none();
 
         if let Some(ref d) = self.driver {
             // Secondary double-check latch right before hardware actuation
@@ -1217,49 +1213,70 @@ impl SupervisorInner {
                 }
             }
             any_driver_enabled = driver.has_any_joint_enabled() || driver.has_known_partial_enable();
-            driver_proven_off = !any_driver_enabled && driver.enable_state() == EnableState::Disabled;
         }
         let was_torqued = self.is_torqued || any_driver_enabled;
-        let prior_proven_off = !was_torqued && driver_proven_off;
         let prev_gripper_cmd = if was_torqued {
             self.config.gripper_index().and_then(|i| self.commanded_positions.get(i).copied())
         } else {
             None
         };
-        Ok((was_torqued, prior_proven_off, prev_gripper_cmd))
+        Ok((was_torqued, prev_gripper_cmd))
     }
 
-    /// The driver's enable failed with `e`: latches `ENABLE_FAILED` first (so the driver choke
-    /// point observes the stopped state), then rolls back an arm that was not torqued.
-    ///
-    /// Uses `DisableProtective { reason: EnableRollbackProven }` ONLY when every motor's prior
-    /// state was PROVEN torque-off (`prior_proven_off`); Unknown or mixed prior states go through
-    /// `DisableRequested` and are gated at send time by Rule A′.
+    /// Applies the fail-closed refused-rollback outcome: seeds holding targets from
+    /// `self.scratch.states` (falling back to current `measured_positions`), keeps `is_torqued = true`
+    /// so the control loop sends hold targets to all motors, and latches recoverable
+    /// [`FaultCode::EnableRollbackHeld`] (clearable via `arm.recover()`).
+    fn apply_refused_enable_rollback(&mut self, cause: &str) {
+        for (i, s) in self.scratch.states.iter().enumerate().take(self.config.dof) {
+            if s.position.is_finite() {
+                self.measured_positions[i] = s.position;
+                self.commanded_positions[i] = s.position;
+                self.target_positions[i] = s.position;
+            }
+        }
+        for i in 0..self.config.dof {
+            if !self.commanded_positions[i].is_finite() && self.measured_positions[i].is_finite() {
+                self.commanded_positions[i] = self.measured_positions[i];
+                self.target_positions[i] = self.measured_positions[i];
+            }
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        self.is_torqued = true;
+        self.pending_rearm = true;
+        self.disable_pending = false;
+        self.active_disable_kind = None;
+        self.last_disable_attempt = None;
+        self.safety.latch(
+            crate::safety::FaultKind::Other,
+            crate::safety::FaultDetail::formatted(FaultCode::EnableRollbackHeld, |buf| {
+                buf.push_str(cause);
+                buf.push_str("; rollback refused to prevent arm drop; motors remain holding");
+            }),
+        );
+    }
+
+    /// The driver's enable failed with `e`: when `!was_torqued`, attempts rollback unconditionally
+    /// through `DisableRequested { rollback: true }` (rest pose + fresh feedback enforced at the
+    /// transmit choke point in every safety state). If rollback is refused, torque stays on, hold
+    /// targets continue to all motors, and recoverable `ENABLE_ROLLBACK_HELD` latches; otherwise
+    /// `ENABLE_FAILED` latches.
     fn enable_failed(
         &mut self,
         was_torqued: bool,
-        prior_proven_off: bool,
         e: &dyn std::fmt::Display,
     ) -> SafetyError {
         let err_msg = format!("Hardware torque enable failed: {}", e);
-        self.safety.latch(
-            crate::safety::FaultKind::Other,
-            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
-                buf.push_str(&err_msg);
-            }),
-        );
+        let mut rollback_refused = false;
         if !was_torqued {
-            if let Some(ref d) = self.driver {
-                if let Ok(mut driver) = d.lock() {
-                    let rb_kind = if prior_proven_off {
-                        crate::driver::DisableKind::DisableProtective {
-                            reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
-                        }
-                    } else {
-                        crate::driver::DisableKind::DisableRequested {
-                            started_at: driver.clock_now(),
-                            rollback: true,
-                        }
+            let mut scratch_states = std::mem::take(&mut self.scratch.states);
+            scratch_states.clear();
+            let disable_outcome = self.driver.as_ref().and_then(|d| {
+                d.lock().ok().map(|mut driver| {
+                    let rb_kind = crate::driver::DisableKind::DisableRequested {
+                        started_at: driver.clock_now(),
+                        rollback: true,
                     };
                     let res = driver.disable_torque(rb_kind);
                     let refused = matches!(
@@ -1268,55 +1285,62 @@ impl SupervisorInner {
                             | crate::driver::ArmDriverError::DisableRequestExpired)
                     );
                     if refused {
-                        self.is_torqued = true;
-                        self.disable_pending = false;
-                        self.active_disable_kind = None;
-                        self.last_disable_attempt = None;
+                        let _ = driver.read_cached_joint_states_into(&mut scratch_states);
+                        (rb_kind, true, false)
                     } else {
                         let sent = res.is_ok();
                         let _ = driver.read_joint_states();
-                        let confirmed_off = sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled;
-                        self.is_torqued = !confirmed_off;
-                        self.disable_pending = !confirmed_off;
-                        self.active_disable_kind = (!confirmed_off).then_some(rb_kind);
-                        self.last_disable_attempt = Some(Instant::now());
+                        let confirmed_off = sent
+                            && driver.is_feedback_valid()
+                            && driver.enable_state() == EnableState::Disabled;
+                        (rb_kind, false, confirmed_off)
                     }
+                })
+            });
+            self.scratch.states = scratch_states;
+            if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
+                if refused {
+                    rollback_refused = true;
+                    self.apply_refused_enable_rollback(&err_msg);
+                } else {
+                    self.is_torqued = !confirmed_off;
+                    self.disable_pending = !confirmed_off;
+                    self.active_disable_kind = (!confirmed_off).then_some(rb_kind);
+                    self.last_disable_attempt = Some(Instant::now());
                 }
             }
+        }
+        if !rollback_refused {
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
+                    buf.push_str(&err_msg);
+                }),
+            );
         }
         SafetyError::ClearFaultRejected(err_msg)
     }
 
-    /// Non-blocking enable failure handler for RT transitions: latches `ENABLE_FAILED` first,
-    /// then sends rollback disable frames with zero RX and zero sleep when `!was_torqued`.
-    /// Uses `DisableProtective { reason: EnableRollbackProven }` ONLY when `prior_proven_off`;
-    /// Unknown or mixed prior states go through `DisableRequested`.
+    /// Non-blocking enable failure handler for RT transitions: when `!was_torqued`, attempts
+    /// rollback with zero RX and zero sleep unconditionally through `DisableRequested { rollback: true }`.
+    /// If rollback is refused, torque stays on, hold targets continue to all motors, and recoverable
+    /// `ENABLE_ROLLBACK_HELD` latches; otherwise `ENABLE_FAILED` latches.
     fn enable_failed_budgeted(
         &mut self,
         was_torqued: bool,
-        prior_proven_off: bool,
         e: &dyn std::fmt::Display,
     ) -> SafetyError {
         let err_msg = format!("Hardware torque enable failed: {}", e);
-        self.safety.latch(
-            crate::safety::FaultKind::Other,
-            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
-                buf.push_str(&err_msg);
-            }),
-        );
+        let mut rollback_refused = false;
         if !was_torqued {
+            let mut scratch_states = std::mem::take(&mut self.scratch.states);
+            scratch_states.clear();
             let disable_outcome = self.driver.as_ref().and_then(|d| {
                 d.lock().ok().map(|mut driver| {
                     driver.abort_enable();
-                    let rb_kind = if prior_proven_off {
-                        crate::driver::DisableKind::DisableProtective {
-                            reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
-                        }
-                    } else {
-                        crate::driver::DisableKind::DisableRequested {
-                            started_at: driver.clock_now(),
-                            rollback: true,
-                        }
+                    let rb_kind = crate::driver::DisableKind::DisableRequested {
+                        started_at: driver.clock_now(),
+                        rollback: true,
                     };
                     let sent = driver.begin_disable_torque_budgeted(rb_kind, 0);
                     let refused = matches!(
@@ -1324,20 +1348,24 @@ impl SupervisorInner {
                         Err(crate::driver::ArmDriverError::TorqueOffWouldDrop
                             | crate::driver::ArmDriverError::DisableRequestExpired)
                     );
-                    let confirmed = matches!(
-                        sent,
-                        Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
-                    ) && driver.is_feedback_valid()
-                        && driver.enable_state() == EnableState::Disabled;
-                    (rb_kind, refused, confirmed)
+                    if refused {
+                        let _ = driver.read_cached_joint_states_into(&mut scratch_states);
+                        (rb_kind, true, false)
+                    } else {
+                        let confirmed = matches!(
+                            sent,
+                            Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
+                        ) && driver.is_feedback_valid()
+                            && driver.enable_state() == EnableState::Disabled;
+                        (rb_kind, false, confirmed)
+                    }
                 })
             });
+            self.scratch.states = scratch_states;
             if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
                 if refused {
-                    self.is_torqued = true;
-                    self.disable_pending = false;
-                    self.active_disable_kind = None;
-                    self.last_disable_attempt = None;
+                    rollback_refused = true;
+                    self.apply_refused_enable_rollback(&err_msg);
                 } else if confirmed_off {
                     self.disable_confirmed();
                 } else {
@@ -1347,25 +1375,31 @@ impl SupervisorInner {
                 }
             }
         }
+        if !rollback_refused {
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
+                    buf.push_str(&err_msg);
+                }),
+            );
+        }
         SafetyError::ClearFaultRejected(err_msg)
     }
 
     /// Enable, after the driver confirmed it: validates fresh feedback (a failure rolls back
-    /// an arm that was proven torque-off before enable), seeds commanded / target / tracking
-    /// state from it, and records torque on.
+    /// through `DisableRequested { rollback: true }` when `!was_torqued`), seeds commanded /
+    /// target / tracking state from it, and records torque on.
     fn enable_finish(
         &mut self,
         was_torqued: bool,
-        prior_proven_off: bool,
         prev_gripper_cmd: Option<f32>,
     ) -> Result<SafetyState, SafetyError> {
-        self.enable_finish_inner(was_torqued, prior_proven_off, prev_gripper_cmd, false)
+        self.enable_finish_inner(was_torqued, prev_gripper_cmd, false)
     }
 
     fn enable_finish_inner(
         &mut self,
         was_torqued: bool,
-        prior_proven_off: bool,
         prev_gripper_cmd: Option<f32>,
         use_cached: bool,
     ) -> Result<SafetyState, SafetyError> {
@@ -1393,15 +1427,9 @@ impl SupervisorInner {
             };
             if read_res.is_err() {
                 let disable_outcome = if !was_torqued {
-                    let rb_kind = if prior_proven_off {
-                        crate::driver::DisableKind::DisableProtective {
-                            reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
-                        }
-                    } else {
-                        crate::driver::DisableKind::DisableRequested {
-                            started_at: driver.clock_now(),
-                            rollback: true,
-                        }
+                    let rb_kind = crate::driver::DisableKind::DisableRequested {
+                        started_at: driver.clock_now(),
+                        rollback: true,
                     };
                     if use_cached {
                         let sent = driver.begin_disable_torque_budgeted(rb_kind, 0);
@@ -1450,25 +1478,8 @@ impl SupervisorInner {
                 self.scratch.loads = scratch_loads;
                 if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
                     if refused {
-                        for (i, s) in self.scratch.states.iter().enumerate().take(self.config.dof) {
-                            if s.position.is_finite() {
-                                self.measured_positions[i] = s.position;
-                                self.commanded_positions[i] = s.position;
-                                self.target_positions[i] = s.position;
-                            }
-                        }
-                        self.commanded_velocities.fill(0.0);
-                        self.is_torqued = true;
-                        self.disable_pending = false;
-                        self.active_disable_kind = None;
-                        self.last_disable_attempt = None;
-                        self.safety.latch(
-                            crate::safety::FaultKind::Other,
-                            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
-                                buf.push_str(
-                                    "Hardware torque enable failed: post-enable feedback unavailable and rollback refused to prevent arm drop; motors remain holding",
-                                );
-                            }),
+                        self.apply_refused_enable_rollback(
+                            "Hardware torque enable failed: post-enable feedback unavailable",
                         );
                     } else if use_cached {
                         if confirmed_off {
@@ -1494,15 +1505,9 @@ impl SupervisorInner {
                 || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled)
             {
                 let disable_outcome = if !was_torqued {
-                    let rb_kind = if prior_proven_off {
-                        crate::driver::DisableKind::DisableProtective {
-                            reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
-                        }
-                    } else {
-                        crate::driver::DisableKind::DisableRequested {
-                            started_at: driver.clock_now(),
-                            rollback: true,
-                        }
+                    let rb_kind = crate::driver::DisableKind::DisableRequested {
+                        started_at: driver.clock_now(),
+                        rollback: true,
                     };
                     if use_cached {
                         let sent = driver.begin_disable_torque_budgeted(rb_kind, 0);
@@ -1551,25 +1556,8 @@ impl SupervisorInner {
                 self.scratch.loads = scratch_loads;
                 if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
                     if refused {
-                        for (i, s) in self.scratch.states.iter().enumerate().take(self.config.dof) {
-                            if s.position.is_finite() {
-                                self.measured_positions[i] = s.position;
-                                self.commanded_positions[i] = s.position;
-                                self.target_positions[i] = s.position;
-                            }
-                        }
-                        self.commanded_velocities.fill(0.0);
-                        self.is_torqued = true;
-                        self.disable_pending = false;
-                        self.active_disable_kind = None;
-                        self.last_disable_attempt = None;
-                        self.safety.latch(
-                            crate::safety::FaultKind::Other,
-                            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
-                                buf.push_str(
-                                    "Hardware torque enable failed: post-enable feedback unavailable and rollback refused to prevent arm drop; motors remain holding",
-                                );
-                            }),
+                        self.apply_refused_enable_rollback(
+                            "Hardware torque enable failed: post-enable feedback invalid or incomplete",
                         );
                     } else if use_cached {
                         if confirmed_off {
@@ -1818,7 +1806,7 @@ impl SupervisorInner {
         if self.torque_transition.is_some() { return Err("TRANSITION_BUSY"); }
         self.gravity_comp_servo_busy().map_err(to_code)?;
         if enable {
-            let (was_torqued, prior_proven_off, prev_gripper_cmd) = self.enable_prepare_inner(false).map_err(to_code)?;
+            let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false).map_err(to_code)?;
             let started = match self.driver.as_ref() {
                 None => None,
                 Some(d) => {
@@ -1829,9 +1817,9 @@ impl SupervisorInner {
             };
             Ok(match started {
                 None | Some((Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)), _)) =>
-                    self.enable_finish_inner(was_torqued, prior_proven_off, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
+                    self.enable_finish_inner(was_torqued, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
                 Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
-                    self.torque_transition = Some(TorqueTransition::Enable { was_torqued, prior_proven_off, prev_gripper_cmd });
+                    self.torque_transition = Some(TorqueTransition::Enable { was_torqued, prev_gripper_cmd });
                     Ok(Rt::Pending { wake: now })
                 }
                 Some((Err(ref e), _)) if crate::driver::is_estop_inhibited(e) =>
@@ -1847,7 +1835,7 @@ impl SupervisorInner {
                     self.pending_rearm = true;
                     return Err("ESTOP_ACTIVE");
                 }
-                Some((r, _)) => self.enable_step_failed(was_torqued, prior_proven_off, r),
+                Some((r, _)) => self.enable_step_failed(was_torqued, r),
             })
         } else {
             self.torque_off_check_rt()?;
@@ -1893,12 +1881,11 @@ impl SupervisorInner {
     fn enable_step_failed(
         &mut self,
         was_torqued: bool,
-        prior_proven_off: bool,
         r: Result<crate::driver::TorqueProgress, crate::driver::ArmDriverError>,
     ) -> Result<crate::rt_core::ops::TorqueProgress, &'static str> {
         let message = match &r { Err(e) => e.to_string(), Ok(_) => "enable not confirmed".to_string() };
         let code = crate::driver::handshake::rt_progress(true, r).err().unwrap_or("ENABLE_FAILED");
-        let _ = self.enable_failed_budgeted(was_torqued, prior_proven_off, &message);
+        let _ = self.enable_failed_budgeted(was_torqued, &message);
         Err(code)
     }
 
@@ -1979,7 +1966,7 @@ impl SupervisorInner {
         let span = budget.deadline.saturating_duration_since(budget.now);
         let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
         match t {
-            TorqueTransition::Enable { was_torqued, prior_proven_off, prev_gripper_cmd } => {
+            TorqueTransition::Enable { was_torqued, prev_gripper_cmd } => {
                 if self.estop_pending() || self.safety.state().is_stopped() {
                     drv.abort_enable();
                     let still_enabled = drv.enable_state() != EnableState::Disabled
@@ -2017,8 +2004,8 @@ impl SupervisorInner {
                         Ok(Rt::Pending { wake: to_exec(wake) })
                     }
                     Ok(Drv::Done(TorqueOutcome::Confirmed)) =>
-                        self.enable_finish_inner(was_torqued, prior_proven_off, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
-                    r => self.enable_step_failed(was_torqued, prior_proven_off, r),
+                        self.enable_finish_inner(was_torqued, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
+                    r => self.enable_step_failed(was_torqued, r),
                 };
                 Some(TransitionPoll { progress, rx })
             }
@@ -2425,19 +2412,10 @@ impl SupervisorInner {
                     }
                     return Err(refusal.into_safety_error());
                 }
-                // MIT expiry recovery disables every motor on the bus. Unless fresh feedback shows
-                // EVERY motor the recovery disables is already disabled (`0`) or has tripped its
-                // own measured command-timeout watchdog (`0xD`), this is an operator torque-off
-                // request and must pass the single Rule A′ rest-pose decision with no override.
-                // Other motor fault codes (e.g. `0x8` overvoltage, `0xE` overload) do NOT bypass
-                // the rest-pose check.
-                let all_motors_watchdog_expired_or_disabled = !st.is_empty()
-                    && st.len() == self.config.dof
-                    && st.iter().all(|&c| c == 0 || c == 0xD);
-                if !all_motors_watchdog_expired_or_disabled {
-                    self.eval_stopped_torque_off()
-                        .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
-                }
+                // MIT expiry recovery disables every motor on the bus and therefore always passes
+                // the single Rule A′ rest-pose decision with no override or already-off bypass.
+                self.eval_stopped_torque_off()
+                    .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
                 if !self.mit.recovery_confirmed {
                     return Err(SafetyError::ClearFaultRejected(format!(
                         "{}: {}",
@@ -2464,10 +2442,7 @@ impl SupervisorInner {
                     }
                 }
                 commit_probed_limits(self);
-                return self.mit_expiry_recovery_for_epoch(
-                    expected_epoch,
-                    all_motors_watchdog_expired_or_disabled,
-                );
+                return self.mit_expiry_recovery_for_epoch(expected_epoch);
             }
         }
 
@@ -2800,6 +2775,7 @@ impl SupervisorInner {
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
         self.bus_loss_instant = None;
+        self.output_suspended = false;
         self.reset_gripper_stall();
         if self.consume_pending_estop() {
             if let Some(received) = ctx.expected_epoch {

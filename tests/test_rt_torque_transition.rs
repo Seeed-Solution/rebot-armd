@@ -113,6 +113,9 @@ fn an_enable_is_withheld_until_the_driver_confirms_it_then_applied_to_the_superv
 
 #[test]
 fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() {
+    // 1. Silent motor (> 100 ms stale at 150 ms enable timeout): cannot prove rest pose from fresh
+    //    feedback, so rollback is refused, torque stays on (motors hold), and `ENABLE_ROLLBACK_HELD`
+    //    latches (alongside `BUS_LOSS` because motor 4 is actually silent while torqued).
     let mut r = rig();
     r.bus.with(|s| s.motors[3].silent = true);
     r.submit(TransitionOp::TorqueOn);
@@ -121,14 +124,68 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     assert_eq!(outcome, Outcome::Failed("ENABLE_FAILED"));
     let inner = &r.fx.core;
     assert!(!inner.torque_transition_pending());
-    assert!(!inner.is_torqued || inner.disable_pending, "torque off or its disable pending ({}, {})", inner.is_torqued, inner.disable_pending);
+    assert!(inner.is_torqued && !inner.disable_pending, "stale rollback refused: must keep holding ({}, {})", inner.is_torqued, inner.disable_pending);
     assert!(matches!(inner.safety.state(), armd::SafetyState::Fault(_)), "{:?}", inner.safety.state());
+    assert!(inner.safety.has_latched_fault_code(armd::FaultCode::EnableRollbackHeld));
     // a second enable while the fault latches is refused at the commit, before any frame
     r.bus.with(|s| s.motors[3].silent = false);
     let before = r.enable_frames();
     r.submit(TransitionOp::TorqueOn);
     assert!(r.step().command.unwrap().1.is_err());
     assert_eq!(r.enable_frames(), before);
+
+    // 2. Raised pose with fresh feedback and non-confirming motor: rollback is refused (0 disables),
+    //    torque stays on, and ONLY recoverable `ENABLE_ROLLBACK_HELD` latches (`recoverable == true`).
+    let mut r_raised = rig();
+    r_raised.bus.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.40;
+        s.motors[3].drop_torque_frames = 10;
+        s.push_all_feedback();
+    });
+    r_raised.step();
+    r_raised.submit(TransitionOp::TorqueOn);
+    assert!(r_raised.step().command.unwrap().1.is_ok());
+    let mut raised_outcome = None;
+    for _ in 0..30 {
+        r_raised.bus.with(|s| s.push_all_feedback());
+        let rep = r_raised.step();
+        if let Some((_, o)) = rep.transition_ended {
+            raised_outcome = Some(o);
+            break;
+        }
+    }
+    assert_eq!(raised_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
+    assert!(r_raised.fx.core.is_torqued && !r_raised.fx.core.disable_pending);
+    assert_eq!(
+        r_raised.fx.core.safety.fault().map(|f| f.code),
+        Some(armd::FaultCode::EnableRollbackHeld)
+    );
+    assert!(
+        r_raised.fx.core.safety.recoverable(),
+        "raised refused rollback with fresh feedback must latch recoverable ENABLE_ROLLBACK_HELD"
+    );
+
+    // 3. Non-confirming motor that keeps replying fresh state 0 at the rest pose: rollback is
+    //    allowed at rest, sends disables, and latches `ENABLE_FAILED`.
+    let mut r2 = rig();
+    r2.bus.with(|s| s.motors[3].drop_torque_frames = 10);
+    r2.submit(TransitionOp::TorqueOn);
+    assert!(r2.step().command.unwrap().1.is_ok());
+    let mut rest_outcome = None;
+    for _ in 0..30 {
+        r2.bus.with(|s| s.push_all_feedback());
+        let rep = r2.step();
+        if let Some((_, o)) = rep.transition_ended {
+            rest_outcome = Some(o);
+            break;
+        }
+    }
+    assert_eq!(rest_outcome, Some(Outcome::Failed("ENABLE_FAILED")));
+    let inner2 = &r2.fx.core;
+    assert!(!inner2.torque_transition_pending());
+    assert!(!inner2.is_torqued || inner2.disable_pending, "at-rest rollback turns torque off ({}, {})", inner2.is_torqued, inner2.disable_pending);
+    assert_eq!(inner2.safety.fault().map(|f| f.code), Some(armd::FaultCode::EnableFailed));
 }
 
 #[test]

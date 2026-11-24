@@ -161,7 +161,7 @@ enum SendGate {
     /// Requested disable command: subject to the stopped rest-pose rule and 1 s request lifetime
     /// while stopped, OR unconditionally in every safety state when `rollback` is true.
     DisableRequested { started_at: Instant, rollback: bool },
-    /// Protective disable command (`Thermal`, `ProcessExit`, `EnableRollbackProven`): never refused.
+    /// Protective disable command (`Thermal`, `ProcessExit`): never refused.
     DisableProtective { reason: crate::driver::DisableProtectiveReason },
 }
 

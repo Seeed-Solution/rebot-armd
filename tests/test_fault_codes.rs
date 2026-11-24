@@ -65,7 +65,9 @@ fn fault_code_all_lists_every_variant_once() {
     let names: Vec<String> = FaultCode::ALL.iter().map(|c| serde_json::to_value(c).unwrap().as_str().unwrap().to_string()).collect();
     assert_eq!(names, [
         "ESTOP", "BUS_LOSS", "THERMAL_TRIP", "JOINT_LIMIT", "WATCHDOG_TIMEOUT", "FOLLOWING_ERROR", "CONTROL_DEADLINE",
-        "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "HARDWARE_FAULT", "ENABLE_FAILED", "SERVO_NO_BRAKE",
-        "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "OTHER",
+        "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "HARDWARE_FAULT", "ENABLE_FAILED",
+        "ENABLE_ROLLBACK_HELD", "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "OTHER",
     ]);
+    assert!(FaultCode::EnableRollbackHeld.recoverable());
+    assert!(!FaultCode::EnableFailed.recoverable());
 }

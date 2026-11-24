@@ -69,6 +69,8 @@ fault_codes! {
         CanTxStalled,
         HardwareFault,
         EnableFailed,
+        /// Enable failed and rollback was refused to prevent dropping the arm; motors stay holding.
+        EnableRollbackHeld,
         ServoNoBrake,
         HandoverUnsettled,
         GravityCompFailed,
@@ -87,7 +89,13 @@ impl FaultCode {
 
     /// Hint for client recovery policies; armd never clears a fault by itself.
     pub fn recoverable(self) -> bool {
-        matches!(self, FaultCode::WatchdogTimeout | FaultCode::ControlDeadline | FaultCode::HandoverUnsettled)
+        matches!(
+            self,
+            FaultCode::WatchdogTimeout
+                | FaultCode::ControlDeadline
+                | FaultCode::HandoverUnsettled
+                | FaultCode::EnableRollbackHeld
+        )
     }
 
     /// Code implied by a reason when the trigger site gave none.

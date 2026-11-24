@@ -50,8 +50,8 @@ pub struct FaultDescription {
 pub fn fault_recovery(code: FaultCode) -> &'static [&'static str] {
     use FaultCode::*;
     match code {
-        Estop | WatchdogTimeout | ControlDeadline | JointLimit | EnableFailed | ServoNoBrake | HandoverUnsettled
-        | GravityCompFailed => &["clear_fault", "torque_on"],
+        Estop | WatchdogTimeout | ControlDeadline | JointLimit | EnableFailed | EnableRollbackHeld | ServoNoBrake
+        | HandoverUnsettled | GravityCompFailed => &["clear_fault", "torque_on"],
         BusLoss | InvalidTelemetry | DriverWriteFailed | CanTxStalled => &["restore_bus", "clear_fault", "torque_on"],
         ThermalTrip => &["wait_cooldown", "clear_fault", "torque_on"],
         FollowingError | Collision => &["remove_obstruction", "clear_fault", "torque_on"],
