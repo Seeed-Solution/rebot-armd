@@ -366,6 +366,102 @@ pub fn prepare_lease_disconnect(connection: ConnectionHandle) -> PreparedLeaseDi
     }
 }
 
+/// Prepared torque transition (`TorqueOn` or `TorqueOff`) built off-thread from a published
+/// [`OwnerStateSnapshot`], carrying the admission-captured [`crate::supervisor::AdmissionStamp`]
+/// so `TorqueOn` consumes A1's `Admitted<'g>` by value and `TorqueOff` keeps its stop-direction exemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTorque {
+    pub enable: bool,
+    pub connection: ConnectionHandle,
+    pub local_generation: u64,
+    pub supplied_epoch: Option<u64>,
+    pub arm: ArmId,
+    pub boot: BootId,
+    pub authority: Authority,
+    pub client: ClientId,
+    pub client_seq: u64,
+    pub deadline: Instant,
+    pub stamp: crate::supervisor::AdmissionStamp,
+}
+
+/// Off-thread preparation for WS `/api/v1/torque` or `/api/v1/arm` from a published snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_torque(
+    snap: &OwnerStateSnapshot,
+    connection: ConnectionHandle,
+    local_generation: u64,
+    supplied_epoch: Option<u64>,
+    enable: bool,
+    client_seq: u64,
+    stamp: crate::supervisor::AdmissionStamp,
+    now: Instant,
+    deadline: Instant,
+) -> Result<PreparedTorque, LeasePrepareError> {
+    if snap.boot.is_zero() {
+        return Err(LeasePrepareError::SnapshotUnavailable);
+    }
+    let mut authority = snap.authority_at(now);
+    authority.lease_generation = local_generation;
+    authority.epoch = supplied_epoch.unwrap_or(u64::MAX);
+    // Preserve the admission-captured stop_generation for TorqueOn so an intervening urgent Stop
+    // refuses the transition with `STOPPED` (TorqueOff is stop-direction exempt at owner commit).
+    if enable {
+        authority.stop_generation = stamp.stop_gen;
+    }
+    Ok(PreparedTorque {
+        enable,
+        connection,
+        local_generation,
+        supplied_epoch,
+        arm: snap.arm,
+        boot: snap.boot,
+        authority,
+        client: ClientId(connection.id()),
+        client_seq,
+        deadline,
+        stamp,
+    })
+}
+
+/// Single owner-side RT install function for `TransitionOp::TorqueOn` (consumes A1's `Admitted<'_>`
+/// by value; zero heap allocations).
+pub fn install_torque_on_transition(
+    admitted: crate::supervisor::Admitted<'_>,
+) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
+    SupervisorInner::begin_enable_torque_transition(admitted)
+}
+
+/// Single owner-side RT install function for `TransitionOp::TorqueOff` (exempt from `Admitted`
+/// and `stop_generation`; zero heap allocations).
+pub fn install_torque_off_transition(
+    inner: &mut SupervisorInner,
+) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
+    inner.begin_disable_torque_transition()
+}
+
+/// Single owner-side legacy install function for `/api/v1/torque` and `/api/v1/arm` (`enable: true`).
+/// Consumes A1's `Admitted<'_>` by value and checks `motor_zero_busy` parity.
+pub fn install_torque_on_legacy(
+    admitted: crate::supervisor::Admitted<'_>,
+) -> Result<SafetyState, crate::safety::SafetyError> {
+    let (inner, proof) = admitted.consume()?;
+    if inner.calibration_busy && inner.motor_zero_busy {
+        return Err(crate::safety::SafetyError::MotionBusy);
+    }
+    inner.enable_torque_inner(&proof)
+}
+
+/// Single owner-side legacy install function for `/api/v1/torque` and `/api/v1/arm` (`enable: false`).
+/// Exempt from `Admitted` (stop-direction action) while checking `motor_zero_busy` parity.
+pub fn install_torque_off_legacy(
+    inner: &mut SupervisorInner,
+) -> Result<SafetyState, crate::safety::SafetyError> {
+    if inner.calibration_busy && inner.motor_zero_busy {
+        return Err(crate::safety::SafetyError::MotionBusy);
+    }
+    inner.disable_torque()
+}
+
 /// Off-thread preparation result for one WS `heartbeat` frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreparedHeartbeat {

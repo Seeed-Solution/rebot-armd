@@ -94,11 +94,24 @@ impl AdmissionStamp {
         lease_gen: u64,
         broker_request_id: u64,
     ) -> Self {
+        Self::from_broker_for_client(stop_gen, estop_epoch, lease_gen, 0, broker_request_id)
+    }
+
+    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request carrying the caller's
+    /// numeric connection ID (`ClientId.0`) so transition authority and closed-connection checks
+    /// bind directly to the submitting connection without heap allocation.
+    pub(crate) fn from_broker_for_client(
+        stop_gen: u64,
+        estop_epoch: u64,
+        lease_gen: u64,
+        connection_id: u64,
+        broker_request_id: u64,
+    ) -> Self {
         Self {
             stop_gen,
             estop_epoch,
             lease_gen,
-            connection_id: 0,
+            connection_id,
             request_id: if broker_request_id == 0 {
                 0
             } else {
@@ -740,6 +753,10 @@ pub struct SupervisorInner {
     pub disable_pending: bool,
     /// The torque transition the RT started and serves from `poll_hardware` (None: none).
     pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
+    /// Bounded retry state for a non-broker background disable whose initial disable attempt
+    /// failed or ended unconfirmed (routes every retry strictly through the driver's single
+    /// `begin_torque_budgeted(false, 0)` disable choke point).
+    pub(crate) background_disable_retry: Option<driver_transitions::BackgroundDisableRetry>,
     pub last_disable_attempt: Option<Instant>,
     pub output_suspended: bool,
     pub feedback_numeric_valid: bool,
@@ -1727,6 +1744,7 @@ impl SupervisorInner {
             following_error_since: None,
             disable_pending: false,
             torque_transition: None,
+            background_disable_retry: None,
             last_disable_attempt: None,
             output_suspended: false,
             feedback_numeric_valid: true,
@@ -2179,9 +2197,12 @@ impl SupervisorInner {
         self.abort_enable_transition_for_fenced_lease(displaced_gen);
     }
 
-    /// L2 hook: aborts any in-flight `TorqueTransition::Enable` owned by `displaced_gen`.
-    /// No-op stub in L1; wired in L2 alongside torque transitions.
-    pub(crate) fn abort_enable_transition_for_fenced_lease(&mut self, _displaced_gen: u64) {}
+    /// Aborts any in-flight `TorqueTransition::Enable` owned by `displaced_gen`, initiating
+    /// bounded background disable cleanup via the driver's single disable choke point when the
+    /// arm was not previously torqued.
+    pub(crate) fn abort_enable_transition_for_fenced_lease(&mut self, displaced_gen: u64) {
+        self.abort_enable_transition_for_fenced_lease_impl(displaced_gen);
+    }
 
     /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
     /// superseded by this start plus the new action's eventual terminal (never drops a terminal).
@@ -3047,6 +3068,96 @@ impl SupervisorInner {
                 .collect();
             (!moving.is_empty()).then(|| moving.join("; "))
         })
+    }
+
+    /// Zero-allocation RT equivalent of `resting_pose_violation(stillness_verified).is_some()`.
+    /// Evaluates every condition (lengths, capabilities, enable state, freshness, joint & total
+    /// position tolerances, support torque/load limits, workspace policy via reusable `ws_eval_bufs`,
+    /// and optional velocity stillness) without any heap allocation or tracing.
+    pub(crate) fn has_resting_pose_violation_rt(&mut self, stillness_verified: bool) -> bool {
+        let dof = self.config.dof;
+        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
+            return true;
+        }
+        let Some(policy) = self.resting_policy() else {
+            return true;
+        };
+        let feedback_max_age = Duration::from_millis(policy.feedback_max_age_ms);
+        let has_support_torque = !policy.support_torque_limits.is_empty();
+        let has_support_load = !policy.support_load_limits.is_empty();
+        if let Some(ref d) = self.driver {
+            let Ok(drv) = d.lock() else {
+                return true;
+            };
+            let caps = drv.capabilities();
+            if !caps.velocity_feedback || !caps.enable_feedback {
+                return true;
+            }
+            if has_support_torque && !caps.torque_feedback {
+                return true;
+            }
+            if has_support_load && !caps.load_feedback {
+                return true;
+            }
+            let enable = drv.enable_state();
+            if enable != EnableState::Enabled && !drv.has_known_partial_enable() {
+                return true;
+            }
+            if self.safety.state().is_stopped() {
+                return true;
+            }
+            let fresh = self.feedback_numeric_valid
+                && drv.feedback_all_within(dof, feedback_max_age);
+            if !fresh {
+                return true;
+            }
+        }
+        let rest = self.config.resting_positions();
+        if rest.len() < dof {
+            return true;
+        }
+        let mut total = 0.0f32;
+        for (i, &tolerance) in policy.position_tolerances.iter().enumerate().take(dof) {
+            let dev = (self.measured_positions[i] - rest[i]).abs();
+            if !dev.is_finite() || dev > tolerance {
+                return true;
+            }
+            total += dev;
+        }
+        if total > policy.max_total_deviation {
+            return true;
+        }
+        if self.driver.is_some() {
+            for &(i, max_tau) in &policy.support_torque_limits {
+                if i >= dof {
+                    return true;
+                }
+                let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
+                if !tau.is_finite() || tau.abs() > max_tau {
+                    return true;
+                }
+            }
+            for &(i, max_load) in &policy.support_load_limits {
+                if i >= dof {
+                    return true;
+                }
+                let load = self.loads.get(i).copied().unwrap_or(f32::NAN);
+                if !load.is_finite() || load.abs() > max_load {
+                    return true;
+                }
+            }
+        }
+        if !stillness_verified {
+            for (i, &v) in self.measured_velocities.iter().enumerate() {
+                if !v.is_finite() || v.abs() > policy.max_velocity_of(i) {
+                    return true;
+                }
+            }
+        }
+        let mut ws_bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let ws_bad = self.measured_workspace_violation_bounded(&mut ws_bufs).is_some();
+        self.ws_eval_bufs = ws_bufs;
+        ws_bad
     }
 
     fn default_rebot_dm_resting_pose() -> &'static RestingPosePolicy {

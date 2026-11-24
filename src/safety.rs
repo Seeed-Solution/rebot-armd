@@ -2421,6 +2421,25 @@ impl SafetyManager {
         }
     }
 
+    /// Zero-allocation RT equivalent of [`Self::set_torque`], returning static protocol error codes.
+    pub fn set_torque_rt(&mut self, enable: bool) -> Result<(), &'static str> {
+        if self.state_arc.is_stopped() {
+            if !enable {
+                return Err("MOTION_FORBIDDEN_IN_FAULT_STATE");
+            }
+            if matches!(*self.state_arc, SafetyState::Fault(_)) {
+                return Err("FAULT_ACTIVE");
+            }
+            return Err("ESTOP_ACTIVE");
+        }
+        if enable {
+            let _ = self.try_replace_state_arc(Arc::clone(&self.armed_arc));
+        } else {
+            let _ = self.try_replace_state_arc(Arc::clone(&self.idle_arc));
+        }
+        Ok(())
+    }
+
     /// Notify that motion has started
     pub fn mark_motion_started(&mut self) -> Result<(), SafetyError> {
         if *self.state_arc != SafetyState::Armed && *self.state_arc != SafetyState::Moving {

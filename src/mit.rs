@@ -226,6 +226,18 @@ pub fn mit_joints(cfg: &ArmConfig) -> Vec<usize> {
     jt.mit_joint_slots().into_iter().filter_map(|k| arm.get(k).copied()).collect()
 }
 
+/// Zero-allocation equivalent of `!mit_joints(cfg).is_empty()` for RT control paths.
+pub fn has_mit_joints(cfg: &ArmConfig) -> bool {
+    let Some(jt) = cfg.joint_tracking.as_ref().filter(|jt| jt.mit_requested()) else {
+        return false;
+    };
+    let arm_len = cfg.arm_joints().len();
+    jt.joints
+        .iter()
+        .enumerate()
+        .any(|(k, j)| j.strategy == crate::tracking::TrackingStrategy::Mit && k < arm_len)
+}
+
 /// Profile-level MIT rules (only for an enabled block with `mit` joints): gain ceilings from the
 /// profile's hand-guide hold gains (`gravity_comp.hold_kp` / `hold_kd`), each optional term
 /// within the effort limit at the profile maxima, and a gravity model when `gravity_scale` > 0.

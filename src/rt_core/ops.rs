@@ -300,8 +300,9 @@ impl Primitive {
 /// Codes an action can end with ([`Outcome`] carries them as `&'static str`).
 pub const TERMINAL_CODES: &[&str] = &[
     // stop / ownership / epoch
-    "STOPPED", "CANCELLED", "SUPERSEDED", "LEASE_LOST", "EPOCH_MISMATCH", "PLAN_STALE", "CALIBRATION_CHANGED", "CONFIG_BUSY",
-    "DEPLOYMENT_CHANGED", "TOOL_MISMATCH", "DATA_STALE", "NOT_ARMED", "MOTION_BUSY", "INTERNAL", "UNSUPPORTED",
+    "STOPPED", "CANCELLED", "SUPERSEDED", "LEASE_LOST", "DISCONNECTED", "EPOCH_MISMATCH", "PLAN_STALE", "CALIBRATION_CHANGED", "CONFIG_BUSY",
+    "DEPLOYMENT_CHANGED", "TOOL_MISMATCH", "DATA_STALE", "NOT_ARMED", "MOTION_BUSY", "TRANSITION_BUSY", "HANDOVER_SETTLING", "DISABLE_PENDING",
+    "INTERNAL", "UNSUPPORTED",
     // faults and holds (FaultCode, SCREAMING_SNAKE_CASE)
     "ESTOP", "ESTOP_ACTIVE", "FAULT", "FAULT_ACTIVE", "BUS_LOSS", "THERMAL_TRIP", "JOINT_LIMIT", "WATCHDOG", "WATCHDOG_TIMEOUT",
     "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "HARDWARE_FAULT", "ENABLE_FAILED",
@@ -527,6 +528,16 @@ pub trait CoreOps {
     fn apply_estop(&mut self) -> bool { false }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
+    /// Applies an authorized stop at `generation` and synchronizes the owner's stop counter.
+    fn apply_stop_at(&mut self, _generation: u64) {
+        self.apply_stop();
+    }
+    /// Pops a transition terminal recorded after Step 2 (e.g. an in-flight enable aborted by
+    /// `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`, or Step 5 lease expiry) so Step 7 can
+    /// deliver it strictly after Step 6 publication and strictly before any replacement grant.
+    fn take_ended_transition(&mut self) -> Option<Result<TorqueProgress, &'static str>> {
+        None
+    }
     /// Authorizes and applies one bounded urgent [`UrgentStop`] request at the owner.
     /// Only an authorized stop advances `stops` (`StopRequests`), inhibits output, and
     /// applies stop semantics before marking `stops` applied.
@@ -709,9 +720,9 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
     use crate::safety::SafetyError as S;
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
-        "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
-        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
-        "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED",
+        "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "DISCONNECTED", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
+        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "FEEDBACK_UNAVAILABLE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED", "HANDOVER_SETTLING", "DISABLE_PENDING", "TRANSITION_BUSY",
     ];
     match &e {
         ArmError::Motion(m) => m.code(),
@@ -723,6 +734,8 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
             S::CollisionHold(_) => "COLLISION_HOLD",
             S::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
             S::MotionBusy => "MOTION_BUSY",
+            S::HandoverSettling => "HANDOVER_SETTLING",
+            S::FeedbackUnavailable => "FEEDBACK_UNAVAILABLE",
             S::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
             S::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
             S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
@@ -978,33 +991,28 @@ impl CoreOps for SupervisorInner {
             ImmediateOp::TorqueOn => self.check_commit(d, ctx)?,
             ImmediateOp::Heartbeat => unreachable!(),
         }
-        let r = match op {
+        match op {
             ImmediateOp::Heartbeat => unreachable!(),
             ImmediateOp::TorqueOn => {
-                if self.driver.is_some() {
-                    return Err("UNSUPPORTED");
-                }
                 self.sync_stop_generation(ctx.stop_generation);
-                let stamp = crate::supervisor::AdmissionStamp::from_broker(
+                let stamp = crate::supervisor::AdmissionStamp::from_broker_for_client(
                     d.stamp.authority.stop_generation,
                     d.stamp.authority.epoch,
                     d.stamp.authority.lease_generation,
+                    d.stamp.client.0,
                     d.stamp.request.0,
                 );
-                self.check_admission(stamp)
-                    .and_then(SupervisorInner::enable_torque)
-                    .map(drop)
-                    .map_err(ArmError::Safety)
+                let admitted = self
+                    .check_admission(stamp)
+                    .map_err(|e| static_code(ArmError::Safety(e)))?;
+                SupervisorInner::enable_torque_immediate_rt(admitted, ctx.now)?;
             }
             // Stop-direction action: exempt from stop-generation checks and Admitted.
             ImmediateOp::TorqueOff => {
-                if self.driver.is_some() {
-                    return Err("UNSUPPORTED");
-                }
-                self.disable_torque().map(drop).map_err(ArmError::Safety)
+                self.disable_torque_immediate_rt(ctx.now)?;
             }
-        };
-        r.map(|_| Committed::authorized(d, None)).map_err(static_code)
+        }
+        Ok(Committed::authorized(d, None))
     }
 
     fn commit_lease(
@@ -1035,19 +1043,21 @@ impl CoreOps for SupervisorInner {
         let progress = match op {
             TransitionOp::TorqueOn => {
                 self.sync_stop_generation(ctx.stop_generation);
-                let stamp = crate::supervisor::AdmissionStamp::from_broker(
+                let stamp = crate::supervisor::AdmissionStamp::from_broker_for_client(
                     d.stamp.authority.stop_generation,
                     d.stamp.authority.epoch,
                     d.stamp.authority.lease_generation,
+                    d.stamp.client.0,
                     d.stamp.request.0,
                 );
-                self.check_admission(stamp)
-                    .and_then(SupervisorInner::begin_enable_torque_transition)
+                let admitted = self
+                    .check_admission(stamp)
+                    .map_err(|e| static_code(ArmError::Safety(e)))?;
+                super::requests::lease::install_torque_on_transition(admitted)?
             }
             // Stop-direction action: exempt from stop-generation checks and Admitted.
-            TransitionOp::TorqueOff => self.begin_disable_torque_transition(),
-        }
-        .map_err(|e| static_code(ArmError::Safety(e)))?;
+            TransitionOp::TorqueOff => super::requests::lease::install_torque_off_transition(self)?,
+        };
         // the next service is the next poll (the begin's wake is on the driver's clock)
         self.core.begin_transition(progress.map(|p| match p { TorqueProgress::Pending { .. } => TorqueProgress::Pending { wake: ctx.now }, done => done }));
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
@@ -1078,6 +1088,19 @@ impl CoreOps for SupervisorInner {
 
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
     fn apply_stop(&mut self) { self.authorized_stop(); }
+
+    fn apply_stop_at(&mut self, generation: u64) {
+        self.authorized_stop();
+        self.sync_stop_generation(generation);
+    }
+
+    fn take_ended_transition(&mut self) -> Option<Result<TorqueProgress, &'static str>> {
+        if self.torque_transition.is_none() && self.core.transition_pending() {
+            self.core.poll_transition()
+        } else {
+            None
+        }
+    }
 
     fn handle_urgent_stop(
         &mut self,
@@ -1506,7 +1529,7 @@ impl ReleaseEngine {
     pub fn apply_pending_stop<O: CoreOps>(&mut self, core: &mut O) -> bool {
         let generation = self.stop.current();
         if generation == self.stop.applied() { return false; }
-        core.apply_stop();
+        core.apply_stop_at(generation);
         self.stop.mark_applied(generation);
         true
     }
@@ -1634,6 +1657,7 @@ impl ReleaseEngine {
         let mut superseded_and_ack: Option<(Installed, super::broker::Reply)> = None;
         let mut deferred_step3_reply: Option<super::broker::Reply> = None;
         let mut deferred_eviction: Option<(super::requests::lease::ConnectionHandle, u64)> = None;
+        let mut transition_installed_this_release = false;
         if let Some(t) = self.intake.take() {
             let d = *t.descriptor();
             match d.kind {
@@ -1697,6 +1721,7 @@ impl ReleaseEngine {
                                 t.ack_deferred(c).map(|(acked, ack_reply)| {
                                     if let Some(i) = acked.installed {
                                         self.transition = Some(i);
+                                        transition_installed_this_release = true;
                                     }
                                     deferred_step3_reply = Some(ack_reply);
                                     acked.commit_seq
@@ -1724,15 +1749,36 @@ impl ReleaseEngine {
         let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
         // 6. Publish
         core.publish(timestamp, publish_generation);
-        // 7. Deliver urgent stop replies, lifecycle replies, Step 3 replies, and terminals strictly AFTER publish
+        // 7. Deliver aborted/finished transition terminals, urgent stop replies, lifecycle replies,
+        //    Step 3 replies, and active-action terminals strictly AFTER publish. Any earlier
+        //    transition aborted during Steps 2b-5 (e.g. by LeasePreempt / Disconnect / expiry)
+        //    emits its Terminal strictly BEFORE lifecycle replies or any replacement grant.
+        let post_step2_ended_transition = if finished_transition.is_none()
+            && !transition_installed_this_release
+            && self.transition.is_some()
+        {
+            match core.take_ended_transition() {
+                Some(Ok(TorqueProgress::Done)) => self.transition.take().map(|t| {
+                    report.transition_ended = Some((t.action(), Outcome::Completed));
+                    (t, Outcome::Completed)
+                }),
+                Some(Err(code)) => self.transition.take().map(|t| {
+                    report.transition_ended = Some((t.action(), Outcome::Failed(code)));
+                    (t, Outcome::Failed(code))
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((t, outcome)) = finished_transition.or(post_step2_ended_transition) {
+            self.intake.terminal(t, outcome);
+        }
         if self.flush_urgent_stop_replies() {
             self.urgent_replies_flushed = true;
         }
         if self.flush_lifecycle_replies() {
             self.lifecycle_replies_flushed = true;
-        }
-        if let Some((t, outcome)) = finished_transition {
-            self.intake.terminal(t, outcome);
         }
         if let Some((old, ack_reply)) = superseded_and_ack {
             self.intake.terminal(old, Outcome::Superseded);
@@ -1778,14 +1824,14 @@ impl ReleaseEngine {
         if urgent_applied || lifecycle_pending || finished.is_some() {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
+            if let Some((t, outcome)) = finished {
+                self.intake.terminal(t, outcome);
+            }
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
             }
             if self.flush_lifecycle_replies() {
                 self.lifecycle_replies_flushed = true;
-            }
-            if let Some((t, outcome)) = finished {
-                self.intake.terminal(t, outcome);
             }
             return true;
         }
