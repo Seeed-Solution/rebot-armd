@@ -2595,11 +2595,20 @@ impl ControlState {
     }
 
     /// Teardown-only handoff (never called on RT ticks): transfers any retained `"Stopped hold
-    /// output failed"` aggregate that could not fit into a full `safety_log_tx` ring directly to
-    /// `OffThreadSinks` so exact suppressed counts are never lost on executor shutdown.
+    /// output failed"` aggregate that could not fit into a full `safety_log_tx` ring to
+    /// `OffThreadSinks` without ever blocking `armd-control` on a mutex (`try_lock` with a
+    /// counted drop on contention).
     fn flush_pending_hold_error_for_shutdown(&mut self, core: &mut SupervisorInner) {
         if let Some(ev) = core.take_pending_hold_tx_error_for_shutdown() {
-            let mut slot = self.shutdown_hold_error.lock().unwrap_or_else(|e| e.into_inner());
+            let mut slot = match self.shutdown_hold_error.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
+                    self.stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
             *slot = Some(match slot.take() {
                 None => ev,
                 Some(SafetyLogEvent::StoppedHoldOutputFailed { suppressed: prev_sup, .. }) => {
@@ -5745,6 +5754,31 @@ mod tests {
             }
             other => panic!("unexpected shutdown handoff event: {other:?}"),
         }
+
+        // 8. Round 4 non-blocking teardown handoff: when `shutdown_hold_error` is contended,
+        //    `flush_pending_hold_error_for_shutdown` MUST NOT block `armd-control`; it uses
+        //    `try_lock()` and records a counted drop on both `core.safety_log_ring_dropped` and
+        //    `state.stats.safety_log_dropped`.
+        let t8 = t7 + Duration::from_millis(1200);
+        let mut msg8 = crate::safety::BoundedText::<160>::empty();
+        msg8.push_str("tx err #8");
+        assert!(core.safety.log_stopped_hold_output_failed(false, 0, msg8, t8));
+        state.drain_retired_states(&mut core, t8);
+        assert_eq!(core.hold_tx_error_suppressed(), 1);
+        let ring_dropped_before = core.safety_log_ring_dropped;
+        let stats_dropped_before = state.stats.safety_log_dropped.load(Ordering::Relaxed);
+        {
+            let lock = Arc::clone(&state.shutdown_hold_error);
+            let _held = lock.lock().unwrap();
+            state.flush_pending_hold_error_for_shutdown(&mut core);
+        }
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.safety_log_ring_dropped, ring_dropped_before + 1);
+        assert_eq!(
+            state.stats.safety_log_dropped.load(Ordering::Relaxed),
+            stats_dropped_before + 1
+        );
+        assert!(state.shutdown_hold_error.lock().unwrap().is_none());
     }
 
     #[test]
