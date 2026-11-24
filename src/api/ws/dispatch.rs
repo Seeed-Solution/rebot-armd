@@ -249,7 +249,7 @@ pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) last_sequence: &'a mut Option<u64>,
     pub(super) evicted_notify: &'a mut Option<(String, u64)>,
     pub(super) action_pending: &'a mut actions::ActionPending,
-    pub(super) pending_config_write: &'a mut Option<(Value, config::PreparedConfigWrite, u64, u64)>,
+    pub(super) pending_config_write: &'a mut Option<config::PendingConfigJob>,
     pub(super) pending_calibration: &'a mut Option<(Value, calibration::CalibJob, u64, u64, bool)>,
 }
 

@@ -370,7 +370,11 @@ impl From<ArmError> for ApiError {
                 ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg, "UNSUPPORTED".to_string())
             }
             ArmError::Rejected { status, code, message } => {
-                ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code)
+                if code == "PERSIST_FAILED" {
+                    ApiError::persist_failed(message)
+                } else {
+                    ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code)
+                }
             }
             ArmError::Detailed { status, code, message, details } => {
                 let mut e = ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code);
@@ -934,6 +938,7 @@ pub async fn post_tool_commissioning_confirm(
             confirmed_at: prepared.confirmed_at,
         },
         write,
+        refresh_commit_window_after_stage: true,
     };
     let outcome = run_config_commit(
         &supervisor,

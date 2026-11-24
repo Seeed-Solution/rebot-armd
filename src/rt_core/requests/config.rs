@@ -18,6 +18,11 @@
 //!   Post-rename failure moves the hold to `HoldState::Reconciling` so live state
 //!   stays unchanged and motion stays inhibited.
 
+// `ConfigError` and `ConfigExchange` variants are intentionally kept unboxed (stack / inline
+// inside the single preallocated `Box<ConfigExchange>`) so `armd-control` performs strictly
+// zero heap allocations and zero heap frees across every config request and error path.
+#![allow(clippy::result_large_err, clippy::large_enum_variant)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -97,6 +102,7 @@ pub struct PublishedConfig {
     pub calibration_revision: u64,
     pub calibration_busy: bool,
     pub calibration_load_error: Option<String>,
+    pub profile_camera_mount: CameraMount,
     pub profile_floor_z_m: Option<f32>,
     pub floor_source: &'static str,
     pub workspace_revision: u64,
@@ -162,6 +168,7 @@ impl PublishedConfig {
             calibration_revision: inner.calibration_revision,
             calibration_busy: inner.calibration_busy,
             calibration_load_error: inner.calibration_load_error.clone(),
+            profile_camera_mount: inner.profile_camera_mount.clone(),
             profile_floor_z_m: inner.profile_floor_z_m,
             floor_source: inner.floor_source,
             workspace_revision: inner.workspace_revision,
@@ -605,14 +612,11 @@ impl PublishedConfigHub {
         self.available.store(true, Ordering::Release);
     }
 
-    pub fn update(&self, mutate: impl FnOnce(&mut PublishedConfig), legacy_lock_gen: Option<u64>) {
+    pub fn update(&self, mutate: impl FnOnce(&mut PublishedConfig)) {
         let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
         let mut next = (*g.config).clone();
         mutate(&mut next);
         g.config = Arc::new(next);
-        if let Some(gen) = legacy_lock_gen {
-            g.legacy_lock_gen = gen;
-        }
         self.available.store(true, Ordering::Release);
     }
 
@@ -625,43 +629,37 @@ impl PublishedConfigHub {
         jaw_opening: Option<JawOpening>,
         new_revision: u64,
     ) {
-        self.update(
-            |cfg| {
-                if cfg.base_gripper_policy.is_none() {
-                    cfg.base_gripper_policy = cfg.config.gripper_policy.clone();
-                }
-                cfg.config.gripper_policy = Some(policy);
-                cfg.gripper_calib_offset = Some(offset_rad);
-                if jaw_opening.is_some() {
-                    cfg.gripper_calib_jaw_opening = jaw_opening;
-                }
-                cfg.gripper_calib_revision = new_revision;
-            },
-            None,
-        );
+        self.update(|cfg| {
+            if cfg.base_gripper_policy.is_none() {
+                cfg.base_gripper_policy = cfg.config.gripper_policy.clone();
+            }
+            cfg.config.gripper_policy = Some(policy);
+            cfg.gripper_calib_offset = Some(offset_rad);
+            if jaw_opening.is_some() {
+                cfg.gripper_calib_jaw_opening = jaw_opening;
+            }
+            cfg.gripper_calib_revision = new_revision;
+        });
     }
 
     /// Updates published joint-zero offsets off-thread after `SetJointZeroOffsets` succeeds.
     pub fn apply_joint_zero_offsets(&self, offsets: &[f32]) {
-        self.update(
-            |cfg| {
-                let changed = cfg.joint_zero_offsets.as_slice() != offsets;
-                if changed {
-                    cfg.calibration_revision += 1;
-                }
-                if cfg.joint_zero_offsets.len() > 5
-                    && offsets.len() > 5
-                    && cfg.joint_zero_offsets[5] != offsets[5]
-                {
-                    cfg.zero_convention = Default::default();
-                }
-                cfg.joint_zero_offsets = offsets.to_vec();
-                if changed {
-                    cfg.refresh_effective_floor_in_place();
-                }
-            },
-            None,
-        );
+        self.update(|cfg| {
+            let changed = cfg.joint_zero_offsets.as_slice() != offsets;
+            if changed {
+                cfg.calibration_revision += 1;
+            }
+            if cfg.joint_zero_offsets.len() > 5
+                && offsets.len() > 5
+                && cfg.joint_zero_offsets[5] != offsets[5]
+            {
+                cfg.zero_convention = Default::default();
+            }
+            cfg.joint_zero_offsets = offsets.to_vec();
+            if changed {
+                cfg.refresh_effective_floor_in_place();
+            }
+        });
     }
 }
 
@@ -968,7 +966,10 @@ pub enum ReservePrecheck {
         steps: Option<Vec<Step>>,
         deleting_sequence_id: Option<HolderLabel>,
     },
-    GraspSetup { new_camera_tilt_deg: f32 },
+    GraspSetup {
+        new_camera_tilt_deg: f32,
+        allow_during_calibration_busy: bool,
+    },
     ToolCommissioning {
         tool_id: HolderLabel,
         tool_config_digest: HolderLabel,
@@ -1107,11 +1108,50 @@ pub enum GravityCompOp {
     },
 }
 
+/// Allocation-free tag mirroring `SafetyState` for owner replies without cloning `FaultReason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyStateTag {
+    Booting,
+    Idle,
+    Armed,
+    Moving,
+    EStop,
+    Fault,
+}
+
+impl SafetyStateTag {
+    pub fn from_state(state: &crate::safety::SafetyState) -> Self {
+        match state {
+            crate::safety::SafetyState::Booting => Self::Booting,
+            crate::safety::SafetyState::Idle => Self::Idle,
+            crate::safety::SafetyState::Armed => Self::Armed,
+            crate::safety::SafetyState::Moving => Self::Moving,
+            crate::safety::SafetyState::EStop => Self::EStop,
+            crate::safety::SafetyState::Fault(_) => Self::Fault,
+        }
+    }
+
+    pub fn to_json_with_hub(self, sup: &ArmSupervisor) -> Value {
+        match self {
+            Self::Booting => json!("Booting"),
+            Self::Idle => json!("Idle"),
+            Self::Armed => json!("Armed"),
+            Self::Moving => json!("Moving"),
+            Self::EStop => json!("EStop"),
+            Self::Fault => sup
+                .hub()
+                .latest()
+                .map_or_else(|| json!("Fault"), |s| json!(s.obs.safety_state)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct GravityCompReply {
     pub active: bool,
     pub epoch_id: u64,
     pub is_torqued: bool,
+    pub safety_state: SafetyStateTag,
 }
 
 /// Outcome of a successful [`ActivateConfig`].
@@ -1122,6 +1162,8 @@ pub struct ConfigActivated {
     pub workspace_revision: u64,
     pub epoch_id: u64,
     pub is_torqued: bool,
+    pub safety_state: SafetyStateTag,
+    pub gravity_comp_active: bool,
 }
 
 /// All owner-side configuration and companion maintenance requests routed via `MaintenanceOp::Config`.
@@ -1362,8 +1404,11 @@ fn run_reserve_precheck(
             retired.steps = steps;
             check_res
         }
-        ReservePrecheck::GraspSetup { new_camera_tilt_deg } => {
-            if core.calibration_busy {
+        ReservePrecheck::GraspSetup {
+            new_camera_tilt_deg,
+            allow_during_calibration_busy,
+        } => {
+            if !allow_during_calibration_busy && core.calibration_busy {
                 return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
             }
             if new_camera_tilt_deg != core.config.camera_mount.tilt_deg {
@@ -1735,6 +1780,8 @@ fn install_activate_config(
             workspace_revision: core.workspace_revision,
             epoch_id: core.safety.epoch_id(),
             is_torqued: core.is_torqued,
+            safety_state: SafetyStateTag::from_state(core.safety.state()),
+            gravity_comp_active: core.gravity_comp_active(),
         }),
         Activated::Refused { code, reservation } => {
             let _ = ConfigAuthority::release(core, reservation);
@@ -1957,6 +2004,14 @@ fn install_gravity_comp(
                     "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
                 ));
             }
+            if core.calibration_busy {
+                retired.gravity_comp_policy = policy;
+                return Err(ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "MOTION_BUSY",
+                    message: "a calibration apply, restore or motor zero is running",
+                });
+            }
             if let Some((conn, gen)) = lease_holder {
                 if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
                     retired.gravity_comp_policy = policy;
@@ -1985,6 +2040,7 @@ fn install_gravity_comp(
                         active: core.gravity_comp_active(),
                         epoch_id: core.safety.epoch_id(),
                         is_torqued: core.is_torqued,
+                        safety_state: SafetyStateTag::from_state(core.safety.state()),
                     })
                 }
                 Err((reason, unused_policy)) => {
@@ -2002,11 +2058,19 @@ fn install_gravity_comp(
                     "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
                 ));
             }
+            if core.calibration_busy {
+                return Err(ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "MOTION_BUSY",
+                    message: "a calibration apply, restore or motor zero is running",
+                });
+            }
             core.exit_gravity_comp_rt(code, message);
             Ok(GravityCompReply {
                 active: core.gravity_comp_active(),
                 epoch_id: core.safety.epoch_id(),
                 is_torqued: core.is_torqued,
+                safety_state: SafetyStateTag::from_state(core.safety.state()),
             })
         }
     }
@@ -2209,6 +2273,12 @@ pub struct ConfigCommitPlan {
     pub precheck: ReservePrecheck,
     pub candidate: ConfigCandidate,
     pub write: Option<PendingWrite>,
+    /// When `true` (default for WS/REST/calibration flows), refreshes `proposal.stamp.deadline`
+    /// and `proposal.stamp.authority.stop_generation` at the post-stage / pre-reserve commit
+    /// boundary (preserving ingress `epoch`, `lease_generation`, `boot`, `expected_revision`,
+    /// and `admission`), so a motion stop or slow disk staging / vision I/O does not cancel
+    /// non-motion configuration persistence while stops racing reserve/activate are still caught.
+    pub refresh_commit_window_after_stage: bool,
 }
 
 /// Outcome of [`run_config_commit`].
@@ -2250,11 +2320,12 @@ where
     let _cw = cw_lock.lock().await;
 
     let ConfigCommitPlan {
-        proposal,
+        mut proposal,
         auth,
         precheck,
         candidate,
         write,
+        refresh_commit_window_after_stage,
     } = plan;
 
     let staged = if let Some(w) = write {
@@ -2274,6 +2345,11 @@ where
     } else {
         None
     };
+
+    if refresh_commit_window_after_stage {
+        proposal.stamp.deadline = Instant::now() + CONFIG_PROPOSAL_BUDGET;
+        proposal.stamp.authority.stop_generation = sup.current_stop_gen();
+    }
 
     if let Some(h) = hooks.before_reserve.as_ref() {
         h();
@@ -2456,9 +2532,8 @@ where
     };
 
     // Update PublishedConfigHub off-thread immediately after owner activation.
-    let legacy_gen = (sup.owner_mode() == OWNER_LEGACY).then(|| sup.inner().generation());
     sup.published_config_hub()
-        .update(|cfg| update_published(cfg, activated), legacy_gen);
+        .update(|cfg| update_published(cfg, activated));
 
     if let Some(ds) = dir_sync {
         let sim_dir_sync_fail = hooks
@@ -2507,3 +2582,77 @@ pub fn prepare_eval_bufs_off_thread(
     bufs.prepare_for(arm_model, ws, cam, tcp_offset);
     bufs
 }
+
+/// Owner-routed gravity-compensation enter/exit command (shared across `Legacy` and `Executor`).
+///
+/// In `OWNER_EXECUTOR`, mock (driverless) entry/exit runs zero-alloc on `armd-control` using a
+/// pre-cloned `GravityCompPolicy`; hardware drivers requiring synchronous CAN MIT mode-switch
+/// fail closed with `503 EXECUTOR_CAPABILITY_UNSUPPORTED`.
+pub async fn gravity_comp_command(
+    sup: &Arc<ArmSupervisor>,
+    admission: AdmissionStamp,
+    lease_holder: Option<(HolderLabel, u64)>,
+    enable: bool,
+    scale: Option<f32>,
+    damping_kd: Option<Vec<f32>>,
+) -> Result<GravityCompReply, ArmError> {
+    let op = if enable {
+        let pub_cfg = sup.published_config().await?;
+        if sup.owner_mode() == OWNER_EXECUTOR && pub_cfg.has_driver {
+            return Err(executor_capability_unsupported(
+                "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
+            ));
+        }
+        let policy = pub_cfg
+            .config
+            .gravity_comp
+            .clone()
+            .filter(|_| pub_cfg.config.six_plus_gripper() && pub_cfg.config.gravity_model.is_some());
+        let damping_arr = match damping_kd {
+            None => None,
+            Some(v) => {
+                let max_kd = policy.as_ref().map_or(f32::INFINITY, |p| p.damping_kd_max);
+                if v.len() != 6 || !v.iter().all(|k| k.is_finite() && *k >= 0.0 && *k <= max_kd) {
+                    return Err(ArmError::Rejected {
+                        status: 400,
+                        code: "INVALID_COMMAND".into(),
+                        message: format!("damping_kd must be 6 values in [0, {max_kd}]"),
+                    });
+                }
+                let mut arr = [0.0f32; 6];
+                arr.copy_from_slice(&v);
+                Some(arr)
+            }
+        };
+        GravityCompOp::Enter {
+            admission,
+            lease_holder,
+            policy,
+            scale,
+            damping_kd: damping_arr,
+        }
+    } else {
+        if sup.owner_mode() == OWNER_EXECUTOR {
+            let pub_cfg = sup.published_config().await?;
+            if pub_cfg.has_driver {
+                return Err(executor_capability_unsupported(
+                    "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
+                ));
+            }
+        }
+        GravityCompOp::Exit {
+            code: "REQUESTED",
+            message: "Exit requested",
+        }
+    };
+    match sup
+        .dispatch_config_request(ConfigRequest::GravityComp(op))
+        .await
+    {
+        Ok(ConfigReply::GravityCompDone(Ok(reply))) => Ok(reply),
+        Ok(ConfigReply::GravityCompDone(Err(e))) => Err(e.to_arm_error()),
+        Err(e) => Err(e.to_arm_error()),
+        _ => Err(ArmError::Internal("unexpected gravity_comp reply".into())),
+    }
+}
+

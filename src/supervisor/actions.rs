@@ -255,31 +255,31 @@ impl SupervisorInner {
             if settled.is_some() { a.settled = settled; }
             if holding.is_some() { a.holding = holding; }
             if gap.is_some() { a.gripper_gap_rad = gap; }
-            if a.kind == "gripper_zero_check" {
-                if self.zero_check_params.as_ref().is_some_and(|p| p.action_id == id) {
-                    let params = self.zero_check_params.take().expect("checked action_id match");
-                    let mut unused_ctx = params.persist_ctx;
-                    if state == "done" {
-                        let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
-                        let offset_rad = stop_rad - params.base_closed_rad;
-                        let pass = offset_rad.abs() <= params.threshold_rad;
-                        a.stop_rad = Some(stop_rad);
-                        a.offset_rad = Some(offset_rad);
-                        a.pass = Some(pass);
-                        self.gripper_zero_checked = true;
-                        self.last_zero_check_offset = Some(offset_rad);
-                        if params.store_offset {
-                            if offset_rad.abs() <= 0.5 {
-                                if let Some(ctx) = unused_ctx.take() {
-                                    store_offset_req = Some((offset_rad, ctx));
-                                }
-                            } else if !self.rt_executor_owned && !self.defer_zero_check_persist {
-                                tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
+            if a.kind == "gripper_zero_check"
+                && self.zero_check_params.as_ref().is_some_and(|p| p.action_id == id)
+            {
+                let params = self.zero_check_params.take().expect("checked action_id match");
+                let mut unused_ctx = params.persist_ctx;
+                if state == "done" {
+                    let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
+                    let offset_rad = stop_rad - params.base_closed_rad;
+                    let pass = offset_rad.abs() <= params.threshold_rad;
+                    a.stop_rad = Some(stop_rad);
+                    a.offset_rad = Some(offset_rad);
+                    a.pass = Some(pass);
+                    self.gripper_zero_checked = true;
+                    self.last_zero_check_offset = Some(offset_rad);
+                    if params.store_offset {
+                        if offset_rad.abs() <= 0.5 {
+                            if let Some(ctx) = unused_ctx.take() {
+                                store_offset_req = Some((offset_rad, ctx));
                             }
+                        } else if !self.rt_executor_owned && !self.defer_zero_check_persist {
+                            tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
                         }
                     }
-                    retired_ctx = unused_ctx;
                 }
+                retired_ctx = unused_ctx;
             }
             if !self.rt_executor_owned && !self.defer_zero_check_persist {
                 tracing::info!(

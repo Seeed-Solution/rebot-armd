@@ -7120,18 +7120,27 @@ impl ArmSupervisor {
             .clone()
     }
 
+    /// Current monotonic stop generation across both `Legacy` and `Executor` owners (lock-free).
+    pub fn current_stop_gen(&self) -> u64 {
+        let legacy = self.stop_gen.load(Ordering::Acquire);
+        self.executor_handle()
+            .map_or(legacy, |h| legacy.max(h.stop_requests().current()))
+    }
+
     pub async fn set_operator_auth_enforced(&self, enforced: bool) {
         if self.owner_mode() == OWNER_LEGACY {
             let mut inner = self.inner.write().await;
             if self.check_legacy_under_guard(&inner).is_ok() {
                 inner.operator_auth_enforced = enforced;
+                let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
+                let gen = self.inner.generation();
+                drop(inner);
+                self.published_config.publish(snap, gen);
+                return;
             }
         }
-        let legacy_gen = (self.owner_mode() == OWNER_LEGACY).then(|| self.inner.generation());
-        self.published_config.update(
-            |cfg| cfg.operator_auth_enforced = enforced,
-            legacy_gen,
-        );
+        self.published_config
+            .update(|cfg| cfg.operator_auth_enforced = enforced);
     }
 
     /// Every tick's observation, forwarded by the dispatcher thread (started here when it
