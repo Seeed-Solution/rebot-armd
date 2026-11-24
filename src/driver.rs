@@ -618,6 +618,21 @@ pub trait ArmDriver: Send {
         self.begin_torque(enabled)
     }
 
+    /// Starts a client-initiated park disable whose FIRST motor disable frame is gated against
+    /// pending Stop / stop-generation advances immediately before transmit (`DamiaoArmDriver::send`).
+    /// Once the first disable frame transmits, remaining motors disable unconditionally so the bus
+    /// never stays half-disabled. Watchdog / fault disables continue using [`Self::begin_torque_budgeted`].
+    fn begin_client_park_disable(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        _expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        match max_rx_frames {
+            Some(limit) => self.begin_torque_budgeted(false, limit),
+            None => self.begin_torque(false),
+        }
+    }
+
     /// Serve the pending torque transition once: one receive pass ending by `deadline` (and the
     /// driver's own frame / time bound), at most one retransmit per joint, no sleep. Err when the
     /// transition failed (or none is pending).
@@ -3064,6 +3079,10 @@ struct StopStamp {
 enum TxKind {
     /// Safety torque-off (`CMD_DISABLE`): never stop-gated and exempt from the motion TX budget.
     Disable,
+    /// First motor disable frame of a client-initiated park (`CMD_DISABLE`): exempt from the
+    /// motion TX budget, but stop-gated (pending Stop/E-stop, E-stop latch, and stop-generation
+    /// stamp rechecked immediately before `can.transmit`). Remaining motors use `Disable`.
+    ClientParkFirstDisable,
     /// Motion target frame (`POS_VEL`, `MIT`, or `POS_FORCE`).
     Target,
     /// Non-rollback mode-switch hold frame.
@@ -3781,6 +3800,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let latched = self.is_stop_latched();
         match kind {
             TxKind::Disable => {}
+            TxKind::ClientParkFirstDisable => {
+                if pending || latched {
+                    return Err(TxRefusal::StopInhibited);
+                }
+            }
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => {
                 if pending {
                     return Err(TxRefusal::StopInhibited);
@@ -3827,8 +3851,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::DeadlinePassed);
         }
 
-        // 2. Tick TX budget check (Disable / panic-disable exempt from motion TX budget).
-        let budgeted = !matches!(kind, TxKind::Disable);
+        // 2. Tick TX budget check (Disable / panic-disable / client-park disable exempt from motion TX budget).
+        let budgeted = !matches!(kind, TxKind::Disable | TxKind::ClientParkFirstDisable);
         if budgeted {
             let _ = self.ensure_tx_pass();
             if !self.can_start_tick_tx() {
@@ -6785,27 +6809,48 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn begin_disable_budgeted(&mut self, max_rx_frames: Option<u16>) -> Result<TorqueProgress, ArmDriverError> {
-        self.refresh_capture = None;
-        if let Some(hs) = self.torque_hs.take() {
-            if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
-                self.awaiting_rx_boundary = false;
+        self.begin_disable_inner(max_rx_frames, false, None)
+    }
+
+    fn begin_disable_inner(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        client_park: bool,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        let expected_stamp = if client_park {
+            let mut stamp = self.current_stop_stamp();
+            if let Some(gen) = expected_stop_gen {
+                stamp.stop_gen = gen;
             }
-            if !matches!(hs, DamiaoTorque::Disable { .. }) {
-                self.enable_failed();
+            self.strict_stop_check(Some(stamp))?;
+            Some(stamp)
+        } else {
+            None
+        };
+        if !client_park {
+            self.refresh_capture = None;
+            if let Some(hs) = self.torque_hs.take() {
+                if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
+                    self.awaiting_rx_boundary = false;
+                }
+                if !matches!(hs, DamiaoTorque::Disable { .. }) {
+                    self.enable_failed();
+                }
             }
-        }
-        self.discard_all_pending_tx();
-        self.begin_tx_tick();
-        self.refresh_unfinished = 0;
-        // MIT tracking: before the first disable frame, discard every cached target so no
-        // later recovery can replay one, whatever the disable's outcome (the fence stays
-        // armed until the disable is confirmed).
-        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
-            self.clear_cached_targets();
+            self.discard_all_pending_tx();
+            self.begin_tx_tick();
+            self.refresh_unfinished = 0;
+            // MIT tracking: before the first disable frame, discard every cached target so no
+            // later recovery can replay one, whatever the disable's outcome (the fence stays
+            // armed until the disable is confirmed).
+            if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+                self.clear_cached_targets();
+            }
         }
         // Still send disable if draining times out: thermal protection must not
         // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
-        self.awaiting_rx_boundary = match max_rx_frames {
+        let awaiting_rx_boundary = match max_rx_frames {
             Some(0) => !self.last_read_drained,
             Some(limit) => {
                 self.last_poll_rx = None;
@@ -6816,14 +6861,57 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             None => !self.drain_rx_before_command(),
         };
+        let mut last_err = None;
+        let first_idx = if client_park {
+            if self.motor_ids.is_empty() {
+                self.strict_stop_check(expected_stamp)?;
+                0
+            } else {
+                // Linearize client park's FIRST disable transmit inside `send()` (Step 3 + Step 5
+                // recheck of pending Stop, E-stop latch, and stop-generation stamp immediately
+                // before `can.transmit`). On stop refusal, zero frames were sent and driver state
+                // remains untouched.
+                match self.send(TxKind::ClientParkFirstDisable, expected_stamp, None, false, |d| {
+                    Some(damiao::build_disable_frame(d.motor_ids[0]))
+                }) {
+                    Ok(_) => 1,
+                    Err(r @ (TxRefusal::StopInhibited | TxRefusal::StopStampChanged)) => {
+                        return Err(Self::refusal_to_driver_err(r));
+                    }
+                    Err(r) => {
+                        last_err = Some(Self::refusal_to_driver_err(r));
+                        1
+                    }
+                }
+            }
+        } else {
+            0
+        };
+        if client_park {
+            self.refresh_capture = None;
+            if let Some(hs) = self.torque_hs.take() {
+                if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
+                    self.awaiting_rx_boundary = false;
+                }
+                if !matches!(hs, DamiaoTorque::Disable { .. }) {
+                    self.enable_failed();
+                }
+            }
+            self.discard_all_pending_tx();
+            self.begin_tx_tick();
+            self.refresh_unfinished = 0;
+            if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+                self.clear_cached_targets();
+            }
+        }
+        self.awaiting_rx_boundary = awaiting_rx_boundary;
         let after_seq = self.rx_seq;
         let cmd_start = self.now();
         self.last_enable_command = Some(cmd_start);
         self.last_enable_command_rx_seq = Some(self.rx_seq);
         self.last_command_was_disable = true;
         self.disable_confirmed_sticky = false;
-        let mut last_err = None;
-        for idx in 0..self.motor_ids.len() {
+        for idx in first_idx..self.motor_ids.len() {
             if let Err(r) = self.send(TxKind::Disable, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
@@ -7536,6 +7624,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         } else {
             self.begin_disable_budgeted(Some(max_rx_frames))
         }
+    }
+
+    fn begin_client_park_disable(
+        &mut self,
+        max_rx_frames: Option<u16>,
+        expected_stop_gen: Option<u64>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        if max_rx_frames.is_some() && !self.can.supports_nonblocking_rt() {
+            return Err(ArmDriverError::Protocol(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            ));
+        }
+        self.begin_disable_inner(max_rx_frames, true, expected_stop_gen)
     }
 
     fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
@@ -9371,8 +9472,9 @@ mod tx_chokepoint_tests {
         }
     }
 
-    const ALL_TX_KINDS: [TxKind; 9] = [
+    const ALL_TX_KINDS: [TxKind; 10] = [
         TxKind::Disable,
+        TxKind::ClientParkFirstDisable,
         TxKind::Target,
         TxKind::Hold,
         TxKind::RollbackHold(0),
@@ -9420,13 +9522,17 @@ mod tx_chokepoint_tests {
         if deadline == DeadlineCase::Passed {
             return Expected::RefusedDeadline;
         }
-        // Step 2: Tick TX budget runs before stop gate (Disable exempt).
-        if budget == BudgetCase::Exhausted && !matches!(kind, TxKind::Disable) {
+        // Step 2: Tick TX budget runs before stop gate (Disable / ClientParkFirstDisable exempt).
+        if budget == BudgetCase::Exhausted && !matches!(kind, TxKind::Disable | TxKind::ClientParkFirstDisable) {
             return Expected::Deferred;
         }
         // Step 3: Stop gate by TxKind.
         match kind {
             TxKind::Disable => Expected::Sent,
+            TxKind::ClientParkFirstDisable => match stop {
+                StopCase::NoStop => Expected::Sent,
+                StopCase::Pending | StopCase::Latched => Expected::RefusedStop,
+            },
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => match stop {
                 StopCase::Pending => Expected::RefusedStop,
                 StopCase::NoStop | StopCase::Latched => Expected::Sent,

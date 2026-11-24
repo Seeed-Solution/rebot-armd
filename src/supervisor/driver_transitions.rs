@@ -1801,9 +1801,11 @@ impl SupervisorInner {
             return;
         };
         let stop_before_write = Arc::clone(&self.e_stop_latched);
+        let expected_stop_gen = self.stop_requests.as_ref().map(|s| s.applied());
         let started = d.lock().ok().map(|mut drv| {
             // Linearize client Stop and hardware E-stop against the first disable transmit
-            // right inside the driver lock before issuing any disable frame.
+            // both inside the driver lock AND inside `DamiaoArmDriver::send(TxKind::ClientParkFirstDisable)`
+            // immediately before motor 0's `can.transmit`.
             if !watchdog && self.urgent_stop_unapplied() {
                 return None;
             }
@@ -1811,7 +1813,25 @@ impl SupervisorInner {
                 return Some((Err(crate::driver::ArmDriverError::EstopInhibited), drv.clock_now(), false));
             }
             let now = drv.clock_now();
-            let res = if self.rt_executor_owned || drv.supports_rt_executor().is_ok() { drv.begin_torque_budgeted(false, 0) } else { drv.begin_torque(false) };
+            let res = if !watchdog {
+                let max_rx = if self.rt_executor_owned || drv.supports_rt_executor().is_ok() { Some(0) } else { None };
+                drv.begin_client_park_disable(max_rx, expected_stop_gen)
+            } else if self.rt_executor_owned || drv.supports_rt_executor().is_ok() {
+                drv.begin_torque_budgeted(false, 0)
+            } else {
+                drv.begin_torque(false)
+            };
+            if !watchdog
+                && matches!(&res, Err(e) if crate::driver::is_estop_inhibited(e))
+                && !stop_before_write.load(Ordering::SeqCst)
+                && !self.estop_pending()
+                && !self.safety.state().is_stopped()
+                && self.urgent_stop_unapplied()
+            {
+                // Driver stop-gated motor 0's first disable frame for a racing client Stop:
+                // zero disable frames were transmitted, so cancel cleanly and hold torque.
+                return None;
+            }
             let confirmed_now = matches!(res, Ok(crate::driver::TorqueProgress::Done(_))) && DisableConfirm::confirmed(&**drv);
             Some((res, now, confirmed_now))
         });

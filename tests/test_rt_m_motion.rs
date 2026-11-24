@@ -1578,3 +1578,165 @@ async fn m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_
         assert!(inner.park_continuation().is_none() && inner.pending_normal_unload);
     }
 }
+
+// ============================================================================
+// 10. Round 2 M3: Park's first disable frame rechecks pending Stop / stop_gen
+//     at the driver's transmit gate (`DamiaoArmDriver::send`)
+// ============================================================================
+
+#[test]
+fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
+    use armd::rt_core::urgent::{EstopGate, StopRequests};
+    use armd::transport::{CanFrame, CanTransport, DriverClock, TransportError};
+
+    struct RaceStopCan {
+        inner: FakeBus,
+        nonblocking_rt: bool,
+        fire_stop_on_receive: Arc<AtomicBool>,
+        fire_stop_on_first_disable_tx: Arc<AtomicBool>,
+        stops: StopRequests,
+        disable_tx_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CanTransport for RaceStopCan {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let is_disable = frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
+            if is_disable {
+                self.disable_tx_count.fetch_add(1, Ordering::SeqCst);
+            }
+            let r = self.inner.transmit(frame);
+            if is_disable && self.fire_stop_on_first_disable_tx.swap(false, Ordering::SeqCst) {
+                let _ = self.stops.request();
+            }
+            r
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            if self.fire_stop_on_receive.swap(false, Ordering::SeqCst) {
+                let _ = self.stops.request();
+            }
+            self.inner.receive()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn supports_nonblocking_rt(&self) -> bool { self.nonblocking_rt }
+    }
+
+    let limits: Vec<DamiaoLimits> = ArmConfig::rebot_dm().damiao_ranges.unwrap()[..2].iter().map(|r| r.limits()).collect();
+
+    // 10a. Direct driver-boundary checks on `DamiaoArmDriver::begin_client_park_disable`.
+    {
+        let clock = armd::transport::MockClock::new();
+        let bus = FakeBus::with_clock(&limits, clock);
+        let stops = StopRequests::default();
+        let req_estop = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let app_estop = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fire_rx = Arc::new(AtomicBool::new(false));
+        let fire_tx = Arc::new(AtomicBool::new(false));
+        let disable_tx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let can = RaceStopCan {
+            inner: bus.clone(),
+            nonblocking_rt: true,
+            fire_stop_on_receive: fire_rx.clone(),
+            fire_stop_on_first_disable_tx: fire_tx.clone(),
+            stops: stops.clone(),
+            disable_tx_count: disable_tx.clone(),
+        };
+        let mut drv = DamiaoArmDriver::new(can, vec![1, 2]).with_joint_limits(limits.clone()).unwrap();
+        drv.set_estop_gate(EstopGate::new(req_estop, app_estop).with_stops(stops.clone()));
+        bus.with(|s| s.push_all_feedback());
+        drv.read_joint_states().unwrap();
+        drv.set_torque(true).unwrap();
+        assert_eq!(drv.enable_state(), EnableState::Enabled);
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 0);
+
+        // (1) Client Stop fires inside `begin_client_park_disable`'s RX drain RIGHT BEFORE motor 0 TX:
+        //     Step 3/Step 5 inside `send(TxKind::ClientParkFirstDisable)` inhibits motor 0 -> 0 frames sent,
+        //     driver stays Enabled with no torque transition mutation.
+        fire_rx.store(true, Ordering::SeqCst);
+        let err = drv.begin_client_park_disable(None, Some(0)).unwrap_err();
+        assert!(armd::driver::is_estop_inhibited(&err), "expected EstopInhibited, got {err:?}");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 0, "zero disable frames may transmit when Stop races motor 0");
+        assert_eq!(drv.enable_state(), EnableState::Enabled);
+        assert!(!drv.torque_transition_pending());
+
+        // (2) Stop generation already applied (`pending() == false`), but caller passes stale `expected_stop_gen`:
+        //     Step 5 `current_stop_stamp() != expected_stamp` still refuses motor 0 -> 0 frames sent.
+        let sg = stops.current();
+        assert_eq!(sg, 1);
+        stops.mark_applied(sg);
+        let err2 = drv.begin_client_park_disable(Some(0), Some(0)).unwrap_err();
+        assert!(armd::driver::is_estop_inhibited(&err2), "stale stop_gen must be refused: {err2:?}");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 0);
+        assert_eq!(drv.enable_state(), EnableState::Enabled);
+
+        // (3) Once motor 0's disable frame transmits, a client Stop arriving BEFORE motor 1 must NOT
+        //     leave the bus half-disabled: motor 1 sends unconditional `TxKind::Disable`.
+        fire_tx.store(true, Ordering::SeqCst);
+        drv.begin_client_park_disable(Some(0), Some(sg)).expect("motor 0 passed gate; motor 1 completes disable");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 2, "both motors must receive disable once motor 0 transmits");
+
+        // (4) Watchdog park (`begin_torque_budgeted(false, 0)`) ignores pending client Stop and disables all motors.
+        let sg2 = stops.current();
+        assert!(sg2 > sg && stops.pending());
+        stops.mark_applied(sg2);
+        drv.set_torque(false).unwrap();
+        drv.set_torque(true).unwrap();
+        let _ = stops.request();
+        assert!(stops.pending());
+        disable_tx.store(0, Ordering::SeqCst);
+        drv.begin_torque_budgeted(false, 0).expect("watchdog disable must ignore client Stop");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 2);
+    }
+
+    // 10b. End-to-end `SupervisorInner::begin_park_disable_transition`: client Stop fires inside the
+    //      driver lock AFTER supervisor's outer check passed and RIGHT BEFORE motor 0's `can.transmit`
+    //      -> zero disable frames transmitted, torque stays ON, !disable_pending, park cancelled STOPPED.
+    {
+        let clock = armd::transport::MockClock::new();
+        let bus = FakeBus::with_clock(&limits, clock);
+        let stops = StopRequests::default();
+        let fire_rx = Arc::new(AtomicBool::new(false));
+        let fire_tx = Arc::new(AtomicBool::new(false));
+        let disable_tx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let can = RaceStopCan {
+            inner: bus.clone(),
+            nonblocking_rt: false, // exercises `begin_client_park_disable(None, ...)` RX drain right before motor 0 TX
+            fire_stop_on_receive: fire_rx.clone(),
+            fire_stop_on_first_disable_tx: fire_tx,
+            stops: stops.clone(),
+            disable_tx_count: disable_tx.clone(),
+        };
+        let drv = DamiaoArmDriver::new(can, vec![1, 2]).with_joint_limits(limits).unwrap();
+        let mut inner = SupervisorInner::new(parkable_2dof_config()).with_driver(Box::new(drv));
+        inner.attach_stop_requests(stops.clone());
+        bus.with(|s| s.push_all_feedback());
+        let stamp = inner.current_admission_stamp();
+        SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+        inner.tick(0.01);
+
+        let snap = MotionPlanSnapshot::from_supervisor(&inner);
+        let park = req::prepare_motion(&snap, &MotionRequest::park()).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let ep = inner.safety.epoch_id();
+        req::install_park(&mut inner, stamp, &park.slot, None, Some(ep), false).unwrap();
+
+        // Advance until trajectory finishes and settle is one tick away from disable, then arm the
+        // pre-motor-0 client Stop race inside `can.receive()`!
+        for _ in 0..220 {
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.01);
+            if inner.unload_settle.as_ref().is_some_and(|u| u.held_s >= 0.45) {
+                fire_rx.store(true, Ordering::SeqCst);
+            }
+            if !inner.pending_normal_unload {
+                break;
+            }
+        }
+        assert!(!fire_rx.load(Ordering::SeqCst), "pre-motor-0 Stop race must have fired during park disable");
+        assert_eq!(disable_tx.load(Ordering::SeqCst), 0, "zero disable frames transmitted on racing client Stop");
+        assert!(inner.is_torqued && !inner.disable_pending, "torque must remain held and disable_pending false");
+        assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("STOPPED"));
+        assert_ne!(inner.safety.fault_code(), Some(FaultCode::DriverWriteFailed));
+    }
+}
