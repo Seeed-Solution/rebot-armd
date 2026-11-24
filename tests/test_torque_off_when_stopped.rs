@@ -1799,3 +1799,734 @@ async fn real_sigterm_to_armd_subprocess_refuses_while_raised_and_exits_once_dis
 
     run_sigterm_for_owner("legacy").await;
 }
+
+/// Comprehensive choke-point matrix over every disable entry point and retry path
+/// (legacy handshake resend, RT poll retry, periodic retry, pre-stop-started request,
+/// rollback with Unknown prior state, Feetech reset/disable, SimArmDriver, and protective
+/// reasons) × {AtRest, Raised, Stale}, asserting directly on the bus / transport trace.
+#[test]
+fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
+    use armd::driver::{
+        DisableKind, DisableProtectiveReason, FeetechArmDriver, StoppedDisableGate,
+    };
+    use armd::protocol::feetech::{calculate_checksum, INST_WRITE, REG_TORQUE_ENABLE};
+    use armd::sim_driver::{SimArmDriver, SimCommand, SimState};
+    use armd::transport::MockTransport;
+    use std::net::{SocketAddr, UdpSocket};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PoseCase {
+        AtRest,
+        Raised,
+        Stale,
+    }
+
+    const ALL_POSES: [PoseCase; 3] = [PoseCase::AtRest, PoseCase::Raised, PoseCase::Stale];
+
+    fn count_damiao_disables(bus: &FakeBus) -> usize {
+        bus.tx_log()
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE)
+            .count()
+    }
+
+    fn count_feetech_torque_off_writes(tx: &[u8]) -> usize {
+        // Feetech WRITE packet to REG_TORQUE_ENABLE (0x28) with value 0:
+        // [0xFF, 0xFF, id, 0x04, INST_WRITE (0x03), REG_TORQUE_ENABLE (0x28), 0x00, cs]
+        tx.windows(8)
+            .filter(|w| {
+                w[0] == 0xFF
+                    && w[1] == 0xFF
+                    && w[3] == 0x04
+                    && w[4] == INST_WRITE
+                    && w[5] == REG_TORQUE_ENABLE
+                    && w[6] == 0x00
+            })
+            .count()
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. Legacy handshake resend (`DamiaoArmDriver::poll_disable`) × {AtRest, Raised, Stale}
+    // -------------------------------------------------------------------------
+    for pose in ALL_POSES {
+        let (mut inner, bus, clock) = make_driver_rig();
+        inner.set_torque(true).unwrap();
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+        // Start a DisableRequested handshake at rest while motor 2 stays silent (never replies
+        // state-0), so DamiaoTorque::Disable stays pending waiting for the 25 ms retry.
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        bus.with(|s| {
+            s.motors[1].torque_reply_delay = Duration::from_secs(10);
+            s.tx_log.clear();
+        });
+        let started_at = {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let t0 = drv.clock_now();
+            let p = drv
+                .begin_disable_torque(DisableKind::DisableRequested { started_at: t0 })
+                .expect("initial disable at rest must start");
+            assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+            t0
+        };
+        assert_eq!(count_damiao_disables(&bus), 7, "initial send emits 7 disable frames");
+
+        // Clear bus trace before the 25 ms handshake resend, then set pose case.
+        // Restore motor 2 `enabled = true` to simulate a lost disable frame on the wire so the
+        // motor is still physically energized (0x1) and `poll_torque` must issue a retry.
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[1].enabled = true;
+        });
+        match pose {
+            PoseCase::AtRest => {
+                clock.advance(Duration::from_millis(30));
+                bus.with(|s| s.push_all_feedback());
+            }
+            PoseCase::Raised => {
+                clock.advance(Duration::from_millis(30));
+                bus.with(|s| {
+                    s.motors[1].q = 0.40;
+                    s.push_all_feedback();
+                });
+            }
+            PoseCase::Stale => {
+                // Past 100 ms feedback bound, still within 150 ms confirm window -> hits 25 ms retry.
+                clock.advance(Duration::from_millis(110));
+            }
+        }
+        let poll_res = {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let dl = drv.clock_now() + Duration::from_millis(5);
+            drv.poll_torque(dl)
+        };
+        let disables = count_damiao_disables(&bus);
+        match pose {
+            PoseCase::AtRest => {
+                assert!(poll_res.is_ok(), "legacy handshake resend at rest failed: {poll_res:?}");
+                assert!(disables > 0, "legacy handshake resend at rest must transmit retry disable");
+            }
+            PoseCase::Raised | PoseCase::Stale => {
+                assert!(
+                    matches!(poll_res, Err(armd::driver::ArmDriverError::TorqueOffWouldDrop)),
+                    "legacy handshake resend ({pose:?}) must refuse with TorqueOffWouldDrop, got {poll_res:?}"
+                );
+                assert_eq!(
+                    disables, 0,
+                    "legacy handshake resend ({pose:?}) must transmit ZERO disable frames"
+                );
+            }
+        }
+        let _ = started_at;
+    }
+
+    // Also verify legacy handshake resend past 1 s total request lifetime sends 0 frames even at rest.
+    {
+        let (mut inner, bus, clock) = make_driver_rig();
+        inner.set_torque(true).unwrap();
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        let t_req = clock.now();
+        // Start the handshake at t+985 ms (still < 1 s), then poll retry at t+1015 ms (> 1 s).
+        clock.advance(Duration::from_millis(950));
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+        clock.advance(Duration::from_millis(35));
+        bus.with(|s| {
+            s.motors[1].torque_reply_delay = Duration::from_secs(10);
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let p = drv
+                .begin_disable_torque(DisableKind::DisableRequested { started_at: t_req })
+                .expect("disable started within 1 s must start");
+            assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+        }
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[1].enabled = true;
+        });
+        clock.advance(Duration::from_millis(30)); // now t_req + 1015 ms, feedback is fresh (30 ms)!
+        bus.with(|s| s.push_all_feedback());
+        let res = {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let dl = drv.clock_now() + Duration::from_millis(5);
+            drv.poll_torque(dl)
+        };
+        assert!(
+            matches!(res, Err(armd::driver::ArmDriverError::DisableRequestExpired)),
+            "legacy handshake resend past 1 s must return DisableRequestExpired, got {res:?}"
+        );
+        assert_eq!(count_damiao_disables(&bus), 0, "0 disable frames after 1 s lifetime");
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. RT poll retry (`service_torque_transition`) × {AtRest, Raised, Stale}
+    // -------------------------------------------------------------------------
+    for pose in ALL_POSES {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
+        r.step();
+        r.bus.with(|s| {
+            s.motors[2].torque_reply_delay = Duration::from_secs(10);
+            s.push_all_feedback();
+        });
+        r.submit_transition(TransitionOp::TorqueOff);
+        let first = r.step();
+        assert!(first.command.unwrap().1.is_ok(), "{first:?}");
+        assert!(r.fx.core.torque_transition_pending());
+
+        r.bus.with(|s| {
+            s.tx_log.clear();
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[2].enabled = true;
+        });
+        match pose {
+            PoseCase::AtRest => {
+                r.clock.advance(Duration::from_millis(30));
+                r.bus.with(|s| s.push_all_feedback());
+            }
+            PoseCase::Raised => {
+                r.clock.advance(Duration::from_millis(30));
+                r.bus.with(|s| {
+                    s.motors[1].q = 0.40;
+                    s.push_all_feedback();
+                });
+            }
+            PoseCase::Stale => {
+                r.clock.advance(Duration::from_millis(110));
+            }
+        }
+        let rep = r.step();
+        let disables = count_damiao_disables(&r.bus);
+        match pose {
+            PoseCase::AtRest => {
+                assert!(disables > 0, "RT poll retry at rest must transmit disable retry frame");
+            }
+            PoseCase::Raised | PoseCase::Stale => {
+                assert_eq!(
+                    rep.transition_ended.map(|(_, o)| o),
+                    Some(Outcome::Failed("TORQUE_OFF_WOULD_DROP")),
+                    "RT poll retry ({pose:?}) must fail with TORQUE_OFF_WOULD_DROP"
+                );
+                assert!(!r.fx.core.disable_pending);
+                assert_eq!(
+                    disables, 0,
+                    "RT poll retry ({pose:?}) must transmit ZERO disable frames"
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Periodic retry & request-started-before-stop × {AtRest, Raised, Stale}
+    // -------------------------------------------------------------------------
+    for started_before_stop in [false, true] {
+        for pose in ALL_POSES {
+            let (mut inner, bus, clock) = make_driver_rig();
+            inner.set_torque(true).unwrap();
+            bus.with(|s| {
+                s.follow_commands = false;
+                s.rx.clear();
+                s.pending.clear();
+                s.push_all_feedback();
+            });
+            inner.tick(0.02);
+
+            if !started_before_stop {
+                inner.apply_stop_policy(StopPolicy::EStopLatch);
+            }
+            bus.with(|s| {
+                s.tx_error = true;
+                s.rx.clear();
+                s.pending.clear();
+                s.push_all_feedback();
+            });
+            assert!(inner.set_torque(false).is_err());
+            assert!(inner.disable_pending);
+
+            if started_before_stop {
+                inner.apply_stop_policy(StopPolicy::EStopLatch);
+            }
+            bus.with(|s| {
+                s.tx_error = false;
+                s.tx_log.clear();
+                s.rx.clear();
+                s.pending.clear();
+            });
+            inner.last_disable_attempt = Some(Instant::now() - Duration::from_millis(300));
+            match pose {
+                PoseCase::AtRest => {
+                    clock.advance(Duration::from_millis(30));
+                    bus.with(|s| s.push_all_feedback());
+                }
+                PoseCase::Raised => {
+                    clock.advance(Duration::from_millis(30));
+                    bus.with(|s| {
+                        s.motors[1].q = 0.40;
+                        s.push_all_feedback();
+                    });
+                }
+                PoseCase::Stale => {
+                    clock.advance(Duration::from_millis(110));
+                }
+            }
+            inner.tick(0.02);
+            let disables = count_damiao_disables(&bus);
+            match pose {
+                PoseCase::AtRest => {
+                    assert!(
+                        disables > 0,
+                        "periodic retry (pre_stop={started_before_stop}) at rest must transmit disable"
+                    );
+                    assert!(!inner.disable_pending);
+                }
+                PoseCase::Raised | PoseCase::Stale => {
+                    assert_eq!(
+                        disables, 0,
+                        "periodic retry (pre_stop={started_before_stop}, {pose:?}) must send ZERO disable frames"
+                    );
+                    assert!(!inner.disable_pending);
+                    assert!(inner.is_torqued);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Enable rollback with Unknown prior state vs EnableRollbackProven × {AtRest, Raised, Stale}
+    // -------------------------------------------------------------------------
+    for proven_prior_off in [false, true] {
+        for pose in ALL_POSES {
+            let clock = MockClock::new();
+            let bus = FakeBus::with_clock(&limits(), clock.clone());
+            let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(limits())
+                .unwrap();
+            // Establish initial empty-queue bound.
+            d.read_joint_states().unwrap();
+            d.check_mapping_ranges();
+            let mut inner = SupervisorInner::new(ArmConfig {
+                lease_timeout_ms: 600_000,
+                ..ArmConfig::rebot_dm()
+            })
+            .with_driver(Box::new(d));
+            inner.lease_enabled = false;
+
+            // Set arm pose and prior enable provenance:
+            // - proven_prior_off = true: all 7 motors freshly report state 0 -> EnableState::Disabled
+            //   (was_torqued=false, prior_proven_off=true -> rollback uses EnableRollbackProven).
+            // - proven_prior_off = false: J1..J6 freshly report non-0x0/non-0xD/non-0x1 status 0x8
+            //   and J7 is silent -> EnableState::Unknown with has_any_joint_enabled()==false
+            //   (was_torqued=false, prior_proven_off=false -> rollback uses DisableRequested).
+            let target_q = if pose == PoseCase::Raised { 0.40 } else { 0.0 };
+            bus.with(|s| {
+                s.follow_commands = false;
+                s.rx.clear();
+                s.pending.clear();
+                for m in &mut s.motors {
+                    m.enabled = false;
+                    m.state_override = if proven_prior_off { None } else { Some(0x8) };
+                    m.q = target_q;
+                }
+                if proven_prior_off {
+                    s.push_all_feedback();
+                } else {
+                    for j in 0..6 {
+                        s.push_feedback(j);
+                    }
+                }
+            });
+            {
+                let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                drv.read_joint_states().unwrap();
+                let st = drv.enable_state();
+                if proven_prior_off {
+                    assert_eq!(st, EnableState::Disabled);
+                } else {
+                    assert_eq!(st, EnableState::Unknown);
+                }
+            }
+
+            // Now fail the enable handshake on motor 4 (CAN ID 4) so `enable_failed` triggers rollback!
+            // For Stale: keep feedback fresh at `enable_prepare` (so `prior_proven_off` is captured
+            // accurately), then advance clock by 40 ms per TX across motors 1..3 with `tx_lost=true`
+            // so feedback is genuinely > 100 ms stale by the time rollback runs.
+            if pose == PoseCase::Stale {
+                bus.with(|s| {
+                    s.rx.clear();
+                    s.pending.clear();
+                    s.fail_tx_ids = vec![4];
+                    s.tx_lost = true;
+                    s.tx_step = Duration::from_millis(40);
+                });
+            } else {
+                bus.with(|s| {
+                    s.fail_tx_ids = vec![4];
+                });
+            }
+            bus.clear_log();
+            let err = inner.set_torque(true).unwrap_err();
+            assert!(
+                matches!(err, SafetyError::ClearFaultRejected(_)),
+                "expected enable failure, got {err:?}"
+            );
+            assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
+            // Clear fail_tx_ids so we inspect what rollback transmitted on the bus.
+            let disables = count_damiao_disables(&bus);
+            if proven_prior_off {
+                assert!(
+                    disables > 0,
+                    "EnableRollbackProven ({pose:?}) must send disable frames"
+                );
+            } else {
+                match pose {
+                    PoseCase::AtRest => {
+                        assert!(
+                            disables > 0,
+                            "Unknown-prior rollback at rest must send disable frames"
+                        );
+                    }
+                    PoseCase::Raised | PoseCase::Stale => {
+                        assert_eq!(
+                            disables, 0,
+                            "Unknown-prior rollback ({pose:?}) must transmit ZERO disable frames"
+                        );
+                        assert!(inner.is_torqued);
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Feetech reset (`clear_fault`) & `disable_torque` × {AtRest, Raised, Stale}
+    // -------------------------------------------------------------------------
+    for pose in ALL_POSES {
+        let clock = MockClock::new();
+        let mock = MockTransport::new_preserving().with_clock(clock.clone());
+        let servo_ids: Vec<u8> = (1..=6).collect();
+        let mut drv = FeetechArmDriver::new(mock, servo_ids.clone())
+            .with_calibrated(true)
+            .with_tx_echo(Some(false))
+            .with_gripper_index(Some(5));
+
+        let safety_stopped = Arc::new(AtomicBool::new(true));
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for i in 0..5 {
+            arm_joints[i] = i;
+        }
+        drv.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: Arc::clone(&safety_stopped),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 5,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+
+        // Push fresh feedback with servo 2 reporting overload error (0x20) at target pose:
+        // 2048 steps = 0.0 rad (rest), 2400 steps ≈ +0.54 rad (raised).
+        let pos_steps: u16 = if pose == PoseCase::Raised { 2400 } else { 2048 };
+        let pos_le = pos_steps.to_le_bytes();
+        let mut rx_fb = Vec::new();
+        for &id in &servo_ids {
+            let err_byte = if id == 2 { 0x20 } else { 0x00 };
+            let params = [pos_le[0], pos_le[1], 0, 0, 0, 0, 70, 35];
+            let cs = calculate_checksum(id, 10, err_byte, &params);
+            rx_fb.extend_from_slice(&[0xFF, 0xFF, id, 10, err_byte]);
+            rx_fb.extend_from_slice(&params);
+            rx_fb.push(cs);
+        }
+        // Feetech read_joint_states loops over both 3-servo chunks in one call.
+        drv.transport_mut().provide_rx(&rx_fb);
+        drv.read_joint_states().unwrap();
+        let _ = drv.transport_mut().take_tx();
+
+        if pose == PoseCase::Stale {
+            clock.advance(Duration::from_millis(120));
+        }
+
+        // 5a. Feetech `clear_fault()` hardware reset (routes through DisableRequested choke point).
+        let mut rx_rb = Vec::new();
+        for &id in &servo_ids {
+            let cs = calculate_checksum(id, 3, 0x00, &[0]);
+            rx_rb.extend_from_slice(&[0xFF, 0xFF, id, 3, 0x00, 0, cs]);
+        }
+        drv.transport_mut().provide_rx(&rx_rb);
+        let cf_res = drv.clear_fault();
+        let cf_tx = drv.transport_mut().take_tx();
+        let cf_disables = count_feetech_torque_off_writes(&cf_tx);
+        match pose {
+            PoseCase::AtRest => {
+                assert!(cf_res.is_ok(), "Feetech clear_fault at rest failed: {cf_res:?}");
+                assert_eq!(cf_disables, 1, "Feetech clear_fault at rest disables faulted servo 2");
+            }
+            PoseCase::Raised | PoseCase::Stale => {
+                assert!(
+                    matches!(cf_res, Err(armd::driver::ArmDriverError::TorqueOffWouldDrop)),
+                    "Feetech clear_fault ({pose:?}) must refuse with TorqueOffWouldDrop, got {cf_res:?}"
+                );
+                assert_eq!(
+                    cf_disables, 0,
+                    "Feetech clear_fault ({pose:?}) must write ZERO TORQUE_ENABLE=0 packets"
+                );
+            }
+        }
+
+        // 5b. Feetech `disable_torque(DisableRequested)` vs `DisableProtective`.
+        drv.transport_mut().provide_rx(&rx_rb);
+        let req_res = drv.disable_torque(DisableKind::DisableRequested {
+            started_at: drv.clock_now(),
+        });
+        let req_tx = drv.transport_mut().take_tx();
+        let req_disables = count_feetech_torque_off_writes(&req_tx);
+        match pose {
+            PoseCase::AtRest => {
+                assert!(req_res.is_ok(), "Feetech DisableRequested at rest failed: {req_res:?}");
+                assert_eq!(req_disables, 6);
+            }
+            PoseCase::Raised | PoseCase::Stale => {
+                assert!(
+                    matches!(req_res, Err(armd::driver::ArmDriverError::TorqueOffWouldDrop)),
+                    "Feetech DisableRequested ({pose:?}) must refuse, got {req_res:?}"
+                );
+                assert_eq!(req_disables, 0, "Feetech DisableRequested ({pose:?}) must send 0 packets");
+            }
+        }
+
+        // Protective reasons bypass Rule A′ on Feetech in all poses.
+        for reason in [
+            DisableProtectiveReason::Thermal,
+            DisableProtectiveReason::ProcessExit,
+            DisableProtectiveReason::EnableRollbackProven,
+        ] {
+            drv.transport_mut().provide_rx(&rx_rb);
+            drv.disable_torque(DisableKind::DisableProtective { reason })
+                .unwrap();
+            let prot_tx = drv.transport_mut().take_tx();
+            assert_eq!(
+                count_feetech_torque_off_writes(&prot_tx),
+                6,
+                "Feetech DisableProtective({reason:?}) ({pose:?}) must send disable to all servos"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. SimArmDriver (`DisableRequested` vs `DisableProtective`) × {AtRest, Raised, Stale}
+    // -------------------------------------------------------------------------
+    for pose in ALL_POSES {
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr: SocketAddr = udp.local_addr().unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+
+        let target_q = if pose == PoseCase::Raised {
+            vec![0.0, 0.40, 0.0, 0.0, 0.0, 0.0, 0.0]
+        } else {
+            vec![0.0; 7]
+        };
+        let disable_cmds = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let send_state = Arc::new(AtomicBool::new(true));
+        let stop_peer = Arc::new(AtomicBool::new(false));
+        let peer_thread = {
+            let disable_cmds = Arc::clone(&disable_cmds);
+            let send_state = Arc::clone(&send_state);
+            let stop_peer = Arc::clone(&stop_peer);
+            let target_q = target_q.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut seq = 0u64;
+                let mut ack = 0u64;
+                let mut enabled = true;
+                let mut client: Option<SocketAddr> = None;
+                let mut last_tx = Instant::now() - Duration::from_secs(1);
+                while !stop_peer.load(Ordering::Relaxed) {
+                    if let Ok((n, src)) = udp.recv_from(&mut buf) {
+                        client = Some(src);
+                        if let Ok(cmd) = serde_json::from_slice::<SimCommand>(&buf[..n]) {
+                            if cmd.kind == "cmd" {
+                                ack = ack.max(cmd.seq);
+                                if cmd.enable == Some(false) {
+                                    disable_cmds.lock().unwrap().push(cmd.seq);
+                                    enabled = false;
+                                } else if cmd.enable == Some(true) {
+                                    enabled = true;
+                                }
+                            }
+                        }
+                    }
+                    if send_state.load(Ordering::Relaxed) && last_tx.elapsed() >= Duration::from_millis(5) {
+                        if let Some(dst) = client {
+                            seq += 1;
+                            let reply = SimState {
+                                v: 1,
+                                kind: "state".into(),
+                                session: 1,
+                                seq,
+                                ack,
+                                enabled,
+                                q: target_q.clone(),
+                                dq: vec![0.0; 7],
+                                tau: vec![0.0; 7],
+                                temp: vec![30.0; 7],
+                                loads: None,
+                                t: 0.0,
+                            };
+                            let bytes = serde_json::to_vec(&reply).unwrap();
+                            let _ = udp.send_to(&bytes, dst);
+                            last_tx = Instant::now();
+                        }
+                    }
+                }
+            })
+        };
+
+        let mut sim = SimArmDriver::connect(&peer_addr.to_string(), 7).unwrap();
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        for i in 0..6 {
+            arm_joints[i] = i;
+        }
+        sim.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(true)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 6,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+
+        // Wait for fresh feedback packet from peer.
+        let mut got_fb = false;
+        for _ in 0..100 {
+            let _ = sim.read_joint_states();
+            if sim.is_feedback_valid() {
+                got_fb = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_fb, "sim peer did not deliver initial feedback");
+
+        if pose == PoseCase::Stale {
+            send_state.store(false, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        disable_cmds.lock().unwrap().clear();
+
+        let req_res = sim.begin_disable_torque(DisableKind::DisableRequested {
+            started_at: Instant::now(),
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        let req_count = disable_cmds.lock().unwrap().len();
+        match pose {
+            PoseCase::AtRest => {
+                assert!(req_res.is_ok(), "Sim DisableRequested at rest failed: {req_res:?}");
+                assert_eq!(req_count, 1, "Sim DisableRequested at rest must transmit enable=false");
+            }
+            PoseCase::Raised | PoseCase::Stale => {
+                assert!(
+                    matches!(req_res, Err(armd::driver::ArmDriverError::TorqueOffWouldDrop)),
+                    "Sim DisableRequested ({pose:?}) must refuse with TorqueOffWouldDrop, got {req_res:?}"
+                );
+                assert_eq!(
+                    req_count, 0,
+                    "Sim DisableRequested ({pose:?}) must transmit ZERO UDP disable commands"
+                );
+            }
+        }
+
+        // Protective reasons bypass Rule A′ on SimArmDriver across all poses.
+        for reason in [
+            DisableProtectiveReason::Thermal,
+            DisableProtectiveReason::ProcessExit,
+            DisableProtectiveReason::EnableRollbackProven,
+        ] {
+            disable_cmds.lock().unwrap().clear();
+            sim.begin_disable_torque(DisableKind::DisableProtective { reason })
+                .unwrap();
+            let mut seen = false;
+            for _ in 0..40 {
+                if !disable_cmds.lock().unwrap().is_empty() {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                seen,
+                "Sim DisableProtective({reason:?}) ({pose:?}) must transmit UDP disable command"
+            );
+        }
+
+        stop_peer.store(true, Ordering::Relaxed);
+        let _ = peer_thread.join();
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Protective reasons (`Thermal`, `ProcessExit`, `EnableRollbackProven`) on Damiao × {AtRest, Raised, Stale}
+    // -------------------------------------------------------------------------
+    for reason in [
+        DisableProtectiveReason::Thermal,
+        DisableProtectiveReason::ProcessExit,
+        DisableProtectiveReason::EnableRollbackProven,
+    ] {
+        for pose in ALL_POSES {
+            let (mut inner, bus, clock) = make_driver_rig();
+            inner.set_torque(true).unwrap();
+            inner.apply_stop_policy(StopPolicy::EStopLatch);
+            bus.with(|s| {
+                s.follow_commands = false;
+                s.rx.clear();
+                s.pending.clear();
+                if pose == PoseCase::Raised {
+                    s.motors[1].q = 0.50;
+                }
+                s.push_all_feedback();
+            });
+            inner.tick(0.02);
+            if pose == PoseCase::Stale {
+                clock.advance(Duration::from_millis(120));
+            }
+            bus.clear_log();
+            {
+                let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+                drv.begin_disable_torque(DisableKind::DisableProtective { reason })
+                    .unwrap();
+            }
+            assert_eq!(
+                count_damiao_disables(&bus),
+                7,
+                "Damiao DisableProtective({reason:?}) ({pose:?}) must transmit all 7 disable frames"
+            );
+        }
+    }
+}

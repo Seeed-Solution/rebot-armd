@@ -3197,6 +3197,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// gravity-compensation recovery frames from live measured position without replaying bytes).
     last_mit_params: Vec<Option<(f32, f32, f32)>>,
     last_feedback_instant: Vec<Option<Instant>>,
+    /// Most recent decoded feedback instant per joint, preserved across `send_enable()` (which
+    /// clears `last_feedback_instant` to gate post-enable state-1 confirmation) and cleared on
+    /// `awaiting_rx_boundary` reset so Rule A′ send-time pose checks during enable rollback still
+    /// observe provably fresh (`<= 100 ms`) pre-enable pose telemetry while `motor_freshly_physically_off`
+    /// keeps requiring post-enable `last_feedback_instant`.
+    pose_feedback_instant: Vec<Option<Instant>>,
     feedback_seq: Vec<u64>,
     /// Instant taken before the last receive call that found the RX queue empty.
     rx_empty_instant: Option<Instant>,
@@ -3679,6 +3685,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_target_frames: vec![None; dof],
             last_mit_params: vec![None; dof],
             last_feedback_instant: vec![None; dof],
+            pose_feedback_instant: vec![None; dof],
             feedback_seq: vec![0; dof],
             rx_empty_instant: None,
             feedback_queue_bound: vec![None; dof],
@@ -3944,6 +3951,46 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 .is_some_and(|st| st == 0 || st == 0xD)
     }
 
+    /// Zero-allocation fresh pose reader for send-time Rule A′ evaluation: requires both
+    /// `pose_feedback_instant` (preserved across `send_enable`, cleared on RX boundary reset)
+    /// and `feedback_queue_bound` to be within `max_age`, plus valid finite joint states.
+    fn fresh_pose_positions_into(
+        &self,
+        joints: &[usize],
+        max_age: Duration,
+        out: &mut [f32],
+    ) -> bool {
+        if joints.is_empty() || out.len() < joints.len() {
+            return false;
+        }
+        let caps = self.capabilities();
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let fresh = self
+                .pose_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| self.since(t) <= max_age)
+                && self
+                    .feedback_queue_bound
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|b| self.since(b) <= max_age);
+            if !fresh {
+                return false;
+            }
+            let Some(s) = self.cached_states.get(i) else {
+                return false;
+            };
+            if !joint_state_valid(s, caps) {
+                return false;
+            }
+            *slot = s.position;
+        }
+        true
+    }
+
     /// Evaluates Rule A′ and the single 1 s request lifetime at send time for `DisableRequested`
     /// while the safety state is stopped (Fault or E-stop). Zero heap allocations.
     fn check_stopped_disable_requested(
@@ -3968,7 +4015,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         };
         let arm_joints = gate.arm_joint_indices();
         let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        if !self.fresh_joint_positions_into(
+        if !self.fresh_pose_positions_into(
             arm_joints,
             STOPPED_DISABLE_FEEDBACK_MAX_AGE,
             &mut arm_positions[..arm_joints.len()],
@@ -8499,6 +8546,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     temperature: feedback.t_mos.max(feedback.t_rotor),
                 };
                 self.last_feedback_instant[idx] = Some(rx_at);
+                self.pose_feedback_instant[idx] = Some(rx_at);
                 self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                 self.feedback_queue_bound[idx] = queue_bound;
                 self.last_feedback_seq[idx] = seq;
@@ -8550,6 +8598,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.awaiting_rx_boundary {
             self.awaiting_rx_boundary = false;
             self.last_feedback_instant.fill(None);
+            self.pose_feedback_instant.fill(None);
             self.pf_last_fresh_feedback = None;
             self.last_enable_command = Some(self.now());
             self.last_enable_command_rx_seq = Some(self.rx_seq);
