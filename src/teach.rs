@@ -294,7 +294,11 @@ impl ArmSupervisor {
 
     /// Set the episode directory (`None`: storage off); the catalog loads on first use.
     pub async fn set_episodes_dir(&self, dir: Option<PathBuf>) {
-        self.inner().write().await.episodes = crate::recording::EpisodeStore::new(dir);
+        let mut inner = self.inner().write().await;
+        if !inner.detached {
+            inner.episodes = crate::recording::EpisodeStore::new(dir);
+            inner.refresh_schema_cache();
+        }
     }
 
     pub async fn episode_store(&self) -> crate::recording::EpisodeStore {

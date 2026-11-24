@@ -346,7 +346,10 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
                         axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>,
                         axum::Extension(sandbox): axum::Extension<Arc<crate::api::sandbox::SandboxState>>,
                         axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>) -> axum::response::Response {
-    let control_hz = supervisor.control_frequency_hz().max(1);
+    let control_hz = match supervisor.control_frequency_hz_checked().await {
+        Ok(hz) => hz.max(1),
+        Err(err) => return ApiError::from(err).into_response(),
+    };
     let obs_rate = match query.get("obs_hz") {
         None => None,
         Some(v) => match v.trim().parse::<u64>() {
@@ -2372,25 +2375,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 Some(mut reply) = ack_rx.recv() => {
-                    let stamped_from_legacy = if recv_supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
-                        let inner = recv_supervisor.inner().read().await;
-                        if !inner.detached {
-                            reply["epoch_id"] = json!(inner.safety.epoch_id());
-                            reply["safety_state"] = json!(inner.safety.state());
-                            reply["is_torqued"] = json!(inner.is_torqued);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if !stamped_from_legacy {
-                        if let Some(s) = recv_supervisor.hub().latest() {
-                            reply["epoch_id"] = json!(s.obs.epoch_id);
-                            reply["safety_state"] = json!(s.obs.safety_state);
-                            reply["is_torqued"] = json!(s.obs.is_torqued);
-                        }
+                    if let Ok(s) = recv_supervisor.fresh_snapshot(None).await {
+                        reply["epoch_id"] = json!(s.obs.epoch_id);
+                        reply["safety_state"] = json!(s.obs.safety_state);
+                        reply["is_torqued"] = json!(s.obs.is_torqued);
+                    } else if let Some(s) = recv_supervisor.hub().latest() {
+                        reply["epoch_id"] = json!(s.obs.epoch_id);
+                        reply["safety_state"] = json!(s.obs.safety_state);
+                        reply["is_torqued"] = json!(s.obs.is_torqued);
                     }
                     test_ack_stamp_delay().await;
                     if !worker_writer.send_ordinary_control(reply).await { break; }
@@ -2448,11 +2440,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 last_ordinary_request = request_id;
                 let path = value.get("path").and_then(Value::as_str).unwrap_or("");
                 if let Some(error) = auth_req.check_lease_free(&ws_auth, path, &value["body"]) {
-                    let mut reply = rejection(
-                        error,
-                        "command_reject",
-                        recv_supervisor.inner().read().await.safety.epoch_id(),
-                    );
+                    let reject_epoch = recv_supervisor
+                        .fresh_snapshot(None)
+                        .await
+                        .map_or_else(|_| recv_supervisor.estop_epoch(), |s| s.obs.epoch_id);
+                    let mut reply = rejection(error, "command_reject", reject_epoch);
                     reply["request_id"] = value["request_id"].clone();
                     if !worker_writer.send_ordinary_control(reply).await {
                         break;

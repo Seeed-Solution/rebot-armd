@@ -193,6 +193,9 @@ impl SupervisorInner {
         #[cfg(feature = "policy-runtime")]
         { self.calibration_digest = Self::calibration_digest_of(self.calibration.as_ref()); }
         self.refresh_effective_floor();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     /// Recompute `config.workspace.floor_z_m` = max(profile floor, valid calibrated table

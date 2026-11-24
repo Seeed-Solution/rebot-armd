@@ -534,6 +534,7 @@ impl SupervisorInner {
         let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &self.joint_zero_offsets));
         self.apply_driver_limits(driver.as_ref());
         self.driver = Some(std::sync::Mutex::new(driver));
+        self.refresh_schema_cache();
         self
     }
 

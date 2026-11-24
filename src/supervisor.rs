@@ -817,7 +817,15 @@ pub struct SupervisorInner {
     pub lease_timeout: Duration,
     pub lease_enabled: bool,
     pub active_lease: Option<ActiveLease>,
+    /// Numeric WS connection ID (`>= 1`) owning `active_lease`, or `0` for non-WS / none.
+    pub(crate) active_lease_conn_id: u64,
+    /// Highest lease generation fenced by release, expiry, preemption, or disconnect.
+    pub(crate) fenced_lease_generation: u64,
     pub lease_generation_counter: u64,
+    /// Boot identity of the active owner (process boot in legacy, `ExecutorConfig::boot` in RT).
+    pub(crate) boot_id: crate::rt_core::broker::BootId,
+    /// Monotonic revision paired with `StateHub`'s off-thread `ObservationSchema` cache.
+    pub(crate) schema_revision: u64,
     pub gripper_stalled: bool,
     pub gripper_high_torque_ticks: u32,
     pub gripper_low_torque_ticks: u32,
@@ -1605,7 +1613,11 @@ impl SupervisorInner {
             lease_timeout,
             lease_enabled: true,
             active_lease: None,
+            active_lease_conn_id: 0,
+            fenced_lease_generation: 0,
             lease_generation_counter: 0,
+            boot_id: crate::rt_core::broker::BootId::process(),
+            schema_revision: 0,
             gripper_stalled: false,
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
@@ -1761,6 +1773,7 @@ impl SupervisorInner {
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
         };
         inner.prepare_workspace_eval_bufs();
+        inner.refresh_schema_cache();
         inner
     }
 
@@ -2355,6 +2368,111 @@ impl SupervisorInner {
         (self.tick_phases_us, self.tick_phase_mark.take())
     }
 
+    /// Updates `schema_revision` and publishes the matching `ObservationSchema` into `StateHub`'s
+    /// off-thread cache. Called strictly off the RT control thread whenever schema inputs change.
+    pub(crate) fn refresh_schema_cache(&mut self) {
+        self.schema_revision = self.schema_revision.saturating_add(1).max(1);
+        let schema = Arc::new(self.schema());
+        self.core.hub().set_schema_cache(self.schema_revision, schema);
+    }
+
+    /// Zero-allocation, lock-free `Copy` snapshot of owner authority, lease, torque, busy, and
+    /// planning inputs published alongside every observation on `StateHub`.
+    pub(crate) fn owner_state_snapshot(&self, now: Instant) -> crate::rt_core::publish::OwnerStateSnapshot {
+        let active = self.active_lease.as_ref().filter(|a| {
+            a.generation > self.fenced_lease_generation
+                && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
+        });
+        let (lease_generation, lease_owner, lease_owner_conn_id, lease_label, lease_expires_at) =
+            match active {
+                Some(a) => (
+                    a.generation,
+                    Some(crate::model::HolderLabel::new(&a.client_id)),
+                    self.active_lease_conn_id,
+                    Some(crate::model::HolderLabel::new(&a.label)),
+                    Some(a.acquired_at + self.lease_timeout),
+                ),
+                None => (0, None, 0, None, None),
+            };
+        let (last_evicted_owner, last_evicted_generation) = match self.last_evicted.as_ref() {
+            Some((conn, gen)) => (Some(crate::model::HolderLabel::new(conn)), *gen),
+            None => (None, 0),
+        };
+        let mut commanded_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        for (dst, &src) in commanded_positions.iter_mut().zip(self.commanded_positions.iter()).take(dof) {
+            *dst = src;
+        }
+        crate::rt_core::publish::OwnerStateSnapshot {
+            arm: self.core.id(),
+            boot: self.boot_id,
+            control_frequency_hz: self.config.control_frequency_hz.max(1),
+            lease_enabled: self.lease_enabled,
+            lease_generation,
+            lease_owner,
+            lease_owner_conn_id,
+            lease_label,
+            lease_expires_at,
+            last_evicted_owner,
+            last_evicted_generation,
+            fenced_lease_generation: self.fenced_lease_generation,
+            last_preemption: self.last_preemption,
+            epoch: self.safety.epoch_id(),
+            stop_generation: self.current_stop_gen(),
+            config_revision: self.workspace_revision,
+            parent_generation: self
+                .last_action
+                .as_ref()
+                .filter(|a| a.is_running())
+                .map_or(0, |a| a.id),
+            schema_revision: self.schema_revision,
+            is_torqued: self.is_torqued,
+            disable_pending: self.disable_pending,
+            torque_transition_pending: self.torque_transition.is_some() || self.core.transition_pending(),
+            motion_active: self.active_trajectory.is_some(),
+            handover_settling: self.handover_settling_since.is_some(),
+            calibration_busy: self.calibration_busy || self.motor_zero_busy,
+            config_inhibited: self.core.motion_inhibited_by_config(),
+            e_stop_latched: self.e_stop_latched.load(Ordering::SeqCst),
+            operator_auth_enforced: self.operator_auth_enforced,
+            gravity_comp_active: self.gravity_comp.is_some(),
+            safety_stopped: self.safety.state().is_stopped() || self.safety.has_latched_fault(),
+            safety_recoverable: self.safety.recoverable(),
+            dof: dof as u8,
+            commanded_positions,
+            residual_torques: self.residual_torques,
+        }
+    }
+
+    /// Synthesizes a coherent [`Snapshot`](crate::rt_core::publish::Snapshot) under a legacy read
+    /// guard when no control loop is ticking (never called in executor mode).
+    pub(crate) fn synthesize_legacy_snapshot(&self, generation: u64) -> crate::rt_core::publish::Snapshot {
+        let obs = self.current_observation();
+        let control_hz = self.config.control_frequency_hz.max(1);
+        let (sampled_at, valid_until) = self.observation_valid_until(
+            &obs,
+            Duration::from_secs_f64(2.0 / f64::from(control_hz)),
+        );
+        let owner = self.owner_state_snapshot(sampled_at);
+        let rt = crate::rt_core::publish::RtSample {
+            positions: self.measured_positions.clone(),
+            velocities: self.measured_velocities.clone(),
+            feedback_instants: self.core.feedback().instants().to_vec(),
+            feedback_seqs: self.core.feedback().seqs().to_vec(),
+        };
+        crate::rt_core::publish::Snapshot {
+            meta: crate::rt_core::publish::SampleMeta {
+                seq: self.core.published_seq(),
+                generation,
+                sampled_at,
+                valid_until,
+            },
+            obs,
+            owner,
+            rt,
+        }
+    }
+
     /// Publishes an observation filled in place at `timestamp` with lock/release generation
     /// `generation` without re-running `tick_control`.
     pub fn publish_at(&mut self, timestamp: f64, generation: u64, keep: bool) -> TickPublished {
@@ -2367,12 +2485,13 @@ impl SupervisorInner {
         let body_end = self.tick_phase_mark.take();
         let control_hz = self.config.control_frequency_hz;
         let (sampled_at, valid_until) = self.observation_valid_until(&obs, Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1))));
+        let owner = self.owner_state_snapshot(sampled_at);
         let kept = keep.then(|| (*obs).clone());
         if let Some(ref hook) = self.before_publish_hook {
             hook();
         }
         let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
-        core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
+        core.publish(obs, generation, sampled_at, valid_until, owner, measured_positions, measured_velocities);
         TickPublished { kept, body_end }
     }
 
@@ -6856,6 +6975,7 @@ impl ArmSupervisor {
         Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
         guard.safety.drain_retired_state_arcs_off_thread();
         guard.prepare_workspace_eval_bufs();
+        guard.refresh_schema_cache();
 
         let initial_gen = self.inner.generation();
         let shell = SupervisorInner::detached_shell(
@@ -7056,21 +7176,34 @@ impl ArmSupervisor {
     }
 
     async fn fresh(&self, count: bool) -> Result<Fresh<'_>, ArmError> {
+        self.fresh_min_gen(count, None).await
+    }
+
+    async fn fresh_min_gen(&self, count: bool, min_gen: Option<u64>) -> Result<Fresh<'_>, ArmError> {
         use crate::rt_core::publish::Poll;
         let mode = self.owner_mode();
         if mode == OWNER_TRANSFERRING || mode == OWNER_FAILED {
             if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
             return Err(observation_unavailable());
         }
-        let want = if mode == OWNER_EXECUTOR {
+        if mode == OWNER_EXECUTOR && self.executor_handle().is_none_or(|h| h.is_exited()) {
+            if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+            return Err(observation_unavailable());
+        }
+        let base_want = if mode == OWNER_EXECUTOR {
             self.executor_base_gen.load(Ordering::Acquire).saturating_add(1)
         } else {
             self.inner.generation()
         };
+        let want = base_want.max(min_gen.unwrap_or(0));
         let started = Instant::now();
         let bound = self.wait_bound();
         let mut waited = false;
         loop {
+            if mode == OWNER_EXECUTOR && self.executor_handle().is_none_or(|h| h.is_exited()) {
+                if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+                return Err(observation_unavailable());
+            }
             let poll = self.hub.try_latest();
             let now = Instant::now();
             match poll {
@@ -7096,10 +7229,12 @@ impl ArmSupervisor {
         }
         // Executor mode NEVER falls back to reading the detached shell under `self.inner`.
         if self.owner_mode() != OWNER_LEGACY {
-            if let Poll::Ready(Some(s)) = self.hub.try_latest() {
-                if Self::answers(&s, want, Instant::now()) {
-                    if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
-                    return Ok(Fresh::Sample(s));
+            if self.owner_mode() == OWNER_EXECUTOR && self.executor_handle().is_some_and(|h| !h.is_exited()) {
+                if let Poll::Ready(Some(s)) = self.hub.try_latest() {
+                    if Self::answers(&s, want, Instant::now()) {
+                        if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
+                        return Ok(Fresh::Sample(s));
+                    }
                 }
             }
             if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
@@ -7140,6 +7275,67 @@ impl ArmSupervisor {
         }
         if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
         Ok(Fresh::Locked(inner))
+    }
+
+    /// Returns a coherent published [`Snapshot`](crate::rt_core::publish::Snapshot) at least as
+    /// fresh as `min_gen` (in executor mode strictly from `StateHub` with zero `SupervisorLock`
+    /// reads, returning `503 OBSERVATION_UNAVAILABLE` if unavailable/stale/exited; in legacy mode
+    /// from `StateHub` or synthesized under a short read guard when no control loop runs).
+    pub async fn fresh_snapshot(
+        &self,
+        min_gen: Option<u64>,
+    ) -> Result<Arc<crate::rt_core::publish::Snapshot>, ArmError> {
+        match self.fresh_min_gen(false, min_gen).await? {
+            Fresh::Sample(s) => Ok(s),
+            Fresh::Locked(inner) => {
+                let gen = self.inner.generation();
+                Ok(Arc::new(inner.synthesize_legacy_snapshot(gen)))
+            }
+        }
+    }
+
+    /// Coherent control frequency for WS upgrade (`?obs_hz=...`).
+    /// In executor mode, requires a fresh `StateHub` snapshot (`503 OBSERVATION_UNAVAILABLE` if
+    /// unavailable); in legacy mode, serves from `StateHub` or the immutable configured value.
+    pub async fn control_frequency_hz_checked(&self) -> Result<u32, ArmError> {
+        if self.owner_mode() == OWNER_LEGACY {
+            if let Some(s) = self.running_sample() {
+                return Ok(s.owner.control_frequency_hz.max(1));
+            }
+            return Ok(self.control_frequency_hz.max(1));
+        }
+        let snap = self.fresh_snapshot(None).await?;
+        Ok(snap.owner.control_frequency_hz.max(1))
+    }
+
+    /// Coherent observation schema served from `StateHub`'s off-thread cache paired by
+    /// `OwnerStateSnapshot::schema_revision` (returns explicit `503 OBSERVATION_UNAVAILABLE` in
+    /// executor mode when no fresh snapshot or matching cached schema is available).
+    pub async fn schema(&self) -> Result<ObservationSchema, ArmError> {
+        match self.fresh_min_gen(false, None).await? {
+            Fresh::Sample(s) => {
+                if let Some(cached) = self.hub.cached_schema(s.owner.schema_revision) {
+                    return Ok((*cached).clone());
+                }
+                if self.owner_mode() == OWNER_LEGACY {
+                    let inner = self.inner.read().await;
+                    if self.check_legacy_under_guard(&inner).is_ok() {
+                        return Ok(inner.schema());
+                    }
+                }
+                Err(observation_unavailable())
+            }
+            Fresh::Locked(inner) => Ok(inner.schema()),
+        }
+    }
+
+    /// Coherent lease activity check for REST routes (`LEASE_ACTIVE` vs `LEASE_REQUIRED`),
+    /// returning explicit `Err(503 OBSERVATION_UNAVAILABLE)` when no fresh snapshot is available.
+    pub async fn lease_active_checked(&self) -> Result<bool, ArmError> {
+        match self.fresh_min_gen(false, None).await? {
+            Fresh::Sample(s) => Ok(s.owner.is_lease_active_at(Instant::now())),
+            Fresh::Locked(inner) => Ok(inner.is_lease_active()),
+        }
     }
 
     fn running_sample(&self) -> Option<Arc<crate::rt_core::publish::Snapshot>> {
@@ -7187,6 +7383,14 @@ impl ArmSupervisor {
     }
 
     pub async fn get_schema(&self) -> ObservationSchema {
+        if let Ok(schema) = self.schema().await {
+            return schema;
+        }
+        if self.owner_mode() != OWNER_LEGACY {
+            if let Some(cached) = self.hub.latest_cached_schema() {
+                return (*cached).clone();
+            }
+        }
         self.inner.read().await.schema()
     }
 
@@ -7228,6 +7432,7 @@ impl ArmSupervisor {
         }
         inner.apply_driver_limits(drv.as_ref());
         inner.driver = Some(std::sync::Mutex::new(drv));
+        inner.refresh_schema_cache();
         Ok(())
     }
 
@@ -7248,6 +7453,7 @@ impl ArmSupervisor {
                 let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
                 inner.apply_driver_limits(driver.as_ref());
                 inner.driver = Some(std::sync::Mutex::new(driver));
+                inner.refresh_schema_cache();
             }
         }
         self
@@ -7334,7 +7540,7 @@ impl ArmSupervisor {
         let now = Instant::now();
         self.hub
             .latest()
-            .is_some_and(|s| Self::answers(&s, want, now) && s.obs.lease_holder.is_some())
+            .is_some_and(|s| Self::answers(&s, want, now) && s.owner.is_lease_active_at(now))
     }
 
     pub async fn is_lease_active(&self) -> bool {

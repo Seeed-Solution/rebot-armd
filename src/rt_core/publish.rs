@@ -32,9 +32,143 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::model::ArmObservation;
+use crate::model::{ArmObservation, HolderLabel, ObservationSchema};
 
+use super::broker::{Authority, BootId};
+use super::ids::ArmId;
+use super::mailbox::MAX_DOF;
 use super::triple::{triple_buffer, Consumer, Producer};
+
+/// Fixed-size, `Copy` owner state published alongside every observation on [`StateHub`].
+///
+/// Zero heap allocations and zero locks on the RT control thread (`armd-control`); readers
+/// (REST schema/lease checks, WS upgrade/ACK/reject decoration, off-thread request preparation)
+/// project variable-length fields off-thread from this coherent snapshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OwnerStateSnapshot {
+    pub arm: ArmId,
+    pub boot: BootId,
+    pub control_frequency_hz: u32,
+    pub lease_enabled: bool,
+    /// Active unfenced lease generation at `sampled_at`, or `0` when no valid lease is held.
+    pub lease_generation: u64,
+    /// Bounded internal connection handle of the active lease holder (`None` when unheld/expired).
+    pub lease_owner: Option<HolderLabel>,
+    /// Numeric WS connection ID (`>= 1`) of the active lease holder (`0` for non-WS / none).
+    pub lease_owner_conn_id: u64,
+    /// Display label of the active lease holder (`Some("")` preserved for empty legacy labels).
+    pub lease_label: Option<HolderLabel>,
+    /// Monotonic expiry instant of the active lease (`acquired_at + lease_timeout`).
+    pub lease_expires_at: Option<Instant>,
+    /// Internal connection handle of the lease most recently evicted by forced preemption.
+    pub last_evicted_owner: Option<HolderLabel>,
+    /// Generation of the lease most recently evicted by forced preemption (`0` if none).
+    pub last_evicted_generation: u64,
+    /// Highest lease generation fenced by release, expiry, preemption, or disconnect.
+    pub fenced_lease_generation: u64,
+    /// Timestamp of the last forced preemption (for off-thread cooldown visibility).
+    pub last_preemption: Option<Instant>,
+    pub epoch: u64,
+    pub stop_generation: u64,
+    pub config_revision: u64,
+    pub parent_generation: u64,
+    /// Revision pairing this published sample with [`StateHub`]'s off-thread schema cache.
+    pub schema_revision: u64,
+    pub is_torqued: bool,
+    pub disable_pending: bool,
+    pub torque_transition_pending: bool,
+    pub motion_active: bool,
+    pub handover_settling: bool,
+    pub calibration_busy: bool,
+    pub config_inhibited: bool,
+    pub e_stop_latched: bool,
+    pub operator_auth_enforced: bool,
+    pub gravity_comp_active: bool,
+    pub safety_stopped: bool,
+    pub safety_recoverable: bool,
+    pub dof: u8,
+    pub commanded_positions: [f32; MAX_DOF],
+    pub residual_torques: Option<[f32; 6]>,
+}
+
+impl Default for OwnerStateSnapshot {
+    fn default() -> Self {
+        Self {
+            arm: ArmId::LOCAL,
+            boot: BootId(0),
+            control_frequency_hz: 50,
+            lease_enabled: true,
+            lease_generation: 0,
+            lease_owner: None,
+            lease_owner_conn_id: 0,
+            lease_label: None,
+            lease_expires_at: None,
+            last_evicted_owner: None,
+            last_evicted_generation: 0,
+            fenced_lease_generation: 0,
+            last_preemption: None,
+            epoch: 0,
+            stop_generation: 0,
+            config_revision: 0,
+            parent_generation: 0,
+            schema_revision: 0,
+            is_torqued: false,
+            disable_pending: false,
+            torque_transition_pending: false,
+            motion_active: false,
+            handover_settling: false,
+            calibration_busy: false,
+            config_inhibited: false,
+            e_stop_latched: false,
+            operator_auth_enforced: false,
+            gravity_comp_active: false,
+            safety_stopped: false,
+            safety_recoverable: true,
+            dof: 0,
+            commanded_positions: [0.0; MAX_DOF],
+            residual_torques: None,
+        }
+    }
+}
+
+impl OwnerStateSnapshot {
+    /// True iff this snapshot reflects an active, unfenced lease not yet expired at `now`.
+    #[inline]
+    pub fn is_lease_active_at(&self, now: Instant) -> bool {
+        self.lease_generation != 0
+            && self.lease_generation > self.fenced_lease_generation
+            && self.lease_expires_at.is_some_and(|exp| now < exp)
+    }
+
+    /// Why `connection` no longer holds `generation` according to this snapshot.
+    #[inline]
+    pub fn lease_loss_reason(&self, connection: &str, generation: u64) -> &'static str {
+        match self.last_evicted_owner {
+            Some(owner)
+                if owner.as_str() == connection && self.last_evicted_generation == generation =>
+            {
+                "preempted"
+            }
+            _ => "expired",
+        }
+    }
+
+    /// Authority tuple projected from this snapshot at `now`.
+    #[inline]
+    pub fn authority_at(&self, now: Instant) -> Authority {
+        Authority {
+            lease_generation: if self.is_lease_active_at(now) {
+                self.lease_generation
+            } else {
+                0
+            },
+            epoch: self.epoch,
+            stop_generation: self.stop_generation,
+            config_revision: self.config_revision,
+            parent_generation: self.parent_generation,
+        }
+    }
+}
 
 /// Publication stamp of a sample (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,6 +239,7 @@ impl ObservationSpares {
 struct Slot {
     meta: Option<SampleMeta>,
     obs: Option<ArmObservation>,
+    owner: OwnerStateSnapshot,
     /// Preallocated string spares reused across state/fault/action transitions (0 alloc on RT).
     spares: ObservationSpares,
     rt: RtSample,
@@ -115,6 +250,7 @@ struct Slot {
 pub struct Snapshot {
     pub meta: SampleMeta,
     pub obs: ArmObservation,
+    pub owner: OwnerStateSnapshot,
     pub rt: RtSample,
 }
 
@@ -198,10 +334,23 @@ impl StatePublisher {
     /// counts it. Readers copy the slot's observation and never take it, so a reader never
     /// empties the tick's buffer and the tick never waits for one.
     pub fn publish(&mut self, generation: u64, sampled_at: Instant, valid_until: Instant, obs: ArmObservation, rt: RtInputs<'_>) -> Option<ArmObservation> {
+        self.publish_with_owner(generation, sampled_at, valid_until, obs, OwnerStateSnapshot::default(), rt)
+    }
+
+    pub fn publish_with_owner(
+        &mut self,
+        generation: u64,
+        sampled_at: Instant,
+        valid_until: Instant,
+        obs: ArmObservation,
+        owner: OwnerStateSnapshot,
+        rt: RtInputs<'_>,
+    ) -> Option<ArmObservation> {
         self.seq += 1;
         let seq = self.seq;
         let slot = self.producer.back_mut();
         slot.meta = Some(SampleMeta { seq, generation, sampled_at, valid_until });
+        slot.owner = owner;
         let displaced = slot.obs.replace(obs).and_then(|old| self.hub.retire.push(&mut self.retire_head, old));
         if displaced.is_some() { self.hub.tick_frees.fetch_add(1, Ordering::Relaxed); }
         copy_into(&mut slot.rt.positions, rt.positions);
@@ -317,6 +466,9 @@ pub struct StateHub {
     /// Pre-sized observation template recorded at executor startup so a contended reader warms
     /// its own `front` slot off-thread before handing it back to the RT producer.
     prewarm_template: OnceLock<Box<ArmObservation>>,
+    /// Off-thread schema cache paired with [`OwnerStateSnapshot::schema_revision`]. Never locked
+    /// on the RT control thread.
+    schema_cache: Mutex<Option<(u64, Arc<ObservationSchema>)>>,
 }
 
 /// A publisher for an arm with `dof` joints and its hub.
@@ -324,6 +476,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
     let slot = || Slot {
         meta: None,
         obs: None,
+        owner: OwnerStateSnapshot::default(),
         spares: ObservationSpares::preallocated(),
         rt: RtSample::with_dof(dof),
     };
@@ -337,6 +490,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
         prewarm_template: OnceLock::new(),
+        schema_cache: Mutex::new(None),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
 }
@@ -380,7 +534,7 @@ impl StateHub {
                 // copied, not moved: the slot keeps its memory for the tick to fill again (the
                 // tick neither allocates nor frees observations)
                 if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
-                    let snap = Snapshot { meta, obs: obs.clone(), rt: slot.rt.clone() };
+                    let snap = Snapshot { meta, obs: obs.clone(), owner: slot.owner, rt: slot.rt.clone() };
                     st.latest = Some(Arc::new(snap));
                 }
             }
@@ -426,6 +580,31 @@ impl StateHub {
     }
 
     pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+
+    /// Records the off-thread [`ObservationSchema`] corresponding to `revision`.
+    pub fn set_schema_cache(&self, revision: u64, schema: Arc<ObservationSchema>) {
+        let mut g = self.schema_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if g.as_ref().is_none_or(|(rev, _)| revision >= *rev) {
+            *g = Some((revision, schema));
+        }
+    }
+
+    /// Returns the cached [`ObservationSchema`] only when its revision matches `revision`.
+    pub fn cached_schema(&self, revision: u64) -> Option<Arc<ObservationSchema>> {
+        if revision == 0 {
+            return None;
+        }
+        let g = self.schema_cache.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref()
+            .filter(|(rev, _)| *rev == revision)
+            .map(|(_, schema)| Arc::clone(schema))
+    }
+
+    /// Returns the newest cached [`ObservationSchema`] regardless of revision (in-process fallback).
+    pub fn latest_cached_schema(&self) -> Option<Arc<ObservationSchema>> {
+        let g = self.schema_cache.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|(_, schema)| Arc::clone(schema))
+    }
 }
 
 #[cfg(test)]

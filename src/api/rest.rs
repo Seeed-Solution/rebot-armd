@@ -405,21 +405,29 @@ pub async fn get_observation_schema(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(up): axum::Extension<crate::api::proxy::DetectorUpstream>,
     axum::Extension(vision): axum::Extension<crate::api::proxy::VisionCache>,
-) -> Json<ObservationSchema> {
-    let mut schema = supervisor.get_schema().await;
+) -> Result<Json<ObservationSchema>, ApiError> {
+    let mut schema = supervisor.schema().await?;
     if let Some(v) = vision.status(&up).await {
         crate::api::proxy::apply_vision_status(&mut schema.capabilities.vision, &v);
     }
-    Json(schema)
+    Ok(Json(schema))
 }
 
 
 // Actuator authority is bound to the WebSocket that acquired the lease. REST
 // cannot prove that identity using a caller-supplied client id or generation.
 async fn actuator_requires_connection_lease(supervisor: &ArmSupervisor) -> ApiError {
-    let code = if supervisor.is_lease_active().await { "LEASE_ACTIVE" } else { "LEASE_REQUIRED" };
-    ApiError(StatusCode::CONFLICT,
-        "Use actuator commands on the WebSocket connection holding the control lease".into(), code.into())
+    match supervisor.lease_active_checked().await {
+        Ok(active) => {
+            let code = if active { "LEASE_ACTIVE" } else { "LEASE_REQUIRED" };
+            ApiError(
+                StatusCode::CONFLICT,
+                "Use actuator commands on the WebSocket connection holding the control lease".into(),
+                code.into(),
+            )
+        }
+        Err(err) => err.into(),
+    }
 }
 
 /// POST /api/v1/torque
