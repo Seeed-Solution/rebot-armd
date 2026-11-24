@@ -3743,3 +3743,67 @@ async fn auth_reply_saturation_helper_exit_never_aborts_reader_and_flushes_urgen
     let c = close_idx.unwrap_or_else(|| panic!("missing Close frame: {seen:?}"));
     assert!(e < f && f < c, "expected E-stop ({e}) < fatal ({f}) < Close ({c}); frames={seen:?}");
 }
+
+// 23. Round-6 Item 2: teardown marks `connection_closed` under the owner lock FIRST, before
+//     awaiting any task join, so a racing install from the closing connection cannot win the
+//     owner lock while teardown awaits writer/worker/child joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_marks_connection_closed_under_owner_lock_before_awaiting_joins() {
+    let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws, gen) = controller(addr).await;
+    let conn_id_str = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard = WriteHookGuard(conn_id_str.clone());
+    let ep0 = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+
+    // Capture the numeric connection_id from the live connection string (`conn:<id>`).
+    let numeric_conn_id: u64 = conn_id_str
+        .rsplit(':')
+        .next()
+        .expect("numeric connection suffix")
+        .parse()
+        .unwrap();
+    let mut stamp = sup.capture_admission_stamp();
+    stamp.connection_id = numeric_conn_id;
+
+    // Stall the writer and trigger fatal close so `writer_task` stays alive during teardown's
+    // bounded fatal grace join.
+    armd::api::ws::set_test_ws_write_paused(&conn_id_str, true);
+    let ep = sup.get_observation().await.epoch_id;
+    send(&mut ws, json!({
+        "type": "command", "request_id": 8100, "generation": gen, "epoch_id": ep,
+        "path": "/api/v1/motion/jog",
+        "body": {"target_positions": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 0.5}
+    })).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_id_str) >= 1).await;
+    // Flood > (ORDINARY_IN_CAPACITY + ORDINARY_OUT_CAPACITY = 128) commands so `ordinary_tx`
+    // overflows into `fatal_triggered = true` before dropping the client socket.
+    for k in 0..150u64 {
+        send(&mut ws, json!({
+            "type": "command", "request_id": 8200 + k, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/motion/jog", "body": {}
+        })).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Drop the client socket so `reader_task` exits immediately and enters teardown while
+    // `writer_task` is still blocked in its paused write / fatal flush grace.
+    drop(ws);
+
+    // Teardown MUST mark `numeric_conn_id` closed under the owner lock BEFORE `writer_task`
+    // finishes joining, so any racing admission check fails immediately with `LeaseLost`.
+    wait_until(Duration::from_millis(400), || {
+        sup.inner().try_read().is_ok_and(|g| g.is_connection_closed(numeric_conn_id))
+    }).await;
+    // Still blocked inside writer join (has not exited yet):
+    assert!(
+        armd::api::ws::test_ws_writer_blocked_count(&conn_id_str) >= 1,
+        "expected connection_closed to be set BEFORE writer_task finished joining"
+    );
+    {
+        let inner = sup.inner().write().await;
+        assert!(inner.is_connection_closed(numeric_conn_id));
+        assert!(matches!(inner.check_admission(stamp), Err(armd::SafetyError::LeaseLost)));
+    }
+    armd::api::ws::set_test_ws_write_paused(&conn_id_str, false);
+}

@@ -3654,12 +3654,21 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut writer_task => FirstExit::Writer,
         _ = &mut reader_task => FirstExit::Reader,
     };
-    // Mark connection closing first so any concurrent acquire under the owner lock releases immediately.
+    // Mark connection closing and record `connection_closed` under the owner lock FIRST,
+    // before awaiting ANY task join, so no resuming async install (policy/start after deployment
+    // lookup, planning, macro) or stale `Admitted` token from this connection can win the owner
+    // lock while teardown waits on worker/heartbeat/auth/writer/reader/child joins.
     connection_closing.store(true, Ordering::SeqCst);
     #[cfg(feature = "policy-runtime")]
     ws_closed.store(true, Ordering::SeqCst);
     ordinary_queue.close();
     heartbeat_slot.close();
+    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+        let mut inner = supervisor.inner().write().await;
+        if !inner.detached {
+            inner.mark_connection_closed(conn_id);
+        }
+    }
 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
     worker_task.abort();
@@ -3668,15 +3677,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let _ = heartbeat_task.await;
     auth_task.abort();
     let _ = auth_task.await;
-    // Set connection-closed under the owner lock immediately at teardown start so no resuming
-    // async install (policy/start after deployment lookup, planning, macro) or stale `Admitted`
-    // token from this connection can install motion while teardown finishes flushing and joining.
-    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
-        let mut inner = supervisor.inner().write().await;
-        if !inner.detached {
-            inner.mark_connection_closed(conn_id);
-        }
-    }
     let fatal_close = fatal_triggered.load(Ordering::Acquire);
     if !fatal_close && !matches!(first_exit, FirstExit::Reader) {
         reader_task.abort();
