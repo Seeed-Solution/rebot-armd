@@ -1705,8 +1705,7 @@ impl SupervisorInner {
         let thermal_below = !self.temperatures.is_empty()
             && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
         let cooldown_elapsed_ms = if thermal_below {
-            self.thermal_below_since
-                .map_or(0, |since| since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+            self.thermal_cooldown.elapsed_ms()
         } else {
             0
         };
@@ -1916,19 +1915,32 @@ impl SupervisorInner {
                 let synced = self.driver.as_ref().and_then(|d| {
                     d.lock().ok().and_then(|mut drv| {
                         let states = drv.read_joint_states().ok()?;
+                        let ages = drv.feedback_ages();
                         let loads = drv.joint_loads();
                         let caps = drv.capabilities();
                         let fresh = drv.is_feedback_valid()
-                            && drv.feedback_all_within(self.config.dof, Duration::from_millis(250))
+                            && ages.len() == self.config.dof
+                            && ages.iter().all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                             && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
                         if fresh {
-                            Some((states, loads, caps.temperature_feedback))
+                            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+                            let thermal_below = caps.temperature_feedback
+                                && !states.is_empty()
+                                && states.iter().all(|s| s.temperature.is_finite() && s.temperature <= threshold);
+                            let mut rx_buf = Vec::new();
+                            let next_cd = self.evaluate_thermal_cooldown_with_driver(
+                                drv.as_ref(),
+                                &ages,
+                                thermal_below,
+                                &mut rx_buf,
+                            );
+                            Some((states, loads, next_cd))
                         } else {
                             None
                         }
                     })
                 });
-                if let Some((states, loads, temp_fb)) = synced {
+                if let Some((states, loads, next_cd)) = synced {
                     self.feedback_numeric_valid = true;
                     Self::apply_feedback(
                         &mut self.measured_positions,
@@ -1940,14 +1952,9 @@ impl SupervisorInner {
                         &states,
                         loads.as_deref(),
                     );
-                    if temp_fb {
-                        let temps_copy = self.temperatures.clone();
-                        self.update_thermal_cooldown_from_temps(&temps_copy);
-                    } else {
-                        self.thermal_below_since = None;
-                    }
+                    self.thermal_cooldown = next_cd;
                 } else {
-                    self.thermal_below_since = None;
+                    self.thermal_cooldown.reset();
                 }
                 let mut mit_ctx = self.build_mit_recovery_clear_context();
                 if clear_driver_err_field && driver_err_override.is_none() {
@@ -2048,12 +2055,15 @@ impl SupervisorInner {
                 && caps.temperature_feedback
                 && !states.is_empty()
                 && states.iter().all(|s| s.temperature.is_finite() && s.temperature <= threshold);
-            // Cooldown accrues ONLY while temperature feedback is fresh; stale/unavailable temp resets it.
-            if thermal_below {
-                self.thermal_below_since.get_or_insert_with(Instant::now);
-            } else {
-                self.thermal_below_since = None;
-            }
+            // Cooldown accrues ONLY across consecutive fresh cool samples; stale/unavailable/gapped temp resets it.
+            let mut rx_buf = Vec::new();
+            let next_cd = self.evaluate_thermal_cooldown_with_driver(
+                drv.as_ref(),
+                &ages,
+                thermal_below,
+                &mut rx_buf,
+            );
+            self.thermal_cooldown = next_cd;
 
             let mut resting_feedback_missing = false;
             let mut resting_pose_violation = None;
@@ -2133,8 +2143,7 @@ impl SupervisorInner {
             commit_probed_limits(self);
             self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
         } else {
-            let temps_copy = self.temperatures.clone();
-            self.update_thermal_cooldown_from_temps(&temps_copy);
+            self.update_thermal_cooldown_driverless(Instant::now());
             ctx = self.build_clear_context_base(driver_err_override);
             if clear_driver_err_field && driver_err_override.is_none() {
                 ctx.driver_config_error = None;
@@ -2395,11 +2404,13 @@ impl SupervisorInner {
         let mut ctx;
         if let Some(ref d) = self.driver {
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+            let mut scratch_rx = std::mem::take(&mut self.scratch.rx);
             let mut ws_bufs = std::mem::take(&mut self.ws_eval_bufs);
             let drv = match d.lock() {
                 Ok(g) => g,
                 Err(_) => {
                     self.scratch.ages = scratch_ages;
+                    self.scratch.rx = scratch_rx;
                     self.ws_eval_bufs = ws_bufs;
                     return Err(E::FeedbackUnavailable);
                 }
@@ -2407,7 +2418,7 @@ impl SupervisorInner {
             // Pure read-only driver snapshot FIRST — ZERO motor resets or mutations.
             drv.feedback_ages_into(&mut scratch_ages);
             let ages_valid = scratch_ages.len() == self.config.dof
-                && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)));
+                && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
             let fb_valid = drv.is_feedback_valid();
             let hw_fault = drv.has_hardware_fault();
             let temp_fb = drv.capabilities().temperature_feedback;
@@ -2439,22 +2450,24 @@ impl SupervisorInner {
                     );
                 }
             }
-            drop(drv);
-            self.scratch.ages = scratch_ages;
-            self.ws_eval_bufs = ws_bufs;
-
             let fb_fresh = self.feedback_numeric_valid && fb_valid && ages_valid;
-            // Cooldown accrues ONLY while temperature feedback is fresh; stale/unavailable temp resets it.
+            // Cooldown accrues ONLY across consecutive fresh cool samples; stale/unavailable/gapped temp resets it.
             let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
             let thermal_below = fb_fresh
                 && temp_fb
                 && !self.temperatures.is_empty()
                 && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
-            if thermal_below {
-                self.thermal_below_since.get_or_insert_with(Instant::now);
-            } else {
-                self.thermal_below_since = None;
-            }
+            let next_cd = self.evaluate_thermal_cooldown_with_driver(
+                drv.as_ref(),
+                &scratch_ages,
+                thermal_below,
+                &mut scratch_rx,
+            );
+            drop(drv);
+            self.scratch.ages = scratch_ages;
+            self.scratch.rx = scratch_rx;
+            self.ws_eval_bufs = ws_bufs;
+            self.thermal_cooldown = next_cd;
 
             ctx = self.build_clear_context_base(driver_err_override);
             if candidate_limits.is_some() {
@@ -2513,14 +2526,7 @@ impl SupervisorInner {
             self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
         } else {
             // Driverless simulation mode: update cooldown clock in place (0 alloc).
-            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
-            if !self.temperatures.is_empty()
-                && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
-            {
-                self.thermal_below_since.get_or_insert_with(Instant::now);
-            } else {
-                self.thermal_below_since = None;
-            }
+            self.update_thermal_cooldown_driverless(Instant::now());
             ctx = self.build_clear_context_base(driver_err_override);
             if candidate_limits.is_some() {
                 ctx.driver_config_error = None;

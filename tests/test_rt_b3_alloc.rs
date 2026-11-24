@@ -2507,24 +2507,27 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
     });
     let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     inner.tick(0.02);
-    // Let 50 ms of real wall-clock dwell accrue while still below the 80 ms cooldown requirement.
-    std::thread::sleep(Duration::from_millis(50));
+    // Advance 50 ms on driver clock with a second fresh cool sample -> 50 ms dwell (< 80 ms required).
+    clock.advance(Duration::from_millis(50));
+    bus.with(|s| s.push_all_feedback());
+    let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     let err_mid = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
-    assert!(
-        matches!(err_mid, ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { required_ms: 80, .. })),
-        "expected ThermalCooldownNotElapsed mid-dwell, got {err_mid:?}"
+    assert_eq!(
+        err_mid,
+        ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed {
+            elapsed_ms: 50,
+            required_ms: 80,
+        })
     );
 
     // Now make temperature feedback stale (> 250 ms old) and tick: cooldown timer MUST reset!
     clock.advance(Duration::from_millis(300));
     let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     inner.tick(0.02);
-    // Wait another 50 ms while stale (total wall time since initial cool > 100 ms > 80 ms!)
-    std::thread::sleep(Duration::from_millis(50));
     let err_stale = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(err_stale, ClearFaultError::Rejected(ClearRefusal::FreshFeedbackRequired));
 
-    // Fresh cool feedback resumes: because stale temp reset the timer, cooldown MUST start from ~0 ms
+    // Fresh cool feedback resumes: because stale temp reset the timer, cooldown MUST start from 0 ms
     // and refuse immediately (must NOT inherit pre-stale dwell!).
     bus.with(|s| {
         s.motors[0].temperature_c = 40;
@@ -2536,15 +2539,15 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
     let _ = alloc::take();
     let err_restarted = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(alloc::take().calls, 0, "restarted cooldown refusal must do 0 heap ops");
-    match err_restarted {
-        ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms, required_ms }) => {
-            assert_eq!(required_ms, 80);
-            assert!(elapsed_ms < 40, "cooldown timer must have reset on stale temp, got elapsed_ms={elapsed_ms}");
-        }
-        other => panic!("expected restarted ThermalCooldownNotElapsed after stale gap, got {other:?}"),
-    }
-    // After a FULL fresh 85 ms dwell -> clears cleanly!
-    std::thread::sleep(Duration::from_millis(85));
+    assert_eq!(
+        err_restarted,
+        ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed {
+            elapsed_ms: 0,
+            required_ms: 80,
+        })
+    );
+    // After a FULL fresh 85 ms dwell (<= 250 ms sample gap) with a fresh cool sample -> clears cleanly!
+    clock.advance(Duration::from_millis(85));
     bus.with(|s| s.push_all_feedback());
     let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     assert_eq!(
@@ -2774,5 +2777,139 @@ fn step5_write_output_error_is_bounded_zero_alloc_on_normal_and_estop_hold() {
     assert_eq!(
         inhib_allocs.calls, 0,
         "Step-5 EstopInhibited error must do 0 heap allocations: {inhib_allocs:?}"
+    );
+}
+
+#[test]
+fn thermal_cooldown_restarts_across_unobserved_stale_gap_without_tick() {
+    let make_rig = |use_executor: bool| {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors { m.temperature_c = 40; }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.max_temperature = 75.0;
+        cfg.resting_pose = None;
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.thermal_cooldown_duration = Duration::from_millis(80);
+        inner.safety.set_off_thread_reclaim(use_executor);
+        inner.safety.latch(
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 },
+        );
+        (inner, bus, clock)
+    };
+
+    // 1. Legacy clear_fault AND RT executor clear_fault_executor_bounded:
+    //    An unobserved gap (> 250 ms) with NO intermediate tick/check between two fresh cool samples
+    //    MUST restart the cooldown dwell from the second fresh sample (never continuing the old dwell).
+    for use_executor in [false, true] {
+        let (mut inner, bus, clock) = make_rig(use_executor);
+        // Sample 1 at t = 0 ms (fresh, cool).
+        bus.with(|s| s.push_all_feedback());
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        } else {
+            let _ = inner.clear_fault().unwrap_err();
+        }
+        // Sample 2 at t = 60 ms (gap 60 ms <= 250 ms -> dwell = 60 ms < 80 ms).
+        clock.advance(Duration::from_millis(60));
+        bus.with(|s| s.push_all_feedback());
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(err, ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms: 60, required_ms: 80 }));
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert!(err.to_string().contains("60 ms of 80 ms"), "expected 60 ms dwell before gap: {err}");
+        }
+
+        // Unobserved 300 ms stale gap (> 250 ms) with ZERO ticks or intermediate checks!
+        // A fresh cool sample then arrives BEFORE the next check (age = 0 ms <= 250 ms).
+        clock.advance(Duration::from_millis(300));
+        bus.with(|s| s.push_all_feedback());
+
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            alloc::time_this_thread();
+            let _ = alloc::take();
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(alloc::take().calls, 0, "restarted cooldown refusal after unobserved gap must do 0 heap ops");
+            assert_eq!(
+                err,
+                ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms: 0, required_ms: 80 }),
+                "unobserved >250ms gap without tick must restart dwell to 0 ms"
+            );
+        } else {
+            // Legacy clear_fault reads the new fresh sample directly with zero ticks in between.
+            let err = inner.clear_fault().unwrap_err();
+            assert!(
+                err.to_string().contains("0 ms of 80 ms"),
+                "legacy clear_fault must restart dwell to 0 ms after unobserved gap: {err}"
+            );
+        }
+        assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+
+        // 2. Single fresh sample does NOT accrue dwell merely by waiting (no new sample arrived):
+        //    advance 100 ms (< 250 ms fresh) without pushing any new frame -> dwell stays 0 ms!
+        clock.advance(Duration::from_millis(100));
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(
+                err,
+                ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms: 0, required_ms: 80 }),
+                "elapsed time without a newer fresh sample must not accrue cooldown dwell"
+            );
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert!(err.to_string().contains("0 ms of 80 ms"), "no new sample must keep dwell at 0 ms: {err}");
+        }
+
+        // 3. Consecutive fresh cool sample arrives 100 ms after restart (gap = 100 ms <= 250 ms -> dwell = 100 ms >= 80 ms) -> clears!
+        bus.with(|s| s.push_all_feedback());
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            assert_eq!(
+                inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap(),
+                SafetyState::Idle
+            );
+        } else {
+            assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+        }
+    }
+
+    // 4. Per-joint unobserved gap: J1..J6 keep sending fresh samples while J0 has a 280 ms gap (> 250 ms)
+    //    and then sends a fresh sample before the next check -> dwell restarts!
+    let (mut inner, bus, clock) = make_rig(false);
+    bus.with(|s| s.push_all_feedback());
+    let _ = inner.clear_fault().unwrap_err(); // t = 0
+    clock.advance(Duration::from_millis(60));
+    bus.with(|s| s.push_all_feedback());
+    let err60 = inner.clear_fault().unwrap_err();
+    assert!(err60.to_string().contains("60 ms of 80 ms"), "{err60}");
+    // J1..J6 update at t = 220 ms (gap 160 ms), J0 stays at t = 60 ms.
+    clock.advance(Duration::from_millis(160));
+    bus.with(|s| { for i in 1..7 { s.push_feedback(i); } });
+    let err_same = inner.clear_fault().unwrap_err(); // oldest is still J0 at 60 ms (age 160 ms <= 250 ms)
+    assert!(err_same.to_string().contains("60 ms of 80 ms"), "{err_same}");
+    // Now advance 120 ms (t = 340 ms): J0 gap since 60 ms is 280 ms (> 250 ms!), while J1..J6 gap is 120 ms.
+    // All 7 push fresh frames at t = 340 ms with no intermediate check -> J0's 280 ms gap restarts dwell!
+    clock.advance(Duration::from_millis(120));
+    bus.with(|s| s.push_all_feedback());
+    let err_restart = inner.clear_fault().unwrap_err();
+    assert!(
+        err_restart.to_string().contains("0 ms of 80 ms"),
+        "per-joint >250ms gap must restart dwell to 0 ms: {err_restart}"
     );
 }

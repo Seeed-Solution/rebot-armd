@@ -1179,8 +1179,21 @@ impl crate::supervisor::SupervisorInner {
                 let partial = drv.has_known_partial_enable();
                 let enable_known = state != EnableState::Unknown || partial;
                 let oldest_age = ages
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .try_fold(std::time::Duration::ZERO, |m, a| a.map(|t| m.max(t)));
+                let threshold = self.config.max_temperature - crate::supervisor::THERMAL_CLEAR_MARGIN_C;
+                let thermal_below = fb_fresh
+                    && caps.temperature_feedback
+                    && !states.is_empty()
+                    && states.iter().all(|s| s.temperature.is_finite() && s.temperature <= threshold);
+                let mut rx_buf = Vec::new();
+                let next_cd = self.evaluate_thermal_cooldown_with_driver(
+                    drv.as_ref(),
+                    &ages,
+                    thermal_below,
+                    &mut rx_buf,
+                );
                 Some((
                     states,
                     loads,
@@ -1190,11 +1203,12 @@ impl crate::supervisor::SupervisorInner {
                     hw_fault,
                     enable_known,
                     oldest_age,
+                    next_cd,
                 ))
             })
         });
         let (post_fb_fresh, post_temp_fb, post_hw_err, post_hw_fault, post_enable_known) =
-            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age)) = post_read {
+            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age, next_cd)) = post_read {
                 self.feedback_numeric_valid = fb_fresh;
                 if fb_fresh {
                     self.last_can_feedback_instant =
@@ -1210,8 +1224,8 @@ impl crate::supervisor::SupervisorInner {
                         loads.as_deref(),
                     );
                     if temp_fb {
+                        self.thermal_cooldown = next_cd;
                         let temps_copy = self.temperatures.clone();
-                        self.update_thermal_cooldown_from_temps(&temps_copy);
                         if let Some((joint_idx, temperature)) = temps_copy
                             .iter()
                             .copied()
@@ -1219,7 +1233,7 @@ impl crate::supervisor::SupervisorInner {
                             .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
                             .max_by(|a, b| a.1.total_cmp(&b.1))
                         {
-                            self.thermal_below_since = None;
+                            self.thermal_cooldown.reset();
                             self.safety.latch(
                                 FaultKind::ThermalTrip,
                                 FaultDetail::ThermalTrip {
@@ -1230,17 +1244,17 @@ impl crate::supervisor::SupervisorInner {
                             );
                         }
                     } else {
-                        self.thermal_below_since = None;
+                        self.thermal_cooldown.reset();
                     }
                 } else {
                     self.last_can_feedback_instant = None;
-                    self.thermal_below_since = None;
+                    self.thermal_cooldown.reset();
                 }
                 (fb_fresh, temp_fb, hw_err, hw_fault, enable_known)
             } else {
                 self.feedback_numeric_valid = false;
                 self.last_can_feedback_instant = None;
-                self.thermal_below_since = None;
+                self.thermal_cooldown.reset();
                 (false, false, None, false, false)
             };
 
