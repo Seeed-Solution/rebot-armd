@@ -2616,3 +2616,163 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
     jl_inner.measured_positions[2] = j2_lim.min_position - 0.005;
     assert_eq!(jl_inner.clear_fault().unwrap(), SafetyState::Idle);
 }
+
+#[test]
+fn step5_write_output_error_is_bounded_zero_alloc_on_normal_and_estop_hold() {
+    #[derive(Clone, Copy)]
+    enum WriteMode {
+        Ok,
+        SocketCanErr,
+        PosForceSpeedZero,
+        EstopInhibited,
+    }
+    struct FailingWriteDriver {
+        dof: usize,
+        mode: Arc<Mutex<WriteMode>>,
+        clock: MockClock,
+    }
+    impl FailingWriteDriver {
+        fn make_err(&self) -> Result<(), ArmDriverError> {
+            match *self.mode.lock().unwrap() {
+                WriteMode::Ok => Ok(()),
+                WriteMode::SocketCanErr => Err(ArmDriverError::Transport(TransportError::SocketCanOs {
+                    op: "send",
+                    errno: {
+                        #[cfg(unix)]
+                        { Some(libc::ENETDOWN) }
+                        #[cfg(not(unix))]
+                        { None }
+                    },
+                    kind: std::io::ErrorKind::BrokenPipe,
+                })),
+                WriteMode::PosForceSpeedZero => Err(ArmDriverError::PosForceSpeedZero { joint: 6 }),
+                WriteMode::EstopInhibited => Err(ArmDriverError::EstopInhibited),
+            }
+        }
+    }
+    impl ArmDriver for FailingWriteDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); self.dof] }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
+        }
+        fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(0)); }
+        }
+        fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+            let now = Instant::now();
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(now)); }
+        }
+        fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+            let now = Instant::now();
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(now)); }
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState { temperature: 30.0, ..JointState::default() }; self.dof])
+        }
+        fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+            out.clear();
+            for _ in 0..self.dof {
+                out.push(JointState { temperature: 30.0, ..JointState::default() });
+            }
+            Ok(())
+        }
+        fn read_joint_states_budgeted(
+            &mut self,
+            out: &mut Vec<JointState>,
+            _: Instant,
+            _: u16,
+        ) -> Result<(u16, bool), ArmDriverError> {
+            self.read_joint_states_into(out)?;
+            Ok((self.dof as u16, false))
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.make_err()
+        }
+        fn write_estop_hold(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.make_err()
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+        fn clock_now(&self) -> Instant { self.clock.now() }
+    }
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.joint_tracking = None;
+    cfg.resting_pose = None;
+    let mode = Arc::new(Mutex::new(WriteMode::Ok));
+    let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(FailingWriteDriver {
+        dof: cfg.dof,
+        mode: Arc::clone(&mode),
+        clock: MockClock::new(),
+    }));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.safety.set_off_thread_reclaim(true);
+    // Warm scratch buffers with two clean ticks.
+    for _ in 0..2 {
+        let _ = inner.tick_control(0.02);
+    }
+    assert!(inner.safety.state().is_operational());
+
+    alloc::time_this_thread();
+
+    // 1. Operational Step-5 write_joint_targets failure -> 0 heap allocs, latches DriverWriteFailed with bounded text.
+    *mode.lock().unwrap() = WriteMode::SocketCanErr;
+    let _ = alloc::take();
+    let _ = inner.tick_control(0.02);
+    let write_err_allocs = alloc::take();
+    assert_eq!(
+        write_err_allocs.calls, 0,
+        "Step-5 write_joint_targets error must do 0 heap allocations: {write_err_allocs:?}"
+    );
+    let fi = inner.safety.fault().expect("DriverWriteFailed must be latched");
+    assert_eq!(fi.code, FaultCode::DriverWriteFailed);
+    assert!(
+        fi.message.as_str().starts_with("Control output failed: Transport error: SocketCAN send failed:"),
+        "unexpected bounded message: {}",
+        fi.message
+    );
+
+    // 2. Stopped Step-5 write_estop_hold failure -> 0 heap allocs on bounded error path.
+    *mode.lock().unwrap() = WriteMode::PosForceSpeedZero;
+    let _ = alloc::take();
+    let _ = inner.tick_control(0.02);
+    let hold_err_allocs = alloc::take();
+    assert_eq!(
+        hold_err_allocs.calls, 0,
+        "Step-5 write_estop_hold error must do 0 heap allocations: {hold_err_allocs:?}"
+    );
+
+    // 3. EstopInhibited error during urgent stop -> 0 heap allocs and not treated as DriverWriteFailed.
+    inner.safety.drain_retired_state_arcs_off_thread();
+    inner.safety.drain_log_events_off_thread();
+    *mode.lock().unwrap() = WriteMode::Ok;
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+    inner.set_torque(true).unwrap();
+    inner.tick_control(0.02);
+    *mode.lock().unwrap() = WriteMode::EstopInhibited;
+    let _ = alloc::take();
+    let _ = inner.tick_control(0.02);
+    let inhib_allocs = alloc::take();
+    assert_eq!(
+        inhib_allocs.calls, 0,
+        "Step-5 EstopInhibited error must do 0 heap allocations: {inhib_allocs:?}"
+    );
+}

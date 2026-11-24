@@ -3478,7 +3478,7 @@ impl SupervisorInner {
         self.tick_phase(1);
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
-        let mut output_error = None;
+        let mut output_error: Option<crate::mit::OutputErrorText> = None;
         let mut tick_output_accepted = false;
         // a torque transition in flight owns the bus until it ends (the driver refuses targets)
         let transition_owns_bus = self.torque_transition.is_some();
@@ -3498,7 +3498,11 @@ impl SupervisorInner {
                         };
                         match write_res {
                             Ok(()) => tick_output_accepted = true,
-                            Err(e) => output_error = Some(e.to_string()),
+                            Err(e) => {
+                                let mut buf = crate::mit::OutputErrorText::empty();
+                                e.write_bounded(&mut buf);
+                                output_error = Some(buf);
+                            }
                         }
                     }
                 }
@@ -3630,7 +3634,7 @@ impl SupervisorInner {
                                 }
                                 Some(Err(e)) => {
                                     self.tracking.invalidate();
-                                    output_error = Some(e.to_string());
+                                    output_error = Some(e);
                                 }
                                 None => self.tracking.invalidate(),
                             }
@@ -3748,7 +3752,7 @@ impl SupervisorInner {
                     stops.mark_applied(generation);
                 }
             }
-            if output_error.as_deref().is_some_and(|e| e.contains(crate::driver::ESTOP_INHIBITED)) { output_error = None; }
+            if output_error.as_ref().is_some_and(|e| e.as_str().contains(crate::driver::ESTOP_INHIBITED)) { output_error = None; }
         }
         if let Some(error) = output_error {
             tick_output_accepted = false;
@@ -3763,11 +3767,14 @@ impl SupervisorInner {
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
-                        let _ = core::fmt::write(buf, format_args!("Control output failed: {error}"));
+                        buf.push_str("Control output failed: ");
+                        buf.push_str(error.as_str());
                     }),
                 );
             }
-            tracing::error!("Control output failed: {error}");
+            if !self.safety.deferred_logging() {
+                tracing::error!("Control output failed: {error}");
+            }
         }
 
         if self.servo_stream_active

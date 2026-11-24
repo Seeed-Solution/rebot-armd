@@ -34,6 +34,10 @@ use crate::tracking::{JointTrackingConfig, TrackingStrategy};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::driver::JointTarget;
 
+/// Bounded, zero-allocation error text returned by Step-5 output writes.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type OutputErrorText = crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>;
+
 /// WS path of the TIMEOUT commissioning.
 pub const TIMEOUT_PATH: &str = "/api/v1/calibration/mit_timeout";
 /// WS path that stores the qualification record.
@@ -676,7 +680,7 @@ impl crate::supervisor::SupervisorInner {
     /// unchanged. With MIT active: the owned joints get MIT frames ([`Self::mit_prepare`]); the
     /// feed-forward history advances only after a successful flush; a failed write cancels the
     /// group. MIT lost: nothing is written (None).
-    pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), String>> {
+    pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), OutputErrorText>> {
         self.write_output_slice(&mut targets, dt, None)
     }
 
@@ -687,13 +691,13 @@ impl crate::supervisor::SupervisorInner {
         mut targets: Vec<JointTarget>,
         dt: f64,
         limits: &[crate::model::JointLimit],
-    ) -> Option<Result<(), String>> {
+    ) -> Option<Result<(), OutputErrorText>> {
         self.write_output_slice(&mut targets, dt, Some(limits))
     }
 
     /// [`Self::write_output`] of the targets in the tick's scratch (`scratch.targets`, filled by
     /// the caller): no allocation for the ordinary position output.
-    pub(crate) fn write_output_scratch(&mut self, dt: f64) -> Option<Result<(), String>> {
+    pub(crate) fn write_output_scratch(&mut self, dt: f64) -> Option<Result<(), OutputErrorText>> {
         let mut targets = std::mem::take(&mut self.scratch.targets);
         let r = self.write_output_slice(&mut targets, dt, None);
         self.scratch.targets = targets;
@@ -732,12 +736,13 @@ impl crate::supervisor::SupervisorInner {
         Some(self.gripper_hold_vel_ceiling.map_or(ceiling, |hold_v| ceiling.min(hold_v)))
     }
 
+    #[allow(clippy::result_large_err)] // inline bounded text avoids RT heap allocation
     fn write_output_slice(
         &mut self,
         targets: &mut [JointTarget],
         dt: f64,
         override_limits: Option<&[crate::model::JointLimit]>,
-    ) -> Option<Result<(), String>> {
+    ) -> Option<Result<(), OutputErrorText>> {
         // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
         // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
         if self.urgent_stop_unapplied() { return None; }
@@ -746,7 +751,11 @@ impl crate::supervisor::SupervisorInner {
             MitOwner::Lost => return None,
             MitOwner::Active => match self.mit_prepare(targets, dt) {
                 Ok(ff) => Some(ff),
-                Err(e) => return Some(Err(format!("MIT output refused: {e}"))),
+                Err(e) => {
+                    let mut buf = OutputErrorText::empty();
+                    let _ = core::fmt::write(&mut buf, format_args!("MIT output refused: {e}"));
+                    return Some(Err(buf));
+                }
             },
         };
         let active_pf_ceiling = self.config.gripper_index().and_then(|g| {
@@ -799,7 +808,11 @@ impl crate::supervisor::SupervisorInner {
                 } else {
                     drv.write_joint_targets(targets)
                 };
-                write_res.map_err(|e| e.to_string())
+                write_res.map_err(|e| {
+                    let mut buf = OutputErrorText::empty();
+                    e.write_bounded(&mut buf);
+                    buf
+                })
             });
         if let Some(ff) = ff {
             match &res {

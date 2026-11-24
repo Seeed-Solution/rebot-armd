@@ -484,7 +484,7 @@ impl SupervisorInner {
         &mut self,
         pending: crate::tracking::PendingFallback,
         gravity_output_enabled: bool,
-    ) -> Option<String> {
+    ) -> Option<crate::mit::OutputErrorText> {
         let crate::tracking::PendingFallback { step, ramp, prev_confirmed, other_depths } = pending;
         match step {
             Ok(fb) => {
@@ -529,7 +529,7 @@ impl SupervisorInner {
                     }
                     Some(Err(e)) => {
                         self.tracking.invalidate();
-                        Some(e.to_string())
+                        Some(e)
                     }
                     None => {
                         self.tracking.invalidate();
