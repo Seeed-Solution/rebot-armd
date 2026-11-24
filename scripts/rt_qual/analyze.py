@@ -70,11 +70,19 @@ PCT_MAX_REQUIRED_KEYS = (
 
 
 RECOGNIZED_OWNER_MODES = ("legacy", "executor")
+INVALID_BOOT_ID_PLACEHOLDERS = frozenset({"unknown", "unknown-boot", "none", "null", "n/a", "na"})
 
 
 def get_nonneg_int(d: dict[str, Any], key: str) -> int | None:
     v = d.get(key)
     if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        return int(v)
+    return None
+
+
+def get_positive_int(d: dict[str, Any], key: str) -> int | None:
+    v = d.get(key)
+    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
         return int(v)
     return None
 
@@ -98,6 +106,28 @@ def get_nonempty_str(d: dict[str, Any], key: str) -> str | None:
     if isinstance(v, str) and v.strip():
         return v.strip()
     return None
+
+
+def get_valid_boot_id(d: dict[str, Any]) -> str | None:
+    s = get_nonempty_str(d, "boot_id")
+    if s is None or s.lower() in INVALID_BOOT_ID_PLACEHOLDERS:
+        return None
+    return s
+
+
+def sample_process_identity(tick: dict[str, Any]) -> tuple[str | None, str | None, int | None]:
+    return (
+        get_nonempty_str(tick, "instance_id"),
+        get_valid_boot_id(tick),
+        get_positive_int(tick, "process_start_unix_ns"),
+    )
+
+
+def identities_conflict(
+    a: tuple[str | None, str | None, int | None],
+    b: tuple[str | None, str | None, int | None],
+) -> bool:
+    return any(x is not None and y is not None and x != y for x, y in zip(a, b))
 
 
 def us_to_ms(val: float | int | None) -> float | None:
@@ -155,7 +185,7 @@ def analyze_counter_series(samples: list[LoadSample], key: str) -> CounterSeries
       sharing the same `instance_id` (both `None` or equal strings).
     """
     raw_vals: list[int | None] = [get_nonneg_int(s.tick, key) for s in samples]
-    inst_vals: list[str | None] = [get_nonempty_str(s.tick, "instance_id") for s in samples]
+    ident_vals = [sample_process_identity(s.tick) for s in samples]
     present_vals = [v for v in raw_vals if v is not None]
     missing_count = len(raw_vals) - len(present_vals)
     if not present_vals:
@@ -183,15 +213,15 @@ def analyze_counter_series(samples: list[LoadSample], key: str) -> CounterSeries
     verified_delta = 0
     any_verified_step = False
     prev_val: int | None = None
-    prev_inst: str | None = None
-    for idx, (val, inst) in enumerate(zip(raw_vals, inst_vals)):
+    prev_ident: tuple[str | None, str | None, int | None] | None = None
+    for idx, (val, ident) in enumerate(zip(raw_vals, ident_vals)):
         if val is None:
             per_sample[idx] = None
             continue
         if prev_val is None:
             per_sample[idx] = 0
-        elif prev_inst is not None and inst is not None and prev_inst != inst:
-            # Daemon instance changed: do not treat cross-process difference as an in-run delta.
+        elif prev_ident is not None and identities_conflict(prev_ident, ident):
+            # Daemon / process / host identity changed: do not treat cross-restart difference as an in-run delta.
             per_sample[idx] = None
         elif val >= prev_val:
             step = val - prev_val
@@ -202,7 +232,7 @@ def analyze_counter_series(samples: list[LoadSample], key: str) -> CounterSeries
             reset_detected = True
             per_sample[idx] = None
         prev_val = val
-        prev_inst = inst
+        prev_ident = ident
 
     total_delta = verified_delta if any_verified_step else None
     verified_in_run_delta = verified_delta if any_verified_step else None
@@ -914,12 +944,26 @@ def analyze(
         wake_over_10ms.verified_in_run_delta,
     )
 
-    # ---- Instance continuity, owner mode continuity, lock-free snapshot integrity ----
+    # ---- Process / boot identity continuity, owner mode continuity, lock-free snapshot integrity ----
     instance_ids = [get_nonempty_str(s.tick, "instance_id") for s in samples]
     distinct_instance_ids = sorted({i for i in instance_ids if i is not None})
     instance_missing_count = sum(1 for i in instance_ids if i is None)
     instance_changed = len(distinct_instance_ids) > 1
     instance_id_latest = distinct_instance_ids[-1] if distinct_instance_ids else None
+
+    boot_ids = [get_valid_boot_id(s.tick) for s in samples]
+    distinct_boot_ids = sorted({b for b in boot_ids if b is not None})
+    boot_id_missing_count = sum(1 for b in boot_ids if b is None)
+    boot_id_changed = len(distinct_boot_ids) > 1
+    boot_id_latest = distinct_boot_ids[-1] if distinct_boot_ids else None
+
+    proc_starts = [get_positive_int(s.tick, "process_start_unix_ns") for s in samples]
+    distinct_proc_starts = sorted({p for p in proc_starts if p is not None})
+    proc_start_missing_count = sum(1 for p in proc_starts if p is None)
+    proc_start_changed = len(distinct_proc_starts) > 1
+    proc_start_latest = distinct_proc_starts[-1] if distinct_proc_starts else None
+
+    process_identity_changed = instance_changed or boot_id_changed or proc_start_changed
 
     owner_modes = [get_nonempty_str(s.tick, "owner_mode") for s in samples]
     owner_invalid_count = sum(1 for m in owner_modes if m not in RECOGNIZED_OWNER_MODES)
@@ -962,6 +1006,12 @@ def analyze(
             )
     if instance_changed:
         invalid_reasons.append(f"daemon restart: instance_id changed ({' -> '.join(distinct_instance_ids)})")
+    if boot_id_changed:
+        invalid_reasons.append(f"host reboot: boot_id changed ({' -> '.join(distinct_boot_ids)})")
+    if proc_start_changed:
+        invalid_reasons.append(
+            f"process restart: process_start_unix_ns changed ({' -> '.join(str(x) for x in distinct_proc_starts)})"
+        )
     if owner_mode_changed:
         invalid_reasons.append(f"owner_mode changed mid-run ({' -> '.join(distinct_owner_modes)})")
     if snapshot_lapped_any:
@@ -1012,10 +1062,10 @@ def analyze(
 
     # Require positive release progress between first and last sample.
     if n_samples >= 2:
-        if releases_total_series.present_all and not releases_total_series.reset_detected and not instance_changed:
+        if releases_total_series.present_all and not releases_total_series.reset_detected and not process_identity_changed:
             if releases_total_series.verified_in_run_delta == 0:
                 invalid_reasons.append("zero releases completed between first and last sample (releases_total delta=0)")
-        elif since_boot_series.present_all and not since_boot_series.reset_detected and not instance_changed:
+        elif since_boot_series.present_all and not since_boot_series.reset_detected and not process_identity_changed:
             if since_boot_series.verified_in_run_delta == 0:
                 invalid_reasons.append("zero releases completed between first and last sample (since_boot_ticks delta=0)")
 
@@ -1062,6 +1112,10 @@ def analyze(
     missing_required_fields: list[str] = []
     if instance_missing_count > 0:
         missing_required_fields.append(f"instance_id ({instance_missing_count}/{n_samples})")
+    if boot_id_missing_count > 0:
+        missing_required_fields.append(f"boot_id ({boot_id_missing_count}/{n_samples})")
+    if proc_start_missing_count > 0:
+        missing_required_fields.append(f"process_start_unix_ns ({proc_start_missing_count}/{n_samples})")
     if owner_invalid_count > 0:
         missing_required_fields.append(f"owner_mode ({owner_invalid_count}/{n_samples})")
     if lapped_missing_count > 0:
@@ -1192,15 +1246,15 @@ def analyze(
             "max_ms": us_to_ms(max_or_none(maxs)),
         }
 
-    # Same-instance high-water-mark increases prove an in-run peak even after 1000-tick rollover.
+    # Same-process high-water-mark increases prove an in-run peak even after 1000-tick rollover.
     in_run_release_ever_us: int | None = None
     in_run_wake_ever_us: int | None = None
-    prev_inst_hwm: str | None = None
+    prev_ident_hwm: tuple[str | None, str | None, int | None] | None = None
     prev_rel_ever: int | None = None
     prev_wake_ever: int | None = None
     for s in samples:
-        cur_inst = get_nonempty_str(s.tick, "instance_id")
-        same_inst = (prev_inst_hwm is None) or (cur_inst is None) or (cur_inst == prev_inst_hwm)
+        cur_ident = sample_process_identity(s.tick)
+        same_inst = (prev_ident_hwm is None) or (not identities_conflict(prev_ident_hwm, cur_ident))
         cur_rel_ever = get_nonneg_int(s.tick, "release_us_max_ever")
         cur_wake_ever = get_nonneg_int(s.tick, "wake_late_max_ever")
         if same_inst and prev_rel_ever is not None and cur_rel_ever is not None and cur_rel_ever > prev_rel_ever:
@@ -1211,8 +1265,7 @@ def analyze(
             prev_rel_ever = cur_rel_ever
         if cur_wake_ever is not None:
             prev_wake_ever = cur_wake_ever
-        if cur_inst is not None:
-            prev_inst_hwm = cur_inst
+        prev_ident_hwm = cur_ident
 
     marker_wake_max_us: int | None = None
     if isinstance(latest_since_marker, dict) and latest_since_marker.get("status") == "active":
@@ -1297,10 +1350,10 @@ def analyze(
     if has_release_us and n_samples >= 2:
         first_rel = get_pct(samples[0].tick, "release_us", "max")
         first_t = get_nonneg_int(samples[0].tick, "since_boot_ticks")
-        first_inst = get_nonempty_str(samples[0].tick, "instance_id")
+        first_ident = sample_process_identity(samples[0].tick)
         for s in samples[1:]:
-            cur_inst = get_nonempty_str(s.tick, "instance_id")
-            if first_inst is not None and cur_inst is not None and cur_inst != first_inst:
+            cur_ident = sample_process_identity(s.tick)
+            if identities_conflict(first_ident, cur_ident):
                 break
             cur_rel = get_pct(s.tick, "release_us", "max")
             if cur_rel is not None and cur_rel >= RELEASE_BUDGET_US:
@@ -1336,8 +1389,10 @@ def analyze(
         and not releases_started_series.reset_detected
         and not releases_total_series.reset_detected
         and not release_max_ever_series.reset_detected
-        and not instance_changed
+        and not process_identity_changed
         and instance_missing_count == 0
+        and boot_id_missing_count == 0
+        and proc_start_missing_count == 0
         and not owner_mode_changed
         and owner_invalid_count == 0
         and not load_run.failed_polls
@@ -1381,8 +1436,10 @@ def analyze(
         skipped_valid = (
             skipped_series.present_all
             and not skipped_series.reset_detected
-            and not instance_changed
+            and not process_identity_changed
             and instance_missing_count == 0
+            and boot_id_missing_count == 0
+            and proc_start_missing_count == 0
             and not owner_mode_changed
             and owner_invalid_count == 0
             and lapped_missing_count == 0
@@ -1641,6 +1698,11 @@ def analyze(
         out.append(f"- **Target**: `{load_run.meta['target']}` | **armd version**: `{armd_ver}`")
     if instance_id_latest is not None:
         out.append(f"- **Instance ID**: `{instance_id_latest}` (distinct={len(distinct_instance_ids)})")
+    if boot_id_latest is not None or proc_start_latest is not None:
+        out.append(
+            f"- **Process boot identity**: `boot_id={boot_id_latest or 'missing'}` (distinct={len(distinct_boot_ids)}), "
+            f"`process_start_unix_ns={fmt_int(proc_start_latest)}` (distinct={len(distinct_proc_starts)})"
+        )
     if release_count is not None:
         out.append(
             f"- **Releases covered**: `{release_count}` "

@@ -404,6 +404,7 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
+    let _ = armd::supervisor::init_process_identity();
     let system = armd::diagnostics::boot::SystemInfo::read();
     let cli = parse_cli_args()?;
 

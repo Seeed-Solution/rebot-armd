@@ -614,6 +614,13 @@ pub struct TickSnapshot {
     /// Unique identifier for this daemon/supervisor instance (changes on every restart).
     #[serde(default)]
     pub instance_id: String,
+    /// Kernel boot UUID (`/proc/sys/kernel/random/boot_id` on Linux), or `None` if unavailable.
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    /// Process start wall-clock timestamp (Unix epoch nanoseconds) derived once at startup from
+    /// Linux `/proc/stat` `btime` + `/proc/self/stat` `starttime`, or `None` if unavailable.
+    #[serde(default)]
+    pub process_start_unix_ns: Option<u64>,
     /// Ticks in the window (at most [`TICK_WINDOW`]).
     pub window: usize,
     /// Whole `ArmSupervisor::tick` call: lock wait, tick body and telemetry broadcast.
@@ -1547,6 +1554,8 @@ impl TickWindow {
     pub fn snapshot(&self) -> TickSnapshot {
         TickSnapshot {
             instance_id: String::new(),
+            boot_id: None,
+            process_start_unix_ns: None,
             window: self.rows.len(),
             tick_us: self.col(|r| r.tick_us),
             release_us: self.col(|r| r.release_us),

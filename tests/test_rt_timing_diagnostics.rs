@@ -503,6 +503,8 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let q1_path = dir.path().join("q1_clean.jsonl");
     let mut q0 = base_tick_json(26_000, 1_500);
     q0["instance_id"] = serde_json::json!("armd-test-1");
+    q0["boot_id"] = serde_json::json!("boot-uuid-test-1");
+    q0["process_start_unix_ns"] = serde_json::json!(1_700_000_000_000_000_000u64);
     q0["owner_mode"] = serde_json::json!("executor");
     q0["stats_snapshot_lapped"] = serde_json::json!(false);
     q0["stats_writer_drops"] = serde_json::json!(0);
@@ -979,6 +981,14 @@ async fn post_publish_25ms_delay_rollover_and_baseline_mark_both_owners() {
             .await
             .unwrap();
         assert_eq!(body["owner_mode"], "executor");
+        assert!(
+            body["boot_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "GET /diagnostics/tick must expose non-empty boot_id: {body}"
+        );
+        assert!(
+            body["process_start_unix_ns"].as_u64().is_some_and(|ns| ns > 0),
+            "GET /diagnostics/tick must expose positive process_start_unix_ns: {body}"
+        );
         assert!(body["tick_us"]["max"].as_u64().unwrap() < 20_000, "tick_us should exclude post-publish delay: {body}");
         assert!(body["release_us"]["max"].as_u64().unwrap() >= 25_000, "release_us must include 25ms post-publish delay: {body}");
         assert!(body["release_us_max_ever"].as_u64().unwrap() >= 25_000);
@@ -1589,6 +1599,8 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
     let make_clean = |ticks: u64, elapsed_s: f64| -> serde_json::Value {
         let mut t = base_tick_json(20_100, 1_200);
         t["instance_id"] = serde_json::json!("armd-inst-1");
+        t["boot_id"] = serde_json::json!("boot-uuid-1111");
+        t["process_start_unix_ns"] = serde_json::json!(1_700_000_000_000_000_000u64);
         t["owner_mode"] = serde_json::json!("executor");
         t["stats_snapshot_lapped"] = serde_json::json!(false);
         t["stats_writer_drops"] = serde_json::json!(0);
@@ -1657,6 +1669,38 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
     let restart_rep = write_and_run("restart_id.jsonl", &[make_clean(100, 0.0), restart_s1]);
     assert!(restart_rep.contains("**Overall Verdict: INVALID"), "{restart_rep}");
     assert!(restart_rep.contains("instance_id changed"), "{restart_rep}");
+
+    // 3b. Kernel reboot (`boot_id` changed) or `panic = "abort"` process restart (`process_start_unix_ns` changed),
+    //     or missing/placeholder/boolean/zero boot identity -> INVALID!
+    let mut reboot_s1 = make_clean(250, 4.0);
+    reboot_s1["tick"]["boot_id"] = serde_json::json!("boot-uuid-2222");
+    let reboot_rep = write_and_run("reboot_id.jsonl", &[make_clean(100, 0.0), reboot_s1]);
+    assert!(reboot_rep.contains("**Overall Verdict: INVALID"), "{reboot_rep}");
+    assert!(reboot_rep.contains("boot_id changed"), "{reboot_rep}");
+
+    let mut proc_restart_s1 = make_clean(250, 4.0);
+    proc_restart_s1["tick"]["process_start_unix_ns"] = serde_json::json!(1_700_000_005_000_000_000u64);
+    let proc_restart_rep = write_and_run("proc_restart.jsonl", &[make_clean(100, 0.0), proc_restart_s1]);
+    assert!(proc_restart_rep.contains("**Overall Verdict: INVALID"), "{proc_restart_rep}");
+    assert!(proc_restart_rep.contains("process_start_unix_ns changed"), "{proc_restart_rep}");
+
+    let mut placeholder_boot = make_clean(250, 4.0);
+    placeholder_boot["tick"]["boot_id"] = serde_json::json!("unknown-boot");
+    let placeholder_rep = write_and_run("placeholder_boot.jsonl", &[make_clean(100, 0.0), placeholder_boot]);
+    assert!(placeholder_rep.contains("**Overall Verdict: INVALID"), "{placeholder_rep}");
+    assert!(placeholder_rep.contains("boot_id (1/2)"), "{placeholder_rep}");
+
+    let mut bool_start = make_clean(250, 4.0);
+    bool_start["tick"]["process_start_unix_ns"] = serde_json::json!(true);
+    let bool_start_rep = write_and_run("bool_start.jsonl", &[make_clean(100, 0.0), bool_start]);
+    assert!(bool_start_rep.contains("**Overall Verdict: INVALID"), "{bool_start_rep}");
+    assert!(bool_start_rep.contains("process_start_unix_ns (1/2)"), "{bool_start_rep}");
+
+    let mut zero_start = make_clean(250, 4.0);
+    zero_start["tick"]["process_start_unix_ns"] = serde_json::json!(0);
+    let zero_start_rep = write_and_run("zero_start.jsonl", &[make_clean(100, 0.0), zero_start]);
+    assert!(zero_start_rep.contains("**Overall Verdict: INVALID"), "{zero_start_rep}");
+    assert!(zero_start_rep.contains("process_start_unix_ns (1/2)"), "{zero_start_rep}");
 
     // 4. Failed poll (tick: null + tick_error) -> INVALID
     let failed_poll_line = serde_json::json!({
