@@ -75,14 +75,28 @@ impl PanicDisableOutcome {
     }
 }
 
+/// Splits a panic-disable `timeout` anchored at `origin` into `(coop_deadline, hard_deadline)`.
+///
+/// `hard_deadline` stays strictly `origin + timeout` (preserving `PANIC_DISABLE_TIMEOUT = 500 ms`
+/// and every blocking-driver bound). `coop_deadline` stops cooperative retries slightly earlier
+/// (`10%`, capped at `25 ms`) so post-loop logging, lock release, and channel/condvar handoff
+/// complete before the hard watchdog fires `TimedOut`.
+pub(crate) fn panic_disable_deadlines(origin: Instant, timeout: Duration) -> (Instant, Instant) {
+    let hard = origin + timeout;
+    let reserve = (timeout / 10).min(Duration::from_millis(25));
+    let coop = origin + timeout.saturating_sub(reserve);
+    (coop, hard)
+}
+
 /// Runs `work` on the bus owner thread (strictly preserving single-bus-writer ownership) while
-/// an independent deadline observer thread waits up to `timeout` without touching the bus or
-/// driver. If `work` blocks past `timeout` (e.g. a driver implementing only blocking `set_torque`
-/// or a stalled transport syscall), the observer fires `on_timeout` at the deadline and this
-/// function returns `None` if `work` later unblocks.
-pub fn run_with_panic_deadline_observer(
-    timeout: Duration,
+/// an independent deadline observer thread waits up to `hard_deadline` without touching the bus or
+/// driver. If `work` blocks past `hard_deadline` (e.g. a driver implementing only blocking
+/// `set_torque` or a stalled transport syscall), the observer fires `on_timeout` at the deadline
+/// and this function returns `None` if `work` later unblocks.
+pub(crate) fn run_with_panic_deadline_observer_until(
+    hard_deadline: Instant,
     work: impl FnOnce() -> PanicDisableOutcome,
+    on_complete: impl FnOnce(&PanicDisableOutcome) -> bool,
     on_timeout: impl FnOnce() + Send + 'static,
 ) -> Option<PanicDisableOutcome> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -99,7 +113,7 @@ pub fn run_with_panic_deadline_observer(
             Arc::new(std::sync::Mutex::new(Some(Box::new(on_timeout))));
         let state_obs = Arc::clone(&state);
         let on_timeout_obs = Arc::clone(&on_timeout_slot);
-        let deadline = Instant::now() + timeout;
+        let deadline = hard_deadline;
         let observer = match std::thread::Builder::new()
             .name("armd-panic-watchdog".into())
             .spawn(move || {
@@ -138,13 +152,18 @@ pub fn run_with_panic_deadline_observer(
         };
 
         let outcome = work();
-        let won = {
+        let (won, fire_timeout_inline) = {
             let mut g = state.0.lock().unwrap_or_else(|e| e.into_inner());
             if *g == ObserverState::Running {
-                *g = ObserverState::Completed;
-                true
+                if Instant::now() >= hard_deadline || !on_complete(&outcome) {
+                    *g = ObserverState::TimedOut;
+                    (false, true)
+                } else {
+                    *g = ObserverState::Completed;
+                    (true, false)
+                }
             } else {
-                false
+                (false, false)
             }
         };
         if won {
@@ -152,14 +171,38 @@ pub fn run_with_panic_deadline_observer(
             let _ = observer.join();
             Some(outcome)
         } else {
+            if fire_timeout_inline {
+                state.1.notify_all();
+                if let Some(cb) = on_timeout_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    cb();
+                }
+            }
+            // Always join observer once `work()` has returned so any in-flight `on_timeout`
+            // callback (including `timeout_hook`) completes before the caller proceeds to exit.
+            let _ = observer.join();
             None
         }
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (timeout, on_timeout);
-        Some(work())
+        let _ = (hard_deadline, on_timeout);
+        let outcome = work();
+        let _ = on_complete(&outcome);
+        Some(outcome)
     }
+}
+
+/// Runs `work` on the bus owner thread (strictly preserving single-bus-writer ownership) while
+/// an independent deadline observer thread waits up to `timeout` without touching the bus or
+/// driver. If `work` blocks past `timeout` (e.g. a driver implementing only blocking `set_torque`
+/// or a stalled transport syscall), the observer fires `on_timeout` at the deadline and this
+/// function returns `None` if `work` later unblocks.
+pub fn run_with_panic_deadline_observer(
+    timeout: Duration,
+    work: impl FnOnce() -> PanicDisableOutcome,
+    on_timeout: impl FnOnce() + Send + 'static,
+) -> Option<PanicDisableOutcome> {
+    run_with_panic_deadline_observer_until(Instant::now() + timeout, work, |_| true, on_timeout)
 }
 
 fn format_joint_list(joints: &[usize]) -> String {
@@ -172,86 +215,144 @@ fn format_joint_list(joints: &[usize]) -> String {
 /// and never exits before the budget is spent. Logs which motors remain unconfirmed when the
 /// budget expires. Callers on panic paths wrap this with [`run_with_panic_deadline_observer`]
 /// to bound drivers whose fallback `begin_torque` or transport I/O may block inside a call.
+#[allow(dead_code)]
 pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) -> PanicDisableOutcome {
-    let wall_deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
+    bounded_panic_disable_driver_until(drv, deadline, deadline, timeout)
+}
+
+pub(crate) fn bounded_panic_disable_driver_until(
+    drv: &mut dyn ArmDriver,
+    coop_deadline: Instant,
+    hard_deadline: Instant,
+    coop_budget: Duration,
+) -> PanicDisableOutcome {
     let enable_fb = drv.capabilities().enable_feedback;
 
     // Preferred per-motor selective retry path (e.g. Damiao CAN bus): sends disable to every
     // unconfirmed motor on each pass, never stops on a single motor's TX error, and keeps
-    // retrying until all motors confirm or the budget is spent.
+    // retrying until all motors confirm or the cooperative budget is spent.
     let mut first_step = true;
+    let mut last_step_err: Option<String> = None;
+    let mut use_generic = false;
     loop {
-        let rem = wall_deadline.saturating_duration_since(Instant::now());
-        let drv_deadline = drv.clock_now() + rem;
+        let drv_now = drv.clock_now();
+        let now = Instant::now();
+        if now >= hard_deadline {
+            if first_step {
+                return PanicDisableOutcome::TimedOut;
+            }
+            if enable_fb && DisableConfirm::confirmed(drv) {
+                return PanicDisableOutcome::Confirmed;
+            }
+            break;
+        }
+        let rem = coop_deadline.saturating_duration_since(now);
+        if !first_step && rem.is_zero() {
+            if enable_fb && DisableConfirm::confirmed(drv) {
+                return PanicDisableOutcome::Confirmed;
+            }
+            break;
+        }
+        let hard_rem = hard_deadline.saturating_duration_since(now);
+        let step_budget = if rem.is_zero() {
+            hard_rem.min(DISABLE_CONFIRM_SERVICE)
+        } else {
+            rem.min(hard_rem)
+        };
+        let drv_deadline = drv_now + step_budget;
         let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drv.panic_disable_step(first_step, drv_deadline)
         }));
         match step_res {
             Err(_) => return PanicDisableOutcome::Failed("driver panicked during panic_disable_step".into()),
-            Ok(None) => break, // Driver uses the generic retry loop below.
+            Ok(None) => {
+                use_generic = true;
+                break; // Driver uses the generic retry loop below.
+            }
             Ok(Some(Ok(unconfirmed))) => {
                 first_step = false;
+                last_step_err = None;
                 if !enable_fb {
                     return PanicDisableOutcome::Unconfirmed;
                 }
                 if unconfirmed.is_empty() && DisableConfirm::confirmed(drv) {
                     return PanicDisableOutcome::Confirmed;
                 }
-                let rem = wall_deadline.saturating_duration_since(Instant::now());
-                if rem.is_zero() {
-                    let final_unconfirmed = drv.unconfirmed_disable_joints();
-                    tracing::error!(
-                        "Bounded panic disable budget ({} ms) exhausted; unconfirmed motors: [{}]",
-                        timeout.as_millis(),
-                        format_joint_list(&final_unconfirmed)
-                    );
-                    return PanicDisableOutcome::Unconfirmed;
-                }
-                std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
             }
             Ok(Some(Err(e))) => {
                 first_step = false;
                 tracing::warn!("Panic disable step error (retrying within budget): {e}");
-                let rem = wall_deadline.saturating_duration_since(Instant::now());
-                if rem.is_zero() {
-                    let final_unconfirmed = drv.unconfirmed_disable_joints();
-                    tracing::error!(
-                        "Bounded panic disable budget ({} ms) exhausted after error ({e}); unconfirmed motors: [{}]",
-                        timeout.as_millis(),
-                        format_joint_list(&final_unconfirmed)
-                    );
-                    return PanicDisableOutcome::Unconfirmed;
-                }
-                std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+                last_step_err = Some(e.to_string());
             }
         }
+        let rem = coop_deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+    }
+
+    if !use_generic {
+        let final_unconfirmed = drv.unconfirmed_disable_joints();
+        tracing::error!(
+            "Bounded panic disable cooperative budget ({} ms) exhausted{}; unconfirmed motors: [{}]",
+            coop_budget.as_millis(),
+            last_step_err.as_deref().map(|e| format!(" after error ({e})")).unwrap_or_default(),
+            format_joint_list(&final_unconfirmed)
+        );
+        return PanicDisableOutcome::Unconfirmed;
     }
 
     // Generic retry loop for drivers that do not implement `panic_disable_step`: retry disable
-    // sends and feedback confirmation until confirmed or `wall_deadline` is spent.
+    // sends and feedback confirmation until confirmed or `coop_deadline` is spent.
     let mut states_buf = Vec::new();
     let mut any_send_ok = false;
     let mut last_err: Option<String> = None;
     let mut attempt = 0u32;
     loop {
+        let now = Instant::now();
+        if now >= hard_deadline {
+            if attempt == 0 {
+                return PanicDisableOutcome::TimedOut;
+            }
+            break;
+        }
+        if attempt > 0 && coop_deadline.saturating_duration_since(now).is_zero() {
+            break;
+        }
         attempt += 1;
         let begin_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drv.begin_torque_budgeted(false, 0)
+            let now = Instant::now();
+            if now >= hard_deadline || (attempt > 1 && now >= coop_deadline) {
+                return Err(None);
+            }
+            drv.begin_torque_budgeted(false, 0).map_err(Some)
         }));
         match begin_res {
             Err(_) => return PanicDisableOutcome::Failed("driver panicked during begin_torque(false)".into()),
-            Ok(Err(e)) => {
+            Ok(Err(None)) => {
+                if attempt == 1 {
+                    return PanicDisableOutcome::TimedOut;
+                }
+                break;
+            }
+            Ok(Err(Some(e))) => {
                 tracing::warn!("Panic disable begin_torque(false) attempt {attempt} failed (retrying within budget): {e}");
                 last_err = Some(e.to_string());
             }
             Ok(Ok(mut progress)) => {
                 any_send_ok = true;
                 while matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
-                    let rem = wall_deadline.saturating_duration_since(Instant::now());
+                    let drv_now = drv.clock_now();
+                    let now = Instant::now();
+                    let rem = coop_deadline
+                        .saturating_duration_since(now)
+                        .min(hard_deadline.saturating_duration_since(now));
                     if rem.is_zero() {
                         break;
                     }
-                    let drv_deadline = drv.clock_now() + rem;
+                    let drv_deadline = drv_now + rem;
                     let poll_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         drv.poll_torque_budgeted(drv_deadline, 64)
                     }));
@@ -269,7 +370,7 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
                         }
                     }
                     if matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
-                        let rem = wall_deadline.saturating_duration_since(Instant::now());
+                        let rem = coop_deadline.saturating_duration_since(Instant::now());
                         if rem.is_zero() {
                             break;
                         }
@@ -285,11 +386,15 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
         if enable_fb && DisableConfirm::confirmed(drv) {
             return PanicDisableOutcome::Confirmed;
         }
-        let rem = wall_deadline.saturating_duration_since(Instant::now());
+        let drv_now = drv.clock_now();
+        let now = Instant::now();
+        let rem = coop_deadline
+            .saturating_duration_since(now)
+            .min(hard_deadline.saturating_duration_since(now));
         if rem.is_zero() {
             break;
         }
-        let drv_deadline = drv.clock_now() + rem;
+        let drv_deadline = drv_now + rem;
         let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drv.read_joint_states_budgeted(&mut states_buf, drv_deadline, 64)
         }));
@@ -299,7 +404,7 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
         if enable_fb && DisableConfirm::confirmed(drv) {
             return PanicDisableOutcome::Confirmed;
         }
-        let rem = wall_deadline.saturating_duration_since(Instant::now());
+        let rem = coop_deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
             break;
         }
@@ -312,7 +417,7 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
     let unconfirmed = drv.unconfirmed_disable_joints();
     tracing::error!(
         "Bounded panic disable budget ({} ms) exhausted; unconfirmed motors: [{}]{}",
-        timeout.as_millis(),
+        coop_budget.as_millis(),
         format_joint_list(&unconfirmed),
         last_err.as_deref().map(|e| format!(" (last error: {e})")).unwrap_or_default()
     );
@@ -2879,21 +2984,44 @@ impl SupervisorInner {
 
     /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
     /// Uses bounded `try_lock()` so a contended driver mutex cannot block indefinitely past `timeout`.
+    /// Runs synchronously on the caller holding `&mut SupervisorInner` (preserving exclusive driver
+    /// ownership) while logging timeout independently at `hard_deadline`.
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.disable_requested();
+        let origin = Instant::now();
+        let (coop_deadline, hard_deadline) = panic_disable_deadlines(origin, timeout);
+        let coop_budget = coop_deadline.saturating_duration_since(origin);
+        run_with_panic_deadline_observer_until(
+            hard_deadline,
+            || self.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget),
+            |_| true,
+            move || {
+                PanicDisableOutcome::TimedOut.log("Bounded panic disable", timeout);
+            },
+        )
+        .unwrap_or(PanicDisableOutcome::TimedOut)
+    }
+
+    pub(crate) fn attempt_panic_disable_until(
+        &mut self,
+        coop_deadline: Instant,
+        hard_deadline: Instant,
+        coop_budget: Duration,
+    ) -> PanicDisableOutcome {
         self.e_stop_latched.store(true, Ordering::SeqCst);
         self.disable_requested();
         let Some(ref d) = self.driver else {
             self.disable_confirmed();
             return PanicDisableOutcome::NoDriver;
         };
-        let wall_deadline = Instant::now() + timeout;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut drv = loop {
                 match d.try_lock() {
                     Ok(g) => break g,
                     Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => {
-                        let rem = wall_deadline.saturating_duration_since(Instant::now());
+                        let rem = hard_deadline.saturating_duration_since(Instant::now());
                         if rem.is_zero() {
                             return PanicDisableOutcome::TimedOut;
                         }
@@ -2901,11 +3029,10 @@ impl SupervisorInner {
                     }
                 }
             };
-            let rem = wall_deadline.saturating_duration_since(Instant::now());
-            if rem.is_zero() {
+            if Instant::now() >= hard_deadline {
                 return PanicDisableOutcome::TimedOut;
             }
-            bounded_panic_disable_driver(&mut **drv, rem)
+            bounded_panic_disable_driver_until(&mut **drv, coop_deadline, hard_deadline, coop_budget)
         }))
         .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during driver panic-disable".into()));
         if outcome == PanicDisableOutcome::Confirmed {
@@ -2994,4 +3121,464 @@ fn describe_workspace_slot_bounded(
         (depth, 0.0)
     };
     W::Constraint { limit, point: gi, cid, gid, depth, value, bound }
+}
+
+#[cfg(test)]
+mod panic_disable_tests {
+    use super::*;
+    use crate::driver::{ArmDriverError, TorqueOutcome, TorqueProgress};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    struct SelectiveMockDriver {
+        selective_calls: Arc<AtomicUsize>,
+        generic_begin_calls: Arc<AtomicUsize>,
+        sleep_on_step: Duration,
+        step_result: Result<Vec<usize>, ArmDriverError>,
+    }
+
+    impl ArmDriver for SelectiveMockDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                enable_feedback: true,
+                ..DriverCapabilities::default()
+            }
+        }
+        fn is_enabled(&self) -> bool { true }
+        fn enable_state(&self) -> EnableState { EnableState::Unknown }
+        fn is_feedback_valid(&self) -> bool { false }
+        fn read_joint_states(&mut self) -> Result<Vec<crate::model::JointState>, ArmDriverError> {
+            Ok(Vec::new())
+        }
+        fn write_joint_targets(&mut self, _: &[crate::driver::JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn begin_torque_budgeted(
+            &mut self,
+            _: bool,
+            _: u16,
+        ) -> Result<TorqueProgress, ArmDriverError> {
+            self.generic_begin_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
+        }
+        fn panic_disable_step(
+            &mut self,
+            _first: bool,
+            _deadline: Instant,
+        ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+            self.selective_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.sleep_on_step.is_zero() {
+                std::thread::sleep(self.sleep_on_step);
+            }
+            Some(match &self.step_result {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(ArmDriverError::HardwareFault(e.to_string())),
+            })
+        }
+        fn unconfirmed_disable_joints(&self) -> Vec<usize> {
+            vec![2]
+        }
+    }
+
+    struct GenericMockDriver {
+        generic_begin_calls: Arc<AtomicUsize>,
+        sleep_on_begin: Duration,
+    }
+
+    impl ArmDriver for GenericMockDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                enable_feedback: true,
+                ..DriverCapabilities::default()
+            }
+        }
+        fn is_enabled(&self) -> bool { true }
+        fn enable_state(&self) -> EnableState { EnableState::Unknown }
+        fn is_feedback_valid(&self) -> bool { false }
+        fn read_joint_states(&mut self) -> Result<Vec<crate::model::JointState>, ArmDriverError> {
+            Ok(Vec::new())
+        }
+        fn read_joint_states_budgeted(
+            &mut self,
+            out: &mut Vec<crate::model::JointState>,
+            _deadline: Instant,
+            _max_rx_frames: u16,
+        ) -> Result<(u16, bool), ArmDriverError> {
+            out.clear();
+            Ok((0, false))
+        }
+        fn write_joint_targets(&mut self, _: &[crate::driver::JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn begin_torque_budgeted(
+            &mut self,
+            _: bool,
+            _: u16,
+        ) -> Result<TorqueProgress, ArmDriverError> {
+            self.generic_begin_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.sleep_on_begin.is_zero() {
+                std::thread::sleep(self.sleep_on_begin);
+            }
+            Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
+        }
+        fn unconfirmed_disable_joints(&self) -> Vec<usize> {
+            vec![0]
+        }
+    }
+
+    struct ProbeThenGenericMockDriver {
+        selective_calls: Arc<AtomicUsize>,
+        generic_begin_calls: Arc<AtomicUsize>,
+        sleep_on_probe: Duration,
+    }
+
+    impl ArmDriver for ProbeThenGenericMockDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                enable_feedback: true,
+                ..DriverCapabilities::default()
+            }
+        }
+        fn is_enabled(&self) -> bool { true }
+        fn enable_state(&self) -> EnableState { EnableState::Unknown }
+        fn is_feedback_valid(&self) -> bool { false }
+        fn read_joint_states(&mut self) -> Result<Vec<crate::model::JointState>, ArmDriverError> {
+            Ok(Vec::new())
+        }
+        fn write_joint_targets(&mut self, _: &[crate::driver::JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn begin_torque_budgeted(
+            &mut self,
+            _: bool,
+            _: u16,
+        ) -> Result<TorqueProgress, ArmDriverError> {
+            self.generic_begin_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))
+        }
+        fn panic_disable_step(
+            &mut self,
+            _first: bool,
+            _deadline: Instant,
+        ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+            self.selective_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.sleep_on_probe.is_zero() {
+                std::thread::sleep(self.sleep_on_probe);
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn panic_disable_deadlines_reserves_tail_within_hard_bound() {
+        let origin = Instant::now();
+        assert_eq!(
+            panic_disable_deadlines(origin, Duration::from_millis(500)),
+            (origin + Duration::from_millis(475), origin + Duration::from_millis(500))
+        );
+        assert_eq!(
+            panic_disable_deadlines(origin, Duration::from_millis(80)),
+            (origin + Duration::from_millis(72), origin + Duration::from_millis(80))
+        );
+        assert_eq!(
+            panic_disable_deadlines(origin, Duration::from_millis(60)),
+            (origin + Duration::from_millis(54), origin + Duration::from_millis(60))
+        );
+        assert_eq!(
+            panic_disable_deadlines(origin, Duration::ZERO),
+            (origin, origin)
+        );
+    }
+
+    #[test]
+    fn bounded_panic_disable_driver_no_extra_step_after_deadline_and_no_generic_fallthrough() {
+        let selective_calls = Arc::new(AtomicUsize::new(0));
+        let generic_begin_calls = Arc::new(AtomicUsize::new(0));
+        let mut drv = SelectiveMockDriver {
+            selective_calls: Arc::clone(&selective_calls),
+            generic_begin_calls: Arc::clone(&generic_begin_calls),
+            sleep_on_step: Duration::from_millis(25),
+            step_result: Ok(vec![2]),
+        };
+        let origin = Instant::now();
+        let coop_budget = Duration::from_millis(15);
+        let coop_deadline = origin + coop_budget;
+        let hard_deadline = origin + Duration::from_millis(40);
+        let outcome = bounded_panic_disable_driver_until(
+            &mut drv,
+            coop_deadline,
+            hard_deadline,
+            coop_budget,
+        );
+        assert_eq!(outcome, PanicDisableOutcome::Unconfirmed);
+        assert_eq!(selective_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(generic_begin_calls.load(Ordering::SeqCst), 0);
+
+        // Top-of-loop sleep wakeup case: step 1 completes immediately, sleep wakes after
+        // `coop_budget` (1ms), and top-of-loop check exits without calling step 2.
+        let selective_calls_wake = Arc::new(AtomicUsize::new(0));
+        let generic_begin_calls_wake = Arc::new(AtomicUsize::new(0));
+        let mut drv_wake = SelectiveMockDriver {
+            selective_calls: Arc::clone(&selective_calls_wake),
+            generic_begin_calls: Arc::clone(&generic_begin_calls_wake),
+            sleep_on_step: Duration::ZERO,
+            step_result: Ok(vec![2]),
+        };
+        let origin_wake = Instant::now();
+        let coop_budget_wake = Duration::from_millis(1);
+        let outcome_wake = bounded_panic_disable_driver_until(
+            &mut drv_wake,
+            origin_wake + coop_budget_wake,
+            origin_wake + Duration::from_millis(50),
+            coop_budget_wake,
+        );
+        assert_eq!(outcome_wake, PanicDisableOutcome::Unconfirmed);
+        assert_eq!(selective_calls_wake.load(Ordering::SeqCst), 1);
+        assert_eq!(generic_begin_calls_wake.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_panic_disable_driver_expired_at_entry_and_generic_probe_expiry() {
+        // Expired at entry: zero selective or generic calls, returns TimedOut.
+        let selective_calls = Arc::new(AtomicUsize::new(0));
+        let generic_begin_calls = Arc::new(AtomicUsize::new(0));
+        let mut drv = SelectiveMockDriver {
+            selective_calls: Arc::clone(&selective_calls),
+            generic_begin_calls: Arc::clone(&generic_begin_calls),
+            sleep_on_step: Duration::ZERO,
+            step_result: Ok(vec![2]),
+        };
+        let expired = Instant::now();
+        let outcome = bounded_panic_disable_driver_until(&mut drv, expired, expired, Duration::ZERO);
+        assert_eq!(outcome, PanicDisableOutcome::TimedOut);
+        assert_eq!(selective_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(generic_begin_calls.load(Ordering::SeqCst), 0);
+
+        // Selective probe returns `None` after sleeping past `hard_deadline`: generic fallback
+        // must see `now >= hard_deadline` and return `TimedOut` with zero `begin_torque_budgeted` calls.
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let generic_calls = Arc::new(AtomicUsize::new(0));
+        let mut drv_probe = ProbeThenGenericMockDriver {
+            selective_calls: Arc::clone(&probe_calls),
+            generic_begin_calls: Arc::clone(&generic_calls),
+            sleep_on_probe: Duration::from_millis(25),
+        };
+        let origin = Instant::now();
+        let outcome_probe = bounded_panic_disable_driver_until(
+            &mut drv_probe,
+            origin + Duration::from_millis(10),
+            origin + Duration::from_millis(15),
+            Duration::from_millis(10),
+        );
+        assert_eq!(outcome_probe, PanicDisableOutcome::TimedOut);
+        assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(generic_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_panic_disable_driver_generic_no_extra_attempt_after_deadline() {
+        let generic_begin_calls = Arc::new(AtomicUsize::new(0));
+        let mut drv = GenericMockDriver {
+            generic_begin_calls: Arc::clone(&generic_begin_calls),
+            sleep_on_begin: Duration::from_millis(25),
+        };
+        let origin = Instant::now();
+        let coop_budget = Duration::from_millis(15);
+        let coop_deadline = origin + coop_budget;
+        let hard_deadline = origin + Duration::from_millis(40);
+        let outcome = bounded_panic_disable_driver_until(
+            &mut drv,
+            coop_deadline,
+            hard_deadline,
+            coop_budget,
+        );
+        assert_eq!(outcome, PanicDisableOutcome::Unconfirmed);
+        assert_eq!(generic_begin_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn attempt_panic_disable_until_rejects_new_hardware_tx_after_hard_deadline() {
+        let selective_calls = Arc::new(AtomicUsize::new(0));
+        let generic_begin_calls = Arc::new(AtomicUsize::new(0));
+        let drv = SelectiveMockDriver {
+            selective_calls: Arc::clone(&selective_calls),
+            generic_begin_calls: Arc::clone(&generic_begin_calls),
+            sleep_on_step: Duration::ZERO,
+            step_result: Ok(vec![2]),
+        };
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
+        let expired = Instant::now();
+        let outcome = inner.attempt_panic_disable_until(expired, expired, Duration::ZERO);
+        assert_eq!(outcome, PanicDisableOutcome::TimedOut);
+        assert_eq!(selective_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(generic_begin_calls.load(Ordering::SeqCst), 0);
+
+        // Contended driver mutex held across `hard_deadline` returns TimedOut with 0 hardware TX.
+        let drv_held = SelectiveMockDriver {
+            selective_calls: Arc::clone(&selective_calls),
+            generic_begin_calls: Arc::clone(&generic_begin_calls),
+            sleep_on_step: Duration::ZERO,
+            step_result: Ok(vec![2]),
+        };
+        let mut inner_held = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_held));
+        // Safe Rust cannot hold a borrow of `inner_held.driver` across `&mut inner_held`;
+        // leaking the guard keeps `try_lock()` contended until `hard_deadline` expires.
+        let leaked_guard = inner_held.driver.as_ref().unwrap().lock().unwrap();
+        std::mem::forget(leaked_guard);
+        let origin_held = Instant::now();
+        let outcome_held = inner_held.attempt_panic_disable_until(
+            origin_held + Duration::from_millis(5),
+            origin_held + Duration::from_millis(10),
+            Duration::from_millis(5),
+        );
+        assert_eq!(outcome_held, PanicDisableOutcome::TimedOut);
+        assert_eq!(selective_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(generic_begin_calls.load(Ordering::SeqCst), 0);
+
+        // Legacy lock contention clearing after `hard_deadline`: `inner` write lock held past
+        // `timeout` and then released -> `attempt_legacy_panic_disable` returns `TimedOut`
+        // with 0 hardware TX.
+        let sup_calls = Arc::new(AtomicUsize::new(0));
+        let sup_generic = Arc::new(AtomicUsize::new(0));
+        let drv_sup = SelectiveMockDriver {
+            selective_calls: Arc::clone(&sup_calls),
+            generic_begin_calls: Arc::clone(&sup_generic),
+            sleep_on_step: Duration::ZERO,
+            step_result: Ok(vec![2]),
+        };
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_sup)));
+        let inner_arc = Arc::clone(sup.inner());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (rel_tx, rel_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = inner_arc.blocking_write();
+            let _ = locked_tx.send(());
+            let _ = rel_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let legacy_outcome = sup.attempt_legacy_panic_disable(Duration::from_millis(12));
+        rel_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(legacy_outcome, PanicDisableOutcome::TimedOut);
+        assert_eq!(sup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sup_generic.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn run_with_panic_deadline_observer_until_completes_before_hard_deadline_and_fires_when_blocked() {
+        let complete_a = Arc::new(AtomicBool::new(false));
+        let complete_a_cb = Arc::clone(&complete_a);
+        let timeout_a = Arc::new(AtomicBool::new(false));
+        let timeout_a_cb = Arc::clone(&timeout_a);
+        let res_a = run_with_panic_deadline_observer_until(
+            Instant::now() + Duration::from_millis(100),
+            || PanicDisableOutcome::Unconfirmed,
+            |outcome| {
+                assert_eq!(*outcome, PanicDisableOutcome::Unconfirmed);
+                complete_a_cb.store(true, Ordering::SeqCst);
+                true
+            },
+            move || {
+                timeout_a_cb.store(true, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(res_a, Some(PanicDisableOutcome::Unconfirmed));
+        assert!(complete_a.load(Ordering::SeqCst));
+        assert!(!timeout_a.load(Ordering::SeqCst));
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_cb = Arc::clone(&gate);
+        let timeout_b = Arc::new(AtomicBool::new(false));
+        let timeout_b_cb = Arc::clone(&timeout_b);
+        let complete_b = Arc::new(AtomicBool::new(false));
+        let complete_b_cb = Arc::clone(&complete_b);
+        let res_b = run_with_panic_deadline_observer_until(
+            Instant::now() + Duration::from_millis(15),
+            || {
+                let mut done = gate.0.lock().unwrap();
+                while !*done {
+                    done = gate.1.wait(done).unwrap();
+                }
+                PanicDisableOutcome::Unconfirmed
+            },
+            |_| {
+                complete_b_cb.store(true, Ordering::SeqCst);
+                true
+            },
+            move || {
+                timeout_b_cb.store(true, Ordering::SeqCst);
+                let mut done = gate_cb.0.lock().unwrap();
+                *done = true;
+                gate_cb.1.notify_all();
+            },
+        );
+        assert_eq!(res_b, None);
+        assert!(!complete_b.load(Ordering::SeqCst));
+        assert!(timeout_b.load(Ordering::SeqCst));
+
+        // Subcase (c): work completes slightly past `hard_deadline` (racing observer wake):
+        // single-winner arbitration must return `None`, NOT fire `on_complete`, and fire `on_timeout` once.
+        let complete_c = Arc::new(AtomicBool::new(false));
+        let complete_c_cb = Arc::clone(&complete_c);
+        let timeout_c_count = Arc::new(AtomicUsize::new(0));
+        let timeout_c_cb = Arc::clone(&timeout_c_count);
+        let res_c = run_with_panic_deadline_observer_until(
+            Instant::now(),
+            || {
+                std::thread::sleep(Duration::from_millis(2));
+                PanicDisableOutcome::Unconfirmed
+            },
+            |_| {
+                complete_c_cb.store(true, Ordering::SeqCst);
+                true
+            },
+            move || {
+                timeout_c_cb.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(res_c, None);
+        assert!(!complete_c.load(Ordering::SeqCst));
+        assert_eq!(timeout_c_count.load(Ordering::SeqCst), 1);
+
+        // Subcase (d): `on_timeout` blocks on a barrier while `work()` unblocks and returns;
+        // `run_with_panic_deadline_observer_until` must NOT return `None` until `on_timeout` finishes.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (work_done_tx, work_done_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let timeout_finished = Arc::new(AtomicBool::new(false));
+        let timeout_finished_cb = Arc::clone(&timeout_finished);
+        let runner_returned = Arc::new(AtomicBool::new(false));
+        let runner_returned_th = Arc::clone(&runner_returned);
+        let runner = std::thread::spawn(move || {
+            let res = run_with_panic_deadline_observer_until(
+                Instant::now() + Duration::from_millis(5),
+                || {
+                    started_rx.recv().unwrap();
+                    let _ = work_done_tx.send(());
+                    PanicDisableOutcome::Unconfirmed
+                },
+                |_| true,
+                move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv().unwrap();
+                    timeout_finished_cb.store(true, Ordering::SeqCst);
+                },
+            );
+            runner_returned_th.store(true, Ordering::SeqCst);
+            res
+        });
+        work_done_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            !runner_returned.load(Ordering::SeqCst),
+            "observer_until must wait for in-flight on_timeout before returning None"
+        );
+        release_tx.send(()).unwrap();
+        let res_d = runner.join().unwrap();
+        assert_eq!(res_d, None);
+        assert!(timeout_finished.load(Ordering::SeqCst));
+    }
 }

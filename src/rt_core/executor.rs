@@ -1687,6 +1687,23 @@ impl TeardownDisable {
         self.done.notify_all();
     }
 
+    fn try_set_outcome_before(
+        &self,
+        outcome: crate::supervisor::PanicDisableOutcome,
+        hard_deadline: Instant,
+    ) -> bool {
+        let mut g = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some() || Instant::now() >= hard_deadline {
+            return false;
+        }
+        if outcome == crate::supervisor::PanicDisableOutcome::TimedOut {
+            self.timed_out.store(true, Ordering::Release);
+        }
+        *g = Some(outcome);
+        self.done.notify_all();
+        true
+    }
+
     fn wait_outcome(&self, timeout: Duration) -> Option<crate::supervisor::PanicDisableOutcome> {
         let deadline = Instant::now() + timeout;
         let mut g = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
@@ -2086,6 +2103,16 @@ impl RtExecutorHandle {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or(crate::supervisor::PanicDisableOutcome::TimedOut)
+    }
+
+    #[doc(hidden)]
+    pub fn last_teardown_disable_outcome(&self) -> Option<crate::supervisor::PanicDisableOutcome> {
+        self.shared
+            .teardown_disable
+            .outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -4310,11 +4337,15 @@ fn control_thread_main(
             let exited_obs = Arc::clone(&exited);
             let hub_obs = Arc::clone(&hub);
             let timeout_hook = state.hooks.on_panic_disable_timeout.clone();
-            let completed = crate::supervisor::run_with_panic_deadline_observer(
-                disable_timeout,
+            let origin = Instant::now();
+            let (coop_deadline, hard_deadline) =
+                crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
+            let coop_budget = coop_deadline.saturating_duration_since(origin);
+            let completed = crate::supervisor::run_with_panic_deadline_observer_until(
+                hard_deadline,
                 || {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        core.attempt_panic_disable(disable_timeout)
+                        core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
                     }))
                     .unwrap_or_else(|_| {
                         crate::supervisor::PanicDisableOutcome::Failed(
@@ -4322,10 +4353,11 @@ fn control_thread_main(
                         )
                     })
                 },
+                |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
                 move || {
                     let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
+                    td_obs.set_outcome(timed_out.clone());
                     timed_out.log("RT executor panic", disable_timeout);
-                    td_obs.set_outcome(timed_out);
                     match policy {
                         PanicPolicy::AbortProcess => {
                             crate::diagnostics::logwriter::flush_all(Duration::from_millis(200));
@@ -4345,7 +4377,6 @@ fn control_thread_main(
             );
             if let Some(outcome) = completed {
                 outcome.log("RT executor panic", disable_timeout);
-                teardown_disable.set_outcome(outcome);
                 match cfg.panic_policy {
                     PanicPolicy::AbortProcess => {
                         crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
@@ -4378,11 +4409,15 @@ fn control_thread_main(
             .panic_disable_timeout
             .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
         let td_obs = Arc::clone(&teardown_disable);
-        let completed = crate::supervisor::run_with_panic_deadline_observer(
-            disable_timeout,
+        let origin = Instant::now();
+        let (coop_deadline, hard_deadline) =
+            crate::supervisor::panic_disable_deadlines(origin, disable_timeout);
+        let coop_budget = coop_deadline.saturating_duration_since(origin);
+        let completed = crate::supervisor::run_with_panic_deadline_observer_until(
+            hard_deadline,
             || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    core.attempt_panic_disable(disable_timeout)
+                    core.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
                 }))
                 .unwrap_or_else(|_| {
                     crate::supervisor::PanicDisableOutcome::Failed(
@@ -4390,15 +4425,15 @@ fn control_thread_main(
                     )
                 })
             },
+            |outcome| teardown_disable.try_set_outcome_before(outcome.clone(), hard_deadline),
             move || {
                 let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
+                td_obs.set_outcome(timed_out.clone());
                 timed_out.log("RT executor emergency shutdown", disable_timeout);
-                td_obs.set_outcome(timed_out);
             },
         );
         if let Some(outcome) = completed {
             outcome.log("RT executor emergency shutdown", disable_timeout);
-            teardown_disable.set_outcome(outcome);
         }
     }
 

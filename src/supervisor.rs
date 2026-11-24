@@ -30,6 +30,7 @@ mod actions;
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
 pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
+pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until};
 
 /// Global monotonic allocator for single-use [`AdmissionStamp::request_id`] values.
 static NEXT_ADMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -7495,17 +7496,23 @@ impl ArmSupervisor {
     /// Bounded last-chance hardware disable for the legacy control-thread panic handler.
     /// Latches E-stop immediately and attempts one disable through the legacy driver within
     /// `timeout` without ever blocking indefinitely (even if another task holds `inner` or a
-    /// blocking transport syscall stalls).
+    /// blocking transport syscall stalls). `timeout` is the hard upper bound, with a small
+    /// internal cooperative reserve so clean `Unconfirmed` exhaustion finishes logging, lock
+    /// release, and channel handoff before `rx.recv_timeout` triggers `TimedOut`.
     pub fn attempt_legacy_panic_disable(&self, timeout: Duration) -> PanicDisableOutcome {
         self.e_stop_latched.store(true, Ordering::SeqCst);
         self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
-        let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>, deadline: Instant| -> PanicDisableOutcome {
+        let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>,
+                          coop_deadline: Instant,
+                          hard_deadline: Instant,
+                          coop_budget: Duration|
+         -> PanicDisableOutcome {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut guard = loop {
                     if let Ok(g) = inner.try_write() {
                         break g;
                     }
-                    let rem = deadline.saturating_duration_since(Instant::now());
+                    let rem = hard_deadline.saturating_duration_since(Instant::now());
                     if rem.is_zero() {
                         return PanicDisableOutcome::TimedOut;
                     }
@@ -7514,16 +7521,17 @@ impl ArmSupervisor {
                 if guard.detached {
                     return PanicDisableOutcome::NoDriver;
                 }
-                let rem = deadline.saturating_duration_since(Instant::now());
-                if rem.is_zero() {
+                if Instant::now() >= hard_deadline {
                     return PanicDisableOutcome::TimedOut;
                 }
-                guard.attempt_panic_disable(rem)
+                guard.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
             }))
             .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during legacy panic-disable".into()))
         };
 
-        let deadline = Instant::now() + timeout;
+        let origin = Instant::now();
+        let (coop_deadline, hard_deadline) = driver_transitions::panic_disable_deadlines(origin, timeout);
+        let coop_budget = coop_deadline.saturating_duration_since(origin);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let inner = Arc::clone(&self.inner);
@@ -7531,16 +7539,19 @@ impl ArmSupervisor {
             match std::thread::Builder::new()
                 .name("armd-panic-disable".into())
                 .spawn(move || {
-                    let outcome = run_inline(inner, deadline);
-                    let _ = tx.send(outcome);
+                    let outcome = run_inline(inner, coop_deadline, hard_deadline, coop_budget);
+                    let _ = tx.send((outcome, Instant::now()));
                 }) {
-                Ok(_) => match rx.recv_timeout(timeout) {
-                    Ok(outcome) => outcome,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PanicDisableOutcome::TimedOut,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
+                Ok(_) => {
+                    let wait = hard_deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(wait) {
+                        Ok((outcome, completed_at)) if completed_at < hard_deadline => outcome,
+                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PanicDisableOutcome::TimedOut,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     // Never fall back to an unbounded inline driver call when the bounded
                     // helper thread cannot be spawned; only confirm NoDriver via non-blocking try_write.
@@ -7557,7 +7568,7 @@ impl ArmSupervisor {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            run_inline(Arc::clone(&self.inner), deadline)
+            run_inline(Arc::clone(&self.inner), coop_deadline, hard_deadline, coop_budget)
         }
     }
 
