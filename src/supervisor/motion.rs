@@ -100,7 +100,7 @@ impl SupervisorInner {
         self.pending_normal_unload = false;
         self.unload_settle = None;
         self.active_trajectory = None;
-        self.servo_target = None;
+        self.release_servo_target();
 
         // Lock onto measured_positions only when finite and the supervisor's own coherent
         // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
@@ -158,10 +158,10 @@ impl SupervisorInner {
                 for (dst, &src) in run.kd.iter_mut().zip(&run.policy.hold_kd) { *dst = src; }
                 self.tracking.invalidate();
                 let at = self.start_time.elapsed().as_secs_f64();
-                tracing::warn!("Gravity compensation exit: ESTOP E-stop");
+                self.safety.log_gravity_comp_estop_exit();
                 self.gravity_comp_last_exit = Some(crate::model::GravityCompExit {
-                    code: "ESTOP".into(),
-                    message: "E-stop".into(),
+                    code: crate::model::HolderLabel::new("ESTOP"),
+                    message: crate::model::HolderLabel::new("E-stop"),
                     at,
                 });
                 exited_gravity_comp = true;
@@ -174,15 +174,17 @@ impl SupervisorInner {
         }
         // Send the stiff MIT exit hold immediately when uncontended; never block on a held mutex.
         if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
-            if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), driver) {
+            if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), driver) {
                 if let Ok(mut drv) = d.try_lock() {
                     if let Err(e) = drv.write_estop_hold(&targets) {
-                        tracing::error!("Gravity comp hold write failed: {e}");
+                        let mut msg = crate::safety::BoundedText::<160>::empty();
+                        e.write_bounded(&mut msg);
+                        self.safety.log_gravity_comp_hold_write_failed(msg);
                     }
                 }
             }
         }
-        self.safety.trigger_e_stop();
+        self.safety.latch(crate::safety::FaultKind::Estop, crate::safety::FaultDetail::Estop);
     }
 
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
@@ -207,7 +209,7 @@ impl SupervisorInner {
             tracing::warn!("NormalUnload unsupported: resting pose or confirmed velocity/torque/enable feedback unavailable; no unload motion started");
             return;
         }
-        self.servo_target = None;
+        self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
         self.servo_stream_active = false;
@@ -390,12 +392,22 @@ impl SupervisorInner {
                 self.stop_motion();
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
+                self.thermal_below_since = None;
                 let (joint_idx, temperature) = self.temperatures.iter().copied().enumerate()
                     .filter(|(_, t)| t.is_finite()).max_by(|a,b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
-                if !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
-                    self.safety.trigger_fault(FaultReason::ThermalTrip { joint_idx, temperature, limit: self.config.max_temperature });
+                self.safety.latch(
+                    crate::safety::FaultKind::ThermalTrip,
+                    crate::safety::FaultDetail::ThermalTrip {
+                        joint_idx,
+                        temperature,
+                        limit: self.config.max_temperature,
+                    },
+                );
+                if !self.disable_pending
+                    || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
+                {
+                    if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }
                 }
-                if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }
             }
             StopPolicy::BusLossFallback => {
                 self.exit_gravity_comp("BUS_LOSS", "CAN feedback lost");
@@ -404,22 +416,21 @@ impl SupervisorInner {
                 self.pending_normal_unload = false;
                 self.unload_settle = None;
                 self.active_trajectory = None;
-                self.servo_target = None;
-                let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
+                self.release_servo_target();
+                if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
                 {
-                    self.measured_positions.clone()
-                } else {
-                    self.commanded_positions.clone()
-                };
-                self.target_positions = hold_pos.clone();
-                self.commanded_positions = hold_pos;
-                self.commanded_velocities = vec![0.0; self.config.dof];
-                if self.driver.is_none() {
-                    self.measured_velocities = vec![0.0; self.config.dof];
+                    crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
                 }
-                self.bus_loss_instant = Some(Instant::now());
-                self.safety.trigger_fault(FaultReason::BusLoss);
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+                self.commanded_velocities.fill(0.0);
+                if self.driver.is_none() {
+                    self.measured_velocities.fill(0.0);
+                }
+                if self.bus_loss_instant.is_none() {
+                    self.bus_loss_instant = Some(Instant::now());
+                }
+                self.safety.latch(crate::safety::FaultKind::BusLoss, crate::safety::FaultDetail::BusLoss);
             }
         }
     }
@@ -558,7 +569,7 @@ impl SupervisorInner {
         let Some(mut park) = self.watchdog_park.take() else { return; };
         if !self.pending_normal_unload {
             tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
-            if self.is_torqued && !self.safety.state().is_stopped() {
+            if self.is_torqued {
                 self.latch_watchdog_fault();
             }
             return;
@@ -583,57 +594,96 @@ impl SupervisorInner {
         self.latch_watchdog_fault();
     }
 
-    /// Conditions for parking automatically when the lease watchdog expires.
-    /// Returns the reason the park is not allowed, or `None` when it is.
-    pub(super) fn watchdog_park_blocker(&self) -> Option<String> {
-        let Some(policy) = &self.config.resting_pose else { return Some("no resting pose configured".into()); };
-        if !self.supports_automatic_unload() { return Some("driver lacks velocity/torque/enable feedback".into()); }
-        if self.e_stop_latched.load(Ordering::SeqCst) { return Some("E-stop latched".into()); }
-        if self.collision.hold.is_some() { return Some("collision hold".into()); }
+    /// Zero-allocation bounded check of conditions for parking automatically when the lease
+    /// watchdog expires. Returns the reason the park is not allowed, or `None` when it is.
+    pub(super) fn watchdog_park_blocker_bounded(&self) -> Option<crate::safety::BoundedText<160>> {
+        use crate::safety::BoundedText;
+        let Some(policy) = &self.config.resting_pose else {
+            return Some(BoundedText::new("no resting pose configured"));
+        };
+        if !self.supports_automatic_unload() {
+            return Some(BoundedText::new("driver lacks velocity/torque/enable feedback"));
+        }
+        if self.e_stop_latched.load(Ordering::SeqCst) {
+            return Some(BoundedText::new("E-stop latched"));
+        }
+        if self.collision.hold.is_some() {
+            return Some(BoundedText::new("collision hold"));
+        }
         if let Some(h) = self.torque_guard.hold {
             let rest = self.config.resting_positions().get(h.joint).copied().unwrap_or(h.hold_q);
             if (rest - h.anchor_q) * h.sign > crate::torque_guard::TORQUE_PUSH_IN_RAD {
-                return Some(format!("torque hold on joint {}: the resting pose lies in the push direction", h.joint + 1));
+                let mut msg = BoundedText::<160>::empty();
+                let _ = core::fmt::write(
+                    &mut msg,
+                    format_args!("torque hold on joint {}: the resting pose lies in the push direction", h.joint + 1),
+                );
+                return Some(msg);
             }
         }
-        if !self.safety.state().is_operational() { return Some(format!("safety state {:?}", self.safety.state())); }
+        if !self.safety.state().is_operational() {
+            let mut msg = BoundedText::<160>::empty();
+            let bstate = crate::safety::BoundedSafetyState::from_state(self.safety.state());
+            let _ = core::fmt::write(&mut msg, format_args!("safety state {bstate:?}"));
+            return Some(msg);
+        }
         if self.pending_rearm || self.disable_pending || self.output_suspended || self.handover_settling_since.is_some() {
-            return Some("re-arm, disable, output suspension or handover pending".into());
+            return Some(BoundedText::new("re-arm, disable, output suspension or handover pending"));
         }
         if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
-            return Some(format!("feedback older than {} ms", policy.feedback_max_age_ms));
+            let mut msg = BoundedText::<160>::empty();
+            let _ = core::fmt::write(&mut msg, format_args!("feedback older than {} ms", policy.feedback_max_age_ms));
+            return Some(msg);
         }
         None
     }
 
+    /// Conditions for parking automatically when the lease watchdog expires.
+    /// Returns the reason the park is not allowed, or `None` when it is.
+    #[allow(dead_code)]
+    pub(super) fn watchdog_park_blocker(&self) -> Option<String> {
+        self.watchdog_park_blocker_bounded().map(|b| b.to_string())
+    }
+
     /// Previous watchdog behaviour: rigid hold at the measured (or commanded) position
-    /// and latch Fault(WatchdogTimeout). Torque stays on.
+    /// and latch Fault(WatchdogTimeout). Torque stays on. Performs zero heap allocations.
     pub(crate) fn latch_watchdog_fault(&mut self) {
         #[cfg(feature = "policy-runtime")]
-        self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
-        let mut hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
-            && self.measured_positions.len() == self.config.dof
-        {
-            self.measured_positions.clone()
-        } else {
-            self.commanded_positions.clone()
-        };
-        // a torque hold keeps its backed-off command (src/torque_guard.rs)
-        if let Some(h) = self.torque_guard.hold {
-            if let (Some(p), Some(c)) = (hold_pos.get_mut(h.joint), self.commanded_positions.get(h.joint)) { *p = *c; }
+        if self.policy_run.is_some() {
+            self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
         }
-        self.watchdog_park = None;
-        self.pending_normal_unload = false;
-        self.unload_settle = None;
-        self.active_trajectory = None;
-        self.servo_target = None; self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
-        self.servo_stream_active = false;
-        self.tracking.invalidate();
-        self.target_positions = hold_pos.clone();
-        self.commanded_positions = hold_pos;
-        self.commanded_velocities = vec![0.0; self.config.dof];
-        self.safety.trigger_fault(FaultReason::WatchdogTimeout);
+        if !self.safety.state().is_stopped() {
+            // Preserve a torque-guard backed-off command before updating commanded_positions in place.
+            let torque_hold = self.torque_guard.hold.and_then(|h| {
+                self.commanded_positions.get(h.joint).copied().map(|c| (h.joint, c))
+            });
+            if self.measured_positions.iter().all(|p| p.is_finite())
+                && self.measured_positions.len() == self.config.dof
+            {
+                crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+            }
+            if let Some((j, c)) = torque_hold {
+                if let Some(slot) = self.commanded_positions.get_mut(j) {
+                    *slot = c;
+                }
+            }
+            self.watchdog_park = None;
+            self.pending_normal_unload = false;
+            self.unload_settle = None;
+            self.active_trajectory = None;
+            self.release_servo_target();
+            self.servo_settled_ticks.fill(0);
+            self.servo_ws_min_depths = None;
+            self.servo_stream_active = false;
+            self.tracking.invalidate();
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+            self.commanded_velocities.fill(0.0);
+            self.commanded_accelerations.fill(0.0);
+        }
+        self.safety.latch(
+            crate::safety::FaultKind::WatchdogTimeout,
+            crate::safety::FaultDetail::WatchdogTimeout,
+        );
     }
 
     /// Drops the lease if `client_id`/`generation` own it. Returns true only when the

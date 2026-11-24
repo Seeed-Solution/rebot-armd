@@ -312,10 +312,13 @@ async fn non_thermal_fault_not_overwritten_by_estop_tick_latch() {
     // Set e_stop_latched while in BusLoss (e.g. hardware latch)
     supervisor.e_stop_latched.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // Subsequent tick must NOT overwrite Fault(BusLoss) with EStop or change epoch
+    // Subsequent tick must NOT overwrite Fault(BusLoss) with EStop, MUST advance epoch for the new E-stop latch,
+    // and steady-state ticks after that must not churn epoch.
     let next_obs = supervisor.tick(0.02).await;
     assert!(matches!(next_obs.safety_state, SafetyState::Fault(FaultReason::BusLoss)), "{:?}", next_obs.safety_state);
-    assert_eq!(next_obs.epoch_id, fault_epoch);
+    assert_eq!(next_obs.epoch_id, fault_epoch + 1);
+    let steady_obs = supervisor.tick(0.02).await;
+    assert_eq!(steady_obs.epoch_id, next_obs.epoch_id);
 }
 
 #[tokio::test]
@@ -448,10 +451,10 @@ async fn test_estop_during_bus_loss_preserves_bus_loss_and_requires_two_stage_cl
     // Concurrently trigger E-Stop while in BusLoss
     supervisor.trigger_e_stop().await;
 
-    // Active diagnostic state must remain Fault(BusLoss), epoch must not churn
+    // Active diagnostic state must remain Fault(BusLoss), and latching E-Stop MUST advance epoch.
     let obs_after_estop = supervisor.get_observation().await;
     assert!(matches!(obs_after_estop.safety_state, SafetyState::Fault(FaultReason::BusLoss)));
-    assert_eq!(obs_after_estop.epoch_id, bus_loss_epoch);
+    assert_eq!(obs_after_estop.epoch_id, bus_loss_epoch + 1);
 
     // Restore bus feedback freshness
     h.lock().unwrap().age = Some(Duration::from_millis(10));
