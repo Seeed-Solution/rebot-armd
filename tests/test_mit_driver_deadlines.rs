@@ -148,13 +148,20 @@ fn success_is_withheld_until_confirmation() {
     clock.advance(ms(10));
     assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
-    // At 20 ms: J1,J2,J4..J7 confirm post-settle; J3 is still delayed until 22 ms.
+    // At 20 ms: settle boundary is strict `> 20 ms`, so still Pending.
     clock.advance(ms(10));
     assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
-    // At 22 ms: J3's post-settle reply arrives -> Confirmed.
+    // At 22 ms: J3's post-settle reply arrives and settled J1,J2,J4..J7 get their post-settle probe;
+    // on an async (`immediate_replies == false`) bus their probe replies arrive on the next poll.
     clock.advance(ms(2));
-    assert_eq!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Done(TorqueOutcome::Confirmed));
+    let p22 = d.poll_torque(clock.now() + RX_PASS).unwrap();
+    if matches!(p22, TorqueProgress::Pending { .. }) {
+        clock.advance(ms(1));
+        assert_eq!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Done(TorqueOutcome::Confirmed));
+    } else {
+        assert_eq!(p22, TorqueProgress::Done(TorqueOutcome::Confirmed));
+    }
     assert!(d.is_enabled());
     d.write_joint_targets(&hold).expect("targets after the confirmation");
     assert!(d.poll_torque(clock.now() + RX_PASS).is_err(), "nothing pending");

@@ -148,13 +148,13 @@ pub fn decode_mit(data: &[u8; 8], l: &DamiaoLimits) -> MotorCmd {
 pub struct FakeBusState {
     pub motors: Vec<FakeMotor>,
     pub rx: VecDeque<CanFrame>,
-    /// Per-entry optional arrival timestamps aligned with `rx`: `Some(ts)` ONLY for genuine
-    /// synchronous replies produced by `handle(frame)` when `immediate_replies == true`, and
-    /// `None` for every pre-seeded, injected, or asynchronous (`immediate_replies == false`) frame.
+    /// Per-entry optional arrival timestamps aligned with `rx`.
     rx_timestamps: VecDeque<Option<Instant>>,
     /// Replies to transmitted frames: they reach `rx` only after the receive queue was observed
     /// empty once after the transmit (a reply never precedes its request on the wire).
     pub pending: VecDeque<CanFrame>,
+    /// Arrival timestamps aligned with `pending` (stamped when the reply was generated).
+    pending_timestamps: VecDeque<Option<Instant>>,
     /// Old frames delivered at once on the next transmit, ahead of any real reply (stale
     /// replies still queued in the transport).
     pub inject_on_next_tx: Vec<CanFrame>,
@@ -220,10 +220,23 @@ impl FakeBusState {
 
     pub fn motor_mut(&mut self, id: u16) -> Option<&mut FakeMotor> { self.motors.iter_mut().find(|m| m.id == id) }
 
+    pub fn push_rx_at(&mut self, frame: CanFrame, ts: Option<Instant>) {
+        let fallback_ts = self.now().unwrap_or_else(Instant::now);
+        while self.rx_timestamps.len() < self.rx.len() {
+            self.rx_timestamps.push_back(Some(fallback_ts));
+        }
+        if self.rx_timestamps.len() > self.rx.len() {
+            self.rx_timestamps.truncate(self.rx.len());
+        }
+        self.rx.push_back(frame);
+        self.rx_timestamps.push_back(ts);
+    }
+
     pub fn push_feedback(&mut self, i: usize) {
         if !self.motors[i].silent && !self.motors[i].mute_feedback && !self.motors[i].no_feedback {
             let f = self.motors[i].feedback_frame();
-            self.rx.push_back(f);
+            let ts = self.now().unwrap_or_else(Instant::now);
+            self.push_rx_at(f, Some(ts));
         }
     }
 
@@ -385,6 +398,7 @@ impl FakeBus {
             rx: VecDeque::with_capacity(256),
             rx_timestamps: VecDeque::with_capacity(256),
             pending: VecDeque::with_capacity(256),
+            pending_timestamps: VecDeque::with_capacity(256),
             inject_on_next_tx: Vec::with_capacity(32),
             inject_on_reg_write: Vec::with_capacity(32),
             immediate_replies: false,
@@ -474,22 +488,31 @@ impl CanTransport for FakeBus {
             let state = &mut *s;
             state.rx.extend(state.inject_on_reg_write.drain(..));
         }
+        let tx_ts = s.now().unwrap_or_else(Instant::now);
+        // Sync deterministic timestamps for any pre-seeded or injected frames ahead of this TX
+        // (including when `tx_lost == true`, so `inject_on_next_tx` frames carry their pre-TX
+        // arrival time rather than later host dequeue time).
+        while s.rx_timestamps.len() < s.rx.len() {
+            s.rx_timestamps.push_back(Some(tx_ts));
+        }
+        let rx_len = s.rx.len();
+        if s.rx_timestamps.len() > rx_len {
+            s.rx_timestamps.truncate(rx_len);
+        }
         if !s.tx_lost {
-            // Sync untimestamped metadata for any pre-seeded or injected frames ahead of this TX.
-            while s.rx_timestamps.len() < s.rx.len() {
-                s.rx_timestamps.push_back(None);
-            }
-            let rx_len = s.rx.len();
-            if s.rx_timestamps.len() > rx_len {
-                s.rx_timestamps.truncate(rx_len);
-            }
             let before = s.rx.len();
             s.handle(frame);
             if !s.immediate_replies && s.rx.len() > before {
                 let mut tmp = std::mem::take(&mut s.scratch_frames);
                 tmp.clear();
                 tmp.extend(s.rx.drain(before..));
-                for f in tmp.drain(..) { s.pending.push_back(f); }
+                while s.pending_timestamps.len() < s.pending.len() {
+                    s.pending_timestamps.push_back(Some(tx_ts));
+                }
+                for f in tmp.drain(..) {
+                    s.pending.push_back(f);
+                    s.pending_timestamps.push_back(Some(tx_ts));
+                }
                 s.scratch_frames = tmp;
             } else if s.immediate_replies && s.rx.len() > before {
                 let reply_ts = s.now().unwrap_or_else(Instant::now);
@@ -506,7 +529,16 @@ impl CanTransport for FakeBus {
     fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
         let mut s = self.0.lock().unwrap();
         s.run_watchdogs();
-        if let Some(now) = s.now() {
+        let now_opt = s.now();
+        let now = now_opt.unwrap_or_else(Instant::now);
+        while s.rx_timestamps.len() < s.rx.len() {
+            s.rx_timestamps.push_back(Some(now));
+        }
+        let rx_len = s.rx.len();
+        if s.rx_timestamps.len() > rx_len {
+            s.rx_timestamps.truncate(rx_len);
+        }
+        if let Some(now) = now_opt {
             if !s.delayed.is_empty() {
                 let mut later = std::mem::take(&mut s.scratch_delayed);
                 later.clear();
@@ -514,6 +546,7 @@ impl CanTransport for FakeBus {
                 for (t, f) in delayed.drain(..) {
                     if t <= now {
                         s.rx.push_back(f);
+                        s.rx_timestamps.push_back(Some(t));
                     } else {
                         later.push((t, f));
                     }
@@ -521,13 +554,6 @@ impl CanTransport for FakeBus {
                 s.delayed = later;
                 s.scratch_delayed = delayed;
             }
-        }
-        while s.rx_timestamps.len() < s.rx.len() {
-            s.rx_timestamps.push_back(None);
-        }
-        let rx_len = s.rx.len();
-        if s.rx_timestamps.len() > rx_len {
-            s.rx_timestamps.truncate(rx_len);
         }
         match s.rx.pop_front() {
             Some(f) => {
@@ -538,9 +564,11 @@ impl CanTransport for FakeBus {
             None => {
                 s.rx_timestamps.clear();
                 while let Some(f) = s.pending.pop_front() {
+                    let ts = s.pending_timestamps.pop_front().flatten().or(Some(now));
                     s.rx.push_back(f);
-                    s.rx_timestamps.push_back(None);
+                    s.rx_timestamps.push_back(ts);
                 }
+                s.pending_timestamps.clear();
                 Err(TransportError::WouldBlock)
             }
         }

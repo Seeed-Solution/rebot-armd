@@ -135,10 +135,11 @@ impl NoAllocDamiaoBus {
     }
 
     fn push_all_feedback(&mut self) {
+        let ts = self.clock.now();
         for k in 0..self.motors.len() {
             let frame = self.build_reply_frame(k);
             if self.rx.len() < self.rx.capacity() {
-                self.rx.push_back((frame, None));
+                self.rx.push_back((frame, Some(ts)));
             }
         }
     }

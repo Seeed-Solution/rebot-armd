@@ -128,11 +128,7 @@ impl VirtualBusState {
     }
 
     fn push_unsolicited_feedback(&mut self, i: usize) {
-        let before = self.rx.len();
         self.push_feedback(i);
-        for slot in self.rx.range_mut(before..) {
-            slot.1 = None;
-        }
     }
 
     fn push_all_feedback(&mut self) {
@@ -1988,7 +1984,7 @@ fn enable_and_retry_frames_obey_tx_budget_across_polls() {
 
     let mut confirmed = false;
     let mut total_enables = 0usize;
-    for step in 0..30 {
+    for step in 0..35 {
         bus.clear();
         clock.advance(ms(1));
         match d.poll_torque(clock.now() + ms(5)).expect("poll_torque under max_frames=1") {

@@ -102,8 +102,9 @@ struct BusState {
 
 impl BusState {
     fn push_all_feedback(&mut self) {
+        let ts = self.clock.now();
         for m in &self.motors {
-            self.rx.push_back((m.feedback_frame(), None));
+            self.rx.push_back((m.feedback_frame(), Some(ts)));
         }
     }
 }

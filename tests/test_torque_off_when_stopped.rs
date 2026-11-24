@@ -4563,7 +4563,7 @@ fn review_b01_b02_b03_damiao_causal_evidence_rejects_pre_tx_and_startup_frames()
         // Also inject fake pre-disable 0x0 right before the retry CMD_DISABLE at +25 ms -> STILL Unknown!
         let mut outcome = None;
         for step in 0..20 {
-            if step == 5 {
+            if step == 2 {
                 bus.with(|s| {
                     for id in 1..=7u16 {
                         s.inject_on_next_tx.push(make_fb(id, 0));
@@ -6470,7 +6470,7 @@ fn t2_thermal_trip_upgrades_pending_disable_with_single_broker_terminal() {
             }
         });
         fx.core.last_disable_attempt = None;
-        for _ in 0..6 {
+        for _ in 0..9 {
             let _ = fx.step();
             broker.poll(|_, r| {
                 if let Reply::Terminal { request, outcome, .. } = r {
@@ -6488,6 +6488,206 @@ fn t2_thermal_trip_upgrades_pending_disable_with_single_broker_terminal() {
             terminals.len(),
             1,
             "T2: background thermal completion must NEVER emit a second broker terminal"
+        );
+    }
+}
+
+#[test]
+fn s1_can_kernel_rx_timestamp_rejects_pre_write_frame_dequeued_25ms_later() {
+    use armd::driver::{ArmDriver, DamiaoArmDriver, DisableKind, MotorTorqueEvidence, RobStrideArmDriver};
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::protocol::robstride::{self, RobStrideLimits};
+    use armd::transport::{CanFrame, CanRxTime, CanTransport, DriverClock, MockClock, TransportError};
+    use std::collections::VecDeque;
+
+    struct KernelTsBus {
+        clock: MockClock,
+        base_real_ns: i128,
+        base_mono: std::time::Instant,
+        rx: VecDeque<(CanFrame, Option<CanRxTime>)>,
+    }
+
+    impl KernelTsBus {
+        fn new(clock: MockClock) -> Self {
+            let base_mono = clock.now();
+            Self {
+                clock,
+                base_real_ns: 1_700_000_000_000_000_000,
+                base_mono,
+                rx: VecDeque::new(),
+            }
+        }
+
+        fn current_kernel_ns(&self) -> i128 {
+            let elapsed = self.clock.now().saturating_duration_since(self.base_mono).as_nanos() as i128;
+            self.base_real_ns + elapsed
+        }
+
+        fn push_kernel_ts(&mut self, frame: CanFrame, kernel_ns: i128) {
+            self.rx.push_back((frame, Some(CanRxTime::KernelRealtimeNs(kernel_ns))));
+        }
+
+        fn push_untimestamped(&mut self, frame: CanFrame) {
+            self.rx.push_back((frame, None));
+        }
+    }
+
+    impl CanTransport for KernelTsBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(Arc::new(self.clock.clone()))
+        }
+        fn rx_clock_now(&self) -> Option<CanRxTime> {
+            Some(CanRxTime::KernelRealtimeNs(self.current_kernel_ns()))
+        }
+        fn transmit(&mut self, _frame: &CanFrame) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.rx.pop_front().map(|(f, _)| f).ok_or(TransportError::WouldBlock)
+        }
+        fn receive_with_rx_time(&mut self) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
+            self.rx.pop_front().ok_or(TransportError::WouldBlock)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn flush_is_noop(&self) -> bool { true }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+    }
+
+    let dm_limits = DamiaoLimits::default();
+    let dm_fb = |id: u16, state: u8, pos: f32| -> CanFrame {
+        let p = damiao::float_to_uint(pos, dm_limits.p_min, dm_limits.p_max, 16);
+        let v = damiao::float_to_uint(0.0, dm_limits.v_min, dm_limits.v_max, 12);
+        let t = damiao::float_to_uint(0.0, dm_limits.t_min, dm_limits.t_max, 12);
+        let data = [
+            ((state & 0x0f) << 4) | (id as u8 & 0x0f),
+            (p >> 8) as u8,
+            p as u8,
+            (v >> 4) as u8,
+            (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+            t as u8,
+            30,
+            30,
+        ];
+        CanFrame::new_standard(0x10 + id, &data).unwrap()
+    };
+
+    // Part A: Damiao with kernel CLOCK_REALTIME timestamps (SocketCAN clock domain).
+    {
+        let clock = MockClock::new();
+        let bus = KernelTsBus::new(clock.clone());
+        let mut drv = DamiaoArmDriver::new(bus, vec![1]).with_limits(dm_limits);
+
+        // Frame queued BEFORE CMD_DISABLE with kernel timestamp t_pre_write.
+        let t_pre_write = drv.can_mut().current_kernel_ns();
+        clock.advance(Duration::from_millis(2));
+        let started_at = clock.now();
+        let _ = drv
+            .begin_disable_torque(DisableKind::DisableRequested { started_at, rollback: false })
+            .expect("begin_disable_torque sends CMD_DISABLE");
+        let t_write_done = drv.can_mut().current_kernel_ns();
+
+        // Now advance host clock by 25 ms (past 20 ms settle window) and dequeue the pre-write
+        // frame whose kernel timestamp precedes the write!
+        clock.advance(Duration::from_millis(25));
+        drv.can_mut().push_kernel_ts(dm_fb(1, 0, 0.0), t_pre_write);
+        let _ = drv.read_joint_states();
+        let mut ev = [MotorTorqueEvidence::Unknown; 1];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev[0],
+            MotorTorqueEvidence::Unknown,
+            "S1 Damiao: frame queued before write and dequeued 25 ms later must be REJECTED"
+        );
+        assert!(
+            drv.feedback_ages()[0].is_none(),
+            "S1 Damiao: rejected pre-write frame must not populate feedback freshness"
+        );
+
+        // Exact write_done + 20 ms must also be rejected (strict >).
+        drv.can_mut().push_kernel_ts(dm_fb(1, 0, 0.0), t_write_done + 20_000_000);
+        let _ = drv.read_joint_states();
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev[0],
+            MotorTorqueEvidence::Unknown,
+            "S1 Damiao: kernel rx == write_done + 20 ms must be rejected (strict >)"
+        );
+
+        // Missing kernel timestamp (`None`) must NEVER fall back to host dequeue time.
+        drv.can_mut().push_untimestamped(dm_fb(1, 0, 0.0));
+        let _ = drv.read_joint_states();
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev[0],
+            MotorTorqueEvidence::Unknown,
+            "S1 Damiao: untimestamped frame must NEVER use host dequeue time"
+        );
+
+        // Post-settle kernel timestamp (write_done + 21 ms) is accepted as causal evidence.
+        drv.can_mut().push_kernel_ts(dm_fb(1, 0, 0.0), t_write_done + 21_000_000);
+        let _ = drv.read_joint_states();
+        assert!(
+            drv.feedback_ages()[0].is_some(),
+            "S1 Damiao: frame with kernel rx > write_done + 20 ms must be accepted"
+        );
+    }
+
+    // Part B: RobStride with kernel CLOCK_REALTIME timestamps.
+    {
+        let rs_limits = RobStrideLimits::default();
+        let rs_fb = |motor_id: u8, pos_rad: f32| -> CanFrame {
+            let id = robstride::build_feedback_extended_id(0, motor_id, 0xFD);
+            let p_raw = ((pos_rad - rs_limits.p_min) / (rs_limits.p_max - rs_limits.p_min) * 65535.0)
+                .clamp(0.0, 65535.0) as u16;
+            let data = [
+                (p_raw >> 8) as u8,
+                p_raw as u8,
+                0x80,
+                0x00,
+                0x80,
+                0x00,
+                0x01,
+                0x2C,
+            ];
+            CanFrame::new_extended(id, &data).unwrap()
+        };
+
+        let clock = MockClock::new();
+        let bus = KernelTsBus::new(clock.clone());
+        let mut drv = RobStrideArmDriver::new(bus, vec![1]);
+
+        let t_pre_write = drv.can_mut().current_kernel_ns();
+        clock.advance(Duration::from_millis(2));
+        drv.set_torque(true).expect("RobStride enable sends type-3 frame");
+        let t_write_done = drv.can_mut().current_kernel_ns();
+
+        // Advance host clock 25 ms past write_done; dequeue pre-write frame -> REJECTED.
+        clock.advance(Duration::from_millis(25));
+        drv.can_mut().push_kernel_ts(rs_fb(1, 0.0), t_pre_write);
+        let mut out = Vec::new();
+        let _ = drv.read_joint_states_budgeted(&mut out, clock.now() + Duration::from_millis(5), 64);
+        assert!(
+            drv.feedback_ages()[0].is_none(),
+            "S1 RobStride: pre-write frame dequeued 25 ms later must be REJECTED"
+        );
+
+        // Missing kernel timestamp (`None`) -> REJECTED.
+        drv.can_mut().push_untimestamped(rs_fb(1, 0.0));
+        let _ = drv.read_joint_states_budgeted(&mut out, clock.now() + Duration::from_millis(5), 64);
+        assert!(
+            drv.feedback_ages()[0].is_none(),
+            "S1 RobStride: untimestamped frame must NEVER use host dequeue time"
+        );
+
+        // Post-settle kernel timestamp (write_done + 21 ms) -> ACCEPTED.
+        drv.can_mut().push_kernel_ts(rs_fb(1, 0.0), t_write_done + 21_000_000);
+        let _ = drv.read_joint_states_budgeted(&mut out, clock.now() + Duration::from_millis(5), 64);
+        assert!(
+            drv.feedback_ages()[0].is_some(),
+            "S1 RobStride: frame with kernel rx > write_done + 20 ms must be accepted"
         );
     }
 }

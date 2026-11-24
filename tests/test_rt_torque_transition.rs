@@ -12,13 +12,12 @@ use std::time::Duration;
 use armd::driver::{ArmDriver, DamiaoArmDriver, GripperPosForce};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{Authority, BootId, Broker, Capacities, ClientId, Outcome, Reply, Submit, TransitionOp};
-use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture, ReleaseReport};
+use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture, ReleaseReport, VirtualClock};
 use armd::transport::MockClock;
 use armd::{ArmConfig, SupervisorInner};
 use mit_support::FakeBus;
 
 const BOOT: BootId = BootId(11);
-const RELEASE: Duration = Duration::from_millis(20);
 
 fn limits() -> Vec<DamiaoLimits> { ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(|r| r.limits()).collect() }
 
@@ -26,6 +25,7 @@ struct Rig {
     fx: ReleaseFixture<SupervisorInner>,
     b: Broker<PlanSlot>,
     bus: FakeBus,
+    #[allow(dead_code)]
     clock: MockClock,
     seq: u64,
 }
@@ -49,7 +49,12 @@ fn rig_with(drive: impl FnOnce(DamiaoArmDriver<FakeBus>) -> DamiaoArmDriver<Fake
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() }).with_driver(Box::new(d));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    let (fx, b, _tw, _stop) = ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 1, replies: 8 });
+    let (fx, b, _tw, _stop) = ReleaseFixture::new_with_clock(
+        inner,
+        BOOT,
+        Capacities { commands: 4, plans: 1, replies: 8 },
+        VirtualClock::from_mock_clock(clock.clone()),
+    );
     Rig { fx, b, bus, clock, seq: 0 }
 }
 
@@ -62,11 +67,9 @@ impl Rig {
         self.b.submit(ClientId(1), self.seq, a, self.fx.now() + Duration::from_secs(5), Submit::Transition(op)).unwrap();
     }
 
-    /// One release; the driver's clock moves with the executor's.
+    /// One release; executor and driver share `self.clock` so sub-release wakes advance driver time too.
     fn step(&mut self) -> ReleaseReport {
-        let r = self.fx.step();
-        self.clock.advance(RELEASE);
-        r
+        self.fx.step()
     }
 
     /// Releases until the transition ends: (release count, outcome, reports).
@@ -176,6 +179,8 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     assert_eq!(raised_fault.code, armd::FaultCode::EnableFailed);
     assert!(!r_raised.fx.core.safety.recoverable(), "ENABLE_FAILED must be non-recoverable");
     assert!(raised_fault.message.contains("J4:unk/queued"), "missing initial per-joint status: {}", raised_fault.message);
+    r_raised.bus.with(|s| s.push_all_feedback());
+    r_raised.step();
     let live_fault = r_raised.fx.core.current_observation().fault.expect("live observation fault expected");
     assert!(live_fault.message.contains("J4:unk/held"), "missing live post-hold per-joint status: {}", live_fault.message);
 

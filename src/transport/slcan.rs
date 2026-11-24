@@ -240,15 +240,24 @@ impl SlcanCodec {
 /// SLCAN transport wrapper adapting any byte stream `Transport` to `CanTransport`
 pub struct SlcanTransport<T: Transport> {
     inner: T,
+    clock: Option<std::sync::Arc<dyn crate::transport::DriverClock>>,
     rx_buffer: Vec<u8>,
+    rx_timestamps: Vec<std::time::Instant>,
 }
 
 impl<T: Transport> SlcanTransport<T> {
     pub fn new(inner: T) -> Self {
+        let clock = inner.clock();
         Self {
             inner,
+            clock,
             rx_buffer: Vec::with_capacity(128),
+            rx_timestamps: Vec::with_capacity(128),
         }
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.clock.as_ref().map_or_else(std::time::Instant::now, |c| c.now())
     }
 
     /// Access the underlying transport
@@ -284,6 +293,10 @@ impl<T: Transport> SlcanTransport<T> {
 }
 
 impl<T: Transport> CanTransport for SlcanTransport<T> {
+    fn clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
+        self.clock.clone()
+    }
+
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let ascii = SlcanCodec::encode_frame(frame);
         self.inner.write_all(ascii.as_bytes())?;
@@ -291,16 +304,25 @@ impl<T: Transport> CanTransport for SlcanTransport<T> {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+
+    fn receive_timestamped(
+        &mut self,
+    ) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
         let mut temp_buf = [0u8; 64];
 
         loop {
             // Check if there is already a full frame terminated with \r or \n in rx_buffer
             if let Some(pos) = self.rx_buffer.iter().position(|&b| b == b'\r' || b == b'\n') {
+                let ts = self.rx_timestamps.get(pos).copied();
                 let line_bytes: Vec<u8> = self.rx_buffer.drain(..=pos).collect();
+                let ts_drain = (pos + 1).min(self.rx_timestamps.len());
+                self.rx_timestamps.drain(..ts_drain);
                 if let Ok(line) = std::str::from_utf8(&line_bytes) {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
-                        return SlcanCodec::decode_frame(trimmed);
+                        return SlcanCodec::decode_frame(trimmed).map(|f| (f, ts));
                     }
                 }
                 continue;
@@ -311,7 +333,9 @@ impl<T: Transport> CanTransport for SlcanTransport<T> {
             if n == 0 {
                 return Err(TransportError::Timeout);
             }
+            let rx_at = self.now();
             self.rx_buffer.extend_from_slice(&temp_buf[..n]);
+            self.rx_timestamps.resize(self.rx_buffer.len(), rx_at);
         }
     }
 

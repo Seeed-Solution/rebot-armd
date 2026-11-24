@@ -1937,14 +1937,14 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
                 }
                 return Ok(item);
             }
-            match self.inner.receive() {
-                Ok(frame) => {
+            match self.inner.receive_timestamped() {
+                Ok((frame, ts)) => {
                     if let Some(d) = self.advance_schedule.lock().unwrap().pop_front() {
                         if !d.is_zero() {
                             self.clock.advance(d);
                         }
                     }
-                    Ok((frame, None))
+                    Ok((frame, ts))
                 }
                 Err(e @ (TransportError::Timeout | TransportError::WouldBlock)) => {
                     if let Some(injected) = self.inject_on_wouldblock.lock().unwrap().take() {

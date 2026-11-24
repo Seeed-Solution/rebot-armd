@@ -387,12 +387,22 @@ impl MockCanTransport {
     }
 
     pub fn provide_rx_frame(&mut self, frame: CanFrame) {
+        let ts = self.now();
+        self.rx_frames.push_back((frame, Some(ts)));
+    }
+
+    pub fn provide_rx_frame_at(&mut self, frame: CanFrame, ts: Instant) {
+        self.rx_frames.push_back((frame, Some(ts)));
+    }
+
+    pub fn provide_rx_frame_untimestamped(&mut self, frame: CanFrame) {
         self.rx_frames.push_back((frame, None));
     }
 
     pub fn provide_rx_frames(&mut self, frames: &[CanFrame]) {
+        let ts = self.now();
         for f in frames {
-            self.rx_frames.push_back((*f, None));
+            self.rx_frames.push_back((*f, Some(ts)));
         }
     }
 

@@ -11,7 +11,7 @@ pub use crate::protocol::damiao::{build_pos_force_frame, DAMIAO_GRIPPER_POSFORCE
 use crate::protocol::fashionstar::{self, FashionStarPacket};
 use crate::protocol::feetech;
 use crate::protocol::robstride::{self, RobStrideLimits};
-use crate::transport::{CanFrame, CanTransport, Transport, TransportError};
+use crate::transport::{CanFrame, CanRxTime, CanTransport, Transport, TransportError};
 
 pub mod handshake;
 pub use handshake::{TorqueOutcome, TorqueProgress};
@@ -4317,7 +4317,11 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Per-motor earliest host monotonic receive instant (`write_done + TORQUE_CAUSAL_SETTLE_WINDOW`)
     /// after the latest torque-changing write returned from `can.transmit()`. Frames received
     /// earlier than this instant are never evidence for that motor's torque state, mode, or rest pose.
-    motor_torque_settle_until: Vec<Option<Instant>>,
+    /// Per-motor causal settle boundary captured after a torque-changing write returns from
+    /// `can.transmit()`. Frames whose kernel/transport receive time is not strictly greater than
+    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for that motor's torque
+    /// state, mode, or rest pose.
+    motor_torque_settle_until: Vec<Option<MotorTorqueSettle>>,
     /// True once motor `i` has received causal feedback strictly after its latest `CMD_ENABLE`
     /// transmit (any state, including fault states, so `poll_enable` detects faults causally).
     motor_post_enable_feedback: Vec<bool>,
@@ -4401,13 +4405,61 @@ pub struct DamiaoArmDriver<C: CanTransport> {
 #[derive(Clone, Copy, Debug)]
 struct MotorTorqueSettle {
     /// Host monotonic instant captured AFTER `can.transmit()` returned `Ok(())`.
-    #[allow(dead_code)]
     write_done: Instant,
-    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`: frames with host monotonic receive time
-    /// earlier than this instant are never causal evidence for this motor.
+    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`: host monotonic wake/probe anchor.
     settle_until: Instant,
-    /// True until one read-only `0x7FF 0xCC` status refresh probe is sent once `now >= settle_until`.
+    /// Kernel or transport receive-clock timestamp captured immediately when `can.transmit()`
+    /// returned `Ok(())`. Causal evidence requires `rx_time > write_done_rx_clock + SETTLE` on
+    /// this exact clock domain (`None` fails closed).
+    write_done_rx_clock: Option<CanRxTime>,
+    /// True until one read-only `0x7FF 0xCC` status refresh probe is sent once `now > settle_until`.
     probe_needed: bool,
+}
+
+/// S1: True iff `rx_time` is a present kernel/transport receive timestamp strictly after
+/// `boundary.write_done_rx_clock + TORQUE_CAUSAL_SETTLE_WINDOW` on the same clock domain, AND
+/// host monotonic elapsed time since `boundary.write_done` is also strictly greater than the
+/// settle window (guarding against forward wall-clock jumps). Host dequeue time (`None`) never counts.
+#[inline]
+fn can_settle_boundary_satisfied(
+    boundary: MotorTorqueSettle,
+    rx_time: Option<CanRxTime>,
+    decode_now: Instant,
+) -> bool {
+    let Some(rx_t) = rx_time else {
+        return false;
+    };
+    let Some(tx_t) = boundary.write_done_rx_clock else {
+        return false;
+    };
+    rx_t.is_after_settle(tx_t, TORQUE_CAUSAL_SETTLE_WINDOW)
+        && decode_now
+            .checked_duration_since(boundary.write_done)
+            .is_some_and(|d| d > TORQUE_CAUSAL_SETTLE_WINDOW)
+}
+
+/// Convert a present kernel/transport [`CanRxTime`] to a monotonic `Instant` for freshness age
+/// checks (clamped at `decode_now`). Never invoked when `rx_time` is `None`.
+#[inline]
+fn can_rx_time_to_monotonic<C: CanTransport>(
+    can: &C,
+    rx_time: CanRxTime,
+    decode_now: Instant,
+) -> Instant {
+    match rx_time {
+        CanRxTime::Monotonic(ts) => ts.min(decode_now),
+        CanRxTime::KernelRealtimeNs(rx_ns) => {
+            if let Some(CanRxTime::KernelRealtimeNs(now_ns)) = can.rx_clock_now() {
+                if now_ns >= rx_ns {
+                    let age_ns = (now_ns - rx_ns).min(i128::from(u64::MAX)) as u64;
+                    if let Some(mapped) = decode_now.checked_sub(Duration::from_nanos(age_ns)) {
+                        return mapped;
+                    }
+                }
+            }
+            decode_now
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5462,6 +5514,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
         let write_done = self.now();
+        let write_done_rx_clock = if torque_tx_info.is_some() && res.is_ok() {
+            Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)))
+        } else {
+            None
+        };
         let wall_ns = write_done.saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
         let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
         let attempt_kind = match &res {
@@ -5473,17 +5530,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         crate::diagnostics::tick::record_tx_attempt(attempt_kind, wall_ns, cpu_ns);
         match res {
             Ok(()) => {
-                // Record the causal settle window AFTER `transmit()` returns: frames received
-                // earlier than `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for
-                // this motor's torque state, mode, or rest pose.
+                // S1: Record the kernel/transport-clock settle boundary AFTER `transmit()` returns:
+                // frames whose kernel/transport receive time is not strictly greater than
+                // `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for this motor's
+                // torque state, mode, or rest pose.
                 if let Some((idx, is_enable)) = torque_tx_info {
                     let settle_until = write_done + TORQUE_CAUSAL_SETTLE_WINDOW;
-                    self.motor_torque_settle_until[idx] = Some(settle_until);
                     let boundary = MotorTorqueSettle {
                         write_done,
                         settle_until,
+                        write_done_rx_clock,
                         probe_needed: true,
                     };
+                    self.motor_torque_settle_until[idx] = Some(boundary);
                     if is_enable {
                         self.motor_enable_tx[idx] = Some(boundary);
                     } else {
@@ -6533,10 +6592,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return false;
             }
             let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
+            match self.can.receive_with_rx_time() {
+                Ok((frame, rx_time)) => {
                     frames += 1;
-                    self.process_rx_frame(&frame, false, rx_ts);
+                    self.process_rx_frame(&frame, false, rx_time);
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     self.mark_rx_empty(attempt);
@@ -7662,10 +7721,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut hit_err = false;
         while frames_processed < max_frames && !self.rx_over(t0) && !deadline.passed(self.now()) {
             let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
+            match self.can.receive_with_rx_time() {
+                Ok((frame, rx_time)) => {
                     frames_processed += 1;
-                    self.process_rx_frame(&frame, true, rx_ts);
+                    self.process_rx_frame(&frame, true, rx_time);
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
@@ -8367,8 +8426,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     #[inline]
-    fn boundary_satisfied(boundary: MotorTorqueSettle, rx_at: Instant) -> bool {
-        rx_at >= boundary.settle_until
+    fn boundary_satisfied(
+        boundary: MotorTorqueSettle,
+        rx_time: Option<CanRxTime>,
+        decode_now: Instant,
+    ) -> bool {
+        can_settle_boundary_satisfied(boundary, rx_time, decode_now)
     }
 
     fn earliest_settle_wake(
@@ -8383,8 +8446,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 continue;
             }
             if let Some(b) = *slot {
-                if now < b.settle_until {
-                    wake = wake.min(b.settle_until);
+                // Wake strictly past `settle_until` (`write_done + 20 ms`) because S1 causality
+                // requires strict `rx_time > write_done + SETTLE`.
+                let after_settle = b.settle_until + Duration::from_micros(1);
+                if now < after_settle {
+                    wake = wake.min(after_settle);
                 }
             }
         }
@@ -8488,7 +8554,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 .get(i)
                 .copied()
                 .flatten()
-                .is_some_and(|b| b.probe_needed && now >= b.settle_until);
+                .is_some_and(|b| b.probe_needed && now > b.settle_until);
             if !needs_probe {
                 continue;
             }
@@ -8558,7 +8624,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 for i in handshake::mask_joints(mask) {
                     if let Some(b) = self.motor_enable_tx.get(i).copied().flatten() {
                         if now.saturating_duration_since(b.write_done) < DAMIAO_ENABLE_RETRY_AT[0] {
-                            if now >= b.settle_until && b.probe_needed {
+                            if now > b.settle_until && b.probe_needed {
                                 probe_instead_mask |= 1 << i;
                             }
                             continue;
@@ -8830,7 +8896,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             .get(i)
                             .copied()
                             .flatten()
-                            .is_some_and(|b| b.probe_needed && now >= b.settle_until);
+                            .is_some_and(|b| b.probe_needed && now > b.settle_until);
                         if !needs_probe {
                             continue;
                         }
@@ -8899,10 +8965,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut hit_err = false;
         while frames_processed < limit && self.since(start) < Duration::from_millis(5) {
             let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
+            match self.can.receive_with_rx_time() {
+                Ok((frame, rx_time)) => {
                     frames_processed += 1;
-                    self.process_rx_frame(&frame, false, rx_ts);
+                    self.process_rx_frame(&frame, false, rx_time);
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
@@ -11305,7 +11371,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Decode one received CAN frame into the driver's feedback cache and, when
     /// `record_register_replies` is true, into the register reply buffers.
-    fn process_rx_frame(&mut self, frame: &CanFrame, record_register_replies: bool, rx_timestamp: Option<Instant>) {
+    fn process_rx_frame(&mut self, frame: &CanFrame, record_register_replies: bool, rx_time: Option<CanRxTime>) {
         self.rx_seq += 1;
         if self.awaiting_rx_boundary {
             return;
@@ -11333,18 +11399,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             .filter(|r| self.motor_ids.contains(&r.motor_id))
         {
             // A register reply is not feedback: byte 0 would decode as state 0.
-            // E1: Register replies received earlier than write_done + SETTLE are never evidence
-            // for that motor's mode.
+            // S1: Host dequeue time never counts; register replies without a kernel/transport RX
+            // timestamp or received on/before `write_done + SETTLE` are never evidence for mode.
             if record_register_replies {
+                let Some(rx_t) = rx_time else {
+                    return;
+                };
                 let decode_now = self.now();
-                let rx_at = rx_timestamp.map_or(decode_now, |ts| ts.min(decode_now));
                 let in_settle = self
                     .motor_ids
                     .iter()
                     .position(|&id| id == reply.motor_id)
                     .and_then(|idx| self.motor_torque_settle_until.get(idx).copied().flatten())
-                    .is_some_and(|until| rx_at < until);
+                    .is_some_and(|boundary| !Self::boundary_satisfied(boundary, Some(rx_t), decode_now));
                 if !in_settle {
+                    let rx_at = can_rx_time_to_monotonic(&self.can, rx_t, decode_now);
                     if self.register_replies.len() < 64 { self.register_replies.push(reply); }
                     if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, rx_at, self.rx_seq, self.rx_empty_seq)); }
                 }
@@ -11371,14 +11440,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             }
             if let Ok(feedback) = damiao::unpack_feedback_frame(frame, &self.limits[idx]) {
+                // S1: Host dequeue time never counts. A frame without a kernel/transport receive
+                // timestamp is never evidence for torque state, mode, or rest pose.
+                let Some(rx_t) = rx_time else {
+                    return;
+                };
                 let decode_now = self.now();
-                let rx_at = rx_timestamp.map_or(decode_now, |ts| ts.min(decode_now));
-                // E1: After a torque-changing write returns from transmit(), frames received
-                // earlier than `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for
-                // that motor's torque state, mode, or rest pose.
-                if self.motor_torque_settle_until[idx].is_some_and(|until| rx_at < until) {
+                // S1/E1: After a torque-changing write returns from transmit(), frames whose
+                // kernel/transport receive time is not strictly greater than
+                // `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` (20 ms) are never evidence for that
+                // motor's torque state, mode, or rest pose. Still update temperature so protective
+                // thermal cutoffs observe overheating without waiting for the settle window.
+                if self.motor_torque_settle_until[idx]
+                    .is_some_and(|boundary| !Self::boundary_satisfied(boundary, Some(rx_t), decode_now))
+                {
+                    self.cached_states[idx].temperature = feedback.t_mos.max(feedback.t_rotor);
                     return;
                 }
+                let rx_at = can_rx_time_to_monotonic(&self.can, rx_t, decode_now);
                 let queue_bound = self.rx_empty_instant;
                 let seq = self.rx_seq;
                 let prev_rx = self.last_feedback_instant[idx];
@@ -11415,26 +11494,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.motor_disable_confirmed[idx] = false;
                 }
                 if let Some(en_boundary) = self.motor_enable_tx[idx].as_mut() {
-                    if !self.awaiting_rx_boundary && Self::boundary_satisfied(*en_boundary, rx_at) {
+                    if !self.awaiting_rx_boundary && Self::boundary_satisfied(*en_boundary, Some(rx_t), decode_now) {
                         en_boundary.probe_needed = false;
                         self.motor_post_enable_feedback[idx] = true;
                     }
                 }
                 if let Some(dis_boundary) = self.motor_disable_tx[idx].as_mut() {
-                    if !self.awaiting_rx_boundary && Self::boundary_satisfied(*dis_boundary, rx_at) {
+                    if !self.awaiting_rx_boundary && Self::boundary_satisfied(*dis_boundary, Some(rx_t), decode_now) {
                         dis_boundary.probe_needed = false;
                     }
                 }
-                // Single owner of per-motor causal torque evidence strictly per §1 + E1:
-                // - OffConfirmed ONLY on a verified disable transaction whose post-settle
-                //   boundary (`rx_at >= write_done + TORQUE_CAUSAL_SETTLE_WINDOW`) excludes
-                //   pre-disable / in-flight samples.
-                // - OnConfirmed ONLY on a verified enable transaction whose post-settle boundary
-                //   excludes pre-enable / in-flight samples.
+                // Single owner of per-motor causal torque evidence strictly per §1 + S1:
+                // - OffConfirmed ONLY on a verified disable transaction whose kernel/transport
+                //   receive time strictly exceeds `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`.
+                // - OnConfirmed ONLY on a verified enable transaction whose kernel/transport
+                //   receive time strictly exceeds `write_done + TORQUE_CAUSAL_SETTLE_WINDOW`.
                 match feedback.state_or_error {
                     0 => {
                         if let Some(boundary) = self.motor_disable_tx[idx] {
-                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, rx_at) {
+                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, Some(rx_t), decode_now) {
                                 self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
                                 self.motor_disable_confirmed[idx] = true;
                                 self.motor_enable_attempted[idx] = false;
@@ -11447,7 +11525,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }
                     1 => {
                         if let Some(boundary) = self.motor_enable_tx[idx] {
-                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, rx_at) {
+                            if !self.awaiting_rx_boundary && Self::boundary_satisfied(boundary, Some(rx_t), decode_now) {
                                 self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
                             }
                         } else if self.motor_evidence[idx] == MotorTorqueEvidence::OffConfirmed {
@@ -11521,10 +11599,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         while frames_processed < max_frames && !self.rx_over(t0) {
             // Taken before the receive: an empty result means the queue was empty after it.
             let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
+            match self.can.receive_with_rx_time() {
+                Ok((frame, rx_time)) => {
                     frames_processed += 1;
-                    self.process_rx_frame(&frame, true, rx_ts);
+                    self.process_rx_frame(&frame, true, rx_time);
                     if frames_processed >= max_frames || self.rx_over(t0) {
                         break;
                     }
@@ -11810,7 +11888,11 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     feedback_queue_bound: Vec<Option<Instant>>,
     /// Per-motor causal settle deadline (`write_done + TORQUE_CAUSAL_SETTLE_WINDOW`) after a
     /// torque-changing write returns from `can.transmit()`.
-    motor_torque_settle_until: Vec<Option<Instant>>,
+    /// Per-motor causal settle boundary captured after a torque-changing write returns from
+    /// `can.transmit()`. Frames whose kernel/transport receive time is not strictly greater than
+    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for that motor's torque
+    /// state, mode, or rest pose.
+    motor_torque_settle_until: Vec<Option<MotorTorqueSettle>>,
     /// True once the most recent RX receive/drain pass reached an empty queue (`Timeout`/`WouldBlock`).
     last_read_drained: bool,
     /// True while a pre-disable RX drain did not complete (zero budget without drained state, or
@@ -11939,8 +12021,14 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         }
         self.can.transmit(frame)?;
         let write_done = self.now();
+        let write_done_rx_clock = Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)));
         if let Some(slot) = self.motor_torque_settle_until.get_mut(idx) {
-            *slot = Some(write_done + TORQUE_CAUSAL_SETTLE_WINDOW);
+            *slot = Some(MotorTorqueSettle {
+                write_done,
+                settle_until: write_done + TORQUE_CAUSAL_SETTLE_WINDOW,
+                write_done_rx_clock,
+                probe_needed: false,
+            });
         }
         Ok(())
     }
@@ -11965,15 +12053,23 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             && self.since(t0) < max_span
         {
             let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
+            match self.can.receive_with_rx_time() {
+                Ok((frame, rx_time)) => {
                     frames_processed += 1;
                     if let Ok(feedback) = robstride::unpack_feedback_frame(&frame, &self.limits) {
                         if let Some(idx) = self.motor_ids.iter().position(|&id| id == feedback.motor_id) {
                             let decode_now = self.now();
-                            let rx_at = rx_ts.map_or(decode_now, |ts| ts.min(decode_now));
+                            // S1: Host dequeue time never counts. Reject frames without a kernel/
+                            // transport RX timestamp completely for causal evidence.
+                            let Some(rx_t) = rx_time else {
+                                self.last_feedback_instant[idx] = None;
+                                self.feedback_queue_bound[idx] = None;
+                                self.feedback_continuity_epoch[idx] =
+                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
+                                continue;
+                            };
                             let in_settle = self.motor_torque_settle_until[idx]
-                                .is_some_and(|until| rx_at < until);
+                                .is_some_and(|boundary| !can_settle_boundary_satisfied(boundary, Some(rx_t), decode_now));
                             self.cached_states[idx] = JointState {
                                 position: feedback.position,
                                 velocity: feedback.velocity,
@@ -11982,7 +12078,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                             };
                             self.fault_flags[idx] = feedback.fault_flags;
                             if in_settle {
-                                // E1: Feedback received earlier than write_done + SETTLE is never
+                                // S1/E1: Feedback received on/before write_done + SETTLE is never
                                 // evidence for rest pose; clear freshness/queue bounds so it
                                 // cannot authorize a stopped disable.
                                 self.last_feedback_instant[idx] = None;
@@ -11991,6 +12087,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                     self.feedback_continuity_epoch[idx].wrapping_add(1);
                                 continue;
                             }
+                            let rx_at = can_rx_time_to_monotonic(&self.can, rx_t, decode_now);
                             let prev_rx = self.last_feedback_instant[idx];
                             let prev_qb = self.feedback_queue_bound[idx];
                             if prev_rx.is_none_or(|p| rx_at.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
@@ -12338,7 +12435,13 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 self.strict_stop_check(Some(start_stamp))?;
                 self.can.transmit(&frame)?;
                 let write_done = self.now();
-                self.motor_torque_settle_until[idx] = Some(write_done + TORQUE_CAUSAL_SETTLE_WINDOW);
+                let write_done_rx_clock = Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)));
+                self.motor_torque_settle_until[idx] = Some(MotorTorqueSettle {
+                    write_done,
+                    settle_until: write_done + TORQUE_CAUSAL_SETTLE_WINDOW,
+                    write_done_rx_clock,
+                    probe_needed: false,
+                });
             }
             self.strict_stop_check(Some(start_stamp))?;
             self.can.flush()?;
@@ -12518,7 +12621,7 @@ mod tx_chokepoint_tests {
     struct TestBus {
         clock: Arc<MockClock>,
         tx: Arc<Mutex<Vec<CanFrame>>>,
-        rx: Arc<Mutex<VecDeque<CanFrame>>>,
+        rx: Arc<Mutex<VecDeque<(CanFrame, Option<Instant>)>>>,
         on_tx: Arc<Mutex<Option<Box<dyn FnMut(&CanFrame) -> Result<(), TransportError> + Send>>>>,
     }
 
@@ -12564,10 +12667,11 @@ mod tx_chokepoint_tests {
                 30,
                 30,
             ];
+            let ts = self.clock.now();
             self.rx
                 .lock()
                 .unwrap()
-                .push_back(CanFrame::new_standard(0x10 + motor_id, &data).unwrap());
+                .push_back((CanFrame::new_standard(0x10 + motor_id, &data).unwrap(), Some(ts)));
         }
     }
 
@@ -12585,6 +12689,9 @@ mod tx_chokepoint_tests {
             Ok(())
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.receive_timestamped().map(|(f, _)| f)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
             self.rx.lock().unwrap().pop_front().ok_or(TransportError::WouldBlock)
         }
         fn flush(&mut self) -> Result<(), TransportError> {

@@ -329,11 +329,74 @@ pub trait AsyncTransport: Send {
     }
 }
 
+/// Kernel or transport receive-clock timestamp carried alongside a CAN frame.
+///
+/// Causal ordering after a torque-changing write compares `rx_time` against the
+/// `write_done` timestamp captured on the **same** clock domain (`CanTransport::rx_clock_now()`).
+/// Missing timestamps (`None`) or cross-domain comparisons always fail closed — host dequeue time
+/// never substitutes for a kernel/transport receive timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanRxTime {
+    /// Linux kernel software RX timestamp in nanoseconds since the Unix epoch (`CLOCK_REALTIME`),
+    /// delivered via `SO_TIMESTAMPING` (`SCM_TIMESTAMPING` `ts[0]`) or `SO_TIMESTAMPNS`
+    /// (`SCM_TIMESTAMPNS`).
+    KernelRealtimeNs(i128),
+    /// Deterministic transport/mock receive instant on the same clock domain as
+    /// [`CanTransport::clock`] (or `std::time::Instant::now()`).
+    Monotonic(std::time::Instant),
+}
+
+impl CanRxTime {
+    /// True iff `self` is strictly later than `write_done + settle` on the same clock domain.
+    pub fn is_after_settle(self, write_done: CanRxTime, settle: std::time::Duration) -> bool {
+        match (self, write_done) {
+            (CanRxTime::KernelRealtimeNs(rx_ns), CanRxTime::KernelRealtimeNs(tx_ns)) => {
+                let settle_ns = settle.as_nanos() as i128;
+                rx_ns > tx_ns.saturating_add(settle_ns)
+            }
+            (CanRxTime::Monotonic(rx), CanRxTime::Monotonic(tx)) => {
+                rx.checked_duration_since(tx).is_some_and(|d| d > settle)
+            }
+            _ => false,
+        }
+    }
+
+    /// Non-negative duration from `earlier` to `self` on the same clock domain (`None` across
+    /// domains or if `self < earlier`).
+    pub fn checked_duration_since(self, earlier: CanRxTime) -> Option<std::time::Duration> {
+        match (self, earlier) {
+            (CanRxTime::KernelRealtimeNs(later_ns), CanRxTime::KernelRealtimeNs(earlier_ns)) => {
+                let diff = later_ns.checked_sub(earlier_ns)?;
+                if diff < 0 {
+                    return None;
+                }
+                let clamped = diff.min(i128::from(u64::MAX)) as u64;
+                Some(std::time::Duration::from_nanos(clamped))
+            }
+            (CanRxTime::Monotonic(later), CanRxTime::Monotonic(earlier)) => {
+                later.checked_duration_since(earlier)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// CAN bus frame transport trait
 pub trait CanTransport: Send {
     /// Optional deterministic clock supplied by test transports ([`DriverClock`]).
     /// Production transports return `None`: drivers use the system clock unchanged.
     fn clock(&self) -> Option<std::sync::Arc<dyn DriverClock>> {
+        None
+    }
+
+    /// Current time on the external kernel receive-clock domain used to stamp RX frames in
+    /// [`Self::receive_with_rx_time`].
+    ///
+    /// On Linux [`SocketCanTransport`], this reads `CLOCK_REALTIME` (matching kernel
+    /// `SO_TIMESTAMPING` software RX / `SO_TIMESTAMPNS`). Transports whose RX timestamps live on
+    /// the driver's monotonic clock domain (`DriverClock` / `Instant::now()`) return `None` so
+    /// drivers reuse their cached clock with zero allocation.
+    fn rx_clock_now(&self) -> Option<CanRxTime> {
         None
     }
 
@@ -345,15 +408,25 @@ pub trait CanTransport: Send {
 
     /// Receive a CAN frame together with its optional transport-measured monotonic receive time
     /// (on the same clock domain as [`Self::clock`], or `Instant::now()` when `clock()` is `None`).
-    /// Transports that do not capture arrival timestamps — including Linux SocketCAN
-    /// (`SocketCanTransport`) — inherit the default (`None`) and callers use the host monotonic
-    /// receive instant. Neither an empty host RX queue nor a no-op [`Self::flush`] establishes
-    /// a causal torque boundary; uncorrelated-RX drivers enforce [`crate::driver::TORQUE_CAUSAL_SETTLE_WINDOW`]
-    /// after `transmit()` returns before accepting feedback as evidence.
+    /// Transports that do not capture arrival timestamps inherit the default (`None`); host
+    /// dequeue time never counts as causal evidence for torque state, mode, or rest pose.
     fn receive_timestamped(
         &mut self,
     ) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
         self.receive().map(|f| (f, None))
+    }
+
+    /// Receive a CAN frame together with its kernel or transport receive timestamp
+    /// ([`CanRxTime`]) on the same clock domain as [`Self::rx_clock_now`].
+    ///
+    /// Linux [`SocketCanTransport`] overrides this to deliver the raw kernel receive timestamp
+    /// from `SO_TIMESTAMPING` / `SO_TIMESTAMPNS` without converting through host dequeue time.
+    /// Transports that return `None` provide no causal RX timestamp; host dequeue time never counts.
+    fn receive_with_rx_time(
+        &mut self,
+    ) -> Result<(CanFrame, Option<CanRxTime>), TransportError> {
+        self.receive_timestamped()
+            .map(|(f, ts)| (f, ts.map(CanRxTime::Monotonic)))
     }
 
     /// Flush pending CAN frames
