@@ -114,6 +114,85 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Zero-allocation in-place install of joint zero offsets for the RT executor.
+    ///
+    /// Swaps `next` with `self.joint_zero_offsets` so the caller returns the old `Vec<f32>`
+    /// for off-thread drop, and returns any invalidated `FreeTorqueBaseline` for off-thread drop.
+    pub(crate) fn set_joint_zero_offsets_in_place(
+        &mut self,
+        next: &mut Vec<f32>,
+        precomputed_floor: Option<(f32, &'static str)>,
+    ) -> Result<Option<crate::gripper_baseline::FreeTorqueBaseline>, String> {
+        if self.is_torqued || self.disable_pending {
+            return Err("torque is on".into());
+        }
+        if next.len() != self.config.dof || !next.iter().all(|o| o.is_finite()) {
+            return Err(format!("joint zero needs {} finite offsets", self.config.dof));
+        }
+        let any_driver_limits = if let Some(d) = self.driver.as_ref() {
+            let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
+            drv.set_joint_zero_offsets(next);
+            (0..self.config.dof).any(|i| drv.position_limits(i).is_some())
+        } else {
+            false
+        };
+        std::mem::swap(&mut self.joint_zero_offsets, next);
+        self.tracking.invalidate();
+        if next.as_slice() != self.joint_zero_offsets.as_slice() {
+            self.calibration_revision += 1;
+            if let Some((floor, source)) = precomputed_floor {
+                self.floor_source = source;
+                if let Some(ws) = self.config.workspace.as_mut() {
+                    if ws.floor_z_m != floor {
+                        ws.floor_z_m = floor;
+                        self.workspace_revision += 1;
+                        self.retire_servo_ws_min_depths();
+                    }
+                }
+            }
+        }
+        if any_driver_limits {
+            let _ = self.reapply_driver_limits_bounded();
+        }
+        let mut gripper_zero_moved = false;
+        for (i, (&o, &n)) in next.iter().zip(self.joint_zero_offsets.iter()).enumerate() {
+            let d = o - n;
+            if d == 0.0 {
+                continue;
+            }
+            if Some(i) == self.config.gripper_index() {
+                gripper_zero_moved = true;
+            }
+            for v in [
+                &mut self.measured_positions,
+                &mut self.commanded_positions,
+                &mut self.target_positions,
+            ] {
+                if let Some(p) = v.get_mut(i) {
+                    *p += d;
+                }
+            }
+        }
+        let retired_baseline = if gripper_zero_moved && self.gripper_baseline.is_some() {
+            let b = self.gripper_baseline.take();
+            self.gripper_last_contact = None;
+            self.gripper_baseline_pending.clear();
+            self.gripper_baseline_generation += 1;
+            self.gripper_baseline_dirty = true;
+            b
+        } else {
+            None
+        };
+        if next.len() > 5
+            && self.joint_zero_offsets.len() > 5
+            && next[5] != self.joint_zero_offsets[5]
+        {
+            self.zero_convention = Default::default();
+        }
+        self.zero_check_pending = true;
+        Ok(retired_baseline)
+    }
+
     /// The reference pose in joint angles (`home_positions` derived from `zero_reference`).
     pub fn zero_reference_joints(&self) -> Option<Vec<f32>> {
         self.config.zero_reference.as_ref().map(|_| self.config.home_positions.clone())

@@ -836,7 +836,10 @@ pub enum MaintenanceOp {
     PlanningSnapshot,
     Observation,
     ClearFault { expected_epoch: Option<u64> },
-    SetJointZeroOffsets { offsets: Vec<f32> },
+    SetJointZeroOffsets {
+        offsets: Vec<f32>,
+        precomputed_floor: Option<(f32, &'static str)>,
+    },
     SetMotorZero { joint: usize },
     TakeBaselinePending {
         fresh_pending: Vec<crate::gripper_baseline::MoveRecord>,
@@ -2020,7 +2023,14 @@ impl RtExecutorHandle {
 
     pub fn set_joint_zero_offsets(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
         let applied = offsets.clone();
-        match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets { offsets })? {
+        let precomputed_floor = self
+            .shared
+            .published_config
+            .precompute_effective_floor_for_offsets(&offsets);
+        match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets {
+            offsets,
+            precomputed_floor,
+        })? {
             MaintenanceResult::JointZeroOffsetsSet(r) => {
                 if r.is_ok() {
                     self.shared.published_config.apply_joint_zero_offsets(&applied);
@@ -2033,7 +2043,17 @@ impl RtExecutorHandle {
 
     pub async fn set_joint_zero_offsets_async(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
         let applied = offsets.clone();
-        match self.call_maintenance_async(MaintenanceOp::SetJointZeroOffsets { offsets }).await? {
+        let precomputed_floor = self
+            .shared
+            .published_config
+            .precompute_effective_floor_for_offsets(&offsets);
+        match self
+            .call_maintenance_async(MaintenanceOp::SetJointZeroOffsets {
+                offsets,
+                precomputed_floor,
+            })
+            .await?
+        {
             MaintenanceResult::JointZeroOffsetsSet(r) => {
                 if r.is_ok() {
                     self.shared.published_config.apply_joint_zero_offsets(&applied);
@@ -2657,7 +2677,10 @@ impl ControlState {
                 self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
                 MaintenanceResult::FaultCleared(res)
             }
-            MaintenanceOp::SetJointZeroOffsets { offsets } => {
+            MaintenanceOp::SetJointZeroOffsets {
+                mut offsets,
+                precomputed_floor,
+            } => {
                 let res = if *core.safety.state() != SafetyState::Idle
                     || core.is_torqued
                     || core.disable_pending
@@ -2665,7 +2688,13 @@ impl ControlState {
                 {
                     Err("Arm must be Idle with torque off and no active trajectory to set joint zero offsets".into())
                 } else {
-                    core.set_joint_zero_offsets(&offsets)
+                    match core.set_joint_zero_offsets_in_place(&mut offsets, precomputed_floor) {
+                        Ok(retired) => {
+                            returned_baseline = retired;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
                 returned_offsets = Some(offsets);
                 MaintenanceResult::JointZeroOffsetsSet(res)
@@ -2805,7 +2834,7 @@ impl ControlState {
         }
         while let Ok(req) = self.maint_req_rx.pop() {
             let (result, returned_offsets, returned_probe, returned_pending, returned_baseline) = match req.op {
-                MaintenanceOp::SetJointZeroOffsets { offsets } => {
+                MaintenanceOp::SetJointZeroOffsets { offsets, .. } => {
                     (MaintenanceResult::Stopped, Some(offsets), None, None, None)
                 }
                 MaintenanceOp::ProbeOwnedPayload { payload } => {

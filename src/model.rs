@@ -2775,6 +2775,12 @@ impl ArmObservation {
                 }
             }
         }
+        if self.gravity_comp.tau_ff.capacity() < 6 {
+            self.gravity_comp.tau_ff.reserve(6 - self.gravity_comp.tau_ff.len());
+        }
+        if self.gravity_comp.damping_kd.capacity() < 6 {
+            self.gravity_comp.damping_kd.reserve(6 - self.gravity_comp.damping_kd.len());
+        }
     }
 
     /// Updates `self.safety_state` to match `next`, recycling any owned `String` buffer between

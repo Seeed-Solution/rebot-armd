@@ -876,10 +876,14 @@ impl SupervisorInner {
                     self.tracking.invalidate();
                 }
                 self.safety.mark_motion_finished();
-                tracing::info!("Gravity compensation off: POS_VEL hold at {hold:?}");
+                if !self.rt_executor_owned {
+                    tracing::info!("Gravity compensation off: POS_VEL hold at {hold:?}");
+                }
             }
             Err(e) => {
-                tracing::error!("Gravity compensation: switch back to POS_VEL not confirmed: {e}");
+                if !self.rt_executor_owned {
+                    tracing::error!("Gravity compensation: switch back to POS_VEL not confirmed: {e}");
+                }
                 if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::ExitFailed { hold, retry_in_s: 0.5 }; }
                 self.safety.latch(
                     crate::safety::FaultKind::Other,

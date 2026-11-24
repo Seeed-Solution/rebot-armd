@@ -642,6 +642,32 @@ impl PublishedConfigHub {
         });
     }
 
+    /// Precomputes `(effective_floor, floor_source)` off-thread for candidate `joint_zero_offsets`
+    /// so `SetJointZeroOffsets` on `armd-control` never allocates strings to recompute fingerprints.
+    pub fn precompute_effective_floor_for_offsets(&self, offsets: &[f32]) -> Option<(f32, &'static str)> {
+        let cfg = self.latest()?;
+        let profile = cfg.profile_floor_z_m?;
+        let (_, fp) = crate::calibration::file_fingerprints(
+            cfg.calibration.as_ref(),
+            &cfg.config.camera_mount,
+            offsets,
+            Some(&cfg.config.active_tool.config_digest),
+        );
+        let legacy_fp = crate::calibration::legacy_file_fingerprint(
+            cfg.calibration.as_ref(),
+            &cfg.config.camera_mount,
+            offsets,
+        );
+        let (floor, source, _) = crate::calibration::effective_floor_for_with_legacy(
+            profile,
+            cfg.calibration.as_ref(),
+            &fp,
+            Some(&legacy_fp),
+            &cfg.config.active_tool,
+        );
+        Some((floor, source))
+    }
+
     /// Updates published joint-zero offsets off-thread after `SetJointZeroOffsets` succeeds.
     pub fn apply_joint_zero_offsets(&self, offsets: &[f32]) {
         self.update(|cfg| {
@@ -1184,6 +1210,7 @@ pub enum ConfigRequest {
     InvalidateAfterZero(Box<ZeroInvalidationCandidate>),
     SampleTableCapture,
     GravityComp(GravityCompOp),
+    InspectHold(ConfigDomain),
 }
 
 /// Reply produced on the owner and read off-thread from `ConfigExchange`.
@@ -1198,6 +1225,10 @@ pub enum ConfigReply {
     ZeroInvalidated(ZeroInvalidatedReply),
     TableCaptureSampled(Result<([f32; 8], usize), ConfigError>),
     GravityCompDone(Result<GravityCompReply, ConfigError>),
+    HoldInspected {
+        config_inhibited: bool,
+        state: Option<crate::rt_core::config_iface::HoldState>,
+    },
 }
 
 /// Displaced or unused heap payloads carried back inside the SAME `Box<ConfigExchange>`
@@ -1282,6 +1313,10 @@ pub(crate) fn handle_config_exchange(
         ConfigRequest::GravityComp(op) => {
             ConfigReply::GravityCompDone(install_gravity_comp(core, ctx, op, &mut ex.retired))
         }
+        ConfigRequest::InspectHold(domain) => ConfigReply::HoldInspected {
+            config_inhibited: core.core.motion_inhibited_by_config(),
+            state: core.core.config_held(domain).map(|h| h.state),
+        },
     };
     ex.reply = Some(reply);
 }
@@ -1703,7 +1738,7 @@ fn install_activate_config(
             retired.keepout_runtime = Some(std::mem::replace(&mut core.keepout.runtime_boxes, runtime_boxes));
             core.keepout.runtime = true;
             core.workspace_revision += 1;
-            core.servo_ws_min_depths = None;
+            core.retire_servo_ws_min_depths();
             core.keepout.revision += 1;
             retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, ws_eval_bufs));
         }
@@ -1754,7 +1789,7 @@ fn install_activate_config(
             let tilt = setup.camera_tilt_deg as f32;
             if core.config.camera_mount.tilt_deg != tilt {
                 core.workspace_revision += 1;
-                core.servo_ws_min_depths = None;
+                core.retire_servo_ws_min_depths();
             }
             core.config.camera_mount.tilt_deg = tilt;
             retired.grasp_setup = core.config.grasp.replace(setup);
@@ -1837,7 +1872,7 @@ fn apply_calibration_candidate_in_place(
     }
     if workspace_bumped {
         core.workspace_revision += 1;
-        core.servo_ws_min_depths = None;
+        core.retire_servo_ws_min_depths();
     }
     if let Some(bufs) = cand.ws_eval_bufs.take() {
         retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
@@ -1943,7 +1978,7 @@ fn install_invalidate_after_zero(
     }
     if workspace_bumped {
         core.workspace_revision += 1;
-        core.servo_ws_min_depths = None;
+        core.retire_servo_ws_min_depths();
     }
     if let Some(bufs) = cand.ws_eval_bufs.take() {
         retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
