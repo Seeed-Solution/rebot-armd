@@ -383,7 +383,10 @@ pub(crate) fn bounded_panic_disable_driver_until(
                         std::thread::sleep(rem.min(PANIC_DISABLE_SERVICE));
                     }
                 }
-                if matches!(progress, crate::driver::TorqueProgress::Done(_)) {
+                if matches!(
+                    progress,
+                    crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
+                ) {
                     return if enable_fb {
                         PanicDisableOutcome::Confirmed
                     } else {

@@ -3786,7 +3786,6 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                     write_err = Some(e);
                     break;
                 }
-                self.last_motion_write_at[idx] = Some(self.clock_now());
             }
 
             self.strict_stop_check(Some(start_stamp))?;
@@ -6028,15 +6027,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if budgeted {
             self.record_tx_pass_attempt();
         }
-        let mut motion_or_enable_idx: Option<usize> = None;
+        let mut motion_idx: Option<usize> = None;
         if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
             if frame.data == damiao::CMD_ENABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
-                    self.rest_pose_window[idx].reset();
                     self.motor_post_enable_feedback[idx] = false;
                     self.motor_enable_seq[idx] = self.rx_seq;
                     self.mode_readback_boundary[idx] = None;
-                    motion_or_enable_idx = Some(idx);
                 }
             } else if frame.data == damiao::CMD_DISABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
@@ -6050,10 +6047,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| id == target_id) {
                     self.mode_readback_boundary[idx] = None;
                 }
-            } else if matches!(kind, TxKind::Target | TxKind::Hold | TxKind::Recovery) {
+            } else if matches!(kind, TxKind::Target | TxKind::Recovery) {
                 if let Some(idx) = self.damiao_command_motor_index(&frame) {
                     self.rest_pose_window[idx].reset();
-                    motion_or_enable_idx = Some(idx);
+                    motion_idx = Some(idx);
                 }
             }
         }
@@ -6061,7 +6058,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
         let write_done = self.now();
-        let write_done_clock = if motion_or_enable_idx.is_some() && res.is_ok() {
+        let write_done_clock = if motion_idx.is_some() && res.is_ok() {
             Some(self.capture_rx_clock_sample(write_done))
         } else {
             None
@@ -6078,9 +6075,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         match res {
             Ok(()) => {
                 // Record the same-clock boundary + CLOCK_REALTIME - CLOCK_MONOTONIC offset AFTER
-                // `transmit()` returns for the rest-pose gate (after last motion/enable command).
+                // `transmit()` returns for the rest-pose gate (after the last motion command).
                 if let (Some(idx), Some((write_done_rx_clock, write_done_offset_ns))) =
-                    (motion_or_enable_idx, write_done_clock)
+                    (motion_idx, write_done_clock)
                 {
                     self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
                         write_done,
@@ -11936,7 +11933,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
-                .last_feedback_instant
+                .pose_feedback_instant
                 .get(i)
                 .copied()
                 .flatten()
@@ -12092,6 +12089,26 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.rest_pose_window[idx].reset();
                     return;
                 };
+                // Per-motor rest-pose causal boundary check (after last motion command):
+                // - OffsetDrifted (> 1 ms CLOCK_REALTIME step): discard completely and restart window.
+                // - InSettle (<= write_done + 20 ms): reset rest window & do NOT refresh pose_feedback_instant.
+                // - Satisfied: eligible for pose_feedback_instant and K=3 rest-pose window.
+                let boundary_check = match self.rest_pose_boundary[idx] {
+                    None => RestBoundaryCheck::Satisfied,
+                    Some(boundary) => {
+                        check_rest_pose_boundary(boundary, rx_t, decode_now, decode_offset_ns)
+                    }
+                };
+                if boundary_check == RestBoundaryCheck::OffsetDrifted {
+                    self.rest_pose_window[idx].reset();
+                    let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
+                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                        write_done: decode_now,
+                        write_done_rx_clock: Some(cur_rx),
+                        write_done_offset_ns: cur_off,
+                    });
+                    return;
+                }
                 let queue_bound = self.rx_empty_instant;
                 let seq = self.rx_seq;
                 let prev_rx = self.last_feedback_instant[idx];
@@ -12111,7 +12128,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     temperature: feedback.t_mos.max(feedback.t_rotor),
                 };
                 self.last_feedback_instant[idx] = Some(rx_at);
-                self.pose_feedback_instant[idx] = Some(rx_at);
                 self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                 self.feedback_queue_bound[idx] = queue_bound;
                 self.last_feedback_seq[idx] = seq;
@@ -12126,28 +12142,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if !self.awaiting_rx_boundary && seq > self.motor_enable_seq[idx] {
                     self.motor_post_enable_feedback[idx] = true;
                 }
-                // Per-motor K=3 causal rest-pose window for arm joints under StoppedDisableGate
-                // (the ONLY place with strict causal settle + offset-drift + K=3 evidence).
-                let boundary_check = match self.rest_pose_boundary[idx] {
-                    None => RestBoundaryCheck::Satisfied,
-                    Some(boundary) => {
-                        check_rest_pose_boundary(boundary, rx_t, decode_now, decode_offset_ns)
-                    }
-                };
                 match boundary_check {
-                    RestBoundaryCheck::OffsetDrifted => {
-                        self.rest_pose_window[idx].reset();
-                        let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
-                        self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
-                            write_done: decode_now,
-                            write_done_rx_clock: Some(cur_rx),
-                            write_done_offset_ns: cur_off,
-                        });
-                    }
+                    RestBoundaryCheck::OffsetDrifted => unreachable!(),
                     RestBoundaryCheck::InSettle => {
                         self.rest_pose_window[idx].reset();
                     }
                     RestBoundaryCheck::Satisfied => {
+                        self.pose_feedback_instant[idx] = Some(rx_at);
                         if let Some(ref gate) = self.stopped_disable_gate {
                             if gate.is_arm_joint(idx) {
                                 if !self.awaiting_rx_boundary
@@ -12291,8 +12292,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 crate::diagnostics::tick::record_tx_dropped_stopped(stopped_hold as u32);
             }
         }
-        if rx_drained && self.is_enabled && !self.is_enabling && self.recovery_tx_allowed()
-            && self.is_feedback_valid() {
+        if rx_drained
+            && self.is_enabled
+            && !self.is_enabling
+            && !self.is_stopped_for_disable()
+            && self.recovery_tx_allowed()
+            && self.is_feedback_valid()
+        {
             let n = self.motor_ids.len();
             for i in 0..n {
                 if self.strict_stop_check(Some(rx_stop_stamp)).is_err() {
@@ -12511,6 +12517,7 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     default_kd: f32,
     cached_states: Vec<JointState>,
     last_feedback_instant: Vec<Option<Instant>>,
+    pose_feedback_instant: Vec<Option<Instant>>,
     feedback_seq: Vec<u64>,
     feedback_continuity_epoch: Vec<u64>,
     /// Instant taken before the last receive call that found the RX queue empty.
@@ -12553,6 +12560,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             default_kd: 1.0,
             cached_states: vec![JointState::default(); dof],
             last_feedback_instant: vec![None; dof],
+            pose_feedback_instant: vec![None; dof],
             feedback_seq: vec![0; dof],
             feedback_continuity_epoch: vec![0; dof],
             rx_empty_instant: None,
@@ -12636,7 +12644,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                 return RestPoseGateStatus::RefusedNonRest;
             };
             let fresh = self
-                .last_feedback_instant
+                .pose_feedback_instant
                 .get(i)
                 .copied()
                 .flatten()
@@ -12759,6 +12767,25 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                 self.rest_pose_window[idx].reset();
                                 continue;
                             };
+                            let boundary_check = match self.rest_pose_boundary[idx] {
+                                None => RestBoundaryCheck::Satisfied,
+                                Some(boundary) => check_rest_pose_boundary(
+                                    boundary,
+                                    rx_t,
+                                    decode_now,
+                                    decode_offset_ns,
+                                ),
+                            };
+                            if boundary_check == RestBoundaryCheck::OffsetDrifted {
+                                self.rest_pose_window[idx].reset();
+                                let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
+                                self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                                    write_done: decode_now,
+                                    write_done_rx_clock: Some(cur_rx),
+                                    write_done_offset_ns: cur_off,
+                                });
+                                continue;
+                            }
                             self.cached_states[idx] = JointState {
                                 position: feedback.position,
                                 velocity: feedback.velocity,
@@ -12778,29 +12805,13 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                             self.last_feedback_instant[idx] = Some(rx_at);
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                            let boundary_check = match self.rest_pose_boundary[idx] {
-                                None => RestBoundaryCheck::Satisfied,
-                                Some(boundary) => check_rest_pose_boundary(
-                                    boundary,
-                                    rx_t,
-                                    decode_now,
-                                    decode_offset_ns,
-                                ),
-                            };
                             match boundary_check {
-                                RestBoundaryCheck::OffsetDrifted => {
-                                    self.rest_pose_window[idx].reset();
-                                    let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
-                                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
-                                        write_done: decode_now,
-                                        write_done_rx_clock: Some(cur_rx),
-                                        write_done_offset_ns: cur_off,
-                                    });
-                                }
+                                RestBoundaryCheck::OffsetDrifted => unreachable!(),
                                 RestBoundaryCheck::InSettle => {
                                     self.rest_pose_window[idx].reset();
                                 }
                                 RestBoundaryCheck::Satisfied => {
+                                    self.pose_feedback_instant[idx] = Some(rx_at);
                                     if let Some(ref gate) = self.stopped_disable_gate {
                                         if gate.is_arm_joint(idx) {
                                             if !self.awaiting_rx_boundary
@@ -13008,7 +13019,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
-                .last_feedback_instant
+                .pose_feedback_instant
                 .get(i)
                 .copied()
                 .flatten()
@@ -13172,16 +13183,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 self.strict_stop_check(Some(start_stamp))?;
                 let frame = robstride::build_enable_frame(id, self.master_id);
                 self.strict_stop_check(Some(start_stamp))?;
-                self.rest_pose_window[idx].reset();
                 self.can.transmit(&frame)?;
-                let write_done = self.now();
-                let (write_done_rx_clock, write_done_offset_ns) =
-                    self.capture_rx_clock_sample(write_done);
-                self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
-                    write_done,
-                    write_done_rx_clock: Some(write_done_rx_clock),
-                    write_done_offset_ns,
-                });
             }
             self.strict_stop_check(Some(start_stamp))?;
             self.can.flush()?;
@@ -14298,6 +14300,7 @@ mod tx_chokepoint_tests {
             for i in 0..3 {
                 drv.cached_states[i].position = 0.50;
                 drv.last_feedback_instant[i] = Some(t0);
+                drv.pose_feedback_instant[i] = Some(t0);
                 drv.feedback_queue_bound[i] = Some(t0);
             }
             let stopped_cb = Arc::clone(&stopped);
@@ -14326,6 +14329,7 @@ mod tx_chokepoint_tests {
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t1);
+                drv.pose_feedback_instant[i] = Some(t1);
                 drv.feedback_queue_bound[i] = Some(t1);
             }
             seed_rest_window(&mut drv.rest_pose_window, t1);
@@ -14356,6 +14360,7 @@ mod tx_chokepoint_tests {
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t_fb);
+                drv.pose_feedback_instant[i] = Some(t_fb);
                 drv.feedback_queue_bound[i] = Some(t_fb);
             }
             seed_rest_window(&mut drv.rest_pose_window, t_fb);
@@ -14395,6 +14400,7 @@ mod tx_chokepoint_tests {
             for i in 0..3 {
                 drv.cached_states[i].position = 0.50;
                 drv.last_feedback_instant[i] = Some(t_cf);
+                drv.pose_feedback_instant[i] = Some(t_cf);
                 drv.feedback_queue_bound[i] = Some(t_cf);
             }
             bus.clear_tx();
@@ -14422,6 +14428,7 @@ mod tx_chokepoint_tests {
             for i in 0..3 {
                 drv.cached_states[i].position = 0.50;
                 drv.last_feedback_instant[i] = Some(t_cf2);
+                drv.pose_feedback_instant[i] = Some(t_cf2);
                 drv.feedback_queue_bound[i] = Some(t_cf2);
             }
             let stopped_cb_cf = Arc::clone(&stopped);
@@ -14446,6 +14453,7 @@ mod tx_chokepoint_tests {
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t_cf3);
+                drv.pose_feedback_instant[i] = Some(t_cf3);
                 drv.feedback_queue_bound[i] = Some(t_cf3);
             }
             seed_rest_window(&mut drv.rest_pose_window, t_cf3);
@@ -14471,6 +14479,7 @@ mod tx_chokepoint_tests {
             for i in 0..3 {
                 drv.cached_states[i].position = 0.0;
                 drv.last_feedback_instant[i] = Some(t_cf4);
+                drv.pose_feedback_instant[i] = Some(t_cf4);
                 drv.feedback_queue_bound[i] = Some(t_cf4);
             }
             seed_rest_window(&mut drv.rest_pose_window, t_cf4);

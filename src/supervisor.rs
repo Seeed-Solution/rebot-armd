@@ -7397,6 +7397,8 @@ impl ArmSupervisor {
             }
         }
         inner.apply_driver_limits(drv.as_ref());
+        inner.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
+        inner.torque_intent = crate::supervisor::TorqueIntent::On;
         inner.driver = Some(std::sync::Mutex::new(drv));
         Ok(())
     }
@@ -7418,6 +7420,8 @@ impl ArmSupervisor {
                 let mut driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
                 driver.set_stopped_disable_gate(inner.stopped_disable_gate());
                 inner.apply_driver_limits(driver.as_ref());
+                inner.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
+                inner.torque_intent = crate::supervisor::TorqueIntent::On;
                 inner.driver = Some(std::sync::Mutex::new(driver));
             }
         }

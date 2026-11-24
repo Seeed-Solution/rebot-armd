@@ -785,6 +785,8 @@ mod shutdown_tests {
         if state == EnableState::Enabled {
             inner.is_torqued = true;
             inner.safety.set_torque(true).unwrap();
+        } else if state == EnableState::Disabled {
+            inner.torque_intent = armd::TorqueIntent::Off;
         }
         inner
     }
@@ -998,6 +1000,7 @@ mod shutdown_tests {
         };
         let sup_ok = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_ok)));
         sup_ok.set_lease_enabled(false).await;
+        sup_ok.disable_torque().await.unwrap();
         let handle_ok = sup_ok
             .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(Duration::from_millis(5)))
             .await
@@ -1052,6 +1055,7 @@ mod shutdown_tests {
         };
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
+        sup.inner().write().await.torque_intent = armd::TorqueIntent::Off;
         let _ = sup.trigger_e_stop().await;
         assert!(sup.request_shutdown().await.unwrap());
 
