@@ -656,11 +656,32 @@ fn gripper_request(action: GripperAction, fraction: Option<f64>, close_speed: f6
     crate::motion::GripperRequest { command, fraction, grasp: command == C::Close, speed, timeout_s, tag: None }
 }
 
-/// Begin the parent action and spawn its orchestrator. Returns (action id, expected duration).
-pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>, plan: RunPlan) -> Result<(u64, f64), ArmError> {
-    let (inner, proof) = admitted.consume()?;
-    let stamp = proof.stamp();
-    let id = inner.begin_orchestrated_action_inner(&proof, "sequence", plan.request.tag.clone(), plan.epoch)?;
+/// Build the A7 [`BeginMacroSpec`] for a prepared sequence run (shared by Legacy and RT Executor).
+pub fn begin_macro_spec(
+    plan: &RunPlan,
+    prepared_boot: crate::rt_core::broker::BootId,
+    deadline: Instant,
+) -> crate::rt_core::requests::actions::BeginMacroSpec {
+    use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+    let mut spec = BeginMacroSpec::new(MacroKind::Sequence, prepared_boot);
+    spec.check_workspace_revision = true;
+    spec.calibration_revision = Some(plan.calibration_revision);
+    spec.macro_deadline = Some(deadline);
+    spec.timeout_code = crate::safety::BoundedText::new("SEQUENCE_TIMEOUT");
+    if let Some(tag) = plan.request.tag.as_deref() {
+        spec.tag = crate::model::HolderLabel::new(tag);
+    }
+    spec
+}
+
+fn finish_begin_setup(
+    inner: &mut SupervisorInner,
+    sup: &Arc<ArmSupervisor>,
+    id: u64,
+    plan: RunPlan,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+) -> (u64, f64) {
     let pose_ids = plan.steps.iter().filter_map(|(_, s)| match s { PinnedStep::Pose { pose_id, .. } => Some(pose_id.clone()), _ => None }).collect();
     let episode_ids = plan.steps.iter().filter_map(|(_, s)| match s { PinnedStep::Replay { episode_id, .. } => Some(episode_id.clone()), _ => None }).collect();
     inner.sequences.pins = Some(RunPins { sequence_id: plan.sequence.id.clone(), action_id: id, pose_ids, episode_ids });
@@ -677,11 +698,76 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
         plan.sequence.name, plan.steps.len(), plan.repeats, plan.request.record.is_some());
     let sup = sup.clone();
     tokio::spawn(async move {
-        let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, stamp).await }) };
+        let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, stamp, deadline).await }) };
         let outcome = worker.await;
         cleanup(&sup, id, outcome.err().map(|e| e.to_string())).await;
     });
-    Ok((id, duration))
+    (id, duration)
+}
+
+/// Begin the parent action under a short write lock through the single owner-side
+/// [`crate::rt_core::requests::actions::install_begin_macro`] function and spawn its orchestrator.
+pub fn begin_with_stamp(
+    inner: &mut SupervisorInner,
+    stamp: crate::supervisor::AdmissionStamp,
+    sup: &Arc<ArmSupervisor>,
+    plan: RunPlan,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{
+        install_begin_macro, ActionStamp, OwnerCheckCtx, DEFAULT_ACTION_DEADLINE,
+    };
+    let deadline = Instant::now() + Duration::from_secs_f64(plan.expected_duration_s * 2.0 + 30.0);
+    let spec = begin_macro_spec(&plan, inner.boot_id, deadline);
+    let action_stamp = ActionStamp {
+        arm: inner.core.id(),
+        boot: inner.boot_id,
+        admission: stamp,
+        config_revision: plan.workspace_revision,
+        calibration_revision: Some(plan.calibration_revision),
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
+    };
+    let owner_ctx = OwnerCheckCtx::for_legacy(inner);
+    let id = install_begin_macro(
+        inner,
+        &action_stamp,
+        &owner_ctx,
+        &spec,
+        plan.request.tag.clone(),
+        None,
+    )
+    .map_err(|r| r.into_arm_error(inner))?;
+    Ok(finish_begin_setup(inner, sup, id, plan, stamp, deadline))
+}
+
+/// Begin the parent action and spawn its orchestrator. Returns (action id, expected duration).
+pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>, plan: RunPlan) -> Result<(u64, f64), ArmError> {
+    let deadline = Instant::now() + Duration::from_secs_f64(plan.expected_duration_s * 2.0 + 30.0);
+    let (inner, proof) = admitted.consume()?;
+    let stamp = proof.stamp();
+    if inner.safety.epoch_id() != plan.epoch {
+        return Err(crate::safety::SafetyError::EpochMismatch {
+            expected: inner.safety.epoch_id(),
+            received: plan.epoch,
+        }
+        .into());
+    }
+    let spec = begin_macro_spec(&plan, inner.boot_id, deadline);
+    let ws_rev = plan.workspace_revision;
+    let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
+        inner,
+        &proof,
+        &spec,
+        Some(ws_rev),
+        plan.request.tag.clone(),
+        None,
+    )?;
+    Ok(finish_begin_setup(inner, sup, id, plan, stamp, deadline))
 }
 
 /// After the orchestrator: discard an unfinished repeat's recording, release the pins, end
@@ -705,10 +791,16 @@ async fn cleanup(sup: &Arc<ArmSupervisor>, id: u64, panic: Option<String>) {
 }
 
 /// The orchestrator: repeats x steps, rechecks before each motion step, one episode per repeat.
-async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: RunPlan, stamp: crate::supervisor::AdmissionStamp) {
+async fn run(
+    sup: Arc<ArmSupervisor>,
+    id: u64,
+    plan: RunPlan,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+) {
     let ctx = MacroCtx {
         sup: sup.clone(), id, stamp,
-        deadline: Instant::now() + Duration::from_secs_f64(plan.expected_duration_s * 2.0 + 30.0),
+        deadline,
         phase_timeout_s: plan.expected_duration_s * 2.0 + 30.0,
         timeout_code: "SEQUENCE_TIMEOUT",
         timeout_message: "the sequence did not finish within twice its expected duration".into(),
@@ -730,7 +822,7 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: RunPlan, stamp: crate::supe
         }
         for (k, (index, step)) in plan.steps.iter().enumerate() {
             let progress = (r as f32 * plan.steps.len() as f32 + k as f32) / total;
-            {
+            if !ctx.is_executor() {
                 let mut inner = sup.inner().write().await;
                 if !inner.macro_alive(id) { drop(inner); return end(&ctx, Err(Stop::Cancelled), current).await; }
                 inner.update_action(id, |a| {
@@ -739,6 +831,8 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: RunPlan, stamp: crate::supe
                     a.repeat_index = Some(r);
                 });
                 inner.set_action_phase(id, step.kind(), progress, None, None);
+            } else if !ctx.alive().await {
+                return end(&ctx, Err(Stop::Cancelled), current).await;
             }
             current = Some(*index);
             if let Err(stop) = run_step(&ctx, &plan, step).await { return end(&ctx, Err(stop), current).await; }
@@ -746,7 +840,11 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: RunPlan, stamp: crate::supe
         if plan.request.record.is_some() {
             if !ctx.alive().await { return end(&ctx, Err(Stop::Cancelled), current).await; }
             match sup.stop_recording_as(crate::teach::Stopper::Owner(owner.clone()), true, Some("ok"), None).await {
-                Ok(crate::teach::Stopped::Saved { sidecar, .. }) => sup.inner().write().await.update_action(id, |a| a.episodes.push(sidecar.id.clone())),
+                Ok(crate::teach::Stopped::Saved { sidecar, .. }) => {
+                    if !ctx.is_executor() {
+                        sup.inner().write().await.update_action(id, |a| a.episodes.push(sidecar.id.clone()));
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => return end(&ctx, Err(arm_fail(e)), current).await,
             }
@@ -758,25 +856,55 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: RunPlan, stamp: crate::supe
 /// End the run; a run that did not finish records `failed_step` (also when a stop, lease loss
 /// or fault ended it while the step ran).
 async fn end(ctx: &MacroCtx, result: Result<(), Stop>, step: Option<usize>) {
-    let mut inner = ctx.sup.inner().write().await;
+    use crate::rt_core::requests::actions::{FinishState, HeldUpdate};
     match result {
-        Ok(()) => return inner.finish_macro(ctx.id, "done", None, None, None, None),
+        Ok(()) => {
+            ctx.finish(FinishState::Done, None, None, None, None, HeldUpdate::Unchanged)
+                .await;
+            return;
+        }
         Err(Stop::Fail(code, message)) => {
-            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && a.is_running()) {
-                a.failed_step = step;
+            if !ctx.is_executor() {
+                let mut inner = ctx.sup.inner().write().await;
+                if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && a.is_running()) {
+                    a.failed_step = step;
+                }
             }
-            inner.finish_macro(ctx.id, "failed", Some(&code), Some(message), None, None);
+            ctx.finish(
+                FinishState::Failed,
+                Some(&code),
+                Some(message),
+                None,
+                None,
+                HeldUpdate::Unchanged,
+            )
+            .await;
         }
         Err(Stop::Cancelled) => {}
     }
-    if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && !a.is_running()) {
-        a.failed_step = step;
+    if !ctx.is_executor() {
+        let mut inner = ctx.sup.inner().write().await;
+        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && !a.is_running()) {
+            a.failed_step = step;
+        }
+        inner.update_recorded_terminal_failed_step(ctx.id, step);
     }
-    inner.update_recorded_terminal_failed_step(ctx.id, step);
 }
 
 /// Before a motion step: the run is alive and nothing it was checked against changed.
 async fn recheck(ctx: &MacroCtx, plan: &RunPlan) -> Result<(), Stop> {
+    if ctx.is_executor() {
+        let snap = ctx.snapshot(ctx.deadline).await?;
+        let m = snap.owner.macro_state;
+        if m.active_id != ctx.id || !m.alive { return Err(Stop::Cancelled); }
+        if snap.owner.authority.epoch != plan.epoch { return Err(fail("PLAN_STALE", "the epoch changed during the sequence (stop or e-stop)")); }
+        if snap.owner.authority.config_revision != plan.workspace_revision { return Err(fail("PLAN_STALE", "the workspace or keep-out boxes changed during the sequence")); }
+        if snap.owner.calibration_revision != plan.calibration_revision {
+            return Err(fail("CALIBRATION_CHANGED", "the joint zero or the kinematic correction changed during the sequence"));
+        }
+        if Instant::now() > ctx.deadline { return Err(fail(ctx.timeout_code, ctx.timeout_message.clone())); }
+        return Ok(());
+    }
     let mut inner = ctx.sup.inner().write().await;
     if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
     if inner.safety.epoch_id() != plan.epoch { return Err(fail("PLAN_STALE", "the epoch changed during the sequence (stop or e-stop)")); }
@@ -806,26 +934,23 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
         }
         PinnedStep::Pose { positions, speed_scale, gripper, .. } => {
             recheck(ctx, plan).await?;
-            let ticket = {
-                let mut inner = ctx.sup.inner().write().await;
-                if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
-                let gripper_idx = inner.config.gripper_index();
-                let mut target = inner.commanded_positions.clone();
-                for i in (0..inner.config.dof).filter(|i| Some(*i) != gripper_idx) { target[i] = positions[i]; }
-                if let (PoseGripper::Pose, Some(g)) = (gripper, gripper_idx) { target[g] = positions[g]; }
-                let mut limits = inner.planning_limits();
-                for (i, l) in limits.iter_mut().enumerate() { if Some(i) != gripper_idx { l.max_velocity *= *speed_scale as f32; } }
-                let admitted = match inner.check_admission(ctx.next_child_stamp()) {
-                    Ok(a) => a,
-                    Err(e) => return Err(ctx.map_install_err(&mut inner, e.into())),
-                };
-                let limit = match SupervisorInner::install_macro_quintic(admitted, ctx.id, target, &limits) {
-                    Ok(v) => v,
-                    Err(e) => return Err(ctx.map_install_err(&mut inner, e)),
-                };
-                ctx.arm_child(&mut inner, "pose", limit * 2.0 + 5.0).ok_or(Stop::Cancelled)?
-            };
-            ctx.wait_child(ticket).await.map(|_| ())
+            let snap = ctx.snapshot(ctx.deadline).await?;
+            let gripper_idx = snap.env.config.gripper_index();
+            let mut target = snap.commanded_positions.clone();
+            for i in (0..snap.env.config.dof).filter(|i| Some(*i) != gripper_idx) { target[i] = positions[i]; }
+            if let (PoseGripper::Pose, Some(g)) = (gripper, gripper_idx) { target[g] = positions[g]; }
+            let limits = snap.env.planning_limits(Some(*speed_scale));
+            ctx.install_joint_child(
+                "pose",
+                target,
+                limits,
+                true,
+                Some(plan.workspace_revision),
+                Some(plan.calibration_revision),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|(s, _)| s)
         }
         PinnedStep::Gripper { action, fraction } => {
             recheck(ctx, plan).await?;
@@ -837,30 +962,27 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
         }
         PinnedStep::Replay { episode_id, speed, gripper } => {
             recheck(ctx, plan).await?;
-            let input = {
-                let inner = ctx.sup.inner().read().await;
-                if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
-                let request = crate::replay::ReplayRequest { episode: episode_id.clone(), speed: *speed, gripper: *gripper, tag: None, allow_stale: plan.request.allow_stale };
-                inner.replay_input(request, plan.epoch).map_err(arm_fail)?
+            let snap = ctx.snapshot(ctx.deadline).await?;
+            let request = crate::replay::ReplayRequest {
+                episode: episode_id.clone(),
+                speed: *speed,
+                gripper: *gripper,
+                tag: None,
+                allow_stale: plan.request.allow_stale,
             };
+            let input = snap.replay_input(request, plan.epoch).map_err(arm_fail)?;
             let planned = tokio::task::spawn_blocking(move || crate::replay::plan(input)).await
                 .map_err(|e| fail("INTERNAL", format!("replay check task failed: {e}")))?
                 .map_err(arm_fail)?;
             recheck(ctx, plan).await?;
-            let ticket = {
-                let mut inner = ctx.sup.inner().write().await;
-                if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
-                let admitted = match inner.check_admission(ctx.next_child_stamp()) {
-                    Ok(a) => a,
-                    Err(e) => return Err(ctx.map_install_err(&mut inner, e.into())),
-                };
-                let limit = match SupervisorInner::install_macro_replay(admitted, ctx.id, planned) {
-                    Ok(v) => v,
-                    Err(e) => return Err(ctx.map_install_err(&mut inner, e)),
-                };
-                ctx.arm_child(&mut inner, "replay", limit * 2.0 + 5.0).ok_or(Stop::Cancelled)?
-            };
-            ctx.wait_child(ticket).await.map(|_| ())
+            ctx.install_replay_child(
+                "replay",
+                planned,
+                Some(plan.workspace_revision),
+                Some(plan.calibration_revision),
+            )
+            .await
+            .map(|_| ())
         }
     }
 }

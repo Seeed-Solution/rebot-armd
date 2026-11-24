@@ -505,11 +505,7 @@ pub(super) fn dispatch_action_command(
             None
         }
         Ok(ActionStart::Sequence(plan)) => Some(
-            match inner
-                .check_admission(stamp)
-                .map_err(ArmError::from)
-                .and_then(|admitted| crate::sequences::begin(admitted, recv_supervisor, *plan))
-            {
+            match crate::sequences::begin_with_stamp(inner, stamp, recv_supervisor, *plan) {
                 Ok(started) => command_ack(inner, &value["request_id"], Some(started)),
                 Err(error) => command_reject(inner, &value["request_id"], error.into()),
             },
