@@ -483,7 +483,7 @@ fn base_tick_json(period_max: u64, tick_max: u64) -> serde_json::Value {
 fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let dir = tempfile::tempdir().unwrap();
 
-    // (a) Legacy tickload.json lacking Q1/monotonic fields: proxies & gaps preserved, verdict INVALID.
+    // (a) Legacy tickload.json lacking Q1/monotonic fields: proxies & gaps preserved, verdict DIAGNOSTIC ONLY.
     let legacy_path = dir.path().join("legacy_tickload.json");
     let t0 = base_tick_json(22_000, 1_500);
     let mut t1 = base_tick_json(23_000, 1_800);
@@ -491,7 +491,7 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let legacy = serde_json::json!({ "fault": null, "ticks": [t0, t1] });
     std::fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
     let legacy_rep = run_analyze(&legacy_path, None);
-    assert!(legacy_rep.contains("**Overall Verdict: INVALID"), "{legacy_rep}");
+    assert!(legacy_rep.contains("**Overall Verdict: DIAGNOSTIC ONLY"), "{legacy_rep}");
     assert!(legacy_rep.contains("PASS (proxy)"), "{legacy_rep}");
     assert!(legacy_rep.contains("Wake Overrun Proxy (ms)"), "{legacy_rep}");
     assert!(legacy_rep.contains("3.00 (sched overrun proxy)"), "{legacy_rep}");
@@ -506,6 +506,7 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     q0["boot_id"] = serde_json::json!("boot-uuid-test-1");
     q0["process_start_unix_ns"] = serde_json::json!(1_700_000_000_000_000_000u64);
     q0["owner_mode"] = serde_json::json!("executor");
+    q0["loop_active"] = serde_json::json!(true);
     q0["stats_snapshot_lapped"] = serde_json::json!(false);
     q0["stats_writer_drops"] = serde_json::json!(0);
     q0["in_flight_release_us"] = serde_json::json!(0);
@@ -534,8 +535,8 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let q1_lines = format!(
         "{}\n{}\n{}\n{}\n",
         serde_json::json!({ "type": "meta", "run_id": "q1-clean" }),
-        serde_json::json!({ "type": "sample", "phase": "baseline", "tick": q0 }),
-        serde_json::json!({ "type": "sample", "phase": "final", "tick": q1 }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-clean", "phase": "baseline", "tick": q0 }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-clean", "phase": "final", "tick": q1 }),
         serde_json::json!({ "type": "summary", "run_id": "q1-clean", "stop_reason": "completed", "fault": null }),
     );
     std::fs::write(&q1_path, q1_lines).unwrap();
@@ -570,8 +571,8 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let drop_lines = format!(
         "{}\n{}\n{}\n{}\n",
         serde_json::json!({ "type": "meta", "run_id": "q1-drop" }),
-        serde_json::json!({ "type": "sample", "phase": "baseline", "tick": d0 }),
-        serde_json::json!({ "type": "sample", "phase": "final", "tick": d1 }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-drop", "phase": "baseline", "tick": d0 }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-drop", "phase": "final", "tick": d1 }),
         serde_json::json!({ "type": "summary", "run_id": "q1-drop", "stop_reason": "completed", "fault": null }),
     );
     std::fs::write(&drop_path, drop_lines).unwrap();
@@ -593,8 +594,8 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let breach_lines = format!(
         "{}\n{}\n{}\n{}\n",
         serde_json::json!({ "type": "meta", "run_id": "q1-drop-breach" }),
-        serde_json::json!({ "type": "sample", "phase": "baseline", "tick": d0 }),
-        serde_json::json!({ "type": "sample", "phase": "final", "tick": b1 }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-drop-breach", "phase": "baseline", "tick": d0 }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-drop-breach", "phase": "final", "tick": b1 }),
         serde_json::json!({ "type": "summary", "run_id": "q1-drop-breach", "stop_reason": "completed", "fault": null }),
     );
     std::fs::write(&breach_path, breach_lines).unwrap();
@@ -614,8 +615,8 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
         format!(
             "{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-missing-dd" }),
-            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": m0 }),
-            serde_json::json!({ "type": "sample", "phase": "final", "tick": m1 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-missing-dd", "phase": "baseline", "tick": m0 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-missing-dd", "phase": "final", "tick": m1 }),
             serde_json::json!({ "type": "summary", "run_id": "q1-missing-dd", "stop_reason": "completed", "fault": null }),
         ),
     )
@@ -643,9 +644,9 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
         format!(
             "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-reset-dd" }),
-            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": r0 }),
-            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": r1 }),
-            serde_json::json!({ "type": "sample", "phase": "final", "tick": r2 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-reset-dd", "phase": "baseline", "tick": r0 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-reset-dd", "phase": "full_load", "tick": r1 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-reset-dd", "phase": "final", "tick": r2 }),
             serde_json::json!({ "type": "summary", "run_id": "q1-reset-dd", "stop_reason": "completed", "fault": null }),
         ),
     )
@@ -673,9 +674,9 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
         format!(
             "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-reset-skip" }),
-            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": s0 }),
-            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": s1 }),
-            serde_json::json!({ "type": "sample", "phase": "final", "tick": s2 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-reset-skip", "phase": "baseline", "tick": s0 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-reset-skip", "phase": "full_load", "tick": s1 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-reset-skip", "phase": "final", "tick": s2 }),
             serde_json::json!({ "type": "summary", "run_id": "q1-reset-skip", "stop_reason": "completed", "fault": null }),
         ),
     )
@@ -700,9 +701,9 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
         format!(
             "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-partial-dd" }),
-            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": d0 }),
-            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": p1 }),
-            serde_json::json!({ "type": "sample", "phase": "final", "tick": p2 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-partial-dd", "phase": "baseline", "tick": d0 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-partial-dd", "phase": "full_load", "tick": p1 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-partial-dd", "phase": "final", "tick": p2 }),
             serde_json::json!({ "type": "summary", "run_id": "q1-partial-dd", "stop_reason": "completed", "fault": null }),
         ),
     )
@@ -731,9 +732,9 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
         format!(
             "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-recur" }),
-            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": f0 }),
-            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": c1 }),
-            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": f2 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-recur", "phase": "full_load", "tick": f0 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-recur", "phase": "cooldown", "tick": c1 }),
+            serde_json::json!({ "type": "sample", "run_id": "q1-recur", "phase": "full_load", "tick": f2 }),
             serde_json::json!({ "type": "summary", "run_id": "q1-recur", "stop_reason": "completed", "fault": null }),
         ),
     )
@@ -1602,6 +1603,7 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
         t["boot_id"] = serde_json::json!("boot-uuid-1111");
         t["process_start_unix_ns"] = serde_json::json!(1_700_000_000_000_000_000u64);
         t["owner_mode"] = serde_json::json!("executor");
+        t["loop_active"] = serde_json::json!(true);
         t["stats_snapshot_lapped"] = serde_json::json!(false);
         t["stats_writer_drops"] = serde_json::json!(0);
         t["in_flight_release_us"] = serde_json::json!(0);
@@ -1630,7 +1632,11 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
         let p = dir.path().join(name);
         let mut buf = format!("{}\n", serde_json::json!({ "type": "meta", "run_id": name }));
         for l in lines {
-            buf.push_str(&format!("{l}\n"));
+            let mut rec = l.clone();
+            if let Some(obj) = rec.as_object_mut() {
+                obj.entry("run_id").or_insert_with(|| serde_json::json!(name));
+            }
+            buf.push_str(&format!("{rec}\n"));
         }
         if include_summary {
             buf.push_str(&format!(
@@ -2287,7 +2293,23 @@ async fn tail_stall_sub_release_overrun_in_flight_stall_and_load_py_boundaries()
             last_sample["tick"]["releases_total"],
             "settled final sample must cover all started releases: {last_sample}"
         );
-        assert_eq!(recs.last().unwrap()["type"], "summary");
+        assert_eq!(
+            last_sample["tick"]["in_flight_release_us"], 0,
+            "settled final sample must have in_flight_release_us == 0: {last_sample}"
+        );
+        let summary_rec = recs.last().unwrap();
+        assert_eq!(summary_rec["type"], "summary");
+        assert_eq!(summary_rec["stop_reason"], "completed");
+        assert!(
+            summary_rec["idle_tail_elapsed_s"].as_f64().unwrap_or(0.0) >= 1.0,
+            "load.py must wait >= 1.0 s of idle releases before final sample: {summary_rec}"
+        );
+        // Verify live load.py output has zero INVALID findings in analyze.py!
+        let live_rep = run_analyze(&dir.path().join("load.jsonl"), None);
+        assert!(
+            !live_rep.contains("**Overall Verdict: INVALID"),
+            "live load.py run must not be INVALID:\n{live_rep}"
+        );
 
         stop.store(true, Ordering::Release);
         jh.join().unwrap();
@@ -2762,5 +2784,373 @@ async fn loop_exit_and_wait_boundary_skip_accounting_both_owners() {
         assert_eq!(snap.releases_total, 0);
         assert_eq!(snap.skipped_releases, 0);
         assert!(!snap.loop_active);
+    }
+}
+
+// ============================================================================
+// 11. Three synthetic false-PASS cases (final-during-tail, legacy-unsealed, interrupted),
+//     strict JSONL grammar, conservative MIT wake scoping, and live load.py SIGINT capture
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let devstat_path = dir.path().join("devstat.txt");
+    std::fs::write(
+        &devstat_path,
+        "=== META ===\nrun_id=q1-fix3\n=== ONCE_START ===\n--- armd_version ---\nARMD_ALLOC_TIMING=1\n=== ONCE_END ===\n",
+    )
+    .unwrap();
+
+    let make_tick = |ticks: u64| -> serde_json::Value {
+        let mut t = base_tick_json(20_100, 1_200);
+        t["instance_id"] = serde_json::json!("armd-fix3-1");
+        t["boot_id"] = serde_json::json!("boot-uuid-fix3-1");
+        t["process_start_unix_ns"] = serde_json::json!(1_700_000_000_000_000_000u64);
+        t["owner_mode"] = serde_json::json!("executor");
+        t["loop_active"] = serde_json::json!(true);
+        t["stats_snapshot_lapped"] = serde_json::json!(false);
+        t["stats_writer_drops"] = serde_json::json!(0);
+        t["in_flight_release_us"] = serde_json::json!(0);
+        t["since_boot_ticks"] = serde_json::json!(ticks);
+        t["release_us"] = serde_json::json!({ "p50": 550, "p99": 950, "max": 1_400 });
+        t["releases_started"] = serde_json::json!(ticks);
+        t["releases_total"] = serde_json::json!(ticks);
+        t["release_us_max_ever"] = serde_json::json!(1_400);
+        t["releases_over_10ms"] = serde_json::json!(0);
+        t["releases_over_15ms"] = serde_json::json!(0);
+        t["releases_over_20ms"] = serde_json::json!(0);
+        t["wake_late_max_ever"] = serde_json::json!(400);
+        t["skipped_releases"] = serde_json::json!(0);
+        t["diag_dropped"] = serde_json::json!(0);
+        t["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 400 });
+        t["wake_lateness_over_1ms"] = serde_json::json!(0);
+        t["wake_lateness_over_5ms"] = serde_json::json!(0);
+        t["wake_lateness_over_10ms"] = serde_json::json!(0);
+        t["control_thread_lock_attempts"] = serde_json::json!(0);
+        t["control_thread_alloc_ops"] = serde_json::json!(0);
+        t["enqueue_to_wire_us"] = serde_json::json!({ "p50": 80, "p99": 150, "max": 200 });
+        t
+    };
+
+    let write_jsonl = |name: &str, run_id: &str, t0: serde_json::Value, t1: serde_json::Value, summary: serde_json::Value| -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": run_id }),
+            serde_json::json!({ "type": "sample", "run_id": run_id, "phase": "baseline", "elapsed_s": 0.0, "tick": t0 }),
+            serde_json::json!({ "type": "sample", "run_id": run_id, "phase": "final", "elapsed_s": 4.0, "tick": t1 }),
+            summary,
+        );
+        std::fs::write(&p, content).unwrap();
+        p
+    };
+
+    // 0. Positive control: complete native capture -> PASS.
+    let pos_path = write_jsonl(
+        "positive_control.jsonl",
+        "pos-1",
+        make_tick(100),
+        make_tick(300),
+        serde_json::json!({ "type": "summary", "run_id": "pos-1", "stop_reason": "completed", "stop_detail": null, "fault": null }),
+    );
+    let pos_rep = run_analyze(&pos_path, Some(&devstat_path));
+    assert!(pos_rep.contains("**Overall Verdict: PASS**"), "positive control must PASS:\n{pos_rep}");
+
+    // 1. Synthetic case 1: `final-during-tail` (mutates ONLY final sample's in_flight_release_us = 5000) -> INVALID!
+    let mut tail_t1 = make_tick(300);
+    tail_t1["in_flight_release_us"] = serde_json::json!(5_000);
+    let tail_path = write_jsonl(
+        "final-during-tail.jsonl",
+        "final-during-tail",
+        make_tick(100),
+        tail_t1,
+        serde_json::json!({ "type": "summary", "run_id": "final-during-tail", "stop_reason": "completed", "stop_detail": null, "fault": null }),
+    );
+    let tail_rep = run_analyze(&tail_path, Some(&devstat_path));
+    assert!(tail_rep.contains("**Overall Verdict: INVALID"), "final-during-tail must be INVALID:\n{tail_rep}");
+    assert!(
+        tail_rep.contains("final sample captured during active in-flight release"),
+        "final-during-tail must cite exact reason:\n{tail_rep}"
+    );
+
+    // 2. Synthetic case 2: `legacy-unsealed` (legacy tickload.json) -> ALWAYS DIAGNOSTIC ONLY (never PASS)!
+    let legacy_path = dir.path().join("legacy-unsealed.json");
+    let lt0 = base_tick_json(20_100, 1_200);
+    let mut lt1 = base_tick_json(20_100, 1_250);
+    lt1["since_boot_ticks"] = serde_json::json!(300);
+    let legacy_obj = serde_json::json!({ "fault": null, "ticks": [lt0, lt1] });
+    std::fs::write(&legacy_path, serde_json::to_string_pretty(&legacy_obj).unwrap()).unwrap();
+    let legacy_rep = run_analyze(&legacy_path, Some(&devstat_path));
+    assert!(
+        legacy_rep.contains("**Overall Verdict: DIAGNOSTIC ONLY (legacy tickload.json; cannot certify Stage 3 §6 gate)**"),
+        "legacy-unsealed must be DIAGNOSTIC ONLY:\n{legacy_rep}"
+    );
+    assert!(legacy_rep.contains("PASS (proxy)"), "legacy-unsealed must retain proxy breakdowns:\n{legacy_rep}");
+
+    // 3. Synthetic case 3: `interrupted` (mutates ONLY summary.stop_reason = "interrupted") -> INVALID!
+    let int_path = write_jsonl(
+        "interrupted.jsonl",
+        "interrupted",
+        make_tick(100),
+        make_tick(300),
+        serde_json::json!({ "type": "summary", "run_id": "interrupted", "stop_reason": "interrupted", "stop_detail": "signal:2", "fault": null }),
+    );
+    let int_rep = run_analyze(&int_path, Some(&devstat_path));
+    assert!(int_rep.contains("**Overall Verdict: INVALID"), "interrupted must be INVALID:\n{int_rep}");
+    assert!(
+        int_rep.contains("stop_reason='interrupted'"),
+        "interrupted must cite exact stop_reason:\n{int_rep}"
+    );
+
+    // 4. Additional stop_reason enum cases: "error" -> INVALID, "fault" -> FAIL, unknown -> INVALID.
+    let err_path = write_jsonl(
+        "stop_error.jsonl",
+        "err-1",
+        make_tick(100),
+        make_tick(300),
+        serde_json::json!({ "type": "summary", "run_id": "err-1", "stop_reason": "error", "stop_detail": "idle_tail_no_release_progress", "fault": null }),
+    );
+    let err_rep = run_analyze(&err_path, Some(&devstat_path));
+    assert!(err_rep.contains("**Overall Verdict: INVALID"), "{err_rep}");
+    assert!(err_rep.contains("stop_reason='error'"), "{err_rep}");
+
+    let fault_path = write_jsonl(
+        "stop_fault.jsonl",
+        "flt-1",
+        make_tick(100),
+        make_tick(300),
+        serde_json::json!({ "type": "summary", "run_id": "flt-1", "stop_reason": "fault", "stop_detail": "safety_state=EStop", "fault": null }),
+    );
+    let fault_rep = run_analyze(&fault_path, Some(&devstat_path));
+    assert!(fault_rep.contains("**Overall Verdict: FAIL**"), "{fault_rep}");
+
+    // 5. Strict JSONL grammar checks: malformed JSON, unknown type, trailing record after summary,
+    //    foreign run_id, missing meta, duplicate final sample, loop_active == false -> ALL INVALID!
+    let malformed_path = dir.path().join("malformed.jsonl");
+    std::fs::write(
+        &malformed_path,
+        format!(
+            "{}\n{}\n{{broken json\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "m1" }),
+            serde_json::json!({ "type": "sample", "run_id": "m1", "phase": "baseline", "tick": make_tick(100) }),
+            serde_json::json!({ "type": "sample", "run_id": "m1", "phase": "final", "tick": make_tick(300) }),
+            serde_json::json!({ "type": "summary", "run_id": "m1", "stop_reason": "completed", "fault": null }),
+        ),
+    )
+    .unwrap();
+    let mal_rep = run_analyze(&malformed_path, Some(&devstat_path));
+    assert!(mal_rep.contains("**Overall Verdict: INVALID"), "{mal_rep}");
+    assert!(mal_rep.contains("malformed JSON at line 3"), "{mal_rep}");
+
+    let trailing_path = dir.path().join("trailing_after_summary.jsonl");
+    std::fs::write(
+        &trailing_path,
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "t1" }),
+            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "baseline", "tick": make_tick(100) }),
+            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "final", "tick": make_tick(300) }),
+            serde_json::json!({ "type": "summary", "run_id": "t1", "stop_reason": "completed", "fault": null }),
+            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "full_load", "tick": make_tick(305) }),
+        ),
+    )
+    .unwrap();
+    let trailing_rep = run_analyze(&trailing_path, Some(&devstat_path));
+    assert!(trailing_rep.contains("**Overall Verdict: INVALID"), "{trailing_rep}");
+    assert!(trailing_rep.contains("trailing sample record after terminal summary"), "{trailing_rep}");
+
+    let foreign_path = dir.path().join("foreign_run_id.jsonl");
+    std::fs::write(
+        &foreign_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "r-a" }),
+            serde_json::json!({ "type": "sample", "run_id": "r-a", "phase": "baseline", "tick": make_tick(100) }),
+            serde_json::json!({ "type": "sample", "run_id": "r-other", "phase": "final", "tick": make_tick(300) }),
+            serde_json::json!({ "type": "summary", "run_id": "r-a", "stop_reason": "completed", "fault": null }),
+        ),
+    )
+    .unwrap();
+    let foreign_rep = run_analyze(&foreign_path, Some(&devstat_path));
+    assert!(foreign_rep.contains("**Overall Verdict: INVALID"), "{foreign_rep}");
+    assert!(foreign_rep.contains("foreign run_id"), "{foreign_rep}");
+
+    let mut inactive_t1 = make_tick(300);
+    inactive_t1["loop_active"] = serde_json::json!(false);
+    let inactive_path = write_jsonl(
+        "loop_inactive.jsonl",
+        "inact-1",
+        make_tick(100),
+        inactive_t1,
+        serde_json::json!({ "type": "summary", "run_id": "inact-1", "stop_reason": "completed", "fault": null }),
+    );
+    let inactive_rep = run_analyze(&inactive_path, Some(&devstat_path));
+    assert!(inactive_rep.contains("**Overall Verdict: INVALID"), "{inactive_rep}");
+    assert!(inactive_rep.contains("loop_active=false"), "{inactive_rep}");
+
+    // 6. Conservative MIT wake scoping:
+    // (6a) Baseline-only pre-run 19.5 ms wake carried in mixed window (ticks 100 -> 300) -> INCOMPLETE (NOT false FAIL!).
+    let mut b19_0 = make_tick(100);
+    b19_0["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 19_500 });
+    b19_0["wake_late_max_ever"] = serde_json::json!(19_500);
+    let mut b19_1 = make_tick(300);
+    b19_1["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 19_500 });
+    b19_1["wake_late_max_ever"] = serde_json::json!(19_500);
+    let b19_path = write_jsonl(
+        "mit_prerun_19ms.jsonl",
+        "mit-19",
+        b19_0,
+        b19_1,
+        serde_json::json!({ "type": "summary", "run_id": "mit-19", "stop_reason": "completed", "fault": null }),
+    );
+    let b19_rep = run_analyze(&b19_path, Some(&devstat_path));
+    assert!(b19_rep.contains("**Overall Verdict: INCOMPLETE"), "baseline-only 19.5 ms wake must be INCOMPLETE, not FAIL/PASS:\n{b19_rep}");
+
+    // (6b) Pre-run 30 ms HWM + 25 ms mixed window (no aligned marker) -> INCOMPLETE (never false PASS!).
+    let mut hw30_0 = make_tick(100);
+    hw30_0["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 400 });
+    hw30_0["wake_late_max_ever"] = serde_json::json!(30_000);
+    let mut hw30_1 = make_tick(300);
+    hw30_1["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 25_000 });
+    hw30_1["wake_late_max_ever"] = serde_json::json!(30_000);
+    let hw30_path = write_jsonl(
+        "mit_mixed_25ms_hwm30.jsonl",
+        "mit-hw30",
+        hw30_0,
+        hw30_1,
+        serde_json::json!({ "type": "summary", "run_id": "mit-hw30", "stop_reason": "completed", "fault": null }),
+    );
+    let hw30_rep = run_analyze(&hw30_path, Some(&devstat_path));
+    assert!(hw30_rep.contains("**Overall Verdict: INCOMPLETE"), "mixed 25 ms window under 30 ms HWM must not PASS:\n{hw30_rep}");
+
+    // (6c) Late marker across 1500-tick gap with 15 ms pre-run HWM -> INCOMPLETE (unaligned marker rejected!).
+    let mut lm0 = make_tick(100);
+    lm0["wake_late_max_ever"] = serde_json::json!(15_000);
+    let mut lm1 = make_tick(1600);
+    lm1["wake_late_max_ever"] = serde_json::json!(15_000);
+    lm1["since_marker"] = serde_json::json!({
+        "marker_id": 1, "status": "active", "releases_total_delta": 50, "wake_late_max": 200
+    });
+    let lm_path = write_jsonl(
+        "mit_late_marker.jsonl",
+        "mit-lm",
+        lm0,
+        lm1,
+        serde_json::json!({ "type": "summary", "run_id": "mit-lm", "stop_reason": "completed", "fault": null }),
+    );
+    let lm_rep = run_analyze(&lm_path, Some(&devstat_path));
+    assert!(lm_rep.contains("**Overall Verdict: INCOMPLETE"), "late unaligned marker must NOT mask 1500-tick gap:\n{lm_rep}");
+
+    // (6d) Properly baseline-aligned marker across 1500-tick gap with 15 ms pre-run HWM -> PASS!
+    let mut am0 = make_tick(100);
+    am0["wake_late_max_ever"] = serde_json::json!(15_000);
+    am0["since_marker"] = serde_json::json!({
+        "marker_id": 2, "status": "active", "releases_total_delta": 0, "wake_late_max": 0
+    });
+    let mut am1 = make_tick(1600);
+    am1["wake_late_max_ever"] = serde_json::json!(15_000);
+    am1["since_marker"] = serde_json::json!({
+        "marker_id": 2, "status": "active", "releases_total_delta": 1500, "wake_late_max": 300
+    });
+    let am_path = write_jsonl(
+        "mit_aligned_marker.jsonl",
+        "mit-am",
+        am0,
+        am1,
+        serde_json::json!({ "type": "summary", "run_id": "mit-am", "stop_reason": "completed", "fault": null }),
+    );
+    let am_rep = run_analyze(&am_path, Some(&devstat_path));
+    assert!(am_rep.contains("**Overall Verdict: PASS**"), "properly baseline-aligned marker must PASS:\n{am_rep}");
+
+    // (6e) Strictly post-rollover window (1200 - 100 >= 1000) with 25 ms wake even under 30 ms pre-run HWM -> FAIL!
+    let mut pr0 = make_tick(100);
+    pr0["wake_late_max_ever"] = serde_json::json!(30_000);
+    let mut pr1 = make_tick(1200);
+    pr1["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 25_000 });
+    pr1["wake_late_max_ever"] = serde_json::json!(30_000);
+    let pr_path = write_jsonl(
+        "mit_post_rollover_25ms.jsonl",
+        "mit-pr",
+        pr0,
+        pr1,
+        serde_json::json!({ "type": "summary", "run_id": "mit-pr", "stop_reason": "completed", "fault": null }),
+    );
+    let pr_rep = run_analyze(&pr_path, Some(&devstat_path));
+    assert!(pr_rep.contains("**Overall Verdict: FAIL**"), "post-rollover 25 ms wake must FAIL:\n{pr_rep}");
+
+    // 7. Live `load.py` SIGINT interruption test (on lock-free RT executor so Lock Gate stays clean):
+    //    sends SIGINT mid-run and verifies `stop_reason == "interrupted"` + exit code 130 + `analyze.py` INVALID!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(5)),
+                PersistTestHooks::default(),
+            )
+            .await
+            .unwrap();
+        let addr = serve(sup.clone()).await;
+        let out_jsonl = dir.path().join("live_interrupted.jsonl");
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/rt_qual/load.py");
+        let mut child = Command::new("python3")
+            .arg(&script)
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &addr.port().to_string(),
+                "--duration",
+                "10.0",
+                "--baseline-s",
+                "0",
+                "--cooldown-s",
+                "0",
+                "--sample-interval",
+                "0.2",
+                "--no-motion",
+                "--no-record",
+                "--no-measure",
+                "--no-ws-stream",
+                "--no-blackbox-log",
+                "--no-bulk-http",
+                "--obs-poll",
+                "--output",
+            ])
+            .arg(&out_jsonl)
+            .spawn()
+            .expect("spawn load.py");
+        // Wait until baseline sample is written, then send SIGINT.
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < wait_deadline {
+            if let Ok(text) = std::fs::read_to_string(&out_jsonl) {
+                if text.lines().count() >= 2 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+        }
+        let status = tokio::task::spawn_blocking(move || child.wait().expect("wait load.py"))
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(130), "SIGINT load.py should exit 130, got {status:?}");
+        let raw = std::fs::read_to_string(&out_jsonl).unwrap();
+        let recs: Vec<serde_json::Value> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let summary = recs.last().unwrap();
+        assert_eq!(summary["type"], "summary");
+        assert_eq!(summary["stop_reason"], "interrupted");
+        let rep = run_analyze(&out_jsonl, None);
+        assert!(rep.contains("**Overall Verdict: INVALID"), "live interrupted run must be INVALID:\n{rep}");
+        assert!(rep.contains("stop_reason='interrupted'"), "{rep}");
+
+        handle.stop_and_join();
     }
 }

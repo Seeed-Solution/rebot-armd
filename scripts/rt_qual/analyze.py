@@ -70,6 +70,7 @@ PCT_MAX_REQUIRED_KEYS = (
 
 
 RECOGNIZED_OWNER_MODES = ("legacy", "executor")
+VALID_STOP_REASONS = ("completed", "interrupted", "fault", "error")
 INVALID_BOOT_ID_PLACEHOLDERS = frozenset({"unknown", "unknown-boot", "none", "null", "n/a", "na"})
 
 
@@ -272,14 +273,16 @@ class LoadRun:
     samples: list[LoadSample]
     failed_polls: list[dict[str, Any]] = field(default_factory=list)
     has_summary: bool = False
+    grammar_errors: list[str] = field(default_factory=list)
+    final_sample_count: int = 0
 
 
 def load_input(path: Path) -> LoadRun:
     text = path.read_text(encoding="utf-8").strip()
     if not text:
-        raise ValueError(f"Empty load file: {path}")
+        return LoadRun("jsonl", {}, {}, [], grammar_errors=[f"empty load file: {path}"])
 
-    # Auto-detect dev6 tickload.json (single JSON object with "ticks": [...]) vs JSONL.
+    # Auto-detect legacy dev6 tickload.json (single JSON object with "ticks": [...]) vs native JSONL.
     if text.startswith("{"):
         try:
             obj = json.loads(text)
@@ -304,7 +307,7 @@ def load_input(path: Path) -> LoadRun:
                 meta = {
                     "run_id": path.stem,
                     "source_file": str(path),
-                    "note": "Converted from legacy tickload.json (no per-sample timestamps or phase tags).",
+                    "note": "Converted from legacy tickload.json (unsealed diagnostic format).",
                 }
                 summary = {
                     "fault": None if str(obj.get("fault")) in ("None", "null", "") else str(obj.get("fault")),
@@ -314,39 +317,77 @@ def load_input(path: Path) -> LoadRun:
         except json.JSONDecodeError:
             pass
 
-    meta = {}
-    summary = {}
+    meta: dict[str, Any] = {}
+    summary: dict[str, Any] = {}
     has_summary = False
+    meta_count = 0
+    summary_count = 0
+    final_sample_count = 0
     samples = []
     failed_polls = []
+    grammar_errors: list[str] = []
+    seen_records: list[tuple[int, str]] = []
+    expected_run_id: str | None = None
     idx = 0
+
     for line_no, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
-        rec = json.loads(line)
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as exc:
+            grammar_errors.append(f"malformed JSON at line {line_no}: {exc.msg}")
+            continue
         if not isinstance(rec, dict):
+            grammar_errors.append(f"non-object JSON record at line {line_no}")
             continue
         rtype = rec.get("type")
+        if rtype not in ("meta", "sample", "summary"):
+            grammar_errors.append(f"unknown or missing record type at line {line_no}: {rtype!r}")
+            continue
+
+        rec_run_id = get_nonempty_str(rec, "run_id")
+        if rec_run_id is None:
+            grammar_errors.append(f"missing or empty run_id on {rtype} record at line {line_no}")
+        elif expected_run_id is None:
+            expected_run_id = rec_run_id
+        elif rec_run_id != expected_run_id:
+            grammar_errors.append(
+                f"foreign run_id on {rtype} record at line {line_no}: {rec_run_id!r} != {expected_run_id!r}"
+            )
+
+        if summary_count > 0:
+            grammar_errors.append(f"trailing {rtype} record after terminal summary at line {line_no}")
+
+        seen_records.append((line_no, rtype))
         if rtype == "meta":
-            meta = rec
+            meta_count += 1
+            if len(seen_records) != 1:
+                grammar_errors.append(f"misplaced meta record at line {line_no} (must be first record)")
+            if meta_count > 1:
+                grammar_errors.append(f"duplicate meta record at line {line_no}")
+            else:
+                meta = rec
         elif rtype == "summary":
-            summary = rec
-            has_summary = True
+            summary_count += 1
+            if summary_count > 1:
+                grammar_errors.append(f"duplicate summary record at line {line_no}")
+            else:
+                summary = rec
+                has_summary = True
         else:
             tick_err = rec.get("tick_error")
             poll_failed = bool(rec.get("poll_failed")) or (tick_err is not None and str(tick_err).strip() != "")
-            has_tick_field = "tick" in rec
-            tick = (
-                rec.get("tick")
-                if has_tick_field
-                else (rec if ("tick_us" in rec or "release_us" in rec) else None)
-            )
-            if poll_failed or (not isinstance(tick, dict) and (rtype == "sample" or has_tick_field)):
+            tick = rec.get("tick")
+            phase_str = str(rec.get("phase") or "unknown")
+            if phase_str == "final":
+                final_sample_count += 1
+            if poll_failed or not isinstance(tick, dict):
                 failed_polls.append(
                     {
                         "line": line_no,
-                        "phase": str(rec.get("phase") or "unknown"),
+                        "phase": phase_str,
                         "elapsed_s": rec.get("elapsed_s"),
                         "error": str(tick_err) if tick_err else "missing or non-object tick payload",
                     }
@@ -356,21 +397,31 @@ def load_input(path: Path) -> LoadRun:
             samples.append(
                 LoadSample(
                     index=idx,
-                    ts_unix=float(rec["ts_unix"]) if rec.get("ts_unix") is not None else None,
-                    ts_iso=rec.get("ts_iso"),
-                    elapsed_s=float(rec["elapsed_s"]) if rec.get("elapsed_s") is not None else None,
-                    phase=str(rec.get("phase") or "unknown"),
+                    ts_unix=float(rec["ts_unix"]) if isinstance(rec.get("ts_unix"), (int, float)) and not isinstance(rec.get("ts_unix"), bool) else None,
+                    ts_iso=rec.get("ts_iso") if isinstance(rec.get("ts_iso"), str) else None,
+                    elapsed_s=float(rec["elapsed_s"]) if isinstance(rec.get("elapsed_s"), (int, float)) and not isinstance(rec.get("elapsed_s"), bool) else None,
+                    phase=phase_str,
                     tick=tick,
                     rx_age_ms=rec.get("rx_age_ms") if isinstance(rec.get("rx_age_ms"), dict) else None,
                     counters=rec.get("counters") if isinstance(rec.get("counters"), dict) else {},
-                    fault=rec.get("fault"),
-                    safety_state=rec.get("safety_state"),
+                    fault=rec.get("fault") if isinstance(rec.get("fault"), str) else None,
+                    safety_state=rec.get("safety_state") if isinstance(rec.get("safety_state"), str) else None,
                 )
             )
             idx += 1
-    if not samples and not failed_polls:
-        raise ValueError(f"No tick samples found in {path}")
-    return LoadRun("jsonl", meta, summary, samples, failed_polls=failed_polls, has_summary=has_summary)
+
+    if meta_count == 0:
+        grammar_errors.append("missing leading meta record")
+    return LoadRun(
+        "jsonl",
+        meta,
+        summary,
+        samples,
+        failed_polls=failed_polls,
+        has_summary=has_summary,
+        grammar_errors=grammar_errors,
+        final_sample_count=final_sample_count,
+    )
 
 
 # ---- devstat.txt parsing ----------------------------------------------------
@@ -796,10 +847,18 @@ def compute_dict_deltas(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
 def _render_all_failed_report(load_run: LoadRun, devstat: DevstatRun | None) -> str:
     run_id = load_run.meta.get("run_id") or (devstat.meta.get("run_id") if devstat else "unknown")
     n_fail = len(load_run.failed_polls)
+    if load_run.source_format == "tickload_json":
+        headline = "**Overall Verdict: DIAGNOSTIC ONLY (legacy tickload.json; no valid tick samples)**"
+    elif n_fail > 0:
+        headline = f"**Overall Verdict: INVALID (all {n_fail} poll(s) failed; no tick samples captured)**"
+    elif load_run.grammar_errors:
+        headline = f"**Overall Verdict: INVALID ({'; '.join(load_run.grammar_errors[:3])})**"
+    else:
+        headline = "**Overall Verdict: INVALID (no valid tick samples captured)**"
     out = [
         f"# SG2002 Real-Time Qualification Report (`{run_id}`)",
         "",
-        f"**Overall Verdict: INVALID (all {n_fail} poll(s) failed; no tick samples captured)**",
+        headline,
         "",
         "## 1. Stage 3 §6 Gate Verdict",
         "",
@@ -808,9 +867,11 @@ def _render_all_failed_report(load_run: LoadRun, devstat: DevstatRun | None) -> 
         f"| Every release (`release_us`) | `< {RELEASE_BUDGET_MS:.0f} ms` | no valid tick samples ({n_fail} failed poll(s)) | INVALID |",
         f"| Zero skipped deadlines | `0` | no valid tick samples ({n_fail} failed poll(s)) | INVALID |",
         "",
-        "## 2. Failed Polls",
+        "## 2. Capture Errors / Failed Polls",
         "",
     ]
+    for ge in load_run.grammar_errors[:20]:
+        out.append(f"- **INVALID**: {ge}")
     for fp in load_run.failed_polls[:20]:
         out.append(f"- line {fp.get('line')}: phase=`{fp.get('phase')}`, error=`{fp.get('error')}`")
     out.append("")
@@ -979,6 +1040,10 @@ def analyze(
     lapped_missing_count = sum(1 for v in lapped_flags if v is None)
     snapshot_lapped_any = any(v is True for v in lapped_flags)
 
+    loop_active_flags = [get_strict_bool(s.tick, "loop_active") for s in samples]
+    loop_active_missing_count = sum(1 for v in loop_active_flags if v is None)
+    loop_inactive_any = any(v is False for v in loop_active_flags)
+
     writer_drop_vals = [get_nonneg_int(s.tick, "stats_writer_drops") for s in samples]
     writer_drops_missing_count = sum(1 for v in writer_drop_vals if v is None)
     writer_drops_max = max_int_or_none([v for v in writer_drop_vals if v is not None])
@@ -991,7 +1056,10 @@ def analyze(
             break
 
     # ---- INVALIDity checks (fail-closed: never default missing to 0, never grant PASS) ----
-    invalid_reasons: list[str] = []
+    invalid_reasons: list[str] = list(load_run.grammar_errors)
+    summary_stop_reason: str | None = None
+    summary_stop_detail: str | None = None
+    stop_reason_fault = False
     if load_run.failed_polls:
         first_err = load_run.failed_polls[0].get("error", "poll failed")
         invalid_reasons.append(f"failed poll(s): {len(load_run.failed_polls)} poll failure(s) (first: {first_err})")
@@ -1000,6 +1068,23 @@ def analyze(
     if load_run.source_format == "jsonl":
         if not load_run.has_summary:
             invalid_reasons.append("incomplete capture: missing terminal summary record")
+        else:
+            summary_stop_reason = get_nonempty_str(load_run.summary, "stop_reason")
+            summary_stop_detail = get_nonempty_str(load_run.summary, "stop_detail")
+            if summary_stop_reason == "completed":
+                pass
+            elif summary_stop_reason == "fault":
+                stop_reason_fault = True
+            elif summary_stop_reason in ("interrupted", "error"):
+                detail_sfx = f" ({summary_stop_detail})" if summary_stop_detail else ""
+                invalid_reasons.append(f"incomplete run: stop_reason='{summary_stop_reason}'{detail_sfx}")
+            else:
+                invalid_reasons.append(
+                    f"invalid or missing summary stop_reason: {load_run.summary.get('stop_reason')!r} "
+                    f"(expected one of {VALID_STOP_REASONS})"
+                )
+        if load_run.final_sample_count > 1:
+            invalid_reasons.append(f"duplicate final samples ({load_run.final_sample_count}; expected exactly 1)")
         if samples[-1].phase != "final":
             invalid_reasons.append(
                 f"incomplete capture: last sample phase is '{samples[-1].phase}' (expected 'final')"
@@ -1014,6 +1099,8 @@ def analyze(
         )
     if owner_mode_changed:
         invalid_reasons.append(f"owner_mode changed mid-run ({' -> '.join(distinct_owner_modes)})")
+    if loop_inactive_any:
+        invalid_reasons.append("control loop inactive during capture (loop_active=false)")
     if snapshot_lapped_any:
         invalid_reasons.append("lock-free tick_stats snapshot lapped (stats_snapshot_lapped=true)")
     if writer_drops_max is not None and writer_drops_max > 0:
@@ -1058,6 +1145,12 @@ def analyze(
         terminal_in_flight_incomplete = True
         invalid_reasons.append(
             f"uncompleted in-flight release at final capture (releases_started={last_started} > releases_total={last_total})"
+        )
+    last_in_flight = get_nonneg_int(samples[-1].tick, "in_flight_release_us")
+    if last_in_flight is not None and 0 < last_in_flight < RELEASE_BUDGET_US:
+        terminal_in_flight_incomplete = True
+        invalid_reasons.append(
+            f"final sample captured during active in-flight release (in_flight_release_us={last_in_flight} us > 0)"
         )
 
     # Require positive release progress between first and last sample.
@@ -1118,6 +1211,8 @@ def analyze(
         missing_required_fields.append(f"process_start_unix_ns ({proc_start_missing_count}/{n_samples})")
     if owner_invalid_count > 0:
         missing_required_fields.append(f"owner_mode ({owner_invalid_count}/{n_samples})")
+    if loop_active_missing_count > 0:
+        missing_required_fields.append(f"loop_active ({loop_active_missing_count}/{n_samples})")
     if lapped_missing_count > 0:
         missing_required_fields.append(f"stats_snapshot_lapped ({lapped_missing_count}/{n_samples})")
     if writer_drops_missing_count > 0:
@@ -1267,28 +1362,89 @@ def analyze(
             prev_wake_ever = cur_wake_ever
         prev_ident_hwm = cur_ident
 
-    marker_wake_max_us: int | None = None
-    if isinstance(latest_since_marker, dict) and latest_since_marker.get("status") == "active":
-        marker_wake_max_us = get_nonneg_int(latest_since_marker, "wake_late_max")
+    # Exact baseline-aligned marker check: marker must be active with releases_total_delta == 0
+    # on samples[0] AND active with the SAME marker_id and releases_total_delta == run_releases_delta
+    # on samples[-1]. Late or early markers never mask earlier in-run wake peaks.
+    aligned_marker_wake_max_us: int | None = None
+    if n_samples >= 2 and not process_identity_changed and not releases_total_series.reset_detected:
+        run_rel_delta = releases_total_series.verified_in_run_delta
+        sm0 = samples[0].tick.get("since_marker")
+        sm_end = samples[-1].tick.get("since_marker")
+        if (
+            isinstance(sm0, dict)
+            and isinstance(sm_end, dict)
+            and sm0.get("status") == "active"
+            and sm_end.get("status") == "active"
+            and (m0 := get_positive_int(sm0, "marker_id")) is not None
+            and get_positive_int(sm_end, "marker_id") == m0
+            and get_nonneg_int(sm0, "releases_total_delta") == 0
+            and run_rel_delta is not None
+            and run_rel_delta > 0
+            and get_nonneg_int(sm_end, "releases_total_delta") == run_rel_delta
+            and (wm := get_nonneg_int(sm_end, "wake_late_max")) is not None
+        ):
+            aligned_marker_wake_max_us = wm
 
-    effective_wake_max_us = max_int_or_none(
-        [v for v in (wake_lateness_max_us, in_run_wake_ever_us, marker_wake_max_us) if v is not None]
-    )
+    # Conservative MIT wake attribution:
+    # - Hard MIT FAIL triggers ONLY from provably in-run wake peaks (same-process wake_late_max_ever
+    #   increase, baseline-aligned since_marker.wake_late_max, or strictly post-rollover windows
+    #   whose 1000-tick span lies entirely after samples[0]).
+    # - PASS requires that the conservative upper bound across ALL post-baseline windows (and any
+    #   rollover-masked wake_late_max_ever.start when >1000-tick gap occurs without aligned marker)
+    #   clears < 45 ms; otherwise MIT reports INCOMPLETE (never false FAIL, never false PASS).
+    provable_wake_vals: list[int] = []
+    if in_run_wake_ever_us is not None:
+        provable_wake_vals.append(in_run_wake_ever_us)
+    if aligned_marker_wake_max_us is not None:
+        provable_wake_vals.append(aligned_marker_wake_max_us)
+    upper_wake_vals: list[int] = list(provable_wake_vals)
+
+    first_ident_w = sample_process_identity(samples[0].tick)
+    first_ticks_w = get_nonneg_int(samples[0].tick, "since_boot_ticks")
+    if n_samples >= 2:
+        for s in samples[1:]:
+            if identities_conflict(first_ident_w, sample_process_identity(s.tick)):
+                break
+            cur_w = get_pct(s.tick, "wake_lateness_us", "max")
+            if cur_w is None:
+                continue
+            if aligned_marker_wake_max_us is None:
+                upper_wake_vals.append(cur_w)
+            cur_t = get_nonneg_int(s.tick, "since_boot_ticks")
+            if first_ticks_w is not None and cur_t is not None and (cur_t - first_ticks_w) >= TICK_WINDOW_CAPACITY:
+                provable_wake_vals.append(cur_w)
+    elif wake_lateness_max_us is not None:
+        upper_wake_vals.append(wake_lateness_max_us)
+
+    provable_in_run_wake_us = max_int_or_none(provable_wake_vals)
     wake_rollover_masked = (
-        max_adjacent_gap_ticks > TICK_WINDOW_CAPACITY
+        aligned_marker_wake_max_us is None
+        and max_adjacent_gap_ticks > TICK_WINDOW_CAPACITY
         and wake_late_max_ever_series.start is not None
-        and (effective_wake_max_us is None or wake_late_max_ever_series.start > effective_wake_max_us)
-        and marker_wake_max_us is None
+        and (provable_in_run_wake_us is None or wake_late_max_ever_series.start > provable_in_run_wake_us)
+    )
+    if wake_rollover_masked and wake_late_max_ever_series.start is not None:
+        upper_wake_vals.append(wake_late_max_ever_series.start)
+
+    upper_bound_wake_us = (
+        aligned_marker_wake_max_us
+        if aligned_marker_wake_max_us is not None
+        else max_int_or_none(upper_wake_vals)
     )
 
-    # Wake lateness (real Q1 field + in-run monotonic HWM/marker peak; legacy period_us proxy otherwise) & MIT budget.
-    if effective_wake_max_us is not None:
-        wake_extra_ms: float | None = effective_wake_max_us / 1000.0
-        wake_extra_label = (
-            "wake lateness (in-run HWM)"
-            if (in_run_wake_ever_us is not None and (wake_lateness_max_us is None or in_run_wake_ever_us > wake_lateness_max_us))
-            else "wake lateness"
-        )
+    # Wake lateness display value & MIT budget.
+    if upper_bound_wake_us is not None:
+        wake_extra_ms: float | None = upper_bound_wake_us / 1000.0
+        if aligned_marker_wake_max_us is not None:
+            wake_extra_label = "wake lateness (aligned marker)"
+        elif provable_in_run_wake_us is not None and provable_in_run_wake_us >= upper_bound_wake_us:
+            wake_extra_label = (
+                "wake lateness (in-run HWM)"
+                if (in_run_wake_ever_us is not None and (wake_lateness_max_us is None or in_run_wake_ever_us > wake_lateness_max_us))
+                else "wake lateness"
+            )
+        else:
+            wake_extra_label = "wake lateness"
     elif period_max_us is not None:
         wake_extra_ms = max(0.0, (period_max_us - nom_period_us) / 1000.0)
         wake_extra_label = "sched overrun proxy"
@@ -1321,6 +1477,15 @@ def analyze(
         worst_extra_ms = None
         mit_total_ms = None
 
+    if provable_in_run_wake_us is not None and start_to_tx_ms is not None:
+        provable_mit_total_ms: float | None = (
+            MIT_PERIOD_MS + (provable_in_run_wake_us / 1000.0) + start_to_tx_ms + enq_ms + MIT_MARGIN_MS
+        )
+    elif not has_wake_lateness and mit_total_ms is not None:
+        provable_mit_total_ms = mit_total_ms
+    else:
+        provable_mit_total_ms = None
+
     # Control thread info (latest non-null).
     ctl_sched: dict[str, Any] = {}
     for s in reversed(samples):
@@ -1331,6 +1496,10 @@ def analyze(
     faults_seen = sorted({s.fault for s in samples if s.fault})
     if load_run.summary.get("fault") and load_run.summary["fault"] not in faults_seen:
         faults_seen.append(str(load_run.summary["fault"]))
+    if stop_reason_fault and not faults_seen:
+        faults_seen.append(
+            f"stop_reason=fault ({summary_stop_detail})" if summary_stop_detail else "stop_reason=fault"
+        )
 
     # ---- Gate Evaluation ----
     # 1. Release latency (< 20 ms): gated on `release_us`, monotonic `releases_over_20ms` delta,
@@ -1395,14 +1564,25 @@ def analyze(
         and proc_start_missing_count == 0
         and not owner_mode_changed
         and owner_invalid_count == 0
+        and loop_active_missing_count == 0
+        and not loop_inactive_any
         and not load_run.failed_polls
+        and not load_run.grammar_errors
         and lapped_missing_count == 0
         and not snapshot_lapped_any
         and writer_drops_missing_count == 0
         and (writer_drops_max is not None and writer_drops_max == 0)
         and not terminal_in_flight_incomplete
         and not contradiction_seen
-        and (load_run.source_format != "jsonl" or (load_run.has_summary and samples[-1].phase == "final"))
+        and (
+            load_run.source_format != "jsonl"
+            or (
+                load_run.has_summary
+                and summary_stop_reason == "completed"
+                and load_run.final_sample_count == 1
+                and samples[-1].phase == "final"
+            )
+        )
         and n_samples >= 2
         and release_over_20_delta is not None
         and (releases_total_series.verified_in_run_delta or 0) > 0
@@ -1442,11 +1622,24 @@ def analyze(
             and proc_start_missing_count == 0
             and not owner_mode_changed
             and owner_invalid_count == 0
+            and loop_active_missing_count == 0
+            and not loop_inactive_any
             and lapped_missing_count == 0
             and not snapshot_lapped_any
             and writer_drops_missing_count == 0
             and (writer_drops_max is not None and writer_drops_max == 0)
             and not load_run.failed_polls
+            and not load_run.grammar_errors
+            and not terminal_in_flight_incomplete
+            and (
+                load_run.source_format != "jsonl"
+                or (
+                    load_run.has_summary
+                    and summary_stop_reason == "completed"
+                    and load_run.final_sample_count == 1
+                    and samples[-1].phase == "final"
+                )
+            )
             and n_samples >= 2
             and skipped_delta is not None
         )
@@ -1580,7 +1773,13 @@ def analyze(
             f"(ARMD_ALLOC_TIMING=1 confirmed={alloc_timing_confirmed})"
         )
 
-    mit_observable_pass = True if mit_total_ms is None else (mit_total_ms < MIT_WATCHDOG_MS)
+    mit_observable_pass = True if provable_mit_total_ms is None else (provable_mit_total_ms < MIT_WATCHDOG_MS)
+    mit_upper_ambiguous = (
+        aligned_marker_wake_max_us is None
+        and mit_observable_pass
+        and mit_total_ms is not None
+        and mit_total_ms >= MIT_WATCHDOG_MS
+    )
     mit_gaps: list[str] = []
     if diag_samples_lost:
         mit_gaps.append(f"diag_dropped delta={diag_dropped_delta} lost tick/wake samples")
@@ -1596,7 +1795,11 @@ def analyze(
         mit_gaps.append("wake_lateness_us missing on some samples")
     if wake_rollover_masked:
         mit_gaps.append(
-            "pre-run wake_late_max_ever masks in-run wake peak across >1000-tick sample gap without active since_marker"
+            "pre-run wake_late_max_ever masks in-run wake peak across >1000-tick sample gap without baseline-aligned since_marker"
+        )
+    if mit_upper_ambiguous:
+        mit_gaps.append(
+            "unscoped rolling wake_lateness_us / pre-run wake_late_max_ever upper bound reaches MIT watchdog budget without baseline-aligned since_marker"
         )
     if not has_enqueue_to_wire:
         mit_gaps.append("enqueue-to-wire CAN latency not exposed")
@@ -1636,7 +1839,9 @@ def analyze(
         or (not alloc_evidence_complete)
         or bool(mit_gaps)
     )
-    if hard_fail:
+    if load_run.source_format == "tickload_json":
+        overall_verdict = "DIAGNOSTIC ONLY (legacy tickload.json; cannot certify Stage 3 §6 gate)"
+    elif hard_fail:
         overall_verdict = "FAIL"
     elif invalid_reasons:
         overall_verdict = f"INVALID ({'; '.join(invalid_reasons[:3])})"

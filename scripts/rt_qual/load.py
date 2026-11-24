@@ -46,6 +46,10 @@ except ImportError:
     HAS_REBOT_SDK = False
 
 MAX_SPEED_SCALE = 0.3
+VALID_STOP_REASONS = ("completed", "interrupted", "fault", "error")
+_STOP_REASON_PRIORITY = {"completed": 0, "error": 1, "interrupted": 2, "fault": 3}
+MIN_IDLE_TAIL_S = 1.0
+IDLE_TAIL_PERIOD_MULTIPLIER = 20.0  # 2 * period * 10 idle releases minimum
 
 # Default J1 joint-path waypoints matching qual-ref/tickload.py (B601-RS workspace).
 DEFAULT_RPY = (0.0, math.radians(41.0), 0.0)
@@ -114,11 +118,16 @@ def extract_rx_ages_ms(obs: Any) -> list[float]:
 class SharedState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.stop_event = threading.Event()
+        # Signals background load workers and periodic tick sampler to wind down.
+        self.workers_stop = threading.Event()
+        # Set ONLY by SIGINT/SIGTERM or an arm fault (never set by normal load completion),
+        # so the post-load idle tail wait sleeps for the full >= 1 s idle window unless interrupted.
+        self.interrupt_event = threading.Event()
         self.phase: str = "init"
         self.fault: str | None = None
         self.safety_state: str | None = None
         self.stop_reason: str = "completed"
+        self.stop_detail: str | None = None
         self.rx_ages_ms: list[float] = []
         self.counters: dict[str, Any] = {
             "obs_ok": 0,
@@ -139,6 +148,25 @@ class SharedState:
             "record_state": "disabled",
             "record_episode_id": None,
         }
+
+    def set_stop_reason(self, reason: str, detail: str | None = None) -> None:
+        if reason not in VALID_STOP_REASONS:
+            raise ValueError(f"invalid stop_reason: {reason!r}")
+        with self._lock:
+            cur_prio = _STOP_REASON_PRIORITY[self.stop_reason]
+            new_prio = _STOP_REASON_PRIORITY[reason]
+            if new_prio > cur_prio or (new_prio == cur_prio and self.stop_detail is None and detail is not None):
+                self.stop_reason = reason
+                self.stop_detail = detail
+
+    def get_stop_reason(self) -> tuple[str, str | None]:
+        with self._lock:
+            return self.stop_reason, self.stop_detail
+
+    def request_interrupt(self, detail: str) -> None:
+        self.set_stop_reason("interrupted", detail)
+        self.workers_stop.set()
+        self.interrupt_event.set()
 
     def set_phase(self, phase: str) -> None:
         with self._lock:
@@ -173,22 +201,29 @@ class SharedState:
         """Update safety_state / rx_ages; return True if fault tripped."""
         self.record_rx_ages(extract_rx_ages_ms(obs))
         fault_str, safety_str = extract_fault_info(obs)
+        tripped = False
         with self._lock:
             if safety_str is not None:
                 self.safety_state = safety_str
             if fault_str is not None and self.fault is None:
                 self.fault = fault_str
-                self.stop_reason = f"fault:{fault_str}"
-                self.stop_event.set()
-                return True
-            return self.fault is not None
+                self.stop_reason = "fault"
+                self.stop_detail = fault_str
+                tripped = True
+            has_fault = self.fault is not None
+        if tripped:
+            self.workers_stop.set()
+            self.interrupt_event.set()
+        return has_fault
 
     def trip_fault(self, reason: str) -> None:
         with self._lock:
             if self.fault is None:
                 self.fault = reason
-                self.stop_reason = f"fault:{reason}"
-            self.stop_event.set()
+                self.stop_reason = "fault"
+                self.stop_detail = reason
+        self.workers_stop.set()
+        self.interrupt_event.set()
 
     def has_fault(self) -> bool:
         with self._lock:
@@ -256,7 +291,7 @@ def run_obs_poll(base_url: str, hz: float, deadline: float, state: SharedState) 
     url = f"{base_url}/api/v1/observation"
     period = 1.0 / max(hz, 0.1)
     next_t = time.monotonic()
-    while not state.stop_event.is_set() and time.monotonic() < deadline:
+    while not state.workers_stop.is_set() and time.monotonic() < deadline:
         try:
             obs = http_get_json(url, timeout=min(1.5, max(0.5, period * 4)))
             state.inc("obs_ok")
@@ -266,7 +301,7 @@ def run_obs_poll(base_url: str, hz: float, deadline: float, state: SharedState) 
         next_t += period
         sleep_s = next_t - time.monotonic()
         if sleep_s > 0:
-            state.stop_event.wait(min(sleep_s, max(0.0, deadline - time.monotonic())))
+            state.workers_stop.wait(min(sleep_s, max(0.0, deadline - time.monotonic())))
         else:
             next_t = time.monotonic()
 
@@ -274,11 +309,11 @@ def run_obs_poll(base_url: str, hz: float, deadline: float, state: SharedState) 
 def run_ws_stream(ws_base: str, ws_obs_hz: int | None, deadline: float, state: SharedState) -> None:
     path = "/api/v1/ws" if ws_obs_hz is None else f"/api/v1/ws?obs_hz={ws_obs_hz}"
     ws_url = f"{ws_base}{path}"
-    while not state.stop_event.is_set() and time.monotonic() < deadline:
+    while not state.workers_stop.is_set() and time.monotonic() < deadline:
         ws = None
         try:
             ws = rebot_ws.connect(ws_url, timeout=3.0, origin=True)
-            while not state.stop_event.is_set() and time.monotonic() < deadline:
+            while not state.workers_stop.is_set() and time.monotonic() < deadline:
                 try:
                     msg = ws.recv(timeout=0.5)
                 except TimeoutError:
@@ -293,10 +328,10 @@ def run_ws_stream(ws_base: str, ws_obs_hz: int | None, deadline: float, state: S
                     except json.JSONDecodeError:
                         pass
         except Exception as exc:
-            if not state.stop_event.is_set():
+            if not state.workers_stop.is_set():
                 state.inc_err("ws_err", err_tag(exc))
                 state.inc("ws_reconnects")
-                state.stop_event.wait(0.5)
+                state.workers_stop.wait(0.5)
         finally:
             if ws is not None:
                 try:
@@ -320,48 +355,69 @@ def run_measure_loop(
         operator_token=operator_token,
         allow_insecure_operator_auth=allow_insecure_auth,
     )
-    while not state.stop_event.is_set() and time.monotonic() < deadline:
+    while not state.workers_stop.is_set() and time.monotonic() < deadline:
         try:
             client.measure(timeout=15.0)
             state.inc("measure_ok")
         except Exception as exc:
             state.inc_err("measure_err", err_tag(exc))
-            state.stop_event.wait(0.3)
+            state.workers_stop.wait(0.3)
 
 
 def run_blackbox_log_loop(base_url: str, hz: float, deadline: float, state: SharedState) -> None:
     url = f"{base_url}/api/v1/diagnostics/blackbox?seconds=60"
     period = 1.0 / max(hz, 0.1)
-    while not state.stop_event.is_set() and time.monotonic() < deadline:
+    while not state.workers_stop.is_set() and time.monotonic() < deadline:
         try:
             http_get_bytes(url, timeout=3.0)
             state.inc("blackbox_ok")
         except Exception as exc:
             state.inc_err("blackbox_err", err_tag(exc))
-        state.stop_event.wait(min(period, max(0.0, deadline - time.monotonic())))
+        state.workers_stop.wait(min(period, max(0.0, deadline - time.monotonic())))
 
 
 def run_bulk_http_loop(base_url: str, bulk_path: str, interval_s: float, deadline: float, state: SharedState) -> None:
     path = bulk_path if bulk_path.startswith("/") else "/" + bulk_path
     url = f"{base_url}{path}"
-    while not state.stop_event.is_set() and time.monotonic() < deadline:
+    while not state.workers_stop.is_set() and time.monotonic() < deadline:
         try:
             _, data = http_get_bytes(url, timeout=3.0)
             state.inc("bulk_ok")
             state.inc("bulk_bytes", len(data))
         except Exception as exc:
             state.inc_err("bulk_err", err_tag(exc))
-            state.stop_event.wait(min(max(interval_s, 0.2), max(0.0, deadline - time.monotonic())))
+            state.workers_stop.wait(min(max(interval_s, 0.2), max(0.0, deadline - time.monotonic())))
             continue
         if interval_s > 0:
-            state.stop_event.wait(min(interval_s, max(0.0, deadline - time.monotonic())))
+            state.workers_stop.wait(min(interval_s, max(0.0, deadline - time.monotonic())))
 
 
-def write_jsonl_line(fh: Any, write_lock: threading.Lock, record: dict[str, Any]) -> None:
-    line = json.dumps(record, separators=(",", ":"), sort_keys=False)
-    with write_lock:
-        fh.write(line + "\n")
-        fh.flush()
+class JsonlWriter:
+    """Thread-safe JSONL writer with sampler write revocation before terminal records."""
+
+    def __init__(self, fh: Any) -> None:
+        self._fh = fh
+        self._lock = threading.Lock()
+        self._sampler_closed = False
+
+    def write_from_sampler(self, record: dict[str, Any]) -> bool:
+        line = json.dumps(record, separators=(",", ":"), sort_keys=False)
+        with self._lock:
+            if self._sampler_closed:
+                return False
+            self._fh.write(line + "\n")
+            self._fh.flush()
+            return True
+
+    def close_sampler_writes(self) -> None:
+        with self._lock:
+            self._sampler_closed = True
+
+    def write_terminal(self, record: dict[str, Any]) -> None:
+        line = json.dumps(record, separators=(",", ":"), sort_keys=False)
+        with self._lock:
+            self._fh.write(line + "\n")
+            self._fh.flush()
 
 
 def sample_tick_once(
@@ -408,25 +464,46 @@ def run_tick_sampler(
     deadline: float,
     state: SharedState,
     enabled_loads: dict[str, bool],
-    fh: Any,
-    write_lock: threading.Lock,
+    writer: JsonlWriter,
     skip_initial: bool = False,
 ) -> None:
     if not skip_initial:
         rec = sample_tick_once(base_url, run_id, t0, state, enabled_loads)
-        write_jsonl_line(fh, write_lock, rec)
+        if not writer.write_from_sampler(rec):
+            return
     next_t = time.monotonic() + interval_s
-    while not state.stop_event.is_set() and time.monotonic() < deadline:
+    while not state.workers_stop.is_set() and time.monotonic() < deadline:
         wait_s = min(max(0.0, next_t - time.monotonic()), max(0.0, deadline - time.monotonic()))
         if wait_s > 0:
-            state.stop_event.wait(wait_s)
-        if state.stop_event.is_set() or time.monotonic() >= deadline:
+            state.workers_stop.wait(wait_s)
+        if state.workers_stop.is_set() or time.monotonic() >= deadline:
             break
         rec = sample_tick_once(base_url, run_id, t0, state, enabled_loads)
-        write_jsonl_line(fh, write_lock, rec)
+        if not writer.write_from_sampler(rec):
+            break
         next_t += interval_s
         if next_t < time.monotonic():
             next_t = time.monotonic() + interval_s
+
+
+def infer_nominal_period_s(tick: Any) -> float:
+    if isinstance(tick, dict):
+        p = tick.get("period_us")
+        if isinstance(p, dict):
+            p50 = p.get("p50")
+            if isinstance(p50, int) and not isinstance(p50, bool) and p50 > 0:
+                return max(0.001, min(1.0, p50 / 1_000_000.0))
+    return 0.02
+
+
+def extract_completed_count(tick: Any) -> int | None:
+    if not isinstance(tick, dict):
+        return None
+    for key in ("releases_total", "since_boot_ticks"):
+        v = tick.get(key)
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            return int(v)
+    return None
 
 
 def capture_settled_final_sample(
@@ -435,32 +512,44 @@ def capture_settled_final_sample(
     t0: float,
     state: SharedState,
     enabled_loads: dict[str, bool],
-    max_attempts: int = 6,
+    max_attempts: int = 8,
     settle_sleep_s: float = 0.005,
 ) -> dict[str, Any]:
-    """Capture the terminal `final` diagnostics sample, briefly settling if an ordinary
-    in-flight release (< 20 ms) happens to be executing when the poll fires so `releases_total`
-    covers `releases_started`. Immediately returns if a release is already stalled >= 20 ms."""
+    """Capture the terminal `final` diagnostics sample, settling briefly if an ordinary
+    in-flight release (< 20 ms) is active when the poll fires so `releases_total == releases_started`
+    and `in_flight_release_us == 0`. Immediately stops if a release is stalled >= 20 ms."""
     sample = sample_tick_once(base_url, run_id, t0, state, enabled_loads, phase_override="final")
     for _ in range(max_attempts - 1):
+        if state.interrupt_event.is_set():
+            break
         tick = sample.get("tick")
         if not isinstance(tick, dict) or sample.get("tick_error"):
             break
         started = tick.get("releases_started")
         total = tick.get("releases_total")
         in_flight = tick.get("in_flight_release_us")
-        if not (isinstance(started, int) and isinstance(total, int) and started > total):
+        in_flight_int = in_flight if isinstance(in_flight, int) and not isinstance(in_flight, bool) else None
+        if in_flight_int is not None and in_flight_int >= 20_000:
             break
-        if isinstance(in_flight, int) and in_flight >= 20_000:
+        has_open_count = (
+            isinstance(started, int)
+            and not isinstance(started, bool)
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and started > total
+        )
+        has_active_in_flight = in_flight_int is not None and in_flight_int > 0
+        if not (has_open_count or has_active_in_flight):
             break
-        time.sleep(settle_sleep_s)
+        if state.interrupt_event.wait(settle_sleep_s):
+            break
         sample = sample_tick_once(base_url, run_id, t0, state, enabled_loads, phase_override="final")
     return sample
 
 
 def check_arm_state(arm: Arm, state: SharedState) -> bool:
     """Return True if healthy, False if faulted or stopped."""
-    if state.stop_event.is_set():
+    if state.workers_stop.is_set():
         return False
     st = arm.state()
     if state.note_observation(st):
@@ -479,7 +568,7 @@ def execute_one_cycle(
     home_joints: list[float] | None,
 ) -> bool:
     """Run one bounded motion cycle. Returns False if stopped/faulted/deadline."""
-    if state.stop_event.is_set() or time.monotonic() >= deadline:
+    if state.workers_stop.is_set() or time.monotonic() >= deadline:
         return False
     if motion_mode == "tickload":
         targets = (DEFAULT_POINT_B, DEFAULT_POINT_A)
@@ -491,7 +580,7 @@ def execute_one_cycle(
             if not check_arm_state(arm, state):
                 return False
             if dwell_s > 0:
-                state.stop_event.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
+                state.workers_stop.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
     else:
         assert home_joints is not None
         p_plus = list(home_joints)
@@ -508,7 +597,7 @@ def execute_one_cycle(
             if not check_arm_state(arm, state):
                 return False
             if dwell_s > 0:
-                state.stop_event.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
+                state.workers_stop.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
     state.inc("motion_cycles_done")
     return True
 
@@ -626,11 +715,9 @@ def main(argv: list[str] | None = None) -> int:
     state = SharedState()
     if args.record:
         state.set_counter("record_state", "pending")
-    write_lock = threading.Lock()
 
     def on_signal(signum: int, _frame: Any) -> None:
-        state.stop_reason = f"signal:{signum}"
-        state.stop_event.set()
+        state.request_interrupt(f"signal:{signum}")
 
     prev_sigint = signal.signal(signal.SIGINT, on_signal)
     prev_sigterm = signal.signal(signal.SIGTERM, on_signal)
@@ -644,9 +731,12 @@ def main(argv: list[str] | None = None) -> int:
 
     workers: list[threading.Thread] = []
     sampler_thread: threading.Thread | None = None
+    idle_wait_s = MIN_IDLE_TAIL_S
+    idle_elapsed_s = 0.0
 
     try:
         with out_path.open("w", encoding="utf-8") as fh:
+            writer = JsonlWriter(fh)
             meta_record = {
                 "type": "meta",
                 "run_id": args.run_id,
@@ -672,17 +762,19 @@ def main(argv: list[str] | None = None) -> int:
                 "armd": boot_meta,
                 "blackbox_log_note": BLACKBOX_LOG_NOTE,
             }
-            write_jsonl_line(fh, write_lock, meta_record)
+            writer.write_terminal(meta_record)
 
             # Capture a synchronous baseline sample BEFORE starting any load workers (even when
             # --baseline-s=0) so early workload spikes cannot be absorbed into samples[0].
             state.set_phase("baseline")
             baseline_sample = sample_tick_once(http_base, args.run_id, t0, state, enabled_loads, phase_override="baseline")
-            write_jsonl_line(fh, write_lock, baseline_sample)
+            writer.write_terminal(baseline_sample)
             baseline_ok = isinstance(baseline_sample.get("tick"), dict) and not baseline_sample.get("tick_error")
+            nominal_period_s = infer_nominal_period_s(baseline_sample.get("tick"))
+            idle_wait_s = max(MIN_IDLE_TAIL_S, IDLE_TAIL_PERIOD_MULTIPLIER * nominal_period_s)
             if not baseline_ok:
-                state.stop_reason = f"baseline_poll_failed:{baseline_sample.get('tick_error') or 'no_tick'}"
-                state.stop_event.set()
+                state.set_stop_reason("error", f"baseline_poll_failed:{baseline_sample.get('tick_error') or 'no_tick'}")
+                state.workers_stop.set()
             else:
                 state.set_phase("baseline" if args.baseline_s > 0 else "full_load")
                 sampler_thread = threading.Thread(
@@ -695,8 +787,7 @@ def main(argv: list[str] | None = None) -> int:
                         deadline,
                         state,
                         enabled_loads,
-                        fh,
-                        write_lock,
+                        writer,
                         True,
                     ),
                     name="tick-sampler",
@@ -704,156 +795,230 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 sampler_thread.start()
 
-            if args.baseline_s > 0 and not state.stop_event.is_set():
-                state.stop_event.wait(min(args.baseline_s, max(0.0, deadline - time.monotonic())))
+            try:
+                if args.baseline_s > 0 and not state.workers_stop.is_set():
+                    state.workers_stop.wait(min(args.baseline_s, max(0.0, deadline - time.monotonic())))
 
-            # Spawn background load threads.
-            if not state.stop_event.is_set() and time.monotonic() < deadline:
-                if args.obs_poll:
-                    workers.append(threading.Thread(
-                        target=run_obs_poll, args=(http_base, args.obs_hz, deadline, state),
-                        name="obs-poll", daemon=True,
-                    ))
-                if args.ws_stream:
-                    workers.append(threading.Thread(
-                        target=run_ws_stream, args=(ws_base, args.ws_obs_hz, deadline, state),
-                        name="ws-stream", daemon=True,
-                    ))
-                if args.measure:
-                    workers.append(threading.Thread(
-                        target=run_measure_loop,
-                        args=(http_base, deadline, state, operator_pin, operator_token, args.allow_insecure_auth),
-                        name="measure-loop", daemon=True,
-                    ))
-                if args.blackbox_log:
-                    workers.append(threading.Thread(
-                        target=run_blackbox_log_loop, args=(http_base, args.blackbox_hz, deadline, state),
-                        name="blackbox-log", daemon=True,
-                    ))
-                if args.bulk_http:
-                    workers.append(threading.Thread(
-                        target=run_bulk_http_loop,
-                        args=(http_base, args.bulk_path, args.bulk_interval_s, deadline, state),
-                        name="bulk-http", daemon=True,
-                    ))
-                for w in workers:
-                    w.start()
+                # Spawn background load threads.
+                if not state.workers_stop.is_set() and time.monotonic() < deadline:
+                    if args.obs_poll:
+                        workers.append(threading.Thread(
+                            target=run_obs_poll, args=(http_base, args.obs_hz, deadline, state),
+                            name="obs-poll", daemon=True,
+                        ))
+                    if args.ws_stream:
+                        workers.append(threading.Thread(
+                            target=run_ws_stream, args=(ws_base, args.ws_obs_hz, deadline, state),
+                            name="ws-stream", daemon=True,
+                        ))
+                    if args.measure:
+                        workers.append(threading.Thread(
+                            target=run_measure_loop,
+                            args=(http_base, deadline, state, operator_pin, operator_token, args.allow_insecure_auth),
+                            name="measure-loop", daemon=True,
+                        ))
+                    if args.blackbox_log:
+                        workers.append(threading.Thread(
+                            target=run_blackbox_log_loop, args=(http_base, args.blackbox_hz, deadline, state),
+                            name="blackbox-log", daemon=True,
+                        ))
+                    if args.bulk_http:
+                        workers.append(threading.Thread(
+                            target=run_bulk_http_loop,
+                            args=(http_base, args.bulk_path, args.bulk_interval_s, deadline, state),
+                            name="bulk-http", daemon=True,
+                        ))
+                    for w in workers:
+                        w.start()
 
-            # Foreground motion + recording inside `with Arm(...)`.
-            needs_arm = args.motion or args.record
-            if needs_arm and not state.stop_event.is_set() and time.monotonic() < deadline:
-                arm_kwargs: dict[str, Any] = {
-                    "host": http_base,
-                    "enable": args.motion,
-                    "park_on_exit": args.motion,
-                    "force": args.force_lease,
-                    "handle_sigterm": False,
-                    "operator_pin": operator_pin,
-                    "operator_token": operator_token,
-                    "allow_insecure_operator_auth": args.allow_insecure_auth,
-                }
-                try:
-                    with Arm(**arm_kwargs) as arm:
-                        if not check_arm_state(arm, state):
-                            raise RuntimeError(f"arm faulted on connect: {state.fault}")
-
-                        home_joints: list[float] | None = None
-                        if args.motion:
-                            state.set_phase("motion_setup")
-                            arm.home()
-                            if not check_arm_state(arm, state):
-                                raise RuntimeError(f"arm faulted after home: {state.fault}")
-                            home_joints = list(arm.state().joint_positions)
-                            if args.motion_mode == "tickload" and time.monotonic() < deadline:
-                                arm.move_to(
-                                    DEFAULT_POINT_A,
-                                    rpy=DEFAULT_RPY,
-                                    yaw="outward",
-                                    path="joint",
-                                    speed_scale=args.speed_scale,
-                                )
-                                state.inc("motion_moves_done")
-                                if not check_arm_state(arm, state):
-                                    raise RuntimeError(f"arm faulted after move A: {state.fault}")
-                                if args.dwell_s > 0:
-                                    state.stop_event.wait(min(args.dwell_s, max(0.0, deadline - time.monotonic())))
-
-                        cycle_idx = 0
-                        # Record one episode (wraps cycle 0 when motion is enabled, else timed window).
-                        if args.record and not state.stop_event.is_set() and time.monotonic() < deadline:
-                            state.set_phase("motion_record" if args.motion else "record_load")
-                            try:
-                                arm.create_dataset(args.record_dataset, exist_ok=True)
-                                with arm.record(dataset=args.record_dataset, task=args.record_task) as rec:
-                                    state.set_counter("record_state", "recording")
-                                    if args.motion and cycle_idx < args.cycles:
-                                        ok = execute_one_cycle(
-                                            arm, args.motion_mode, args.speed_scale, args.dwell_s,
-                                            args.j1_delta_rad, deadline, state, home_joints,
-                                        )
-                                        cycle_idx += 1
-                                        if not ok and state.has_fault():
-                                            raise RuntimeError(f"arm faulted during recorded cycle: {state.fault}")
-                                    else:
-                                        rec_wait = min(args.record_seconds, max(0.0, deadline - time.monotonic()))
-                                        state.stop_event.wait(rec_wait)
-                                state.set_counter("record_episode_id", rec.episode_id)
-                                state.set_counter("record_state", "saved" if rec.episode_id else "discarded")
-                            except RebotError as exc:
-                                # Non-fault recording unavailability (e.g. --episodes-dir off) is noted, not a fault.
-                                state.set_counter("record_state", f"unavailable:{err_tag(exc)}")
-                                if not check_arm_state(arm, state):
-                                    raise
-
-                        # Remaining motion cycles under full load.
-                        if args.motion:
-                            state.set_phase("full_load")
-                            while cycle_idx < args.cycles and not state.stop_event.is_set() and time.monotonic() < deadline:
-                                ok = execute_one_cycle(
-                                    arm, args.motion_mode, args.speed_scale, args.dwell_s,
-                                    args.j1_delta_rad, deadline, state, home_joints,
-                                )
-                                cycle_idx += 1
-                                if not ok:
-                                    break
-                            if not state.has_fault() and not state.stop_event.is_set():
-                                state.set_phase("cooldown")
-                                arm.home()
-                                check_arm_state(arm, state)
-                                if args.cooldown_s > 0:
-                                    state.stop_event.wait(min(args.cooldown_s, max(0.0, deadline - time.monotonic())))
-                        else:
-                            state.set_phase("full_load")
-                            remaining = max(0.0, deadline - time.monotonic())
-                            if remaining > 0:
-                                state.stop_event.wait(remaining)
-                except RebotError as exc:
-                    # Check whether the arm faulted; never clear faults.
+                # Foreground motion + recording inside `with Arm(...)`.
+                needs_arm = args.motion or args.record
+                if needs_arm and not state.workers_stop.is_set() and time.monotonic() < deadline:
+                    arm_kwargs: dict[str, Any] = {
+                        "host": http_base,
+                        "enable": args.motion,
+                        "park_on_exit": args.motion,
+                        "force": args.force_lease,
+                        "handle_sigterm": False,
+                        "operator_pin": operator_pin,
+                        "operator_token": operator_token,
+                        "allow_insecure_operator_auth": args.allow_insecure_auth,
+                    }
                     try:
-                        obs = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
-                        state.note_observation(obs)
-                    except Exception:
-                        pass
-                    if not state.has_fault():
-                        state.trip_fault(f"{err_tag(exc)}: {exc}")
-                except RuntimeError as exc:
-                    if not state.has_fault():
-                        state.trip_fault(str(exc))
-            else:
-                state.set_phase("full_load")
-                remaining = max(0.0, deadline - time.monotonic())
-                if remaining > 0:
-                    state.stop_event.wait(remaining)
+                        with Arm(**arm_kwargs) as arm:
+                            if not check_arm_state(arm, state):
+                                raise RuntimeError(f"arm faulted on connect: {state.fault}")
 
-            # Stop all background loads cleanly before final sample.
-            state.stop_event.set()
+                            home_joints: list[float] | None = None
+                            if args.motion:
+                                state.set_phase("motion_setup")
+                                arm.home()
+                                if not check_arm_state(arm, state):
+                                    raise RuntimeError(f"arm faulted after home: {state.fault}")
+                                home_joints = list(arm.state().joint_positions)
+                                if args.motion_mode == "tickload" and time.monotonic() < deadline:
+                                    arm.move_to(
+                                        DEFAULT_POINT_A,
+                                        rpy=DEFAULT_RPY,
+                                        yaw="outward",
+                                        path="joint",
+                                        speed_scale=args.speed_scale,
+                                    )
+                                    state.inc("motion_moves_done")
+                                    if not check_arm_state(arm, state):
+                                        raise RuntimeError(f"arm faulted after move A: {state.fault}")
+                                    if args.dwell_s > 0:
+                                        state.workers_stop.wait(min(args.dwell_s, max(0.0, deadline - time.monotonic())))
+
+                            cycle_idx = 0
+                            # Record one episode (wraps cycle 0 when motion is enabled, else timed window).
+                            if args.record and not state.workers_stop.is_set() and time.monotonic() < deadline:
+                                state.set_phase("motion_record" if args.motion else "record_load")
+                                try:
+                                    arm.create_dataset(args.record_dataset, exist_ok=True)
+                                    with arm.record(dataset=args.record_dataset, task=args.record_task) as rec:
+                                        state.set_counter("record_state", "recording")
+                                        if args.motion and cycle_idx < args.cycles:
+                                            ok = execute_one_cycle(
+                                                arm, args.motion_mode, args.speed_scale, args.dwell_s,
+                                                args.j1_delta_rad, deadline, state, home_joints,
+                                            )
+                                            cycle_idx += 1
+                                            if not ok and state.has_fault():
+                                                raise RuntimeError(f"arm faulted during recorded cycle: {state.fault}")
+                                        else:
+                                            rec_wait = min(args.record_seconds, max(0.0, deadline - time.monotonic()))
+                                            state.workers_stop.wait(rec_wait)
+                                    state.set_counter("record_episode_id", rec.episode_id)
+                                    state.set_counter("record_state", "saved" if rec.episode_id else "discarded")
+                                except RebotError as exc:
+                                    # Non-fault recording unavailability (e.g. --episodes-dir off) is noted, not a fault.
+                                    state.set_counter("record_state", f"unavailable:{err_tag(exc)}")
+                                    if not check_arm_state(arm, state):
+                                        raise
+
+                            # Remaining motion cycles under full load.
+                            if args.motion:
+                                state.set_phase("full_load")
+                                while cycle_idx < args.cycles and not state.workers_stop.is_set() and time.monotonic() < deadline:
+                                    ok = execute_one_cycle(
+                                        arm, args.motion_mode, args.speed_scale, args.dwell_s,
+                                        args.j1_delta_rad, deadline, state, home_joints,
+                                    )
+                                    cycle_idx += 1
+                                    if not ok:
+                                        break
+                                if not state.has_fault() and not state.workers_stop.is_set():
+                                    state.set_phase("cooldown")
+                                    arm.home()
+                                    check_arm_state(arm, state)
+                                    if args.cooldown_s > 0:
+                                        state.workers_stop.wait(min(args.cooldown_s, max(0.0, deadline - time.monotonic())))
+                            else:
+                                state.set_phase("full_load")
+                                remaining = max(0.0, deadline - time.monotonic())
+                                if remaining > 0:
+                                    state.workers_stop.wait(remaining)
+                    except RebotError as exc:
+                        # Check whether the arm faulted; never clear faults.
+                        try:
+                            obs = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
+                            state.note_observation(obs)
+                        except Exception:
+                            pass
+                        if not state.has_fault():
+                            state.trip_fault(f"{err_tag(exc)}: {exc}")
+                    except RuntimeError as exc:
+                        if not state.has_fault():
+                            state.trip_fault(str(exc))
+                else:
+                    state.set_phase("full_load")
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if remaining > 0:
+                        state.workers_stop.wait(remaining)
+            except KeyboardInterrupt:
+                state.request_interrupt("KeyboardInterrupt")
+            except Exception as exc:
+                state.set_stop_reason("error", f"load_exception:{err_tag(exc)}: {exc}")
+
+            # Stop all background loads and periodic sampler cleanly, then revoke sampler writes
+            # so a timed-out background sampler can never append records after final/summary.
+            state.workers_stop.set()
             for w in workers:
                 w.join(timeout=3.0)
             if sampler_thread is not None:
                 sampler_thread.join(timeout=3.0)
+            writer.close_sampler_writes()
+
+            alive_threads = [t.name for t in workers if t.is_alive()]
+            if sampler_thread is not None and sampler_thread.is_alive():
+                alive_threads.append(sampler_thread.name)
+            if alive_threads:
+                state.set_stop_reason("error", f"threads_still_alive:{','.join(alive_threads)}")
+
+            # Post-load idle release tail: wait >= max(1.0 s, 2 * period * 10) of idle releases
+            # on `interrupt_event` (NOT `workers_stop`) before taking the settled `final` sample.
+            pre_idle_total: int | None = None
+            reason_now, _ = state.get_stop_reason()
+            if reason_now == "completed":
+                try:
+                    obs_pre = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
+                    state.note_observation(obs_pre)
+                except Exception:
+                    pass
+                reason_now, _ = state.get_stop_reason()
+            if reason_now == "completed":
+                try:
+                    pre_idle_tick = http_get_json(f"{http_base}/api/v1/diagnostics/tick", timeout=2.0)
+                    pre_idle_total = extract_completed_count(pre_idle_tick)
+                except Exception as exc:
+                    state.set_stop_reason("error", f"pre_idle_poll_failed:{err_tag(exc)}: {exc}")
+                reason_now, _ = state.get_stop_reason()
+            if reason_now == "completed":
+                state.set_phase("idle_tail")
+                idle_start = time.monotonic()
+                idle_deadline = idle_start + idle_wait_s
+                try:
+                    while not state.interrupt_event.is_set():
+                        rem = idle_deadline - time.monotonic()
+                        if rem <= 0.0:
+                            break
+                        state.interrupt_event.wait(rem)
+                except KeyboardInterrupt:
+                    state.request_interrupt("KeyboardInterrupt")
+                idle_elapsed_s = time.monotonic() - idle_start
+                reason_now, _ = state.get_stop_reason()
+                if reason_now == "completed" and idle_elapsed_s < idle_wait_s:
+                    state.set_stop_reason(
+                        "error",
+                        f"idle_tail_short:{idle_elapsed_s:.3f}s<{idle_wait_s:.3f}s",
+                    )
+                if state.get_stop_reason()[0] == "completed":
+                    try:
+                        obs_post = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
+                        state.note_observation(obs_post)
+                    except Exception:
+                        pass
 
             final_sample = capture_settled_final_sample(http_base, args.run_id, t0, state, enabled_loads)
-            write_jsonl_line(fh, write_lock, final_sample)
+            if state.get_stop_reason()[0] == "completed":
+                if final_sample.get("tick_error") or not isinstance(final_sample.get("tick"), dict):
+                    state.set_stop_reason(
+                        "error",
+                        f"final_poll_failed:{final_sample.get('tick_error') or 'no_tick'}",
+                    )
+                else:
+                    final_total = extract_completed_count(final_sample.get("tick"))
+                    if not (
+                        pre_idle_total is not None
+                        and final_total is not None
+                        and final_total > pre_idle_total
+                    ):
+                        state.set_stop_reason(
+                            "error",
+                            f"idle_tail_no_release_progress:{pre_idle_total}->{final_total}",
+                        )
+            writer.write_terminal(final_sample)
 
             blackbox_tail = None
             if state.has_fault():
@@ -862,30 +1027,38 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception:
                     blackbox_tail = None
 
+            final_stop_reason, final_stop_detail = state.get_stop_reason()
             summary = {
                 "type": "summary",
                 "run_id": args.run_id,
                 "ts_unix": round(time.time(), 6),
                 "ts_iso": utc_iso(time.time()),
                 "elapsed_s": round(time.monotonic() - t0, 3),
-                "stop_reason": state.stop_reason,
+                "stop_reason": final_stop_reason,
+                "stop_detail": final_stop_detail,
+                "idle_tail_target_s": round(idle_wait_s, 3),
+                "idle_tail_elapsed_s": round(idle_elapsed_s, 3),
                 "fault": state.fault,
                 "safety_state": state.safety_state,
                 "counters": final_sample["counters"],
                 "blackbox_tail_on_fault": blackbox_tail,
             }
-            write_jsonl_line(fh, write_lock, summary)
+            writer.write_terminal(summary)
     finally:
         signal.signal(signal.SIGINT, prev_sigint)
         signal.signal(signal.SIGTERM, prev_sigterm)
 
+    final_stop_reason, final_stop_detail = state.get_stop_reason()
     print(
         f"rt_qual load finished: run_id={args.run_id} elapsed={time.monotonic() - t0:.1f}s "
-        f"stop_reason={state.stop_reason} fault={state.fault} output={out_path}"
+        f"stop_reason={final_stop_reason} stop_detail={final_stop_detail} "
+        f"idle_tail={idle_elapsed_s:.2f}s/{idle_wait_s:.2f}s fault={state.fault} output={out_path}"
     )
-    if state.has_fault():
+    if final_stop_reason == "fault":
         return 2
-    if state.stop_reason.startswith("baseline_poll_failed"):
+    if final_stop_reason == "interrupted":
+        return 130
+    if final_stop_reason == "error":
         return 3
     return 0
 
