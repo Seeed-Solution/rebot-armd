@@ -199,13 +199,57 @@ async fn capability_is_advertised_with_cartesian() {
 
 // ---- WS: move_to, move_relative, place ----
 
-struct Rig { ws: common::TestSocket, generation: u64, epoch: u64, sup: Arc<ArmSupervisor> }
+struct Rig {
+    ws: common::TestSocket,
+    generation: u64,
+    epoch: u64,
+    sup: Arc<ArmSupervisor>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        for t in self.tasks.drain(..) { t.abort(); }
+    }
+}
 
 impl Rig {
     async fn new() -> Self {
         let home: [f32; 7] = std::array::from_fn(|i| profile().home_positions.get(i).copied().unwrap_or(0.0));
-        let (ws, generation, epoch, sup, _) = common::torqued_rig(Arc::new(ArmSupervisor::new(profile())), &home).await;
-        Rig { ws, generation, epoch, sup }
+        let sup = Arc::new(ArmSupervisor::new(profile()));
+        let router = armd::create_router(sup.clone(), armd::OperatorAuth::disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let ticker = sup.clone();
+        // Advance 50 Hz simulated trajectories at accelerated wall-clock rate while moving.
+        let tick_task = tokio::spawn(async move {
+            loop {
+                let moving = ticker.inner().read().await.active_trajectory.is_some();
+                if moving {
+                    for _ in 0..4 {
+                        ticker.tick(0.02).await;
+                        if ticker.inner().read().await.active_trajectory.is_none() { break; }
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    ticker.tick(0.02).await;
+                }
+            }
+        });
+        let (mut ws, generation) = common::controller(addr).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = home.to_vec();
+            inner.measured_positions = home.to_vec();
+            inner.target_positions = home.to_vec();
+        }
+        let epoch = sup.get_observation().await.epoch_id;
+        Rig { ws, generation, epoch, sup, tasks: vec![srv, tick_task] }
     }
     async fn rpc(&mut self, path: &str, body: Value) -> Value { common::rpc(&mut self.ws, self.generation, self.epoch, path, body).await }
     async fn wait(&mut self, id: u64) -> armd::motion::ActionStatus {
@@ -222,7 +266,7 @@ impl Rig {
             if let Some(a) = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id) {
                 if !a.is_running() { return a; }
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
     async fn run(&mut self, path: &str, body: Value) -> Result<armd::motion::ActionStatus, Value> {
