@@ -424,13 +424,22 @@ pub enum EnableLifecycle {
 #[derive(Debug, Clone, Copy)]
 pub struct MeasuredHoldTracker {
     /// Fixed captured target position per joint while feedback stays fresh (<= 100 ms).
-    /// Cleared to `None` when feedback goes stale/missing, mode becomes unverified, or
-    /// the motor is `OffConfirmed`, and recaptured when fresh feedback returns.
+    /// Cleared to `None` when feedback goes stale/missing, continuity breaks across a `> 100 ms`
+    /// gap, mode becomes unverified, or the motor is `OffConfirmed`, and recaptured when fresh
+    /// feedback returns.
     pub captured_positions: [Option<f32>; crate::rt_core::mailbox::MAX_DOF],
+    /// Driver-reported per-joint feedback continuity epoch at capture time (detects `> 100 ms`
+    /// gaps even if feedback resumed before the next service pass).
+    pub captured_continuity_epoch: [Option<u64>; crate::rt_core::mailbox::MAX_DOF],
+    /// Driver-clock timestamp when this joint's capture was last confirmed continuously fresh.
+    pub last_seen_fresh_at: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
     /// Most recent per-motor torque evidence observed from the driver.
     pub motor_evidence: [crate::driver::MotorTorqueEvidence; crate::rt_core::mailbox::MAX_DOF],
     /// Most recent per-joint hold status observed during hold evaluation/servicing.
     pub joint_status: [crate::driver::JointHoldStatus; crate::rt_core::mailbox::MAX_DOF],
+    /// Original failure cause stored on `FailedHold` entry so live `ENABLE_FAILED` messages
+    /// reflect updated per-joint hold status without relatching or bumping `epoch_id`.
+    pub enable_failed_cause: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
     pub dof: usize,
 }
 
@@ -438,14 +447,21 @@ impl MeasuredHoldTracker {
     pub fn new(dof: usize) -> Self {
         Self {
             captured_positions: [None; crate::rt_core::mailbox::MAX_DOF],
+            captured_continuity_epoch: [None; crate::rt_core::mailbox::MAX_DOF],
+            last_seen_fresh_at: [None; crate::rt_core::mailbox::MAX_DOF],
             motor_evidence: [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF],
             joint_status: [crate::driver::JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
+            enable_failed_cause: crate::safety::BoundedText::empty(),
             dof: dof.min(crate::rt_core::mailbox::MAX_DOF),
         }
     }
 
     pub fn clear(&mut self) {
         self.captured_positions.fill(None);
+        self.captured_continuity_epoch.fill(None);
+        self.last_seen_fresh_at.fill(None);
+        self.joint_status.fill(crate::driver::JointHoldStatus::SkippedOff);
+        self.enable_failed_cause = crate::safety::BoundedText::empty();
     }
 
     pub fn any_possibly_energized(&self) -> bool {
@@ -476,6 +492,21 @@ impl MeasuredHoldTracker {
             );
         }
         buf.push_str("]");
+    }
+
+    /// Format the live `ENABLE_FAILED` message (`Enable failed [J1:...]: <cause>`) without heap
+    /// allocation so observations reflect current per-joint torque and hold status.
+    pub fn write_fault_message(
+        &self,
+        buf: &mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+    ) {
+        *buf = crate::safety::BoundedText::empty();
+        buf.push_str("Enable failed ");
+        self.write_summary(buf);
+        if !self.enable_failed_cause.is_empty() {
+            buf.push_str(": ");
+            buf.push_str(self.enable_failed_cause.as_str());
+        }
     }
 }
 
@@ -1222,6 +1253,26 @@ impl SupervisorInner {
         &self.measured_hold.joint_status[..self.measured_hold.dof]
     }
 
+    /// Single shared clear-fault enable-evidence policy for BOTH legacy and RT clear owners:
+    /// keeps `ctx.enable_state_known` strictly truthful (`Disabled | Enabled | partial`) and
+    /// sets `ctx.failed_hold_recovery_allowed` explicitly only for `FailedHold` (`ENABLE_FAILED`)
+    /// recovery on enable-feedback drivers when no `BusLoss` or `ThermalTrip` is latched.
+    #[inline]
+    fn populate_enable_clear_context(
+        &self,
+        ctx: &mut crate::safety::ClearContext,
+        state: EnableState,
+        partial: bool,
+        enable_fb: bool,
+    ) {
+        ctx.enable_state_known = state != EnableState::Unknown || partial;
+        ctx.failed_hold_recovery_allowed = self.enable_lifecycle == EnableLifecycle::FailedHold
+            && enable_fb
+            && self.safety.has_latched_fault_code(FaultCode::EnableFailed)
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::BusLoss)
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip);
+    }
+
     /// Stopped-hold eligibility derived from the transition reducer state (`FailedHold` /
     /// `Armed`) or active torque flag.
     #[inline]
@@ -1230,44 +1281,19 @@ impl SupervisorInner {
             || self.is_torqued
     }
 
-    /// Evaluates each joint independently from driver-owned per-motor torque evidence, fresh
-    /// (`<= 100 ms`) finite measured position with transport provenance, and verified hold mode.
-    /// Captures a fixed hold target per joint while fresh, clears it on staleness/unverified/off,
-    /// and returns the bitmask of joints eligible for hold frames (zero heap allocations).
-    pub(crate) fn snapshot_measured_hold(&mut self) -> u64 {
+    /// Single shared stopped-hold capture kernel used by both `snapshot_measured_hold` and
+    /// `apply_estop_latch_with_driver` (zero heap allocations). Evaluates each joint independently
+    /// from driver-owned torque evidence, fresh (`<= 100 ms`) finite measured position with
+    /// continuity tracking, and verified hold mode. Returns `(hold_mask, invalidated_mask)` where
+    /// `invalidated_mask` names joints whose continuity broke across a `> 100 ms` gap or became
+    /// ineligible so queued holds for those joints are dropped before sending.
+    pub(crate) fn capture_measured_hold_from_driver_ref(
+        &mut self,
+        drv: &dyn crate::driver::ArmDriver,
+    ) -> (u64, u64) {
         use crate::driver::{JointHoldStatus, MotorTorqueEvidence, STOPPED_DISABLE_FEEDBACK_MAX_AGE};
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         self.measured_hold.dof = dof;
-        let Some(d) = self.driver.as_ref() else {
-            self.measured_hold.motor_evidence[..dof].fill(if self.is_torqued {
-                MotorTorqueEvidence::OnConfirmed
-            } else {
-                MotorTorqueEvidence::OffConfirmed
-            });
-            for j in 0..dof {
-                if self.is_torqued {
-                    if let Some(p) = self.measured_positions.get(j).copied().filter(|p| p.is_finite()) {
-                        let _ = self.measured_hold.captured_positions[j].get_or_insert(p);
-                        self.measured_hold.joint_status[j] = JointHoldStatus::Held;
-                    } else {
-                        self.measured_hold.captured_positions[j] = None;
-                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
-                    }
-                } else {
-                    self.measured_hold.captured_positions[j] = None;
-                    self.measured_hold.joint_status[j] = JointHoldStatus::SkippedOff;
-                }
-            }
-            return 0;
-        };
-        let Ok(drv) = d.lock() else {
-            for j in 0..dof {
-                self.measured_hold.motor_evidence[j] = MotorTorqueEvidence::Unknown;
-                self.measured_hold.captured_positions[j] = None;
-                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
-            }
-            return 0;
-        };
         let mut ev = [MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF];
         drv.motor_torque_evidence_into(&mut ev[..dof]);
         let has_drv_fresh = drv.has_driver_fresh_position_api();
@@ -1288,11 +1314,11 @@ impl SupervisorInner {
             self.scratch.ages = ages_buf;
             self.scratch.fb.bounds = bounds_buf;
         }
-        let mut fresh_pos_arr = [None::<f32>; crate::rt_core::mailbox::MAX_DOF];
+        let mut fresh_sample_arr = [None::<(f32, u64)>; crate::rt_core::mailbox::MAX_DOF];
         let mut mode_ok_arr = [false; crate::rt_core::mailbox::MAX_DOF];
         for j in 0..dof {
-            fresh_pos_arr[j] = if has_drv_fresh {
-                drv.fresh_measured_position_for(j, STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+            fresh_sample_arr[j] = if has_drv_fresh {
+                drv.fresh_measured_sample_for(j, STOPPED_DISABLE_FEEDBACK_MAX_AGE)
             } else {
                 let age_ok = ages_arr[j].is_some_and(|a| a <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
                 let bound_ok = !has_bounds
@@ -1300,37 +1326,115 @@ impl SupervisorInner {
                         drv_now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
                     });
                 if self.feedback_numeric_valid && age_ok && bound_ok {
-                    self.measured_positions.get(j).copied().filter(|p| p.is_finite())
+                    self.measured_positions
+                        .get(j)
+                        .copied()
+                        .filter(|p| p.is_finite())
+                        .map(|p| (p, 0u64))
                 } else {
                     None
                 }
             };
             mode_ok_arr[j] = drv.joint_hold_mode_verified(j);
         }
-        drop(drv);
         self.measured_hold.motor_evidence[..dof].copy_from_slice(&ev[..dof]);
         let mut hold_mask = 0u64;
+        let mut invalidated_mask = 0u64;
         for j in 0..dof {
             if ev[j] == MotorTorqueEvidence::OffConfirmed {
                 self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.captured_continuity_epoch[j] = None;
+                self.measured_hold.last_seen_fresh_at[j] = None;
                 self.measured_hold.joint_status[j] = JointHoldStatus::SkippedOff;
+                invalidated_mask |= 1u64 << j;
                 continue;
             }
-            let Some(pos) = fresh_pos_arr[j] else {
+            let Some((pos, epoch)) = fresh_sample_arr[j] else {
                 self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.captured_continuity_epoch[j] = None;
+                self.measured_hold.last_seen_fresh_at[j] = None;
                 self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                invalidated_mask |= 1u64 << j;
                 continue;
             };
             if !mode_ok_arr[j] {
                 self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.captured_continuity_epoch[j] = None;
+                self.measured_hold.last_seen_fresh_at[j] = None;
                 self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+                invalidated_mask |= 1u64 << j;
                 continue;
             }
-            let _ = self.measured_hold.captured_positions[j].get_or_insert(pos);
-            self.measured_hold.joint_status[j] = JointHoldStatus::Held;
+            let continuity_broken = self.measured_hold.captured_positions[j].is_none()
+                || self.measured_hold.captured_continuity_epoch[j] != Some(epoch)
+                || self.measured_hold.last_seen_fresh_at[j].is_some_and(|prev| {
+                    drv_now.saturating_duration_since(prev) > STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                });
+            if continuity_broken {
+                self.measured_hold.captured_positions[j] = Some(pos);
+                self.measured_hold.captured_continuity_epoch[j] = Some(epoch);
+                self.measured_hold.joint_status[j] = JointHoldStatus::Queued;
+                invalidated_mask |= 1u64 << j;
+            } else if !matches!(
+                self.measured_hold.joint_status[j],
+                JointHoldStatus::Held | JointHoldStatus::Queued
+            ) {
+                self.measured_hold.joint_status[j] = JointHoldStatus::Queued;
+            }
+            self.measured_hold.last_seen_fresh_at[j] = Some(drv_now);
             hold_mask |= 1u64 << j;
         }
-        hold_mask
+        (hold_mask, invalidated_mask)
+    }
+
+    /// Evaluates each joint independently from driver-owned per-motor torque evidence, fresh
+    /// (`<= 100 ms`) finite measured position with transport provenance and continuity tracking,
+    /// and verified hold mode. Returns `(hold_mask, invalidated_mask)` (zero heap allocations).
+    pub(crate) fn snapshot_measured_hold_with_invalidated(&mut self) -> (u64, u64) {
+        use crate::driver::{JointHoldStatus, MotorTorqueEvidence};
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        self.measured_hold.dof = dof;
+        let Some(d) = self.driver.take() else {
+            self.measured_hold.motor_evidence[..dof].fill(if self.is_torqued {
+                MotorTorqueEvidence::OnConfirmed
+            } else {
+                MotorTorqueEvidence::OffConfirmed
+            });
+            for j in 0..dof {
+                if self.is_torqued {
+                    if let Some(p) = self.measured_positions.get(j).copied().filter(|p| p.is_finite()) {
+                        let _ = self.measured_hold.captured_positions[j].get_or_insert(p);
+                        self.measured_hold.joint_status[j] = JointHoldStatus::Held;
+                    } else {
+                        self.measured_hold.captured_positions[j] = None;
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    }
+                } else {
+                    self.measured_hold.captured_positions[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::SkippedOff;
+                }
+            }
+            return (0, 0);
+        };
+        let res = match d.lock() {
+            Ok(drv) => self.capture_measured_hold_from_driver_ref(drv.as_ref()),
+            Err(_) => {
+                for j in 0..dof {
+                    self.measured_hold.motor_evidence[j] = MotorTorqueEvidence::Unknown;
+                    self.measured_hold.captured_positions[j] = None;
+                    self.measured_hold.captured_continuity_epoch[j] = None;
+                    self.measured_hold.last_seen_fresh_at[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                }
+                (0, u64::MAX)
+            }
+        };
+        self.driver = Some(d);
+        res
+    }
+
+    pub(crate) fn snapshot_measured_hold(&mut self) -> u64 {
+        self.snapshot_measured_hold_with_invalidated().0
     }
 
     /// Services one masked measured-position hold pass while stopped or in `FailedHold`
@@ -1352,7 +1456,16 @@ impl SupervisorInner {
             return TickOutput::None;
         }
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
-        let hold_mask = self.snapshot_measured_hold();
+        let (mut hold_mask, invalidated_mask) = self.snapshot_measured_hold_with_invalidated();
+
+        // Always prune queued holds for ineligible or continuity-broken joints BEFORE any MIT
+        // preparation or transmit so a stale/excluded joint's queued hold can never leak.
+        let keep_queued_mask = hold_mask & !invalidated_mask;
+        if let Some(ref d) = self.driver {
+            if let Ok(mut drv) = d.lock() {
+                drv.drop_pending_holds_outside_mask(keep_queued_mask);
+            }
+        }
 
         let mut targets = std::mem::take(&mut self.scratch.targets);
         targets.clear();
@@ -1375,22 +1488,29 @@ impl SupervisorInner {
             });
         }
 
+        // Per-joint masked MIT hold preparation: an excluded or stale MIT joint clears ONLY its
+        // own bit from `hold_mask` and drops its queued hold without vetoing eligible peers.
         let ff = if self.mit.owner == crate::mit::MitOwner::Active && hold_mask != 0 {
-            match self.mit_prepare(&mut targets, dt) {
-                Ok(ff) => Some(ff),
-                Err(e) => {
-                    self.scratch.targets = targets;
-                    let mut buf = crate::mit::OutputErrorText::empty();
-                    let _ = core::fmt::write(&mut buf, format_args!("MIT hold output refused: {e}"));
-                    return TickOutput::Error {
-                        message: buf,
-                        now: self.mit_now(),
-                        max_age: crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
-                        is_hold: true,
-                        sent_any: false,
-                    };
+            let before_mask = hold_mask;
+            let (filtered_mask, ff_opt) = self.mit_prepare_masked(hold_mask, &mut targets, dt);
+            let rejected = before_mask & !filtered_mask;
+            if rejected != 0 {
+                for j in 0..dof {
+                    if (rejected & (1u64 << j)) != 0 {
+                        self.measured_hold.captured_positions[j] = None;
+                        self.measured_hold.captured_continuity_epoch[j] = None;
+                        self.measured_hold.last_seen_fresh_at[j] = None;
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    }
+                }
+                if let Some(ref d) = self.driver {
+                    if let Ok(mut drv) = d.lock() {
+                        drv.drop_pending_holds_outside_mask(filtered_mask);
+                    }
                 }
             }
+            hold_mask = filtered_mask;
+            ff_opt
         } else {
             None
         };
@@ -1420,8 +1540,10 @@ impl SupervisorInner {
                 let n = report.dof.min(dof);
                 for j in 0..n {
                     self.measured_hold.joint_status[j] = report.joint_status[j];
-                    if report.joint_status[j] != JointHoldStatus::Held {
+                    if !matches!(report.joint_status[j], JointHoldStatus::Held | JointHoldStatus::Queued) {
                         self.measured_hold.captured_positions[j] = None;
+                        self.measured_hold.captured_continuity_epoch[j] = None;
+                        self.measured_hold.last_seen_fresh_at[j] = None;
                     }
                 }
                 if hold_mask == 0 && !report.sent_any && matches!(report.outcome, TxBatchOutcome::Complete) {
@@ -1704,13 +1826,13 @@ impl SupervisorInner {
         self.active_disable_kind = None;
         self.last_disable_attempt = None;
 
-        // 5. Latch non-recoverable ENABLE_FAILED with per-joint torque & hold status first so the
-        //    joint report is never truncated by a verbose driver error string.
+        // 5. Store cause and latch non-recoverable ENABLE_FAILED with per-joint torque & hold
+        //    status first so the joint report is never truncated by a verbose driver error string.
+        let mut cause = crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
+        write_cause(&mut cause);
+        self.measured_hold.enable_failed_cause = cause;
         let mut msg = crate::safety::BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::empty();
-        msg.push_str("Enable failed ");
-        self.measured_hold.write_summary(&mut msg);
-        msg.push_str(": ");
-        write_cause(&mut msg);
+        self.measured_hold.write_fault_message(&mut msg);
         let msg_copy = msg;
         self.safety.latch(
             crate::safety::FaultKind::Other,
@@ -1719,6 +1841,20 @@ impl SupervisorInner {
             }),
         );
         msg
+    }
+
+    /// Reducer-owned cancellation of an in-flight enable when `StopPolicy::ThermalTrip` takes
+    /// over: cancels queued enable work, records the `ENABLE_FAILED` diagnostic with per-joint
+    /// status (while `ThermalTrip` retains highest display precedence), and ends any pending RT
+    /// `TorqueOn` command with `THERMAL_TRIP` before thermal protection starts `DisableProtective`.
+    pub(crate) fn interrupt_enable_for_thermal(&mut self) {
+        let Some(TorqueTransition::Enable(reducer)) = self.torque_transition.take() else {
+            return;
+        };
+        self.core.begin_transition(Err("THERMAL_TRIP"));
+        let _ = self.enter_failed_hold(reducer.was_torqued, |buf| {
+            buf.push_str("interrupted by thermal trip");
+        });
     }
 
     /// Starts the single budgeted enable reducer (`Enable -> Validate -> Armed | FailedHold`).
@@ -1738,6 +1874,7 @@ impl SupervisorInner {
         let Some(ref d) = self.driver else {
             return self.step_enable_validate(
                 EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                None,
                 budgeted,
             );
         };
@@ -1771,10 +1908,12 @@ impl SupervisorInner {
             }
             Ok(Drv::Done(TorqueOutcome::Confirmed)) => self.step_enable_validate(
                 EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                None,
                 budgeted,
             ),
             Ok(Drv::Done(TorqueOutcome::Unconfirmed)) if !enable_fb => self.step_enable_validate(
                 EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                None,
                 budgeted,
             ),
             Ok(Drv::Done(TorqueOutcome::Unconfirmed)) => {
@@ -1832,7 +1971,10 @@ impl SupervisorInner {
             );
         }
         match reducer.phase {
-            EnableReducerPhase::Validate => (self.step_enable_validate(reducer, budget.is_some()), None),
+            EnableReducerPhase::Validate => (
+                self.step_enable_validate(reducer, budget, budget.is_some()),
+                None,
+            ),
             EnableReducerPhase::Enable => {
                 let Some(ref d) = self.driver else {
                     let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
@@ -1887,6 +2029,7 @@ impl SupervisorInner {
                     Ok(Drv::Done(TorqueOutcome::Confirmed)) => (
                         self.step_enable_validate(
                             EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                            budget,
                             budget.is_some(),
                         ),
                         rx,
@@ -1894,6 +2037,7 @@ impl SupervisorInner {
                     Ok(Drv::Done(TorqueOutcome::Unconfirmed)) if !enable_fb => (
                         self.step_enable_validate(
                             EnableReducer { phase: EnableReducerPhase::Validate, ..reducer },
+                            budget,
                             budget.is_some(),
                         ),
                         rx,
@@ -1939,6 +2083,7 @@ impl SupervisorInner {
     fn step_enable_validate(
         &mut self,
         reducer: EnableReducer,
+        budget: Option<&crate::rt_core::ops::ServiceBudget>,
         use_cached: bool,
     ) -> EnableStepOutcome {
         let was_torqued = reducer.was_torqued;
@@ -1970,14 +2115,21 @@ impl SupervisorInner {
                 match d.lock() {
                     Err(_) => Err("driver mutex poisoned during validation"),
                     Ok(mut driver) => {
-                        let read_res = if use_cached {
+                        let read_res: Result<(), ()> = if use_cached {
                             if driver.read_cached_joint_states_into(&mut scratch_states).is_some() {
                                 Ok(())
+                            } else if let Some(b) = budget {
+                                let span = b.deadline.saturating_duration_since(b.now);
+                                let drv_deadline = driver.clock_now() + span;
+                                driver
+                                    .read_joint_states_budgeted(&mut scratch_states, drv_deadline, b.max_rx_frames)
+                                    .map(|_| ())
+                                    .map_err(|_| ())
                             } else {
-                                driver.read_joint_states_into(&mut scratch_states)
+                                Err(())
                             }
                         } else {
-                            driver.read_joint_states_into(&mut scratch_states)
+                            driver.read_joint_states_into(&mut scratch_states).map_err(|_| ())
                         };
                         if read_res.is_err() {
                             Err("post-enable feedback unavailable")
@@ -2491,6 +2643,7 @@ impl SupervisorInner {
             lease_heartbeat_fresh,
             joint_limit_violation: self.joint_limit_clear_violation(),
             enable_state_known: self.driver.is_none(),
+            failed_hold_recovery_allowed: false,
             hardware_reset_required: false,
             hardware_reset_sent: false,
             hardware_error: None,
@@ -2893,7 +3046,6 @@ impl SupervisorInner {
                         self.resting_pose_support_violation_bounded(Some(drv.as_ref()), &ages, &mut ws_bufs);
                 }
             }
-            let enable_known = state != EnableState::Unknown || partial;
             drop(drv);
             self.ws_eval_bufs = ws_bufs;
 
@@ -2924,7 +3076,7 @@ impl SupervisorInner {
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
-            ctx.enable_state_known = enable_known;
+            self.populate_enable_clear_context(&mut ctx, state, partial, caps.enable_feedback);
 
             // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
             // reset, or `refresh_enable_state` side effect.
@@ -2952,7 +3104,7 @@ impl SupervisorInner {
                 partial = partial_after;
                 any_enabled = any_en_after;
                 ctx.tx_queue_drained = drained_after;
-                ctx.enable_state_known = state != EnableState::Unknown || partial;
+                self.populate_enable_clear_context(&mut ctx, state, partial, caps.enable_feedback);
                 ctx.hardware_reset_required = hw_fault_after;
                 ctx.pending_estop = self.estop_request_unapplied();
                 match probe_res {
@@ -3022,9 +3174,7 @@ impl SupervisorInner {
                         partial = drv.has_known_partial_enable();
                         any_enabled = drv.has_any_joint_enabled();
                     }
-                    ctx.enable_state_known = state != EnableState::Unknown
-                        || partial
-                        || (self.enable_lifecycle == EnableLifecycle::FailedHold && caps.enable_feedback);
+                    self.populate_enable_clear_context(&mut ctx, state, partial, caps.enable_feedback);
                     ctx.pending_estop = self.estop_request_unapplied();
                     if let Err(refusal) = self.safety.clear_check(&ctx) {
                         if refusal == ClearRefusal::EStopActive {
@@ -3498,9 +3648,7 @@ impl SupervisorInner {
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
-            ctx.enable_state_known = state != EnableState::Unknown
-                || partial
-                || (self.enable_lifecycle == EnableLifecycle::FailedHold && enable_fb);
+            self.populate_enable_clear_context(&mut ctx, state, partial, enable_fb);
 
             // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
             // reset, or concurrent E-stop / config mutation.
@@ -3544,9 +3692,7 @@ impl SupervisorInner {
                 partial = partial_after;
                 any_enabled = any_en_after;
                 ctx.tx_queue_drained = drained_after;
-                ctx.enable_state_known = state != EnableState::Unknown
-                    || partial
-                    || (self.enable_lifecycle == EnableLifecycle::FailedHold && enable_fb);
+                self.populate_enable_clear_context(&mut ctx, state, partial, enable_fb);
                 ctx.hardware_reset_required = hw_fault_after;
                 ctx.pending_estop = self.estop_request_unapplied();
                 match probe_res {

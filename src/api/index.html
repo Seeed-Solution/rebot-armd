@@ -7984,8 +7984,8 @@ function faultText() {
   const c = S.faultCode;
   if (!c || c === 'ESTOP' || I18N.zh['fc.' + c] === undefined) return null;
   let title = t('fc.' + c, { d: S.fault || t('unknown') });
-  // joint limit / over-temperature details name the joint
-  if ((c === 'JOINT_LIMIT' || c === 'THERMAL_TRIP') && S.fault && !/^[A-Z][A-Za-z]+$/.test(S.fault)) title += (LANG === 'zh' ? '（' + S.fault + '）' : ' (' + S.fault + ')');
+  // joint limit / over-temperature / failed-enable details name per-joint status
+  if ((c === 'JOINT_LIMIT' || c === 'THERMAL_TRIP' || c === 'ENABLE_FAILED') && S.fault && !/^[A-Z][A-Za-z]+$/.test(S.fault)) title += (LANG === 'zh' ? '（' + S.fault + '）' : ' (' + S.fault + ')');
   return { title, todo: t('fc.' + c + '.do') };
 }
 function lockReason() {

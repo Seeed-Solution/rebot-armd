@@ -1832,6 +1832,13 @@ impl SupervisorInner {
         let state = self.safety.state();
         if state.is_stopped() || self.safety.has_latched_fault() || out.fault.is_some() {
             out.fault = self.safety.fault();
+            if let Some(ref mut fi) = out.fault {
+                if fi.code == FaultCode::EnableFailed
+                    && self.enable_lifecycle == EnableLifecycle::FailedHold
+                {
+                    self.measured_hold.write_fault_message(&mut fi.message);
+                }
+            }
         }
         out.set_safety_state(state);
         out.epoch_id = self.safety.epoch_id();
@@ -4132,13 +4139,22 @@ impl SupervisorInner {
             self.execute_stop_in_tick(StopPolicy::BusLossFallback);
         }
 
-        // Check hardware motor faults / error flags from feedback
+        // Check hardware motor faults / error flags from feedback (0 heap allocs on RT).
         if self.is_torqued {
             if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
-                    if let Err(e) = driver.check_hardware_status() {
+                    if driver.has_hardware_fault() {
+                        let hw_err = if !self.safety.has_latched_fault_code(FaultCode::HardwareFault)
+                            || !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other)
+                        {
+                            driver.check_hardware_status().err()
+                        } else {
+                            None
+                        };
                         if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other) {
-                            tracing::error!("Hardware fault detected on driver: {}", e);
+                            if let Some(ref e) = hw_err {
+                                tracing::error!("Hardware fault detected on driver: {}", e);
+                            }
                         }
                         if self.measured_positions.iter().all(|p| p.is_finite())
                             && self.measured_positions.len() == self.config.dof
@@ -4161,7 +4177,11 @@ impl SupervisorInner {
                             self.safety.latch(
                                 crate::safety::FaultKind::Other,
                                 crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
-                                    let _ = core::fmt::write(buf, format_args!("{e}"));
+                                    if let Some(ref e) = hw_err {
+                                        e.write_bounded(buf);
+                                    } else {
+                                        buf.push_str("Hardware motor fault");
+                                    }
                                 }),
                             );
                         }

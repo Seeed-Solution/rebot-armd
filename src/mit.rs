@@ -627,6 +627,63 @@ impl crate::supervisor::SupervisorInner {
         Ok(ff)
     }
 
+    /// Per-joint masked MIT hold preparation for stopped / `FailedHold` states: validates each
+    /// joint in `hold_mask` independently so an excluded or stale joint never vetoes peer joints.
+    /// Returns `(filtered_mask, Option<ff>)` where failing MIT joints are cleared from `hold_mask`.
+    pub fn mit_prepare_masked(
+        &self,
+        hold_mask: u64,
+        targets: &mut [JointTarget],
+        dt: f64,
+    ) -> (u64, Option<Vec<f32>>) {
+        let mut eff_mask = hold_mask;
+        let ages = self.driver.as_ref().and_then(|d| d.lock().ok()).map(|drv| drv.feedback_ages());
+        let g_res = self.mit_gravity();
+        let dt = (dt as f32).clamp(0.001, 0.1);
+        let mut ff = self.mit.last_ff.clone();
+        ff.resize(self.config.dof, 0.0);
+        let mut any_mit_prepared = false;
+        for &j in &self.mit.joints {
+            if j >= 64 || (eff_mask & (1u64 << j)) == 0 {
+                continue;
+            }
+            let age_ok = match ages.as_ref() {
+                Some(a) => a.get(j).copied().flatten().is_some_and(|age| !past_deadline(age)),
+                None => true,
+            };
+            if !age_ok {
+                eff_mask &= !(1u64 << j);
+                continue;
+            }
+            let g_j = match (&g_res, self.mit_slot(j)) {
+                (Ok(g), _) => g.get(j).copied().unwrap_or(0.0),
+                (Err(_), Some(c)) if c.gravity_scale <= 0.0 => 0.0,
+                (Err(_), _) => {
+                    eff_mask &= !(1u64 << j);
+                    continue;
+                }
+            };
+            let Some(t) = targets.get_mut(j) else {
+                eff_mask &= !(1u64 << j);
+                continue;
+            };
+            let (q_d, v_d) = (t.position, t.velocity.unwrap_or(0.0));
+            let a_d = self.commanded_accelerations.get(j).copied().unwrap_or(0.0);
+            let last = self.mit.last_ff.get(j).copied().unwrap_or(0.0);
+            match self.mit_frame(j, q_d, v_d, a_d, true, g_j, Some((last, dt))) {
+                Ok((frame, tau)) => {
+                    *t = frame;
+                    ff[j] = tau;
+                    any_mit_prepared = true;
+                }
+                Err(_) => {
+                    eff_mask &= !(1u64 << j);
+                }
+            }
+        }
+        (eff_mask, any_mit_prepared.then_some(ff))
+    }
+
     /// One MIT frame for joint `j` on the decoded wire grid and its tau_ff (see
     /// [`Self::mit_prepare`]); `slew` = (last tau_ff, dt) limits the change, None (the handover's
     /// first frame) does not. Every bound is checked on the fields the motor decodes.

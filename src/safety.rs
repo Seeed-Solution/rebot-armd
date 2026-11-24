@@ -1179,6 +1179,10 @@ pub struct ClearContext {
     pub lease_heartbeat_fresh: bool,
     pub joint_limit_violation: Option<JointLimitClearViolation>,
     pub enable_state_known: bool,
+    /// Explicit recovery admission for `FailedHold` (`ENABLE_FAILED`) on drivers with enable
+    /// feedback when per-motor evidence remains `Unknown` after a failed/interrupted enable:
+    /// keeps `enable_state_known` truthful for all other checks while allowing operator recovery.
+    pub failed_hold_recovery_allowed: bool,
     /// True when the driver reports a latched motor fault bit that requires a motor reset
     /// before it can clear. `clear_check` permits this reset ONLY after every OTHER recorded
     /// kind's condition has passed, returning [`ClearRefusal::HardwareResetRequired`].
@@ -1216,6 +1220,7 @@ impl ClearContext {
             lease_heartbeat_fresh: true,
             joint_limit_violation: None,
             enable_state_known: true,
+            failed_hold_recovery_allowed: false,
             hardware_reset_required: false,
             hardware_reset_sent: false,
             hardware_error: None,
@@ -2038,7 +2043,10 @@ impl SafetyManager {
             self.has_non_recoverable = true;
         }
         let keep_prev_other_detail = kind == FaultKind::Other
-            && prev_detail.is_some_and(|d| !d.code.recoverable() && code.recoverable());
+            && prev_detail.is_some_and(|d| {
+                (!d.code.recoverable() && code.recoverable())
+                    || (d.code == FaultCode::EnableFailed && code == FaultCode::HardwareFault)
+            });
         if !keep_prev_other_detail {
             self.latched_fault_details[kind as usize] = Some(LatchedFaultDetail {
                 code,
@@ -2242,7 +2250,7 @@ impl SafetyManager {
             if ctx.hardware_reset_required {
                 return Err(ClearRefusal::HardwareResetRequired);
             }
-            if ctx.has_driver && !ctx.enable_state_known {
+            if ctx.has_driver && !ctx.enable_state_known && !ctx.failed_hold_recovery_allowed {
                 return Err(ClearRefusal::EnableStateUnknown);
             }
         }
