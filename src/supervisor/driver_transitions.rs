@@ -1920,6 +1920,7 @@ impl SupervisorInner {
             shutdown_committed: self.shutdown_committed,
             driver_config_error: driver_config_error_override
                 .or_else(|| self.driver_config_error.as_deref().map(BoundedText::new)),
+            config_reconcile_fault: self.config_reconcile_fault,
             gravity_comp_unconfirmed: self.gravity_comp_blocks_clear(),
             disable_pending: self.disable_pending,
             has_driver: self.driver.is_some(),

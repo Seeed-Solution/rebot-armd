@@ -1030,6 +1030,8 @@ pub struct SupervisorInner {
     pub driver_config_error: Option<String>,
     /// Previous `driver_config_error` string retired on the RT thread for off-thread deallocation.
     pub(crate) retired_driver_config_error: Option<String>,
+    /// Non-recoverable configuration persistence fault latched after bounded reconciliation fails.
+    pub(crate) config_reconcile_fault: Option<crate::safety::BoundedText<256>>,
     /// Required continuous duration below `max_temperature - THERMAL_CLEAR_MARGIN_C` before
     /// `ThermalTrip` may clear (default `Duration::ZERO`).
     pub thermal_cooldown_duration: Duration,
@@ -1786,6 +1788,7 @@ impl SupervisorInner {
             mock_gripper_object: None,
             driver_config_error: None,
             retired_driver_config_error: None,
+            config_reconcile_fault: None,
             thermal_cooldown_duration: Duration::ZERO,
             thermal_cooldown: ThermalCooldown::default(),
             zero_check_params: None,

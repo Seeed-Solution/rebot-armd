@@ -1479,6 +1479,10 @@ pub struct PersistTestHooks {
     pub on_panic_disable_timeout: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Runs on `armd-control` strictly before Step 6 `StateHub` publication.
     pub before_publish: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Overrides the bounded reconciliation retry interval for `armd-persist` dir-fsync recovery.
+    pub reconcile_retry_interval: Option<Duration>,
+    /// Overrides the maximum reconciliation retry attempts for `armd-persist` dir-fsync recovery.
+    pub reconcile_max_attempts: Option<u32>,
 }
 
 enum PersistCmd {
@@ -1545,6 +1549,18 @@ enum PersistCmd {
         operator_revoked: bool,
         code_buf: String,
         msg_buf: String,
+    },
+    FinishReconcile {
+        proposal: ConfigProposal,
+        auth: super::requests::config::ConfigAuthContext,
+        base_revision: u64,
+        offset_rad: f32,
+        new_policy: GripperPolicy,
+        new_jaw: Option<JawOpening>,
+        operator_revoked: bool,
+    },
+    LatchConfigReconcileFault {
+        message: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
     },
 }
 
@@ -3066,6 +3082,26 @@ impl ControlState {
                     _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 },
+                PersistCmd::FinishReconcile {
+                    new_policy,
+                    new_jaw,
+                    ..
+                } => PersistReply::Done {
+                    _returned_policy: Some(new_policy),
+                    _returned_jaw: new_jaw,
+                    _returned_code: None,
+                    _returned_msg: None,
+                    _returned_warning: None,
+                    _returned_probe: self.take_reply_probe(),
+                },
+                PersistCmd::LatchConfigReconcileFault { .. } => PersistReply::Done {
+                    _returned_policy: None,
+                    _returned_jaw: None,
+                    _returned_code: None,
+                    _returned_msg: None,
+                    _returned_warning: None,
+                    _returned_probe: self.take_reply_probe(),
+                },
             };
             self.push_persist_reply_or_offload(reply);
             woke = true;
@@ -3539,6 +3575,74 @@ impl ControlState {
                     }
                 }
             }
+            PersistCmd::FinishReconcile {
+                proposal,
+                auth,
+                base_revision,
+                offset_rad,
+                new_policy,
+                new_jaw,
+                operator_revoked,
+            } => {
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_finish_reconcile(
+                    core,
+                    ctx,
+                    &proposal,
+                    &auth,
+                    base_revision,
+                    offset_rad,
+                    new_policy,
+                    new_jaw,
+                    operator_revoked,
+                ) {
+                    Ok((old_policy, old_jaw)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Activated {
+                                _returned_policy: old_policy,
+                                _returned_jaw: old_jaw,
+                                _returned_code: None,
+                                _returned_msg: None,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                    Err((_code, ret_policy, ret_jaw)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Done {
+                                _returned_policy: ret_policy,
+                                _returned_jaw: ret_jaw,
+                                _returned_code: None,
+                                _returned_msg: None,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                }
+            }
+            PersistCmd::LatchConfigReconcileFault { message } => {
+                super::requests::config::install_latch_config_reconcile_fault(
+                    core,
+                    ConfigDomain::GripperCalibration,
+                    message,
+                );
+                let probe = self.take_reply_probe();
+                self.push_persist_reply_or_retain(
+                    PersistReply::Done {
+                        _returned_policy: None,
+                        _returned_jaw: None,
+                        _returned_code: None,
+                        _returned_msg: None,
+                        _returned_warning: None,
+                        _returned_probe: probe,
+                    },
+                    core,
+                );
+            }
         }
     }
 }
@@ -3669,6 +3773,8 @@ fn spawn_persist_worker(
             let mut backend = ExecutorPersistBackend {
                 cmd_tx: &mut cmd_tx,
                 rep_rx: &rep_rx,
+                config_write_mutex: &config_write_mutex,
+                cw_guard: Some(_cw),
                 published_config: &published_config,
                 persist_stop: &persist_stop,
                 control_exited: &control_exited,
@@ -3694,6 +3800,8 @@ fn spawn_persist_worker(
 struct ExecutorPersistBackend<'a> {
     cmd_tx: &'a mut Producer<PersistCmd>,
     rep_rx: &'a Arc<Mutex<Consumer<PersistReply>>>,
+    config_write_mutex: &'a Arc<tokio::sync::Mutex<()>>,
+    cw_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: &'a Arc<AtomicBool>,
     control_exited: &'a Arc<AtomicBool>,
@@ -3910,21 +4018,157 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
         }
     }
 
-    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
-        use super::requests::config::ZeroCheckCommitStop;
+    async fn reconcile_after_dir_sync_failure(
+        &mut self,
+        target_path: std::path::PathBuf,
+        warn: String,
+    ) -> Self::Err {
+        use super::requests::config::{
+            ZeroCheckCommitStop, DEFAULT_RECONCILE_MAX_ATTEMPTS, DEFAULT_RECONCILE_RETRY_INTERVAL,
+        };
         if let Some(reservation) = self.reservation.take() {
-            let unused_policy = self.new_policy.take();
-            let unused_jaw = self.new_jaw.take();
+            let keep_for_retry = !self.hooks.leave_final_reply_queued && !self.hooks.exit_after_first_job;
+            let (unused_policy, unused_jaw) = if keep_for_retry {
+                (None, None)
+            } else {
+                (self.new_policy.take(), self.new_jaw.take())
+            };
             let _ = self.push_cmd(PersistCmd::DirSyncFailed {
                 action_id: self.job.action_id,
                 reservation,
-                warning: warn,
+                warning: warn.clone(),
                 unused_policy,
                 unused_jaw,
                 msg_buf: String::with_capacity(160),
             });
             if !self.hooks.leave_final_reply_queued {
                 let _ = self.wait_reply();
+            }
+            if keep_for_retry {
+                if let (Some(proposal), Some(auth), Some(new_policy)) = (
+                    self.proposal,
+                    self.auth,
+                    self.new_policy.take(),
+                ) {
+                    let new_jaw = self.new_jaw.take();
+                    let interval = self
+                        .hooks
+                        .reconcile_retry_interval
+                        .unwrap_or(DEFAULT_RECONCILE_RETRY_INTERVAL);
+                    let max_attempts = self
+                        .hooks
+                        .reconcile_max_attempts
+                        .unwrap_or(DEFAULT_RECONCILE_MAX_ATTEMPTS)
+                        .max(1);
+                    let file_name = target_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| target_path.display().to_string());
+                    let mut last_warn = warn;
+                    let mut policy_opt = Some(new_policy);
+                    let mut jaw_opt = new_jaw;
+                    // Release `config_write_mutex` during reconciliation retry backoff so
+                    // concurrent config writes immediately observe `HoldState::Reconciling`
+                    // (`CONFIG_BUSY`) rather than stalling behind the sleep.
+                    drop(self.cw_guard.take());
+                    for attempt in 1..=max_attempts {
+                        let wake_at = Instant::now() + interval;
+                        while Instant::now() < wake_at {
+                            if self.persist_stop.load(Ordering::Acquire)
+                                || self.control_exited.load(Ordering::Acquire)
+                            {
+                                return ZeroCheckCommitStop::WorkerDisconnected;
+                            }
+                            let rem = wake_at.saturating_duration_since(Instant::now());
+                            thread::park_timeout(rem.min(Duration::from_millis(5)));
+                        }
+                        if self.persist_stop.load(Ordering::Acquire)
+                            || self.control_exited.load(Ordering::Acquire)
+                        {
+                            return ZeroCheckCommitStop::WorkerDisconnected;
+                        }
+                        let pds = crate::persist::PendingDirSync::for_path(&target_path);
+                        let outcome = match self.hooks.dir_sync_override.as_ref() {
+                            Some(f) => pds.sync_with(|dir| f(dir)),
+                            None => pds.sync_parent_dir(),
+                        };
+                        match outcome {
+                            crate::persist::PublishOutcome::Published => {}
+                            crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                                last_warn = w;
+                                tracing::warn!(
+                                    "Executor zero_check reconciliation retry {attempt}/{max_attempts} for {file_name} failed dir fsync: {last_warn}"
+                                );
+                                continue;
+                            }
+                        }
+                        let _cw_reconcile = loop {
+                            if self.persist_stop.load(Ordering::Acquire)
+                                || self.control_exited.load(Ordering::Acquire)
+                            {
+                                return ZeroCheckCommitStop::WorkerDisconnected;
+                            }
+                            match self.config_write_mutex.try_lock() {
+                                Ok(guard) => break guard,
+                                Err(_) => thread::park_timeout(Duration::from_millis(2)),
+                            }
+                        };
+                        let operator_revoked = !self.op_auth_ok();
+                        let Some(pol) = policy_opt.take() else {
+                            return ZeroCheckCommitStop::Aborted;
+                        };
+                        let pub_pol = pol.clone();
+                        let jaw = jaw_opt.take();
+                        let pub_jaw = jaw.clone();
+                        if !self.push_cmd(PersistCmd::FinishReconcile {
+                            proposal,
+                            auth,
+                            base_revision: self.job.base_revision,
+                            offset_rad: self.job.offset_rad,
+                            new_policy: pol,
+                            new_jaw: jaw,
+                            operator_revoked,
+                        }) {
+                            return ZeroCheckCommitStop::WorkerDisconnected;
+                        }
+                        match self.wait_reply() {
+                            Some(PersistReply::Activated { .. }) => {
+                                self.published_config.apply_zero_check_commit(
+                                    self.job.offset_rad,
+                                    pub_pol,
+                                    pub_jaw,
+                                    self.job.base_revision + 1,
+                                );
+                                tracing::info!(
+                                    "Executor zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
+                                );
+                                return ZeroCheckCommitStop::Aborted;
+                            }
+                            Some(_) => {
+                                let msg = format!(
+                                    "Configuration persistence failed for {file_name}: post-rename reconciliation rejected"
+                                );
+                                tracing::error!("{msg}");
+                                if self.push_cmd(PersistCmd::LatchConfigReconcileFault {
+                                    message: crate::safety::BoundedText::new(&msg),
+                                }) {
+                                    let _ = self.wait_reply();
+                                }
+                                return ZeroCheckCommitStop::Aborted;
+                            }
+                            None => return ZeroCheckCommitStop::WorkerDisconnected,
+                        }
+                    }
+                    let msg = format!(
+                        "Configuration persistence failed for {file_name} after {max_attempts} reconciliation attempts: {last_warn}"
+                    );
+                    tracing::error!("{msg}");
+                    if self.push_cmd(PersistCmd::LatchConfigReconcileFault {
+                        message: crate::safety::BoundedText::new(&msg),
+                    }) {
+                        let _ = self.wait_reply();
+                    }
+                }
             }
         }
         ZeroCheckCommitStop::Aborted

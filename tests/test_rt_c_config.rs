@@ -31,9 +31,9 @@ use armd::rt_core::config_iface::{ConfigDomain, HoldState};
 use armd::rt_core::executor::{ExecutorConfig, RtOwner};
 use armd::rt_core::requests::config::{
     build_config_proposal, capture_config_admission, gravity_comp_command,
-    prepare_eval_bufs_off_thread, run_config_commit, ConfigAuthContext, ConfigCandidate,
-    ConfigCommitPlan, ConfigCommitTestHooks, ConfigReply, ConfigRequest, ConfigWriteOp,
-    ReleaseConfig, ReservationGuard, ReserveConfig, ReservePrecheck,
+    prepare_eval_bufs_off_thread, run_config_commit, run_config_commit_detailed,
+    ConfigAuthContext, ConfigCandidate, ConfigCommitPlan, ConfigCommitTestHooks, ConfigReply,
+    ConfigRequest, ConfigWriteOp, ReleaseConfig, ReservationGuard, ReserveConfig, ReservePrecheck,
 };
 use armd::sequences::{Sequence, SequenceFile, Step};
 use armd::supervisor::ArmError;
@@ -3467,4 +3467,347 @@ async fn legacy_zero_and_staged_pose_write_are_mutually_exclusive_and_stale_mark
         );
     }
     rig.shutdown().await;
+}
+
+// ============================================================================
+// 16. Round 4 M1 — Bounded post-rename reconciliation retry + non-recoverable fault
+// ============================================================================
+
+async fn run_reconciling_bounded_retry_and_fault_test(owner: RtOwner) {
+    use std::sync::atomic::AtomicU32;
+
+    // 16a. Transient dir-fsync failure for 3 tries (initial + retries 1 & 2 fail; retry 3 succeeds)
+    //      -> inhibit is lifted automatically, renamed policy activates, no fault latched.
+    let rig = Rig::new(owner, |_| {}).await;
+    let _detached = if owner == RtOwner::Executor {
+        Some(rig.sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let attempts_hook = Arc::clone(&attempts);
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        dir_sync_override: Some(Arc::new(move |_| {
+            let n = attempts_hook.fetch_add(1, Ordering::AcqRel) + 1;
+            if n <= 3 {
+                Err(std::io::Error::other(format!("transient dir fsync EIO #{n}")))
+            } else {
+                Ok(())
+            }
+        })),
+        reconcile_retry_interval: Some(Duration::from_millis(20)),
+        reconcile_max_attempts: Some(6),
+        ..Default::default()
+    });
+
+    let pub0 = rig.sup.published_config().await.unwrap();
+    let (plan, pb, rb, eb) = keepout_plan(
+        &rig,
+        &pub0,
+        vec![make_box("transient_reconciled_box", 0.35)],
+        pub0.keepout.revision,
+        10,
+        rig.lease_gen,
+        true,
+    );
+    let err = run_config_commit_detailed(&rig.sup, plan, || Ok(()), move |cfg, act| {
+        if let Some(ws) = cfg.config.workspace.as_mut() {
+            ws.keepout_boxes = eb;
+        }
+        cfg.keepout.profile = Some(pb);
+        cfg.keepout.runtime_boxes = rb;
+        cfg.keepout.runtime = true;
+        cfg.keepout.revision = act.revision;
+        cfg.workspace_revision = act.workspace_revision;
+    })
+    .await
+    .expect_err("initial dir-fsync failure must return PERSIST_FAILED + Reconciling");
+
+    assert!(err.disk_published);
+    assert!(err.reconciling);
+    assert!(
+        matches!(&err.error, ArmError::Rejected { status: 500, code, .. } if code == "PERSIST_FAILED"),
+        "expected 500 PERSIST_FAILED, got {:?}",
+        err.error
+    );
+    // Immediately after initial failure: still Reconciling, motion inhibited, OLD policy active.
+    assert!(rig.is_config_inhibited().await, "motion must be inhibited while reconciling");
+    assert_eq!(
+        rig.hold_state(ConfigDomain::Keepout).await,
+        Some(HoldState::Reconciling)
+    );
+    let pub_during = rig.sup.published_config().await.unwrap();
+    assert_eq!(pub_during.keepout.revision, 1, "old policy must stay active before dir fsync succeeds");
+
+    // Wait for bounded retry #3 (4th total dir-fsync call) to succeed and lift the inhibit.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if !rig.is_config_inhibited().await && rig.hold_state(ConfigDomain::Keepout).await.is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for transient reconciliation to lift inhibit (attempts={})",
+            attempts.load(Ordering::Acquire)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        attempts.load(Ordering::Acquire) >= 4,
+        "expected >= 4 dir-fsync calls (3 failures + 1 success), got {}",
+        attempts.load(Ordering::Acquire)
+    );
+    let pub_after = rig.sup.published_config().await.unwrap();
+    assert_eq!(pub_after.keepout.revision, 2, "reconciled keepout revision must activate");
+    assert!(
+        pub_after
+            .keepout
+            .runtime_boxes
+            .iter()
+            .any(|b| b.name == "transient_reconciled_box"),
+        "reconciled keepout box must be published"
+    );
+    let obs_ok = if owner == RtOwner::Legacy {
+        rig.sup.get_observation().await
+    } else {
+        rig.sup.hub().latest().unwrap().obs.clone()
+    };
+    assert!(obs_ok.fault.is_none(), "transient recovery must not latch a fault: {:?}", obs_ok.fault);
+
+    // Subsequent config commit at the reconciled revision succeeds normally.
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    let (plan_next, pb2, rb2, eb2) = keepout_plan(
+        &rig,
+        &pub_after,
+        vec![make_box("post_reconcile_box", 0.45)],
+        pub_after.keepout.revision,
+        10,
+        rig.lease_gen,
+        true,
+    );
+    let next_out = run_config_commit(&rig.sup, plan_next, || Ok(()), move |cfg, act| {
+        if let Some(ws) = cfg.config.workspace.as_mut() {
+            ws.keepout_boxes = eb2;
+        }
+        cfg.keepout.profile = Some(pb2);
+        cfg.keepout.runtime_boxes = rb2;
+        cfg.keepout.runtime = true;
+        cfg.keepout.revision = act.revision;
+        cfg.workspace_revision = act.workspace_revision;
+    })
+    .await
+    .expect("commit after automatic reconciliation must succeed");
+    assert_eq!(next_out.activated.revision, 3);
+
+    rig.assert_executor_zero_alloc("transient dir-fsync reconciliation recovery");
+    drop(_detached);
+    rig.shutdown().await;
+
+    // 16b. Persistent dir-fsync failure past the bound -> latches clear non-recoverable fault
+    //      naming the file, keeps motion inhibited, refuses clear_fault, and STOP/E-stop keep working.
+    let rig_p = Rig::new(owner, |_| {}).await;
+    let _detached_p = if owner == RtOwner::Executor {
+        Some(rig_p.sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let persist_attempts = Arc::new(AtomicU32::new(0));
+    let persist_attempts_hook = Arc::clone(&persist_attempts);
+    rig_p.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        dir_sync_override: Some(Arc::new(move |_| {
+            persist_attempts_hook.fetch_add(1, Ordering::AcqRel);
+            Err(std::io::Error::other("persistent EIO on storage"))
+        })),
+        reconcile_retry_interval: Some(Duration::from_millis(15)),
+        reconcile_max_attempts: Some(3),
+        ..Default::default()
+    });
+
+    let pub_p = rig_p.sup.published_config().await.unwrap();
+    let (plan_p, ..) = keepout_plan(
+        &rig_p,
+        &pub_p,
+        vec![make_box("persistent_fail_box", 0.35)],
+        pub_p.keepout.revision,
+        10,
+        rig_p.lease_gen,
+        true,
+    );
+    let err_p = run_config_commit_detailed(&rig_p.sup, plan_p, || Ok(()), |_, _| {})
+        .await
+        .expect_err("persistent dir-fsync failure must return PERSIST_FAILED + Reconciling");
+    assert!(err_p.disk_published && err_p.reconciling);
+
+    // Wait for the bounded retry loop to exhaust (1 initial + 3 retries = 4 calls) and latch fault.
+    let fault_deadline = Instant::now() + Duration::from_secs(3);
+    let obs_fault = loop {
+        let obs = if owner == RtOwner::Legacy {
+            rig_p.sup.get_observation().await
+        } else {
+            rig_p.sup.hub().latest().unwrap().obs.clone()
+        };
+        if obs.fault.is_some() {
+            break obs;
+        }
+        assert!(
+            Instant::now() < fault_deadline,
+            "timed out waiting for non-recoverable config fault after bound exhaustion (attempts={})",
+            persist_attempts.load(Ordering::Acquire)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(
+        persist_attempts.load(Ordering::Acquire),
+        4,
+        "expected 1 initial + 3 bounded retries = 4 dir-fsync attempts"
+    );
+    let fault = obs_fault.fault.as_ref().expect("fault must be latched");
+    assert!(!fault.recoverable, "config persistence fault must be non-recoverable: {fault:?}");
+    assert!(
+        fault.message.contains("keepout.json"),
+        "fault message must name the file (keepout.json), got: {}",
+        fault.message
+    );
+    assert!(
+        fault.message.contains("persistent EIO"),
+        "fault message must report the underlying failure, got: {}",
+        fault.message
+    );
+    assert!(
+        rig_p.is_config_inhibited().await,
+        "motion must remain inhibited after fault latch"
+    );
+    assert_eq!(
+        rig_p.hold_state(ConfigDomain::Keepout).await,
+        Some(HoldState::Reconciling)
+    );
+
+    // clear_fault MUST fail closed while the config persistence fault is latched.
+    let clear_failed = if owner == RtOwner::Legacy {
+        rig_p.sup.clear_fault().await.is_err()
+    } else {
+        rig_p
+            .sup
+            .executor_handle()
+            .unwrap()
+            .clear_fault_async()
+            .await
+            .unwrap()
+            .is_err()
+    };
+    assert!(
+        clear_failed,
+        "clear_fault must refuse to clear a permanently failed config persistence fault"
+    );
+
+    // STOP and E-stop MUST still work while the config fault / reconciliation is active.
+    let epoch_before_estop = obs_fault.epoch_id;
+    if owner == RtOwner::Executor {
+        let h = rig_p.sup.executor_handle().unwrap();
+        let prev_stop = h.stop_requests().current();
+        let next_stop = h.stop_requests().request();
+        assert!(next_stop > prev_stop, "STOP must remain functional");
+    } else {
+        rig_p.sup.stop_motion().await;
+    }
+    let (_, estop_epoch) = rig_p.sup.trigger_e_stop().await;
+    assert!(
+        estop_epoch > epoch_before_estop,
+        "E-stop must still latch and bump epoch ({estop_epoch} > {epoch_before_estop})"
+    );
+
+    rig_p.assert_executor_zero_alloc("persistent dir-fsync exhaustion + fault latch + E-stop");
+    drop(_detached_p);
+    rig_p.shutdown().await;
+
+    // 16c. E-stop arriving DURING active reconciliation retries causes authority recheck on
+    //      FinishReconcile to reject activation and latch a non-recoverable fault naming the file.
+    let rig_e = Rig::new(owner, |_| {}).await;
+    let _detached_e = if owner == RtOwner::Executor {
+        Some(rig_e.sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let estop_sync_calls = Arc::new(AtomicU32::new(0));
+    let estop_sync_hook = Arc::clone(&estop_sync_calls);
+    let allow_sync = Arc::new(AtomicBool::new(false));
+    let allow_sync_hook = Arc::clone(&allow_sync);
+    rig_e.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        dir_sync_override: Some(Arc::new(move |_| {
+            estop_sync_hook.fetch_add(1, Ordering::AcqRel);
+            if allow_sync_hook.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("paused dir fsync awaiting estop"))
+            }
+        })),
+        reconcile_retry_interval: Some(Duration::from_millis(15)),
+        reconcile_max_attempts: Some(30),
+        ..Default::default()
+    });
+
+    let pub_e = rig_e.sup.published_config().await.unwrap();
+    let (plan_e, ..) = keepout_plan(
+        &rig_e,
+        &pub_e,
+        vec![make_box("estop_during_reconcile_box", 0.35)],
+        pub_e.keepout.revision,
+        10,
+        rig_e.lease_gen,
+        true,
+    );
+    let err_e = run_config_commit_detailed(&rig_e.sup, plan_e, || Ok(()), |_, _| {})
+        .await
+        .expect_err("initial dir-fsync failure enters Reconciling");
+    assert!(err_e.reconciling);
+
+    // Fire E-stop while Reconciling, THEN let dir-fsync succeed -> authority recheck MUST fail
+    // closed without activating the new keepout policy and latch the non-recoverable config fault.
+    let _ = rig_e.sup.trigger_e_stop().await;
+    allow_sync.store(true, Ordering::Release);
+
+    let estop_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let obs = if owner == RtOwner::Legacy {
+            rig_e.sup.get_observation().await
+        } else {
+            rig_e.sup.hub().latest().unwrap().obs.clone()
+        };
+        if obs
+            .fault
+            .as_ref()
+            .is_some_and(|f| !f.recoverable && f.message.contains("keepout.json"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < estop_deadline,
+            "timed out waiting for post-estop reconciliation fault (last fault: {:?})",
+            obs.fault
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(rig_e.is_config_inhibited().await);
+    assert_eq!(
+        rig_e.sup.published_config().await.unwrap().keepout.revision,
+        1,
+        "keepout must NOT activate after E-stop revoked authority during reconciliation"
+    );
+    rig_e.assert_executor_zero_alloc("E-stop during reconciliation rejects FinishReconcile");
+    drop(_detached_e);
+    rig_e.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciling_transient_dir_sync_recovers_and_persistent_failure_latches_fault_legacy() {
+    run_reconciling_bounded_retry_and_fault_test(RtOwner::Legacy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciling_transient_dir_sync_recovers_and_persistent_failure_latches_fault_executor() {
+    run_reconciling_bounded_retry_and_fault_test(RtOwner::Executor).await;
 }

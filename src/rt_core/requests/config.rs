@@ -42,7 +42,7 @@ use crate::model::{
     KeepoutBox, MotorZeroSupport, MotorZeroTool,
 };
 use crate::motion::MotionError;
-use crate::persist::{PendingWrite, PublishOutcome, StagedWrite};
+use crate::persist::{PendingDirSync, PendingWrite, PublishOutcome, StagedWrite};
 use crate::poses::{NamedPose, PoseList, PoseStore, PoseTcp};
 use crate::recording::store::EpisodeStore;
 use crate::rt_core::broker::{Authority, BootId, ClientId, RequestId, Stamp};
@@ -61,6 +61,11 @@ use crate::supervisor::{
 use crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
 
 static NEXT_CONFIG_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Default delay between bounded post-rename parent-directory fsync reconciliation retries.
+pub const DEFAULT_RECONCILE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Default maximum number of bounded post-rename reconciliation retry attempts before latching a fault.
+pub const DEFAULT_RECONCILE_MAX_ATTEMPTS: u32 = 30;
 
 // ============================================================================
 // Published configuration snapshot (off-RT readers + off-thread prepare)
@@ -882,7 +887,8 @@ pub struct ConfigAuthContext {
     pub lease_holder: Option<(HolderLabel, u64)>,
 }
 
-/// Single authority check for `ReserveConfig` and `ActivateConfig`.
+/// Single authority check for `ReserveConfig`, `VerifyAuthority`, `ActivateConfig`,
+/// and `FinishReconcile`.
 ///
 /// Reuses A1's `AdmissionStamp`, `ClosedConnections`, and `ConsumedStamps` alongside
 /// `ConfigProposal::check` (`arm`, `boot`, `deadline`, `stop_generation`, `epoch`,
@@ -893,6 +899,17 @@ pub(crate) fn check_config_authority(
     proposal: &ConfigProposal,
     auth: &ConfigAuthContext,
     enforce_unused_stamp: bool,
+) -> Result<(), ConfigError> {
+    check_config_authority_inner(core, ctx, proposal, auth, enforce_unused_stamp, true)
+}
+
+pub(crate) fn check_config_authority_inner(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    proposal: &ConfigProposal,
+    auth: &ConfigAuthContext,
+    enforce_unused_stamp: bool,
+    enforce_deadline: bool,
 ) -> Result<(), ConfigError> {
     if proposal.stamp.boot.is_zero() || ctx.boot.is_zero() {
         return Err(ConfigError::WrongTarget);
@@ -909,7 +926,12 @@ pub(crate) fn check_config_authority(
         return Err(ConfigError::Stopped);
     }
     let current = core.authority(ctx);
-    if let Some(code) = proposal.check(ctx.arm, ctx.boot, ctx.now, &current) {
+    let check_now = if enforce_deadline {
+        ctx.now
+    } else {
+        proposal.stamp.deadline
+    };
+    if let Some(code) = proposal.check(ctx.arm, ctx.boot, check_now, &current) {
         return Err(match code {
             "WRONG_TARGET" => ConfigError::WrongTarget,
             "DEADLINE_EXPIRED" => ConfigError::DeadlineExpired,
@@ -1033,6 +1055,19 @@ pub struct ReleaseConfig {
     pub reservation: Reservation,
 }
 
+/// Complete post-rename reconciliation once parent-directory fsync succeeds: rechecks live
+/// authority (allowing the bounded reconciliation retry window) and domain invariants, swaps
+/// `candidate` in-place, and calls `ConfigAuthority::finish_reconcile` to lift motion inhibit.
+pub struct FinishReconcileConfig {
+    pub domain: ConfigDomain,
+    pub expected_from: u64,
+    pub proposal: ConfigProposal,
+    pub auth: ConfigAuthContext,
+    pub candidate: ConfigCandidate,
+    pub expected_workspace_revision: Option<u64>,
+    pub expected_poses_revision: Option<u64>,
+}
+
 /// Owner-routed gravity compensation request (mock zero-alloc; hardware driver fails closed in Executor).
 pub enum GravityCompOp {
     Enter {
@@ -1124,6 +1159,11 @@ pub enum ConfigRequest {
     },
     Persisted(PersistedConfig),
     Activate(ActivateConfig),
+    FinishReconcile(FinishReconcileConfig),
+    LatchConfigReconcileFault {
+        domain: ConfigDomain,
+        message: BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+    },
     Release(ReleaseConfig),
     ForceReconcile(ConfigDomain),
     SampleTableCapture,
@@ -1140,6 +1180,7 @@ pub enum ConfigReply {
     AuthorityVerified(Result<(), ConfigError>),
     Persisted(Result<Reservation, ConfigError>),
     Activated(Result<ConfigActivated, ConfigError>),
+    ReconcileFaultLatched,
     Released(Released),
     ReconcilingForced,
     TableCaptureSampled(Result<([f32; 8], usize), ConfigError>),
@@ -1225,6 +1266,13 @@ pub(crate) fn handle_config_exchange(
         )),
         ConfigRequest::Persisted(p) => ConfigReply::Persisted(install_persisted_config(core, p)),
         ConfigRequest::Activate(a) => ConfigReply::Activated(install_activate_config(core, ctx, a, &mut ex.retired)),
+        ConfigRequest::FinishReconcile(f) => {
+            ConfigReply::Activated(install_finish_reconcile(core, ctx, f, &mut ex.retired))
+        }
+        ConfigRequest::LatchConfigReconcileFault { domain, message } => {
+            install_latch_config_reconcile_fault(core, domain, message);
+            ConfigReply::ReconcileFaultLatched
+        }
         ConfigRequest::Release(r) => {
             let domain = r.reservation.domain();
             let released = ConfigAuthority::release(core, r.reservation);
@@ -1676,7 +1724,42 @@ fn install_activate_config(
     }
 
     // Domain-specific post-rename invariant rechecks before swapping live state.
-    let domain_ok: Result<(), &'static str> = match &candidate {
+    if let Err(code) = check_candidate_domain_invariants(core, &candidate) {
+        return Err(fail_activation(core, reservation, code, candidate, retired));
+    }
+
+    // Infallible zero-alloc, zero-free in-place swap into SupervisorInner.
+    swap_config_candidate_in_place(core, candidate, retired);
+
+    if durability == Durability::Durable {
+        let _ = core.core.config_mut().confirm_durable(&reservation);
+    }
+
+    match ConfigAuthority::activate(core, reservation) {
+        Activated::Active { revision, durability } => Ok(ConfigActivated {
+            revision,
+            durability,
+            workspace_revision: core.workspace_revision,
+            poses_revision: core.poses.revision,
+            gripper_calib_revision: core.gripper_calib_revision,
+            epoch_id: core.safety.epoch_id(),
+            is_torqued: core.is_torqued,
+            safety_state: SafetyStateTag::from_state(core.safety.state()),
+            gravity_comp_active: core.gravity_comp_active(),
+        }),
+        Activated::Refused { code, reservation } => {
+            let _ = ConfigAuthority::release(core, reservation);
+            Err(ConfigError::Busy(code))
+        }
+        Activated::Reconciling { code } => Err(ConfigError::Reconciling(code)),
+    }
+}
+
+fn check_candidate_domain_invariants(
+    core: &SupervisorInner,
+    candidate: &ConfigCandidate,
+) -> Result<(), &'static str> {
+    match candidate {
         ConfigCandidate::Keepout { .. } => {
             if core.workspace_policy().is_none() {
                 Err("UNSUPPORTED")
@@ -1727,12 +1810,14 @@ fn install_activate_config(
             }
         }
         ConfigCandidate::Poses { .. } | ConfigCandidate::Sequences { .. } => Ok(()),
-    };
-    if let Err(code) = domain_ok {
-        return Err(fail_activation(core, reservation, code, candidate, retired));
     }
+}
 
-    // Infallible zero-alloc, zero-free in-place swap into SupervisorInner.
+fn swap_config_candidate_in_place(
+    core: &mut SupervisorInner,
+    candidate: ConfigCandidate,
+    retired: &mut ConfigRetiredPayloads,
+) {
     match candidate {
         ConfigCandidate::Keepout {
             profile_boxes,
@@ -1816,29 +1901,108 @@ fn install_activate_config(
             core.tool_commissioning_revision += 1;
         }
     }
+}
 
-    if durability == Durability::Durable {
-        let _ = core.core.config_mut().confirm_durable(&reservation);
+fn install_finish_reconcile(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    req: FinishReconcileConfig,
+    retired: &mut ConfigRetiredPayloads,
+) -> Result<ConfigActivated, ConfigError> {
+    let FinishReconcileConfig {
+        domain,
+        expected_from,
+        proposal,
+        auth,
+        candidate,
+        expected_workspace_revision,
+        expected_poses_revision,
+    } = req;
+    let is_reconciling = core
+        .core
+        .config_held(domain)
+        .is_some_and(|h| h.state == crate::rt_core::config_iface::HoldState::Reconciling);
+    if !is_reconciling {
+        retired.unused_candidate = Some(candidate);
+        return Err(ConfigError::NotHeld);
     }
-
-    match ConfigAuthority::activate(core, reservation) {
-        Activated::Active { revision, durability } => Ok(ConfigActivated {
-            revision,
-            durability,
-            workspace_revision: core.workspace_revision,
-            poses_revision: core.poses.revision,
-            gripper_calib_revision: core.gripper_calib_revision,
-            epoch_id: core.safety.epoch_id(),
-            is_torqued: core.is_torqued,
-            safety_state: SafetyStateTag::from_state(core.safety.state()),
-            gravity_comp_active: core.gravity_comp_active(),
-        }),
-        Activated::Refused { code, reservation } => {
-            let _ = ConfigAuthority::release(core, reservation);
-            Err(ConfigError::Busy(code))
+    if let Err(err) = check_config_authority_inner(core, ctx, &proposal, &auth, false, false) {
+        retired.unused_candidate = Some(candidate);
+        return Err(err);
+    }
+    let current_rev = ConfigAuthority::revision(core, domain);
+    if current_rev != expected_from {
+        retired.unused_candidate = Some(candidate);
+        return Err(ConfigError::RevisionMismatch {
+            expected: expected_from,
+            current: current_rev,
+        });
+    }
+    if let Some(exp_ws) = expected_workspace_revision {
+        if core.workspace_revision != exp_ws {
+            retired.unused_candidate = Some(candidate);
+            return Err(ConfigError::PlanStale(
+                "workspace changed before configuration reconciliation completed",
+            ));
         }
-        Activated::Reconciling { code } => Err(ConfigError::Reconciling(code)),
     }
+    if let Some(exp_poses) = expected_poses_revision {
+        if core.poses.revision != exp_poses {
+            retired.unused_candidate = Some(candidate);
+            return Err(ConfigError::PlanStale(
+                "poses changed before configuration reconciliation completed",
+            ));
+        }
+    }
+    if let Err(code) = check_candidate_domain_invariants(core, &candidate) {
+        retired.unused_candidate = Some(candidate);
+        return Err(match code {
+            "MOTION_BUSY" => ConfigError::MotionBusy {
+                subject: "configuration",
+                reason: "motion started before reconciliation completed",
+            },
+            "PLAN_STALE" => ConfigError::PlanStale("active configuration changed before reconciliation completed"),
+            other => ConfigError::Reconciling(other),
+        });
+    }
+
+    swap_config_candidate_in_place(core, candidate, retired);
+    let cleared = ConfigAuthority::finish_reconcile(core, domain);
+    debug_assert!(cleared);
+    Ok(ConfigActivated {
+        revision: ConfigAuthority::revision(core, domain),
+        durability: Durability::Durable,
+        workspace_revision: core.workspace_revision,
+        poses_revision: core.poses.revision,
+        gripper_calib_revision: core.gripper_calib_revision,
+        epoch_id: core.safety.epoch_id(),
+        is_torqued: core.is_torqued,
+        safety_state: SafetyStateTag::from_state(core.safety.state()),
+        gravity_comp_active: core.gravity_comp_active(),
+    })
+}
+
+/// Zero-allocation owner-side fault latch called when bounded post-rename reconciliation
+/// exhausts its retries or hits an unrecoverable authority/invariant divergence.
+/// Keeps `HoldState::Reconciling` active and latches a non-recoverable fault naming the file.
+pub(crate) fn install_latch_config_reconcile_fault(
+    core: &mut SupervisorInner,
+    domain: ConfigDomain,
+    message: BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+) {
+    let is_reconciling = core
+        .core
+        .config_held(domain)
+        .is_some_and(|h| h.state == crate::rt_core::config_iface::HoldState::Reconciling);
+    if !is_reconciling {
+        return;
+    }
+    core.config_reconcile_fault = Some(BoundedText::new(message.as_str()));
+    let detail = crate::safety::FaultDetail::formatted(crate::safety::FaultCode::Other, |buf| {
+        use std::fmt::Write;
+        let _ = buf.write_str(message.as_str());
+    });
+    core.safety.latch(crate::safety::FaultKind::Other, detail);
 }
 
 fn install_sample_table_capture(core: &SupervisorInner) -> Result<([f32; 8], usize), ConfigError> {
@@ -2064,6 +2228,12 @@ pub struct ConfigCommitTestHooks {
     pub fail_rename_once: Option<Arc<AtomicBool>>,
     pub fail_dir_sync_once: Option<Arc<AtomicBool>>,
     pub fail_persisted_once: Option<Arc<AtomicBool>>,
+    /// Optional parent-directory fsync override invoked on both initial commit and reconciliation retries.
+    pub dir_sync_override: Option<DirSyncOverride>,
+    /// Override delay between post-rename reconciliation retries (defaults to `DEFAULT_RECONCILE_RETRY_INTERVAL`).
+    pub reconcile_retry_interval: Option<std::time::Duration>,
+    /// Override maximum post-rename reconciliation retry attempts (defaults to `DEFAULT_RECONCILE_MAX_ATTEMPTS`).
+    pub reconcile_max_attempts: Option<u32>,
 }
 
 /// RAII config reservation guard for legacy zero and calibration transactions
@@ -2486,9 +2656,11 @@ pub(crate) trait CommonCommitWorker: Send {
     fn on_renamed(&mut self) {}
     /// Step 4b: Record `Persisted(DurableUnconfirmed)` on the live owner immediately after rename.
     fn mark_persisted(&mut self) -> impl std::future::Future<Output = Result<(), Self::Err>> + Send;
-    /// Step 5 error: Parent-directory fsync failed after rename -> enter `Reconciling`, NO Activate.
+    /// Step 5 error: Parent-directory fsync failed after rename -> enter `Reconciling`, NO Activate,
+    /// and kick off bounded off-RT reconciliation retry for `target_path`.
     fn reconcile_after_dir_sync_failure(
         &mut self,
+        target_path: PathBuf,
         warn: String,
     ) -> impl std::future::Future<Output = Self::Err> + Send;
     /// Optional post-dir-sync hook; returning `true` simulates worker disconnect (without Activate).
@@ -2620,6 +2792,7 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
                 return Err(w.reconcile_rename_join_error(e).await);
             }
         };
+        let target_path = dir_sync.target().to_path_buf();
 
         disk_published = true;
 
@@ -2628,7 +2801,7 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
 
         // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
         //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
-        //    motion inhibited until reconciliation succeeds.
+        //    motion inhibited until bounded reconciliation succeeds (or latches a fault).
         let dir_sync_res: Result<(), String> = if w.should_fail_dir_sync_once() {
             Err("simulated parent dir fsync failure".into())
         } else {
@@ -2650,9 +2823,10 @@ pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
 
         if let Err(warn) = dir_sync_res {
             tracing::error!(
-                "Parent directory fsync failed after rename ({warn}); keeping old policy active and entering Reconciling"
+                "Parent directory fsync failed after rename for {} ({warn}); keeping old policy active and entering Reconciling",
+                target_path.display()
             );
-            return Err(w.reconcile_after_dir_sync_failure(warn).await);
+            return Err(w.reconcile_after_dir_sync_failure(target_path, warn).await);
         }
 
         if w.after_rename_before_activate() {
@@ -2688,7 +2862,7 @@ struct ConfigCommitBackend<FAuth, FPub> {
     expected_workspace_revision: Option<u64>,
     expected_poses_revision: Option<u64>,
     replay_episode_refs: Vec<(usize, String)>,
-    auth_check: FAuth,
+    auth_check: Option<FAuth>,
     update_published: Option<FPub>,
     guard: Option<ReservationGuard>,
     grant: Option<GrantId>,
@@ -2698,8 +2872,8 @@ struct ConfigCommitBackend<FAuth, FPub> {
 
 impl<FAuth, FPub> CommonCommitWorker for ConfigCommitBackend<FAuth, FPub>
 where
-    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send,
-    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send,
+    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send + 'static,
+    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send + 'static,
 {
     type Ok = ConfigCommitOutcome;
     type Err = ConfigCommitError;
@@ -2725,8 +2899,12 @@ where
             .is_some_and(|f| f.swap(false, Ordering::AcqRel))
     }
 
+    fn dir_sync_override(&self) -> Option<DirSyncOverride> {
+        self.hooks.dir_sync_override.clone()
+    }
+
     async fn reserve(&mut self) -> Result<(), Self::Err> {
-        if let Err((_, err)) = (self.auth_check)() {
+        if let Err((_, err)) = (self.auth_check.as_ref().expect("auth_check present"))() {
             return Err(ConfigCommitError::pre_publish(err));
         }
         let precheck = self.precheck.take().expect("precheck taken once in reserve");
@@ -2790,7 +2968,7 @@ where
     }
 
     async fn verify_authority_before_rename(&mut self) -> Result<(), Self::Err> {
-        if let Err((_, err)) = (self.auth_check)() {
+        if let Err((_, err)) = (self.auth_check.as_ref().expect("auth_check present"))() {
             return Err(ConfigCommitError::pre_publish(err));
         }
         let grant = self.grant.expect("reservation granted before verify");
@@ -2893,11 +3071,14 @@ where
         Ok(())
     }
 
-    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
-        if let Some(pg) = self.episode_pin_guard.take() {
-            pg.keep_pinned_for_reconcile();
-        }
+    async fn reconcile_after_dir_sync_failure(
+        &mut self,
+        target_path: PathBuf,
+        warn: String,
+    ) -> Self::Err {
+        let mut expected_from = self.proposal.expected_revision;
         if let Some(r) = self.guard.as_mut().and_then(|g| g.take()) {
+            expected_from = r.from();
             let rel = self
                 .sup
                 .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
@@ -2911,6 +3092,40 @@ where
                     .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
                     .await;
             }
+        }
+        if let (Some(candidate), Some(auth_check), Some(update_published)) = (
+            self.candidate.take(),
+            self.auth_check.take(),
+            self.update_published.take(),
+        ) {
+            let interval = self
+                .hooks
+                .reconcile_retry_interval
+                .unwrap_or(DEFAULT_RECONCILE_RETRY_INTERVAL);
+            let max_attempts = self
+                .hooks
+                .reconcile_max_attempts
+                .unwrap_or(DEFAULT_RECONCILE_MAX_ATTEMPTS);
+            spawn_config_reconcile_retry(
+                Arc::clone(&self.sup),
+                self.domain,
+                target_path,
+                expected_from,
+                self.proposal,
+                self.auth,
+                candidate,
+                self.expected_workspace_revision,
+                self.expected_poses_revision,
+                auth_check,
+                update_published,
+                self.episode_pin_guard.take(),
+                self.hooks.dir_sync_override.clone(),
+                interval,
+                max_attempts,
+                warn.clone(),
+            );
+        } else if let Some(pg) = self.episode_pin_guard.take() {
+            pg.keep_pinned_for_reconcile();
         }
         ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
             status: 500,
@@ -2927,7 +3142,7 @@ where
     }
 
     async fn activate_and_publish(&mut self, disk_published: bool) -> Result<Self::Ok, Self::Err> {
-        let post_rename_revoked = match (self.auth_check)() {
+        let post_rename_revoked = match (self.auth_check.as_ref().expect("auth_check present"))() {
             Ok(()) => None,
             Err((code, err)) => {
                 if !disk_published {
@@ -3103,8 +3318,8 @@ async fn run_config_commit_worker<FAuth, FPub>(
     update_published: FPub,
 ) -> Result<ConfigCommitOutcome, ConfigCommitError>
 where
-    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send,
-    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send,
+    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send + 'static,
+    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send + 'static,
 {
     let hooks = sup.config_commit_test_hooks();
     let cw_lock = sup.config_write_lock();
@@ -3167,7 +3382,7 @@ where
         expected_workspace_revision,
         expected_poses_revision,
         replay_episode_refs,
-        auth_check,
+        auth_check: Some(auth_check),
         update_published: Some(update_published),
         guard: None,
         grant: None,
@@ -3175,6 +3390,198 @@ where
         episode_pin_guard: None,
     };
     execute_common_commit(&mut backend).await
+}
+
+fn target_file_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+async fn is_owner_stopped(sup: &ArmSupervisor) -> bool {
+    match sup.owner_mode() {
+        OWNER_EXECUTOR => sup.executor_handle().is_none_or(|h| h.is_exited()),
+        OWNER_LEGACY => sup.inner().read().await.detached,
+        _ => true,
+    }
+}
+
+/// Bounded off-RT post-rename reconciliation retry loop for every PR C config family.
+///
+/// Re-runs parent-directory fsync and live authority rechecks on a bounded backoff strictly off
+/// `armd-control`:
+/// - On success: swaps the candidate in-place, calls `ConfigAuthority::finish_reconcile`, updates
+///   `PublishedConfigHub`, and lifts the motion inhibit.
+/// - On exhaustion or non-recoverable post-rename authority/invariant divergence: latches a clear
+///   non-recoverable config fault naming the file so the user sees why motion stays inhibited.
+#[allow(clippy::too_many_arguments)]
+fn spawn_config_reconcile_retry<FAuth, FPub>(
+    sup: Arc<ArmSupervisor>,
+    domain: ConfigDomain,
+    target_path: PathBuf,
+    expected_from: u64,
+    proposal: ConfigProposal,
+    auth: ConfigAuthContext,
+    candidate: ConfigCandidate,
+    expected_workspace_revision: Option<u64>,
+    expected_poses_revision: Option<u64>,
+    auth_check: FAuth,
+    update_published: FPub,
+    mut episode_pin_guard: Option<crate::recording::store::EpisodePinGuard>,
+    dir_sync_override: Option<DirSyncOverride>,
+    interval: std::time::Duration,
+    max_attempts: u32,
+    initial_warn: String,
+) where
+    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send + 'static,
+    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send + 'static,
+{
+    tokio::spawn(async move {
+        let file_name = target_file_label(&target_path);
+        let mut last_warn = initial_warn;
+        let mut candidate_opt = Some(candidate);
+        let mut update_pub_opt = Some(update_published);
+        let total_attempts = max_attempts.max(1);
+
+        let latch_fault = |sup: Arc<ArmSupervisor>,
+                           domain: ConfigDomain,
+                           msg: String,
+                           ep_guard: Option<crate::recording::store::EpisodePinGuard>| async move {
+            tracing::error!("{msg}");
+            if let Some(pg) = ep_guard {
+                pg.keep_pinned_for_reconcile();
+            }
+            let bounded = BoundedText::<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>::new(&msg);
+            let _ = sup
+                .dispatch_config_request_reliable(|| ConfigRequest::LatchConfigReconcileFault {
+                    domain,
+                    message: bounded,
+                })
+                .await;
+        };
+
+        for attempt in 1..=total_attempts {
+            tokio::time::sleep(interval).await;
+            if is_owner_stopped(&sup).await {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+                return;
+            }
+            match sup
+                .dispatch_config_request_reliable(|| ConfigRequest::InspectHold(domain))
+                .await
+            {
+                Ok(ConfigReply::HoldInspected {
+                    state: Some(crate::rt_core::config_iface::HoldState::Reconciling),
+                    ..
+                }) => {}
+                Ok(_) => {
+                    // Already reconciled externally.
+                    drop(episode_pin_guard.take());
+                    return;
+                }
+                Err(_) => {
+                    if let Some(pg) = episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
+                    return;
+                }
+            }
+
+            let pds = PendingDirSync::for_path(&target_path);
+            let ov = dir_sync_override.clone();
+            let sync_res = tokio::task::spawn_blocking(move || {
+                let outcome = match ov {
+                    Some(f) => pds.sync_with(|dir| f(dir)),
+                    None => pds.sync_parent_dir(),
+                };
+                match outcome {
+                    PublishOutcome::Published => Ok(()),
+                    PublishOutcome::PublishedDurabilityUnconfirmed(w) => Err(w),
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+
+            if let Err(w) = sync_res {
+                last_warn = w;
+                tracing::warn!(
+                    "Config reconciliation retry {attempt}/{total_attempts} for {file_name} failed parent dir fsync: {last_warn}"
+                );
+                continue;
+            }
+
+            // Directory fsync succeeded; serialize with config writes and recheck authority + finish_reconcile.
+            let cw_lock = sup.config_write_lock();
+            let _cw = cw_lock.lock().await;
+            if let Err((code, _)) = (auth_check)() {
+                let msg = format!(
+                    "Configuration persistence failed for {file_name}: post-rename authority revoked ({code})"
+                );
+                latch_fault(sup, domain, msg, episode_pin_guard.take()).await;
+                return;
+            }
+            let Some(cand) = candidate_opt.take() else {
+                return;
+            };
+            match sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::FinishReconcile(
+                    FinishReconcileConfig {
+                        domain,
+                        expected_from,
+                        proposal,
+                        auth,
+                        candidate: cand,
+                        expected_workspace_revision,
+                        expected_poses_revision,
+                    },
+                ))
+                .await
+            {
+                Ok(ConfigReply::Activated(Ok(activated))) => {
+                    if domain == ConfigDomain::Sequences {
+                        sup.set_sequences_revision(activated.revision);
+                    }
+                    if let Some(update_pub) = update_pub_opt.take() {
+                        sup.published_config_hub().update(|cfg| {
+                            cfg.workspace_revision = activated.workspace_revision;
+                            update_pub(cfg, activated);
+                        });
+                    }
+                    drop(episode_pin_guard.take());
+                    tracing::info!(
+                        "Config reconciliation succeeded for {file_name} on retry {attempt}/{total_attempts}; motion inhibit lifted"
+                    );
+                    return;
+                }
+                Ok(ConfigReply::Activated(Err(ConfigError::NotHeld))) => {
+                    drop(episode_pin_guard.take());
+                    return;
+                }
+                Ok(ConfigReply::Activated(Err(err))) => {
+                    let msg = format!(
+                        "Configuration persistence failed for {file_name}: post-rename reconciliation rejected ({})",
+                        err.to_arm_error()
+                    );
+                    latch_fault(sup, domain, msg, episode_pin_guard.take()).await;
+                    return;
+                }
+                Err(_) | Ok(_) => {
+                    if let Some(pg) = episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
+                    return;
+                }
+            }
+        }
+
+        let msg = format!(
+            "Configuration persistence failed for {file_name} after {total_attempts} reconciliation attempts: {last_warn}"
+        );
+        latch_fault(sup, domain, msg, episode_pin_guard.take()).await;
+    });
 }
 
 // ============================================================================
@@ -3560,6 +3967,57 @@ pub(crate) fn zero_check_owner_activate(
     }
 }
 
+/// Owner-side zero-allocation post-rename reconciliation for `gripper_zero_check(store_offset=true)`
+/// once parent-directory fsync succeeds on a bounded retry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zero_check_owner_finish_reconcile(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    proposal: &ConfigProposal,
+    auth: &ConfigAuthContext,
+    base_revision: u64,
+    offset_rad: f32,
+    new_policy: GripperPolicy,
+    new_jaw: Option<JawOpening>,
+    operator_revoked: bool,
+) -> Result<(Option<GripperPolicy>, Option<JawOpening>), (&'static str, Option<GripperPolicy>, Option<JawOpening>)> {
+    let is_reconciling = core
+        .core
+        .config_held(ConfigDomain::GripperCalibration)
+        .is_some_and(|h| h.state == crate::rt_core::config_iface::HoldState::Reconciling);
+    if !is_reconciling {
+        return Err(("NOT_HELD", Some(new_policy), new_jaw));
+    }
+    if operator_revoked {
+        return Err(("OPERATOR_REQUIRED", Some(new_policy), new_jaw));
+    }
+    if core.safety.state().is_stopped() {
+        return Err(("STOPPED", Some(new_policy), new_jaw));
+    }
+    if let Err(err) = check_config_authority_inner(core, ctx, proposal, auth, false, false) {
+        let code = match err {
+            ConfigError::LeaseLost | ConfigError::ConnectionClosed => "LEASE_LOST",
+            ConfigError::EpochMismatch { .. } => "EPOCH_MISMATCH",
+            ConfigError::Stopped => "STOPPED",
+            _ => "AUTHORITY_REVOKED",
+        };
+        return Err((code, Some(new_policy), new_jaw));
+    }
+    if core.gripper_calib_revision != base_revision {
+        return Err(("POLICY_REVISION_MISMATCH", Some(new_policy), new_jaw));
+    }
+    if core.driver_config_error.is_some()
+        || ((core.driver.is_some() || core.driver_config_error.is_some())
+            && core.validate_gripper_policy_against_driver_bounded(&new_policy).is_err())
+    {
+        return Err(("INVALID_CALIBRATION", Some(new_policy), new_jaw));
+    }
+    let (old_policy, old_jaw) = core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
+    let cleared = ConfigAuthority::finish_reconcile(core, ConfigDomain::GripperCalibration);
+    debug_assert!(cleared);
+    Ok((old_policy, old_jaw))
+}
+
 /// Control outcome returned by [`CommonCommitWorker`] adapters for `gripper_zero_check(store_offset=true)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ZeroCheckCommitStop {
@@ -3577,6 +4035,7 @@ fn zero_check_op_auth_ok(ctx: &crate::supervisor::ZeroCheckPersistContext) -> bo
 
 struct LegacyZeroCheckBackend {
     sup_inner: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>,
+    cw_lock: Arc<tokio::sync::Mutex<()>>,
     published_config: Arc<PublishedConfigHub>,
     hooks: ConfigCommitTestHooks,
     job: crate::supervisor::PendingZeroCheckPersist,
@@ -3609,6 +4068,10 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
             .fail_dir_sync_once
             .as_ref()
             .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+    }
+
+    fn dir_sync_override(&self) -> Option<DirSyncOverride> {
+        self.hooks.dir_sync_override.clone()
     }
 
     async fn reserve(&mut self) -> Result<(), Self::Err> {
@@ -3734,16 +4197,159 @@ impl CommonCommitWorker for LegacyZeroCheckBackend {
         }
     }
 
-    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
+    async fn reconcile_after_dir_sync_failure(
+        &mut self,
+        target_path: PathBuf,
+        warn: String,
+    ) -> Self::Err {
         if let Some(r) = self.reservation.take() {
             let mut inner = self.sup_inner.write().await;
             let _ = zero_check_owner_reconcile_dir_sync_failed(
                 &mut inner,
                 self.job.action_id,
                 r,
-                warn,
+                warn.clone(),
                 Some(String::with_capacity(160)),
             );
+        }
+        if let (Some(proposal), Some(auth), Some(policy)) = (
+            self.proposal,
+            self.auth,
+            self.candidate_policy.take(),
+        ) {
+            let sup_inner = Arc::clone(&self.sup_inner);
+            let cw_lock = Arc::clone(&self.cw_lock);
+            let published_config = Arc::clone(&self.published_config);
+            let dir_sync_override = self.hooks.dir_sync_override.clone();
+            let interval = self
+                .hooks
+                .reconcile_retry_interval
+                .unwrap_or(DEFAULT_RECONCILE_RETRY_INTERVAL);
+            let max_attempts = self
+                .hooks
+                .reconcile_max_attempts
+                .unwrap_or(DEFAULT_RECONCILE_MAX_ATTEMPTS)
+                .max(1);
+            let base_revision = self.job.base_revision;
+            let offset_rad = self.job.offset_rad;
+            let ctx_clone = self.job.ctx.clone();
+            tokio::spawn(async move {
+                let file_name = target_file_label(&target_path);
+                let mut last_warn = warn;
+                let mut policy_opt = Some(policy);
+                let mut jaw_opt = ctx_clone.jaw_opening.clone();
+                for attempt in 1..=max_attempts {
+                    tokio::time::sleep(interval).await;
+                    {
+                        let inner = sup_inner.read().await;
+                        if inner.detached {
+                            return;
+                        }
+                        let still_reconciling = inner
+                            .core
+                            .config_held(ConfigDomain::GripperCalibration)
+                            .is_some_and(|h| h.state == crate::rt_core::config_iface::HoldState::Reconciling);
+                        if !still_reconciling {
+                            return;
+                        }
+                    }
+                    let pds = PendingDirSync::for_path(&target_path);
+                    let ov = dir_sync_override.clone();
+                    let sync_res = tokio::task::spawn_blocking(move || {
+                        let outcome = match ov {
+                            Some(f) => pds.sync_with(|dir| f(dir)),
+                            None => pds.sync_parent_dir(),
+                        };
+                        match outcome {
+                            PublishOutcome::Published => Ok(()),
+                            PublishOutcome::PublishedDurabilityUnconfirmed(w) => Err(w),
+                        }
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r);
+                    if let Err(w) = sync_res {
+                        last_warn = w;
+                        tracing::warn!(
+                            "Legacy zero_check reconciliation retry {attempt}/{max_attempts} for {file_name} failed dir fsync: {last_warn}"
+                        );
+                        continue;
+                    }
+                    let _cw = cw_lock.lock().await;
+                    let operator_revoked = !zero_check_op_auth_ok(&ctx_clone);
+                    let Some(pol) = policy_opt.take() else {
+                        return;
+                    };
+                    let pub_pol = pol.clone();
+                    let jaw = jaw_opt.take();
+                    let pub_jaw = jaw.clone();
+                    let finish_res = {
+                        let mut inner = sup_inner.write().await;
+                        if inner.detached {
+                            return;
+                        }
+                        let commit_ctx = CommitCtx {
+                            arm: inner.core.id(),
+                            boot: BootId::process(),
+                            now: Instant::now(),
+                            stop_generation: inner.current_stop_gen(),
+                        };
+                        zero_check_owner_finish_reconcile(
+                            &mut inner,
+                            &commit_ctx,
+                            &proposal,
+                            &auth,
+                            base_revision,
+                            offset_rad,
+                            pol,
+                            jaw,
+                            operator_revoked,
+                        )
+                    };
+                    match finish_res {
+                        Ok(_) => {
+                            published_config.apply_zero_check_commit(
+                                offset_rad,
+                                pub_pol,
+                                pub_jaw,
+                                base_revision + 1,
+                            );
+                            tracing::info!(
+                                "Legacy zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
+                            );
+                            return;
+                        }
+                        Err(("NOT_HELD", _, _)) => return,
+                        Err((code, _, _)) => {
+                            let msg = format!(
+                                "Configuration persistence failed for {file_name}: post-rename reconciliation rejected ({code})"
+                            );
+                            tracing::error!("{msg}");
+                            let mut inner = sup_inner.write().await;
+                            if !inner.detached {
+                                install_latch_config_reconcile_fault(
+                                    &mut inner,
+                                    ConfigDomain::GripperCalibration,
+                                    BoundedText::new(&msg),
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+                let msg = format!(
+                    "Configuration persistence failed for {file_name} after {max_attempts} reconciliation attempts: {last_warn}"
+                );
+                tracing::error!("{msg}");
+                let mut inner = sup_inner.write().await;
+                if !inner.detached {
+                    install_latch_config_reconcile_fault(
+                        &mut inner,
+                        ConfigDomain::GripperCalibration,
+                        BoundedText::new(&msg),
+                    );
+                }
+            });
         }
         ZeroCheckCommitStop::Aborted
     }
@@ -3894,6 +4500,7 @@ pub(crate) async fn run_legacy_zero_check_commit(
     };
     let mut backend = LegacyZeroCheckBackend {
         sup_inner,
+        cw_lock: Arc::clone(&cw_lock),
         published_config,
         hooks,
         job,
@@ -4027,16 +4634,29 @@ impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
         }
     }
 
-    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
+    async fn reconcile_after_dir_sync_failure(
+        &mut self,
+        target_path: PathBuf,
+        warn: String,
+    ) -> Self::Err {
         if let Some(r) = self.reservation.take() {
             let _ = zero_check_owner_reconcile_dir_sync_failed(
                 self.core,
                 self.action_id,
                 r,
-                warn,
+                warn.clone(),
                 Some(String::with_capacity(160)),
             );
         }
+        let file_name = target_file_label(&target_path);
+        let msg = format!(
+            "Configuration persistence failed for {file_name}: parent directory fsync failed ({warn})"
+        );
+        install_latch_config_reconcile_fault(
+            self.core,
+            ConfigDomain::GripperCalibration,
+            BoundedText::new(&msg),
+        );
         ZeroCheckCommitStop::Aborted
     }
 
