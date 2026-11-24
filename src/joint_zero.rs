@@ -124,9 +124,6 @@ impl ZeroOffsetDriver {
 impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
-    fn motor_torque_evidence_into(&self, out: &mut [crate::driver::MotorTorqueEvidence]) -> usize {
-        self.inner.motor_torque_evidence_into(out)
-    }
     fn has_driver_fresh_position_api(&self) -> bool {
         self.inner.has_driver_fresh_position_api()
     }

@@ -6,13 +6,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-use crate::driver::handshake::Deadline;
-
-/// Supervisor-side disable confirmation after the driver's own window: fresh valid feedback
-/// and `EnableState::Disabled`, within this time.
-pub const DISABLE_CONFIRM_WINDOW: Duration = Duration::from_millis(25);
-/// Interval between services of [`DisableConfirm`] in the blocking `request_disable`.
-pub const DISABLE_CONFIRM_SERVICE: Duration = Duration::from_millis(2);
+/// Interval between service polls in bounded panic-disable teardown.
+pub const PANIC_DISABLE_SERVICE: Duration = Duration::from_millis(2);
 /// Upper wall-clock bound for last-chance hardware disable attempts on panic or forced teardown.
 pub const PANIC_DISABLE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -252,24 +247,18 @@ pub(crate) fn bounded_panic_disable_driver_until(
             if first_step {
                 return PanicDisableOutcome::TimedOut;
             }
-            if enable_fb && DisableConfirm::confirmed(drv) {
-                return PanicDisableOutcome::Confirmed;
-            }
             break;
         }
         let rem = coop_deadline.saturating_duration_since(now);
         let drv_rem = drv_coop_deadline.saturating_duration_since(drv_now);
         if !first_step && (rem.is_zero() || drv_rem.is_zero()) {
-            if enable_fb && DisableConfirm::confirmed(drv) {
-                return PanicDisableOutcome::Confirmed;
-            }
             break;
         }
         let hard_rem = hard_deadline.saturating_duration_since(now);
         let step_budget = if rem.is_zero() {
-            hard_rem.min(DISABLE_CONFIRM_SERVICE)
+            hard_rem.min(PANIC_DISABLE_SERVICE)
         } else {
-            rem.min(hard_rem).min(drv_rem.max(DISABLE_CONFIRM_SERVICE))
+            rem.min(hard_rem).min(drv_rem.max(PANIC_DISABLE_SERVICE))
         };
         let drv_deadline = drv_now + step_budget;
         let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -287,7 +276,7 @@ pub(crate) fn bounded_panic_disable_driver_until(
                 if !enable_fb {
                     return PanicDisableOutcome::Unconfirmed;
                 }
-                if unconfirmed.is_empty() && DisableConfirm::confirmed(drv) {
+                if unconfirmed.is_empty() {
                     return PanicDisableOutcome::Confirmed;
                 }
             }
@@ -302,7 +291,7 @@ pub(crate) fn bounded_panic_disable_driver_until(
         if rem.is_zero() || drv_rem.is_zero() {
             break;
         }
-        drv.clock_pause(rem.min(drv_rem).min(DISABLE_CONFIRM_SERVICE));
+        drv.clock_pause(rem.min(drv_rem).min(PANIC_DISABLE_SERVICE));
     }
 
     if !use_generic {
@@ -316,9 +305,8 @@ pub(crate) fn bounded_panic_disable_driver_until(
         return PanicDisableOutcome::Unconfirmed;
     }
 
-    // Generic retry loop for drivers that do not implement `panic_disable_step`: retry disable
-    // sends and feedback confirmation until confirmed or `coop_deadline` is spent.
-    let mut states_buf = Vec::new();
+    // Generic retry loop for drivers that do not implement `panic_disable_step`: transmit
+    // bounded protective disable frames until the driver finishes or `coop_deadline` is spent.
     let mut any_send_ok = false;
     let mut last_err: Option<String> = None;
     let mut attempt = 0u32;
@@ -392,8 +380,15 @@ pub(crate) fn bounded_panic_disable_driver_until(
                         if rem.is_zero() {
                             break;
                         }
-                        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+                        std::thread::sleep(rem.min(PANIC_DISABLE_SERVICE));
                     }
+                }
+                if matches!(progress, crate::driver::TorqueProgress::Done(_)) {
+                    return if enable_fb {
+                        PanicDisableOutcome::Confirmed
+                    } else {
+                        PanicDisableOutcome::Unconfirmed
+                    };
                 }
             }
         }
@@ -401,37 +396,13 @@ pub(crate) fn bounded_panic_disable_driver_until(
         if !enable_fb && any_send_ok {
             return PanicDisableOutcome::Unconfirmed;
         }
-        if enable_fb && DisableConfirm::confirmed(drv) {
-            return PanicDisableOutcome::Confirmed;
-        }
-        let drv_now = drv.clock_now();
-        let now = Instant::now();
-        let rem = coop_deadline
-            .saturating_duration_since(now)
-            .min(hard_deadline.saturating_duration_since(now));
-        if rem.is_zero() {
-            break;
-        }
-        let drv_deadline = drv_now + rem;
-        let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drv.read_joint_states_budgeted(&mut states_buf, drv_deadline, 64)
-        }));
-        if read_res.is_err() {
-            return PanicDisableOutcome::Failed("driver panicked while confirming disable".into());
-        }
-        if enable_fb && DisableConfirm::confirmed(drv) {
-            return PanicDisableOutcome::Confirmed;
-        }
         let rem = coop_deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
             break;
         }
-        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+        std::thread::sleep(rem.min(PANIC_DISABLE_SERVICE));
     }
 
-    if enable_fb && DisableConfirm::confirmed(drv) {
-        return PanicDisableOutcome::Confirmed;
-    }
     let unconfirmed = drv.unconfirmed_disable_joints();
     tracing::error!(
         "Bounded panic disable budget ({} ms) exhausted; unconfirmed motors: [{}]{}",
@@ -446,15 +417,6 @@ pub(crate) fn bounded_panic_disable_driver_until(
     }
 }
 
-/// Result of one budgeted [`DisableConfirm::serve_budgeted`] call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DisableServe {
-    pub outcome: Option<bool>,
-    pub did_rx: bool,
-    pub rx_frames: u16,
-    pub budget_exhausted: bool,
-}
-
 /// Outcome of one [`SupervisorInner::service_torque_transition`] call, with the exact
 /// RX work performed by this call (None when no bus receive pass ran).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,69 +425,28 @@ pub(crate) struct TransitionPoll {
     pub rx: Option<(u16, bool)>,
 }
 
-/// The supervisor's disable confirmation as an absolute-deadline wait (no sleep inside): served
-/// once per call, it reads feedback once and reports `Some(confirmed)` when finished.
-#[derive(Clone, Copy, Debug)]
-pub struct DisableConfirm { deadline: Deadline }
-
-impl DisableConfirm {
-    pub fn start(now: Instant) -> Self { Self { deadline: Deadline::after(now, DISABLE_CONFIRM_WINDOW) } }
-
-    /// End of the confirmation window (driver clock).
-    pub fn deadline(&self) -> Instant { self.deadline.at }
-
-    /// Fresh valid feedback reports every motor disabled.
-    pub fn confirmed(drv: &dyn ArmDriver) -> bool { drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled }
-
-    /// One service: past the deadline -> `Some(false)` without a read (unless already confirmed);
-    /// else one receive pass, `Some(true)` once confirmed, `None` to serve again.
-    pub fn serve(&mut self, drv: &mut dyn ArmDriver) -> Option<bool> {
-        if self.deadline.passed(drv.clock_now()) { return Some(Self::confirmed(drv)); }
-        let _ = drv.read_joint_states();
-        Self::confirmed(drv).then_some(true)
-    }
-
-    /// Budgeted service for the RT executor: skips bus RX once the deadline has passed,
-    /// otherwise performs a single budgeted receive pass into `buf`.
-    pub fn serve_budgeted(
-        &mut self,
-        drv: &mut dyn ArmDriver,
-        deadline: Instant,
-        max_rx_frames: u16,
-        buf: &mut Vec<crate::model::JointState>,
-    ) -> DisableServe {
-        if self.deadline.passed(drv.clock_now()) {
-            return DisableServe {
-                outcome: Some(Self::confirmed(drv)),
-                did_rx: false,
-                rx_frames: 0,
-                budget_exhausted: false,
-            };
-        }
-        let (rx_frames, budget_exhausted) = drv
-            .read_joint_states_budgeted(buf, deadline, max_rx_frames)
-            .unwrap_or_default();
-        DisableServe {
-            outcome: Self::confirmed(drv).then_some(true),
-            did_rx: true,
-            rx_frames,
-            budget_exhausted,
-        }
-    }
+/// Owner-owned torque decision state (never inferred from motor feedback).
+///
+/// Holds are the default while stopped whenever `torque_intent == On`. Transitions to `Off`
+/// ONLY by an accepted explicit disable (passing the rest-pose gate when stopped) or
+/// `DisableProtective` (thermal / process exit / panic). A later enable sets `On`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorqueIntent {
+    Off,
+    On,
 }
 
 /// Persistent enable-lifecycle state owned by the single enable transition reducer.
-/// Stopped-hold eligibility is derived from this state together with per-motor torque evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnableLifecycle {
-    /// Torque is confirmed off (or never enabled).
+    /// Torque is off by accepted disable (or driverless startup).
     Disarmed,
     /// Enable transition reducer is active (`Enable` / `Validate`).
     Enabling,
     /// Enable and post-enable validation succeeded; arm is armed.
     Armed,
-    /// Enable failed at any stage: queued enable work cancelled, `ENABLE_FAILED` latched,
-    /// and measured-position holds are serviced for `OnConfirmed | Unknown` motors.
+    /// Enable failed or was interrupted at any stage: queued enable work cancelled,
+    /// `ENABLE_FAILED` latched, and measured-position holds are serviced for EVERY joint.
     FailedHold,
 }
 
@@ -538,15 +459,14 @@ pub const UNVERIFIED_MODE_READBACK_TIMEOUT: Duration = Duration::from_millis(200
 pub struct MeasuredHoldTracker {
     /// Fixed captured target position per joint while feedback stays fresh (<= 100 ms).
     /// Cleared to `None` when feedback goes stale/missing, continuity breaks across a `> 100 ms`
-    /// gap, mode becomes unverified, or the motor is `OffConfirmed`, and recaptured when fresh
-    /// feedback returns.
+    /// gap, or mode becomes unverified, and recaptured when fresh feedback returns.
     pub captured_positions: [Option<f32>; crate::rt_core::mailbox::MAX_DOF],
     /// Driver-reported per-joint feedback continuity epoch at capture time (detects `> 100 ms`
     /// gaps even if feedback resumed before the next service pass).
     pub captured_continuity_epoch: [Option<u64>; crate::rt_core::mailbox::MAX_DOF],
     /// Driver-clock timestamp when this joint's capture was last confirmed continuously fresh.
     pub last_seen_fresh_at: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
-    /// Driver-clock timestamp when an energized joint was first seen with an unverified hold mode
+    /// Driver-clock timestamp when a joint was first seen with an unverified hold mode
     /// (L2: per-tick `RID_CTRL_MODE` readback, non-recoverable fault at 200 ms).
     pub unverified_mode_since: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
     /// Bitmask of joints that have already latched the 200 ms unverified-mode fault.
@@ -557,8 +477,6 @@ pub struct MeasuredHoldTracker {
     pub owner_hold_mask: u64,
     /// Owner-held inline stopped-hold target queue for the current pass (L3; zero alloc).
     pub owner_hold_targets: [f32; crate::rt_core::mailbox::MAX_DOF],
-    /// Most recent per-motor torque evidence observed from the driver.
-    pub motor_evidence: [crate::driver::MotorTorqueEvidence; crate::rt_core::mailbox::MAX_DOF],
     /// Most recent per-joint hold status observed during hold evaluation/servicing.
     pub joint_status: [crate::driver::JointHoldStatus; crate::rt_core::mailbox::MAX_DOF],
     /// Original failure cause stored on `FailedHold` entry so live `ENABLE_FAILED` messages
@@ -578,7 +496,6 @@ impl MeasuredHoldTracker {
             owner_pending_hold_mask: 0,
             owner_hold_mask: 0,
             owner_hold_targets: [0.0; crate::rt_core::mailbox::MAX_DOF],
-            motor_evidence: [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF],
             joint_status: [crate::driver::JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
             enable_failed_cause: crate::safety::BoundedText::empty(),
             dof: dof.min(crate::rt_core::mailbox::MAX_DOF),
@@ -598,13 +515,7 @@ impl MeasuredHoldTracker {
         self.enable_failed_cause = crate::safety::BoundedText::empty();
     }
 
-    pub fn any_possibly_energized(&self) -> bool {
-        self.motor_evidence[..self.dof]
-            .iter()
-            .any(|e| *e != crate::driver::MotorTorqueEvidence::OffConfirmed)
-    }
-
-    /// Append concise per-joint torque and hold status (`[J1:on/held,...]`) into a bounded text
+    /// Append concise per-joint hold status (`[J1:held,...]`) into a bounded text
     /// buffer without heap allocation.
     pub fn write_summary(&self, buf: &mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>) {
         if self.dof == 0 {
@@ -618,9 +529,8 @@ impl MeasuredHoldTracker {
             let _ = core::fmt::write(
                 buf,
                 format_args!(
-                    "J{}:{}/{}",
+                    "J{}:{}",
                     i + 1,
-                    self.motor_evidence[i].short_tag(),
                     self.joint_status[i].short_tag()
                 ),
             );
@@ -629,7 +539,7 @@ impl MeasuredHoldTracker {
     }
 
     /// Format the live `ENABLE_FAILED` message (`Enable failed [J1:...]: <cause>`) without heap
-    /// allocation so observations reflect current per-joint torque and hold status.
+    /// allocation so observations reflect current per-joint hold status.
     pub fn write_fault_message(
         &self,
         buf: &mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
@@ -652,7 +562,6 @@ impl MeasuredHoldTracker {
 pub(crate) struct OwnerDriverSnapshot {
     pub(crate) valid: bool,
     pub(crate) captured_at: Option<Instant>,
-    pub(crate) motor_evidence: [crate::driver::MotorTorqueEvidence; crate::rt_core::mailbox::MAX_DOF],
     pub(crate) fresh_samples: [Option<(f32, u64)>; crate::rt_core::mailbox::MAX_DOF],
     pub(crate) feedback_ages: [Option<Duration>; crate::rt_core::mailbox::MAX_DOF],
     pub(crate) hold_mode_verified: [bool; crate::rt_core::mailbox::MAX_DOF],
@@ -663,7 +572,6 @@ impl OwnerDriverSnapshot {
         Self {
             valid: false,
             captured_at: None,
-            motor_evidence: [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF],
             fresh_samples: [None; crate::rt_core::mailbox::MAX_DOF],
             feedback_ages: [None; crate::rt_core::mailbox::MAX_DOF],
             hold_mode_verified: [false; crate::rt_core::mailbox::MAX_DOF],
@@ -674,7 +582,6 @@ impl OwnerDriverSnapshot {
     pub(crate) fn invalidate(&mut self) {
         self.valid = false;
         self.captured_at = None;
-        self.motor_evidence.fill(crate::driver::MotorTorqueEvidence::Unknown);
         self.fresh_samples.fill(None);
         self.feedback_ages.fill(None);
         self.hold_mode_verified.fill(false);
@@ -693,7 +600,6 @@ impl OwnerDriverSnapshot {
         use crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE;
         let dof = dof.min(crate::rt_core::mailbox::MAX_DOF);
         let mut snap = Self::new(dof);
-        drv.motor_torque_evidence_into(&mut snap.motor_evidence[..dof]);
         let drv_now = drv.clock_now();
         snap.captured_at = Some(drv_now);
         let has_drv_fresh = drv.has_driver_fresh_position_api();
@@ -767,16 +673,14 @@ enum EnableStepOutcome {
 }
 
 /// A torque transition in flight: either the single budgeted enable reducer
-/// (`Enable -> Validate -> Armed | FailedHold`) or a disable handshake followed by
-/// [`DisableConfirm`]. Blocking callers drive the enable reducer to completion; RT callers
-/// poll it once per [`crate::rt_core::ops::CoreOps::poll_hardware`].
+/// (`Enable -> Validate -> Armed | FailedHold`) or an explicit/protective disable handshake
+/// (rest-pose gate defer + bounded disable repeats within the 1 s request lifetime).
 #[derive(Debug, Clone, Copy)]
 pub enum TorqueTransition {
     /// Single budgeted enable transition reducer (`Enable -> Validate -> Armed | FailedHold`).
     Enable(EnableReducer),
-    /// Waiting for the driver's disable handshake (`confirm` None), then for fresh feedback
-    /// reporting every motor disabled.
-    Disable { confirm: Option<DisableConfirm> },
+    /// Driver disable handshake in flight (rest-pose gate wait or bounded disable repeats).
+    Disable,
 }
 
 /// RT terminal code for a driver error during enable without moving the error (zero alloc).
@@ -818,6 +722,7 @@ impl SupervisorInner {
         driver.set_stopped_disable_gate(self.stopped_disable_gate());
         self.apply_driver_limits(driver.as_ref());
         self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
+        self.torque_intent = TorqueIntent::On;
         self.driver = Some(std::sync::Mutex::new(driver));
         self
     }
@@ -1339,7 +1244,7 @@ impl SupervisorInner {
         // `Enable`) end `SUPERSEDED`; a pending `Disable` stays attached to the upgraded driver
         // disable handshake (or completes/fails here) so its broker request receives a terminal
         // delivered exactly once.
-        let pending_disable = matches!(self.torque_transition, Some(TorqueTransition::Disable { .. }));
+        let pending_disable = matches!(self.torque_transition, Some(TorqueTransition::Disable));
         if !pending_disable && self.torque_transition.take().is_some() {
             self.core.begin_transition(Err("SUPERSEDED"));
         }
@@ -1361,7 +1266,6 @@ impl SupervisorInner {
                 }
             };
             if self.rt_executor_owned {
-                let drv_now = drv.clock_now();
                 let res = match drv.begin_disable_torque_budgeted(kind, 0) {
                     Ok(p) => p,
                     Err(e) => {
@@ -1396,11 +1300,7 @@ impl SupervisorInner {
                         });
                     }
                 };
-                let confirmed_now = matches!(
-                    res,
-                    crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
-                ) && DisableConfirm::confirmed(&**drv);
-                let done_unconfirmed = matches!(res, crate::driver::TorqueProgress::Done(_)) && !confirmed_now;
+                let done_now = matches!(res, crate::driver::TorqueProgress::Done(_));
                 let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                 let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
                 self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
@@ -1414,8 +1314,8 @@ impl SupervisorInner {
                 self.scratch.ages = ages_buf;
                 self.scratch.fb.bounds = bounds_buf;
                 drop(drv);
-                if confirmed_now {
-                    self.disable_confirmed();
+                if done_now {
+                    self.disable_accepted();
                     if pending_disable {
                         self.torque_transition = None;
                         let terminal = self
@@ -1424,13 +1324,8 @@ impl SupervisorInner {
                             .map_err(|e| torque_error_code(&e));
                         self.core.begin_transition(terminal);
                     }
-                } else {
-                    self.is_torqued = true;
-                    if pending_disable {
-                        self.torque_transition = Some(TorqueTransition::Disable {
-                            confirm: done_unconfirmed.then(|| DisableConfirm::start(drv_now)),
-                        });
-                    }
+                } else if pending_disable {
+                    self.torque_transition = Some(TorqueTransition::Disable);
                 }
                 return Ok(());
             }
@@ -1465,10 +1360,6 @@ impl SupervisorInner {
                     refused_by_chokepoint: refused,
                 });
             }
-            let mut confirm = DisableConfirm::start(drv.clock_now());
-            while confirm.serve(&mut **drv).is_none() {
-                drv.clock_pause(DISABLE_CONFIRM_SERVICE);
-            }
             let mut ages_buf = std::mem::take(&mut self.scratch.ages);
             let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
             self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
@@ -1481,22 +1372,9 @@ impl SupervisorInner {
             );
             self.scratch.ages = ages_buf;
             self.scratch.fb.bounds = bounds_buf;
-            if !DisableConfirm::confirmed(&**drv) {
-                drop(drv);
-                if pending_disable {
-                    self.torque_transition = None;
-                    self.core.begin_transition(Err("FEEDBACK_UNCONFIRMED"));
-                }
-                return Err(RequestDisableError {
-                    code: "FEEDBACK_UNCONFIRMED",
-                    message: crate::safety::BoundedText::new(
-                        "Torque disable has not been confirmed by fresh hardware feedback",
-                    ),
-                    refused_by_chokepoint: false,
-                });
-            }
+            drop(drv);
         }
-        self.disable_confirmed();
+        self.disable_accepted();
         if pending_disable {
             self.torque_transition = None;
             let terminal = self
@@ -1535,8 +1413,10 @@ impl SupervisorInner {
         self.last_disable_attempt = Some(Instant::now());
     }
 
-    /// State once fresh feedback confirmed the disable.
-    pub(super) fn disable_confirmed(&mut self) {
+    /// State once an explicit disable (passing the rest-pose gate) or protective disable has been
+    /// accepted and transmitted: records `torque_intent = Off` by decision and stops holding.
+    pub(crate) fn disable_accepted(&mut self) {
+        self.torque_intent = TorqueIntent::Off;
         self.is_torqued = false;
         self.pending_rearm = false;
         self.disable_pending = false;
@@ -1551,9 +1431,9 @@ impl SupervisorInner {
         self.enable_lifecycle
     }
 
-    /// Latest per-motor torque evidence observed by the stopped/failed-hold tracker.
-    pub fn motor_torque_evidence(&self) -> &[crate::driver::MotorTorqueEvidence] {
-        &self.measured_hold.motor_evidence[..self.measured_hold.dof]
+    /// Owner-owned torque decision state (`Off` only after an accepted disable or protective cut).
+    pub fn torque_intent(&self) -> TorqueIntent {
+        self.torque_intent
     }
 
     /// Latest per-joint hold status observed by the stopped/failed-hold tracker.
@@ -1561,19 +1441,17 @@ impl SupervisorInner {
         &self.measured_hold.joint_status[..self.measured_hold.dof]
     }
 
-    /// Single shared clear-fault enable-evidence policy for BOTH legacy and RT clear owners:
-    /// keeps `ctx.enable_state_known` strictly truthful (`Disabled | Enabled | partial`) and
-    /// sets `ctx.failed_hold_recovery_allowed` explicitly only for `FailedHold` (`ENABLE_FAILED`)
-    /// recovery on enable-feedback drivers when no `BusLoss` or `ThermalTrip` is latched.
+    /// Single shared clear-fault enable context for BOTH legacy and RT clear owners:
+    /// reported enable state from feedback is telemetry only (never blocks recovery).
     #[inline]
     fn populate_enable_clear_context(
         &self,
         ctx: &mut crate::safety::ClearContext,
-        state: EnableState,
-        partial: bool,
+        _state: EnableState,
+        _partial: bool,
         enable_fb: bool,
     ) {
-        ctx.enable_state_known = state != EnableState::Unknown || partial;
+        ctx.enable_state_known = true;
         ctx.failed_hold_recovery_allowed = self.enable_lifecycle == EnableLifecycle::FailedHold
             && enable_fb
             && self.safety.has_latched_fault_code(FaultCode::EnableFailed)
@@ -1581,12 +1459,12 @@ impl SupervisorInner {
             && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip);
     }
 
-    /// Stopped-hold eligibility derived from the transition reducer state (`FailedHold` /
-    /// `Armed`) or active torque flag.
+    /// Stopped-hold eligibility derived strictly from the owner's decision state (`torque_intent`):
+    /// holds are the default after any stop, fault, E-stop, failed/interrupted enable, lease loss,
+    /// or watchdog event, and stop ONLY after an accepted disable records `torque_intent = Off`.
     #[inline]
     pub(crate) fn stopped_hold_eligible(&self) -> bool {
-        matches!(self.enable_lifecycle, EnableLifecycle::FailedHold | EnableLifecycle::Armed)
-            || self.is_torqued
+        self.torque_intent == TorqueIntent::On || self.is_torqued
     }
 
     /// Refreshes [`Self::owner_driver_snapshot`] from an already-locked driver reference without
@@ -1606,11 +1484,11 @@ impl SupervisorInner {
         self.scratch.fb.bounds = bounds_buf;
     }
 
-    /// L2: For every energized (or possibly energized while torqued/stopped) joint whose control
-    /// mode is unverified, request a `RID_CTRL_MODE` readback every tick while already holding the
-    /// driver lock in `poll_hardware_rx`. If still unverified after 200 ms, latch a non-recoverable
-    /// fault naming the joint(s) and report the joint unheld (`UnheldNoVerifiedMode`). Zero heap
-    /// allocations.
+    /// L2: For every joint while torqued or holding while stopped (`torqued_or_stopped`) whose
+    /// control mode is unverified, request a `RID_CTRL_MODE` readback every tick while already
+    /// holding the driver lock in `poll_hardware_rx`. If still unverified after 200 ms, latch a
+    /// non-recoverable fault naming the joint(s) and report the joint unheld
+    /// (`UnheldNoVerifiedMode`). Zero heap allocations.
     pub(crate) fn enforce_unverified_mode_readback_parts(
         measured_hold: &mut MeasuredHoldTracker,
         safety: &mut crate::safety::SafetyManager,
@@ -1620,7 +1498,7 @@ impl SupervisorInner {
         config_dof: usize,
         driver: &mut dyn crate::driver::ArmDriver,
     ) {
-        use crate::driver::{JointHoldStatus, MotorTorqueEvidence};
+        use crate::driver::JointHoldStatus;
         if !snap.valid || transition_pending {
             return;
         }
@@ -1630,9 +1508,7 @@ impl SupervisorInner {
         let mut unverified_mask = 0u64;
         let mut timed_out_mask = 0u64;
         for j in 0..dof {
-            let joint_energized = snap.motor_evidence[j] == MotorTorqueEvidence::OnConfirmed
-                || (torqued_or_stopped && snap.motor_evidence[j] != MotorTorqueEvidence::OffConfirmed);
-            if !joint_energized || snap.hold_mode_verified[j] {
+            if !torqued_or_stopped || snap.hold_mode_verified[j] {
                 measured_hold.unverified_mode_since[j] = None;
                 measured_hold.unverified_mode_faulted_mask &= !(1u64 << j);
                 continue;
@@ -1670,16 +1546,15 @@ impl SupervisorInner {
 
     /// Single shared stopped-hold capture kernel reading strictly from the owner's inline
     /// [`Self::owner_driver_snapshot`] with ZERO driver mutex acquisition and ZERO heap
-    /// allocations (Rule R1). Evaluates each joint independently from driver-owned torque
-    /// evidence, fresh (`<= 100 ms`) finite measured position with continuity tracking, and
-    /// verified hold mode. Returns `(hold_mask, invalidated_mask)`.
+    /// allocations (Rule R1). Commands holds to EVERY joint with fresh (`<= 100 ms`) finite
+    /// measured position and verified hold mode, regardless of reported motor enable telemetry.
+    /// Returns `(hold_mask, invalidated_mask)`.
     pub(crate) fn capture_measured_hold_from_owner(&mut self) -> (u64, u64) {
-        use crate::driver::{JointHoldStatus, MotorTorqueEvidence, STOPPED_DISABLE_FEEDBACK_MAX_AGE};
+        use crate::driver::{JointHoldStatus, STOPPED_DISABLE_FEEDBACK_MAX_AGE};
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         self.measured_hold.dof = dof;
         if !self.owner_driver_snapshot.valid {
             for j in 0..dof {
-                self.measured_hold.motor_evidence[j] = MotorTorqueEvidence::Unknown;
                 self.measured_hold.captured_positions[j] = None;
                 self.measured_hold.captured_continuity_epoch[j] = None;
                 self.measured_hold.last_seen_fresh_at[j] = None;
@@ -1689,18 +1564,9 @@ impl SupervisorInner {
         }
         let snap = self.owner_driver_snapshot;
         let drv_now = snap.captured_at.unwrap_or_else(Instant::now);
-        self.measured_hold.motor_evidence[..dof].copy_from_slice(&snap.motor_evidence[..dof]);
         let mut hold_mask = 0u64;
         let mut invalidated_mask = 0u64;
         for j in 0..dof {
-            if snap.motor_evidence[j] == MotorTorqueEvidence::OffConfirmed {
-                self.measured_hold.captured_positions[j] = None;
-                self.measured_hold.captured_continuity_epoch[j] = None;
-                self.measured_hold.last_seen_fresh_at[j] = None;
-                self.measured_hold.joint_status[j] = JointHoldStatus::SkippedOff;
-                invalidated_mask |= 1u64 << j;
-                continue;
-            }
             let Some((pos, epoch)) = snap.fresh_samples[j] else {
                 self.measured_hold.captured_positions[j] = None;
                 self.measured_hold.captured_continuity_epoch[j] = None;
@@ -1739,21 +1605,16 @@ impl SupervisorInner {
         (hold_mask, invalidated_mask)
     }
 
-    /// Evaluates each joint independently from owner-held per-motor torque evidence, fresh
-    /// (`<= 100 ms`) finite measured position with transport provenance and continuity tracking,
-    /// and verified hold mode without acquiring the driver mutex (Rule R1; zero heap allocations).
+    /// Evaluates each joint independently from fresh (`<= 100 ms`) finite measured position with
+    /// transport provenance and continuity tracking, and verified hold mode without acquiring the
+    /// driver mutex (Rule R1; zero heap allocations).
     pub fn snapshot_measured_hold_with_invalidated(&mut self) -> (u64, u64) {
-        use crate::driver::{JointHoldStatus, MotorTorqueEvidence};
+        use crate::driver::JointHoldStatus;
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         self.measured_hold.dof = dof;
         if self.driver.is_none() {
-            self.measured_hold.motor_evidence[..dof].fill(if self.is_torqued {
-                MotorTorqueEvidence::OnConfirmed
-            } else {
-                MotorTorqueEvidence::OffConfirmed
-            });
             for j in 0..dof {
-                if self.is_torqued {
+                if self.is_torqued || self.torque_intent == TorqueIntent::On {
                     if let Some(p) = self.measured_positions.get(j).copied().filter(|p| p.is_finite()) {
                         let _ = self.measured_hold.captured_positions[j].get_or_insert(p);
                         self.measured_hold.joint_status[j] = JointHoldStatus::Held;
@@ -2164,8 +2025,6 @@ impl SupervisorInner {
         self.mit_gate_error = None;
 
         // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback.
-        let mut any_driver_enabled = false;
-
         if let Some(d) = self.driver.take() {
             // Secondary double-check latch right before hardware actuation
             if self.estop_pending() {
@@ -2205,12 +2064,11 @@ impl SupervisorInner {
                     }
                 }
             }
-            any_driver_enabled = driver.has_any_joint_enabled() || driver.has_known_partial_enable();
             self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
             drop(driver);
             self.driver = Some(d);
         }
-        let was_torqued = self.is_torqued || any_driver_enabled;
+        let was_torqued = self.is_torqued;
         let prev_gripper_cmd = if was_torqued {
             self.config.gripper_index().and_then(|i| self.commanded_positions.get(i).copied())
         } else {
@@ -2226,13 +2084,13 @@ impl SupervisorInner {
     ///    disable frame at any pose.
     /// 3. Evaluates per-motor torque evidence and per-joint measured-position holds independently
     ///    (`snapshot_measured_hold`) and drops queued driver holds outside the eligible hold mask.
-    /// 4. Transitions `enable_lifecycle` to [`EnableLifecycle::FailedHold`], sets `is_torqued`
-    ///    when any motor is `OnConfirmed | Unknown` (or `was_torqued`), and latches non-recoverable
-    ///    [`FaultCode::EnableFailed`] carrying per-joint torque and hold status while preserving
+    /// 4. Transitions `enable_lifecycle` to [`EnableLifecycle::FailedHold`], keeps `torque_intent = On`
+    ///    and `is_torqued = true` (every joint held), and latches non-recoverable
+    ///    [`FaultCode::EnableFailed`] carrying per-joint hold status while preserving
     ///    any existing E-stop or thermal latch.
     fn enter_failed_hold(
         &mut self,
-        was_torqued: bool,
+        _was_torqued: bool,
         write_cause: impl FnOnce(&mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>),
     ) -> crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }> {
         // 1. Preserve any pending E-stop before snapshotting holds (consume_pending_estop clears
@@ -2278,7 +2136,8 @@ impl SupervisorInner {
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.enable_lifecycle = EnableLifecycle::FailedHold;
-        self.is_torqued = was_torqued || self.measured_hold.any_possibly_energized();
+        self.torque_intent = TorqueIntent::On;
+        self.is_torqued = true;
         self.pending_rearm = true;
         self.disable_pending = false;
         self.active_disable_kind = None;
@@ -2363,6 +2222,7 @@ impl SupervisorInner {
             was_torqued,
             prev_gripper_cmd,
         };
+        self.torque_intent = TorqueIntent::On;
         self.enable_lifecycle = EnableLifecycle::Enabling;
         let Some(ref d) = self.driver else {
             return self.step_enable_validate(
@@ -3093,21 +2953,20 @@ impl SupervisorInner {
         }
         Ok(match started {
             None => {
-                self.disable_confirmed();
+                self.disable_accepted();
                 self.torque_off_finish_in_place()
                     .map(|()| Rt::Done)
                     .map_err(|e| torque_error_code(&e))
             }
             Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now, _)) => {
-                self.torque_transition = Some(TorqueTransition::Disable { confirm: None });
+                self.torque_transition = Some(TorqueTransition::Disable);
                 Ok(Rt::Pending { wake: now })
             }
-            // the frames went out: the supervisor's confirmation follows (as in request_disable)
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), now, _)) => {
-                self.torque_transition = Some(TorqueTransition::Disable {
-                    confirm: Some(DisableConfirm::start(now)),
-                });
-                Ok(Rt::Pending { wake: now })
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _)) => {
+                self.disable_accepted();
+                self.torque_off_finish_in_place()
+                    .map(|()| Rt::Done)
+                    .map_err(|e| torque_error_code(&e))
             }
             Some((Err(e), _, _)) => Err(self.disable_step_failed(e)),
         })
@@ -3175,14 +3034,19 @@ impl SupervisorInner {
         self.scratch.ages = ages_buf;
         self.scratch.fb.bounds = bounds_buf;
         drop(drv);
-        if matches!(
-            poll_res,
-            Err(crate::driver::ArmDriverError::TorqueOffWouldDrop
-                | crate::driver::ArmDriverError::DisableRequestExpired)
-        ) {
-            self.disable_pending = false;
-            self.active_disable_kind = None;
-            self.last_disable_attempt = None;
+        match poll_res {
+            Ok(crate::driver::TorqueProgress::Done(_)) => {
+                self.disable_accepted();
+            }
+            Err(
+                crate::driver::ArmDriverError::TorqueOffWouldDrop
+                | crate::driver::ArmDriverError::DisableRequestExpired,
+            ) => {
+                self.disable_pending = false;
+                self.active_disable_kind = None;
+                self.last_disable_attempt = None;
+            }
+            _ => {}
         }
         rx
     }
@@ -3205,7 +3069,7 @@ impl SupervisorInner {
                 };
                 Some(TransitionPoll { progress, rx })
             }
-            TorqueTransition::Disable { confirm } => {
+            TorqueTransition::Disable => {
                 let Some(d) = self.driver.as_ref() else {
                     return Some(TransitionPoll { progress: Err("INTERNAL"), rx: None });
                 };
@@ -3215,57 +3079,24 @@ impl SupervisorInner {
                 let drv_now = drv.clock_now();
                 let span = budget.deadline.saturating_duration_since(budget.now);
                 let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
-                match confirm {
-                    None => {
-                        let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
-                        let rx = drv.take_last_poll_rx();
-                        match r {
-                            Ok(Drv::Pending { wake }) => {
-                                drop(drv);
-                                self.torque_transition = Some(TorqueTransition::Disable { confirm: None });
-                                Some(TransitionPoll { progress: Ok(Rt::Pending { wake: to_exec(wake) }), rx })
-                            }
-                            // confirmed or not by the driver's window: the supervisor's confirmation decides
-                            // (an unconfirmed disable is never success; `request_disable` does the same)
-                            Ok(Drv::Done(_)) => {
-                                let now = drv.clock_now();
-                                drop(drv);
-                                self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(DisableConfirm::start(now)) });
-                                Some(TransitionPoll { progress: Ok(Rt::Pending { wake: budget.now }), rx })
-                            }
-                            Err(e) => {
-                                drop(drv);
-                                Some(TransitionPoll { progress: Err(self.disable_step_failed(e)), rx })
-                            }
-                        }
+                let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                let rx = drv.take_last_poll_rx();
+                drop(drv);
+                match r {
+                    Ok(Drv::Pending { wake }) => {
+                        self.torque_transition = Some(TorqueTransition::Disable);
+                        Some(TransitionPoll { progress: Ok(Rt::Pending { wake: to_exec(wake) }), rx })
                     }
-                    Some(mut c) => {
-                        let mut states = std::mem::take(&mut self.scratch.states);
-                        let served = c.serve_budgeted(&mut **drv, drv_now + span, budget.max_rx_frames, &mut states);
-                        self.scratch.states = states;
-                        drop(drv);
-                        let rx = served.did_rx.then_some((served.rx_frames, served.budget_exhausted));
-                        let progress = match served.outcome {
-                            None => {
-                                self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(c) });
-                                let wake = (drv_now + DISABLE_CONFIRM_SERVICE).min(c.deadline());
-                                Ok(Rt::Pending { wake: to_exec(wake) })
-                            }
-                            Some(true) => {
-                                self.disable_confirmed();
-                                self.torque_off_finish_in_place().map(|()| Rt::Done).map_err(|e| torque_error_code(&e))
-                            }
-                            Some(false) => {
-                                if !self.torque_off_stopped() {
-                                    self.safety.latch(
-                                        crate::safety::FaultKind::Other,
-                                        crate::safety::FaultDetail::Static(crate::safety::StaticFault::DisableUnconfirmed),
-                                    );
-                                }
-                                Err("FEEDBACK_UNCONFIRMED")
-                            }
-                        };
+                    Ok(Drv::Done(_)) => {
+                        self.disable_accepted();
+                        let progress = self
+                            .torque_off_finish_in_place()
+                            .map(|()| Rt::Done)
+                            .map_err(|e| torque_error_code(&e));
                         Some(TransitionPoll { progress, rx })
+                    }
+                    Err(e) => {
+                        Some(TransitionPoll { progress: Err(self.disable_step_failed(e)), rx })
                     }
                 }
             }
@@ -3883,16 +3714,14 @@ impl SupervisorInner {
                 self.thermal_cooldown = next_cd;
             }
             commit_probed_limits(self);
-            if state == EnableState::Disabled {
+            if self.torque_intent == TorqueIntent::Off {
                 self.is_torqued = false;
                 self.enable_lifecycle = EnableLifecycle::Disarmed;
                 self.measured_hold.clear();
-            } else {
-                self.is_torqued = state == EnableState::Enabled
-                    || partial
-                    || any_enabled
-                    || self.enable_lifecycle == EnableLifecycle::FailedHold;
+            } else if self.enable_lifecycle == EnableLifecycle::FailedHold {
+                self.is_torqued = true;
             }
+            let _ = any_enabled;
         } else {
             self.update_thermal_cooldown_driverless(Instant::now());
             ctx = self.build_clear_context_base(driver_err_override);
@@ -4433,16 +4262,14 @@ impl SupervisorInner {
             if let Some(ref cand) = candidate_limits {
                 self.commit_driver_limits_bounded(cand);
             }
-            if state == EnableState::Disabled {
+            if self.torque_intent == TorqueIntent::Off {
                 self.is_torqued = false;
                 self.enable_lifecycle = EnableLifecycle::Disarmed;
                 self.measured_hold.clear();
-            } else {
-                self.is_torqued = state == EnableState::Enabled
-                    || partial
-                    || any_enabled
-                    || self.enable_lifecycle == EnableLifecycle::FailedHold;
+            } else if self.enable_lifecycle == EnableLifecycle::FailedHold {
+                self.is_torqued = true;
             }
+            let _ = any_enabled;
         } else {
             // Driverless simulation mode: update cooldown clock in place (0 alloc).
             self.update_thermal_cooldown_driverless(Instant::now());
@@ -4519,7 +4346,7 @@ impl SupervisorInner {
     ) -> PanicDisableOutcome {
         self.mark_panic_disable_requested();
         let Some(ref d) = self.driver else {
-            self.disable_confirmed();
+            self.disable_accepted();
             return PanicDisableOutcome::NoDriver;
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4543,7 +4370,7 @@ impl SupervisorInner {
         }))
         .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during driver panic-disable".into()));
         if outcome == PanicDisableOutcome::Confirmed {
-            self.disable_confirmed();
+            self.disable_accepted();
         }
         outcome
     }

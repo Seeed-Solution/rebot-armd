@@ -1359,7 +1359,6 @@ impl crate::supervisor::SupervisorInner {
         &mut self,
         expected_epoch: Option<u64>,
     ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
-        use crate::driver::EnableState;
         use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
         // Single authoritative clear_check FIRST before issuing any recovery disable/reset commands.
         let mut pre_ctx = self.build_mit_recovery_clear_context();
@@ -1398,14 +1397,12 @@ impl crate::supervisor::SupervisorInner {
             tracing::error!("{msg}");
             return Err(SafetyError::ClearFaultRejected(msg));
         }
-        tracing::warn!("MIT recovery after a motor timeout: every motor confirmed disabled; torque is off on all joints");
+        tracing::warn!("MIT recovery after a motor timeout: accepted disable sent; torque is off on all joints");
         self.stop_motion();
         self.servo_stream_active = false;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
-        self.is_torqued = false;
-        self.disable_pending = false;
-        self.pending_rearm = false;
+        self.disable_accepted();
 
         // Refresh supervisor feedback from samples received strictly AFTER the recovery request
         // (verified by per-joint receive sequence advance AND driver post-recovery RX boundary) —
@@ -1434,9 +1431,7 @@ impl crate::supervisor::SupervisorInner {
                     && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
                 let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
                 let hw_fault = drv.has_hardware_fault();
-                let state = drv.enable_state();
-                let partial = drv.has_known_partial_enable();
-                let enable_known = state != EnableState::Unknown || partial;
+                let enable_known = true;
                 let oldest_age = ages
                     .iter()
                     .copied()

@@ -691,18 +691,6 @@ impl ArmDriver for SimArmDriver {
         }
     }
 
-    fn motor_torque_evidence_into(&self, out: &mut [crate::driver::MotorTorqueEvidence]) -> usize {
-        use crate::driver::MotorTorqueEvidence;
-        let ev = match self.enable_state() {
-            EnableState::Disabled => MotorTorqueEvidence::OffConfirmed,
-            EnableState::Enabled => MotorTorqueEvidence::OnConfirmed,
-            EnableState::Unknown => MotorTorqueEvidence::Unknown,
-        };
-        let n = self.dof.min(out.len());
-        out[..n].fill(ev);
-        n
-    }
-
     fn has_driver_fresh_position_api(&self) -> bool { true }
 
     fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
@@ -911,22 +899,14 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-        let mask = if self.enable_state() == EnableState::Disabled {
-            0
-        } else {
-            let n = self.dof.min(64);
-            if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
-        };
+        let n = self.dof.min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         self.write_measured_hold_masked(mask, targets).map(|_| ())
     }
 
     fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
-        let mask = if self.enable_state() == EnableState::Disabled {
-            0
-        } else {
-            let n = self.dof.min(64);
-            if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
-        };
+        let n = self.dof.min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
         self.write_measured_hold_masked(mask, targets).map(|r| r.outcome)
     }
 
@@ -935,7 +915,7 @@ impl ArmDriver for SimArmDriver {
         hold_mask: u64,
         targets: &[JointTarget],
     ) -> Result<crate::driver::HoldPassReport, ArmDriverError> {
-        use crate::driver::{HoldPassReport, JointHoldStatus, MotorTorqueEvidence};
+        use crate::driver::{HoldPassReport, JointHoldStatus};
         if self.torque_hs.is_some() {
             return Err(ArmDriverError::Protocol("torque transition pending: no hold before its confirmation".into()));
         }
@@ -944,15 +924,9 @@ impl ArmDriver for SimArmDriver {
         }
         let dof = self.dof.min(crate::rt_core::mailbox::MAX_DOF);
         let mut report = HoldPassReport::empty(dof);
-        let mut ev = [MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF];
-        self.motor_torque_evidence_into(&mut ev[..dof]);
         let mut held_mask = 0u64;
         let mut hold_pos = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         for (i, target) in targets.iter().enumerate().take(dof) {
-            if ev[i] == MotorTorqueEvidence::OffConfirmed {
-                report.joint_status[i] = JointHoldStatus::SkippedOff;
-                continue;
-            }
             let fresh = self.fresh_measured_position_for(i, crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE);
             if (hold_mask & (1u64 << i)) == 0 {
                 report.joint_status[i] = if fresh.is_none() {

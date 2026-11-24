@@ -57,8 +57,7 @@ pub mod wasm_api;
 #[cfg(not(target_arch = "wasm32"))] pub use auth::OperatorAuth;
 #[cfg(not(target_arch = "wasm32"))] pub use driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
-    HoldPassReport, JointHoldStatus, JointMode, JointTarget, MotorTorqueEvidence,
-    RobStrideArmDriver,
+    HoldPassReport, JointHoldStatus, JointMode, JointTarget, RobStrideArmDriver,
 };
 pub use gravity::{compute_gravity_torques, GravityError};
 #[cfg(not(target_arch = "wasm32"))]
@@ -71,7 +70,7 @@ pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, Join
 pub use safety::{FaultCode, FaultInfo, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 #[cfg(not(target_arch = "wasm32"))] pub use supervisor::{
     AdmissionStamp, Admitted, ArmError, ArmSupervisor, MotionStartKind, MotionStartOp,
-    PreemptError, SupervisorInner,
+    PreemptError, SupervisorInner, TorqueIntent,
 };
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,

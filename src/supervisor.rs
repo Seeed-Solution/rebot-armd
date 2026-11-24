@@ -31,7 +31,8 @@ mod torque_off;
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
 pub use driver_transitions::{
-    run_with_panic_deadline_observer, EnableLifecycle, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT,
+    run_with_panic_deadline_observer, EnableLifecycle, PanicDisableOutcome, TorqueIntent,
+    PANIC_DISABLE_TIMEOUT,
 };
 pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until};
 pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
@@ -746,6 +747,9 @@ pub struct SupervisorInner {
     pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
     /// Persistent enable-lifecycle state owned by the single enable transition reducer.
     pub(crate) enable_lifecycle: driver_transitions::EnableLifecycle,
+    /// Owner-owned torque decision state (`On` by default on hardware until an accepted disable
+    /// or `DisableProtective` sets `Off`; never inferred from feedback telemetry).
+    pub torque_intent: driver_transitions::TorqueIntent,
     /// Inline per-joint measured-position hold state (zero alloc on RT).
     pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
     /// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver
@@ -1571,6 +1575,7 @@ impl SupervisorInner {
             disable_pending: false,
             torque_transition: None,
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
+            torque_intent: driver_transitions::TorqueIntent::Off,
             measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
             owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot::new(dof),
             last_disable_attempt: None,
@@ -2658,8 +2663,6 @@ impl SupervisorInner {
             if !policy.support_load_limits.is_empty() && !caps.load_feedback {
                 return Some("driver lacks load feedback for support load limits".into());
             }
-            let enable = drv.enable_state();
-            if enable != EnableState::Enabled && !drv.has_known_partial_enable() { return Some(format!("enable state {enable:?}")); }
             if self.safety.state().is_stopped() { return Some(format!("safety state {:?}", self.safety.state())); }
             drop(drv);
             if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
@@ -3109,21 +3112,22 @@ impl SupervisorInner {
         }
     }
 
-    /// Consumes confirmation of a non-broker background disable once fresh valid hardware
-    /// feedback reports every motor disabled. Returns `true` when no background disable
-    /// remains pending.
+    /// Returns `true` when no background disable requires a periodic 250 ms retry (either no
+    /// background disable is pending, a broker torque transition owns it, or the RT executor is
+    /// actively polling an in-flight driver disable transition).
     pub(crate) fn confirm_background_disable_if_ready(&mut self) -> bool {
         if !self.disable_pending || self.torque_transition.is_some() {
             return true;
         }
-        let confirmed = self.driver.as_ref().is_none_or(|d| {
-            d.lock()
-                .is_ok_and(|drv| drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled)
-        });
-        if confirmed {
-            self.disable_confirmed();
+        if self.driver.is_none() {
+            self.disable_accepted();
+            return true;
         }
-        confirmed
+        self.rt_executor_owned
+            && self
+                .driver
+                .as_ref()
+                .is_some_and(|d| d.lock().is_ok_and(|drv| drv.torque_transition_pending()))
     }
 
     pub fn shutdown_ready(&self) -> bool {
@@ -3132,30 +3136,15 @@ impl SupervisorInner {
         }
         match &self.driver {
             None => !self.is_torqued,
-            Some(driver) => !self.is_torqued
-                && driver.lock().is_ok_and(|drv| {
-                    if !drv.capabilities().enable_feedback {
-                        true
-                    } else {
-                        drv.enable_state() == EnableState::Disabled
-                    }
-                }),
+            Some(_) => !self.is_torqued && self.torque_intent == TorqueIntent::Off,
         }
-    }
-
-    fn driver_enable_state_unknown(&self) -> bool {
-        self.driver.as_ref().is_some_and(|d| {
-            d.lock().is_ok_and(|drv| {
-                drv.capabilities().enable_feedback && drv.enable_state() == EnableState::Unknown
-            })
-        })
     }
 
     /// Authoritative shutdown gate shared by legacy lock and RT executor ownership paths.
     /// Returns `true` when safe to stop the control loop and exit; returns `false` after
-    /// latching stop when hardware disable is not yet confirmed. When shutdown was refused
-    /// because the hardware enable state is `Unknown`, a repeated shutdown signal issues a
-    /// bounded disable request rather than only re-checking.
+    /// latching stop when no accepted disable has recorded `torque_intent = Off` yet. When
+    /// shutdown was refused while not armed (`!is_torqued || disable_pending`), a repeated
+    /// shutdown signal issues `DisableProtective { ProcessExit }`.
     pub fn request_shutdown(&mut self) -> bool {
         if self.driver.is_none() || self.shutdown_ready() {
             self.shutdown_refused_unknown = false;
@@ -3163,17 +3152,17 @@ impl SupervisorInner {
             self.e_stop_latched.store(true, Ordering::SeqCst);
             return true;
         }
-        // Signal-path shutdown vs protective-cut exception (decision b, 2026-11-24):
-        // - A normal SIGTERM / Ctrl-C with a known-enabled arm latches E-Stop and refuses shutdown
-        //   (returns `false`), keeping the process running and in control (motors stay holding).
-        // - Exception (b) covers actual process exit (panic / forced teardown, or repeated shutdown
-        //   when hardware enable state is `Unknown` with `!is_torqued || disable_pending`), which
-        //   disables motors in any pose without consulting `may_disable_torque_while_stopped`.
+        // Signal-path shutdown vs protective-cut exception:
+        // - A normal SIGTERM / Ctrl-C with an energized/holding arm latches E-Stop and refuses
+        //   shutdown (returns `false`), keeping the process running and in control (motors hold).
+        // - Repeated shutdown when `!is_torqued || disable_pending` (e.g. startup before any
+        //   enable or an in-flight disable) issues `DisableProtective { ProcessExit }` so process
+        //   exit disables motors in any pose.
         if !self.safety.state().is_stopped() {
             self.execute_stop(StopPolicy::EStopLatch);
         }
-        let unknown = self.driver_enable_state_unknown();
-        if unknown && self.shutdown_refused_unknown && (!self.is_torqued || self.disable_pending) {
+        let unaccepted_idle = self.torque_intent == TorqueIntent::On && (!self.is_torqued || self.disable_pending);
+        if unaccepted_idle && self.shutdown_refused_unknown {
             let exit_kind = crate::driver::DisableKind::DisableProtective {
                 reason: crate::driver::DisableProtectiveReason::ProcessExit,
             };
@@ -3183,7 +3172,7 @@ impl SupervisorInner {
                 }
             } else {
                 let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
-                outcome.log("Repeated shutdown disable while state Unknown", PANIC_DISABLE_TIMEOUT);
+                outcome.log("Repeated shutdown protective disable", PANIC_DISABLE_TIMEOUT);
             }
             if self.shutdown_ready() {
                 self.shutdown_refused_unknown = false;
@@ -3192,7 +3181,7 @@ impl SupervisorInner {
                 return true;
             }
         }
-        self.shutdown_refused_unknown = unknown;
+        self.shutdown_refused_unknown = unaccepted_idle;
         false
     }
 
@@ -4175,10 +4164,12 @@ impl SupervisorInner {
                             &mut sc.fb.bounds,
                         );
                     let torqued_or_stopped = self.is_torqued
-                        || matches!(
-                            self.enable_lifecycle,
-                            EnableLifecycle::FailedHold | EnableLifecycle::Armed
-                        );
+                        || (self.torque_intent == TorqueIntent::On
+                            && (self.safety.state().is_stopped()
+                                || matches!(
+                                    self.enable_lifecycle,
+                                    EnableLifecycle::FailedHold | EnableLifecycle::Armed
+                                )));
                     Self::enforce_unverified_mode_readback_parts(
                         &mut self.measured_hold,
                         &mut self.safety,
@@ -5641,7 +5632,7 @@ impl SupervisorInner {
                     gravity_driverless_ok = true;
                 } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), self.driver.as_ref()) {
                     if let Ok(mut driver) = d.lock() {
-                        if driver.enable_state() != EnableState::Disabled {
+                        if self.torque_intent == TorqueIntent::On {
                             let is_hold = self.safety.state().is_stopped();
                             let write_res = if is_hold {
                                 driver.write_estop_hold_bounded(&targets)
@@ -5704,10 +5695,9 @@ impl SupervisorInner {
             let is_stopped_or_failed_hold = self.safety.state().is_stopped()
                 || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
             let send_to_bus = self.is_torqued
+                && self.torque_intent == TorqueIntent::On
                 && feedback_fresh
-                && self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT)
-                && self.driver.as_ref().is_none_or(|d|
-                    d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
+                && self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
             let has_fallback_ramp = send_to_bus
                 && tracking_active
                 && self.driver.is_some()

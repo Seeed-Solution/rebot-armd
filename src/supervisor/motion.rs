@@ -569,20 +569,11 @@ impl SupervisorInner {
         #[cfg(feature = "policy-runtime")]
         self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
 
-        // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
-        let confirmed_hardware_disabled = match &self.driver {
-            None => !self.is_torqued && !self.disable_pending && self.safety.state() == &SafetyState::Idle,
-            Some(driver) => !self.is_torqued
-                && !self.disable_pending
-                && self.safety.state() == &SafetyState::Idle
-                && driver.lock().is_ok_and(|drv| {
-                    if !drv.capabilities().enable_feedback {
-                        true
-                    } else {
-                        drv.enable_state() == EnableState::Disabled
-                    }
-                }),
-        };
+        // Decision-based hardware disabled check (never inferred from feedback telemetry).
+        let confirmed_hardware_disabled = !self.is_torqued
+            && !self.disable_pending
+            && self.safety.state() == &SafetyState::Idle
+            && (self.driver.is_none() || self.torque_intent == crate::supervisor::TorqueIntent::Off);
 
         if confirmed_hardware_disabled
             || self.safety.state().is_stopped()
