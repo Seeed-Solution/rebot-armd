@@ -5335,3 +5335,294 @@ fn e1_damiao_causal_settle_window_rejects_5ms_in_flight_and_accepts_25ms() {
         );
     }
 }
+
+/// Rule E2: The rest-pose disable gate requires a completed RX drain.
+/// A cached resting pose MUST NEVER authorize a disable while newer frames (e.g. a queued
+/// raised-pose frame behind an exhausted drain) may still be queued.
+#[test]
+fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain() {
+    use armd::driver::{
+        ArmDriverError, DisableKind, DisableProtectiveReason, RobStrideArmDriver, StoppedDisableGate,
+        TorqueProgress,
+    };
+    use armd::protocol::robstride;
+    use armd::transport::{CanFrame, MockCanTransport};
+    use std::sync::atomic::AtomicBool;
+
+    let dm_limits = limits();
+    let make_dm_fb = |id: u16, state: u8, q: f32| -> CanFrame {
+        let l = &dm_limits[usize::from(id - 1)];
+        let p = damiao::float_to_uint(q, l.p_min, l.p_max, 16);
+        let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
+        let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
+        CanFrame::new_standard(
+            0x10 + id,
+            &[
+                (state << 4) | (id as u8 & 0x0f),
+                (p >> 8) as u8,
+                p as u8,
+                (v >> 4) as u8,
+                (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+                t as u8,
+                30,
+                30,
+            ],
+        )
+        .unwrap()
+    };
+    let junk_frame = CanFrame::new_standard(0x500, &[0u8; 8]).unwrap();
+
+    // 1. Damiao: cached resting pose (0.0) + queued raised-pose frame (0.45) behind an exhausted drain.
+    {
+        let (mut inner, bus, clock) = make_driver_rig();
+        enable_torque_admitted(&mut inner).unwrap();
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+        // Fresh resting pose (0.0 rad) with completed drain.
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            for m in &mut s.motors {
+                m.q = 0.0;
+            }
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        assert_eq!(inner.may_disable_torque_while_stopped(), Ok(()));
+
+        // Enqueue 70 unrelated bus frames followed by a REAL raised-pose frame for J1 (q = 0.45 rad).
+        // First: a budgeted Step-2 read of 64 frames exhausts BEFORE reaching the raised-pose frame!
+        bus.with(|s| {
+            s.tx_log.clear();
+            for _ in 0..70 {
+                s.rx.push_back(junk_frame);
+            }
+            s.rx.push_back(make_dm_fb(1, 1, 0.45));
+        });
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let mut out = Vec::new();
+            let dl = drv.clock_now() + Duration::from_millis(10);
+            let (frames, more) = drv.read_joint_states_budgeted(&mut out, dl, 64).unwrap();
+            assert_eq!(frames, 64);
+            assert!(more, "drain must report exhaustion");
+            // Zero-RX-budget disable gate MUST REFUSE (fail closed; 0 disable frames)!
+            let started = drv.clock_now();
+            let err = drv
+                .begin_disable_torque_budgeted(
+                    DisableKind::DisableRequested {
+                        started_at: started,
+                        rollback: false,
+                    },
+                    0,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, ArmDriverError::TorqueOffWouldDrop),
+                "zero-RX-budget disable behind exhausted drain must refuse: {err:?}"
+            );
+        }
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+            0,
+            "zero-RX-budget refusal must send ZERO CMD_DISABLE frames"
+        );
+        // Supervisor gate (`may_disable_torque_while_stopped`) must also refuse while not drained!
+        assert_eq!(
+            inner.may_disable_torque_while_stopped(),
+            Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+            "cached rest pose must NEVER pass supervisor gate while RX drain is incomplete"
+        );
+
+        // Second: bounded pre-disable drain (`max_rx_frames = 4`) also exhausts BEFORE reaching
+        // the queued raised-pose frame -> STILL refuses with ZERO CMD_DISABLE frames!
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let started = drv.clock_now();
+            let err = drv
+                .begin_disable_torque_budgeted(
+                    DisableKind::DisableRequested {
+                        started_at: started,
+                        rollback: false,
+                    },
+                    4,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, ArmDriverError::TorqueOffWouldDrop),
+                "exhausted pre-disable drain must refuse: {err:?}"
+            );
+        }
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+            0,
+            "exhausted pre-disable drain must send ZERO CMD_DISABLE frames"
+        );
+
+        // Next tick finishes draining the backlog (`mark_rx_empty` clears untrusted backlog
+        // timestamps -> still refused as StaleOrMissingFeedback, 0 CMD_DISABLE frames). Then fresh
+        // post-boundary feedback at the raised pose (0.45 rad) refuses as JointOutsideRest!
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let _ = drv.read_joint_states().unwrap();
+            let started = drv.clock_now();
+            let err = drv
+                .begin_disable_torque_budgeted(
+                    DisableKind::DisableRequested {
+                        started_at: started,
+                        rollback: false,
+                    },
+                    0,
+                )
+                .unwrap_err();
+            assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop));
+        }
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+            0
+        );
+        assert_eq!(
+            inner.may_disable_torque_while_stopped(),
+            Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+        );
+        bus.with(|s| {
+            s.motors[0].q = 0.45;
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        assert!(matches!(
+            inner.may_disable_torque_while_stopped(),
+            Err(StoppedTorqueOffRefusal::JointOutsideRest { joint_index: 0, .. })
+        ));
+
+        // Third: contrast case — if the queued traffic behind an exhausted drain turns out to be
+        // harmless (arm genuinely remains at rest 0.0), retrying on the next tick after the drain
+        // completes and fresh post-boundary feedback arrives (within the 1 s lifetime) SUCCEEDS!
+        bus.with(|s| {
+            s.rx.clear();
+            s.tx_log.clear();
+            s.motors[0].q = 0.0;
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        let req_started = clock.now();
+        bus.with(|s| {
+            for _ in 0..10 {
+                s.rx.push_back(junk_frame);
+            }
+            s.rx.push_back(make_dm_fb(1, 1, 0.0));
+        });
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            // Tick 1: 4-frame drain exhausts -> refused (0 CMD_DISABLE frames).
+            let err = drv
+                .begin_disable_torque_budgeted(
+                    DisableKind::DisableRequested {
+                        started_at: req_started,
+                        rollback: false,
+                    },
+                    4,
+                )
+                .unwrap_err();
+            assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop));
+            assert_eq!(bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(), 0);
+
+            // Tick 2 (within 1 s lifetime): drain completes, fresh post-boundary rest feedback
+            // arrives -> ALLOWED!
+            clock.advance(Duration::from_millis(20));
+            let _ = drv.read_joint_states().unwrap();
+            bus.with(|s| s.push_all_feedback());
+            let _ = drv.read_joint_states().unwrap();
+            let p = drv
+                .begin_disable_torque_budgeted(
+                    DisableKind::DisableRequested {
+                        started_at: req_started,
+                        rollback: false,
+                    },
+                    0,
+                )
+                .expect("retry after completed drain at rest within 1s lifetime must succeed");
+            assert!(matches!(p, TorqueProgress::Pending { .. }));
+        }
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+            7
+        );
+
+        // Fourth: protective disable (`DisableProtective::Thermal`) still bypasses even behind an
+        // exhausted drain.
+        bus.with(|s| {
+            s.tx_log.clear();
+            for _ in 0..20 {
+                s.rx.push_back(junk_frame);
+            }
+        });
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let p = drv
+                .begin_disable_torque_budgeted(
+                    DisableKind::DisableProtective {
+                        reason: DisableProtectiveReason::Thermal,
+                    },
+                    4,
+                )
+                .expect("protective thermal disable must not be blocked by exhausted drain");
+            assert!(matches!(p, TorqueProgress::Pending { .. }));
+        }
+        assert_eq!(
+            bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+            7
+        );
+    }
+
+    // 2. RobStride: queued raised-pose frame behind an exhausted drain MUST ALSO refuse!
+    {
+        let clock = MockClock::new();
+        let can = MockCanTransport::new().with_clock(clock.clone());
+        let mut rs = RobStrideArmDriver::new(can, vec![1]);
+        let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+        arm_joints[0] = 0;
+        rs.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(true)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 1,
+            rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+        let fb_id = robstride::build_feedback_extended_id(0x00, 1, 0xFD);
+        // 0x8000 = 0.0 rad (rest); 0xA000 = raised (~3.14 rad)
+        let fb_rest = CanFrame::new_extended(fb_id, &[0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x00, 250]).unwrap();
+        let fb_raised = CanFrame::new_extended(fb_id, &[0xA0, 0x00, 0x80, 0x00, 0x80, 0x00, 0x00, 250]).unwrap();
+
+        // Establish empty-queue bound + fresh resting pose.
+        let _ = rs.read_joint_states().unwrap();
+        rs.can_mut().provide_rx_frame(fb_rest);
+        let _ = rs.read_joint_states().unwrap();
+        let _ = rs.can_mut().take_tx_frames();
+
+        // Queue 10 junk frames + raised-pose frame behind them; 4-frame budgeted disable MUST refuse!
+        for _ in 0..10 {
+            rs.can_mut().provide_rx_frame(junk_frame);
+        }
+        rs.can_mut().provide_rx_frame(fb_raised);
+        let err = rs
+            .begin_disable_torque_budgeted(
+                DisableKind::DisableRequested {
+                    started_at: clock.now(),
+                    rollback: false,
+                },
+                4,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::TorqueOffWouldDrop),
+            "RobStride exhausted drain must refuse disable: {err:?}"
+        );
+        assert!(
+            rs.can_mut().take_tx_frames().is_empty(),
+            "RobStride exhausted drain refusal must emit 0 stop frames"
+        );
+    }
+}

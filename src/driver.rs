@@ -4950,6 +4950,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if joints.is_empty() || out.len() < joints.len() {
             return false;
         }
+        // E2: The rest-pose disable gate requires a completed RX drain. A cached resting pose
+        // never authorizes a disable while newer frames may still be queued.
+        if self.awaiting_rx_boundary || !self.last_read_drained {
+            return false;
+        }
         let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
@@ -8312,11 +8317,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.begin_tx_tick();
         self.refresh_unfinished = 0;
         let prev_awaiting_rx_boundary = self.awaiting_rx_boundary;
-        // Drain RX before checking Rule A′ in `send` so the send-time check sees the freshest
-        // bus feedback. Still send protective disables if draining times out (thermal protection
-        // must not be blocked by traffic). Until a new empty-queue boundary, ignore ACKs.
+        // E2: Drain RX before checking Rule A′ in `send` so the send-time check sees the freshest
+        // bus feedback. If `max_rx_frames == Some(0)` without a completed prior drain, or if the
+        // drain exhausts without reaching an empty queue, `awaiting_rx_boundary` becomes true and
+        // `send(DisableRequested)` refuses (fail closed; retried next tick within the 1 s
+        // lifetime). Protective disables bypass Rule A′ so thermal/exit cuts are never blocked.
         self.awaiting_rx_boundary = match max_rx_frames {
-            Some(0) => !self.last_read_drained,
+            Some(0) => self.awaiting_rx_boundary || !self.last_read_drained,
             Some(limit) => {
                 self.last_poll_rx = None;
                 self.rx_frame_limit = Some(limit.min(64));
@@ -8352,10 +8359,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if !sent_any && other_err.is_none() {
             if let Some(e) = refused_err {
                 // Choke point refused every disable frame before touching the transport (0 CAN
-                // frames attempted): preserve prior enable/feedback boundary state untouched so
-                // telemetry & enable_state stay honest. A transport TX error falls through below
-                // so enable_state becomes Unknown until post-error feedback proves motor state.
-                self.awaiting_rx_boundary = prev_awaiting_rx_boundary;
+                // frames attempted): preserve prior enable/feedback state, while keeping
+                // `awaiting_rx_boundary` latched if the drain did not complete (`!last_read_drained`).
+                self.awaiting_rx_boundary = prev_awaiting_rx_boundary || !self.last_read_drained;
                 return Err(e);
             }
         }
@@ -10896,6 +10902,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if joints.is_empty() || out.len() < joints.len() {
             return false;
         }
+        // E2: A cached resting pose never authorizes a disable while newer RX frames may still be
+        // queued (`awaiting_rx_boundary` or incomplete last drain).
+        if self.awaiting_rx_boundary || !self.last_read_drained {
+            return false;
+        }
         let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
@@ -11465,6 +11476,11 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     /// Per-motor causal settle deadline (`write_done + TORQUE_CAUSAL_SETTLE_WINDOW`) after a
     /// torque-changing write returns from `can.transmit()`.
     motor_torque_settle_until: Vec<Option<Instant>>,
+    /// True once the most recent RX receive/drain pass reached an empty queue (`Timeout`/`WouldBlock`).
+    last_read_drained: bool,
+    /// True while a pre-disable RX drain did not complete (zero budget without drained state, or
+    /// exhausted drain); fail-closed for the rest-pose disable gate until a drain completes.
+    awaiting_rx_boundary: bool,
     fault_flags: Vec<u8>,
     clock: Option<Arc<dyn crate::transport::DriverClock>>,
     abort_flag: Option<Arc<AtomicBool>>,
@@ -11491,6 +11507,8 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             rx_empty_instant: None,
             feedback_queue_bound: vec![None; dof],
             motor_torque_settle_until: vec![None; dof],
+            last_read_drained: false,
+            awaiting_rx_boundary: false,
             fault_flags: vec![0; dof],
             clock,
             abort_flag: None,
@@ -11598,6 +11616,126 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         self.send_type4_frame(idx, &frame, kind)
     }
 
+    /// Shared bounded RX drain for RobStride: returns `(frames_processed, rx_drained, hit_err)`.
+    /// Updates `last_read_drained` and clears `awaiting_rx_boundary` ONLY when the queue actually
+    /// drains to `Timeout | WouldBlock`.
+    fn drain_rx_bounded(&mut self, max_frames: usize, deadline: Option<Instant>, max_span: Duration) -> (u16, bool, bool) {
+        self.last_read_drained = false;
+        let t0 = self.now();
+        let mut frames_processed = 0usize;
+        let mut rx_drained = false;
+        let mut hit_err = false;
+        while frames_processed < max_frames
+            && deadline.is_none_or(|dl| self.now() < dl)
+            && self.since(t0) < max_span
+        {
+            let attempt = self.now();
+            match self.can.receive_timestamped() {
+                Ok((frame, rx_ts)) => {
+                    frames_processed += 1;
+                    if let Ok(feedback) = robstride::unpack_feedback_frame(&frame, &self.limits) {
+                        if let Some(idx) = self.motor_ids.iter().position(|&id| id == feedback.motor_id) {
+                            let decode_now = self.now();
+                            let rx_at = rx_ts.map_or(decode_now, |ts| ts.min(decode_now));
+                            let in_settle = self.motor_torque_settle_until[idx]
+                                .is_some_and(|until| rx_at < until);
+                            self.cached_states[idx] = JointState {
+                                position: feedback.position,
+                                velocity: feedback.velocity,
+                                torque: feedback.torque,
+                                temperature: feedback.mos_temperature,
+                            };
+                            self.fault_flags[idx] = feedback.fault_flags;
+                            if in_settle {
+                                // E1: Feedback received earlier than write_done + SETTLE is never
+                                // evidence for rest pose; clear freshness/queue bounds so it
+                                // cannot authorize a stopped disable.
+                                self.last_feedback_instant[idx] = None;
+                                self.feedback_queue_bound[idx] = None;
+                                self.feedback_continuity_epoch[idx] =
+                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
+                                continue;
+                            }
+                            let prev_rx = self.last_feedback_instant[idx];
+                            let prev_qb = self.feedback_queue_bound[idx];
+                            if prev_rx.is_none_or(|p| rx_at.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                                || prev_qb.is_none_or(|qb| rx_at.saturating_duration_since(qb) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                                || !feedback.position.is_finite()
+                            {
+                                self.feedback_continuity_epoch[idx] =
+                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
+                            }
+                            self.last_feedback_instant[idx] = Some(rx_at);
+                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
+                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
+                        }
+                    }
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    rx_drained = true;
+                    self.rx_empty_instant = Some(attempt);
+                    self.last_read_drained = true;
+                    self.awaiting_rx_boundary = false;
+                    break;
+                }
+                Err(_) => {
+                    hit_err = true;
+                    break;
+                }
+            }
+        }
+        (frames_processed as u16, rx_drained, hit_err)
+    }
+
+    fn disable_torque_with_drain(
+        &mut self,
+        kind: DisableKind,
+        max_rx_frames: Option<u16>,
+    ) -> Result<(), ArmDriverError> {
+        let prev_awaiting = self.awaiting_rx_boundary;
+        self.awaiting_rx_boundary = match max_rx_frames {
+            Some(0) => self.awaiting_rx_boundary || !self.last_read_drained,
+            Some(limit) => {
+                let (_, drained, _) =
+                    self.drain_rx_bounded(usize::from(limit.min(64)), None, Duration::from_millis(5));
+                !drained
+            }
+            None => {
+                let (_, drained, _) = self.drain_rx_bounded(128, None, Duration::from_millis(5));
+                !drained
+            }
+        };
+        let mut wrote_any = false;
+        let mut refused_err = None;
+        let mut last_err = None;
+        for idx in 0..self.motor_ids.len() {
+            let id = self.motor_ids[idx];
+            match self.send_stop_frame(idx, id, kind) {
+                Ok(()) => wrote_any = true,
+                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
+                    refused_err = Some(e);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if !wrote_any && last_err.is_none() {
+            if let Some(e) = refused_err {
+                self.awaiting_rx_boundary = prev_awaiting || !self.last_read_drained;
+                return Err(e);
+            }
+        }
+        if wrote_any {
+            if let Err(e) = self.can.flush() {
+                last_err = Some(e.into());
+            }
+        }
+        if let Some(e) = refused_err.or(last_err) {
+            return Err(e);
+        }
+        Ok(())
+    }
+
     pub fn with_gains(mut self, kp: f32, kd: f32) -> Self {
         self.default_kp = kp;
         self.default_kd = kd;
@@ -11694,6 +11832,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         if joints.is_empty() || out.len() < joints.len() {
             return false;
         }
+        // E2: A cached resting pose never authorizes a disable while newer RX frames may still be
+        // queued (`awaiting_rx_boundary` or incomplete last drain).
+        if self.awaiting_rx_boundary || !self.last_read_drained {
+            return false;
+        }
         let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
@@ -11738,68 +11881,14 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         deadline: Instant,
         max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
-        let max_frames = usize::from(max_rx_frames.min(64));
-        let t0 = self.now();
-        let mut frames_processed = 0;
-        let mut rx_drained = false;
-        let mut hit_err = false;
-        while frames_processed < max_frames && self.now() < deadline && self.since(t0) < Duration::from_micros(2000) {
-            let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
-                    frames_processed += 1;
-                    if let Ok(feedback) = robstride::unpack_feedback_frame(&frame, &self.limits) {
-                        if let Some(idx) = self.motor_ids.iter().position(|&id| id == feedback.motor_id) {
-                            let decode_now = self.now();
-                            let rx_at = rx_ts.map_or(decode_now, |ts| ts.min(decode_now));
-                            let in_settle = self.motor_torque_settle_until[idx]
-                                .is_some_and(|until| rx_at < until);
-                            self.cached_states[idx] = JointState {
-                                position: feedback.position,
-                                velocity: feedback.velocity,
-                                torque: feedback.torque,
-                                temperature: feedback.mos_temperature,
-                            };
-                            self.fault_flags[idx] = feedback.fault_flags;
-                            if in_settle {
-                                // E1: Feedback received earlier than write_done + SETTLE is never
-                                // evidence for rest pose; clear freshness/queue bounds so it
-                                // cannot authorize a stopped disable.
-                                self.last_feedback_instant[idx] = None;
-                                self.feedback_queue_bound[idx] = None;
-                                self.feedback_continuity_epoch[idx] =
-                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
-                                continue;
-                            }
-                            let prev_rx = self.last_feedback_instant[idx];
-                            let prev_qb = self.feedback_queue_bound[idx];
-                            if prev_rx.is_none_or(|p| rx_at.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                                || prev_qb.is_none_or(|qb| rx_at.saturating_duration_since(qb) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                                || !feedback.position.is_finite()
-                            {
-                                self.feedback_continuity_epoch[idx] =
-                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
-                            }
-                            self.last_feedback_instant[idx] = Some(rx_at);
-                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
-                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                        }
-                    }
-                }
-                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
-                    rx_drained = true;
-                    self.rx_empty_instant = Some(attempt);
-                    break;
-                }
-                Err(_) => {
-                    hit_err = true;
-                    break;
-                }
-            }
-        }
+        let (frames_processed, rx_drained, hit_err) = self.drain_rx_bounded(
+            usize::from(max_rx_frames.min(64)),
+            Some(deadline),
+            Duration::from_micros(2000),
+        );
         out.clear();
         out.extend_from_slice(&self.cached_states);
-        Ok((frames_processed as u16, !rx_drained && !hit_err))
+        Ok((frames_processed, !rx_drained && !hit_err))
     }
 
     fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
@@ -11840,7 +11929,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
         // `build_clear_fault_frame` sends type-4 (`TYPE_STOP`) frames with `data[0] = 1`
         // (documented under the motor-stop command; hardware behaviour unverified). Fail closed
-        // by routing every write through the same per-write disable choke point as `disable_torque`.
+        // by draining RX and routing every write through the same per-write disable choke point
+        // as `disable_torque`.
+        let prev_awaiting = self.awaiting_rx_boundary;
+        let (_, drained, _) = self.drain_rx_bounded(128, None, Duration::from_millis(5));
+        self.awaiting_rx_boundary = !drained;
         let started_at = self.now();
         let kind = DisableKind::DisableRequested {
             started_at,
@@ -11859,6 +11952,12 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                     break;
                 }
                 Err(e) => last_err = Some(e),
+            }
+        }
+        if !wrote_any && last_err.is_none() {
+            if let Some(e) = refused_err {
+                self.awaiting_rx_boundary = prev_awaiting || !self.last_read_drained;
+                return Err(e);
             }
         }
         if wrote_any {
@@ -11913,29 +12012,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
-        let mut wrote_any = false;
-        let mut refused_err = None;
-        let mut last_err = None;
-        for idx in 0..self.motor_ids.len() {
-            let id = self.motor_ids[idx];
-            match self.send_stop_frame(idx, id, kind) {
-                Ok(()) => wrote_any = true,
-                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
-                    refused_err = Some(e);
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        if wrote_any {
-            if let Err(e) = self.can.flush() {
-                last_err = Some(e.into());
-            }
-        }
-        if let Some(e) = refused_err.or(last_err) {
-            return Err(e);
-        }
-        Ok(())
+        self.disable_torque_with_drain(kind, None)
     }
 
     fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
@@ -11944,16 +12021,17 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     }
 
     fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
-        self.disable_torque(kind)
+        self.disable_torque_with_drain(kind, None)
             .map(|()| TorqueProgress::Done(TorqueOutcome::Unconfirmed))
     }
 
     fn begin_disable_torque_budgeted(
         &mut self,
         kind: DisableKind,
-        _max_rx_frames: u16,
+        max_rx_frames: u16,
     ) -> Result<TorqueProgress, ArmDriverError> {
-        self.begin_disable_torque(kind)
+        self.disable_torque_with_drain(kind, Some(max_rx_frames))
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Unconfirmed))
     }
 
     fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -12087,68 +12165,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-        let t0 = self.now();
-        let mut frames_processed = 0;
-        while frames_processed < 64 {
-            // Taken before the receive: an empty result means the queue was empty after it.
-            let attempt = self.now();
-            match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => {
-                    frames_processed += 1;
-                    if let Ok(feedback) = robstride::unpack_feedback_frame(&frame, &self.limits) {
-                        if let Some(idx) = self
-                            .motor_ids
-                            .iter()
-                            .position(|&id| id == feedback.motor_id)
-                        {
-                            let decode_now = self.now();
-                            let rx_at = rx_ts.map_or(decode_now, |ts| ts.min(decode_now));
-                            let in_settle = self.motor_torque_settle_until[idx]
-                                .is_some_and(|until| rx_at < until);
-                            self.cached_states[idx] = JointState {
-                                position: feedback.position,
-                                velocity: feedback.velocity,
-                                torque: feedback.torque,
-                                temperature: feedback.mos_temperature,
-                            };
-                            self.fault_flags[idx] = feedback.fault_flags;
-                            if in_settle {
-                                // E1: Feedback received earlier than write_done + SETTLE is never
-                                // evidence for rest pose.
-                                self.last_feedback_instant[idx] = None;
-                                self.feedback_queue_bound[idx] = None;
-                                self.feedback_continuity_epoch[idx] =
-                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
-                                if frames_processed >= 64 || self.since(t0) >= Duration::from_micros(2000) {
-                                    break;
-                                }
-                                continue;
-                            }
-                            let prev_rx = self.last_feedback_instant[idx];
-                            let prev_qb = self.feedback_queue_bound[idx];
-                            if prev_rx.is_none_or(|p| rx_at.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                                || prev_qb.is_none_or(|qb| rx_at.saturating_duration_since(qb) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-                                || !feedback.position.is_finite()
-                            {
-                                self.feedback_continuity_epoch[idx] =
-                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
-                            }
-                            self.last_feedback_instant[idx] = Some(rx_at);
-                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
-                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                        }
-                    }
-                    if frames_processed >= 64 || self.since(t0) >= Duration::from_micros(2000) {
-                        break;
-                    }
-                }
-                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
-                    self.rx_empty_instant = Some(attempt);
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
+        let _ = self.drain_rx_bounded(64, None, Duration::from_micros(2000));
         Ok(self.cached_states.clone())
     }
 }
