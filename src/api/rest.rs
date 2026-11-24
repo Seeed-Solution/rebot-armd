@@ -1014,6 +1014,11 @@ pub async fn auth_unlock(
     let (token, expires_in_s) = auth.unlock(&req.pin).map_err(|e| match e {
         crate::auth::UnlockError::InvalidPin => ApiError::invalid_pin(),
         crate::auth::UnlockError::RateLimited { retry_after_s } => ApiError::rate_limited(retry_after_s),
+        crate::auth::UnlockError::SessionsFull => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Maximum active operator sessions reached".into(),
+            "OPERATOR_SESSIONS_FULL".into(),
+        ),
         crate::auth::UnlockError::RngFailed => ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to generate session token".into(),
