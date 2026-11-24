@@ -75,6 +75,7 @@ impl SupervisorInner {
         if self.policy_run.is_some() {
             self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
         }
+        if self.gripper_reference_active() { self.hold_gripper_at_measured(); }
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -82,6 +83,7 @@ impl SupervisorInner {
         self.pending_normal_unload = false;
         self.unload_settle = None;
         self.zero_check_persisting = None;
+        self.end_gripper_stream();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
     }
 
@@ -101,6 +103,9 @@ impl SupervisorInner {
         self.unload_settle = None;
         self.active_trajectory = None;
         self.release_servo_target();
+        self.gripper_stream_target = None;
+        self.gripper_stream_contact = None;
+        self.gripper_stream_lease = None;
 
         // Lock onto measured_positions only when finite and the supervisor's own coherent
         // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
@@ -143,6 +148,11 @@ impl SupervisorInner {
             crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
         }
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+        if let (Some(g), Some(h)) = (self.config.gripper_index(), self.gripper_motion_hold.as_mut()) {
+            if g < self.commanded_positions.len() {
+                h.0 = self.commanded_positions[g];
+            }
+        }
 
         // Transition floating gravity compensation to Exiting using the freshness-gated
         // hold position (never overwriting pre-stop commands with stale readings and never taking
@@ -217,6 +227,11 @@ impl SupervisorInner {
         // instead of dropping active lead in a single tick.
         if policy != StopPolicy::NormalUnload {
             self.tracking.invalidate();
+        }
+        // Hold J7 at measured on non-park stops, except EStopLatch which applies its own
+        // non-blocking 250 ms feedback freshness gate before snapping commanded_positions.
+        if policy != StopPolicy::NormalUnload && policy != StopPolicy::EStopLatch && self.gripper_reference_active() {
+            self.hold_gripper_at_measured();
         }
         match policy {
             StopPolicy::NormalUnload => {
@@ -395,7 +410,7 @@ impl SupervisorInner {
                 self.stop_motion();
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
-                self.thermal_below_since = None;
+                self.thermal_cooldown.reset();
                 let (joint_idx, temperature) = self.temperatures.iter().copied().enumerate()
                     .filter(|(_, t)| t.is_finite()).max_by(|a,b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
                 self.safety.latch(
@@ -424,6 +439,9 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.active_trajectory = None;
                 self.release_servo_target();
+                self.gripper_stream_target = None;
+                self.gripper_stream_contact = None;
+                self.gripper_stream_lease = None;
                 if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
                 {
@@ -679,6 +697,9 @@ impl SupervisorInner {
             self.unload_settle = None;
             self.active_trajectory = None;
             self.release_servo_target();
+            self.gripper_stream_target = None;
+            self.gripper_stream_contact = None;
+            self.gripper_stream_lease = None;
             self.servo_settled_ticks.fill(0);
             self.servo_ws_min_depths = None;
             self.servo_stream_active = false;

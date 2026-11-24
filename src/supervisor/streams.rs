@@ -300,6 +300,7 @@ impl SupervisorInner {
     pub(super) fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
         if let Some(g_idx) = self.config.gripper_index() {
             self.gripper_stream_target = targets.get(g_idx).copied().filter(|t| t.is_finite());
+            self.gripper_stream_lease = self.active_lease.as_ref().map(|l| l.generation);
             if self.gripper_stalled && targets.len() > g_idx && self.commanded_positions.len() > g_idx {
                 let delta = targets[g_idx] - self.commanded_positions[g_idx];
                 let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);

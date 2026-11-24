@@ -2507,24 +2507,27 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
     });
     let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     inner.tick(0.02);
-    // Let 50 ms of real wall-clock dwell accrue while still below the 80 ms cooldown requirement.
-    std::thread::sleep(Duration::from_millis(50));
+    // Advance 50 ms on driver clock with a second fresh cool sample -> 50 ms dwell (< 80 ms required).
+    clock.advance(Duration::from_millis(50));
+    bus.with(|s| s.push_all_feedback());
+    let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     let err_mid = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
-    assert!(
-        matches!(err_mid, ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { required_ms: 80, .. })),
-        "expected ThermalCooldownNotElapsed mid-dwell, got {err_mid:?}"
+    assert_eq!(
+        err_mid,
+        ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed {
+            elapsed_ms: 50,
+            required_ms: 80,
+        })
     );
 
     // Now make temperature feedback stale (> 250 ms old) and tick: cooldown timer MUST reset!
     clock.advance(Duration::from_millis(300));
     let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     inner.tick(0.02);
-    // Wait another 50 ms while stale (total wall time since initial cool > 100 ms > 80 ms!)
-    std::thread::sleep(Duration::from_millis(50));
     let err_stale = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(err_stale, ClearFaultError::Rejected(ClearRefusal::FreshFeedbackRequired));
 
-    // Fresh cool feedback resumes: because stale temp reset the timer, cooldown MUST start from ~0 ms
+    // Fresh cool feedback resumes: because stale temp reset the timer, cooldown MUST start from 0 ms
     // and refuse immediately (must NOT inherit pre-stale dwell!).
     bus.with(|s| {
         s.motors[0].temperature_c = 40;
@@ -2536,15 +2539,15 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
     let _ = alloc::take();
     let err_restarted = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(alloc::take().calls, 0, "restarted cooldown refusal must do 0 heap ops");
-    match err_restarted {
-        ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms, required_ms }) => {
-            assert_eq!(required_ms, 80);
-            assert!(elapsed_ms < 40, "cooldown timer must have reset on stale temp, got elapsed_ms={elapsed_ms}");
-        }
-        other => panic!("expected restarted ThermalCooldownNotElapsed after stale gap, got {other:?}"),
-    }
-    // After a FULL fresh 85 ms dwell -> clears cleanly!
-    std::thread::sleep(Duration::from_millis(85));
+    assert_eq!(
+        err_restarted,
+        ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed {
+            elapsed_ms: 0,
+            required_ms: 80,
+        })
+    );
+    // After a FULL fresh 85 ms dwell (<= 250 ms sample gap) with a fresh cool sample -> clears cleanly!
+    clock.advance(Duration::from_millis(85));
     bus.with(|s| s.push_all_feedback());
     let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
     assert_eq!(
@@ -2774,5 +2777,899 @@ fn step5_write_output_error_is_bounded_zero_alloc_on_normal_and_estop_hold() {
     assert_eq!(
         inhib_allocs.calls, 0,
         "Step-5 EstopInhibited error must do 0 heap allocations: {inhib_allocs:?}"
+    );
+}
+
+#[test]
+fn thermal_cooldown_restarts_across_unobserved_stale_gap_without_tick() {
+    let make_rig = |use_executor: bool| {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors { m.temperature_c = 40; }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.max_temperature = 75.0;
+        cfg.resting_pose = None;
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.thermal_cooldown_duration = Duration::from_millis(80);
+        inner.safety.set_off_thread_reclaim(use_executor);
+        inner.safety.latch(
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 },
+        );
+        (inner, bus, clock)
+    };
+
+    // 1. Legacy clear_fault AND RT executor clear_fault_executor_bounded:
+    //    An unobserved gap (> 250 ms) with NO intermediate tick/check between two fresh cool samples
+    //    MUST restart the cooldown dwell from the second fresh sample (never continuing the old dwell).
+    for use_executor in [false, true] {
+        let (mut inner, bus, clock) = make_rig(use_executor);
+        // Sample 1 at t = 0 ms (fresh, cool).
+        bus.with(|s| s.push_all_feedback());
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+        } else {
+            let _ = inner.clear_fault().unwrap_err();
+        }
+        // Sample 2 at t = 60 ms (gap 60 ms <= 250 ms -> dwell = 60 ms < 80 ms).
+        clock.advance(Duration::from_millis(60));
+        bus.with(|s| s.push_all_feedback());
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(err, ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms: 60, required_ms: 80 }));
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert!(err.to_string().contains("60 ms of 80 ms"), "expected 60 ms dwell before gap: {err}");
+        }
+
+        // Unobserved 300 ms stale gap (> 250 ms) with ZERO ticks or intermediate checks!
+        // A fresh cool sample then arrives BEFORE the next check (age = 0 ms <= 250 ms).
+        clock.advance(Duration::from_millis(300));
+        bus.with(|s| s.push_all_feedback());
+
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            alloc::time_this_thread();
+            let _ = alloc::take();
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(alloc::take().calls, 0, "restarted cooldown refusal after unobserved gap must do 0 heap ops");
+            assert_eq!(
+                err,
+                ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms: 0, required_ms: 80 }),
+                "unobserved >250ms gap without tick must restart dwell to 0 ms"
+            );
+        } else {
+            // Legacy clear_fault reads the new fresh sample directly with zero ticks in between.
+            let err = inner.clear_fault().unwrap_err();
+            assert!(
+                err.to_string().contains("0 ms of 80 ms"),
+                "legacy clear_fault must restart dwell to 0 ms after unobserved gap: {err}"
+            );
+        }
+        assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+
+        // 2. Single fresh sample does NOT accrue dwell merely by waiting (no new sample arrived):
+        //    advance 100 ms (< 250 ms fresh) without pushing any new frame -> dwell stays 0 ms!
+        clock.advance(Duration::from_millis(100));
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+            assert_eq!(
+                err,
+                ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms: 0, required_ms: 80 }),
+                "elapsed time without a newer fresh sample must not accrue cooldown dwell"
+            );
+        } else {
+            let err = inner.clear_fault().unwrap_err();
+            assert!(err.to_string().contains("0 ms of 80 ms"), "no new sample must keep dwell at 0 ms: {err}");
+        }
+
+        // 3. Consecutive fresh cool sample arrives 100 ms after restart (gap = 100 ms <= 250 ms -> dwell = 100 ms >= 80 ms) -> clears!
+        bus.with(|s| s.push_all_feedback());
+        if use_executor {
+            let _ = inner.poll_hardware(&ServiceBudget::for_release(clock.now(), clock.now() + Duration::from_millis(20)));
+            assert_eq!(
+                inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap(),
+                SafetyState::Idle
+            );
+        } else {
+            assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+        }
+    }
+
+    // 4. Per-joint unobserved gap: J1..J6 keep sending fresh samples while J0 has a 280 ms gap (> 250 ms)
+    //    and then sends a fresh sample before the next check -> dwell restarts!
+    let (mut inner, bus, clock) = make_rig(false);
+    bus.with(|s| s.push_all_feedback());
+    let _ = inner.clear_fault().unwrap_err(); // t = 0
+    clock.advance(Duration::from_millis(60));
+    bus.with(|s| s.push_all_feedback());
+    let err60 = inner.clear_fault().unwrap_err();
+    assert!(err60.to_string().contains("60 ms of 80 ms"), "{err60}");
+    // J1..J6 update at t = 220 ms (gap 160 ms), J0 stays at t = 60 ms.
+    clock.advance(Duration::from_millis(160));
+    bus.with(|s| { for i in 1..7 { s.push_feedback(i); } });
+    let err_same = inner.clear_fault().unwrap_err(); // oldest is still J0 at 60 ms (age 160 ms <= 250 ms)
+    assert!(err_same.to_string().contains("60 ms of 80 ms"), "{err_same}");
+    // Now advance 120 ms (t = 340 ms): J0 gap since 60 ms is 280 ms (> 250 ms!), while J1..J6 gap is 120 ms.
+    // All 7 push fresh frames at t = 340 ms with no intermediate check -> J0's 280 ms gap restarts dwell!
+    clock.advance(Duration::from_millis(120));
+    bus.with(|s| s.push_all_feedback());
+    let err_restart = inner.clear_fault().unwrap_err();
+    assert!(
+        err_restart.to_string().contains("0 ms of 80 ms"),
+        "per-joint >250ms gap must restart dwell to 0 ms: {err_restart}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_clear_fault_carries_epoch_and_refuses_after_newer_estop() {
+    use armd::rt_core::executor::ExecutorClock;
+
+    struct StepClock {
+        origin: Instant,
+        state: Mutex<(u64, u64)>, // (now_ns, sleeping_waiters)
+        cv: Condvar,
+    }
+    impl StepClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                state: Mutex::new((0, 0)),
+                cv: Condvar::new(),
+            })
+        }
+        fn wait_until_parked(&self) {
+            let mut g = self.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while g.1 == 0 {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                assert!(!rem.is_zero(), "timed out waiting for armd-control to park on StepClock");
+                g = self.cv.wait_timeout(g, rem).unwrap().0;
+            }
+        }
+        fn advance(&self, dur: Duration) {
+            let mut g = self.state.lock().unwrap();
+            g.0 = g.0.saturating_add(dur.as_nanos() as u64);
+            self.cv.notify_all();
+        }
+    }
+    impl ExecutorClock for StepClock {
+        fn now(&self) -> Instant {
+            let ns = self.state.lock().unwrap().0;
+            self.origin + Duration::from_nanos(ns)
+        }
+        fn now_ns(&self) -> u64 {
+            self.state.lock().unwrap().0
+        }
+        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+            let mut g = self.state.lock().unwrap();
+            g.1 += 1;
+            self.cv.notify_all();
+            while !stop.load(Ordering::Acquire) && g.0 < target_ns {
+                g = self.cv.wait_timeout(g, Duration::from_millis(5)).unwrap().0;
+            }
+            g.1 -= 1;
+        }
+        fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+            let target = self.now_ns().saturating_add(dur.as_nanos() as u64);
+            self.sleep_until_ns(target, stop);
+        }
+        fn wake(&self) {
+            self.cv.notify_all();
+        }
+    }
+
+    // 1. Live RtExecutor: queue ClearFault(Some(e)), latch a newer E-stop B before the release runs,
+    //    then step armd-control -> refused with EpochMismatch, latch kept, 0 heap allocs.
+    let period = Duration::from_millis(20);
+    let step_clock = StepClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    {
+        let mut g = sup.inner().write().await;
+        g.lease_enabled = false;
+    }
+    let mut exec_cfg = ExecutorConfig::for_tests(period);
+    exec_cfg.alloc_timing = true;
+    let hooks = PersistTestHooks {
+        clock: Some(step_clock.clone()),
+        ..Default::default()
+    };
+    let handle = sup.start_executor_with_hooks(exec_cfg, hooks).await.unwrap();
+    let step_one = |target_steps: u64| {
+        step_clock.wait_until_parked();
+        step_clock.advance(period);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.stats().steps.load(Ordering::Acquire) < target_steps {
+            assert!(Instant::now() < deadline, "timed out waiting for step {target_steps}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // Warm up every StateHub slot and per-tick scratch buffer before measuring release allocations.
+    let mut expected_steps = handle.stats().steps.load(Ordering::Acquire);
+    for _ in 0..8 {
+        expected_steps += 1;
+        step_one(expected_steps);
+    }
+    step_clock.wait_until_parked();
+
+    // Latch E-stop A and observe epoch e.
+    let estop_a = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.trigger_e_stop_checked().await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    expected_steps += 1;
+    step_one(expected_steps);
+    let (state_a, epoch_a) = estop_a.await.unwrap().unwrap();
+    assert_eq!(state_a, SafetyState::EStop);
+    step_clock.wait_until_parked();
+
+    // While armd-control is parked between releases:
+    // (a) Queue ClearFault carrying client-observed epoch_a.
+    let clear_stale = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.clear_fault_for_epoch(Some(epoch_a)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    // (b) Latch a newer E-stop B before the queued clear is applied.
+    let estop_b = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.trigger_e_stop_checked().await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Step one release: Step 1 applies E-stop B (epoch_a + 1), Step 2b evaluates queued ClearFault(epoch_a).
+    expected_steps += 1;
+    step_one(expected_steps);
+    let (state_b, epoch_b) = estop_b.await.unwrap().unwrap();
+    assert_eq!(state_b, SafetyState::EStop);
+    assert_eq!(epoch_b, epoch_a + 1);
+
+    let clear_res = clear_stale.await.unwrap();
+    assert!(
+        matches!(
+            clear_res,
+            Err(ArmError::Safety(SafetyError::EpochMismatch { expected, received }))
+                if expected == epoch_b && received == epoch_a
+        ),
+        "queued ClearFault with stale epoch_a must be refused after newer E-stop B: {clear_res:?}"
+    );
+    let obs_after_refuse = sup.hub().latest().expect("published observation");
+    assert_eq!(obs_after_refuse.obs.safety_state, SafetyState::EStop, "latch must stay active");
+    assert_eq!(obs_after_refuse.obs.epoch_id, epoch_b);
+
+    let refuse_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
+    let refuse_sample = expect_release_sample(&sup, refuse_seq, "executor stale-epoch clear refusal").await;
+    assert_ne!(refuse_sample.release_flags & RELEASE_FLAG_CLEAR_REFUSED, 0);
+    assert_eq!(refuse_sample.usage.lock_alloc_calls, 0, "stale-epoch clear refusal allocated: {refuse_sample:?}");
+
+    // Queuing ClearFault with the exact current epoch_b clears cleanly with 0 allocs.
+    step_clock.wait_until_parked();
+    let clear_exact = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.clear_fault_for_epoch(Some(epoch_b)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    expected_steps += 1;
+    step_one(expected_steps);
+    assert_eq!(clear_exact.await.unwrap().unwrap(), SafetyState::Idle);
+    let ok_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
+    assert!(ok_seq > refuse_seq);
+    let ok_sample = expect_release_sample(&sup, ok_seq, "executor exact-epoch clear ok").await;
+    assert_ne!(ok_sample.release_flags & RELEASE_FLAG_CLEAR_OK, 0);
+    assert_eq!(ok_sample.usage.lock_alloc_calls, 0, "exact-epoch clear allocated: {ok_sample:?}");
+
+    step_clock.advance(period);
+    handle.stop_and_join();
+
+    // 2. Owner-level direct check: pending unconsumed E-stop B arriving right before
+    //    clear_fault_executor_bounded_for_epoch(Some(e)) -> EpochMismatch (0 heap allocs).
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+    inner.lease_enabled = false;
+    inner.safety.set_off_thread_reclaim(true);
+    inner.apply_stop_policy(StopPolicy::EStopLatch);
+    let e = inner.safety.epoch_id();
+    // Simulate a newer E-stop B queued before clear_fault runs on owner.
+    inner.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+    alloc::time_this_thread();
+    let _ = alloc::take();
+    let err = inner
+        .clear_fault_executor_bounded_for_epoch(Instant::now() + Duration::from_millis(50), Some(e))
+        .unwrap_err();
+    assert_eq!(alloc::take().calls, 0, "pending-estop EpochMismatch on executor path allocated");
+    assert_eq!(err, ClearFaultError::EpochMismatch { expected: e + 1, received: e });
+    assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert_eq!(inner.safety.epoch_id(), e + 1);
+    // Exact epoch clears cleanly with 0 heap allocs.
+    let _ = alloc::take();
+    let cleared = inner
+        .clear_fault_executor_bounded_for_epoch(Instant::now() + Duration::from_millis(50), Some(e + 1))
+        .unwrap();
+    assert_eq!(alloc::take().calls, 0, "exact-epoch clear_fault_executor_bounded_for_epoch allocated");
+    assert_eq!(cleared, SafetyState::Idle);
+}
+
+#[test]
+fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
+    use armd::mit::{self, MitJointQualification, MitQualificationFile};
+    use armd::protocol::damiao;
+    use armd::tracking::{JointTrackingConfig, TrackingStrategy};
+
+    const DT: f64 = 0.02;
+    let setup_mit_lost = |advance_past_quiet: bool| {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+
+        let mut jt = JointTrackingConfig::rebot_dm();
+        jt.enabled = true;
+        for j in &mut jt.joints { j.strategy = TrackingStrategy::Position; }
+        let j4 = &mut jt.joints[3];
+        j4.strategy = TrackingStrategy::Mit;
+        j4.kp = 10.0;
+        j4.kd = 0.3;
+        j4.hold_kp = Some(12.0);
+        j4.hold_kd = Some(0.4);
+        j4.effort_limit_nm = 3.0;
+        j4.gravity_scale = 1.0;
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 50,
+            workspace: None,
+            joint_tracking: Some(jt),
+            max_temperature: 75.0,
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.max_temperature = 75.0;
+        let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+        let l4 = limits[3];
+        let rec = MitQualificationFile {
+            version: mit::QUALIFICATION_VERSION,
+            joints: vec![MitJointQualification {
+                profile_id: "rebot_b601dm".into(),
+                joint: 4,
+                joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
+                zero_fingerprint: mit::zero_fingerprint(0.0),
+                motor_id: 4,
+                reply_id: 0x14,
+                esc_id: 4,
+                mst_id: 0x14,
+                sw_ver: mit_support::SW_VER,
+                pmax: l4.p_max,
+                vmax: l4.v_max,
+                tmax: l4.t_max,
+                timeout_raw: 2000,
+                timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
+                timeout_unit_verified: true,
+                tested_response: "disabled".into(),
+                measured_expiry_ms: 101.0,
+                worst_latency_ms: 8.0,
+                load_envelope: "unloaded, supported".into(),
+                max_kp: 15.0,
+                max_kd: 0.5,
+                effort_ceiling_nm: 4.0,
+                date: "2026-11-22T00:00:00Z".into(),
+                trace_id: "b3f-item3".into(),
+            }],
+            invalidated: None,
+        };
+        inner.set_calibration(Some(armd::calibration::CalibrationFile {
+            mit_qualification: serde_json::to_value(&rec).ok(),
+            ..Default::default()
+        }));
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        for _ in 0..3 { inner.tick(DT); }
+        assert!(inner.mit_active());
+        bus.with(|s| s.fail_tx_after = Some(3));
+        inner.tick(DT);
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        bus.with(|s| s.fail_tx_after = None);
+        if advance_past_quiet {
+            for _ in 0..8 {
+                clock.advance(Duration::from_millis(50));
+                inner.tick(DT);
+            }
+            assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled));
+        }
+        (inner, bus, clock)
+    };
+
+    // (a) Quiet-period refusal MUST NOT ack the fence: after holdoff elapses, background ticks
+    //     must still emit 0 autonomous 0xCC CAN refresh frames.
+    {
+        let (mut inner, bus, clock) = setup_mit_lost(false);
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(err.to_string().contains("quiet") || err.to_string().contains("MIT_QUIET_PERIOD") || err.to_string().contains("ms"), "{err}");
+        assert!(bus.tx_log().is_empty(), "quiet-period refusal sent frames: {:?}", bus.tx_log());
+        clock.advance(Duration::from_millis(350));
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(
+            bus.tx_log().is_empty(),
+            "failed quiet-period clear must NOT ack fence or unlock autonomous CAN refresh: {:?}",
+            bus.tx_log()
+        );
+    }
+
+    // (b) WatchdogTimeout with active lease + stale heartbeat MUST refuse in pre_ctx BEFORE
+    //     even polling 0xCC, leaving fence unacked and state unchanged.
+    {
+        let (mut inner, bus, clock) = setup_mit_lost(true);
+        inner.lease_enabled = true;
+        let _ = inner.acquire_lease("mit-wd").unwrap();
+        inner.last_heartbeat = Instant::now() - Duration::from_millis(80);
+        inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(err.to_string().contains("heartbeat"), "expected heartbeat refusal: {err}");
+        assert!(bus.tx_log().is_empty(), "stale heartbeat must refuse before any CAN poll: {:?}", bus.tx_log());
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(bus.tx_log().is_empty(), "fence must stay unacked after heartbeat refusal: {:?}", bus.tx_log());
+    }
+
+    // (c) Hot ThermalTrip during MIT recovery MUST refuse in full clear_check with ZERO fence ack
+    //     and ZERO supervisor state mutation (temperatures/positions/mit.owner unchanged).
+    {
+        let (mut inner, bus, clock) = setup_mit_lost(true);
+        inner.safety.latch(
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 82.0, limit: 75.0 },
+        );
+        let temps_before = inner.temperatures.clone();
+        let pos_before = inner.measured_positions.clone();
+        bus.with(|s| {
+            s.motors[0].temperature_c = 85;
+            s.motors[0].q = 0.25;
+        });
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(err.to_string().contains("Temperature must be confirmed below the reset threshold"), "{err}");
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mit.owner must not change before clear_check passes");
+        assert_eq!(inner.temperatures, temps_before, "temperatures must not mutate when clear_check refuses");
+        assert_eq!(inner.measured_positions, pos_before, "measured_positions must not mutate when clear_check refuses");
+        assert!(
+            bus.tx_log().iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "no recovery commands allowed when clear_check refuses: {:?}",
+            bus.tx_log()
+        );
+        // Subsequent ticks MUST send 0 autonomous CAN refresh frames (fence was NOT acked!).
+        bus.clear_log();
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(
+            bus.tx_log().is_empty(),
+            "autonomous CAN refresh must stay blocked after ThermalTrip refused MIT clear: {:?}",
+            bus.tx_log()
+        );
+
+        // (d) Cool motor 0 to 35 C and move J0 to 0.40 rad, but omit confirmation -> refused with
+        //     RECOVERY_CONFIRM_CODE, still ZERO fence ack and ZERO state mutation!
+        let pos_before_unconf = inner.measured_positions.clone();
+        let temps_before_unconf = inner.temperatures.clone();
+        bus.with(|s| {
+            s.motors[0].temperature_c = 35;
+            s.motors[0].q = 0.40;
+        });
+        let err_unconf = inner.clear_fault_confirmed(false).unwrap_err();
+        assert!(matches!(err_unconf, ArmError::Rejected { ref code, .. } if code == mit::RECOVERY_CONFIRM_CODE), "{err_unconf}");
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        assert_eq!(inner.measured_positions, pos_before_unconf);
+        assert_eq!(inner.temperatures, temps_before_unconf);
+        bus.clear_log();
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(
+            bus.tx_log().is_empty(),
+            "autonomous CAN refresh must stay blocked when recovery confirmation is missing: {:?}",
+            bus.tx_log()
+        );
+
+        // (e) Now full clear_check passes + confirmed -> recovery succeeds, clears to Idle,
+        //     mit.owner becomes Off, and fence is now acknowledged so read-only polls may resume.
+        let cleared = inner.clear_fault_confirmed(true).unwrap();
+        assert_eq!(cleared, SafetyState::Idle);
+        assert_eq!(inner.mit.owner, mit::MitOwner::Off);
+        assert!(!inner.is_torqued);
+        bus.clear_log();
+        clock.advance(Duration::from_millis(150));
+        inner.tick(DT);
+        assert!(
+            bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "after full clear_check passes and recovery clears, read-only 0xCC polling resumes"
+        );
+    }
+}
+
+#[test]
+fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq() {
+    use armd::mit;
+
+    // 1. Driver whose `mit_expiry_recover()` returns Ok(()) without receiving any post-recovery
+    //    feedback frame (feedback_seqs stays unchanged, cached age is 5 ms <= 250 ms):
+    //    final MIT check MUST refuse with FreshFeedbackRequired and keep the fault latched!
+    struct CachedMitRecoveryDriver {
+        dof: usize,
+        seqs: Vec<u64>,
+        states: Vec<JointState>,
+        recovered_called: Arc<AtomicBool>,
+    }
+    impl ArmDriver for CachedMitRecoveryDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Disabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(5)); self.dof] }
+        fn feedback_seqs(&self) -> Vec<u64> { self.seqs.clone() }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            // Returns pre-recovery cached states without advancing `seqs`.
+            Ok(self.states.clone())
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
+            // Simulate J4 expired (0x0D), others enabled (1) -> triggers MIT expiry recovery path.
+            let mut st = vec![1u8; self.dof];
+            st[3] = 0x0D;
+            Ok(st)
+        }
+        fn mit_expiry_recover(&mut self) -> Result<(), String> {
+            self.recovered_called.store(true, Ordering::SeqCst);
+            // Intentionally does NOT advance `self.seqs` (simulates stale/cached readback).
+            Ok(())
+        }
+    }
+
+    let cfg = ArmConfig {
+        resting_pose: None,
+        workspace: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let recovered_called = Arc::new(AtomicBool::new(false));
+    let cached_states: Vec<JointState> = cfg
+        .home_positions
+        .iter()
+        .map(|&p| JointState {
+            position: p,
+            velocity: 0.0,
+            torque: 0.0,
+            temperature: 30.0,
+        })
+        .collect();
+    let drv = CachedMitRecoveryDriver {
+        dof: cfg.dof,
+        seqs: vec![7; cfg.dof],
+        states: cached_states,
+        recovered_called: Arc::clone(&recovered_called),
+    };
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.is_torqued = true;
+    inner.feedback_numeric_valid = true;
+    inner.mit.owner = mit::MitOwner::Lost;
+    inner.safety.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+
+    let err = inner.clear_fault_confirmed(true).unwrap_err();
+    assert!(recovered_called.load(Ordering::SeqCst), "mit_expiry_recover must have run");
+    assert!(
+        err.to_string().contains("Fresh feedback is required"),
+        "final MIT read must reject cached feedback whose receive sequence did not advance after recovery request: {err}"
+    );
+    assert!(inner.safety.state().is_stopped(), "fault must stay latched when post-recovery receive sequence did not advance");
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mit.owner must remain Lost when final clear_check fails");
+
+    // 2. Real DamiaoArmDriver: pre-recovery state-0 frame sitting unread in RX before recovery
+    //    cannot satisfy post-recovery feedback when motor 0 drops its disable reply!
+    let clock = MockClock::new();
+    let limits = dm_limits();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    dm.read_joint_states().unwrap();
+    dm.check_mapping_ranges();
+    dm.set_torque(true).unwrap();
+    // Queue a pre-recovery state-0 frame for motor 0 BEFORE mit_expiry_recover() is requested,
+    // and make motor 0 drop its disable command reply.
+    let stale_state0_j1 = bus.with(|s| {
+        let prev_en = s.motors[0].enabled;
+        s.motors[0].enabled = false;
+        let f = s.motors[0].feedback_frame();
+        s.motors[0].enabled = prev_en;
+        s.motors[0].no_feedback = true;
+        s.rx.push_back(f);
+        f
+    });
+    let _ = stale_state0_j1;
+    let err_dm = dm.mit_expiry_recover().unwrap_err();
+    assert!(err_dm.contains("J1"), "pre-recovery RX frame must not satisfy J1 post-recovery boundary: {err_dm}");
+    assert!(
+        !dm.mit_feedback_after_recovery(7),
+        "mit_feedback_after_recovery must be false when recovery did not receive post-request feedback for every joint"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path() {
+    let log = global_log();
+    let _serial = log.guard.lock().await;
+    let _ = take_global_logs(log);
+
+    // 1. Collision trip, quiet release, and escalation (both operational and while E-stop latched)
+    //    must perform ZERO heap allocations on the control thread with tracing subscriber enabled.
+    struct CollisionAndGravityDriver {
+        dof: usize,
+        torques: Arc<Mutex<[f32; 7]>>,
+        positions: Arc<Mutex<[f32; 7]>>,
+        last_targets: Arc<Mutex<[JointTarget; 7]>>,
+        write_count: Arc<std::sync::atomic::AtomicUsize>,
+        estop_hold_count: Arc<std::sync::atomic::AtomicUsize>,
+        clock: MockClock,
+    }
+    impl ArmDriver for CollisionAndGravityDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: true,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn supports_mit_mode_switch(&self) -> bool { true }
+        fn set_joint_modes(&mut self, _: &[armd::driver::JointMode], _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); self.dof] }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
+        }
+        fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(0)); }
+        }
+        fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+            let now = self.clock.now();
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(now)); }
+        }
+        fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+            let now = self.clock.now();
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(now)); }
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            let mut out = Vec::with_capacity(self.dof);
+            self.read_joint_states_into(&mut out)?;
+            Ok(out)
+        }
+        fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+            let qs = *self.positions.lock().unwrap();
+            let taus = *self.torques.lock().unwrap();
+            out.clear();
+            for i in 0..self.dof {
+                out.push(JointState {
+                    position: qs[i],
+                    velocity: 0.0,
+                    torque: taus[i],
+                    temperature: 30.0,
+                });
+            }
+            Ok(())
+        }
+        fn read_joint_states_budgeted(&mut self, out: &mut Vec<JointState>, _: Instant, _: u16) -> Result<(u16, bool), ArmDriverError> {
+            self.read_joint_states_into(out)?;
+            Ok((self.dof as u16, false))
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            let mut dst = self.last_targets.lock().unwrap();
+            for (d, s) in dst.iter_mut().zip(targets.iter()) { *d = s.clone(); }
+            self.write_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            let mut dst = self.last_targets.lock().unwrap();
+            for (d, s) in dst.iter_mut().zip(targets.iter()) { *d = s.clone(); }
+            self.estop_hold_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+        fn clock_now(&self) -> Instant { self.clock.now() }
+    }
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.joint_tracking = None;
+    cfg.resting_pose = None;
+    cfg.workspace = None;
+    if let Some(col) = cfg.collision.as_mut() {
+        col.enabled = true;
+        col.persist_ticks = 2;
+        col.resume_after_s = 0.04;
+        col.max_auto_resumes = 1;
+        col.escalate_window_s = 30.0;
+    }
+    if let Some(gc) = cfg.gravity_comp.as_mut() {
+        gc.ramp_in_s = 0.04;
+        gc.exit_hold_ms = 200;
+    }
+
+    let q_init = [0.0, -0.5, -0.5, 0.3, 0.0, 0.0, 0.0];
+    let g_model = cfg.arm_model.gravity_torques(&q_init[..6]).unwrap();
+    let mut tau_init = [0.0f32; 7];
+    tau_init[..6].copy_from_slice(&g_model[..6]);
+
+    let torques = Arc::new(Mutex::new(tau_init));
+    let positions = Arc::new(Mutex::new(q_init));
+    let last_targets = Arc::new(Mutex::new(std::array::from_fn(|_| JointTarget::position(0.0))));
+    let write_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let estop_hold_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drv = CollisionAndGravityDriver {
+        dof: cfg.dof,
+        torques: Arc::clone(&torques),
+        positions: Arc::clone(&positions),
+        last_targets: Arc::clone(&last_targets),
+        write_count: Arc::clone(&write_count),
+        estop_hold_count: Arc::clone(&estop_hold_count),
+        clock: MockClock::new(),
+    };
+
+    let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.gravity_compensated = true;
+    inner.collision.enabled = true;
+    inner.collision.torque_feedback = true;
+    inner.measured_positions = q_init.to_vec();
+    inner.commanded_positions = q_init.to_vec();
+    inner.target_positions = q_init.to_vec();
+    inner.set_torque(true).unwrap();
+    inner.safety.set_off_thread_reclaim(true);
+    // Warm up per-tick scratch buffers.
+    for _ in 0..3 {
+        let _ = inner.tick_control(0.02);
+    }
+
+    alloc::time_this_thread();
+
+    // (a) First collision trip -> protective hold (0 allocs).
+    torques.lock().unwrap()[0] = g_model[0] + 15.0;
+    let _ = alloc::take();
+    let _ = inner.tick_control(0.02);
+    let _ = inner.tick_control(0.02);
+    let trip1_allocs = alloc::take();
+    assert_eq!(trip1_allocs.calls, 0, "collision protective-stop trip allocated: {trip1_allocs:?}");
+    assert!(inner.collision.hold.is_some(), "expected protective hold on first collision trip");
+
+    // (b) Quiet period -> collision hold release (0 allocs).
+    torques.lock().unwrap()[0] = g_model[0];
+    let _ = alloc::take();
+    for _ in 0..3 {
+        let _ = inner.tick_control(0.02);
+    }
+    let rel_allocs = alloc::take();
+    assert_eq!(rel_allocs.calls, 0, "collision hold release allocated: {rel_allocs:?}");
+    assert!(inner.collision.hold.is_none(), "expected collision hold to release after quiet period");
+
+    // (c) Second collision trip in window -> escalation latches FaultKind::CollisionLatched (0 allocs!).
+    torques.lock().unwrap()[0] = g_model[0] + 15.0;
+    let _ = alloc::take();
+    let _ = inner.tick_control(0.02);
+    let _ = inner.tick_control(0.02);
+    let esc_allocs = alloc::take();
+    assert_eq!(esc_allocs.calls, 0, "collision escalation allocated: {esc_allocs:?}");
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::CollisionLatched));
+    let fi = inner.safety.fault().expect("collision fault info");
+    assert_eq!(fi.code, FaultCode::Collision);
+    assert!(
+        fi.message.as_str().contains("COLLISION: Collision on joint 1:") && fi.message.as_str().contains("2 trips within 30 s"),
+        "unexpected collision fault message: {}",
+        fi.message
+    );
+    // Off-thread deferred logs emit exact collision lines.
+    inner.safety.drain_log_events_off_thread();
+    inner.safety.drain_retired_state_arcs_off_thread();
+    let col_logs = take_global_logs(log);
+    assert!(
+        col_logs.contains("Collision hold ended after quiet period")
+            && col_logs.contains("Collision on joint 1:")
+            && col_logs.contains("latching Fault COLLISION"),
+        "missing deferred collision logs:\n{col_logs}"
+    );
+
+    // 2. Gravity-comp tick + Step-5 inline output (RampIn, RampIn -> Active, steady Active,
+    //    and E-stop Exiting hold): ZERO heap allocations across every control tick!
+    torques.lock().unwrap()[0] = g_model[0];
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+    inner.set_torque(true).unwrap();
+    let _ = inner.tick_control(0.02);
+    inner.enter_gravity_comp(armd::gravity_comp::GravityCompRequest::default()).unwrap();
+    // Warm up one tick after entering gravity_comp (not strictly required, keeps measurement focused on steady/ramp RT path).
+    let before_writes = write_count.load(Ordering::Relaxed);
+    let _ = alloc::take();
+    let direct_targets = inner.gravity_comp_targets().expect("gravity_comp_targets inline");
+    assert_eq!(alloc::take().calls, 0, "gravity_comp_targets() must be bounded/inline with 0 heap allocs");
+    assert!(direct_targets[0].kp.is_some() && direct_targets[6].kp.is_none());
+
+    // Measure RampIn, RampIn -> Active transition, and steady Active ticks (5 ticks = 0.10 s > 0.04 s ramp).
+    let _ = alloc::take();
+    for _ in 0..5 {
+        let _ = inner.tick_control(0.02);
+    }
+    let gc_allocs = alloc::take();
+    assert_eq!(gc_allocs.calls, 0, "gravity_comp tick + Step-5 output allocated: {gc_allocs:?}");
+    assert!(
+        write_count.load(Ordering::Relaxed) >= before_writes + 5,
+        "gravity_comp Step-5 must deliver MIT targets to driver"
+    );
+    let sent = last_targets.lock().unwrap().clone();
+    assert!(sent[1].kp == Some(0.0) && sent[1].torque.is_some_and(f32::is_finite), "expected Active MIT target: {:?}", sent[1]);
+
+    // Trigger E-stop during gravity comp -> Exiting phase Step-5 `write_estop_hold` must also do 0 heap allocs!
+    let before_holds = estop_hold_count.load(Ordering::Relaxed);
+    let _ = alloc::take();
+    inner.apply_stop_policy(StopPolicy::EStopLatch);
+    let _ = inner.tick_control(0.02);
+    let gc_estop_allocs = alloc::take();
+    assert_eq!(gc_estop_allocs.calls, 0, "gravity_comp E-stop exit + hold output allocated: {gc_estop_allocs:?}");
+    assert!(
+        estop_hold_count.load(Ordering::Relaxed) >= before_holds + 2,
+        "expected immediate + Step-5 write_estop_hold calls"
+    );
+    inner.safety.drain_log_events_off_thread();
+    inner.safety.drain_retired_state_arcs_off_thread();
+    let gc_logs = take_global_logs(log);
+    assert!(
+        gc_logs.contains("Gravity compensation ramp complete")
+            && gc_logs.contains("Gravity compensation exit: ESTOP E-stop"),
+        "missing deferred gravity_comp logs:\n{gc_logs}"
     );
 }

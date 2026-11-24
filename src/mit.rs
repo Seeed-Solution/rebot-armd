@@ -1140,9 +1140,13 @@ impl crate::supervisor::SupervisorInner {
             self.eval_stopped_torque_off()
                 .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
         }
-        let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-            Some(mut drv) => drv.mit_expiry_recover(),
-            None => Err("no driver".into()),
+        let (pre_recovery_seqs, res) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            Some(mut drv) => {
+                let pre = drv.feedback_seqs();
+                let r = drv.mit_expiry_recover();
+                (pre, r)
+            }
+            None => (Vec::new(), Err("no driver".into())),
         };
         if let Err(e) = res {
             let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
@@ -1155,28 +1159,34 @@ impl crate::supervisor::SupervisorInner {
         self.servo_stream_active = false;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
-        self.mit.owner = MitOwner::Off;
-        self.mit.joints.clear();
-        self.mit.last_ff.clear();
-        self.mit.last_output = None;
-        self.mit.armed_ok = false;
-        self.mit.revoke_pending = false;
         self.is_torqued = false;
         self.disable_pending = false;
         self.pending_rearm = false;
 
-        // Refresh supervisor feedback from samples received AFTER `drv.mit_expiry_recover()`
-        // confirmed every motor disabled — never evaluate final `clear_check` on pre-recovery
-        // positions or temperatures.
+        // Refresh supervisor feedback from samples received strictly AFTER the recovery request
+        // (verified by per-joint receive sequence advance AND driver post-recovery RX boundary) —
+        // never evaluate final `clear_check` on cached or pre-recovery feedback.
         let post_read = self.driver.as_ref().and_then(|d| {
             d.lock().ok().and_then(|mut drv| {
                 let states = drv.read_joint_states().ok()?;
+                let post_seqs = drv.feedback_seqs();
+                let seqs_after_recovery = pre_recovery_seqs.len() == self.config.dof
+                    && post_seqs.len() == self.config.dof
+                    && post_seqs
+                        .iter()
+                        .zip(&pre_recovery_seqs)
+                        .all(|(&post, &pre)| post > pre);
+                let rx_boundary_ok = drv.mit_feedback_after_recovery(self.config.dof);
                 let ages = drv.feedback_ages();
                 let loads = drv.joint_loads();
                 let caps = drv.capabilities();
-                let fb_fresh = drv.is_feedback_valid()
+                let fb_fresh = seqs_after_recovery
+                    && rx_boundary_ok
+                    && drv.is_feedback_valid()
                     && ages.len() == self.config.dof
-                    && ages.iter().all(|a| a.is_some_and(|t| t <= std::time::Duration::from_millis(250)))
+                    && ages
+                        .iter()
+                        .all(|a| a.is_some_and(|t| t <= crate::supervisor::THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                     && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
                 let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
                 let hw_fault = drv.has_hardware_fault();
@@ -1184,8 +1194,21 @@ impl crate::supervisor::SupervisorInner {
                 let partial = drv.has_known_partial_enable();
                 let enable_known = state != EnableState::Unknown || partial;
                 let oldest_age = ages
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .try_fold(std::time::Duration::ZERO, |m, a| a.map(|t| m.max(t)));
+                let threshold = self.config.max_temperature - crate::supervisor::THERMAL_CLEAR_MARGIN_C;
+                let thermal_below = fb_fresh
+                    && caps.temperature_feedback
+                    && !states.is_empty()
+                    && states.iter().all(|s| s.temperature.is_finite() && s.temperature <= threshold);
+                let mut rx_buf = Vec::new();
+                let next_cd = self.evaluate_thermal_cooldown_with_driver(
+                    drv.as_ref(),
+                    &ages,
+                    thermal_below,
+                    &mut rx_buf,
+                );
                 Some((
                     states,
                     loads,
@@ -1195,11 +1218,12 @@ impl crate::supervisor::SupervisorInner {
                     hw_fault,
                     enable_known,
                     oldest_age,
+                    next_cd,
                 ))
             })
         });
         let (post_fb_fresh, post_temp_fb, post_hw_err, post_hw_fault, post_enable_known) =
-            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age)) = post_read {
+            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age, next_cd)) = post_read {
                 self.feedback_numeric_valid = fb_fresh;
                 if fb_fresh {
                     self.last_can_feedback_instant =
@@ -1215,8 +1239,8 @@ impl crate::supervisor::SupervisorInner {
                         loads.as_deref(),
                     );
                     if temp_fb {
+                        self.thermal_cooldown = next_cd;
                         let temps_copy = self.temperatures.clone();
-                        self.update_thermal_cooldown_from_temps(&temps_copy);
                         if let Some((joint_idx, temperature)) = temps_copy
                             .iter()
                             .copied()
@@ -1224,7 +1248,7 @@ impl crate::supervisor::SupervisorInner {
                             .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
                             .max_by(|a, b| a.1.total_cmp(&b.1))
                         {
-                            self.thermal_below_since = None;
+                            self.thermal_cooldown.reset();
                             self.safety.latch(
                                 FaultKind::ThermalTrip,
                                 FaultDetail::ThermalTrip {
@@ -1235,17 +1259,17 @@ impl crate::supervisor::SupervisorInner {
                             );
                         }
                     } else {
-                        self.thermal_below_since = None;
+                        self.thermal_cooldown.reset();
                     }
                 } else {
                     self.last_can_feedback_instant = None;
-                    self.thermal_below_since = None;
+                    self.thermal_cooldown.reset();
                 }
                 (fb_fresh, temp_fb, hw_err, hw_fault, enable_known)
             } else {
                 self.feedback_numeric_valid = false;
                 self.last_can_feedback_instant = None;
-                self.thermal_below_since = None;
+                self.thermal_cooldown.reset();
                 (false, false, None, false, false)
             };
 
@@ -1292,6 +1316,15 @@ impl crate::supervisor::SupervisorInner {
                 }
             }
             return Err(refusal.into_safety_error());
+        }
+        self.mit.owner = MitOwner::Off;
+        self.mit.joints.clear();
+        self.mit.last_ff.clear();
+        self.mit.last_output = None;
+        self.mit.armed_ok = false;
+        self.mit.revoke_pending = false;
+        if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            drv.acknowledge_mit_fence_trip();
         }
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {

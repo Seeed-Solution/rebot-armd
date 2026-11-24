@@ -280,6 +280,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
+    fn mit_feedback_after_recovery(&self, dof: usize) -> bool { self.inner.mit_feedback_after_recovery(dof) }
     fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
     fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
         self.inner.commission_motor_timeout(joints, counts)

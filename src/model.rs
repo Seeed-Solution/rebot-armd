@@ -719,9 +719,21 @@ pub struct GripperPolicy {
     /// when the stream ends. Gripper actions (grasp) keep their own contact handling. Absent: off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_contact_speed_rad_s: Option<f32>,
+    /// J7 speed (rad/s) of closing gripper steps that armd plans itself: grasp, place and
+    /// sequence closes and moves, and every closing stroke of `gripper_calibrate`. Absent:
+    /// [`DEFAULT_CLOSE_SPEED_RAD_S`]. A gripper action keeps its own `speed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_speed_rad_s: Option<f32>,
 }
 
+/// Default `gripper_policy.close_speed_rad_s` (rad/s): the grasp contact speed
+/// (`motion::GRIPPER_CONTACT_SPEED`).
+pub const DEFAULT_CLOSE_SPEED_RAD_S: f32 = 0.3;
+
 impl GripperPolicy {
+    /// `close_speed_rad_s` or [`DEFAULT_CLOSE_SPEED_RAD_S`] (rad/s).
+    pub fn close_speed(&self) -> f64 { f64::from(self.close_speed_rad_s.unwrap_or(DEFAULT_CLOSE_SPEED_RAD_S)) }
+
     /// Thresholds from the MIT-mode project; holding torque and squeeze need verification in POS_VEL.
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
@@ -749,6 +761,7 @@ impl GripperPolicy {
             // the grasp contact speed (motion::GRIPPER_CONTACT_SPEED): one 20 ms tick adds
             // 0.006 rad of lead, 0.18 N·m on a 30 N·m/rad contact
             stream_contact_speed_rad_s: Some(0.3),
+            close_speed_rad_s: None,
         }
     }
 
@@ -835,6 +848,9 @@ pub fn validate_effective_gripper_policy_with_mode(
         || !positive(g.stream_contact_speed_rad_s)
     {
         return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm, max_lead_rad and stream_contact_speed_rad_s must be positive".into());
+    }
+    if g.close_speed_rad_s.is_some_and(|v| !(v.is_finite() && v > 0.0 && v <= 2.0)) {
+        return Err("Invalid gripper policy: close_speed_rad_s must be in (0, 2] rad/s".into());
     }
     if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
         if contact >= cap {
@@ -2197,12 +2213,19 @@ impl ArmConfig {
             }
         }
         if let (Some(g), Some(dg)) = (self.gripper_index(), &self.damiao_gripper) {
-            if dg.mode == DamiaoGripperMode::PosForce
-                && self.limits.get(g).is_some_and(|l| DamiaoGripperDrive::quantize_vel_raw(l.max_velocity) == 0)
-            {
-                return Err(format!(
-                    "Joint {g} max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
-                ));
+            if dg.mode == DamiaoGripperMode::PosForce {
+                if self.limits.get(g).is_some_and(|l| DamiaoGripperDrive::quantize_vel_raw(l.max_velocity) == 0) {
+                    return Err(format!(
+                        "Joint {g} max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
+                    ));
+                }
+                if let Some(gp) = &self.gripper_policy {
+                    if DamiaoGripperDrive::quantize_vel_raw_f64(gp.close_speed()) == 0 {
+                        return Err(
+                            "gripper_policy.close_speed_rad_s encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)".into()
+                        );
+                    }
+                }
             }
         }
         if self.home_positions.iter().zip(&self.limits).any(|(p, l)| !p.is_finite() || *p < l.min_position || *p > l.max_position) {
@@ -2414,6 +2437,25 @@ pub struct GripperObs {
     /// Torque cap trips since start.
     #[serde(default)]
     pub force_limit_trips: u64,
+    /// Learned free-motion torque of the jaw (`crate::gripper_baseline`); absent from older armd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<GripperBaselineObs>,
+}
+
+/// `observation.gripper.baseline`: state of the learned free-motion torque baseline.
+/// Stored inline (`HolderLabel`) so `fill_observation` does zero heap allocations per tick.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct GripperBaselineObs {
+    /// `"unlearned"`, `"learning"` or `"learned"`.
+    pub state: HolderLabel,
+    /// Unloaded moves learned per direction.
+    pub close_moves: u64,
+    pub open_moves: u64,
+    /// Moves with a position bin rejected as an outlier (not learned).
+    pub rejected_moves: u64,
+    /// Last grasp contact verdict: torque, threshold, baseline and margin (|τ| − baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_contact: Option<crate::gripper_baseline::ContactInfo>,
 }
 
 /// A short label stored inline (at most [`HolderLabel::CAPACITY`] bytes): a lease holder's
@@ -2988,6 +3030,11 @@ pub struct Capabilities {
     /// Absent (false) from older armd.
     #[serde(default)]
     pub grasp_measure: bool,
+    /// Grasp dry run `strategy: "adaptive"` (pose selection over approach directions and
+    /// contacts, `pose_preferences`, `evidence`, `budget_ms`): `grasp` on a 6-DOF arm. Absent
+    /// (false) from older armd.
+    #[serde(default)]
+    pub grasp_select: bool,
     /// Action `/api/v1/action/measure_multiview` (lease, operator session): motion-stereo object
     /// measurement from views around the object (`ActionStatus.measurement`); same value as `grasp`.
     /// Absent (false) from older armd.
@@ -3317,6 +3364,7 @@ impl Capabilities {
             yaw_outward: arm_with_gripper && kin,
             move_path_joint: arm_with_gripper && kin,
             grasp_measure: grasp,
+            grasp_select: grasp && config.arm_dof() == 6,
             measure_multiview: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),

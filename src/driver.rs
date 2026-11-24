@@ -810,6 +810,10 @@ pub trait ArmDriver: Send {
     /// next confirmed enable.
     fn acknowledge_mit_fence_trip(&mut self) {}
 
+    /// True when every joint `0..dof` has received fresh feedback with a receive sequence strictly
+    /// after the most recent [`Self::mit_expiry_recover`] request.
+    fn mit_feedback_after_recovery(&self, _dof: usize) -> bool { true }
+
     /// Write the motor command timeout of `joints` to `counts` in RAM (never flash), check the
     /// acknowledgement and confirm it with a separate read. Torque off only.
     fn commission_motor_timeout(&mut self, joints: &[usize], _counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
@@ -2939,6 +2943,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_fence_holdoff: Duration,
     /// The operator cleared the trip (`acknowledge_mit_fence_trip`): polls may resume.
     mit_fence_acked: bool,
+    /// RX sequence boundary captured at the start of the most recent [`ArmDriver::mit_expiry_recover`]
+    /// request; final MIT clear requires every joint's `last_feedback_seq` to exceed this boundary.
+    last_mit_recovery_rx_seq: Option<u64>,
     /// MIT tracking armed a fence since the last confirmed enable: base-mode restores use POS_VEL
     /// frames only.
     mit_tracking_used: bool,
@@ -3382,6 +3389,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
             mit_fence_acked: false,
+            last_mit_recovery_rx_seq: None,
             mit_tracking_used: false,
             torque_hs: None,
             rx_deadline: None,
@@ -6309,6 +6317,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.mit_fence = None;
                 self.mit_fence_trip = None;
                 self.mit_fence_acked = false;
+                self.last_mit_recovery_rx_seq = None;
                 self.mit_tracking_used = false;
                 self.mit_fence_last_cmd.fill(None);
                 Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
@@ -6719,9 +6728,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn clock_now(&self) -> Instant { self.now() }
 
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
-        // after a trip the poll obeys the same clearance + quiet-period gate as every other poll
+        // Enforce the post-trip quiet period directly without requiring or mutating
+        // `mit_fence_acked`: autonomous background CAN refreshes stay inhibited until
+        // `acknowledge_mit_fence_trip()` runs AFTER `clear_check` passes.
         if let Some((_, at)) = &self.mit_fence_trip {
-            if !self.poll_tx_allowed() {
+            if self.since(*at) < self.mit_fence_holdoff {
                 let remaining = self.mit_fence_holdoff.saturating_sub(self.since(*at));
                 return Err(format!("{}: the motors' command timeout may still be running; no frame is sent for {} ms more after the loss",
                     crate::mit::QUIET_PERIOD_CODE, remaining.as_millis().max(1)));
@@ -6762,9 +6773,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn mit_expiry_recover(&mut self) -> Result<(), String> {
+        self.last_mit_recovery_rx_seq = None;
         self.discard_pending_tx_stopped();
         self.begin_tx_tick();
         let start_stamp = self.current_stop_stamp();
+        let req_boundary = self
+            .rx_boundary()
+            .map_err(|e| format!("receive boundary before MIT recovery: {e}"))?;
         // 1. clear-error (FF..FB on the motor's ID) to every motor reporting an error state
         let faulted: Vec<usize> = (0..self.motor_ids.len()).filter(|&i| self.motor_status[i] >= 8).collect();
         for &i in &faulted {
@@ -6793,13 +6808,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // disabled or its own watchdog has already expired (`status == 0 || status >= 8`).
         self.clear_cached_targets();
         let res = self.set_torque(false);
+        let boundary = self
+            .last_enable_command_rx_seq
+            .map_or(req_boundary, |s| s.max(req_boundary));
         let unconfirmed: Vec<String> = (0..self.motor_ids.len()).filter(|&i| {
-            !(self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+            !(self.motor_feedback_after(i, self.last_enable_command, Some(boundary))
+                && self.last_feedback_seq[i] > boundary
                 && self.motor_status[i] == 0)
         }).map(|i| format!("J{}", i + 1)).collect();
         if res.is_err() || !unconfirmed.is_empty() {
             return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
         }
+        self.last_mit_recovery_rx_seq = Some(boundary);
         self.disable_confirmed_sticky = true;
         self.mit_fence = None;
         Ok(())
@@ -6807,6 +6827,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn acknowledge_mit_fence_trip(&mut self) {
         if self.mit_fence_trip.is_some() { self.mit_fence_acked = true; }
+    }
+
+    fn mit_feedback_after_recovery(&self, dof: usize) -> bool {
+        !self.awaiting_rx_boundary
+            && self.last_mit_recovery_rx_seq.is_some_and(|req| {
+                self.last_feedback_seq.len() == dof
+                    && self.last_feedback_seq.iter().all(|&seq| seq > req)
+            })
     }
 
     fn joint_modes_uncertain(&self) -> bool {

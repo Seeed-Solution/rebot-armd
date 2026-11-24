@@ -181,7 +181,7 @@ fn main() {
         let outcomes: Vec<Value> = c.rec.outcomes.iter().map(|(f, o)| json!([f.x, f.y, f.normal, f.side, f.strength, o])).collect();
         let plane = c.plane.as_ref().map_or(Value::Null, |t| json!({
             "plane": t.plane, "n_points": t.n_points, "n_inliers": t.n_inliers, "offset_mm": t.offset_mm, "tilt_deg": t.tilt_deg,
-            "mad_mm": t.mad_mm, "threshold_mm": t.threshold_mm,
+            "mad_mm": t.mad_mm, "threshold_mm": t.threshold_mm, "mode": t.mode, "max_gap_deg": t.max_gap_deg,
         }));
         #[cfg_attr(not(feature = "mview-profile"), allow(unused_mut))]
         let mut doc = json!({

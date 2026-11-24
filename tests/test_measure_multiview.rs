@@ -1225,6 +1225,8 @@ async fn an_arm_moving_at_the_start_fails_not_settled_before_any_trigger() {
     assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("NOT_SETTLED")), "{a}");
     let window = mm::MAX_SETTLE_S - mm::MIN_SETTLE_S;
     assert!(a["message"].as_str().unwrap().contains(&format!("within {window} s")), "{a}");
+    // seen moving with fresh feedback: NOT_SETTLED, with the per-joint update counts
+    assert!(a["message"].as_str().unwrap().contains("feedback updates per joint") && a["measurement"]["settle"]["window_samples"] == 10, "{a}");
     assert!(took >= window && took < window + 3.0, "{took}");
     assert_eq!(r.vision.frame.load(Ordering::SeqCst), 0, "no trigger before the arm is still");
     assert!(r.at_start().await);
@@ -1656,7 +1658,8 @@ impl ArmDriver for FrozenFeedbackArm {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cached_feedback_without_new_samples_never_counts_as_still() {
     // feedback within the freshness bound but no new sample (sequence counters stand still): the
-    // start view's still window never fills, so NOT_SETTLED without any trigger
+    // start view's still window never fills, so FEEDBACK_SLOW (not NOT_SETTLED: nothing was seen
+    // moving) without any trigger, with the per-joint update counts
     for gray in [false, true] {
         let frozen = Arc::new(AtomicBool::new(false));
         let d = FrozenFeedbackArm { inner: common::TestArm::new(), frozen: frozen.clone(), seq: 0 };
@@ -1666,8 +1669,11 @@ async fn cached_feedback_without_new_samples_never_counts_as_still() {
         let ack = r.start(json!({"label": "box"})).await;
         let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
         let a = r.wait(id, 30.0).await;
-        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("NOT_SETTLED")), "gray {gray}: {a}");
-        assert!(a["message"].as_str().unwrap().contains("0 taken"), "{a}");
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("FEEDBACK_SLOW")), "gray {gray}: {a}");
+        assert!(a["message"].as_str().unwrap().contains("0 of 10 samples") && a["message"].as_str().unwrap().contains("J1 0 (0"), "{a}");
+        let s = &a["measurement"]["settle"];
+        assert_eq!((s["code"].as_str(), s["window_samples"].as_u64(), s["joints"].as_array().map(Vec::len)), (Some("FEEDBACK_SLOW"), Some(0), Some(6)), "{a}");
+        assert!(s["joints"].as_array().unwrap().iter().all(|j| j["updates"] == 0), "{a}");
         assert_eq!(r.vision.frame.load(Ordering::SeqCst), 0, "no trigger while the feedback is cached");
     }
 }
