@@ -539,17 +539,13 @@ pub(super) fn dispatch_action_command(
             },
         ),
         Ok(ActionStart::MeasureMultiview(plan)) => Some(
-            match inner
-                .check_admission(stamp)
-                .map_err(ArmError::from)
-                .and_then(|admitted| {
-                    crate::measure_multiview::begin(
-                        admitted,
-                        recv_supervisor,
-                        *plan,
-                        recv_deps.source.clone(),
-                    )
-                }) {
+            match crate::measure_multiview::begin_with_stamp(
+                inner,
+                stamp,
+                recv_supervisor,
+                *plan,
+                recv_deps.source.clone(),
+            ) {
                 Ok(started) => command_ack(inner, &value["request_id"], Some(started)),
                 Err(error) => command_reject(inner, &value["request_id"], error.into()),
             },

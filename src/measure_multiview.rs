@@ -590,27 +590,131 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     })
 }
 
-/// Begin the action and spawn its orchestrator. Returns (action id, deadline bound s).
-pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>, plan: Plan, source: Arc<dyn DetectionSource>) -> Result<(u64, f64), ArmError> {
-    let (inner, proof) = admitted.consume()?;
-    let stamp = proof.stamp();
-    let id = inner.begin_orchestrated_action_inner(&proof, "measure_multiview", None, plan.epoch)?;
-    let deadline = plan.deadline_s;
-    tracing::info!("measure_multiview {id} started ({} views, baseline {:.3} m, speed_scale {:.2}, bound {deadline:.0} s)",
+/// Build the A7 [`BeginMacroSpec`] for a prepared multi-view measurement (shared by Legacy and RT Executor).
+pub fn begin_macro_spec(
+    plan: &Plan,
+    prepared_boot: crate::rt_core::broker::BootId,
+    deadline: Instant,
+) -> crate::rt_core::requests::actions::BeginMacroSpec {
+    use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+    let mut spec = BeginMacroSpec::new(MacroKind::MeasureMultiview, prepared_boot);
+    spec.check_workspace_revision = true;
+    spec.calibration_revision = Some(plan.calibration_revision);
+    spec.macro_deadline = Some(deadline);
+    spec.timeout_code = crate::safety::BoundedText::new("MEASURE_TIMEOUT");
+    spec
+}
+
+fn spawn_measure_worker(
+    sup: &Arc<ArmSupervisor>,
+    id: u64,
+    plan: Plan,
+    source: Arc<dyn DetectionSource>,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline_at: Instant,
+) -> (u64, f64) {
+    let deadline_s = plan.deadline_s;
+    tracing::info!("measure_multiview {id} started ({} views, baseline {:.3} m, speed_scale {:.2}, bound {deadline_s:.0} s)",
         plan.request.views, plan.request.baseline_m, plan.request.speed_scale);
     let sup = sup.clone();
     tokio::spawn(async move {
-        let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, source, stamp).await }) };
+        let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, source, stamp, deadline_at).await }) };
         if let Err(e) = worker.await {
             tracing::error!("measure_multiview {id} orchestrator failed: {e}");
-            sup.inner().write().await.finish_macro(id, "failed", Some("INTERNAL"), Some(format!("orchestrator failed: {e}")), None, None);
+            if sup.owner_mode() != crate::supervisor::OWNER_EXECUTOR {
+                sup.inner().write().await.finish_macro(id, "failed", Some("INTERNAL"), Some(format!("orchestrator failed: {e}")), None, None);
+            }
         }
     });
-    Ok((id, deadline))
+    (id, deadline_s)
+}
+
+/// Begin the action under a short write lock through the single owner-side
+/// [`crate::rt_core::requests::actions::install_begin_macro`] function and spawn its orchestrator.
+pub fn begin_with_stamp(
+    inner: &mut SupervisorInner,
+    stamp: crate::supervisor::AdmissionStamp,
+    sup: &Arc<ArmSupervisor>,
+    plan: Plan,
+    source: Arc<dyn DetectionSource>,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{
+        install_begin_macro, ActionStamp, OwnerCheckCtx, DEFAULT_ACTION_DEADLINE,
+    };
+    let deadline_at = Instant::now() + Duration::from_secs_f64(plan.deadline_s);
+    let spec = begin_macro_spec(&plan, inner.boot_id, deadline_at);
+    let action_stamp = ActionStamp {
+        arm: inner.core.id(),
+        boot: inner.boot_id,
+        admission: stamp,
+        config_revision: plan.workspace_revision,
+        calibration_revision: Some(plan.calibration_revision),
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
+    };
+    let owner_ctx = OwnerCheckCtx::for_legacy(inner);
+    let id = install_begin_macro(inner, &action_stamp, &owner_ctx, &spec, None, None)
+        .map_err(|r| r.into_arm_error(inner))?;
+    Ok(spawn_measure_worker(sup, id, plan, source, stamp, deadline_at))
+}
+
+/// Begin the action and spawn its orchestrator. Returns (action id, deadline bound s).
+pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>, plan: Plan, source: Arc<dyn DetectionSource>) -> Result<(u64, f64), ArmError> {
+    let deadline_at = Instant::now() + Duration::from_secs_f64(plan.deadline_s);
+    let (inner, proof) = admitted.consume()?;
+    let stamp = proof.stamp();
+    if inner.safety.epoch_id() != plan.epoch {
+        return Err(crate::safety::SafetyError::EpochMismatch {
+            expected: inner.safety.epoch_id(),
+            received: plan.epoch,
+        }
+        .into());
+    }
+    let spec = begin_macro_spec(&plan, inner.boot_id, deadline_at);
+    let ws_rev = plan.workspace_revision;
+    let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
+        inner,
+        &proof,
+        &spec,
+        Some(ws_rev),
+        None,
+        None,
+    )?;
+    Ok(spawn_measure_worker(sup, id, plan, source, stamp, deadline_at))
 }
 
 /// Alive, nothing the run was checked against changed, telemetry fresh, torque on.
 async fn recheck(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
+    if ctx.is_executor() {
+        let snap = ctx.snapshot(ctx.deadline).await?;
+        let m = snap.owner.macro_state;
+        if m.active_id != ctx.id || !m.alive { return Err(Stop::Cancelled); }
+        if snap.owner.authority.epoch != plan.epoch { return Err(fail("PLAN_STALE", "the epoch changed during the measurement (stop or e-stop)")); }
+        if snap.owner.authority.config_revision != plan.workspace_revision { return Err(fail("PLAN_STALE", "the workspace, keep-out boxes or camera mount changed during the measurement")); }
+        if snap.owner.calibration_revision != plan.calibration_revision { return Err(fail("CALIBRATION_CHANGED", "the joint zero or the kinematic correction changed during the measurement")); }
+        if let Some(pub_snap) = ctx.sup.hub().latest() {
+            if !pub_snap.obs.is_torqued { return Err(fail("NOT_ARMED", "torque went off during the measurement")); }
+        }
+        if snap.env.driver_present {
+            let now = Instant::now();
+            let arm = snap.env.config.arm_joint_indices();
+            let fresh = arm.iter().all(|&i| {
+                snap.feedback_instants
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| now.saturating_duration_since(t) <= FEEDBACK_MAX_AGE)
+            });
+            if !fresh { return Err(fail("STALE_TELEMETRY", "joint feedback is stale")); }
+        }
+        if Instant::now() > ctx.deadline { return Err(fail(ctx.timeout_code, ctx.timeout_message.clone())); }
+        return Ok(());
+    }
     let mut inner = ctx.sup.inner().write().await;
     if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
     if inner.safety.epoch_id() != plan.epoch { return Err(fail("PLAN_STALE", "the epoch changed during the measurement (stop or e-stop)")); }
@@ -627,11 +731,32 @@ async fn recheck(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
     Ok(())
 }
 
+async fn arm_joint_indices_ctx(ctx: &MacroCtx) -> Vec<usize> {
+    if ctx.is_executor() {
+        ctx.sup
+            .hub()
+            .prep_env()
+            .map_or_else(Vec::new, |e| e.config.arm_joint_indices())
+    } else {
+        ctx.sup.inner().read().await.config.arm_joint_indices()
+    }
+}
+
+async fn fk_pose_ctx(ctx: &MacroCtx, joints: &[f32]) -> Option<Pose> {
+    if ctx.is_executor() {
+        ctx.sup
+            .hub()
+            .prep_env()
+            .and_then(|e| e.config.arm_model.fk_f32(joints))
+    } else {
+        ctx.sup.inner().read().await.config.arm_model.fk_f32(joints)
+    }
+}
+
 /// Measured joints (all), per-arm-joint feedback instants, and per-arm-joint monotonic feedback
-/// sequence counters, read coherently under one lock.
+/// sequence counters, read coherently (0 lock on `OWNER_EXECUTOR`).
 async fn sample_with_timing(ctx: &MacroCtx) -> (Vec<f32>, Vec<Option<Instant>>, Vec<u64>) {
-    let inner = ctx.sup.inner().read().await;
-    let (pos, _, instants, seqs) = inner.arm_feedback_snapshot();
+    let (pos, instants, seqs, _) = ctx.arm_receive_progress().await;
     (pos, instants, seqs)
 }
 
@@ -651,22 +776,6 @@ fn max_feedback_age_ms(now: Instant, instants: &[Option<Instant>]) -> Option<f64
         .flatten()
         .map(|t| now.saturating_duration_since(*t).as_secs_f64() * 1000.0)
         .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
-}
-
-/// The arm joints' receive progress from one planning snapshot (`CoreOps::planning_snapshot`):
-/// `(measured positions, feedback instants, feedback sequence counters, receive-queue bounds)`
-/// of the arm joints. A joint without a reported queue bound (no receive queue) uses its
-/// receive instant as the bound, as `SupervisorInner::arm_feedback_queue_bounds` does.
-fn arm_receive_progress(inner: &SupervisorInner) -> (Vec<f32>, Vec<Option<Instant>>, Vec<u64>, Vec<Option<Instant>>) {
-    use crate::rt_core::ops::{CommitCtx, CoreOps};
-    let ctx = CommitCtx { arm: inner.core.id(), boot: crate::rt_core::broker::BootId(0), now: Instant::now(), stop_generation: 0 };
-    let snap = inner.planning_snapshot(&ctx);
-    let arm = inner.config.arm_joint_indices();
-    let instant = |i: usize| snap.feedback_instants.get(i).copied().flatten();
-    let instants = arm.iter().map(|&i| instant(i)).collect();
-    let seqs = arm.iter().map(|&i| snap.feedback_seqs.get(i).copied().unwrap_or(0)).collect();
-    let bounds = arm.iter().map(|&i| match snap.feedback_queue_bounds.get(i) { Some(b) => *b, None => instant(i) }).collect();
-    (snap.measured, instants, seqs, bounds)
 }
 
 /// Wait until every arm joint has a hardware feedback sample that was enqueued after `after`,
@@ -691,10 +800,7 @@ async fn sample_fresh_after(
     let wait_start = Instant::now();
     loop {
         recheck(ctx, plan).await?;
-        let (pos, instants, seqs, bounds) = {
-            let inner = ctx.sup.inner().read().await;
-            arm_receive_progress(&inner)
-        };
+        let (pos, instants, seqs, bounds) = ctx.arm_receive_progress().await;
         let ready = !instants.is_empty()
             && instants.len() == fence_seqs.len()
             && seqs.len() == fence_seqs.len()
@@ -729,7 +835,7 @@ async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
         tokio::time::sleep(POLL).await;
     }
     recheck(ctx, plan).await?;
-    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let arm = arm_joint_indices_ctx(ctx).await;
     let mut win: std::collections::VecDeque<(Vec<f32>, Vec<f32>)> = std::collections::VecDeque::new();
     // the sequence counters of the last sample taken (the first read only sets them): a sample
     // enters the window only when every arm joint has new feedback since the previous one, so the
@@ -743,7 +849,23 @@ async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
     let mut max_age_ms: Vec<f64> = vec![0.0; arm.len()];
     loop {
         ctx.check().await?;
-        let (pos, vel, instants, seqs) = ctx.sup.arm_feedback_snapshot(&arm).await;
+        let (pos, vel, instants, seqs) = if ctx.is_executor() {
+            if let Some(s) = ctx.sup.hub().latest() {
+                let instants = arm
+                    .iter()
+                    .map(|&i| s.rt.feedback_instants.get(i).copied().flatten())
+                    .collect();
+                let seqs = arm
+                    .iter()
+                    .map(|&i| s.rt.feedback_seqs.get(i).copied().unwrap_or(0))
+                    .collect();
+                (s.rt.positions.clone(), s.rt.velocities.clone(), instants, seqs)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            }
+        } else {
+            ctx.sup.arm_feedback_snapshot(&arm).await
+        };
         let now = Instant::now();
         for (m, t) in max_age_ms.iter_mut().zip(&instants) {
             let age = t.map_or(f64::INFINITY, |t| now.saturating_duration_since(t).as_secs_f64() * 1000.0);
@@ -1023,7 +1145,7 @@ async fn capture_gray(
     let settle_s = settle(ctx, plan, min_settle_s).await?;
     let t_cap = Instant::now();
     let (mut trig_total_ms, mut fetch_total_ms) = (0.0, 0.0);
-    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let arm = arm_joint_indices_ctx(ctx).await;
     let bracket_limit = if plan.request.pose_refine == PoseRefine::Off { BRACKET_RAD } else { BRACKET_REFINED_RAD };
     let pipelines = if markers { YOLO_ARUCO_GRAY } else { YOLO_GRAY };
     let (cw, ch) = exact_camera_dims(plan.cam.size, "camera model (grasp setup image_size_px)")
@@ -1132,7 +1254,8 @@ async fn capture_gray(
         return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} captures (largest joint change across each trigger and gray fetch: {} mrad, limit {:.1})", mrad.join(", "), bracket_limit * 1000.0)));
     };
     recheck(ctx, plan).await?;
-    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
+    let pose = fk_pose_ctx(ctx, &joints)
+        .await
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
     rescale_markers_and_frame(plan, &mut trig.frame, &mut trig.markers);
     let convert_ms = trig.gray_ms.or(Some(gray.convert_ms));
@@ -1165,7 +1288,7 @@ async fn capture_snapshot(
     // possibly a frame from before the motion settled (the idle camera runs at 1 fps)
     let mut s0 = snap().await?;
     let (mut trig_total_ms, mut fetch_total_ms) = (0.0, t_cap.elapsed().as_secs_f64() * 1000.0);
-    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let arm = arm_joint_indices_ctx(ctx).await;
     let mut tries: Vec<(f32, usize)> = Vec::new();
     let mut retry_reasons: Vec<String> = Vec::new();
     let bracket_limit = if plan.request.pose_refine == PoseRefine::Off { BRACKET_RAD } else { BRACKET_REFINED_RAD };
@@ -1227,7 +1350,8 @@ async fn capture_snapshot(
         return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each trigger and snapshot: {} mrad, limit {:.1})", mrad.join(", "), bracket_limit * 1000.0)));
     };
     recheck(ctx, plan).await?;
-    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
+    let pose = fk_pose_ctx(ctx, &joints)
+        .await
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
     rescale_markers_and_frame(plan, &mut frame, &mut marks);
     let size = plan.cam.size;
@@ -1279,15 +1403,17 @@ fn pick_view_index(target: &Detection, min_score: f64, dets: &[Detection], shift
 /// is true when the motion was installed (a failure after the arm moved).
 async fn move_to_goal(ctx: &MacroCtx, plan: &Plan, phase: &str, goal: Pose) -> Result<(), (Stop, bool)> {
     let before = |s: Stop| (s, false);
-    let (input, seeds) = {
-        let inner = ctx.sup.inner().read().await;
-        if !inner.macro_alive(ctx.id) { return Err(before(Stop::Cancelled)); }
-        let input = inner.plan_input().map_err(arm_fail).map_err(before)?;
-        let mut extra = inner.goal_seed_poses();
-        extra.push(kinematics::q6(&plan.start[..plan.arm_dof.min(plan.start.len())]));
-        let seeds = motion::goal_seeds(&input, &goal, &extra);
-        (input, seeds)
-    };
+    if !ctx.alive().await {
+        return Err(before(Stop::Cancelled));
+    }
+    let snap = ctx.snapshot(ctx.deadline).await.map_err(before)?;
+    let input = snap
+        .plan_input_in(crate::motion::GoalFrame::EndLink)
+        .map_err(arm_fail)
+        .map_err(before)?;
+    let mut extra = snap.env.goal_seed_poses();
+    extra.push(kinematics::q6(&plan.start[..plan.arm_dof.min(plan.start.len())]));
+    let seeds = motion::goal_seeds(&input, &goal, &extra);
     let opts = PathOpts { yaw_free: plan.arm_dof < 6, yaw_outward: false };
     let q = tokio::task::spawn_blocking(move || motion::solve_goal_joints(&input, &goal, opts, &seeds)).await
         .map_err(|e| before(fail("INTERNAL", format!("IK task failed: {e}"))))?
@@ -1297,25 +1423,31 @@ async fn move_to_goal(ctx: &MacroCtx, plan: &Plan, phase: &str, goal: Pose) -> R
 
 /// Joint-space quintic sub-motion to the arm joints `q` (gripper kept).
 async fn move_joints(ctx: &MacroCtx, plan: &Plan, phase: &str, q: &[f64; 6]) -> Result<(), (Stop, bool)> {
-    let ticket = {
-        let mut inner = ctx.sup.inner().write().await;
-        if !inner.macro_alive(ctx.id) { return Err((Stop::Cancelled, false)); }
-        let target = inner.joint_goal_target(q);
-        let limits = inner.joint_goal_limits(plan.request.speed_scale);
-        inner.set_action_phase(ctx.id, phase, 0.0, None, None);
-        let admitted = match inner.check_admission(ctx.next_child_stamp()) {
-            Ok(a) => a,
-            Err(e) => return Err((ctx.map_install_err(&mut inner, e.into()), false)),
-        };
-        match SupervisorInner::install_macro_quintic(admitted, ctx.id, target, &limits) {
-            Ok(l) => ctx.arm_child(&mut inner, phase, l * 2.0 + 5.0).ok_or((Stop::Cancelled, true))?,
-            Err(e) => {
-                if let Some(detail) = e.workspace_detail() { inner.set_action_workspace_violation(ctx.id, detail); }
-                return Err((ctx.map_install_err(&mut inner, e), false));
-            }
-        }
-    };
-    ctx.wait_child(ticket).await.map(|_| ()).map_err(|s| (s, true))
+    let before = |s: Stop| (s, false);
+    if !ctx.alive().await {
+        return Err(before(Stop::Cancelled));
+    }
+    let snap = ctx.snapshot(ctx.deadline).await.map_err(before)?;
+    let target = crate::supervisor::joint_goal_target_from(
+        &snap.commanded_positions,
+        q,
+        snap.env.config.arm_dof(),
+        snap.env.config.gripper_index(),
+    );
+    let limits = snap.env.planning_limits(Some(plan.request.speed_scale));
+    if !ctx.is_executor() {
+        ctx.sup.inner().write().await.set_action_phase(ctx.id, phase, 0.0, None, None);
+    }
+    ctx.install_joint_child(
+        phase,
+        target,
+        limits,
+        true,
+        Some(plan.workspace_revision),
+        Some(plan.calibration_revision),
+    )
+    .await
+    .map(|_| ())
 }
 
 fn is_refusal(s: &Stop) -> bool { matches!(s, Stop::Fail(code, _) if PLAN_REFUSALS.contains(&code.as_str())) }
@@ -2152,10 +2284,18 @@ pub fn replay_bundle_with(dir: &std::path::Path, mode: Option<PoseRefine>) -> Re
     Ok((b, c))
 }
 
-async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: Plan, src: Arc<dyn DetectionSource>, stamp: crate::supervisor::AdmissionStamp) {
+async fn run(
+    sup: Arc<ArmSupervisor>,
+    id: u64,
+    plan: Plan,
+    src: Arc<dyn DetectionSource>,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+) {
+    use crate::rt_core::requests::actions::{FinishState, HeldUpdate};
     let ctx = MacroCtx {
         sup: sup.clone(), id, stamp,
-        deadline: Instant::now() + Duration::from_secs_f64(plan.deadline_s),
+        deadline,
         phase_timeout_s: plan.deadline_s,
         timeout_code: "MEASURE_TIMEOUT",
         timeout_message: "the measurement did not finish within its time bound".into(),
@@ -2164,16 +2304,24 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: Plan, src: Arc<dyn Detectio
     let outcome = measure_run(&ctx, &plan, &src, &mut hold).await;
     // the camera gate goes back to the provider's state before the run, whatever the outcome
     if let Some(h) = hold { h.release().await; }
-    let mut inner = sup.inner().write().await;
     match outcome {
-        Ok(None) => inner.finish_macro(id, "done", None, None, None, None),
-        Ok(Some((code, message))) => inner.finish_macro(id, "failed", Some(&code), Some(message), None, None),
-        Err(Stop::Fail(code, message)) => inner.finish_macro(id, "failed", Some(&code), Some(message), None, None),
+        Ok(None) => {
+            ctx.finish(FinishState::Done, None, None, None, None, HeldUpdate::Unchanged).await;
+        }
+        Ok(Some((code, message))) => {
+            ctx.finish(FinishState::Failed, Some(&code), Some(message), None, None, HeldUpdate::Unchanged).await;
+        }
+        Err(Stop::Fail(code, message)) => {
+            ctx.finish(FinishState::Failed, Some(&code), Some(message), None, None, HeldUpdate::Unchanged).await;
+        }
         Err(Stop::Cancelled) => {}
     }
-    let a = inner.last_action.as_ref().filter(|a| a.id == id).map(|a| (a.state, a.code));
-    drop(inner);
-    tracing::info!("measure_multiview {id} ended: {a:?}");
+    if !ctx.is_executor() {
+        let inner = sup.inner().read().await;
+        let a = inner.last_action.as_ref().filter(|a| a.id == id).map(|a| (a.state, a.code));
+        drop(inner);
+        tracing::info!("measure_multiview {id} ended: {a:?}");
+    }
 }
 
 /// The run's image source: gray when the provider advertises it on a loopback upstream and its
