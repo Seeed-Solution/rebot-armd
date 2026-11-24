@@ -867,7 +867,7 @@ async fn server_fatal_close_preserves_error_before_close_frame_order() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_corpus_matches_baseline_zero_diff() {
     let dir = corpus_dir();
     let bin = replay_binary();
@@ -979,39 +979,55 @@ async fn replay_corpus_matches_baseline_zero_diff() {
         files.len()
     );
 
-    let mut total_frames = 0usize;
-    let mut total_diffs = 0usize;
+    // Each session runs against its own isolated tempdir, ports and armd binary; 4 concurrent
+    // slots saturate the 14.2 s / 10.8 s / 6.8 s tail sessions while keeping CPU contention low
+    // under heavy load.
+    let sem = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut handles = Vec::with_capacity(files.len());
     for entry in files {
-        let raw_filename = entry.as_str().expect("session filename");
+        let raw_filename = entry.as_str().expect("session filename").to_string();
         #[cfg(feature = "policy-runtime")]
         let filename = raw_filename;
         #[cfg(not(feature = "policy-runtime"))]
         let filename = if raw_filename == "16_policy_shadow_start_stop.json" {
-            policy_disabled_file
+            policy_disabled_file.to_string()
         } else {
             raw_filename
         };
         #[cfg(feature = "policy-runtime")]
         let _ = policy_disabled_file;
 
-        let path = dir.join(filename);
+        let path = dir.join(&filename);
         let expected: SessionTranscript =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
                 .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
-        let actual = execute_binary_session(
-            &bin,
-            &expected.id,
-            &expected.family,
-            &expected.description,
-            &expected.setup,
-            &expected.steps,
-        )
-        .await;
-        total_frames += actual.events.len();
-        let diffs = compare_transcripts(&expected, &actual);
+        let sem = sem.clone();
+        let bin = bin.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let actual = execute_binary_session(
+                &bin,
+                &expected.id,
+                &expected.family,
+                &expected.description,
+                &expected.setup,
+                &expected.steps,
+            )
+            .await;
+            let frames = actual.events.len();
+            let diffs = compare_transcripts(&expected, &actual);
+            (expected.id, filename, frames, diffs)
+        }));
+    }
+
+    let mut total_frames = 0usize;
+    let mut total_diffs = 0usize;
+    for handle in handles {
+        let (id, filename, frames, diffs) = handle.await.expect("session task panicked");
+        total_frames += frames;
         if !diffs.is_empty() {
             total_diffs += diffs.len();
-            eprintln!("DIFF in session {} ({}):", expected.id, filename);
+            eprintln!("DIFF in session {} ({}):", id, filename);
             for d in &diffs {
                 eprintln!(
                     "  ev[{}] {}: expected={} actual={}",
