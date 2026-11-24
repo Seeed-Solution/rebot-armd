@@ -1020,6 +1020,19 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
         guard.mode = Mode::EnobufsAfter(0);
         guard.tx_count = 0;
     }
+    // Round-2 Item 2 zero-alloc check: empty software queue + fresh feedback + persistent ENOBUFS
+    // -> RT executor clear_fault_executor_bounded runs TX probe, fails with ENOBUFS, 0 allocs/0 frees.
+    {
+        let dl = std::time::Instant::now() + Duration::from_millis(200);
+        let (refused_by_probe, a, f) = counted(|| {
+            matches!(
+                inner.clear_fault_executor_bounded(dl),
+                Err(armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::DriverError(_)))
+            )
+        });
+        assert!(refused_by_probe, "ENOBUFS TX probe must refuse clear_fault_executor_bounded");
+        assert_eq!((a, f), (0, 0), "ENOBUFS TX probe clear refusal touched allocator");
+    }
     let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
     assert!(published.kept.is_none());
     drop(published);
@@ -1027,11 +1040,28 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     assert!(matches!(inner.safety.state(), SafetyState::Fault(FaultReason::CanTxStalled)));
     assert_eq!((a, f), (0, 0), "subsequent stalled hold tick_publish touched allocator");
 
+    // Round-2 Item 2 zero-alloc check: when ENOBUFS clears and the queue drains, RT executor
+    // clear_fault_executor_bounded sends the 0xCC TX probe, receives post-probe fresh feedback,
+    // and clears CAN_TX_STALLED to Idle with 0 allocs / 0 frees.
+    {
+        let mut guard = bus.0.lock().unwrap();
+        guard.mode = Mode::Ok;
+        guard.tx_count = 0;
+        guard.push_all_feedback();
+    }
+    let _ = inner.tick_publish(0.02, 1, false);
+    let _ = inner.core.hub().latest();
+    {
+        let dl = std::time::Instant::now() + Duration::from_millis(200);
+        let (cleared_to_idle, a, f) = counted(|| inner.clear_fault_executor_bounded(dl) == Ok(SafetyState::Idle));
+        assert!(cleared_to_idle, "healthy TX probe must clear CAN_TX_STALLED to Idle");
+        assert_eq!((a, f), (0, 0), "healthy TX probe clear_fault_executor_bounded touched allocator");
+    }
+
     // (d) Off-thread reclamation saturation: fill RETIRED_STATE_CAPACITY (16) retired
     // fault transitions without draining, leave a non-cached Fault(Other) active, then latch
     // CanTxStalled via SafetyManager::latch inside counted -> records kind & detail and advances
     // epoch with 0 allocs / 0 frees without overflowing or dropping the retired fault ring.
-    inner.safety.clear_fault_bounded().expect("clear before filling retired ring");
     for _ in 0..RETIRED_STATE_CAPACITY {
         inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fill".into()));
         inner.safety.clear_fault_bounded().expect("retire fault arc");

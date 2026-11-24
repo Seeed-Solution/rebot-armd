@@ -2704,6 +2704,7 @@ impl SupervisorInner {
         if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.try_lock() {
                 drv.discard_pending_tx();
+                drv.clear_tx_probe();
             }
         }
         self.stop_motion();

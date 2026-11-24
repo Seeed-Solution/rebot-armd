@@ -1457,3 +1457,133 @@ fn dual_owner_late_output_start_stops_tx_at_release_deadline_and_carries_over() 
         assert!(rig.inner().safety.state().is_operational());
     }
 }
+
+/// Round-2 Item 2:
+/// `CAN_TX_STALLED` clear MUST prove that TX works on BOTH owners (Legacy and RT Executor):
+/// 1. Right after latching `CAN_TX_STALLED`, pending motion frames were discarded (empty software
+///    queue) and feedback is fresh, yet `ENOBUFS` persists -> clear MUST be refused.
+/// 2. When `ENOBUFS` clears, a `0xCC` refresh/status probe is transmitted with no backpressure or
+///    error, but without post-probe feedback (`immediate_replies = false`) -> clear MUST be
+///    refused with `TxProbeFeedbackRequired`.
+/// 3. If `ENOBUFS` returns after a probe was sent, the probe is invalidated and clear is refused.
+/// 4. When `ENOBUFS` is gone and fresh feedback arrives strictly after the probe -> clear passes
+///    to `Idle` and re-enable succeeds.
+#[test]
+fn dual_owner_can_tx_stalled_clear_requires_tx_probe_and_post_probe_feedback() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new(owner, base_cfg(), None);
+        rig.bus.with(|s| s.tx_enobufs = true);
+        for _ in 0..8 {
+            rig.step();
+            if rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled) {
+                break;
+            }
+        }
+        assert!(rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled));
+        assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::CanTxStalled));
+        let latched_epoch = rig.inner().safety.epoch_id();
+
+        // Stall handler discarded pending motion frames -> software queue is empty right now,
+        // and feedback from the latching tick is fresh, while ENOBUFS still persists!
+        assert_eq!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_tx_len_total(),
+            0,
+            "{owner:?}: software TX queue is empty immediately after stall latch"
+        );
+
+        // 1. ENOBUFS persists on empty queue + fresh feedback -> clear MUST be refused!
+        rig.bus.clear_log();
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(
+                    err.contains("ENOBUFS") || err.contains("Transmit queue full"),
+                    "{owner:?}: expected ENOBUFS refusal while TX is still failing, got: {err}"
+                );
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::DriverError(_))
+                    ),
+                    "{owner:?}: expected bounded DriverError(ENOBUFS) refusal, got: {err:?}"
+                );
+                assert!(
+                    err.to_string().contains("ENOBUFS"),
+                    "{owner:?}: expected ENOBUFS in refusal text, got: {err}"
+                );
+            }
+        }
+        assert!(rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled));
+        assert_eq!(rig.inner().safety.epoch_id(), latched_epoch);
+
+        // 2. ENOBUFS gone, but NO feedback reply arrives after the probe (motor 0 silent):
+        //    probe transmits a 0xCC refresh frame (0x7FF) cleanly, yet clear MUST be refused with
+        //    TxProbeFeedbackRequired until fresh feedback arrives strictly after that probe.
+        rig.bus.clear_log();
+        rig.bus.with(|s| {
+            s.tx_enobufs = false;
+            s.motors[0].silent = true;
+        });
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(
+                    err.contains("CAN TX probe sent; wait for fresh feedback received after the probe"),
+                    "{owner:?}: expected TxProbeFeedbackRequired refusal, got: {err}"
+                );
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert_eq!(
+                    err,
+                    armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::TxProbeFeedbackRequired),
+                    "{owner:?}: expected bounded TxProbeFeedbackRequired refusal"
+                );
+            }
+        }
+        let probe_frames = rig.bus.tx_log();
+        assert!(
+            probe_frames.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "{owner:?}: expected 0xCC refresh probe frame on 0x7FF, got: {probe_frames:?}"
+        );
+        assert!(rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled));
+
+        // 3. If ENOBUFS returns on a subsequent tick, the earlier pending probe is invalidated and
+        //    clearing (even after discarding pending frames with fresh feedback) is refused again.
+        rig.bus.with(|s| {
+            s.motors[0].silent = false;
+            s.tx_enobufs = true;
+        });
+        rig.step(); // stopped-hold hits ENOBUFS -> invalidates probe
+        rig.inner().driver.as_ref().unwrap().lock().unwrap().discard_pending_tx();
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(err.contains("ENOBUFS"), "{owner:?}: expected ENOBUFS after probe invalidation, got: {err}");
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert!(err.to_string().contains("ENOBUFS"), "{owner:?}: expected ENOBUFS, got: {err}");
+            }
+        }
+
+        // 4. ENOBUFS gone + replies active -> probe transmits cleanly, fresh feedback arrives
+        //    strictly after the probe, clear_fault passes to Idle and re-enable succeeds!
+        rig.bus.clear_log();
+        rig.bus.with(|s| {
+            s.tx_enobufs = false;
+            s.motors[0].silent = false;
+            s.immediate_replies = true;
+        });
+        rig.step();
+        rig.clear_fault_and_enable();
+        assert_eq!(rig.inner().safety.latched_fault_kinds(), 0);
+        assert!(rig.inner().safety.state().is_operational());
+    }
+}

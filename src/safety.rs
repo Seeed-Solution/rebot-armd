@@ -1067,6 +1067,8 @@ pub enum ClearRefusal {
     HardwareResetSent,
     FreshFeedbackRequired,
     TxQueueNotDrained,
+    TxProbeRequired,
+    TxProbeFeedbackRequired,
     TemperatureConfirmationRequired,
     TemperatureAboveThreshold,
     ThermalCooldownNotElapsed { elapsed_ms: u64, required_ms: u64 },
@@ -1115,6 +1117,8 @@ impl std::fmt::Display for ClearRefusal {
             Self::HardwareResetSent => f.write_str("Hardware reset sent; wait for fresh fault-free feedback before retrying"),
             Self::FreshFeedbackRequired => f.write_str("Fresh feedback is required before resetting a fault"),
             Self::TxQueueNotDrained => f.write_str("CAN TX queue still has pending frames; wait for the bus to drain before clearing CAN_TX_STALLED"),
+            Self::TxProbeRequired => f.write_str("CAN TX transmit probe is required before clearing CAN_TX_STALLED"),
+            Self::TxProbeFeedbackRequired => f.write_str("CAN TX probe sent; wait for fresh feedback received after the probe before clearing CAN_TX_STALLED"),
             Self::TemperatureConfirmationRequired => f.write_str("Temperature must be confirmed below the reset threshold"),
             Self::TemperatureAboveThreshold => f.write_str("Temperature is above the reset threshold"),
             Self::ThermalCooldownNotElapsed { elapsed_ms, required_ms } =>
@@ -1143,6 +1147,11 @@ pub struct ClearContext {
     pub feedback_fresh: bool,
     /// True when the driver's bounded TX carry-over queues (motion + stopped-hold) are empty.
     pub tx_queue_drained: bool,
+    /// True when a CAN transmit probe (refresh/status frame sent with no backpressure or error
+    /// after an empty queue) has been confirmed by fresh feedback received after that probe.
+    pub tx_probe_confirmed: bool,
+    /// True when a CAN transmit probe was sent cleanly and is awaiting post-probe fresh feedback.
+    pub tx_probe_sent: bool,
     pub thermal_sensor_available: bool,
     pub thermal_below_threshold: bool,
     pub thermal_cooldown_elapsed_ms: u64,
@@ -1178,6 +1187,8 @@ impl ClearContext {
             has_driver: false,
             feedback_fresh: true,
             tx_queue_drained: true,
+            tx_probe_confirmed: true,
+            tx_probe_sent: false,
             thermal_sensor_available: true,
             thermal_below_threshold: true,
             thermal_cooldown_elapsed_ms: 0,
@@ -2149,16 +2160,22 @@ impl SafetyManager {
         if !checked_any && self.state_arc.is_stopped() && ctx.has_driver && !ctx.feedback_fresh {
             return Err(ClearRefusal::FreshFeedbackRequired);
         }
-        // Hardware-fault reset & status checks run ONLY after every other recorded kind passed.
+        // Hardware-fault reset, CAN TX probe, and status checks run ONLY after every other recorded kind passed.
         if checked_any || self.state_arc.is_stopped() {
+            if let Some(err) = ctx.hardware_error {
+                return Err(ClearRefusal::DriverError(err));
+            }
+            if ctx.has_driver && self.has_latched_fault_kind(FaultKind::CanTxStalled) && !ctx.tx_probe_confirmed {
+                if ctx.tx_probe_sent {
+                    return Err(ClearRefusal::TxProbeFeedbackRequired);
+                }
+                return Err(ClearRefusal::TxProbeRequired);
+            }
             if ctx.hardware_reset_sent {
                 return Err(ClearRefusal::HardwareResetSent);
             }
             if ctx.hardware_reset_required {
                 return Err(ClearRefusal::HardwareResetRequired);
-            }
-            if let Some(err) = ctx.hardware_error {
-                return Err(ClearRefusal::DriverError(err));
             }
             if ctx.has_driver && !ctx.enable_state_known {
                 return Err(ClearRefusal::EnableStateUnknown);

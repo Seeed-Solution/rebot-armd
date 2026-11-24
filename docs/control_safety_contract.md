@@ -62,7 +62,7 @@ When enable confirmation is unavailable or remains `Unknown`, automatic disable,
   - **Clear gate (`SafetyManager::clear_check`)**: every clear path (legacy `clear_fault`, RT executor `clear_fault`, MIT expiry recovery, and E-stop clear) evaluates `SafetyManager::clear_check` FIRST before any motor reset or other side effect (a motor fault reset is permitted only after every other recorded kind's condition passes, followed by re-evaluating `clear_check`; MIT expiry recovery evaluates its final check on feedback received after recovery). Every recorded kind is evaluated, failing closed on any unknown kind bit:
     - `ThermalTrip`: below `max_temperature - THERMAL_CLEAR_MARGIN_C` for the required cooldown duration; cooldown accrues only while temperature feedback is fresh, and stale or unavailable temperature feedback resets the cooldown timer.
     - `BusLoss`: fresh feedback from every motor.
-    - `CanTxStalled`: bounded CAN TX queue completely drained (zero pending motion and hold frames) and fresh feedback from every motor.
+    - `CanTxStalled`: bounded CAN TX queue completely drained (zero pending motion and hold frames), fresh feedback from every motor, and a successful transmit probe (a read-only refresh/status frame sent with no backpressure or error on an empty queue, confirmed by fresh feedback received strictly after that probe).
     - `WatchdogTimeout`: fresh heartbeat from the active lease holder, or no active lease (an expired lease counts as no lease).
     - `JointLimit` (manual recovery when out of limits): measured joint positions must be back within `[min - 0.01, max + 0.01]` rad (`JOINT_LIMIT_CLEAR_MARGIN_RAD`), with no driver limit conflict. Even with torque off when the arm rests beyond a soft limit plus `0.01 rad`, armd does not allow a software clear that could subsequently enable at an out-of-limit pose; `clear_fault` keeps refusing and the refusal message names the offending joint, its measured position, and its configured limits so the operator knows to move it back within limits by hand before retrying `clear_fault`.
     - `CollisionLatched` / `Estop` / `Other`: fresh feedback, fault-free hardware status, and known enable state.
@@ -80,7 +80,7 @@ When enable confirmation is unavailable or remains `Unknown`, automatic disable,
   - **清除校验（`SafetyManager::clear_check`）**：所有清除路径（旧路径 `clear_fault`、RT 执行器 `clear_fault`、MIT 超时恢复及急停清除）均在任何电机复位或其他副作用之前**最先**调用 `SafetyManager::clear_check`（仅当其余所有已记录类别的条件均已通过时，才允许发送电机故障复位并随后重新执行 `clear_check`；MIT 超时恢复的最终校验基于恢复完成后收到的新反馈）。逐一核对记录中所有类别，未知类别位一律 fail-closed 拒绝清除：
     - `ThermalTrip`：所有关节温度低于 `max_temperature - THERMAL_CLEAR_MARGIN_C` 且满足冷却持续时间；冷却时间仅在温度反馈新鲜时累计，温度反馈过期或不可用时立即重置冷却计时器。
     - `BusLoss`：全部电机具备新鲜反馈。
-    - `CanTxStalled`：有界 CAN TX 发送队列完全排空（运动与停止保持待发帧数均为 0）且全部电机具备新鲜反馈。
+    - `CanTxStalled`：有界 CAN TX 发送队列完全排空（运动与停止保持待发帧数均为 0）、全部电机具备新鲜反馈，且在队列为空后完成一次无背压、无错误的发送探测（只读状态刷新帧），并收到严格晚于该探测帧的新鲜反馈。
     - `WatchdogTimeout`：活动租约持有者具备新鲜心跳，或当前无活动租约（已过期的租约视同无租约）。
     - `JointLimit`（越界时须人工复位）：实测关节位置须回到 `[min - 0.01, max + 0.01]` rad（`JOINT_LIMIT_CLEAR_MARGIN_RAD`）以内且无驱动限位配置冲突。即使力矩已关闭、机械臂停在软限位加 `0.01 rad` 之外，armd 也不允许软件清除（避免在越界位姿下重新使能）；`clear_fault` 持续拒绝，并在拒绝消息中明确标出越界关节名称/编号、当前实测位置与配置限位，方便操作员先手动将关节移回限位内后再重试 `clear_fault`。
     - `CollisionLatched` / `Estop` / `Other`：保持新鲜反馈、无硬件故障状态与已知使能状态规则。

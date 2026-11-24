@@ -286,6 +286,13 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn pending_motion_tx_len(&self) -> usize { self.inner.pending_motion_tx_len() }
     fn pending_hold_tx_len(&self) -> usize { self.inner.pending_hold_tx_len() }
+    fn tx_probe_confirmed(&self) -> bool { self.inner.tx_probe_confirmed() }
+    fn tx_probe_pending(&self) -> bool { self.inner.tx_probe_pending() }
+    fn probe_tx_ready(&mut self) -> Result<bool, ArmDriverError> { self.inner.probe_tx_ready() }
+    fn probe_tx_ready_budgeted(&mut self, deadline: Instant) -> Result<bool, ArmDriverError> {
+        self.inner.probe_tx_ready_budgeted(deadline)
+    }
+    fn clear_tx_probe(&mut self) { self.inner.clear_tx_probe(); }
     fn joint_modes_uncertain(&self) -> bool { self.inner.joint_modes_uncertain() }
     fn range_check(&self) -> Option<DriverRangeCheck> { self.inner.range_check() }
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }

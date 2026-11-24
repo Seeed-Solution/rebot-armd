@@ -1223,6 +1223,22 @@ fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
             ClearRefusal::FreshFeedbackRequired,
             driver_met,
         ),
+        // CanTxStalled: drained queue + fresh feedback, no TX probe yet -> TxProbeRequired
+        (
+            FaultKind::CanTxStalled,
+            FaultDetail::CanTxStalled(None),
+            ClearContext { tx_probe_confirmed: false, tx_probe_sent: false, ..driver_met },
+            ClearRefusal::TxProbeRequired,
+            driver_met,
+        ),
+        // CanTxStalled: TX probe sent, awaiting post-probe feedback -> TxProbeFeedbackRequired
+        (
+            FaultKind::CanTxStalled,
+            FaultDetail::CanTxStalled(None),
+            ClearContext { tx_probe_confirmed: false, tx_probe_sent: true, ..driver_met },
+            ClearRefusal::TxProbeFeedbackRequired,
+            driver_met,
+        ),
         // WatchdogTimeout: active lease with stale heartbeat -> refused; fresh heartbeat -> cleared
         (
             FaultKind::WatchdogTimeout,

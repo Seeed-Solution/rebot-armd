@@ -573,6 +573,27 @@ pub trait ArmDriver: Send {
         self.pending_motion_tx_len() + self.pending_hold_tx_len()
     }
 
+    /// True when a bounded-CAN driver has confirmed healthy TX via a refresh/status transmit probe
+    /// sent with no backpressure or error on an empty queue, followed by fresh feedback received
+    /// strictly after that probe. Non-CAN/sim drivers default to `true`.
+    fn tx_probe_confirmed(&self) -> bool { true }
+
+    /// True when a TX probe was recently sent and is still awaiting post-probe fresh feedback.
+    fn tx_probe_pending(&self) -> bool { false }
+
+    /// Blocking transmit probe (Legacy `clear_fault` path): requires an empty TX queue, drains RX
+    /// to establish a boundary, sends a read-only refresh/status frame without backpressure or
+    /// error, flushes, and waits up to 50 ms for fresh post-probe feedback.
+    /// Returns `Ok(true)` when post-probe fresh feedback arrived, `Ok(false)` when the probe
+    /// transmitted cleanly but no reply arrived yet, or `Err` on backpressure/error.
+    fn probe_tx_ready(&mut self) -> Result<bool, ArmDriverError> { Ok(true) }
+
+    /// Non-blocking, zero-allocation budgeted transmit probe for the RT executor `clear_fault` path.
+    fn probe_tx_ready_budgeted(&mut self, _deadline: Instant) -> Result<bool, ArmDriverError> { Ok(true) }
+
+    /// Clear any recorded TX probe state (called on fault clear or new TX stall latch).
+    fn clear_tx_probe(&mut self) {}
+
     /// Enable or disable torque / power across all joints
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError>;
 
@@ -2974,6 +2995,15 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Optional absolute driver-clock ceiling on the active control release's TX start-cutoff
     /// (`release_deadline - publish_margin`), set during a release and cleared afterwards.
     tx_release_deadline: Option<Instant>,
+    /// Active/confirmed CAN transmit probe recorded for clearing `CAN_TX_STALLED` (zero alloc).
+    tx_probe: Option<TxProbeState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TxProbeState {
+    joint: usize,
+    boundary_seq: u64,
+    sent_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3432,6 +3462,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             enable_stop_stamp: None,
             pf_last_fresh_feedback: None,
             tx_release_deadline: None,
+            tx_probe: None,
         }
     }
 
@@ -3481,6 +3512,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Explicitly drop all queued motion frames (e.g. on an ordinary stop from a bounded caller).
     /// Returns how many frames were dropped and counts them under `tx_dropped_stopped`.
     pub fn discard_pending_tx(&mut self) -> usize {
+        self.tx_probe = None;
         let n = self.pending_tx.clear();
         if n > 0 {
             crate::diagnostics::tick::record_tx_dropped_stopped(n as u32);
@@ -3491,6 +3523,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Drop all queued stopped-hold frames and reset the round-robin hold cursor.
     fn discard_pending_hold_tx(&mut self) {
+        self.tx_probe = None;
         let n = self.pending_hold_tx.clear();
         self.hold_cursor = 0;
         if n > 0 {
@@ -3624,6 +3657,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     #[inline]
     fn mark_tx_pass_backpressured(&mut self) {
+        self.tx_probe = None;
         let mut pass = self.ensure_tx_pass();
         pass.backpressured = true;
         self.tick_tx = Some(pass);
@@ -3817,6 +3851,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         match res {
             Ok(()) => Ok(frame),
             Err(e) => {
+                self.tx_probe = None;
                 if budgeted && e.is_tx_backpressure() {
                     self.mark_tx_pass_backpressured();
                 }
@@ -4823,6 +4858,137 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// the receive queue is observed empty (bounded). Every frame dequeued afterwards (RX sequence
     /// number larger than the returned one) was enqueued after the boundary, so frames queued
     /// before the transaction never count, and a reply arriving right after its request does.
+    /// Pure RX-only drain (no autonomous recovery/refresh TX, no `begin_tx_tick`, zero heap
+    /// allocation). Returns `true` when the transport explicitly reported an empty RX queue.
+    fn drain_rx_frames_only(&mut self, deadline: Option<Deadline>, max_frames: usize) -> bool {
+        let mut frames = 0usize;
+        while frames < max_frames {
+            if deadline.is_some_and(|d| d.passed(self.now())) {
+                return false;
+            }
+            let attempt = self.now();
+            match self.can.receive_timestamped() {
+                Ok((frame, rx_ts)) => {
+                    frames += 1;
+                    self.process_rx_frame(&frame, false, rx_ts);
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    self.mark_rx_empty(attempt);
+                    return true;
+                }
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// Transmit a read-only `0xCC` status refresh probe on an empty software queue through the
+    /// single `send()` chokepoint, flush, and check for fresh post-probe feedback.
+    /// Zero heap allocations when `blocking == false` (RT executor path).
+    fn probe_tx_ready_inner(
+        &mut self,
+        deadline: Option<Deadline>,
+        blocking: bool,
+    ) -> Result<bool, ArmDriverError> {
+        if !blocking && (!self.can.supports_nonblocking_rt() || !self.can.supports_bounded_flush()) {
+            return Err(ArmDriverError::Protocol(
+                "UNSUPPORTED: transport does not support non-blocking RT I/O and bounded flush".into(),
+            ));
+        }
+        let pending = self.total_pending_tx_len() as usize;
+        if pending > 0 {
+            self.tx_probe = None;
+            return Err(ArmDriverError::TxDeferred { pending });
+        }
+        if self.motor_ids.is_empty() {
+            return Ok(true);
+        }
+        let start_stamp = self.current_stop_stamp();
+        self.pending_stop_check(Some(start_stamp))?;
+        if let Some((_, at)) = self.mit_fence_trip {
+            if self.since(at) < self.mit_fence_holdoff {
+                return Err(ArmDriverError::Transport(TransportError::WouldBlock));
+            }
+        }
+        if deadline.is_some_and(|d| d.passed(self.now())) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        // Drain pre-existing queued RX frames to establish an empty-queue sequence boundary so
+        // pre-probe replies cannot satisfy post-probe feedback confirmation.
+        let mut drained = self.drain_rx_frames_only(deadline, 64);
+        if !drained && blocking {
+            for _ in 0..7 {
+                drained = self.drain_rx_frames_only(deadline, 64);
+                if drained {
+                    break;
+                }
+            }
+        }
+        if !drained {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        let boundary_seq = self.rx_empty_seq;
+        self.pending_stop_check(Some(start_stamp))?;
+        if deadline.is_some_and(|d| d.passed(self.now())) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        self.tx_probe = None;
+        self.tx_release_deadline = None;
+        self.begin_tx_tick();
+        let probe_joint = 0usize;
+        match self.send(TxKind::Refresh, Some(start_stamp), deadline, false, |d| {
+            Some(damiao::build_refresh_frame(d.motor_ids[probe_joint]))
+        }) {
+            Ok(_) => {}
+            Err(TxRefusal::DeadlinePassed) => {
+                return Err(ArmDriverError::Transport(TransportError::Timeout));
+            }
+            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                return Err(ArmDriverError::EstopInhibited);
+            }
+            Err(TxRefusal::Deferred) => {
+                return Err(ArmDriverError::TxDeferred { pending: 1 });
+            }
+            Err(TxRefusal::Transport(e)) => {
+                return Err(ArmDriverError::Transport(e));
+            }
+            Err(r) => {
+                return Err(Self::refusal_to_driver_err(r));
+            }
+        }
+        self.pending_stop_check(Some(start_stamp))?;
+        if deadline.is_some_and(|d| d.passed(self.now())) {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        if let Err(e) = self.can.flush() {
+            self.mark_tx_pass_backpressured();
+            return Err(ArmDriverError::Transport(e));
+        }
+        let sent_at = self.now();
+        self.tx_probe = Some(TxProbeState {
+            joint: probe_joint,
+            boundary_seq,
+            sent_at,
+        });
+        if blocking {
+            loop {
+                let _ = self.drain_rx_frames_only(deadline, 64);
+                if self.tx_probe_confirmed() {
+                    return Ok(true);
+                }
+                if self.since(sent_at) >= REGISTER_REPLY_TIMEOUT
+                    || deadline.is_some_and(|d| d.passed(self.now()))
+                {
+                    return Ok(false);
+                }
+                self.pause(Duration::from_micros(500));
+            }
+        } else {
+            let _ = self.drain_rx_frames_only(deadline, 64);
+            Ok(self.tx_probe_confirmed())
+        }
+    }
+
     fn rx_boundary(&mut self) -> Result<u64, ArmDriverError> {
         for _ in 0..8 {
             let _ = self.read_joint_states();
@@ -6840,6 +7006,34 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.pending_hold_tx.len()
     }
 
+    fn tx_probe_confirmed(&self) -> bool {
+        let Some(probe) = self.tx_probe else { return false };
+        !self.awaiting_rx_boundary
+            && self.total_pending_tx_len() == 0
+            && probe.joint < self.last_feedback_seq.len()
+            && self.last_feedback_seq[probe.joint] > probe.boundary_seq
+            && self.last_feedback_instant[probe.joint]
+                .is_some_and(|t| self.since(t) <= Duration::from_millis(250))
+            && self.is_feedback_valid()
+    }
+
+    fn tx_probe_pending(&self) -> bool {
+        let Some(probe) = self.tx_probe else { return false };
+        !self.tx_probe_confirmed() && self.since(probe.sent_at) < REGISTER_REPLY_TIMEOUT
+    }
+
+    fn probe_tx_ready(&mut self) -> Result<bool, ArmDriverError> {
+        self.probe_tx_ready_inner(None, true)
+    }
+
+    fn probe_tx_ready_budgeted(&mut self, deadline: Instant) -> Result<bool, ArmDriverError> {
+        self.probe_tx_ready_inner(Some(Deadline { at: deadline }), false)
+    }
+
+    fn clear_tx_probe(&mut self) {
+        self.tx_probe = None;
+    }
+
     fn set_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         self.switch_joint_modes_confirmed(modes, hold)
     }
@@ -6896,7 +7090,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         loop {
             let _ = self.read_joint_states();
             let stale: Vec<String> = (0..self.motor_ids.len()).filter(|&i| self.last_feedback_seq[i] <= pre).map(|i| format!("J{}", i + 1)).collect();
-            if stale.is_empty() { return Ok(self.motor_status.clone()); }
+            if stale.is_empty() {
+                if self.total_pending_tx_len() == 0 && !self.motor_ids.is_empty() {
+                    self.tx_probe = Some(TxProbeState {
+                        joint: 0,
+                        boundary_seq: pre,
+                        sent_at: start,
+                    });
+                }
+                return Ok(self.motor_status.clone());
+            }
             if self.since(start) >= REGISTER_REPLY_TIMEOUT {
                 return Err(format!("no fresh feedback from {}", stale.join(", ")));
             }
@@ -6949,6 +7152,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
         }
         self.last_mit_recovery_rx_seq = Some(boundary);
+        if self.total_pending_tx_len() == 0 && !self.motor_ids.is_empty() {
+            self.tx_probe = Some(TxProbeState {
+                joint: 0,
+                boundary_seq: boundary,
+                sent_at: self.now(),
+            });
+        }
         self.disable_confirmed_sticky = true;
         self.mit_fence = None;
         Ok(())

@@ -1733,6 +1733,8 @@ impl SupervisorInner {
             has_driver: self.driver.is_some(),
             feedback_fresh: self.driver.is_none(),
             tx_queue_drained: self.driver.is_none(),
+            tx_probe_confirmed: self.driver.is_none(),
+            tx_probe_sent: false,
             thermal_sensor_available: self.driver.is_none(),
             thermal_below_threshold: thermal_below,
             thermal_cooldown_elapsed_ms: cooldown_elapsed_ms,
@@ -1764,6 +1766,8 @@ impl SupervisorInner {
                     && drv.is_feedback_valid()
                     && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
                 ctx.tx_queue_drained = drv.pending_tx_len_total() == 0;
+                ctx.tx_probe_confirmed = drv.tx_probe_confirmed();
+                ctx.tx_probe_sent = drv.tx_probe_pending();
                 ctx.enable_state_known = true;
             }
         }
@@ -1896,6 +1900,7 @@ impl SupervisorInner {
         // / `lease_heartbeat_fresh`) run FIRST here before any bus poll or state change.
         pre_ctx.feedback_fresh = true;
         pre_ctx.tx_queue_drained = true;
+        pre_ctx.tx_probe_confirmed = true;
         pre_ctx.thermal_sensor_available = true;
         pre_ctx.thermal_below_threshold = true;
         pre_ctx.thermal_cooldown_elapsed_ms = pre_ctx.thermal_cooldown_required_ms;
@@ -1934,6 +1939,8 @@ impl SupervisorInner {
                         let caps = drv.capabilities();
                         let modes_uncertain = drv.joint_modes_uncertain();
                         let tx_queue_drained = drv.pending_tx_len_total() == 0;
+                        let tx_probe_confirmed = drv.tx_probe_confirmed();
+                        let tx_probe_sent = drv.tx_probe_pending();
                         let fb_fresh = drv.is_feedback_valid()
                             && ages.len() == self.config.dof
                             && ages.iter().all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT))
@@ -1956,6 +1963,8 @@ impl SupervisorInner {
                             caps.temperature_feedback,
                             fb_fresh,
                             tx_queue_drained,
+                            tx_probe_confirmed,
+                            tx_probe_sent,
                             thermal_below,
                             next_cd,
                             modes_uncertain,
@@ -1968,11 +1977,13 @@ impl SupervisorInner {
                 }
                 mit_ctx.expected_epoch = expected_epoch;
                 mit_ctx.pending_estop = self.estop_request_unapplied();
-                if let Some((ref states, _, temp_fb, fb_fresh, tx_queue_drained, thermal_below, next_cd, modes_uncertain)) = snapshot {
+                if let Some((ref states, _, temp_fb, fb_fresh, tx_queue_drained, tx_probe_confirmed, tx_probe_sent, thermal_below, next_cd, modes_uncertain)) = snapshot {
                     mit_ctx.mit_modes_uncertain = modes_uncertain;
                     mit_ctx.thermal_sensor_available = temp_fb;
                     mit_ctx.feedback_fresh = fb_fresh;
                     mit_ctx.tx_queue_drained = tx_queue_drained;
+                    mit_ctx.tx_probe_confirmed = tx_probe_confirmed;
+                    mit_ctx.tx_probe_sent = tx_probe_sent;
                     mit_ctx.thermal_below_threshold = thermal_below;
                     mit_ctx.thermal_cooldown_elapsed_ms = if thermal_below {
                         next_cd.elapsed_ms()
@@ -1986,6 +1997,8 @@ impl SupervisorInner {
                 } else {
                     mit_ctx.feedback_fresh = false;
                     mit_ctx.tx_queue_drained = false;
+                    mit_ctx.tx_probe_confirmed = false;
+                    mit_ctx.tx_probe_sent = false;
                     mit_ctx.thermal_sensor_available = false;
                     mit_ctx.thermal_below_threshold = false;
                     mit_ctx.thermal_cooldown_elapsed_ms = 0;
@@ -2008,7 +2021,7 @@ impl SupervisorInner {
                 }
                 // Full `clear_check` and operator confirmation passed: commit synced state now.
                 self.mit.recovery_confirmed = false;
-                if let Some((states, loads, _, fb_fresh, _, _, next_cd, _)) = snapshot {
+                if let Some((states, loads, _, fb_fresh, _, _, _, _, next_cd, _)) = snapshot {
                     if fb_fresh {
                         self.feedback_numeric_valid = true;
                         Self::apply_feedback(
@@ -2058,6 +2071,8 @@ impl SupervisorInner {
             let mut any_enabled = drv.has_any_joint_enabled();
             let fb_valid = drv.is_feedback_valid();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
+            let tx_probe_confirmed = drv.tx_probe_confirmed();
+            let tx_probe_sent = drv.tx_probe_pending();
             let states_ok = Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
             let fb_fresh = fb_valid
                 && ages.len() == self.config.dof
@@ -2138,6 +2153,8 @@ impl SupervisorInner {
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.feedback_fresh = fb_fresh;
             ctx.tx_queue_drained = tx_queue_drained;
+            ctx.tx_probe_confirmed = tx_probe_confirmed;
+            ctx.tx_probe_sent = tx_probe_sent;
             ctx.thermal_sensor_available = caps.temperature_feedback;
             ctx.thermal_below_threshold = thermal_below;
             if defer_mit_commit {
@@ -2157,9 +2174,53 @@ impl SupervisorInner {
             ctx.hardware_reset_required = hw_fault;
             ctx.enable_state_known = enable_known;
 
-            // Evaluate `clear_check` FIRST over EVERY recorded kind before any motor reset or
-            // `refresh_enable_state` side effect.
-            match self.safety.clear_check(&ctx) {
+            // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
+            // reset, or `refresh_enable_state` side effect.
+            let mut clear_res = self.safety.clear_check(&ctx);
+            if clear_res == Err(ClearRefusal::TxProbeRequired) {
+                // Every OTHER recorded kind's condition passed and the software TX queue is empty:
+                // run one read-only refresh/status TX probe and verify fresh post-probe feedback.
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, ages_after) = {
+                    let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                    let res = drv.probe_tx_ready();
+                    (
+                        res,
+                        drv.pending_tx_len_total() == 0,
+                        drv.tx_probe_confirmed(),
+                        drv.tx_probe_pending(),
+                        drv.check_hardware_status().is_err(),
+                        drv.enable_state(),
+                        drv.has_known_partial_enable(),
+                        drv.has_any_joint_enabled(),
+                        drv.is_feedback_valid(),
+                        drv.feedback_ages(),
+                    )
+                };
+                state = st_after;
+                partial = partial_after;
+                any_enabled = any_en_after;
+                ctx.tx_queue_drained = drained_after;
+                ctx.enable_state_known = state != EnableState::Unknown || partial;
+                ctx.hardware_reset_required = hw_fault_after;
+                ctx.pending_estop = self.estop_request_unapplied();
+                match probe_res {
+                    Ok(confirmed) => {
+                        ctx.tx_probe_sent = true;
+                        ctx.tx_probe_confirmed = confirmed && probe_ok;
+                        let fresh_after = fb_valid_after
+                            && ages_after.len() == self.config.dof
+                            && !ages_after.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)));
+                        ctx.feedback_fresh = fb_fresh && fresh_after;
+                    }
+                    Err(e) => {
+                        ctx.tx_probe_confirmed = false;
+                        ctx.tx_probe_sent = probe_pending;
+                        ctx.hardware_error = Some(clear_fault_driver_error(&e));
+                    }
+                }
+                clear_res = self.safety.clear_check(&ctx);
+            }
+            match clear_res {
                 Ok(()) => {}
                 Err(ClearRefusal::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(ClearRefusal::HardwareResetRequired) => {
@@ -2282,6 +2343,7 @@ impl SupervisorInner {
         if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.lock() {
                 drv.discard_pending_tx();
+                drv.clear_tx_probe();
             }
         }
         // Reset at the measured position; never retain a residual old trajectory target.
@@ -2559,11 +2621,13 @@ impl SupervisorInner {
                 && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
             let fb_valid = drv.is_feedback_valid();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
+            let tx_probe_confirmed = drv.tx_probe_confirmed();
+            let tx_probe_sent = drv.tx_probe_pending();
             let hw_fault = drv.has_hardware_fault();
             let temp_fb = drv.capabilities().temperature_feedback;
-            let state = drv.enable_state();
-            let partial = drv.has_known_partial_enable();
-            let any_enabled = drv.has_any_joint_enabled();
+            let mut state = drv.enable_state();
+            let mut partial = drv.has_known_partial_enable();
+            let mut any_enabled = drv.has_any_joint_enabled();
             let needs_resting_check = (self.is_torqued || any_enabled || state != EnableState::Disabled)
                 && drv.clear_fault_disables_arm_joint(self.config.arm_dof());
             let mut resting_feedback_missing = false;
@@ -2617,6 +2681,8 @@ impl SupervisorInner {
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
             ctx.feedback_fresh = fb_fresh;
             ctx.tx_queue_drained = tx_queue_drained;
+            ctx.tx_probe_confirmed = tx_probe_confirmed;
+            ctx.tx_probe_sent = tx_probe_sent;
             ctx.thermal_sensor_available = temp_fb;
             ctx.thermal_below_threshold = thermal_below;
             ctx.joint_limit_violation =
@@ -2626,9 +2692,64 @@ impl SupervisorInner {
             ctx.hardware_reset_required = hw_fault;
             ctx.enable_state_known = state != EnableState::Unknown || partial;
 
-            // Evaluate `clear_check` FIRST over EVERY recorded kind before any motor reset or
-            // concurrent E-stop / config mutation.
-            match self.safety.clear_check(&ctx) {
+            // Evaluate `clear_check` FIRST over EVERY recorded kind before any TX probe, motor
+            // reset, or concurrent E-stop / config mutation.
+            let mut clear_res = self.safety.clear_check(&ctx);
+            if clear_res == Err(R::TxProbeRequired) {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(E::Rejected(R::BudgetExpired));
+                }
+                let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, ages_valid_after) = {
+                    let mut drv = match d.lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            self.scratch.ages = scratch_ages;
+                            return Err(E::FeedbackUnavailable);
+                        }
+                    };
+                    let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
+                    let res = drv.probe_tx_ready_budgeted(drv_deadline);
+                    drv.feedback_ages_into(&mut scratch_ages);
+                    let ages_ok = scratch_ages.len() == self.config.dof
+                        && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
+                    (
+                        res,
+                        drv.pending_tx_len_total() == 0,
+                        drv.tx_probe_confirmed(),
+                        drv.tx_probe_pending(),
+                        drv.has_hardware_fault(),
+                        drv.enable_state(),
+                        drv.has_known_partial_enable(),
+                        drv.has_any_joint_enabled(),
+                        drv.is_feedback_valid(),
+                        ages_ok,
+                    )
+                };
+                self.scratch.ages = scratch_ages;
+                state = st_after;
+                partial = partial_after;
+                any_enabled = any_en_after;
+                ctx.tx_queue_drained = drained_after;
+                ctx.enable_state_known = state != EnableState::Unknown || partial;
+                ctx.hardware_reset_required = hw_fault_after;
+                ctx.pending_estop = self.estop_request_unapplied();
+                match probe_res {
+                    Ok(confirmed) => {
+                        ctx.tx_probe_sent = true;
+                        ctx.tx_probe_confirmed = confirmed && probe_ok;
+                        ctx.feedback_fresh = fb_fresh && fb_valid_after && ages_valid_after;
+                    }
+                    Err(e) => {
+                        ctx.tx_probe_confirmed = false;
+                        ctx.tx_probe_sent = probe_pending;
+                        ctx.hardware_error = Some(clear_fault_driver_error(&e));
+                    }
+                }
+                clear_res = self.safety.clear_check(&ctx);
+            }
+            match clear_res {
                 Ok(()) => {}
                 Err(R::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(R::HardwareResetRequired) => {
