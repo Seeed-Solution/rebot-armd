@@ -2029,7 +2029,7 @@ impl GripperMotion {
     pub fn with_baseline_data(self, baseline: Option<crate::gripper_baseline::BaselineData>, learn: LearnMode) -> Self {
         let needs_samples = self.will_record_learning(learn);
         let samples = needs_samples.then(MoveSamples::default);
-        self.with_baseline_data_and_samples(baseline, learn, samples)
+        self.with_baseline_data_and_samples(baseline, learn, samples).0
     }
 
     /// True if `learn` will record free-motion samples for this move.
@@ -2044,13 +2044,15 @@ impl GripperMotion {
     }
 
     /// Strictly zero-alloc RT variant using a caller-supplied preallocated [`MoveSamples`] buffer.
-    /// If `samples` is `None` when learning would apply, disables recording cleanly rather than allocating.
+    /// If `samples` is `None` when learning would apply, disables recording cleanly rather than
+    /// allocating. If learning does not apply, returns `samples` back to the caller untouched so
+    /// the caller can recycle it into the RT pool without dropping it on `armd-control`.
     pub fn with_baseline_data_and_samples(
         mut self,
         baseline: Option<crate::gripper_baseline::BaselineData>,
         learn: LearnMode,
         samples: Option<MoveSamples>,
-    ) -> Self {
+    ) -> (Self, Option<MoveSamples>) {
         self.baseline = baseline;
         if self.will_record_learning(learn) {
             if let Some(mut buf) = samples {
@@ -2060,10 +2062,11 @@ impl GripperMotion {
             } else {
                 self.learn = LearnMode::Off;
             }
+            (self, None)
         } else {
             self.learn = LearnMode::Off;
+            (self, samples)
         }
-        self
     }
 
     /// Takes any un-emitted `MoveSamples` buffer for zero-dealloc recycling on `armd-control`.

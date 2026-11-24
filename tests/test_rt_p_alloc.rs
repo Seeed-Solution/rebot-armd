@@ -1229,3 +1229,325 @@ async fn b2_r2_m4_prepared_replay_approach_planned_off_thread_is_zero_alloc_on_r
     assert_eq!(handle.stats().wake_allocs.snapshot(), AllocCounts::ZERO);
     handle.stop_and_join();
 }
+
+#[test]
+fn b2_r2_m5_1000_refused_rt_gripper_installs_preserve_learning_pool_and_are_zero_alloc() {
+    // M5: 1,000 refused qualifying-open RT gripper installs across BOTH standalone
+    // (`install_gripper_rt`) and macro-child (`install_macro_child_slot_rt`) paths must
+    // leave the RT `MoveSamples` spare pool completely unchanged AND perform strictly
+    // (0, 0, 0, 0) heap operations on `armd-control`; unused spares passed to
+    // `GripperMotion::with_baseline_data_and_samples` on a non-learning move are returned
+    // untouched rather than dropped.
+    let cfg = ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    let gp = cfg.gripper_policy.clone().expect("rebot_dm has gripper_policy");
+    let g_idx = cfg.gripper_index().expect("rebot_dm has gripper_index");
+    let mut start_q = INSPECT;
+    start_q[g_idx] = gp.closed_rad; // closed -> Open is a qualifying LearnMode::Opening move!
+
+    // (a) Direct unit check on `with_baseline_data_and_samples`: closing move returns spare untouched.
+    {
+        let mut lim = cfg.limits[g_idx].clone();
+        lim.name = String::new();
+        let mut gp_zero = gp.clone();
+        gp_zero.jaw_opening = None;
+        let req = armd::motion::GripperRequest {
+            command: GripperCommand::Close,
+            fraction: None,
+            grasp: true,
+            speed: 1.0,
+            timeout_s: Some(4.0),
+            tag: None,
+        };
+        let mot = armd::motion::GripperMotion::try_with_close_speed_limit_static(
+            req,
+            gp_zero,
+            lim,
+            gp.open_rad,
+            g_idx,
+            None,
+        )
+        .unwrap();
+        assert!(!mot.will_record_learning(armd::motion::LearnMode::Opening));
+        let spare = armd::gripper_baseline::MoveSamples::default();
+        let (mot2, returned) = mot.with_baseline_data_and_samples(
+            None,
+            armd::motion::LearnMode::Opening,
+            Some(spare),
+        );
+        assert!(
+            returned.is_some(),
+            "with_baseline_data_and_samples must return unused MoveSamples spare instead of dropping it"
+        );
+        assert!(!mot2.has_inner_heap_storage());
+    }
+
+    // (b) 1,000 refused RT gripper installs (500 standalone + 500 macro-child) on ReleaseFixture!
+    let mut inner = SupervisorInner::new(cfg);
+    inner.lease_enabled = false;
+    inner.commanded_positions = start_q.to_vec();
+    inner.measured_positions = start_q.to_vec();
+    inner.target_positions = start_q.to_vec();
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    inner.tick(0.02);
+    // Prewarm RT buffers before constructing `ReleaseFixture` (which also prewarms `move_samples_spares`).
+    inner.prewarm_rt_buffers();
+
+    let boot = BootId(11);
+    let (mut fx, mut b, _tw, _stop) = armd::rt_core::ops::ReleaseFixture::new(
+        inner,
+        boot,
+        armd::rt_core::broker::Capacities::default(),
+    );
+    let initial_pool = fx.core.test_move_samples_spare_count();
+    assert!(initial_pool >= 2, "expected prewarmed move_samples_spares >= 2, got {initial_pool}");
+    // Prewarm triple-buffer observation slots before entering timed zero-alloc thread.
+    for _ in 0..4 {
+        let _ = fx.step();
+    }
+
+    let mut s_arr = [0.0f32; MAX_DOF];
+    s_arr[..start_q.len()].copy_from_slice(&start_q);
+    let mut standalone_slot = PlanSlot::default();
+    standalone_slot.set(Primitive::Action(StagedAction::Gripper {
+        child: None,
+        dof: start_q.len() as u8,
+        start: s_arr,
+        command: armd::rt_core::requests::actions::GripperCommandKind::Open,
+        fraction: None,
+        grasp: false,
+        speed: 1.0,
+        timeout_s: Some(4.0),
+        max_budget_s: None,
+        extend_pos_force_close_timeout: false,
+        speed_scale: None,
+    }));
+
+    // Consume admission_request_id = 42 once via a real no-op or mark it already consumed
+    // by first running a standalone BeginMacro (which consumes request_id = 42 -> later
+    // requests with admission_request_id = 42 fail inside `consume_action_admission` AFTER
+    // `GripperMotion::try_with_close_speed_limit_static`!).
+    let auth_now = |fx: &armd::rt_core::ops::ReleaseFixture<SupervisorInner>| Authority {
+        epoch: fx.core.safety.epoch_id(),
+        stop_generation: fx.core.stop_gen.load(Ordering::Acquire),
+        lease_generation: 0,
+        config_revision: fx.core.workspace_revision,
+        parent_generation: 0,
+    };
+
+    // Start a macro parent with admission_request_id = 42 (valid, single-use) so we can test
+    // BOTH standalone STAMP_REUSED refusals (id=42) AND macro-child max_budget_s / STAMP_REUSED
+    // refusals under the active parent!
+    let mut begin = BeginMacroSpec::new(MacroKind::Grasp, boot);
+    begin.admission_request_id = 42;
+    let r_b = b
+        .submit(
+            ClientId(1),
+            1,
+            auth_now(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(begin)),
+        )
+        .unwrap();
+    let rep_b = fx.step();
+    assert!(matches!(rep_b.command, Some((r, Ok(_))) if r == r_b), "{rep_b:?}");
+    let parent = fx.active().expect("macro parent active");
+    let mut seq = 2u64;
+    b.poll(|_, _| true);
+
+    let child_bad_budget = ChildSpec {
+        ticket: ChildTicket { parent, child_seq: 1 },
+        timeout_s: 10.0,
+        timeout_code: "GRASP_TIMEOUT",
+        contact: None,
+    };
+    let mut child_bad_budget_slot = PlanSlot::default();
+    child_bad_budget_slot.set(Primitive::Action(StagedAction::Gripper {
+        child: Some(child_bad_budget),
+        dof: start_q.len() as u8,
+        start: s_arr,
+        command: armd::rt_core::requests::actions::GripperCommandKind::Open,
+        fraction: None,
+        grasp: false,
+        speed: 1.0,
+        timeout_s: Some(4.0),
+        max_budget_s: Some(0.0), // fails post-GripperMotion max_budget_s check (INVALID_COMMAND)
+        extend_pos_force_close_timeout: false,
+        speed_scale: None,
+    }));
+
+    let mut child_ok_slot = PlanSlot::default();
+    child_ok_slot.set(Primitive::Action(StagedAction::Gripper {
+        child: Some(child_bad_budget),
+        dof: start_q.len() as u8,
+        start: s_arr,
+        command: armd::rt_core::requests::actions::GripperCommandKind::Open,
+        fraction: None,
+        grasp: false,
+        speed: 1.0,
+        timeout_s: Some(4.0),
+        max_budget_s: None,
+        extend_pos_force_close_timeout: false,
+        speed_scale: None,
+    }));
+
+    let mut child_nan_slot = child_bad_budget_slot.clone();
+    if let Primitive::Action(StagedAction::Gripper { ref mut max_budget_s, .. }) =
+        child_nan_slot.primitive
+    {
+        *max_budget_s = Some(f64::NAN);
+    }
+
+    // Run all 1,000 refusals on a dedicated `TimedAlloc`-measured thread!
+    std::thread::spawn(move || {
+        armd::diagnostics::alloc::time_this_thread();
+        let before = armd::diagnostics::alloc::snapshot_counts();
+
+        // 500 standalone qualifying-open gripper installs refused at `consume_action_admission`
+        // (`STAMP_REUSED` via reused `admission_request_id: 42`, AFTER `GripperMotion` construction!).
+        let w_standalone = |dst: &mut PlanSlot| dst.copy_from(&standalone_slot).unwrap();
+        for _ in 0..500 {
+            let a = auth_now(&fx);
+            let req = b
+                .submit(
+                    ClientId(1),
+                    seq,
+                    a,
+                    fx.now() + DEFAULT_ACTION_DEADLINE,
+                    Submit::Action(ActionSubmit::InstallPrepared {
+                        write: &w_standalone,
+                        kind: PreparedActionKind::Gripper,
+                        prepared_boot: boot,
+                        admission_request_id: 42,
+                        check_workspace_revision: false,
+                        poses_revision: None,
+                        calibration_revision: None,
+                        gripper_calib_revision: None,
+                        power_budget_revision: None,
+                    }),
+                )
+                .unwrap();
+            seq += 1;
+            let rep = fx.step();
+            assert_eq!(rep.command, Some((req, Err("STAMP_REUSED"))));
+            b.poll(|_, _| true);
+        }
+
+        // 250 macro-child qualifying-open gripper installs refused at post-GripperMotion `max_budget_s` (`INVALID_COMMAND`)!
+        let w_child_bad = |dst: &mut PlanSlot| dst.copy_from(&child_bad_budget_slot).unwrap();
+        for _ in 0..250 {
+            let mut a = auth_now(&fx);
+            a.parent_generation = parent.0;
+            let req = b
+                .submit(
+                    ClientId(1),
+                    seq,
+                    a,
+                    fx.now() + DEFAULT_ACTION_DEADLINE,
+                    Submit::Action(ActionSubmit::InstallChild {
+                        write: &w_child_bad,
+                        prepared_boot: boot,
+                        check_workspace_revision: false,
+                        calibration_revision: None,
+                        gripper_calib_revision: None,
+                        power_budget_revision: None,
+                    }),
+                )
+                .unwrap();
+            seq += 1;
+            let rep = fx.step();
+            assert_eq!(rep.command, Some((req, Err("INVALID_COMMAND"))));
+            b.poll(|_, _| true);
+        }
+
+        // 250 macro-child qualifying-open gripper installs refused with NaN `max_budget_s` (`INVALID_COMMAND`)!
+        let w_child_nan = |dst: &mut PlanSlot| dst.copy_from(&child_nan_slot).unwrap();
+        for _ in 0..250 {
+            let mut a = auth_now(&fx);
+            a.parent_generation = parent.0;
+            let req = b
+                .submit(
+                    ClientId(1),
+                    seq,
+                    a,
+                    fx.now() + DEFAULT_ACTION_DEADLINE,
+                    Submit::Action(ActionSubmit::InstallChild {
+                        write: &w_child_nan,
+                        prepared_boot: boot,
+                        check_workspace_revision: false,
+                        calibration_revision: None,
+                        gripper_calib_revision: None,
+                        power_budget_revision: None,
+                    }),
+                )
+                .unwrap();
+            seq += 1;
+            let rep = fx.step();
+            assert_eq!(rep.command, Some((req, Err("INVALID_COMMAND"))));
+            b.poll(|_, _| true);
+        }
+
+        // Pool MUST be completely unchanged after 1,000 refusals AND 0 heap ops on RT!
+        assert_eq!(
+            fx.core.test_move_samples_spare_count(),
+            initial_pool,
+            "1,000 refused RT gripper installs must leave move_samples_spares unchanged"
+        );
+        let after_refusals = armd::diagnostics::alloc::snapshot_counts();
+        assert_eq!(
+            after_refusals.delta_since(before),
+            AllocCounts::ZERO,
+            "1,000 refused RT gripper installs must perform strictly 0 allocs and 0 frees on RT"
+        );
+
+        // 1,001st install: ACCEPTED macro-child qualifying opening -> consumes 1 spare with 0 alloc!
+        let w_child_ok = |dst: &mut PlanSlot| dst.copy_from(&child_ok_slot).unwrap();
+        let mut a = auth_now(&fx);
+        a.parent_generation = parent.0;
+        let req_ok = b
+            .submit(
+                ClientId(1),
+                seq,
+                a,
+                fx.now() + DEFAULT_ACTION_DEADLINE,
+                Submit::Action(ActionSubmit::InstallChild {
+                    write: &w_child_ok,
+                    prepared_boot: boot,
+                    check_workspace_revision: false,
+                    calibration_revision: None,
+                    gripper_calib_revision: None,
+                    power_budget_revision: None,
+                }),
+            )
+            .unwrap();
+        let rep_ok = fx.step();
+        assert!(matches!(rep_ok.command, Some((r, Ok(_))) if r == req_ok), "{rep_ok:?}");
+        assert_eq!(
+            fx.core.test_move_samples_spare_count(),
+            initial_pool - 1,
+            "accepted qualifying opening after 1,000 refusals must take 1 spare from the intact pool"
+        );
+        let after_accept = armd::diagnostics::alloc::snapshot_counts();
+        assert_eq!(
+            after_accept.delta_since(before),
+            AllocCounts::ZERO,
+            "accepted qualifying opening must also perform strictly 0 allocs and 0 frees on RT"
+        );
+
+        drop(b);
+        drop(fx);
+        drop(standalone_slot);
+        drop(child_bad_budget_slot);
+        drop(child_nan_slot);
+        drop(child_ok_slot);
+    })
+    .join()
+    .unwrap();
+}

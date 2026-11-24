@@ -3306,12 +3306,6 @@ fn install_gripper_rt(
         close_cap,
     )?
     .with_ceiling_torque_estimate(ceiling_est);
-    let learn_samples = if motion.will_record_learning(LearnMode::Opening) {
-        inner.take_move_samples_spare_rt()
-    } else {
-        None
-    };
-    motion = motion.with_baseline_data_and_samples(baseline_data, LearnMode::Opening, learn_samples);
     let duration = motion.expected_duration();
     let target_g = motion.target;
     let is_open = matches!(motion.request.command, GripperCommand::Open);
@@ -3327,6 +3321,9 @@ fn install_gripper_rt(
     this.safety
         .mark_motion_started()
         .map_err(|e| static_code(ArmError::Safety(e)))?;
+    // Infallible commit tail: take and attach a learning-buffer spare ONLY after final admission
+    // and motion-start checks succeed so refused installs never drain or drop pool buffers.
+    motion = this.attach_gripper_learning_rt(motion, baseline_data, LearnMode::Opening);
     this.releasing = is_open;
     this.gripper_hold_vel_ceiling = Some(wire_vel_ceiling);
     this.release_servo_target();
@@ -4198,16 +4195,6 @@ fn install_macro_child_slot_rt(
                 close_cap,
             )?
             .with_ceiling_torque_estimate(ceiling_est);
-            let learn_samples = if motion.will_record_learning(LearnMode::Opening) {
-                inner.take_move_samples_spare_rt()
-            } else {
-                None
-            };
-            motion = motion.with_baseline_data_and_samples(
-                baseline_data,
-                LearnMode::Opening,
-                learn_samples,
-            );
             let is_pf = close_cap.is_some() && motion.is_closing();
             if is_pf && extend_pos_force_close_timeout && motion.request.timeout_s.is_some() {
                 motion.use_default_timeout();
@@ -4235,6 +4222,15 @@ fn install_macro_child_slot_rt(
                 this.guard_next_macro_child(parent_id, None);
                 return Err(static_code(ArmError::Safety(e)));
             }
+            this.set_macro_sub_running(parent_id);
+            let override_s = is_pf.then_some(mot_timeout_s + 10.0);
+            let Some(ticket) = arm_child_deadline_clamped(this, parent_id, &spec, ctx.now, override_s) else {
+                this.guard_next_macro_child(parent_id, None);
+                return Err("PARENT_REPLACED");
+            };
+            // Infallible commit tail: take and attach a learning-buffer spare ONLY after final
+            // admission, motion-start, and parent-child checks all succeed.
+            motion = this.attach_gripper_learning_rt(motion, baseline_data, LearnMode::Opening);
             this.releasing = is_open;
             this.gripper_hold_vel_ceiling = Some(wire_vel);
             this.release_servo_target();
@@ -4250,10 +4246,6 @@ fn install_macro_child_slot_rt(
                 Some(parent_id),
                 Reference::Gripper(boxed),
             )));
-            this.set_macro_sub_running(parent_id);
-            let override_s = is_pf.then_some(mot_timeout_s + 10.0);
-            let ticket = arm_child_deadline_clamped(this, parent_id, &spec, ctx.now, override_s)
-                .ok_or("PARENT_REPLACED")?;
             Ok(InstalledMacroChild {
                 parent: ActionId(parent_id),
                 ticket,

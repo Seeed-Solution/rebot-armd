@@ -1889,6 +1889,11 @@ impl SupervisorInner {
         bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
     ) {
         self.rt_closed_connections = Some(bitset);
+        self.prewarm_rt_gripper_spares();
+    }
+
+    /// Prewarms the RT `move_samples_spares` pool and `gripper_motion_spare` box off-thread.
+    pub(crate) fn prewarm_rt_gripper_spares(&mut self) {
         let target_spares = GRIPPER_BASELINE_PENDING_MAX + 2;
         if self.move_samples_spares.capacity() < target_spares {
             self.move_samples_spares
@@ -1897,6 +1902,36 @@ impl SupervisorInner {
         while self.move_samples_spares.len() < target_spares {
             self.move_samples_spares
                 .push(crate::gripper_baseline::MoveSamples::default());
+        }
+        if self.gripper_motion_spare.is_none() {
+            if let (Some(g_idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) {
+                let lim = &self.config.limits[g_idx];
+                let limit_zero = crate::model::JointLimit {
+                    name: String::new(),
+                    min_position: lim.min_position,
+                    max_position: lim.max_position,
+                    max_velocity: lim.max_velocity,
+                    max_acceleration: lim.max_acceleration,
+                };
+                let req = crate::motion::GripperRequest {
+                    command: crate::motion::GripperCommand::Open,
+                    fraction: None,
+                    grasp: false,
+                    speed: 0.5,
+                    timeout_s: None,
+                    tag: None,
+                };
+                if let Ok(m) = crate::motion::GripperMotion::try_with_close_speed_limit(
+                    req,
+                    policy.clone_without_jaw_opening(),
+                    limit_zero,
+                    self.commanded_positions.get(g_idx).copied().unwrap_or(0.0),
+                    g_idx,
+                    None,
+                ) {
+                    self.gripper_motion_spare = Some(Box::new(m));
+                }
+            }
         }
     }
 
@@ -2545,45 +2580,7 @@ impl SupervisorInner {
         } else {
             self.held_label_spare.reserve(128);
         }
-        let target_spares = GRIPPER_BASELINE_PENDING_MAX + 2;
-        if self.move_samples_spares.capacity() < target_spares {
-            self.move_samples_spares
-                .reserve(target_spares - self.move_samples_spares.len());
-        }
-        while self.move_samples_spares.len() < target_spares {
-            self.move_samples_spares
-                .push(crate::gripper_baseline::MoveSamples::default());
-        }
-        if self.gripper_motion_spare.is_none() {
-            if let (Some(g_idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) {
-                let lim = &self.config.limits[g_idx];
-                let limit_zero = crate::model::JointLimit {
-                    name: String::new(),
-                    min_position: lim.min_position,
-                    max_position: lim.max_position,
-                    max_velocity: lim.max_velocity,
-                    max_acceleration: lim.max_acceleration,
-                };
-                let req = crate::motion::GripperRequest {
-                    command: crate::motion::GripperCommand::Open,
-                    fraction: None,
-                    grasp: false,
-                    speed: 0.5,
-                    timeout_s: None,
-                    tag: None,
-                };
-                if let Ok(m) = crate::motion::GripperMotion::try_with_close_speed_limit(
-                    req,
-                    policy.clone_without_jaw_opening(),
-                    limit_zero,
-                    self.commanded_positions.get(g_idx).copied().unwrap_or(0.0),
-                    g_idx,
-                    None,
-                ) {
-                    self.gripper_motion_spare = Some(Box::new(m));
-                }
-            }
-        }
+        self.prewarm_rt_gripper_spares();
         let tmpl = self.current_observation();
         self.core.try_prewarm_observations(|| {
             let mut obs = tmpl.clone();
@@ -3595,6 +3592,34 @@ impl SupervisorInner {
         if self.move_samples_spares.len() < self.move_samples_spares.capacity() {
             self.move_samples_spares.push(samples);
         }
+    }
+
+    /// Single shared RT point for attaching baseline data and (only when `motion` will record
+    /// learning) one preallocated `MoveSamples` spare from `move_samples_spares`.
+    /// Must be called ONLY after final admission and start checks succeed; any unused spare is
+    /// returned to the pool without dropping on `armd-control`.
+    pub(crate) fn attach_gripper_learning_rt(
+        &mut self,
+        motion: crate::motion::GripperMotion,
+        baseline: Option<crate::gripper_baseline::BaselineData>,
+        learn: crate::motion::LearnMode,
+    ) -> crate::motion::GripperMotion {
+        let spare = if motion.will_record_learning(learn) {
+            self.take_move_samples_spare_rt()
+        } else {
+            None
+        };
+        let (motion, unused) = motion.with_baseline_data_and_samples(baseline, learn, spare);
+        if let Some(buf) = unused {
+            self.recycle_move_samples_rt(buf);
+        }
+        motion
+    }
+
+    /// Test-only accessor for the current RT learning-buffer spare pool depth.
+    #[doc(hidden)]
+    pub fn test_move_samples_spare_count(&self) -> usize {
+        self.move_samples_spares.len()
     }
 
     /// Computes the commanded joint vector that will hold immediately after quiescing an active
