@@ -56,6 +56,13 @@ AP_PIDFILE=/var/run/hostapd_arm.pid
 AP_GUARD_PIDFILE=/var/run/rebot-teleop-apguard.pid
 AP_GUARD_TICKS=30  # x 2 s
 
+# SG2002 RT priority tuning (applied only when device-tree compatible matches SG2002/CV181x)
+RT_PROC_ROOT=${RT_PROC_ROOT:-/proc}
+RT_DT_COMPAT=${RT_DT_COMPAT:-/proc/device-tree/compatible}
+RT_CHRT_BIN=${RT_CHRT_BIN:-chrt}
+RT_SETTLE_PIDFILE=/var/run/rebot-teleop-rtsettle.pid
+RT_SETTLE_TICKS=${RT_SETTLE_TICKS:-20}
+
 # 默认配置参数
 FOLLOWER_MODEL="rebot-dm"
 FOLLOWER_PORT="can0"
@@ -530,6 +537,153 @@ port_busy() {
     netstat -ltn 2>/dev/null | grep -q "[:.]$1 "
 }
 
+# True only on SG2002 / CV181x boards (checked from device-tree compatible).
+is_sg2002() {
+    [ -r "$RT_DT_COMPAT" ] || return 1
+    tr '\000' '\n' < "$RT_DT_COMPAT" 2>/dev/null | grep -Eq 'cvitek,cv181|sophgo,sg200|sg2002'
+}
+
+# Print "<policy> <rt_priority>" parsed from a /proc/.../stat file (handles spaces/parens in comm).
+rt_thread_sched() {
+    [ -r "$1" ] || return 1
+    awk '{
+        r = length($0)
+        while (r > 0 && substr($0, r, 1) != ")") r--
+        if (r == 0) exit 1
+        rest = substr($0, r + 2)
+        n = split(rest, f, " ")
+        if (n < 39) exit 1
+        print f[39], f[38]
+    }' "$1" 2>/dev/null
+}
+
+# Apply target RT policy ($4: 1=FIFO, 2=RR, keep) and priority ($5) to tid $1 ($2, stat $3).
+# Idempotent: does nothing when already at the target policy and priority.
+set_rt_prio() {
+    st_tid=$1
+    st_comm=$2
+    st_stat=$3
+    st_want_pol=$4
+    st_want_prio=$5
+    st_cur=$(rt_thread_sched "$st_stat") || return 0
+    st_cur_pol=${st_cur%% *}
+    st_cur_prio=${st_cur#* }
+    if [ "$st_want_pol" = "keep" ]; then
+        if [ "$st_cur_pol" = "1" ]; then
+            st_want_pol=1
+        else
+            st_want_pol=2
+        fi
+    fi
+    if [ "$st_cur_pol" = "$st_want_pol" ] && [ "$st_cur_prio" = "$st_want_prio" ]; then
+        return 0
+    fi
+    if [ "$st_want_pol" = "1" ]; then
+        st_flag="-f"
+        st_new_name="FIFO"
+    else
+        st_flag="-r"
+        st_new_name="RR"
+    fi
+    case "$st_cur_pol" in
+        1) st_old_name="FIFO" ;;
+        2) st_old_name="RR" ;;
+        0) st_old_name="OTHER" ;;
+        *) st_old_name="P$st_cur_pol" ;;
+    esac
+    if "$RT_CHRT_BIN" "$st_flag" -p "$st_want_prio" "$st_tid" >/dev/null 2>&1; then
+        RT_CHANGED="$RT_CHANGED ${st_comm}(${st_tid}):${st_old_name}/${st_cur_prio}->${st_new_name}/${st_want_prio}"
+    fi
+    return 0
+}
+
+# Apply the SG2002 RT thread priority layout with busybox chrt:
+# - spi0 and SPI/CAN IRQ kernel threads -> SCHED_FIFO 80 (above armd-control at FIFO 79);
+# - the 4 unpinned cvitask threads (vc_wt2, vc_bh2, isp_bla, isp_err) -> 70;
+# - rebot-vision RT threads (any SCHED_FIFO/RR thread of rebot-vision) -> SCHED_RR 70.
+# Never touches pinned cvitask threads (isp_pre, vpss_0/1 at 90; tpu_wor at 85) or non-SPI IRQs.
+# Idempotent, logs only changes, and never fails service start if a thread is missing.
+apply_rt_priorities() {
+    is_sg2002 || return 0
+    command -v "$RT_CHRT_BIN" >/dev/null 2>&1 || return 0
+    RT_CHANGED=""
+    RT_VISION_RT_SEEN=0
+    RT_VENC_KT_SEEN=0
+    for pdir in "$RT_PROC_ROOT"/[0-9]*; do
+        [ -d "$pdir" ] || continue
+        pid=${pdir##*/}
+        comm=$(cat "$pdir/comm" 2>/dev/null) || continue
+        if [ ! -s "$pdir/cmdline" ]; then
+            case "$comm" in
+                spi[0-9]*|irq/*spi*|irq/*mcp251*|mcp251*)
+                    set_rt_prio "$pid" "$comm" "$pdir/stat" 1 80
+                    ;;
+                cvitask_vc_wt2|cvitask_vc_bh2|cvitask_isp_bla|cvitask_isp_err)
+                    case "$comm" in
+                        cvitask_vc_wt2|cvitask_vc_bh2) RT_VENC_KT_SEEN=$((RT_VENC_KT_SEEN + 1)) ;;
+                    esac
+                    set_rt_prio "$pid" "$comm" "$pdir/stat" keep 70
+                    ;;
+            esac
+        elif [ "$comm" = "rebot-vision" ]; then
+            for tdir in "$pdir"/task/[0-9]*; do
+                [ -d "$tdir" ] || continue
+                tid=${tdir##*/}
+                tcomm=$(cat "$tdir/comm" 2>/dev/null) || continue
+                tsched=$(rt_thread_sched "$tdir/stat") || continue
+                tpol=${tsched%% *}
+                case "$tpol" in
+                    1|2)
+                        RT_VISION_RT_SEEN=$((RT_VISION_RT_SEEN + 1))
+                        set_rt_prio "$tid" "$tcomm" "$tdir/stat" 2 70
+                        ;;
+                esac
+            done
+        fi
+    done
+    if [ -n "$RT_CHANGED" ]; then
+        echo "[rebot-teleop] RT priorities:$RT_CHANGED"
+        logger -t "$NAME" "RT priorities:$RT_CHANGED" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Poll briefly after vision starts so SDK/VENC threads created during camera init are also lowered.
+rt_priorities_settle() {
+    is_sg2002 || { rm -f "$RT_SETTLE_PIDFILE"; return 0; }
+    t=0
+    quiet=0
+    while [ "$t" -lt "${RT_SETTLE_TICKS:-20}" ]; do
+        apply_rt_priorities
+        if [ -z "$RT_CHANGED" ] && [ "$RT_VISION_RT_SEEN" -ge 5 ] && [ "$RT_VENC_KT_SEEN" -ge 2 ]; then
+            quiet=$((quiet + 1))
+            [ "$quiet" -ge 2 ] && break
+        else
+            quiet=0
+        fi
+        sleep 1
+        t=$((t + 1))
+    done
+    rm -f "$RT_SETTLE_PIDFILE"
+    return 0
+}
+
+stop_rt_settle() {
+    SPID=$(cat "$RT_SETTLE_PIDFILE" 2>/dev/null)
+    case "$SPID" in ''|*[!0-9]*) rm -f "$RT_SETTLE_PIDFILE"; return 0 ;; esac
+    case "$(proc_cmdline "$SPID")" in
+        *rt-priorities-settle*) kill -TERM "$SPID" 2>/dev/null || true ;;
+    esac
+    rm -f "$RT_SETTLE_PIDFILE"
+    return 0
+}
+
+start_rt_settle() {
+    is_sg2002 || return 0
+    stop_rt_settle
+    start-stop-daemon -S -b -m -p "$RT_SETTLE_PIDFILE" -a /bin/sh -- -c "exec \"$INIT_SCRIPT\" rt-priorities-settle >> \"$LOGFILE\" 2>&1" >/dev/null 2>&1 || true
+}
+
 # Start rebot-vision under its respawn loop at nice 10. Never fails the app start.
 start_vision() {
     if [ ! -x "$VISION_DAEMON" ] || [ ! -f "$VISION_RUNNER" ]; then
@@ -543,6 +697,8 @@ start_vision() {
         while [ "$c" -lt 4 ] && ! has_child "$VPID"; do sleep 0.25; c=$((c + 1)); done
         if [ "$c" -lt 4 ]; then
             echo "[rebot-teleop] rebot-vision is already running (PID: $VPID)"
+            apply_rt_priorities
+            start_rt_settle
             return 0
         fi
         echo "[rebot-teleop] rebot-vision loop (PID: $VPID) has no child; restarting it"
@@ -568,6 +724,8 @@ start_vision() {
     sleep 0.5
     if VPID=$(vision_pid); then
         echo "[rebot-teleop] rebot-vision started (PID: $VPID, log /var/log/rebot-vision.log)"
+        apply_rt_priorities
+        start_rt_settle
     else
         echo "[rebot-teleop] rebot-vision did not start; see /var/log/rebot-vision.log"
     fi
@@ -597,6 +755,7 @@ start() {
             # armd already up (boot S92 then a console switch, or app_restore): make sure vision runs too
             echo "$NAME is already running (PID: $PID)"
             start_vision
+            apply_rt_priorities
             if [ "$APP_ENABLED" = 1 ] && [ -n "$APP_NAME" ] && ! app_pid >/dev/null; then start_app || true; fi
             register_active_app || true
             return 0
@@ -694,6 +853,7 @@ start() {
     stop_video
 
     start_vision
+    apply_rt_priorities
     if [ "$APP_ENABLED" = 1 ] && [ -n "$APP_NAME" ]; then start_app || true; fi
     register_active_app || true
     return 0
@@ -765,6 +925,7 @@ stop_vision() {
 stop() {
     echo "Stopping $NAME..."
     stop_ap_guard
+    stop_rt_settle
     stop_app
     stop_vision
     if [ ! -f "$PIDFILE" ]; then
@@ -863,13 +1024,16 @@ case "$1" in
     restart) lock || exit 1; stop || exit $?; sleep 2; start; exit $? ;;
     status) status; exit $? ;;
     register) register_active_app; exit $? ;;
-    stop-vision) stop_vision; exit $? ;;
+    start-vision) start_vision; exit $? ;;
+    stop-vision) stop_rt_settle; stop_vision; exit $? ;;
+    rt-priorities) apply_rt_priorities; [ "$2" = "--settle" ] && start_rt_settle; exit 0 ;;
+    rt-priorities-settle) rt_priorities_settle; exit 0 ;;
     app-start) start_app "$2"; exit $? ;;
     app-stop) stop_app; exit $? ;;
     app-status) app_status; exit $? ;;
     app-logs) app_logs "$2"; exit $? ;;
     ap-guard) ap_guard "$2" "$3"; exit 0 ;;
-    *) echo "Usage: $0 {start|stop|restart|status|register|stop-vision|ap-guard|app-start [name]|app-stop|app-status|app-logs [n]}"; exit 1 ;;
+    *) echo "Usage: $0 {start|stop|restart|status|register|start-vision|stop-vision|rt-priorities [--settle]|ap-guard|app-start [name]|app-stop|app-status|app-logs [n]}"; exit 1 ;;
 esac
 
 exit 0
