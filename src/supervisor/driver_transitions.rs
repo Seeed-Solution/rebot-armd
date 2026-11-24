@@ -702,6 +702,9 @@ impl SupervisorInner {
         }
 
         self.config = candidate;
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     pub fn reapply_driver_limits(&mut self) -> bool {

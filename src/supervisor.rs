@@ -2705,6 +2705,8 @@ impl SupervisorInner {
             dof: dof as u8,
             commanded_positions,
             residual_torques: self.residual_torques,
+            has_zero_reference: self.config.zero_reference.is_some(),
+            zero_convention: self.zero_convention,
         }
     }
 
@@ -7611,18 +7613,25 @@ impl ArmSupervisor {
 
     /// Coherent observation schema served from `StateHub`'s off-thread cache paired by
     /// `OwnerStateSnapshot::schema_revision` (returns explicit `503 OBSERVATION_UNAVAILABLE` in
-    /// executor mode when no fresh snapshot or matching cached schema is available).
+    /// executor mode when no fresh snapshot or matching cached schema is available, and overlays
+    /// live `zero_convention` from `OwnerStateSnapshot` without RT allocations).
     pub async fn schema(&self) -> Result<ObservationSchema, ArmError> {
+        if self.owner_mode() == OWNER_LEGACY {
+            let inner = self.inner.read().await;
+            if self.check_legacy_under_guard(&inner).is_ok() {
+                return Ok(inner.schema());
+            }
+        }
         match self.fresh_min_gen(false, None).await? {
             Fresh::Sample(s) => {
                 if let Some(cached) = self.hub.cached_schema(s.owner.schema_revision) {
-                    return Ok((*cached).clone());
-                }
-                if self.owner_mode() == OWNER_LEGACY {
-                    let inner = self.inner.read().await;
-                    if self.check_legacy_under_guard(&inner).is_ok() {
-                        return Ok(inner.schema());
-                    }
+                    let mut schema = (*cached).clone();
+                    schema.zero_convention = if s.owner.has_zero_reference {
+                        serde_json::to_value(s.owner.zero_convention).ok()
+                    } else {
+                        None
+                    };
+                    return Ok(schema);
                 }
                 Err(observation_unavailable())
             }

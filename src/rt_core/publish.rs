@@ -89,6 +89,8 @@ pub struct OwnerStateSnapshot {
     pub dof: u8,
     pub commanded_positions: [f32; MAX_DOF],
     pub residual_torques: Option<[f32; 6]>,
+    pub has_zero_reference: bool,
+    pub zero_convention: crate::joint_zero::ZeroConvention,
 }
 
 impl Default for OwnerStateSnapshot {
@@ -127,6 +129,8 @@ impl Default for OwnerStateSnapshot {
             dof: 0,
             commanded_positions: [0.0; MAX_DOF],
             residual_torques: None,
+            has_zero_reference: false,
+            zero_convention: crate::joint_zero::ZeroConvention::default(),
         }
     }
 }

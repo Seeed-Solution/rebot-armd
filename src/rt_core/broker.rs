@@ -221,6 +221,7 @@ pub enum TransitionOp {
 
 /// What a descriptor asks the RT to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Fixed-size `Copy` SPSC ring descriptor (32 slots): boxing would allocate on RT.
 pub enum CommandKind {
     /// Install the primitive of a plan slot; starts an action (a terminal reply follows the ACK).
     Install { plan: PlanHandle },
@@ -609,6 +610,7 @@ struct Pending {
 }
 
 /// What a command asks for, with the plan to stage for an install.
+#[allow(clippy::large_enum_variant)] // Matches `CommandKind` zero-alloc value passing without heap boxing.
 pub enum Submit<'a, P> {
     Install(&'a dyn Fn(&mut P)),
     Immediate(ImmediateOp),

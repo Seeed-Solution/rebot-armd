@@ -434,7 +434,15 @@ fn ticks_with_a_full_retire_ring_do_not_touch_the_allocator() {
     let buf = inner.core.take_observation_buffer();
     let now = Instant::now();
     assert!(inner.core.publish_displacing(1, now, now, template.clone(), &q, &q).is_err());
-    inner.core.publish(buf, 1, now, now, &q, &q);
+    inner.core.publish(
+        buf,
+        1,
+        now,
+        now,
+        armd::rt_core::publish::OwnerStateSnapshot::default(),
+        &q,
+        &q,
+    );
 }
 
 /// Like [`count_ticks`] without the reader between ticks (the hub reader is held).

@@ -239,6 +239,9 @@ impl SupervisorInner {
         if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
         self.refresh_effective_floor();
         self.prepare_workspace_eval_bufs();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     /// Install the kinematic correction of the built-in model (calibration apply / restore /
@@ -256,6 +259,9 @@ impl SupervisorInner {
         self.calibration_revision += 1;
         self.refresh_pose_tcps();
         self.refresh_effective_floor();
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
         Ok(())
     }
 
@@ -597,6 +603,9 @@ impl SupervisorInner {
         self.gripper_calib_jaw_opening = cand.gripper_calib_jaw_opening;
         self.gripper_calib_invalid = cand.gripper_calib_invalid;
         self.driver_config_error = cand.driver_config_error;
+        if !self.rt_executor_owned {
+            self.refresh_schema_cache();
+        }
     }
 
     pub fn validate_gripper_calibration_with_driver(
