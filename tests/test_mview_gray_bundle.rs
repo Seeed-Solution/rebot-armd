@@ -126,11 +126,22 @@ async fn run_one(debug: bool) -> (Value, u64) {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
     let ticker = sup.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(20));
-        loop { interval.tick().await; ticker.tick(0.02).await; }
+    let ticker_task = tokio::spawn(async move {
+        loop {
+            let moving = ticker.inner().read().await.active_trajectory.is_some();
+            if moving {
+                for _ in 0..4 {
+                    ticker.tick(0.02).await;
+                    if ticker.inner().read().await.active_trajectory.is_none() { break; }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                ticker.tick(0.02).await;
+            }
+        }
     });
     let (mut ws, generation) = common::controller(addr).await;
     let epoch = sup.get_observation().await.epoch_id;
@@ -143,19 +154,26 @@ async fn run_one(debug: bool) -> (Value, u64) {
         inner.target_positions = START.to_vec();
     }
     let epoch = sup.get_observation().await.epoch_id;
-    let ack = common::rpc(&mut ws, generation, epoch, mm::PATH, json!({"label": "box", "speed_scale": 0.5, "debug": debug})).await;
+    let ack = common::rpc(&mut ws, generation, epoch, mm::PATH, json!({"label": "box", "speed_scale": 0.5, "settle_min_s": 0.5, "debug": debug})).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
     let until = Instant::now() + Duration::from_secs(120);
-    loop {
+    let mut last_hb = Instant::now();
+    let res = loop {
         assert!(Instant::now() < until, "action {id} did not end");
-        common::send(&mut ws, json!({"type":"heartbeat", "generation": generation, "epoch_id": epoch})).await;
-        common::drain(&mut ws, 5).await;
+        if last_hb.elapsed() > Duration::from_millis(200) {
+            common::send(&mut ws, json!({"type":"heartbeat", "generation": generation, "epoch_id": epoch})).await;
+            common::drain(&mut ws, 5).await;
+            last_hb = Instant::now();
+        }
         let obs = sup.get_observation().await;
         if let Some(a) = [obs.action, obs.previous_action].into_iter().flatten().find(|a| a.id == id && !a.is_running()) {
-            return (serde_json::to_value(a).unwrap(), id);
+            break (serde_json::to_value(a).unwrap(), id);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    ticker_task.abort();
+    srv.abort();
+    res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
