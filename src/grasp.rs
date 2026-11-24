@@ -3222,6 +3222,10 @@ pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn Detectio
 
 /// Dry-run verdict: (reachable, code, message, (task, requires, models) when the request parsed,
 /// the adaptive selection reply when `strategy` is `"adaptive"`).
+///
+/// Read-only planning/selection path (acquires only a read lock on `SupervisorInner` and runs
+/// off-lock in `spawn_blocking`): never starts motion or actuator output, so no `Admitted` token
+/// is required; real execution of `strategy: "adaptive"` is unconditionally refused in [`prepare`].
 type DryRunPlan = (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires, Option<TaskModels>)>, Option<Value>);
 
 async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPlan {

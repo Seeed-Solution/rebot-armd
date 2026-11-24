@@ -178,6 +178,10 @@ impl CanTransport for SocketCanTransport {
         true
     }
 
+    fn flush_is_noop(&self) -> bool {
+        true
+    }
+
     fn supports_nonblocking_rt(&self) -> bool {
         true
     }
@@ -250,6 +254,10 @@ impl CanTransport for SocketCanTransport {
     }
 
     fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+
+    fn flush_is_noop(&self) -> bool {
         true
     }
 

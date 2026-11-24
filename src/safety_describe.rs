@@ -52,7 +52,7 @@ pub fn fault_recovery(code: FaultCode) -> &'static [&'static str] {
     match code {
         Estop | WatchdogTimeout | ControlDeadline | JointLimit | EnableFailed | ServoNoBrake | HandoverUnsettled
         | GravityCompFailed => &["clear_fault", "torque_on"],
-        BusLoss | InvalidTelemetry | DriverWriteFailed => &["restore_bus", "clear_fault", "torque_on"],
+        BusLoss | InvalidTelemetry | DriverWriteFailed | CanTxStalled => &["restore_bus", "clear_fault", "torque_on"],
         ThermalTrip => &["wait_cooldown", "clear_fault", "torque_on"],
         FollowingError | Collision => &["remove_obstruction", "clear_fault", "torque_on"],
         HardwareFault => &["clear_fault", "clear_fault_again", "torque_on"],
@@ -428,7 +428,7 @@ impl SupervisorInner {
                     "close_speed_rad_s": self.effective_planned_close_speed(),
                     // grasp contact relative to the learned free-motion torque (crate::gripper_baseline)
                     "contact_baseline": {
-                        "rule": "calibrated: contact when |torque| >= baseline(position, direction, speed band) + max(margin_floor_nm, margin_spreads x spread), at least min_contact_nm, below cap_fraction x max_close_torque_nm, for 3 ticks while moving or 2 ticks once net progress stops; uncalibrated: moving floor max(contact_torque_nm + 0.25, 0.82 N·m, 0.9 x ceiling_estimate) for 3 ticks, or contact_torque_nm for 2 ticks once net progress stops; lag contact requires following error >= 0.30 rad with no net progress; the torque cap does not depend on it",
+                        "rule": "shared net-progress contact detector (actions, macros, streams; no instantaneous-velocity shortcut): once closing net progress stops over the window (<= 0.50 s, 0.002 rad watermark), contact triggers at baseline + max(margin_floor_nm, margin_spreads x spread) when calibrated or contact_torque_nm when uncalibrated for 2 ticks; while moving, contact requires |torque| >= max(threshold, contact_torque_nm, 0.82 N·m, 0.9 x ceiling_estimate) for 3 ticks; lag contact requires following error >= 0.30 rad with no net progress; the torque cap does not depend on it",
                         "margin_floor_nm": crate::gripper_baseline::MARGIN_FLOOR_NM,
                         "margin_spreads": crate::gripper_baseline::MARGIN_SPREADS,
                         "min_contact_nm": crate::gripper_baseline::MIN_CONTACT_NM,

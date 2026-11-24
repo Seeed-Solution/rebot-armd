@@ -20,7 +20,6 @@
 //! way to move hardware.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::broker::{
@@ -305,7 +304,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     "DEPLOYMENT_CHANGED", "TOOL_MISMATCH", "DATA_STALE", "NOT_ARMED", "MOTION_BUSY", "INTERNAL", "UNSUPPORTED",
     // faults and holds (FaultCode, SCREAMING_SNAKE_CASE)
     "ESTOP", "ESTOP_ACTIVE", "FAULT", "FAULT_ACTIVE", "BUS_LOSS", "THERMAL_TRIP", "JOINT_LIMIT", "WATCHDOG", "WATCHDOG_TIMEOUT",
-    "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "HARDWARE_FAULT", "ENABLE_FAILED",
+    "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "CAN_TX_STALLED", "HARDWARE_FAULT", "ENABLE_FAILED",
     "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "COLLISION_HOLD", "BLOCKED_HOLD", "WORKSPACE_HOLD",
     "TORQUE_LIMIT", "TRACKING_STALL", "SAFETY_ERROR", "SAFETY_REJECTED", "SOFT_LIMIT_EXCEEDED", "FEEDBACK_UNAVAILABLE",
     "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED",
@@ -474,6 +473,17 @@ pub trait CoreOps {
     /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
     /// the transition (the adapter uses the request id's value).
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Release-bounded [`Self::commit_transition`] carrying the absolute control `release_deadline`
+    /// so initial handshake TX frames are capped at `release_deadline - margin`.
+    fn commit_transition_for_release(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        _release_deadline: Instant,
+    ) -> Result<Committed, &'static str> {
+        self.commit_transition(d, op, ctx)
+    }
     /// Applies one target after rechecking it ([`TargetFrame::check`] against the core's
     /// [`super::mailbox::TargetAuthority`], then the configuration hold).
     ///
@@ -504,10 +514,24 @@ pub trait CoreOps {
     /// The bus owner's progress and confirmations within `budget` (exclusive: the bus
     /// owner's state machine advances here).
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll;
+    /// Release-bounded [`Self::poll_hardware`] carrying the absolute control `release_deadline`
+    /// so any refresh/recovery TX started during Step 2 is capped at `release_deadline - margin`.
+    fn poll_hardware_for_release(&mut self, budget: &ServiceBudget, _release_deadline: Instant) -> HardwarePoll {
+        self.poll_hardware(budget)
+    }
     /// Sub-release wake for a pending driver transition only (without running a full release
     /// feedback pass). Default delegates to [`Self::poll_hardware`].
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
         self.poll_hardware(budget)
+    }
+    /// Release-bounded [`Self::poll_transition_wake`] carrying the absolute control
+    /// `release_deadline` so sub-release transition TX obeys `release_deadline - margin`.
+    fn poll_transition_wake_for_release(
+        &mut self,
+        budget: &ServiceBudget,
+        _release_deadline: Instant,
+    ) -> HardwarePoll {
+        self.poll_transition_wake(budget)
     }
     /// One release of the control tick (`generation`: the publication's lock generation).
     fn advance(&mut self, dt: f64, generation: u64);
@@ -516,6 +540,17 @@ pub trait CoreOps {
     fn advance_output(&mut self, dt: f64, generation: u64) -> f64 {
         self.advance(dt, generation);
         0.0
+    }
+    /// Release-bounded [`Self::advance_output`] carrying the current release clock `now` and
+    /// absolute `release_deadline` so TX start-cutoffs never run past `release_deadline - margin`.
+    fn advance_output_with_deadline(
+        &mut self,
+        dt: f64,
+        generation: u64,
+        _now: Instant,
+        _release_deadline: Instant,
+    ) -> f64 {
+        self.advance_output(dt, generation)
     }
     /// Publishes the state computed by [`Self::advance_output`] at `timestamp` with `generation`.
     fn publish(&mut self, _timestamp: f64, _generation: u64) {}
@@ -971,6 +1006,21 @@ impl CoreOps for SupervisorInner {
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
     }
 
+    fn commit_transition_for_release(
+        &mut self,
+        d: &Descriptor,
+        op: TransitionOp,
+        ctx: &CommitCtx,
+        release_deadline: Instant,
+    ) -> Result<Committed, &'static str> {
+        let applied = self.install_driver_tx_release_cap(ctx.now, release_deadline);
+        let res = self.commit_transition(d, op, ctx);
+        if applied {
+            self.clear_driver_tx_release_cap();
+        }
+        res
+    }
+
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
         // track D: identity, deadline, authority, stream, policy generation, input / camera
         // ages, config hold, then the servo / policy step checks (supervisor::streams::targets)
@@ -1027,43 +1077,24 @@ impl CoreOps for SupervisorInner {
     fn action_children(&self, action: ActionId) -> u32 { self.core.last_macro().filter(|m| m.action == action).map_or(0, |m| m.children) }
 
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
-        // One budgeted bus service per release: first serve any torque transition in flight,
-        // then apply feedback from the transition's RX cache (when this call polled the bus)
-        // or run a single budgeted receive pass.
-        let was_torqued_or_disabling = self.is_torqued || self.disable_pending;
-        let trans = self.service_torque_transition(budget);
-        let transition_rx = if let Some(tp) = trans {
-            self.core.begin_transition(tp.progress);
-            tp.rx
-        } else {
-            self.service_background_disable(budget)
-        };
-        let rx = self.poll_hardware_rx(Some(budget), transition_rx);
-        let rx_frames = rx.rx_frames;
-        let rx_exhausted = rx.budget_exhausted;
-        self.pending_rx_poll = rx;
-        // Run thermal protection BEFORE consuming background disable confirmation and before
-        // Step 2b maintenance (`ClearFault`/`RequestShutdown`) or Step 3 command admission so an
-        // over-temperature sample arriving on the same poll as confirmed disable cannot suppress
-        // `ThermalTrip`.
-        self.check_thermal_protection(was_torqued_or_disabling);
-        let _ = self.confirm_background_disable_if_ready();
-        let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
-        let Some(driver) = self.driver.as_ref() else {
-            return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };
-        };
-        let d = driver.lock().unwrap_or_else(|e| e.into_inner());
-        d.feedback_ages_into(&mut self.scratch.ages);
-        let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-        HardwarePoll {
-            driverless: false,
-            feedback_valid: d.is_feedback_valid(),
-            enable_state: Some(d.enable_state()),
-            oldest_feedback_age: oldest,
-            rx_frames,
-            budget_exhausted,
-            torque: self.core.poll_transition(),
+        self.poll_hardware_with_release_deadline(budget, None)
+    }
+
+    fn poll_hardware_for_release(&mut self, budget: &ServiceBudget, release_deadline: Instant) -> HardwarePoll {
+        self.poll_hardware_with_release_deadline(budget, Some(release_deadline))
+    }
+
+    fn poll_transition_wake_for_release(
+        &mut self,
+        budget: &ServiceBudget,
+        release_deadline: Instant,
+    ) -> HardwarePoll {
+        let applied = self.install_driver_tx_release_cap(budget.now, release_deadline);
+        let poll = self.poll_transition_wake(budget);
+        if applied {
+            self.clear_driver_tx_release_cap();
         }
+        poll
     }
 
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
@@ -1099,6 +1130,16 @@ impl CoreOps for SupervisorInner {
 
     fn advance_output(&mut self, dt: f64, _generation: u64) -> f64 {
         self.tick_control(dt)
+    }
+
+    fn advance_output_with_deadline(
+        &mut self,
+        dt: f64,
+        _generation: u64,
+        now: Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        self.tick_control_with_deadline(dt, now, release_deadline)
     }
 
     fn publish(&mut self, timestamp: f64, generation: u64) {
@@ -1241,19 +1282,36 @@ pub struct ReleaseReport {
 
 /// The fixture's clock: virtual monotonic time, advanced by the fixture (one `dt` per
 /// release) or by a test ([`Self::advance`]); clones share it. Never reads the wall clock
-/// after construction.
+/// after construction. Backed by [`crate::transport::MockClock`] so a test can drive both the
+/// executor and a mock CAN transport from ONE shared clock.
 #[derive(Debug, Clone)]
 pub struct VirtualClock {
-    base: Instant,
-    offset_ns: Arc<AtomicU64>,
+    clock: crate::transport::MockClock,
 }
 
 impl VirtualClock {
     /// A clock starting at `base`.
-    pub fn starting_at(base: Instant) -> Self { Self { base, offset_ns: Arc::new(AtomicU64::new(0)) } }
-    pub fn base(&self) -> Instant { self.base }
-    pub fn now(&self) -> Instant { self.base + Duration::from_nanos(self.offset_ns.load(Ordering::SeqCst)) }
-    pub fn advance(&self, d: Duration) { self.offset_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst); }
+    pub fn starting_at(base: Instant) -> Self {
+        Self { clock: crate::transport::MockClock::starting_at(base) }
+    }
+    /// Wraps an existing [`crate::transport::MockClock`] so executor and driver share ONE clock.
+    pub fn from_mock_clock(clock: crate::transport::MockClock) -> Self {
+        Self { clock }
+    }
+    /// Returns a clone of the shared [`crate::transport::MockClock`].
+    pub fn as_mock_clock(&self) -> crate::transport::MockClock {
+        self.clock.clone()
+    }
+    pub fn base(&self) -> Instant { self.clock.base() }
+    pub fn now(&self) -> Instant { self.clock.now() }
+    pub fn advance(&self, d: Duration) { self.clock.advance(d); }
+}
+
+impl crate::transport::DriverClock for VirtualClock {
+    fn clock_id(&self) -> u64 { self.clock.clock_id() }
+    fn now(&self) -> Instant { self.clock.now() }
+    fn sleep(&self, d: Duration) { self.clock.sleep(d); }
+    fn yield_now(&self) { self.clock.yield_now(); }
 }
 
 /// Synchronous single-arm release engine shared by [`ReleaseFixture`] (virtual time)
@@ -1445,7 +1503,7 @@ impl ReleaseEngine {
         // recovery TX path (`src/driver.rs:4701`) outside Step 5's `BeforeOutput` checkpoint;
         // that path is addressed on branch `feat/rt-tx-budget`, which merges after stage 3 step 1.
         let budget = ServiceBudget::for_release(now_fn(), release_deadline);
-        report.poll = core.poll_hardware(&budget);
+        report.poll = core.poll_hardware_for_release(&budget, release_deadline);
         let finished_transition = self.take_finished_transition(&mut report);
         // 2b. Owner persistence and bounded maintenance run strictly after Step 2 feedback intake
         // and strictly before Step 3–6 commit, output, and publication.
@@ -1481,7 +1539,7 @@ impl ReleaseEngine {
                     Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
                 CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
-                CommandKind::Transition(op) => core.commit_transition(&d, op, &ctx),
+                CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
             };
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
@@ -1522,8 +1580,8 @@ impl ReleaseEngine {
             report.target = Some((f.seq, result.map_err(|r| r.code)));
         }
         // 5. Urgent recheck + advance control output
-        let _ = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
-        let timestamp = core.advance_output(dt, publish_generation);
+        let out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
+        let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
         // 6. Publish
         core.publish(timestamp, publish_generation);
         // 7. Deliver urgent stop replies and terminals strictly AFTER publish
@@ -1563,7 +1621,7 @@ impl ReleaseEngine {
         let urgent_applied = self.apply_pending_urgent_at(core, now);
         if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
-        report.poll = core.poll_transition_wake(&budget);
+        report.poll = core.poll_transition_wake_for_release(&budget, release_deadline);
         let finished = self.take_finished_transition(report);
         if urgent_applied || finished.is_some() {
             let ts = core.now_timestamp();
@@ -1612,8 +1670,17 @@ pub enum Checkpoint {
 impl<O: CoreOps> ReleaseFixture<O> {
     /// The fixture, the broker feeding it, the target writer and the stop handle.
     pub fn new(core: O, boot: BootId, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        Self::new_with_clock(core, boot, caps, VirtualClock::starting_at(Instant::now()))
+    }
+
+    /// [`Self::new`] driven by a caller-supplied shared [`VirtualClock`].
+    pub fn new_with_clock(
+        core: O,
+        boot: BootId,
+        caps: Capacities,
+        clock: VirtualClock,
+    ) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
         let (engine, broker, tw, stop) = ReleaseEngine::new(boot, caps);
-        let clock = VirtualClock::starting_at(Instant::now());
         (Self { core, engine, clock, dt: 0.02 }, broker, tw, stop)
     }
 

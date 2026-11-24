@@ -173,6 +173,25 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
+    fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+        if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_joint_targets_bounded(targets); }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone(); // plain fields: no allocation
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        let r = self.inner.write_joint_targets_bounded(&m);
+        self.motor_targets = m;
+        r
+    }
+    fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
+    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
+    fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
+    fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
+    fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }
     fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_estop_hold(targets); }
         let mut m = std::mem::take(&mut self.motor_targets);
@@ -187,6 +206,22 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
+    fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+        if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_estop_hold_bounded(targets); }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone(); // plain fields: no allocation
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        let r = self.inner.write_estop_hold_bounded(&m);
+        self.motor_targets = m;
+        r
+    }
+    fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
+    fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }
@@ -219,6 +254,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
     fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
     fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }
+    fn gripper_pos_force_info(&self) -> Option<crate::driver::GripperPosForceInfo> { self.inner.gripper_pos_force_info() }
     fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
@@ -244,6 +280,21 @@ impl ArmDriver for ZeroOffsetDriver {
             Some(m) => self.inner.set_joint_modes(modes, &m),
         }
     }
+    fn set_joint_modes_in_tick(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        match self.to_motor(hold) {
+            None => self.inner.set_joint_modes_in_tick(modes, hold),
+            Some(m) => self.inner.set_joint_modes_in_tick(modes, &m),
+        }
+    }
+    fn pending_motion_tx_len(&self) -> usize { self.inner.pending_motion_tx_len() }
+    fn pending_hold_tx_len(&self) -> usize { self.inner.pending_hold_tx_len() }
+    fn tx_probe_confirmed(&self) -> bool { self.inner.tx_probe_confirmed() }
+    fn tx_probe_pending(&self) -> bool { self.inner.tx_probe_pending() }
+    fn probe_tx_ready(&mut self) -> Result<bool, ArmDriverError> { self.inner.probe_tx_ready() }
+    fn probe_tx_ready_budgeted(&mut self, deadline: Instant) -> Result<bool, ArmDriverError> {
+        self.inner.probe_tx_ready_budgeted(deadline)
+    }
+    fn clear_tx_probe(&mut self) { self.inner.clear_tx_probe(); }
     fn joint_modes_uncertain(&self) -> bool { self.inner.joint_modes_uncertain() }
     fn range_check(&self) -> Option<DriverRangeCheck> { self.inner.range_check() }
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }

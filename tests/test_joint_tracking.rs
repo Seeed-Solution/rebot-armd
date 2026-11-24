@@ -2135,12 +2135,18 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         }
         assert!(inner.gravity_comp.is_some(), "must stay in Exiting while arm is still moving");
 
-        // Once stationary and fresh, handback succeeds, seeds a confirmed baseline, and the same
-        // tick's tracking output validates and issues the stationary hold frame.
+        // Once stationary and fresh:
+        // - Tick 1: stiff MIT hold completes cleanly while stationary and schedules the handback release.
+        // - Tick 2: dedicated transition release executes POS_VEL handback within its TX pass and seeds Stationary.
+        // - Tick 3: tracking owns POS_VEL output, validates, and issues the confirmed stationary baseline.
         drv.with(|s| s.v[0] = 0.0);
         inner.tick(DT);
-        assert!(inner.gravity_comp.is_none(), "stationary fresh feedback should complete handback");
+        assert!(inner.gravity_comp.is_some(), "handback must wait for the scheduled transition release after stiff hold completes");
+        inner.tick(DT);
+        assert!(inner.gravity_comp.is_none(), "scheduled transition release should complete handback");
         assert!(inner.safety.state().is_operational(), "clean handback must stay operational");
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Stationary);
+        inner.tick(DT);
         assert_eq!(inner.tracking.history_state, TrackingHistoryState::Issued);
         let issued = inner.tracking.last_issued_positions.as_ref().expect("confirmed baseline issued");
         for i in 0..6 {
@@ -4214,12 +4220,12 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "samples one period apart are evidence");
 }
 
-/// Review 4 #4: with tracking off (absent or disabled) a Path/Gripper/Replay action's
-/// `done` is published during stepping, before that tick's driver write, as in e4f72b6:
-/// a write failure on the final tick leaves the action `done` and latches
-/// DriverWriteFailed. Earlier ticks report `running`.
+/// With bounded TX deferral active on both tracking-on and tracking-off paths, a
+/// Path/Gripper/Replay action's `done` is gated on that tick's driver write completing:
+/// a write failure on the final tick fails the action and latches DriverWriteFailed
+/// instead of falsely reporting `done`. Earlier ticks report `running`.
 #[test]
-fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
+fn tracking_off_action_done_waits_for_final_tick_write_acceptance() {
     for jt in [None, Some(JointTrackingConfig::rebot_dm())] {
         let label = if jt.is_some() { "tracking disabled" } else { "tracking none" };
         let make_rig = || {
@@ -4257,7 +4263,7 @@ fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
         let obs = inner.tick(DT);
         let act = obs.action.expect("action status");
         assert_eq!(act.id, id);
-        assert_eq!(act.state, "done", "{label}: e4f72b6 publishes done before the failed final-tick write");
+        assert_eq!(act.state, "failed", "{label}: failed final-tick write must not report done");
         assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(FaultCode::DriverWriteFailed), "{label}: {:?}", obs.fault);
     }
 }

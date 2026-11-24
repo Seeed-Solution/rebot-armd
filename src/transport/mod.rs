@@ -345,8 +345,12 @@ pub trait CanTransport: Send {
 
     /// Receive a CAN frame together with its optional transport-measured monotonic receive time
     /// (on the same clock domain as [`Self::clock`], or `Instant::now()` when `clock()` is `None`).
-    /// Transports that do not capture arrival timestamps inherit the default (`None`) and callers
-    /// fall back to the host decode instant.
+    /// Transports that do not capture arrival timestamps — including Linux SocketCAN
+    /// (`SocketCanTransport`) — inherit the default (`None`) and callers fall back to the host
+    /// decode instant. Because SocketCAN gives no arrival timestamps, TX-probe confirmation
+    /// (`DamiaoArmDriver::probe_tx_ready_inner` / `tx_probe_confirmed`) relies on draining RX and
+    /// snapshotting the RX sequence boundary immediately AFTER the probe write returns
+    /// successfully, requiring confirming feedback to carry a strictly greater RX sequence number.
     fn receive_timestamped(
         &mut self,
     ) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
@@ -360,6 +364,14 @@ pub trait CanTransport: Send {
     /// test transports). Serial transports (`SlcanTransport`) default to `false` so bounded
     /// RT maintenance fails closed rather than stalling the executor thread.
     fn supports_bounded_flush(&self) -> bool {
+        false
+    }
+
+    /// True when [`Self::flush`] performs no transport I/O and cannot block or consume TX budget
+    /// (e.g. Linux SocketCAN, where each `transmit()` submits directly to the kernel socket).
+    /// Transports with a real flush default to `false` so the driver enforces the tick TX
+    /// start-cutoff before starting `flush()`.
+    fn flush_is_noop(&self) -> bool {
         false
     }
 

@@ -77,6 +77,7 @@ impl SupervisorInner {
         self.release_servo_target();
         let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
         let trajectory = self.active_trajectory.take().filter(|t| t.has_heap_storage());
+        self.clear_unload_settle();
         let unload_settle = self.unload_settle.take();
         if trajectory.is_some() || unload_settle.is_some() || servo_ws_min_depths.is_some() {
             self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
@@ -87,7 +88,7 @@ impl SupervisorInner {
         }
     }
 
-    fn push_retired_stop(&mut self, retired: crate::rt_core::urgent::RetiredStopPayloads) {
+    pub(crate) fn push_retired_stop(&mut self, retired: crate::rt_core::urgent::RetiredStopPayloads) {
         if self.rt_executor_owned
             && self.pending_retired_stops.len() < self.pending_retired_stops.capacity()
         {
@@ -114,6 +115,7 @@ impl SupervisorInner {
         if self.gripper_reference_active() { self.hold_gripper_at_measured(); }
         self.servo_settled_ticks.fill(0);
         self.retire_motion_payloads();
+        self.pending_deferred_done = None;
         self.pending_normal_unload = false;
         self.zero_check_persisting = None;
         self.end_gripper_stream();
@@ -122,6 +124,10 @@ impl SupervisorInner {
 
     pub fn execute_stop(&mut self, policy: StopPolicy) {
         self.apply_stop_policy(policy);
+    }
+
+    pub(crate) fn execute_stop_in_tick(&mut self, policy: StopPolicy) {
+        self.apply_stop_policy_in_tick(policy, true);
     }
 
     /// Execute the `StopPolicy::EStopLatch` transition without ever blocking on `driver`.
@@ -134,8 +140,10 @@ impl SupervisorInner {
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;
         self.retire_motion_payloads();
+        self.pending_deferred_done = None;
         self.gripper_stream_target = None;
         self.gripper_stream_contact = None;
+        self.gripper_stream_contact_detector.reset();
         self.gripper_stream_lease = None;
 
         // Lock onto measured_positions only when finite and the supervisor's own coherent
@@ -194,6 +202,7 @@ impl SupervisorInner {
                 let mut hold = [0.0f32; 6];
                 for (dst, &src) in hold.iter_mut().zip(&self.commanded_positions) { *dst = src; }
                 run.phase = crate::gravity_comp::GravityCompPhase::Exiting { hold, elapsed_s: 0.0 };
+                self.gravity_comp_handback_ready = false;
                 run.position = hold;
                 for (dst, &src) in run.kp.iter_mut().zip(&run.policy.hold_kp) { *dst = src; }
                 for (dst, &src) in run.kd.iter_mut().zip(&run.policy.hold_kd) { *dst = src; }
@@ -214,21 +223,34 @@ impl SupervisorInner {
             self.measured_velocities.fill(0.0);
         }
         // Send the stiff MIT exit hold immediately when uncontended; never block on a held mutex.
-        if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
-            if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), driver) {
-                if let Ok(mut drv) = d.try_lock() {
-                    if let Err(e) = drv.write_estop_hold(&targets) {
-                        let mut msg = crate::safety::BoundedText::<160>::empty();
-                        e.write_bounded(&mut msg);
-                        self.safety.log_gravity_comp_hold_write_failed(msg);
-                    }
-                }
-            }
-        }
+        let hold_out = if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
+            self.write_gravity_comp_immediate_with_driver(driver, true, true)
+        } else {
+            crate::supervisor::TickOutput::None
+        };
         self.safety.latch(crate::safety::FaultKind::Estop, crate::safety::FaultDetail::Estop);
+        // If an urgent E-stop request is still pending (requested != applied), `pending_stop_check`
+        // intentionally returns `EstopInhibited` and defers the hold to the first eligible stopped
+        // release; do not log or classify that as a hold write failure.
+        let suppress_pending_estop = matches!(
+            &hold_out,
+            crate::supervisor::TickOutput::EstopInhibited { .. }
+        );
+        if !suppress_pending_estop {
+            if let crate::supervisor::TickOutput::Error { ref message, .. } = hold_out {
+                let mut msg = crate::safety::BoundedText::<160>::empty();
+                msg.push_str(message.as_str());
+                self.safety.log_gravity_comp_hold_write_failed(msg);
+            }
+            let _ = self.classify_tick_output(hold_out, false, false);
+        }
     }
 
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
+        self.apply_stop_policy_in_tick(policy, false);
+    }
+
+    pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
             match policy {
@@ -460,15 +482,15 @@ impl SupervisorInner {
                 }
             }
             StopPolicy::BusLossFallback => {
-                self.exit_gravity_comp("BUS_LOSS", "CAN feedback lost");
+                self.exit_gravity_comp_inner("BUS_LOSS", "CAN feedback lost", !in_tick);
                 // Bus loss / disconnect: hold position locked, latch fault, advance epoch
                 // Maintain holding torque: DO NOT disable hardware torque to prevent gravitational collapse!
                 self.pending_normal_unload = false;
-                self.unload_settle = None;
-                self.active_trajectory = None;
-                self.release_servo_target();
+                self.retire_motion_payloads();
+                self.pending_deferred_done = None;
                 self.gripper_stream_target = None;
                 self.gripper_stream_contact = None;
+                self.gripper_stream_contact_detector.reset();
                 self.gripper_stream_lease = None;
                 if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
@@ -725,8 +747,10 @@ impl SupervisorInner {
             self.watchdog_park = None;
             self.pending_normal_unload = false;
             self.retire_motion_payloads();
+            self.pending_deferred_done = None;
             self.gripper_stream_target = None;
             self.gripper_stream_contact = None;
+            self.gripper_stream_contact_detector.reset();
             self.gripper_stream_lease = None;
             self.servo_settled_ticks.fill(0);
             self.servo_ws_min_depths = None;
@@ -1030,6 +1054,7 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }
@@ -1180,6 +1205,7 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }

@@ -230,13 +230,13 @@ pub const BASELINE_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::
 
 /// Lowest first value of a bin's baseline: the free-motion torque the absolute contact rule
 /// leaves room for (`contact_torque_nm` − margin floor); 0.45 N·m without contact_torque_nm.
-fn initial_max_nm(inner: &SupervisorInner) -> f32 {
+pub(crate) fn initial_max_nm(inner: &SupervisorInner) -> f32 {
     inner.config.gripper_policy.as_ref().and_then(|p| p.contact_torque_nm)
         .map_or(0.45, |c| c - crate::gripper_baseline::MARGIN_FLOOR_NM)
 }
 
 /// First-value limit of a calibration stroke: CALIBRATION_MAX_TORQUE_FRACTION of the cap.
-fn calibration_initial_max_nm(inner: &SupervisorInner) -> f32 {
+pub(crate) fn calibration_initial_max_nm(inner: &SupervisorInner) -> f32 {
     inner.config.gripper_policy.as_ref().and_then(|p| p.max_close_torque_nm)
         .map_or(CALIBRATION_MAX_TORQUE_NM, |c| CALIBRATION_MAX_TORQUE_FRACTION * c)
 }
@@ -296,27 +296,140 @@ pub fn take_baseline_snapshot(inner: &mut SupervisorInner) -> Option<(PathBuf, c
     Some((path, b))
 }
 
-/// Every [`BASELINE_PERSIST_INTERVAL`]: learn queued gripper moves and write a changed baseline.
-/// The lock is held only to take the moves and a snapshot and to store the result; learning and
-/// JSON serialization run without it.
-pub fn spawn_baseline_persister(supervisor: std::sync::Arc<ArmSupervisor>) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(BASELINE_PERSIST_INTERVAL);
-        loop {
-            tick.tick().await;
-            let job = take_learn_job(&mut *supervisor.inner().write().await);
-            if let Some(mut job) = job {
-                if run_learn_job(&mut job) { store_learn_job(&mut *supervisor.inner().write().await, job); }
+/// Run one cycle of the off-control-thread automatic baseline learner and persister,
+/// supporting both `RtOwner::Legacy` (supervisor write lock) and `RtOwner::Executor`
+/// (zero-alloc/zero-free maintenance handoff through [`crate::rt_core::executor::RtExecutorHandle`]).
+/// Returns `false` once an executor owner has permanently stopped (or ownership transfer failed).
+pub async fn step_baseline_persister_once(supervisor: &ArmSupervisor) -> bool {
+    if let Some(handle) = supervisor.executor_handle() {
+        let id = handle.baseline_identity().clone();
+        let taken = match handle.take_baseline_pending_async(id.path.is_some()).await {
+            Ok(t) => t,
+            Err(crate::rt_core::executor::OwnerError::Stopped) => return false,
+            Err(_) => return true,
+        };
+        let mut to_persist: Option<(PathBuf, crate::gripper_baseline::FreeTorqueBaseline)> = None;
+        if !taken.moves.is_empty() {
+            if let Some((closed_rad, open_rad, init_max, calib_init_max)) = taken.policy {
+                let lo = closed_rad.min(open_rad);
+                let hi = closed_rad.max(open_rad);
+                let mut base = match taken.current {
+                    Some(data)
+                        if (data.lo_rad - lo).abs() < 1e-3
+                            && (data.hi_rad - hi).abs() < 1e-3 =>
+                    {
+                        crate::gripper_baseline::FreeTorqueBaseline::from_data(
+                            data,
+                            Some(id.tool_id.clone()),
+                            Some(id.tool_config_digest.clone()),
+                            id.follower.clone(),
+                        )
+                    }
+                    _ => crate::gripper_baseline::FreeTorqueBaseline::new(
+                        closed_rad,
+                        open_rad,
+                        Some(id.tool_id.clone()),
+                        Some(id.tool_config_digest.clone()),
+                        id.follower.clone(),
+                    ),
+                };
+                let mut job = (taken.moves, base, taken.generation, (init_max, calib_init_max));
+                if run_learn_job(&mut job) {
+                    base = job.1;
+                    let persist_copy = id.path.as_ref().map(|p| (p.clone(), base.clone()));
+                    let mark_dirty = id.path.is_none();
+                    match handle.store_baseline_async(base, taken.generation, mark_dirty).await {
+                        Ok(true) => to_persist = persist_copy,
+                        Ok(false) => {}
+                        Err(crate::rt_core::executor::OwnerError::Stopped) => return false,
+                        Err(_) => return true,
+                    }
+                }
             }
-            let snapshot = take_baseline_snapshot(&mut *supervisor.inner().write().await);
-            let Some((path, b)) = snapshot else { continue };
-            let text = match serde_json::to_string_pretty(&b) { Ok(t) => t, Err(_) => continue };
-            if let Err(e) = PendingWrite::new(path.clone(), text).run().await {
-                tracing::warn!("Failed to write gripper baseline {}: {e}", path.display());
-                supervisor.inner().write().await.gripper_baseline_dirty = true;
+        } else if taken.dirty {
+            if let (Some(path), Some(data)) = (id.path.clone(), taken.current) {
+                let base = crate::gripper_baseline::FreeTorqueBaseline::from_data(
+                    data,
+                    Some(id.tool_id.clone()),
+                    Some(id.tool_config_digest.clone()),
+                    id.follower.clone(),
+                );
+                to_persist = Some((path, base));
             }
         }
-    });
+        if let Some((path, b)) = to_persist {
+            match serde_json::to_string_pretty(&b) {
+                Ok(text) => {
+                    if let Err(e) = PendingWrite::new(path.clone(), text).run().await {
+                        tracing::warn!("Failed to write gripper baseline {}: {e}", path.display());
+                        let _ = handle.mark_baseline_dirty_async().await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize gripper baseline {}: {e}", path.display());
+                    let _ = handle.mark_baseline_dirty_async().await;
+                }
+            }
+        }
+        return true;
+    }
+
+    match supervisor.owner_mode() {
+        crate::supervisor::OWNER_LEGACY => {}
+        crate::supervisor::OWNER_FAILED => return false,
+        _ => return true,
+    }
+
+    let job = take_learn_job(&mut *supervisor.inner().write().await);
+    if let Some(mut job) = job {
+        if run_learn_job(&mut job) { store_learn_job(&mut *supervisor.inner().write().await, job); }
+    }
+    let snapshot = take_baseline_snapshot(&mut *supervisor.inner().write().await);
+    let Some((path, b)) = snapshot else { return true };
+    let text = match serde_json::to_string_pretty(&b) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Failed to serialize gripper baseline {}: {e}", path.display());
+            let mut inner = supervisor.inner().write().await;
+            if !inner.detached {
+                inner.gripper_baseline_dirty = true;
+            }
+            return true;
+        }
+    };
+    if let Err(e) = PendingWrite::new(path.clone(), text).run().await {
+        tracing::warn!("Failed to write gripper baseline {}: {e}", path.display());
+        let mut inner = supervisor.inner().write().await;
+        if !inner.detached {
+            inner.gripper_baseline_dirty = true;
+        }
+    }
+    true
+}
+
+/// Spawn the off-control-thread baseline consumer with a custom polling interval (tests).
+pub fn spawn_baseline_persister_with_interval(
+    supervisor: std::sync::Arc<ArmSupervisor>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            if !step_baseline_persister_once(&supervisor).await {
+                break;
+            }
+        }
+    })
+}
+
+/// Every [`BASELINE_PERSIST_INTERVAL`]: learn queued gripper moves and write a changed baseline
+/// for whichever owner (`RtOwner::Legacy` or `RtOwner::Executor`) currently owns `ArmCore`.
+/// Learning and JSON serialization always run off the control thread and without holding the
+/// supervisor lock. Passive telemetry/persistence consumer only: never starts motion or actuator
+/// output (no `Admitted` token needed).
+pub fn spawn_baseline_persister(supervisor: std::sync::Arc<ArmSupervisor>) {
+    drop(spawn_baseline_persister_with_interval(supervisor, BASELINE_PERSIST_INTERVAL));
 }
 
 /// Load the persisted baseline. It applies only to the tool (id and config digest) and the
@@ -514,7 +627,9 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
         let scratch = crate::gripper_baseline::FreeTorqueBaseline::new(policy.closed_rad, policy.open_rad,
             Some(tool.id.clone()), Some(tool.config_digest.clone()), inner.follower.clone());
         let limit = policy.max_close_torque_nm.map_or(CALIBRATION_MAX_TORQUE_NM, |c| CALIBRATION_MAX_TORQUE_FRACTION * c);
-        (policy, g, scratch, limit, inner.effective_planned_close_speed())
+        // Carry the unquantized close speed into `GripperRequest` so `GripperMotion` is the
+        // single wire-speed quantization point (never re-floor a decoded wire speed like 29 -> 0.29 -> 28).
+        (policy, g, scratch, limit, inner.unquantized_planned_close_speed())
     };
     let list = strokes(close_speed);
     for (i, st) in list.iter().enumerate() {
@@ -523,10 +638,11 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
         ctx.phase(&phase, i as f32 / list.len() as f32).await?;
         let request = crate::motion::GripperRequest { command: crate::motion::GripperCommand::Move, fraction: Some(st.fraction), grasp: false, speed: st.speed, timeout_s: None, tag: None };
         let target = policy.closed_rad + st.fraction as f32 * (policy.open_rad - policy.closed_rad);
-        let (ticket, before) = {
+        let (ticket, before, stroke_speed) = {
             let mut inner = ctx.sup.inner().write().await;
             if !inner.macro_alive(ctx.id) { return Err(crate::macro_action::Stop::Cancelled); }
             let before = inner.gripper_calibration.as_ref().map_or(0, |c| c.records.len());
+            // Every calibration stroke must pass AdmissionStamp under the owner lock and consume Admitted.
             let admitted = match inner.check_admission(ctx.next_child_stamp()) {
                 Ok(a) => a,
                 Err(e) => return Err(ctx.map_install_err(&mut inner, e.into())),
@@ -535,9 +651,13 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
                 admitted, ctx.id, request, crate::motion::LearnMode::Calibration, None, false,
             )
             .map_err(|e| ctx.map_install_err(&mut inner, e))?;
+            let stroke_speed = match inner.active_trajectory.as_ref().map(|a| &a.reference) {
+                Some(crate::motion::Reference::Gripper(gm)) => gm.planned_speed,
+                _ => st.speed,
+            };
             let limit_s = if is_pos_force_close { timeout_s + 10.0 } else { duration + 10.0 };
             let ticket = ctx.arm_child(&mut inner, &phase, limit_s);
-            (ticket, before)
+            (ticket, before, stroke_speed)
         };
         match ctx.wait_child(ticket.ok_or(crate::macro_action::Stop::Cancelled)?).await {
             Ok(_) => {}
@@ -566,10 +686,10 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
             let (from_start, to_end) = ((q - rec.start_rad) * sign, (rec.end_rad - q) * sign);
             if from_start < crate::gripper_baseline::LEARN_START_GUARD_RAD || to_end < crate::gripper_baseline::LEARN_END_GUARD_RAD { continue; }
             mid += 1;
-            if v < CALIBRATION_MIN_SPEED_FRACTION * st.speed as f32 { slow += 1; }
+            if v < CALIBRATION_MIN_SPEED_FRACTION * stroke_speed as f32 { slow += 1; }
         }
         if mid > 0 && slow as f32 > CALIBRATION_SLOW_SHARE_MAX * mid as f32 {
-            return Err(obstructed(format!("stroke {n}: the jaw moved slower than {:.2} rad/s for {slow} of {mid} samples", CALIBRATION_MIN_SPEED_FRACTION * st.speed as f32)));
+            return Err(obstructed(format!("stroke {n}: the jaw moved slower than {:.2} rad/s for {slow} of {mid} samples", CALIBRATION_MIN_SPEED_FRACTION * stroke_speed as f32)));
         }
         let p95 = torque_quantile(&rec, 0.95);
         if p95 > limit_nm {

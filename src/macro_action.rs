@@ -75,7 +75,7 @@ pub enum SubState {
     Idle,
     Running,
     Done(SubDone),
-    Failed { code: String, message: String },
+    Failed { code: crate::safety::BoundedText<48>, message: crate::motion::StepErrorText },
 }
 
 /// Supervisor-side record of the running macro action.
@@ -126,7 +126,7 @@ pub struct ChildRecord {
     pub seq: u32,
     /// The tick fails the child (code and message of `timeout`) when it still runs after this.
     pub deadline: Option<Instant>,
-    pub timeout: Option<(String, String)>,
+    pub timeout: Option<(crate::safety::BoundedText<48>, crate::motion::StepErrorText)>,
     pub guard: Option<ContactGuard>,
     pub watch: ContactWatch,
 }
@@ -270,7 +270,7 @@ impl MacroCtx {
                 match inner.macro_child_state(ticket) {
                     None => return Err(Stop::Cancelled),
                     Some(SubState::Done(d)) => return Ok(d),
-                    Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code, message)),
+                    Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code.as_str().to_owned(), message.as_str().to_owned())),
                     Some(_) => inner.macro_child_overdue(ticket, Instant::now(), OVERDUE_GRACE),
                 }
             };
