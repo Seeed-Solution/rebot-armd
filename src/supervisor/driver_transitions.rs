@@ -1124,7 +1124,9 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
+            if !self.safety.state().is_stopped() {
+                self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
+            }
             return Err(error);
         }
         self.torque_off_finish_in_place()
@@ -1253,7 +1255,9 @@ impl SupervisorInner {
     fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
         let message = format!("Torque disable transmission failed: {e}");
         let code = crate::driver::handshake::rt_progress(false, Err(e)).err().unwrap_or("HARDWARE_FAULT");
-        self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(message));
+        if !self.safety.state().is_stopped() {
+            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(message));
+        }
         code
     }
 
@@ -1378,8 +1382,10 @@ impl SupervisorInner {
                         self.torque_off_finish_in_place().map(|()| Rt::Done).map_err(|e| torque_error_code(&e))
                     }
                     Some(false) => {
-                        self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(
-                            "Torque disable has not been confirmed by fresh hardware feedback".into()));
+                        if !self.safety.state().is_stopped() {
+                            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(
+                                "Torque disable has not been confirmed by fresh hardware feedback".into()));
+                        }
                         Err("FEEDBACK_UNCONFIRMED")
                     }
                 };

@@ -553,6 +553,16 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     // At rest + fresh feedback -> allowed; TxKind::Disable bypasses stop gate; EStop latch kept.
     bus.with(|s| s.push_all_feedback());
     inner.tick(0.02);
+    // First inject a disable TX failure while in EStop: sticky disable stays pending and
+    // SafetyState::EStop must NOT be overwritten to Fault(DriverWriteFailed).
+    bus.with(|s| s.tx_error = true);
+    assert!(inner.set_torque(false).is_err());
+    assert_eq!(*inner.safety.state(), SafetyState::EStop, "failed disable must not overwrite E-Stop latch");
+    assert!(inner.disable_pending, "sticky disable_pending must stay set on failure");
+    bus.with(|s| {
+        s.tx_error = false;
+        s.push_all_feedback();
+    });
     let st = inner.set_torque(false).expect("disable at rest in E-Stop must succeed");
     assert_eq!(st, SafetyState::EStop);
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
