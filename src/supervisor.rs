@@ -3436,6 +3436,12 @@ impl SupervisorInner {
         self.hold_tx_error_suppressed
     }
 
+    /// Per-`(joint, slot)` (`index = joint * 2 + slot`) consecutive stopped-hold ticks without
+    /// reaching the transport.
+    pub fn hold_tx_no_progress_ticks(&self) -> &[u32] {
+        &self.hold_tx_no_progress_ticks
+    }
+
     /// Return an `UnloadSettle` buffer to `unload_settle_spare` (resetting its logical state
     /// without freeing its preallocated sample ring; any overflow is retired off-thread on RT).
     pub(crate) fn clear_unload_settle(&mut self) {
@@ -3849,8 +3855,12 @@ impl SupervisorInner {
     /// outcomes (`Complete`, `Deferred`, `Expired`, and hard `Error`):
     /// - Counts ticks in which a due motor's stopped-hold frame failed to reach the transport,
     ///   whether it remained queued, expired (`pending == 0`), or failed with a hard TX error.
-    /// - When nothing is due (`due_mask == 0`, e.g. idle, disabled, or stop-inhibited), resets
-    ///   progress counters and never latches `CAN_TX_STALLED`.
+    /// - Each motor's streak changes ONLY on that motor's own outcome: one motor's refusal
+    ///   (e.g. stale feedback on J1 removing J1 from `due_mask`) never clears another motor's
+    ///   no-progress streak.
+    /// - When `reset_when_empty` is `true` and `due_mask == 0` (idle / disabled / nothing due),
+    ///   resets progress counters and never latches `CAN_TX_STALLED`; when `reset_when_empty` is
+    ///   `false` (e.g. an error pass where `due_mask == 0`), existing streaks are left intact.
     fn account_stopped_hold_progress(
         &mut self,
         now: Instant,
@@ -3859,10 +3869,13 @@ impl SupervisorInner {
         sent_mask: u64,
         queued: usize,
         dropped: usize,
+        reset_when_empty: bool,
     ) {
         self.reset_tx_joint_progress();
         if due_mask == 0 {
-            self.reset_hold_tx_joint_progress();
+            if reset_when_empty {
+                self.reset_hold_tx_joint_progress();
+            }
             return;
         }
         let slots = self
@@ -4152,7 +4165,7 @@ impl SupervisorInner {
             TickOutput::Complete { is_hold, now, max_age, due_mask, sent_mask, pf_status } => {
                 self.reset_tx_joint_progress();
                 if is_hold || self.safety.state().is_stopped() {
-                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, 0, 0);
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, 0, 0, true);
                 } else {
                     self.reset_hold_tx_joint_progress();
                 }
@@ -4174,7 +4187,7 @@ impl SupervisorInner {
                 // mask a motion TX stall; both conditions record through `SafetyManager::latch`.
                 let treat_as_hold = is_hold || self.safety.state().is_stopped();
                 if treat_as_hold {
-                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, pending, 0);
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, pending, 0, true);
                     self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
@@ -4242,7 +4255,7 @@ impl SupervisorInner {
                 // mask a non-recoverable motion `CAN_TX_STALLED` latch.
                 let treat_as_hold = is_hold || self.safety.state().is_stopped();
                 if treat_as_hold {
-                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, pending, dropped);
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, pending, dropped, true);
                     self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
@@ -4280,7 +4293,7 @@ impl SupervisorInner {
                     // Rate-limit `"Stopped hold output failed"` (<= 1/s with exact suppressed
                     // counter) AND account per-motor lack of progress toward `CAN_TX_STALLED`.
                     self.log_stopped_hold_output_failed_throttled(now, sent_any, message.as_str());
-                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, 0, 0);
+                    self.account_stopped_hold_progress(now, max_age, due_mask, sent_mask, 0, 0, false);
                 } else {
                     self.reset_tx_joint_progress();
                     self.reset_hold_tx_joint_progress();

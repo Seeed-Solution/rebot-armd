@@ -4986,3 +4986,72 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
         }
     }
 }
+
+/// Round 5 M2 regression (Legacy + RT Executor, both standard POS_VEL and PosForce rigs):
+/// Stale J1 (`BuildRefused` on every tick) + J2 `WouldBlock` (`backpressure_tx_ids = [0x102]`)
+/// streak MUST NOT allow J1's refusal to clear J2's per-motor stopped-hold progress accounting:
+/// J1 stays at 0 ticks (refused, not TX-stalled), while J2's streak advances past 45 ms and
+/// latches `CAN_TX_STALLED`!
+#[test]
+fn dual_owner_stale_j1_refusal_never_hides_j2_wouldblock_can_tx_stalled() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        for use_pos_force in [false, true] {
+            let mut rig = if use_pos_force {
+                DualRig::new_pos_force(owner, base_cfg(), None)
+            } else {
+                DualRig::new(owner, base_cfg(), None)
+            };
+            rig.inner_mut().safety.trigger_fault_coded(
+                FaultCode::Other,
+                FaultReason::Other("M2 stale J1 + J2 WouldBlock".into()),
+            );
+            rig.step();
+
+            // Make ONLY J1 stale (> 100 ms, < 500 ms BUS_LOSS) while J2–J7 stay fresh across
+            // normal ticks, and inject persistent WouldBlock on J2 (0x102)!
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[0].mute_feedback = true;
+            });
+            // Run 6 healthy ticks for J2–J7 (120 ms elapsed on J1 -> J1 hits BuildRefused).
+            for _ in 0..6 {
+                rig.bus.with(|s| for i in 1..7 { s.push_feedback(i); });
+                rig.step_dt(DT, false);
+            }
+            assert_eq!(
+                rig.inner().safety.fault_code(),
+                Some(FaultCode::Other),
+                "{owner:?} (pf={use_pos_force}): stale J1 alone without TX backpressure must not latch CAN_TX_STALLED"
+            );
+
+            // Now inject WouldBlock on J2 (0x102) while J1 remains stale (`BuildRefused` every tick).
+            rig.bus.with(|s| s.backpressure_tx_ids = vec![0x102]);
+            let mut latched = false;
+            for _ in 0..6 {
+                rig.bus.with(|s| for i in 1..7 { s.push_feedback(i); });
+                rig.step_dt(DT, false);
+                assert_eq!(
+                    rig.inner().hold_tx_no_progress_ticks()[0],
+                    0,
+                    "{owner:?} (pf={use_pos_force}): refused J1 slot 0 must not accumulate TX stall ticks"
+                );
+                if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
+                    latched = true;
+                    break;
+                }
+            }
+            assert!(
+                latched,
+                "{owner:?} (pf={use_pos_force}): stale J1 BuildRefused must NEVER hide J2 WouldBlock -> CAN_TX_STALLED"
+            );
+            assert!(
+                rig.inner().hold_tx_no_progress_ticks()[2] >= 3,
+                "{owner:?} (pf={use_pos_force}): expected J2 slot 0 (index 2) to accumulate stall streak, got {:?}",
+                rig.inner().hold_tx_no_progress_ticks()
+            );
+            let detail = rig.inner().safety.tx_stall_detail().expect("tx_stall_detail");
+            assert!(detail.is_hold && detail.age_ms >= 45, "{detail:?}");
+        }
+    }
+}

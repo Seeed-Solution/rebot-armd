@@ -3373,6 +3373,23 @@ impl PendingTxQueue {
             .any(|slot| slot.is_some_and(|e| e.joint == joint))
     }
 
+    /// Remove every queued entry targeting `joint`, compacting in place (zero allocation).
+    fn remove_joint(&mut self, joint: usize) {
+        let mut write = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                if entry.joint != joint {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
+    }
+
     /// Replace an existing `(joint, frame_id)` slot in place without moving it to the back
     /// (preserving oldest-first carry-over FIFO order and its original `queued_at` under the same
     /// `stop_stamp` so carry-over frames always drain first with the latest target value and
@@ -8721,7 +8738,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut staged_ids: [[Option<u32>; 2]; MAX_MODE_JOINTS] = [[None; 2]; MAX_MODE_JOINTS];
         let mut new_keys = 0usize;
         let mut due_mask: u64 = 0;
+        let mut first_build_refused_joint: Option<usize> = None;
         for (i, target) in targets.iter().enumerate() {
+            // Non-PosForce joints with stale feedback (> 100 ms) cannot build a fresh rollback
+            // hold: exclude ONLY that joint from `due_mask` and `pending_hold_tx` up front so
+            // head-of-line backpressure on another joint neither accrues false stall ticks on
+            // the refused joint nor lets the refusal hide the backpressured motor's TX stall.
+            if self.joint_modes.get(i).copied().flatten() != Some(DamiaoControlMode::PosForce)
+                && self.fresh_measured_position_at(i, POS_FORCE_FEEDBACK_MAX_AGE, cleanup_now).is_none()
+            {
+                first_build_refused_joint.get_or_insert(i);
+                self.pending_hold_tx.remove_joint(i);
+                continue;
+            }
             let cmds = match self.pending_target_cmds_checked(i, target) {
                 Ok(v) => v,
                 Err(e) => {
@@ -8785,7 +8814,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut sent_slot_mask: u64 = 0;
         let mut dropped_stale_in_pass = 0usize;
         let mut freeze_retried_key: Option<(usize, u32)> = None;
-        let mut first_build_refused_joint: Option<usize> = None;
         while let Some(entry) = self.pending_hold_tx.front() {
             let i = entry.joint;
             let frame_id = entry.frame_id;
@@ -8884,9 +8912,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         && !self.pos_force_feedback_valid(i, self.now())
                     {
                         let _ = self.check_pos_force_freshness_for_tx();
-                        if self.pf_last_fresh_position.is_some()
-                            && freeze_retried_key != Some((i, frame_id))
-                        {
+                        if freeze_retried_key != Some((i, frame_id)) {
                             freeze_retried_key = Some((i, frame_id));
                             continue;
                         }
@@ -8894,26 +8920,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         freeze_retried_key = None;
                         continue;
                     }
-                    // When an active PosForce J7 (TIMEOUT=0) has a known last-fresh position,
-                    // do NOT abort the loop on a stale J1–J6 joint before J7 gets its freeze
-                    // frame onto the wire: skip the refused joint, let J7 transmit and flush,
-                    // then return the refused-joint error below.
-                    if self.active_pos_force_joint().is_some()
-                        && self.pf_last_fresh_position.is_some()
-                    {
-                        first_build_refused_joint.get_or_insert(i);
-                        let _ = self.pending_hold_tx.pop_front();
-                        freeze_retried_key = None;
-                        continue;
+                    // Isolate this motor's build refusal from every other motor: remove ONLY this
+                    // `(joint, slot)` bit from `due_mask`, pop the refused entry, record the
+                    // first refused joint, and continue so other motors (including active J7
+                    // freeze and any backpressured motor) still run and retain independent
+                    // per-motor TX progress accounting.
+                    let flat_bit = i.saturating_mul(2).saturating_add(usize::from(slot));
+                    if flat_bit < 64 {
+                        due_mask &= !(1u64 << flat_bit);
                     }
-                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
-                    self.last_hold_tx_due_mask = 0;
-                    self.last_hold_tx_sent_mask = 0;
-                    self.discard_pending_hold_tx();
-                    if self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
-                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
-                    }
-                    return Err(ArmDriverError::PosForceTargetUnavailable { joint: i });
+                    first_build_refused_joint.get_or_insert(i);
+                    let _ = self.pending_hold_tx.pop_front();
+                    freeze_retried_key = None;
+                    continue;
                 }
                 Err(TxRefusal::MitFenceTripped(reason)) => {
                     self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
@@ -8962,8 +8981,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 Ok(sent) => pf_refresh_sent |= sent,
                 Err(e) => {
                     self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
-                    self.last_hold_tx_due_mask = 0;
-                    self.last_hold_tx_sent_mask = 0;
+                    if is_estop_inhibited(&e) {
+                        self.last_hold_tx_due_mask = 0;
+                        self.last_hold_tx_sent_mask = 0;
+                    } else {
+                        self.last_hold_tx_due_mask = due_mask;
+                        self.last_hold_tx_sent_mask = if self.can.flush_is_noop() { sent_slot_mask } else { 0 };
+                    }
                     return Err(e);
                 }
             }
@@ -9006,10 +9030,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(ArmDriverError::EstopInhibited);
         }
         if let Some(refused_joint) = first_build_refused_joint {
+            // Preserve per-motor due/sent masks and remaining queued holds for all non-refused
+            // motors (only the refused motor's bit was cleared from `due_mask` and popped above)
+            // so one stale joint NEVER hides another motor's stopped-hold TX stall.
+            let post_now = self.now();
+            let (late_stale, late_oldest) =
+                self.pending_hold_tx.drop_stale(post_now, self.tx_budget.frame_max_age);
+            if late_stale > 0 {
+                if let Some(age) = late_oldest {
+                    oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
+                }
+                self.last_expired_oldest_age = oldest_expired;
+                crate::diagnostics::tick::record_tx_dropped_stale(late_stale as u32);
+            }
+            let newly_deferred = self.pending_hold_tx.mark_newly_deferred();
+            crate::diagnostics::tick::record_tx_deferred(newly_deferred as u32, self.total_pending_tx_len());
             self.last_hold_tx_sent_any = sent_any;
-            self.last_hold_tx_due_mask = 0;
-            self.last_hold_tx_sent_mask = 0;
-            self.discard_pending_hold_tx();
+            self.last_hold_tx_due_mask = due_mask;
+            self.last_hold_tx_sent_mask = sent_slot_mask;
             if self.fresh_measured_position(refused_joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
                 return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: refused_joint });
             }
