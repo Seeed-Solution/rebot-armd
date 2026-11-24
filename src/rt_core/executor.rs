@@ -734,6 +734,7 @@ pub(crate) struct OffThreadSinks {
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
     reclaim_traj_rx: Mutex<Consumer<crate::motion::ActiveTrajectory>>,
+    reclaim_macro_rx: Mutex<Consumer<crate::macro_action::MacroRun>>,
     reclaim_return_tx: Mutex<Producer<Arc<SafetyState>>>,
     /// `(consumer, last_reported_dropped, shutdown_reported_total)` guarded by one mutex so
     /// best-effort warning deltas never race and never reset `stats.safety_log_dropped`.
@@ -786,6 +787,12 @@ impl OffThreadSinks {
             let mut rx = self.reclaim_traj_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(traj) = rx.pop() {
                 drop(traj);
+            }
+        }
+        {
+            let mut rx = self.reclaim_macro_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(run) = rx.pop() {
+                drop(run);
             }
         }
         {
@@ -1190,6 +1197,7 @@ pub(crate) fn spawn_executor(
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
     let (reclaim_traj_tx, reclaim_traj_rx) = RingBuffer::<crate::motion::ActiveTrajectory>::new(8);
+    let (reclaim_macro_tx, reclaim_macro_rx) = RingBuffer::<crate::macro_action::MacroRun>::new(8);
     let (reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(
         FAULT_ARC_POOL_CAPACITY + FORMATTED_FAULT_ARC_POOL_CAPACITY + JOINT_LIMIT_ARC_POOL_CAPACITY,
     );
@@ -1215,6 +1223,7 @@ pub(crate) fn spawn_executor(
         estop_reg: estop_reg.clone(),
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
         reclaim_traj_rx: Mutex::new(reclaim_traj_rx),
+        reclaim_macro_rx: Mutex::new(reclaim_macro_rx),
         reclaim_return_tx: Mutex::new(reclaim_return_tx),
         safety_log_rx: Mutex::new((safety_log_rx, 0, 0)),
         stats: stats.clone(),
@@ -1275,6 +1284,7 @@ pub(crate) fn spawn_executor(
                 estop_overflow_gen,
                 reclaim_state_tx,
                 reclaim_traj_tx,
+                reclaim_macro_tx,
                 reclaim_return_rx,
                 safety_log_tx,
                 persist_job_tx,
@@ -1360,6 +1370,7 @@ struct ControlState {
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
+    reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
     stats: Arc<ExecutorStats>,
@@ -1427,6 +1438,13 @@ impl ControlState {
                 break;
             };
             let _ = self.reclaim_traj_tx.push(traj);
+            drained = true;
+        }
+        while !self.reclaim_macro_tx.is_full() {
+            let Some(run) = core.pop_retired_macro_run() else {
+                break;
+            };
+            let _ = self.reclaim_macro_tx.push(run);
             drained = true;
         }
         let lost_inline = core.safety.advance_log_dropped_forwarded();
@@ -2337,6 +2355,7 @@ fn control_thread_main(
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
+    reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
@@ -2404,6 +2423,7 @@ fn control_thread_main(
         estop_overflow_gen,
         reclaim_state_tx,
         reclaim_traj_tx,
+        reclaim_macro_tx,
         reclaim_return_rx,
         safety_log_tx,
         stats: Arc::clone(&stats),
@@ -3093,6 +3113,7 @@ mod tests {
         let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
+        let (reclaim_macro_tx, _) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
         let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
@@ -3122,6 +3143,7 @@ mod tests {
             estop_overflow_gen: Arc::new(AtomicU64::new(0)),
             reclaim_state_tx,
             reclaim_traj_tx,
+            reclaim_macro_tx,
             reclaim_return_rx,
             safety_log_tx,
             stats: Arc::new(ExecutorStats::default()),

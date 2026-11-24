@@ -222,8 +222,15 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
     fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
+    fn take_last_pos_force_tx_status(&mut self) -> crate::driver::PosForceTxStatus {
+        self.inner.take_last_pos_force_tx_status()
+    }
+    fn pos_force_feedback_fresh(&self) -> bool { self.inner.pos_force_feedback_fresh() }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        self.inner.feedback_joints_within(joints, max_age)
+    }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { self.inner.with_range_check(f) }
     fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_instants_into(out) }

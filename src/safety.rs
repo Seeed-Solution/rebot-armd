@@ -35,6 +35,8 @@ pub enum FaultReason {
     WatchdogTimeout,
     /// Bounded CAN TX stalled: frames expired past the age limit or consecutive ticks deferred.
     CanTxStalled,
+    /// J7 position-force feedback stayed stale past the configured bounded limit (recoverable).
+    J7FeedbackStale,
     Other(String),
 }
 
@@ -66,6 +68,8 @@ fault_codes! {
         InvalidTelemetry,
         DriverWriteFailed,
         CanTxStalled,
+        /// J7 position-force feedback stayed stale past `damiao_gripper.feedback_stale_fault_ms`.
+        J7FeedbackStale,
         HardwareFault,
         EnableFailed,
         ServoNoBrake,
@@ -86,7 +90,13 @@ impl FaultCode {
 
     /// Hint for client recovery policies; armd never clears a fault by itself.
     pub fn recoverable(self) -> bool {
-        matches!(self, FaultCode::WatchdogTimeout | FaultCode::ControlDeadline | FaultCode::HandoverUnsettled)
+        matches!(
+            self,
+            FaultCode::WatchdogTimeout
+                | FaultCode::ControlDeadline
+                | FaultCode::HandoverUnsettled
+                | FaultCode::J7FeedbackStale
+        )
     }
 
     /// Code implied by a reason when the trigger site gave none.
@@ -97,8 +107,37 @@ impl FaultCode {
             FaultReason::BusLoss => FaultCode::BusLoss,
             FaultReason::WatchdogTimeout => FaultCode::WatchdogTimeout,
             FaultReason::CanTxStalled => FaultCode::CanTxStalled,
+            FaultReason::J7FeedbackStale => FaultCode::J7FeedbackStale,
             FaultReason::Other(_) => FaultCode::Other,
         }
+    }
+}
+
+/// Inline, allocation-free numeric diagnostics for [`FaultCode::J7FeedbackStale`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct J7StaleDetail {
+    pub joint: u8,
+    pub age_ms: Option<u64>,
+    pub limit_ms: u64,
+}
+
+impl J7StaleDetail {
+    /// Formats a human-readable J7 staleness message directly into a [`core::fmt::Write`] sink
+    /// without heap allocation.
+    pub fn write_message_into(&self, out: &mut impl core::fmt::Write) {
+        let j = usize::from(self.joint) + 1;
+        let _ = match self.age_ms {
+            Some(age_ms) => write!(
+                out,
+                "Joint {j} position-force feedback stale for {age_ms} ms (limit {} ms); jaw holding last target",
+                self.limit_ms
+            ),
+            None => write!(
+                out,
+                "Joint {j} position-force feedback unavailable/unbounded past limit {} ms; jaw holding last target",
+                self.limit_ms
+            ),
+        };
     }
 }
 
@@ -179,6 +218,9 @@ impl FaultReason {
             }
             FaultReason::CanTxStalled => {
                 let _ = w.write_str("CAN TX stalled (bounded transmit queue did not drain within age limit)");
+            }
+            FaultReason::J7FeedbackStale => {
+                let _ = w.write_str("Joint 7 position-force feedback stale past bounded limit; jaw holding last target");
             }
             FaultReason::Other(m) => {
                 let _ = w.write_str(m);
@@ -375,7 +417,8 @@ impl StaticFault {
 ///
 /// Severity order (highest to lowest, used for reported `fault.code` and displayed state):
 /// `ThermalTrip` > `BusLoss` > `CollisionLatched` > `JointLimit` > `CanTxStalled`
-/// > `Other` (non-recoverable) > `Estop` > `Other` (recoverable) > `WatchdogTimeout`.
+/// > `Other` (non-recoverable) > `Estop` > `Other` (recoverable) / `J7FeedbackStale`
+/// > `WatchdogTimeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FaultKind {
@@ -387,10 +430,11 @@ pub enum FaultKind {
     Other = 5,
     WatchdogTimeout = 6,
     Estop = 7,
+    J7FeedbackStale = 8,
 }
 
 impl FaultKind {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
     /// All known kinds in strict descending severity order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ThermalTrip,
@@ -399,8 +443,9 @@ impl FaultKind {
         Self::JointLimit,
         Self::CanTxStalled,
         Self::Other,
-        Self::WatchdogTimeout,
         Self::Estop,
+        Self::J7FeedbackStale,
+        Self::WatchdogTimeout,
     ];
     /// Bitmask covering every known [`FaultKind`]; any bit outside this mask fails closed.
     pub const ALL_MASK: u16 = (1u16 << Self::COUNT) - 1;
@@ -421,6 +466,7 @@ impl FaultKind {
             5 => Some(Self::Other),
             6 => Some(Self::WatchdogTimeout),
             7 => Some(Self::Estop),
+            8 => Some(Self::J7FeedbackStale),
             _ => None,
         }
     }
@@ -437,26 +483,29 @@ impl FaultKind {
             Self::Other => FaultCode::Other,
             Self::WatchdogTimeout => FaultCode::WatchdogTimeout,
             Self::Estop => FaultCode::Estop,
+            Self::J7FeedbackStale => FaultCode::J7FeedbackStale,
         }
     }
 
-    /// Severity rank for `(kind, code)` (higher wins reported `fault.code` and displayed state).
+    /// Severity rank for `(kind, code)` (strict total order across distinct `FaultKind`s so
+    /// `highest_severity_kind()` and `latch()` state promotion always agree).
     #[inline]
     pub const fn severity(self, code: FaultCode) -> u8 {
         match self {
-            Self::ThermalTrip => 8,
-            Self::BusLoss => 7,
-            Self::CollisionLatched => 6,
-            Self::JointLimit => 5,
-            Self::CanTxStalled => 4,
+            Self::ThermalTrip => 9,
+            Self::BusLoss => 8,
+            Self::CollisionLatched => 7,
+            Self::JointLimit => 6,
+            Self::CanTxStalled => 5,
             Self::Other => {
                 if matches!(code, FaultCode::ControlDeadline | FaultCode::HandoverUnsettled) {
-                    1
+                    2
                 } else {
-                    3
+                    4
                 }
             }
-            Self::Estop => 2,
+            Self::Estop => 3,
+            Self::J7FeedbackStale => 1,
             Self::WatchdogTimeout => 0,
         }
     }
@@ -483,6 +532,7 @@ impl FaultKind {
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
             FaultReason::CanTxStalled => Self::CanTxStalled,
+            FaultReason::J7FeedbackStale => Self::J7FeedbackStale,
             FaultReason::Other(_) => Self::Other,
         }
     }
@@ -495,6 +545,7 @@ impl FaultKind {
             FaultCode::Collision => Self::CollisionLatched,
             FaultCode::JointLimit => Self::JointLimit,
             FaultCode::CanTxStalled => Self::CanTxStalled,
+            FaultCode::J7FeedbackStale => Self::J7FeedbackStale,
             FaultCode::WatchdogTimeout => Self::WatchdogTimeout,
             FaultCode::Estop => Self::Estop,
             _ => Self::Other,
@@ -514,6 +565,8 @@ pub enum FaultDetail {
     WatchdogTimeout,
     /// Bounded CAN TX stalled (optional inline numeric diagnostics, 0 heap ops).
     CanTxStalled(Option<TxStallDetail>),
+    /// J7 position-force feedback stayed stale past the configured limit (0 heap ops).
+    J7FeedbackStale(Option<J7StaleDetail>),
     /// Joint temperature exceeded `max_temperature`.
     ThermalTrip { joint_idx: usize, temperature: f32, limit: f32 },
     /// Joint position exceeded configured/driver limits.
@@ -555,6 +608,7 @@ impl FaultDetail {
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
             FaultReason::CanTxStalled => Self::CanTxStalled(None),
+            FaultReason::J7FeedbackStale => Self::J7FeedbackStale(None),
             FaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max } => {
                 Self::JointLimitExceeded {
                     joint_idx: *joint_idx,
@@ -575,6 +629,7 @@ impl FaultDetail {
             Self::BusLoss => FaultCode::BusLoss,
             Self::WatchdogTimeout => FaultCode::WatchdogTimeout,
             Self::CanTxStalled(_) => FaultCode::CanTxStalled,
+            Self::J7FeedbackStale(_) => FaultCode::J7FeedbackStale,
             Self::ThermalTrip { .. } => FaultCode::ThermalTrip,
             Self::JointLimitExceeded { .. } => FaultCode::JointLimit,
             Self::Static(sf) => sf.code(),
@@ -592,6 +647,7 @@ impl FaultDetail {
             Self::BusLoss => BoundedFaultReason::BusLoss,
             Self::WatchdogTimeout => BoundedFaultReason::WatchdogTimeout,
             Self::CanTxStalled(detail) => BoundedFaultReason::CanTxStalled(detail),
+            Self::J7FeedbackStale(detail) => BoundedFaultReason::J7FeedbackStale(detail),
             Self::ThermalTrip { joint_idx, temperature, limit } => {
                 BoundedFaultReason::ThermalTrip { joint_idx, temperature, limit }
             }
@@ -720,6 +776,7 @@ pub enum BoundedFaultReason {
     BusLoss,
     WatchdogTimeout,
     CanTxStalled(Option<TxStallDetail>),
+    J7FeedbackStale(Option<J7StaleDetail>),
     Other(BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
 }
 
@@ -734,6 +791,7 @@ impl BoundedFaultReason {
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
             FaultReason::CanTxStalled => Self::CanTxStalled(None),
+            FaultReason::J7FeedbackStale => Self::J7FeedbackStale(None),
             FaultReason::Other(m) => Self::Other(BoundedText::new(m)),
         }
     }
@@ -759,6 +817,12 @@ impl BoundedFaultReason {
             Self::CanTxStalled(None) => {
                 let _ = w.write_str("CAN TX stalled (bounded transmit queue did not drain within age limit)");
             }
+            Self::J7FeedbackStale(Some(detail)) => {
+                detail.write_message_into(w);
+            }
+            Self::J7FeedbackStale(None) => {
+                let _ = w.write_str("Joint 7 position-force feedback stale past bounded limit; jaw holding last target");
+            }
             Self::Other(m) => {
                 let _ = write!(w, "{m}");
             }
@@ -779,6 +843,7 @@ impl std::fmt::Debug for BoundedFaultReason {
             Self::BusLoss => f.write_str("BusLoss"),
             Self::WatchdogTimeout => f.write_str("WatchdogTimeout"),
             Self::CanTxStalled(_) => f.write_str("CanTxStalled"),
+            Self::J7FeedbackStale(_) => f.write_str("J7FeedbackStale"),
             Self::Other(m) => f.debug_tuple("Other").field(&m.as_str()).finish(),
         }
     }
@@ -1066,6 +1131,7 @@ pub enum ClearRefusal {
     HardwareResetRequired,
     HardwareResetSent,
     FreshFeedbackRequired,
+    J7FeedbackStale,
     TxQueueNotDrained,
     TxProbeRequired,
     TxProbeFeedbackRequired,
@@ -1116,6 +1182,7 @@ impl std::fmt::Display for ClearRefusal {
             Self::HardwareResetRequired => f.write_str("Hardware fault bit active; motor reset is required before re-evaluating clear conditions"),
             Self::HardwareResetSent => f.write_str("Hardware reset sent; wait for fresh fault-free feedback before retrying"),
             Self::FreshFeedbackRequired => f.write_str("Fresh feedback is required before resetting a fault"),
+            Self::J7FeedbackStale => f.write_str("Fresh J7 position-force feedback (<= 100 ms) is required before clearing J7_FEEDBACK_STALE"),
             Self::TxQueueNotDrained => f.write_str("CAN TX queue still has pending frames; wait for the bus to drain before clearing CAN_TX_STALLED"),
             Self::TxProbeRequired => f.write_str("CAN TX transmit probe is required before clearing CAN_TX_STALLED"),
             Self::TxProbeFeedbackRequired => f.write_str("CAN TX probe sent; wait for fresh feedback received after the probe before clearing CAN_TX_STALLED"),
@@ -1145,6 +1212,9 @@ pub struct ClearContext {
     pub disable_pending: bool,
     pub has_driver: bool,
     pub feedback_fresh: bool,
+    /// True when J7 position-force feedback is provably fresh (<= 100 ms on both receive
+    /// instant and receive-queue bound, finite position). Required to clear `J7FeedbackStale`.
+    pub j7_feedback_fresh: bool,
     /// True when the driver's bounded TX carry-over queues (motion + stopped-hold) are empty.
     pub tx_queue_drained: bool,
     /// True when a CAN transmit probe (refresh/status frame sent with no backpressure or error
@@ -1186,6 +1256,7 @@ impl ClearContext {
             disable_pending: false,
             has_driver: false,
             feedback_fresh: true,
+            j7_feedback_fresh: true,
             tx_queue_drained: true,
             tx_probe_confirmed: true,
             tx_probe_sent: false,
@@ -1281,6 +1352,7 @@ pub struct SafetyManager {
     moving_arc: Arc<SafetyState>,
     estop_arc: Arc<SafetyState>,
     can_tx_stalled_arc: Arc<SafetyState>,
+    j7_feedback_stale_arc: Arc<SafetyState>,
     bus_loss_arc: Arc<SafetyState>,
     watchdog_timeout_arc: Arc<SafetyState>,
     detail_unavailable_arc: Arc<SafetyState>,
@@ -1329,6 +1401,7 @@ impl Clone for SafetyManager {
             moving_arc: Arc::clone(&self.moving_arc),
             estop_arc: Arc::clone(&self.estop_arc),
             can_tx_stalled_arc: Arc::clone(&self.can_tx_stalled_arc),
+            j7_feedback_stale_arc: Arc::clone(&self.j7_feedback_stale_arc),
             bus_loss_arc: Arc::clone(&self.bus_loss_arc),
             watchdog_timeout_arc: Arc::clone(&self.watchdog_timeout_arc),
             detail_unavailable_arc: Arc::clone(&self.detail_unavailable_arc),
@@ -1383,6 +1456,7 @@ impl Default for SafetyManager {
             moving_arc: Arc::new(SafetyState::Moving),
             estop_arc: Arc::new(SafetyState::EStop),
             can_tx_stalled_arc: Arc::new(SafetyState::Fault(FaultReason::CanTxStalled)),
+            j7_feedback_stale_arc: Arc::new(SafetyState::Fault(FaultReason::J7FeedbackStale)),
             bus_loss_arc: Arc::new(SafetyState::Fault(FaultReason::BusLoss)),
             watchdog_timeout_arc: Arc::new(SafetyState::Fault(FaultReason::WatchdogTimeout)),
             detail_unavailable_arc: Arc::new(SafetyState::Fault(FaultReason::Other(
@@ -1839,6 +1913,7 @@ impl SafetyManager {
 
     fn is_cached_fault_arc(&self, arc: &Arc<SafetyState>) -> bool {
         Arc::ptr_eq(arc, &self.can_tx_stalled_arc)
+            || Arc::ptr_eq(arc, &self.j7_feedback_stale_arc)
             || Arc::ptr_eq(arc, &self.bus_loss_arc)
             || Arc::ptr_eq(arc, &self.watchdog_timeout_arc)
             || Arc::ptr_eq(arc, &self.detail_unavailable_arc)
@@ -1852,6 +1927,7 @@ impl SafetyManager {
             FaultDetail::BusLoss => Some(Arc::clone(&self.bus_loss_arc)),
             FaultDetail::WatchdogTimeout => Some(Arc::clone(&self.watchdog_timeout_arc)),
             FaultDetail::CanTxStalled(_) => Some(Arc::clone(&self.can_tx_stalled_arc)),
+            FaultDetail::J7FeedbackStale(_) => Some(Arc::clone(&self.j7_feedback_stale_arc)),
             FaultDetail::Static(sf) => Some(Arc::clone(&self.static_fault_arcs[sf as usize])),
             FaultDetail::DetailUnavailable(_) => {
                 if kind == FaultKind::Estop {
@@ -2084,6 +2160,7 @@ impl SafetyManager {
             FaultKind::ThermalTrip,
             FaultKind::WatchdogTimeout,
             FaultKind::JointLimit,
+            FaultKind::J7FeedbackStale,
             FaultKind::CollisionLatched,
             FaultKind::Estop,
             FaultKind::Other,
@@ -2106,6 +2183,14 @@ impl SafetyManager {
                     }
                     if !ctx.tx_queue_drained {
                         return Err(ClearRefusal::TxQueueNotDrained);
+                    }
+                }
+                FaultKind::J7FeedbackStale => {
+                    if ctx.has_driver && !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                    if !ctx.j7_feedback_fresh {
+                        return Err(ClearRefusal::J7FeedbackStale);
                     }
                 }
                 FaultKind::ThermalTrip => {

@@ -594,6 +594,11 @@ impl ArmDriver for SimArmDriver {
         self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
     }
 
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        joints.iter().all(|&j| j < self.dof)
+            && self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
+    }
+
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
         let age = self.rx_metadata().1.map(|t| t.elapsed());
         out.clear();

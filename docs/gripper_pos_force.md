@@ -16,6 +16,7 @@ Profile block `damiao_gripper` (B601-DM default):
 | `calibrated` | false | the ceiling's torque equivalent was measured (needs `ceiling_torque_nm`) |
 | `ceiling_torque_nm` | none | measured torque equivalent of the ceiling |
 | `torque_reference` | none | `external` (independent force / torque reference) or `feedback_equivalent` (motor feedback only) |
+| `feedback_stale_fault_ms` | 250 | bounded limit (200..=450 ms, ≥ 2 × 100 ms and < 500 ms `BUS_LOSS_TIMEOUT`) before sustained J7 staleness latches recoverable `J7_FEEDBACK_STALE` |
 
 Measurements on **2026-11-23** (office B601-DM, J7 `sw_ver 942747703`, build `1.6.0-dev8j7` / `027e46c`, method: motor feedback torque at stall on empty jaws, no external force/torque reference):
 
@@ -41,7 +42,7 @@ Earlier `pos_vel` runs measured free-motion torque up to `0.79 N·m` near full o
   - Any failure fails the enable: wrong value, wrong CAN ID or register ID, reply at or after the 50 ms deadline, missing/unbounded fresh measured position, or a request/hold that was not sent. Capped operation is then unavailable: target batches are refused before their first frame, and J7 never receives a frame of another mode.
 - **Final writer.** Every J7 frame is `0x300 + id`: position f32, speed u16 in 0.01 rad/s (quantized downward via `f64` floor so wire speed never exceeds the limit), current u16 = `current_ceiling_raw`. This covers targets, holds, pre-enable holds, measured-position recovery holds, mode-switch holds, servo streams and policies.
   - The speed field is the requested speed (`JointTarget::velocity`, else the POS_VEL ceiling, at most 4 rad/s).
-  - Speed may exceed `close_speed_rad_s` only when provably fresh (≤ 100 ms) finite feedback proves the frame moves the jaw strictly toward `open_rad`. Closing frames, holds (target == measured), explicit fast closes, and recovery holds stay capped at `close_speed_rad_s`. Once J7 feedback exceeds 100 ms (at batch entry, mid-batch, or across a `WouldBlock` retry) or a J7 target position/velocity is non-finite, stale-feedback recovery emits no J7 motion frame (read-only `0xCC` refresh only), `write_joint_targets` refuses to transmit a J7 frame, and enabled mode handovers back to `PosForce` fail before writing `CTRL_MODE`.
+  - Speed may exceed `close_speed_rad_s` only when provably fresh (≤ 100 ms) finite feedback proves the frame moves the jaw strictly toward `open_rad`. Closing frames, holds (target == measured), explicit fast closes, and recovery holds stay capped at `close_speed_rad_s`. Once J7 feedback exceeds 100 ms (at batch entry, mid-batch, or across a `WouldBlock` retry), stale-feedback recovery emits no J7 motion frame (read-only `0xCC` refresh only), enabled mode handovers back to `PosForce` and MIT-fenced batches fail closed, and unfenced motion and stopped-hold passes skip J7 (`0` `0x307` frame sent), request a `0xCC` refresh for J7, and let J1–J6 continue. **While J7 updates are skipped, the J7 jaw holds by itself because the Damiao motor firmware keeps its last pos-force target.** If J7 stays stale past `feedback_stale_fault_ms` (default 250 ms, configurable 200..=450 ms), the supervisor latches recoverable fault `J7_FEEDBACK_STALE`, whose `clear_check` requires fresh (≤ 100 ms) J7 feedback (and complete CAN silence past 500 ms still escalates to `BUS_LOSS`). Non-finite J7 target positions or velocities and zero-wire-speed targets still refuse the entire batch before J1.
 - **E-stop hold.** `StopPolicy::EStopLatch` locks onto `measured_positions` only when every joint reading is finite and the supervisor's own coherent feedback snapshot (`core.feedback()` decode instants and, for receive-queued drivers, `joint_feedback_queue_bounds`, evaluated against `driver.clock_now()` via non-blocking `try_lock`) is provably within the 250 ms feedback freshness bound; when the driver mutex is contended or that snapshot is stale, unread past 250 ms, or lacks a receive-queue bound (even if a driver-side drain later updated the driver's cache), E-stop completes without waiting on a lock and holds `commanded_positions` instead.
 - **Unchanged.** J1–J6 frames are byte-identical to the legacy profile (test `final_writer_caps_every_j7_frame_and_j1_j6_frames_are_unchanged`). The host-side lead cap, contact regulator and software torque cap remain as the second layer.
 - **Reporting.** `GET /api/v1/safety/describe` → `hardware.gripper_current_cap` returns:
@@ -116,6 +117,7 @@ Profile 块 `damiao_gripper`（B601-DM 默认）：
 | `calibrated` | false | 上限对应的力矩已实测（需要 `ceiling_torque_nm`） |
 | `ceiling_torque_nm` | 无 | 上限对应的实测力矩 |
 | `torque_reference` | 无 | `external`（独立力 / 力矩参考）或 `feedback_equivalent`（仅电机反馈） |
+| `feedback_stale_fault_ms` | 250 | J7 反馈持续陈旧触发可恢复故障 `J7_FEEDBACK_STALE` 的有界上限（200..=450 ms，≥ 2 × 100 ms 且 < 500 ms `BUS_LOSS_TIMEOUT`） |
 
 **2026-11-23** 实机测量记录（办公室 B601-DM，J7 `sw_ver 942747703`，构建 `1.6.0-dev8j7` / `027e46c`，方法：空夹爪堵转时的电机反馈力矩，无外部力/力矩参考）：
 
@@ -141,7 +143,7 @@ Profile 块 `damiao_gripper`（B601-DM 默认）：
   - 任一失败都使使能失败：值不符、CAN ID 或寄存器号不符、在 50 ms 截止时间及之后到达、缺少有界新鲜实测位置、请求或保持帧未发出。此时受限运行不可用：目标批次在第一帧之前被拒，J7 不会收到其他模式的帧。
 - **最终写入。** 每个 J7 帧都是 `0x300 + id`：位置 f32、速度 u16（0.01 rad/s，按 `f64` 向下取整确保线速不超过上限）、电流 u16 = `current_ceiling_raw`。覆盖目标、保持、使能前保持、实测位置恢复保持、模式切换保持、servo 流和策略。
   - 速度字段为请求速度（`JointTarget::velocity`，否则为 POS_VEL 上限，最大 4 rad/s）。
-  - 仅当可证新鲜（≤ 100 ms）且有限的反馈证明帧将夹爪严格移向 `open_rad` 时才允许超过 `close_speed_rad_s`。闭合帧、保持帧（目标等于实测）、显式快速闭合及恢复保持均限制在 `close_speed_rad_s` 以内。J7 反馈超过 100 ms（含批次入口、批次中途或 `WouldBlock` 重试期间）或目标位置/速度非有限时，陈旧反馈恢复不再发送 J7 运动帧（仅发只读 `0xCC` 刷新），`write_joint_targets` 拒绝发送 J7 帧，且使能状态下切回 `PosForce` 的模式切换在写 `CTRL_MODE` 之前失败。
+  - 仅当可证新鲜（≤ 100 ms）且有限的反馈证明帧将夹爪严格移向 `open_rad` 时才允许超过 `close_speed_rad_s`。闭合帧、保持帧（目标等于实测）、显式快速闭合及恢复保持均限制在 `close_speed_rad_s` 以内。当 J7 反馈超过 100 ms（含批次入口、批次中途或 `WouldBlock` 重试期间）时，陈旧反馈恢复不发送 J7 运动帧（仅发只读 `0xCC` 刷新），使能状态下切回 `PosForce` 的模式切换及 MIT 围栏批次保持 fail-closed，而非围栏运动路径与停止保持路径共享同一门控：该周期跳过 J7（不发 `0x307` 帧）并请求一次 J7 的 `0xCC` 刷新，J1–J6 正常继续。**在跳过 J7 帧期间，J7 夹爪自行保持，因为达妙电机固件会维持上一帧位置-力控目标。**仅当 J7 持续陈旧超过 `feedback_stale_fault_ms`（默认 250 ms，可配置 200..=450 ms）时，监管器锁存可恢复故障 `J7_FEEDBACK_STALE`，其 `clear_check` 要求 J7 反馈恢复新鲜（≤ 100 ms）；若总线完全静默超过 500 ms，仍按原有规则升级为 `BUS_LOSS`。J7 目标位置/速度非有限或线速编码为 0 时仍整批在第一帧之前拒绝。
 - **急停保持。** `StopPolicy::EStopLatch` 仅在所有关节实测位置有限且监管器自身一致性反馈快照（与 `measured_positions` 同步记录的 `core.feedback()` 解码时间以及带接收队列驱动的 `joint_feedback_queue_bounds`，经非阻塞 `try_lock` 按 `driver.clock_now()` 判定）可证在 250 ms 反馈新鲜度上限内时锁定到 `measured_positions`；若驱动互斥锁被占用，或快照陈旧、在队列中积压超 250 ms 或无接收队列边界（即使之后驱动侧排空刷新了驱动缓存），急停不等待锁，直接改用 `commanded_positions` 保持。
 - **不变部分。** J1–J6 帧与旧版 profile 逐字节相同（测试 `final_writer_caps_every_j7_frame_and_j1_j6_frames_are_unchanged`）。主机侧领先量上限、接触调节和软件力矩上限保留为第二层。
 - **上报。** `GET /api/v1/safety/describe` → `hardware.gripper_current_cap` 返回：

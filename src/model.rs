@@ -1224,9 +1224,21 @@ pub struct DamiaoGripperDrive {
     /// own torque feedback only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torque_reference: Option<String>,
+    /// Maximum time (ms) J7 position-force feedback may remain stale (> 100 ms) before latching
+    /// recoverable `J7_FEEDBACK_STALE` (default 250 ms; allowed range 200..=450 ms, i.e.
+    /// >= 2 x 100 ms freshness bound and strictly < 500 ms `BUS_LOSS_TIMEOUT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_stale_fault_ms: Option<u64>,
 }
 
 impl DamiaoGripperDrive {
+    /// Default bounded staleness limit before latching recoverable `J7_FEEDBACK_STALE` (ms).
+    pub const DEFAULT_FEEDBACK_STALE_FAULT_MS: u64 = 250;
+    /// Minimum configurable staleness fault limit (2 x 100 ms `POS_FORCE_FEEDBACK_MAX_AGE`).
+    pub const MIN_FEEDBACK_STALE_FAULT_MS: u64 = 200;
+    /// Maximum configurable staleness fault limit (strictly below 500 ms `BUS_LOSS_TIMEOUT`).
+    pub const MAX_FEEDBACK_STALE_FAULT_MS: u64 = 450;
+
     /// Feedback-equivalent torque ratio (N·m per raw current unit) measured from office B601-DM J7
     /// stall plateaus on 2026-11-23 (raw 220 -> 0.42 N·m, raw 300 -> 0.55–0.57 N·m).
     pub const FEEDBACK_EQUIVALENT_NM_PER_RAW: f32 = 0.0019;
@@ -1238,7 +1250,13 @@ impl DamiaoGripperDrive {
     /// estimate above the 0.79 N·m free-motion peak near full open, not an external calibration.
     pub fn rebot_dm() -> Self {
         Self { mode: DamiaoGripperMode::PosForce, current_ceiling_raw: 460, close_speed_rad_s: 0.30,
-            calibrated: false, ceiling_torque_nm: None, torque_reference: None }
+            calibrated: false, ceiling_torque_nm: None, torque_reference: None,
+            feedback_stale_fault_ms: None }
+    }
+
+    /// Resolved bounded staleness limit (ms) for J7 position-force feedback.
+    pub fn resolved_feedback_stale_fault_ms(&self) -> u64 {
+        self.feedback_stale_fault_ms.unwrap_or(Self::DEFAULT_FEEDBACK_STALE_FAULT_MS)
     }
 
     /// Legacy profile: J7 in POS_VEL, no motor current cap.
@@ -1292,6 +1310,15 @@ impl DamiaoGripperDrive {
         if let Some(r) = &self.torque_reference {
             if r != "external" && r != "feedback_equivalent" {
                 return Err("damiao_gripper.torque_reference must be external or feedback_equivalent".into());
+            }
+        }
+        if let Some(ms) = self.feedback_stale_fault_ms {
+            if !(Self::MIN_FEEDBACK_STALE_FAULT_MS..=Self::MAX_FEEDBACK_STALE_FAULT_MS).contains(&ms) {
+                return Err(format!(
+                    "damiao_gripper.feedback_stale_fault_ms must be {}..={} ms, got {ms}",
+                    Self::MIN_FEEDBACK_STALE_FAULT_MS,
+                    Self::MAX_FEEDBACK_STALE_FAULT_MS
+                ));
             }
         }
         Ok(())
@@ -1628,6 +1655,22 @@ impl ArmConfig {
     /// otherwise the default `10` ms (`DAMIAO_TX_MAX_DURATION`).
     pub fn resolved_tx_budget_ms(&self) -> u64 {
         self.tx_budget_ms.unwrap_or(10)
+    }
+
+    /// Resolved bounded J7 position-force staleness fault limit (ms), clamped as defense-in-depth
+    /// to `[MIN_FEEDBACK_STALE_FAULT_MS, MAX_FEEDBACK_STALE_FAULT_MS]` (`200..=450` ms, default
+    /// `250` ms).
+    pub fn resolved_j7_stale_fault_ms(&self) -> u64 {
+        self.damiao_gripper
+            .as_ref()
+            .map_or(
+                DamiaoGripperDrive::DEFAULT_FEEDBACK_STALE_FAULT_MS,
+                DamiaoGripperDrive::resolved_feedback_stale_fault_ms,
+            )
+            .clamp(
+                DamiaoGripperDrive::MIN_FEEDBACK_STALE_FAULT_MS,
+                DamiaoGripperDrive::MAX_FEEDBACK_STALE_FAULT_MS,
+            )
     }
 
     /// Damiao per-tick CAN TX budget derived from this profile (`tx_budget_ms` overrides
@@ -2793,6 +2836,7 @@ impl ArmObservation {
                     SafetyState::Fault(FaultReason::BusLoss) => SafetyState::Fault(FaultReason::BusLoss),
                     SafetyState::Fault(FaultReason::WatchdogTimeout) => SafetyState::Fault(FaultReason::WatchdogTimeout),
                     SafetyState::Fault(FaultReason::CanTxStalled) => SafetyState::Fault(FaultReason::CanTxStalled),
+                    SafetyState::Fault(FaultReason::J7FeedbackStale) => SafetyState::Fault(FaultReason::J7FeedbackStale),
                     SafetyState::Fault(FaultReason::ThermalTrip { joint_idx, temperature, limit }) => {
                         SafetyState::Fault(FaultReason::ThermalTrip {
                             joint_idx: *joint_idx,

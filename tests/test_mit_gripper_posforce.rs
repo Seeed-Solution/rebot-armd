@@ -751,12 +751,25 @@ fn stale_j7_recovery_caps_speed_and_fails_closed_without_fresh_feedback() {
     assert!(j7_commands(&log).is_empty(), "emitted J7 motion frame without fresh feedback: {:?}", j7_commands(&log));
     assert!(log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC), "expected 0xCC refresh: {log:?}");
 
-    // 3. While J7 feedback is stale (> 100 ms), write_joint_targets must refuse the batch
-    //    before sending any frame (no changed target reaches J7 during the outage).
+    // 3. While J7 feedback is stale (> 100 ms), unfenced write_joint_targets skips J7 (0x307)
+    //    so J1-J6 continue normally, emits a J7 0xCC refresh, and reports Stale via take_last_pos_force_tx_status.
     bus.clear_log();
-    let stale_err = d.write_joint_targets(&targets(-2.0)).unwrap_err().to_string();
-    assert!(stale_err.contains("feedback stale"), "{stale_err}");
-    assert!(bus.tx_log().is_empty(), "frames sent during J7 stale outage: {:?}", bus.tx_log());
+    d.begin_tx_tick();
+    d.write_joint_targets(&targets(-2.0)).unwrap();
+    let stale_log = bus.tx_log();
+    assert!(j7_commands(&stale_log).is_empty(), "emitted 0x307 during J7 stale outage: {:?}", j7_commands(&stale_log));
+    assert!(
+        (1..=6u32).all(|id| stale_log.iter().any(|f| f.id == 0x100 + id)),
+        "expected J1-J6 commands to continue while J7 is stale: {stale_log:?}"
+    );
+    assert!(
+        stale_log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+        "expected J7 0xCC refresh during stale outage: {stale_log:?}"
+    );
+    assert!(
+        matches!(d.take_last_pos_force_tx_status(), armd::driver::PosForceTxStatus::Stale { joint: J7, .. }),
+        "expected Stale status after skipping J7"
+    );
 
     // 4. Fresh feedback returns with jaw physically opened to -2.5: ramping back toward -1.0 closes at <= close_speed;
     //    a non-finite J7 target refuses the entire batch before sending J1-J6; strictly opening allows opening speed.
@@ -822,7 +835,8 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     use armd::driver::JointMode;
 
     // 1. Mid-batch expiry: feedback is 99 ms old at batch entry, J1-J6 take 1 ms each ->
-    //    J7 is 105 ms old when its frame is built -> write_joint_targets returns Err and emits NO 0x307 frame.
+    //    J7 is 105 ms old when its frame is built -> unfenced write_joint_targets sends J1-J6,
+    //    emits NO 0x307 frame, requests a J7 0xCC refresh, and reports Stale.
     let (mut d, bus, clock) = rig(true);
     d.set_torque(true).unwrap();
     d.read_joint_states().unwrap();
@@ -830,12 +844,27 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     clock.advance(Duration::from_millis(99));
     bus.with(|s| s.tx_step = Duration::from_millis(1));
     bus.clear_log();
-    let err = d.write_joint_targets(&targets(-2.0)).unwrap_err().to_string();
-    assert!(err.contains("feedback stale"), "{err}");
-    assert!(j7_commands(&bus.tx_log()).is_empty(), "emitted 0x307 after mid-batch expiry: {:?}", j7_commands(&bus.tx_log()));
+    d.begin_tx_tick();
+    d.write_joint_targets(&targets(-2.0)).unwrap();
+    let mid_log = bus.tx_log();
+    assert!(j7_commands(&mid_log).is_empty(), "emitted 0x307 after mid-batch expiry: {:?}", j7_commands(&mid_log));
+    assert!(
+        (1..=6u32).all(|id| mid_log.iter().any(|f| f.id == 0x100 + id)),
+        "expected J1-J6 to be sent before J7 expired: {mid_log:?}"
+    );
+    assert!(
+        mid_log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+        "expected J7 0xCC refresh after mid-batch expiry: {mid_log:?}"
+    );
+    assert!(
+        matches!(d.take_last_pos_force_tx_status(), armd::driver::PosForceTxStatus::Stale { joint: J7, .. }),
+        "expected Stale status after mid-batch expiry"
+    );
 
     // 2. WouldBlock stall crossing 100 ms: single-joint pos-force driver at 99 ms tries once,
-    //    stall advances clock to 101 ms -> retry re-checks freshness and fails closed without a 2nd attempt.
+    //    stall advances clock to 101 ms -> retry re-checks freshness, drops the stale pos-force
+    //    frame without a 2nd 0x301 attempt, defers 0xCC while the pass is backpressured, reports
+    //    Stale, and transmits the priority 0xCC refresh on the next tick once the bus clears.
     let clock = MockClock::new();
     let one_limit = vec![b601_limits()[J7]];
     let bus = FakeBus::with_clock(&one_limit, clock.clone());
@@ -855,9 +884,25 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     clock.advance(Duration::from_millis(99));
     bus.with(|s| { s.tx_stall = true; s.stall_step = Duration::from_millis(2); });
     bus.clear_log();
-    let err = d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap_err().to_string();
-    assert!(err.contains("feedback stale before transmit"), "{err}");
-    assert_eq!(bus.tx_log().len(), 1, "retried transmit past freshness bound: {:?}", bus.tx_log());
+    d.begin_tx_tick();
+    d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap();
+    let stall_log = bus.tx_log();
+    let pf_attempts = stall_log.iter().filter(|f| f.id == 0x301).count();
+    assert_eq!(pf_attempts, 1, "retried pos-force transmit past freshness bound: {stall_log:?}");
+    assert!(
+        matches!(d.take_last_pos_force_tx_status(), armd::driver::PosForceTxStatus::Stale { joint: 0, .. }),
+        "expected Stale status after stall crossed 100 ms"
+    );
+    bus.with(|s| { s.tx_stall = false; });
+    bus.clear_log();
+    d.begin_tx_tick();
+    d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap();
+    let next_log = bus.tx_log();
+    assert!(next_log.iter().all(|f| f.id != 0x301), "emitted 0x301 while still stale: {next_log:?}");
+    assert!(
+        next_log.iter().any(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == 0xCC),
+        "expected priority 0xCC refresh on next tick after backpressured stall: {next_log:?}"
+    );
 
     // 3. Non-finite velocity (NaN / Inf) on an opening target refuses the entire batch before J1.
     let (mut d, bus, _) = rig(true);

@@ -796,6 +796,7 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     let res_bus = sm.try_trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
     let res_wd = sm.try_trigger_fault_coded(FaultCode::WatchdogTimeout, FaultReason::WatchdogTimeout);
     let res_tx = sm.try_trigger_fault_coded(FaultCode::CanTxStalled, FaultReason::CanTxStalled);
+    let res_j7 = sm.try_trigger_fault_coded(FaultCode::J7FeedbackStale, FaultReason::J7FeedbackStale);
     let res_other = sm.try_trigger_fault_coded(FaultCode::HardwareFault, other);
     sm.latch(
         FaultKind::CollisionLatched,
@@ -805,7 +806,7 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     let rest_allocs = alloc::take();
     assert_eq!(rest_allocs.calls, 0, "latching all fault kinds with empty pool must do 0 heap ops: {rest_allocs:?}");
 
-    assert!(res_bus.is_ok() && res_wd.is_ok() && res_tx.is_ok(), "cached BusLoss/WatchdogTimeout/CanTxStalled arcs do not need pool slots");
+    assert!(res_bus.is_ok() && res_wd.is_ok() && res_tx.is_ok() && res_j7.is_ok(), "cached BusLoss/WatchdogTimeout/CanTxStalled/J7FeedbackStale arcs do not need pool slots");
     let (_, ret_jl) = res_jl.unwrap_err();
     let (_, ret_th) = res_th.unwrap_err();
     let (_, ret_other) = res_other.unwrap_err();
@@ -1300,6 +1301,14 @@ fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
             FaultDetail::Estop,
             ClearContext { feedback_fresh: false, ..driver_met },
             ClearRefusal::FreshFeedbackRequired,
+            driver_met,
+        ),
+        // J7FeedbackStale: requires provably fresh J7 pos-force feedback (<= 100 ms)
+        (
+            FaultKind::J7FeedbackStale,
+            FaultDetail::J7FeedbackStale(None),
+            ClearContext { j7_feedback_fresh: false, ..driver_met },
+            ClearRefusal::J7FeedbackStale,
             driver_met,
         ),
         // Other: keeps existing rule (active hardware error)
@@ -1898,6 +1907,9 @@ async fn watchdog_latch_and_executor_clear_retry_zero_alloc_on_tagged_live_relea
             out.clear(); for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
         }
         fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
+            joints.iter().all(|&j| j < self.dof)
+        }
         fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
             out.clear(); for _ in 0..self.dof { out.push(Some(0)); }
         }
@@ -2715,6 +2727,9 @@ fn step5_write_output_error_is_bounded_zero_alloc_on_normal_and_estop_hold() {
             for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
         }
         fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
+            joints.iter().all(|&j| j < self.dof)
+        }
         fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
             out.clear();
             for _ in 0..self.dof { out.push(Some(0)); }
@@ -3519,6 +3534,9 @@ async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path
             for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
         }
         fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_joints_within(&self, joints: &[usize], _: Duration) -> bool {
+            joints.iter().all(|&j| j < self.dof)
+        }
         fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
             out.clear();
             for _ in 0..self.dof { out.push(Some(0)); }

@@ -314,7 +314,9 @@ impl SupervisorInner {
             if let Some((state, code)) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()).map(|a| (a.state, a.code)) {
                 self.record_macro_terminal(id, &state, code.as_deref());
             }
-            self.macro_run = None;
+            if let Some(run) = self.macro_run.take() {
+                self.retire_macro_run(run);
+            }
         }
     }
 
@@ -374,6 +376,12 @@ impl SupervisorInner {
     /// `input`. Its orchestrator drives it from now on. Returns its id.
     pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         self.check_plan_fresh(input)?;
+        if !self.can_admit_macro_run() {
+            return Err(MotionError::MotionBusy(
+                "RT macro reclamation queue is full; retry after drain".into(),
+            )
+            .into());
+        }
         let id = self.begin_action(kind, tag);
         self.macro_run = Some(MacroRun::new(id, input.epoch));
         self.set_action_phase(id, "start", 0.0, None, None);
@@ -393,6 +401,12 @@ impl SupervisorInner {
         }
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
+        if !self.can_admit_macro_run() {
+            return Err(MotionError::MotionBusy(
+                "RT macro reclamation queue is full; retry after drain".into(),
+            )
+            .into());
+        }
         let id = self.begin_action(kind, tag);
         self.macro_run = Some(MacroRun::new(id, epoch));
         self.set_action_phase(id, "start", 0.0, None, None);
@@ -775,7 +789,9 @@ impl SupervisorInner {
     pub(crate) fn drop_macro_run(&mut self, state: &str, code: Option<&str>) {
         let Some(id) = self.macro_run.as_ref().map(|m| m.id) else { return; };
         if self.core.last_macro().is_none_or(|m| m.action.0 != id) { self.record_macro_terminal(id, state, code); }
-        self.macro_run = None;
+        if let Some(run) = self.macro_run.take() {
+            self.retire_macro_run(run);
+        }
     }
 
     /// Keeps the terminal record of macro `id` (outcome with its code, child count) in the
@@ -1092,6 +1108,7 @@ impl SupervisorInner {
                 *a.phase_ms.entry(prev_phase).or_insert(0) += ms;
             }
         }
+        self.retire_macro_run(m);
         self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
     }
 
@@ -1289,6 +1306,9 @@ impl SupervisorInner {
             SafetyState::Fault(FaultReason::CanTxStalled) => {
                 Some(ReconcileCause::SafetyMessage("failed", "CAN_TX_STALLED"))
             }
+            SafetyState::Fault(FaultReason::J7FeedbackStale) => {
+                Some(ReconcileCause::SafetyMessage("failed", "J7_FEEDBACK_STALE"))
+            }
             SafetyState::Fault(FaultReason::Other(_)) => {
                 Some(ReconcileCause::SafetyMessage("failed", "FAULT"))
             }
@@ -1342,6 +1362,7 @@ impl SupervisorInner {
                     "WATCHDOG" => "WATCHDOG_TIMEOUT",
                     "LEASE_LOST" => "LEASE_LOST",
                     "CAN_TX_STALLED" => "CAN_TX_STALLED",
+                    "J7_FEEDBACK_STALE" => "J7_FEEDBACK_STALE",
                     _ => "FAULT",
                 };
                 self.terminate_policy_run(reason, state, Some(code), Some(message));

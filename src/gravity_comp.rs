@@ -395,7 +395,6 @@ impl SupervisorInner {
         use_estop_hold: bool,
         nonblocking: bool,
     ) -> crate::supervisor::TickOutput {
-        use crate::driver::TxBatchOutcome;
         use crate::supervisor::TickOutput;
         if !self.is_torqued || self.disable_pending { return TickOutput::None; }
         let Some(targets) = self.gravity_comp_targets_array() else { return TickOutput::None; };
@@ -413,44 +412,7 @@ impl SupervisorInner {
         } else {
             drv.write_joint_targets_bounded(&targets)
         };
-        let now = drv.clock_now();
-        let max_age = drv.tx_frame_max_age();
-        let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
-        match write_res {
-            Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold },
-            Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
-                pending,
-                now,
-                max_age,
-                oldest_age: drv.oldest_pending_tx_age(),
-                is_hold,
-                sent_any: hold_sent_any,
-                sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
-            },
-            Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
-                dropped,
-                pending,
-                now,
-                max_age,
-                oldest_age: drv.last_tx_expired_age(),
-                is_hold,
-                sent_any: hold_sent_any,
-            },
-            Err(crate::driver::ArmDriverError::EstopInhibited) => {
-                TickOutput::EstopInhibited { is_hold }
-            }
-            Err(e) => {
-                let mut buf = crate::mit::OutputErrorText::empty();
-                e.write_bounded(&mut buf);
-                TickOutput::Error {
-                    message: buf,
-                    now,
-                    max_age,
-                    is_hold,
-                    sent_any: hold_sent_any,
-                }
-            }
-        }
+        crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res)
     }
 
     /// Stack-allocated gravity-comp targets (`ARM` MIT joints + 1 position gripper), 0 heap allocs.
@@ -483,6 +445,7 @@ impl SupervisorInner {
         match self.safety.state() {
             SafetyState::Fault(FaultReason::BusLoss) => return Some(("BUS_LOSS", "CAN feedback lost".into())),
             SafetyState::Fault(FaultReason::WatchdogTimeout) => return Some(("WATCHDOG", "Lease watchdog".into())),
+            SafetyState::Fault(FaultReason::J7FeedbackStale) => return Some(("J7_FEEDBACK_STALE", "J7 position-force feedback stale".into())),
             SafetyState::Fault(r) => return Some(("FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
             _ => {}
         }
@@ -500,7 +463,7 @@ impl SupervisorInner {
                 return Some(("LEASE_LOST", "Control lease lost, released or taken over".into()));
             }
         }
-        if !self.feedback_numeric_valid || !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
+        if !self.feedback_numeric_valid || !self.hardware_arm_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
             return Some(("FEEDBACK_STALE", format!("Feedback older than {} ms", policy.feedback_max_age_ms)));
         }
         if let Some(msg) = self.gravity_comp_near_limit(policy) { return Some(("GRAVITY_COMP_JOINT_LIMIT", msg.to_string())); }
@@ -620,7 +583,7 @@ impl SupervisorInner {
                     let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
                     if tracking_active {
                         let fresh = self.feedback_numeric_valid
-                            && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms));
+                            && self.hardware_arm_feedback_fresh(Duration::from_millis(max_age_ms));
                         let stationary = self.gravity_comp_is_stationary(max_vel);
                         // When tracking will take over POS_VEL output, wait for the arm to settle
                         // under the stiff MIT hold before scheduling the handback release (bounded
@@ -673,7 +636,7 @@ impl SupervisorInner {
                     (r.policy.exit_hold_ms as f64 / 1000.0, r.policy.feedback_max_age_ms, r.policy.entry_max_velocity)
                 });
                 let fresh = self.feedback_numeric_valid
-                    && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms));
+                    && self.hardware_arm_feedback_fresh(Duration::from_millis(max_age_ms));
                 let stationary = self.gravity_comp_is_stationary(max_vel);
                 // If the arm resumed moving before the settle deadline, cancel the scheduled
                 // transition release and continue sending stiff MIT holds.
@@ -710,7 +673,7 @@ impl SupervisorInner {
             .map_or((100, 0.05), |r| (r.policy.feedback_max_age_ms, r.policy.entry_max_velocity));
         let fresh = !tracking_active
             || (self.feedback_numeric_valid
-                && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms))
+                && self.hardware_arm_feedback_fresh(Duration::from_millis(max_age_ms))
                 && self.measured_positions.len() >= ARM
                 && self.measured_positions[..ARM].iter().all(|q| q.is_finite()));
         let stationary = !tracking_active || self.gravity_comp_is_stationary(max_vel);

@@ -30,6 +30,7 @@ mod actions;
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
 pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
+pub(crate) use driver_transitions::ClearFaultCommit;
 
 #[derive(Debug, Error)]
 pub enum ArmError {
@@ -363,7 +364,11 @@ pub(crate) enum TickOutput {
     /// Driver refused target/hold because an E-stop or authorized stop is pending/latched.
     /// Zero-allocation typed refusal (avoids formatting or matching `ESTOP_INHIBITED`).
     EstopInhibited { is_hold: bool },
-    Complete { is_hold: bool },
+    Complete {
+        is_hold: bool,
+        now: Instant,
+        pf_status: crate::driver::PosForceTxStatus,
+    },
     Deferred {
         pending: usize,
         now: Instant,
@@ -372,6 +377,7 @@ pub(crate) enum TickOutput {
         is_hold: bool,
         sent_any: bool,
         sent_mask: u64,
+        pf_status: crate::driver::PosForceTxStatus,
     },
     Expired {
         dropped: usize,
@@ -381,6 +387,7 @@ pub(crate) enum TickOutput {
         oldest_age: Option<Duration>,
         is_hold: bool,
         sent_any: bool,
+        pf_status: crate::driver::PosForceTxStatus,
     },
     Error {
         message: crate::mit::OutputErrorText,
@@ -388,7 +395,23 @@ pub(crate) enum TickOutput {
         max_age: Duration,
         is_hold: bool,
         sent_any: bool,
+        pf_status: crate::driver::PosForceTxStatus,
     },
+}
+
+impl TickOutput {
+    /// True when the active J7 position-force gripper was skipped during this pass due to stale
+    /// feedback (> 100 ms); prevents J7-dependent action completions from committing on that tick.
+    #[inline]
+    pub(crate) fn j7_skipped(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
+                | Self::Deferred { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
+                | Self::Expired { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
+                | Self::Error { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
+        )
+    }
 }
 
 /// What [`SupervisorInner::tick_publish`] hands back.
@@ -771,6 +794,10 @@ pub struct SupervisorInner {
     pub(crate) hold_tx_stalled_latched: bool,
     /// Last driver-clock instant when a stopped-hold TX error/stall was logged (<= 1/s throttle).
     pub(crate) last_hold_tx_error_log: Option<Instant>,
+    /// Driver-clock anchor `(pf_fresh_gen, since)` when continuous J7 position-force staleness
+    /// (`> 100 ms`) began for the current feedback generation; cleared on fresh J7 feedback,
+    /// feedback-generation advance, or `clear_fault_finish_bounded`.
+    pub(crate) j7_stale_since: Option<(u64, Instant)>,
     /// Action / macro-sub / park-release completion awaiting bus acceptance (`Complete`) across
     /// one or more transient `Deferred` ticks.
     pub(crate) pending_deferred_done: Option<DeferredActionDone>,
@@ -782,6 +809,8 @@ pub struct SupervisorInner {
     pub(crate) action_msg_spare: String,
     /// Retired `ActiveTrajectory` instances queued for off-thread drop on RT executor (0 free on RT).
     pub(crate) retired_trajectories: std::collections::VecDeque<ActiveTrajectory>,
+    /// Retired `MacroRun` instances queued for off-thread drop on RT executor (0 free on RT).
+    pub(crate) retired_macro_runs: std::collections::VecDeque<crate::macro_action::MacroRun>,
     /// Preallocated reusable `UnloadSettle` ring returned on stop/finish (0 alloc / 0 free on RT).
     pub(crate) unload_settle_spare: Option<UnloadSettle>,
 }
@@ -1209,10 +1238,12 @@ impl SupervisorInner {
             hold_tx_unsent_since: None,
             hold_tx_stalled_latched: false,
             last_hold_tx_error_log: None,
+            j7_stale_since: None,
             pending_deferred_done: None,
             gravity_comp_handback_ready: false,
             action_msg_spare: String::with_capacity(256),
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
+            retired_macro_runs: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
         };
         inner.prepare_workspace_eval_bufs();
@@ -2155,16 +2186,24 @@ impl SupervisorInner {
         ThermalCooldown::default()
     }
 
-    /// Updates continuous thermal cooldown tracking from driverless simulation temperatures at `now`.
-    pub(crate) fn update_thermal_cooldown_driverless(&mut self, now: Instant) {
+    /// Evaluates continuous thermal cooldown tracking from driverless simulation temperatures at
+    /// `now` without mutating `self.thermal_cooldown`.
+    pub(crate) fn evaluate_thermal_cooldown_driverless(&self, now: Instant) -> ThermalCooldown {
+        let mut next = self.thermal_cooldown;
         let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
         if !self.temperatures.is_empty()
             && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
         {
-            self.thermal_cooldown.record_fresh_cool_at(now);
+            next.record_fresh_cool_at(now);
         } else {
-            self.thermal_cooldown.reset();
+            next.reset();
         }
+        next
+    }
+
+    /// Updates continuous thermal cooldown tracking from driverless simulation temperatures at `now`.
+    pub(crate) fn update_thermal_cooldown_driverless(&mut self, now: Instant) {
+        self.thermal_cooldown = self.evaluate_thermal_cooldown_driverless(now);
     }
 
     /// Returns the first measured joint violating configured limits plus
@@ -2566,6 +2605,30 @@ impl SupervisorInner {
         self.retired_trajectories.pop_front()
     }
 
+    /// True when the supervisor has guaranteed off-thread retirement capacity for a new `MacroRun`
+    /// so retiring it on `armd-control` can never fall back to freeing heap strings on the RT
+    /// thread. Always `true` in Legacy mode (off-RT).
+    pub fn can_admit_macro_run(&self) -> bool {
+        !self.rt_executor_owned
+            || self.retired_macro_runs.len() + usize::from(self.macro_run.is_some())
+                < self.retired_macro_runs.capacity()
+    }
+
+    /// Queue a replaced `MacroRun` for off-thread drop when owned by the RT executor
+    /// (prevents dropping heap-backed `phase` / `SubState::Failed` strings on `armd-control`).
+    pub(crate) fn retire_macro_run(&mut self, run: crate::macro_action::MacroRun) {
+        if self.rt_executor_owned
+            && self.retired_macro_runs.len() < self.retired_macro_runs.capacity()
+        {
+            self.retired_macro_runs.push_back(run);
+        }
+    }
+
+    /// Pop one retired `MacroRun` for off-thread drop (0 alloc, 0 drop).
+    pub(crate) fn pop_retired_macro_run(&mut self) -> Option<crate::macro_action::MacroRun> {
+        self.retired_macro_runs.pop_front()
+    }
+
     /// Return an `UnloadSettle` buffer to `unload_settle_spare` (resetting its logical state
     /// without freeing its preallocated sample ring).
     pub(crate) fn clear_unload_settle(&mut self) {
@@ -2837,6 +2900,141 @@ impl SupervisorInner {
         }
     }
 
+    /// Single shared constructor converting any bounded driver motion or stopped-hold write
+    /// result into a zero-allocation [`TickOutput`] carrying attempt-scoped J7 freshness status.
+    pub(crate) fn tick_output_from_driver_write(
+        drv: &mut dyn ArmDriver,
+        is_hold: bool,
+        write_res: Result<crate::driver::TxBatchOutcome, crate::driver::ArmDriverError>,
+    ) -> TickOutput {
+        use crate::driver::TxBatchOutcome;
+        let now = drv.clock_now();
+        let max_age = drv.tx_frame_max_age();
+        let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
+        let pf_status = drv.take_last_pos_force_tx_status();
+        match write_res {
+            Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold, now, pf_status },
+            Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
+                pending,
+                now,
+                max_age,
+                oldest_age: drv.oldest_pending_tx_age(),
+                is_hold,
+                sent_any: hold_sent_any,
+                sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
+                pf_status,
+            },
+            Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
+                dropped,
+                pending,
+                now,
+                max_age,
+                oldest_age: drv.last_tx_expired_age(),
+                is_hold,
+                sent_any: hold_sent_any,
+                pf_status,
+            },
+            Err(crate::driver::ArmDriverError::EstopInhibited) => {
+                TickOutput::EstopInhibited { is_hold }
+            }
+            Err(e) => {
+                let mut buf = crate::mit::OutputErrorText::empty();
+                e.write_bounded(&mut buf);
+                TickOutput::Error {
+                    message: buf,
+                    now,
+                    max_age,
+                    is_hold,
+                    sent_any: hold_sent_any,
+                    pf_status,
+                }
+            }
+        }
+    }
+
+    /// Zero-allocation / zero-free motion halt for an RT fault latch on `skip_joint` (e.g. J7
+    /// pos-force staleness): retires any active trajectory off-thread, clears servo/park/stream
+    /// motion state WITHOUT calling allocating `stop_motion()`, and snaps commanded positions to
+    /// fresh measured positions ONLY for healthy joints (`i != skip_joint`) so stale `skip_joint`
+    /// never overwrites its last commanded target.
+    fn halt_motion_for_fault_rt(&mut self, skip_joint: usize) {
+        self.mit.park_after_hand_back = false;
+        self.mit.deferred_park_action = None;
+        self.release_servo_target();
+        self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
+        self.servo_stream_active = false;
+        if let Some(old_traj) = self.active_trajectory.take() {
+            self.retire_active_trajectory(old_traj);
+        }
+        self.pending_deferred_done = None;
+        self.pending_normal_unload = false;
+        self.clear_unload_settle();
+        self.zero_check_persisting = None;
+        self.gripper_stream_target = None;
+        self.gripper_stream_contact = None;
+        self.gripper_stream_lease = None;
+        self.tracking.invalidate();
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        let dof = self.config.dof.min(self.commanded_positions.len()).min(self.measured_positions.len());
+        for i in 0..dof {
+            if i != skip_joint && self.measured_positions[i].is_finite() {
+                self.commanded_positions[i] = self.measured_positions[i];
+            }
+        }
+        copy_into(&mut self.target_positions, &self.commanded_positions);
+    }
+
+    /// Single owner-side J7 position-force staleness handler shared by BOTH motion and stopped-hold
+    /// paths:
+    /// - `Fresh`: resets the staleness timer.
+    /// - `Unobserved`: leaves state unchanged.
+    /// - `Stale { joint, age }`: advances the continuous staleness duration on the driver clock;
+    ///   while below `damiao_gripper.feedback_stale_fault_ms` (default 250 ms, 200..=450 ms), no
+    ///   fault latches (J7 jaw holds its last pos-force target inside motor firmware while a `0xCC`
+    ///   refresh polls it and J1–J6 continue). At or above the limit, halts motion zero-alloc and
+    ///   latches recoverable [`FaultKind::J7FeedbackStale`] once per fault episode.
+    fn handle_j7_feedback_staleness(
+        &mut self,
+        pf_status: crate::driver::PosForceTxStatus,
+        now: Instant,
+    ) {
+        use crate::driver::PosForceTxStatus;
+        match pf_status {
+            PosForceTxStatus::Unobserved => {}
+            PosForceTxStatus::Fresh => {
+                self.j7_stale_since = None;
+            }
+            PosForceTxStatus::Stale { joint, age, fresh_gen } => {
+                let since = match self.j7_stale_since {
+                    Some((gen, t)) if gen == fresh_gen => t,
+                    _ => {
+                        self.j7_stale_since = Some((fresh_gen, now));
+                        now
+                    }
+                };
+                let elapsed = now.saturating_duration_since(since);
+                let effective_age = age.map_or(elapsed, |a| a.max(elapsed));
+                let limit_ms = self.config.resolved_j7_stale_fault_ms();
+                if effective_age >= Duration::from_millis(limit_ms)
+                    && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                {
+                    self.halt_motion_for_fault_rt(joint);
+                    let detail = crate::safety::J7StaleDetail {
+                        joint: joint.min(u8::MAX as usize) as u8,
+                        age_ms: Some(effective_age.as_millis().min(u128::from(u64::MAX)) as u64),
+                        limit_ms,
+                    };
+                    self.safety.latch(
+                        crate::safety::FaultKind::J7FeedbackStale,
+                        crate::safety::FaultDetail::J7FeedbackStale(Some(detail)),
+                    );
+                }
+            }
+        }
+    }
+
     /// Classify one release's (or immediate write's) bounded TX outcome. Returns `true` iff the
     /// submitted batch completed (`TickOutput::Complete`).
     /// - `count_release_streak`: `true` ONLY for periodic control releases (`tick_control`),
@@ -2856,6 +3054,7 @@ impl SupervisorInner {
                 if !self.is_torqued || self.disable_pending || self.shutdown_committed {
                     self.reset_tx_joint_progress();
                     self.hold_tx_unsent_since = None;
+                    self.j7_stale_since = None;
                 } else if count_release_streak && !has_pending_motion {
                     self.reset_tx_joint_progress();
                 }
@@ -2893,67 +3092,83 @@ impl SupervisorInner {
                 }
                 false
             }
-            TickOutput::Complete { .. } => {
+            TickOutput::Complete { now, pf_status, .. } => {
                 self.reset_tx_joint_progress();
                 self.hold_tx_unsent_since = None;
+                self.handle_j7_feedback_staleness(pf_status, now);
                 true
             }
-            TickOutput::Deferred { pending, now, max_age, oldest_age, is_hold, sent_any, sent_mask } => {
-                if is_hold || self.safety.state().is_stopped() {
+            TickOutput::Deferred { pending, now, max_age, oldest_age, is_hold, sent_any, sent_mask, pf_status } => {
+                // Classify using the pass's original motion vs stopped-hold context BEFORE
+                // `handle_j7_feedback_staleness` so a same-release J7 threshold crossing can never
+                // mask a motion TX stall; both conditions record through `SafetyManager::latch`.
+                let treat_as_hold = is_hold || self.safety.state().is_stopped();
+                if treat_as_hold {
                     self.account_stopped_hold_progress(now, max_age, sent_any, pending, 0, oldest_age, false, None);
+                    self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
 
                 self.hold_tx_unsent_since = None;
-                if !count_release_streak {
-                    return false;
-                }
-                // Track per-motor lack of progress: joints that completed a target TX in this pass
-                // reset their streak, while unsent joints advance their own streak & age. Healthy
-                // partial passes where carry-over frames drain every 1-2 ticks never false-fault.
-                let n = self
-                    .config
-                    .dof
-                    .min(self.tx_joint_no_progress_ticks.len())
-                    .min(self.tx_joint_no_progress_since.len())
-                    .min(64);
-                let mut max_joint_ticks = 0u32;
-                let mut max_joint_age = Duration::ZERO;
-                for j in 0..n {
-                    if (sent_mask & (1u64 << j)) != 0 {
-                        self.tx_joint_no_progress_ticks[j] = 0;
-                        self.tx_joint_no_progress_since[j] = None;
-                    } else {
-                        let ticks = self.tx_joint_no_progress_ticks[j].saturating_add(1);
-                        self.tx_joint_no_progress_ticks[j] = ticks;
-                        let since = *self.tx_joint_no_progress_since[j].get_or_insert(now);
-                        let age = now.saturating_duration_since(since);
-                        if ticks > max_joint_ticks {
-                            max_joint_ticks = ticks;
-                        }
-                        if age > max_joint_age {
-                            max_joint_age = age;
+                if count_release_streak {
+                    // Track per-motor lack of progress: joints that completed a target TX in this pass
+                    // reset their streak, while unsent joints advance their own streak & age. Healthy
+                    // partial passes where carry-over frames drain every 1-2 ticks never false-fault.
+                    // Exclude a skipped stale J7 from motion TX stall accounting (handled by Item 1).
+                    let skipped_pf_joint = match pf_status {
+                        crate::driver::PosForceTxStatus::Stale { joint, .. } => Some(joint),
+                        _ => None,
+                    };
+                    let n = self
+                        .config
+                        .dof
+                        .min(self.tx_joint_no_progress_ticks.len())
+                        .min(self.tx_joint_no_progress_since.len())
+                        .min(64);
+                    let mut max_joint_ticks = 0u32;
+                    let mut max_joint_age = Duration::ZERO;
+                    for j in 0..n {
+                        if skipped_pf_joint == Some(j) || (sent_mask & (1u64 << j)) != 0 {
+                            self.tx_joint_no_progress_ticks[j] = 0;
+                            self.tx_joint_no_progress_since[j] = None;
+                        } else {
+                            let ticks = self.tx_joint_no_progress_ticks[j].saturating_add(1);
+                            self.tx_joint_no_progress_ticks[j] = ticks;
+                            let since = *self.tx_joint_no_progress_since[j].get_or_insert(now);
+                            let age = now.saturating_duration_since(since);
+                            if ticks > max_joint_ticks {
+                                max_joint_ticks = ticks;
+                            }
+                            if age > max_joint_age {
+                                max_joint_age = age;
+                            }
                         }
                     }
+                    let observed_age = oldest_age.map_or(max_joint_age, |a| a.max(max_joint_age));
+                    let max_ticks = self.config.resolved_tx_stall_ticks();
+                    if max_joint_ticks >= max_ticks || observed_age >= max_age {
+                        let detail = crate::safety::TxStallDetail {
+                            queued: pending,
+                            dropped: 0,
+                            age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                            limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                            consecutive_ticks: max_joint_ticks,
+                            is_hold: false,
+                        };
+                        self.latch_can_tx_stalled_motion(detail, now);
+                    }
                 }
-                let observed_age = oldest_age.map_or(max_joint_age, |a| a.max(max_joint_age));
-                let max_ticks = self.config.resolved_tx_stall_ticks();
-                if max_joint_ticks >= max_ticks || observed_age >= max_age {
-                    let detail = crate::safety::TxStallDetail {
-                        queued: pending,
-                        dropped: 0,
-                        age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
-                        limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
-                        consecutive_ticks: max_joint_ticks,
-                        is_hold: false,
-                    };
-                    self.latch_can_tx_stalled_motion(detail, now);
-                }
+                self.handle_j7_feedback_staleness(pf_status, now);
                 false
             }
-            TickOutput::Expired { dropped, pending, now, max_age, oldest_age, is_hold, sent_any } => {
-                if is_hold || self.safety.state().is_stopped() {
+            TickOutput::Expired { dropped, pending, now, max_age, oldest_age, is_hold, sent_any, pf_status } => {
+                // Classify using the pass's original motion vs stopped-hold context BEFORE
+                // `handle_j7_feedback_staleness` so a same-release J7 threshold crossing can never
+                // mask a non-recoverable motion `CAN_TX_STALLED` latch.
+                let treat_as_hold = is_hold || self.safety.state().is_stopped();
+                if treat_as_hold {
                     self.account_stopped_hold_progress(now, max_age, sent_any, pending, dropped, oldest_age, true, None);
+                    self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
 
@@ -2970,10 +3185,15 @@ impl SupervisorInner {
                     is_hold: false,
                 };
                 self.latch_can_tx_stalled_motion(detail, now);
+                self.handle_j7_feedback_staleness(pf_status, now);
                 false
             }
-            TickOutput::Error { message, now, max_age, is_hold, sent_any } => {
-                if is_hold || self.safety.state().is_stopped() {
+            TickOutput::Error { message, now, max_age, is_hold, sent_any, pf_status } => {
+                // Classify using the pass's original motion vs stopped-hold context BEFORE
+                // `handle_j7_feedback_staleness` so recoverable J7 staleness can never mask a
+                // non-recoverable motion `DRIVER_WRITE_FAILED` latch.
+                let treat_as_hold = is_hold || self.safety.state().is_stopped();
+                if treat_as_hold {
                     self.tracking.invalidate();
                     self.commanded_velocities.fill(0.0);
                     if self.measured_positions.iter().all(|q| q.is_finite()) {
@@ -3012,6 +3232,7 @@ impl SupervisorInner {
                         tracing::error!("Control output failed: {message}");
                     }
                 }
+                self.handle_j7_feedback_staleness(pf_status, now);
                 false
             }
         }
@@ -4707,53 +4928,10 @@ impl SupervisorInner {
                             } else {
                                 driver.write_joint_targets_bounded(&targets)
                             };
-                            let now = driver.clock_now();
-                            let max_age = driver.tx_frame_max_age();
-                            let hold_sent_any = is_hold && driver.last_hold_tx_sent_any();
-                            tick_output = match write_res {
-                                Ok(crate::driver::TxBatchOutcome::Complete) => {
-                                    if !is_hold {
-                                        allow_output_accepted = true;
-                                    }
-                                    TickOutput::Complete { is_hold }
-                                }
-                                Ok(crate::driver::TxBatchOutcome::Deferred { pending }) => {
-                                    TickOutput::Deferred {
-                                        pending,
-                                        now,
-                                        max_age,
-                                        oldest_age: driver.oldest_pending_tx_age(),
-                                        is_hold,
-                                        sent_any: hold_sent_any,
-                                        sent_mask: if is_hold { 0 } else { driver.last_target_tx_sent_mask() },
-                                    }
-                                }
-                                Ok(crate::driver::TxBatchOutcome::Expired { dropped, pending }) => {
-                                    TickOutput::Expired {
-                                        dropped,
-                                        pending,
-                                        now,
-                                        max_age,
-                                        oldest_age: driver.last_tx_expired_age(),
-                                        is_hold,
-                                        sent_any: hold_sent_any,
-                                    }
-                                }
-                                Err(crate::driver::ArmDriverError::EstopInhibited) => {
-                                    TickOutput::EstopInhibited { is_hold }
-                                }
-                                Err(e) => {
-                                    let mut buf = crate::mit::OutputErrorText::empty();
-                                    e.write_bounded(&mut buf);
-                                    TickOutput::Error {
-                                        message: buf,
-                                        now,
-                                        max_age,
-                                        is_hold,
-                                        sent_any: hold_sent_any,
-                                    }
-                                }
-                            };
+                            tick_output = Self::tick_output_from_driver_write(&mut **driver, is_hold, write_res);
+                            if matches!(tick_output, TickOutput::Complete { is_hold: false, .. }) {
+                                allow_output_accepted = true;
+                            }
                         }
                     }
                 }
@@ -5014,7 +5192,7 @@ impl SupervisorInner {
                 TickOutput::EstopInhibited { .. } => {
                     tick_output = TickOutput::None;
                 }
-                TickOutput::Complete { is_hold: false }
+                TickOutput::Complete { is_hold: false, .. }
                 | TickOutput::Deferred { is_hold: false, .. }
                 | TickOutput::Expired { is_hold: false, .. } => {
                     tick_output = TickOutput::None;
@@ -5027,6 +5205,7 @@ impl SupervisorInner {
             && self.driver.as_ref().is_some_and(|d| {
                 d.lock().is_ok_and(|drv| drv.pending_motion_tx_len() > 0)
             });
+        let j7_skipped = tick_output.j7_skipped();
         let batch_completed = self.classify_tick_output(tick_output, true, has_pending_motion);
 
         if self.servo_stream_active
@@ -5041,9 +5220,10 @@ impl SupervisorInner {
             self.servo_stream_active = false;
         }
 
-        let tick_output_accepted =
+        let arm_output_accepted =
             (driverless_accepted || (allow_output_accepted && batch_completed))
                 && !self.safety.state().is_stopped();
+        let tick_output_accepted = arm_output_accepted && !j7_skipped;
 
         if !gravity_handback_ran {
             let gravity_stiff_hold_completed =

@@ -738,7 +738,6 @@ impl crate::supervisor::SupervisorInner {
         dt: f64,
         override_limits: Option<&[crate::model::JointLimit]>,
     ) -> crate::supervisor::TickOutput {
-        use crate::driver::TxBatchOutcome;
         use crate::supervisor::TickOutput;
         // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
         // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
@@ -758,6 +757,7 @@ impl crate::supervisor::SupervisorInner {
                         max_age: crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
                         is_hold,
                         sent_any: false,
+                        pf_status: crate::driver::PosForceTxStatus::Unobserved,
                     };
                 }
             },
@@ -812,44 +812,7 @@ impl crate::supervisor::SupervisorInner {
                 } else {
                     drv.write_joint_targets_bounded(targets)
                 };
-                let now = drv.clock_now();
-                let max_age = drv.tx_frame_max_age();
-                let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
-                match write_res {
-                    Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold },
-                    Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
-                        pending,
-                        now,
-                        max_age,
-                        oldest_age: drv.oldest_pending_tx_age(),
-                        is_hold,
-                        sent_any: hold_sent_any,
-                        sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
-                    },
-                    Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
-                        dropped,
-                        pending,
-                        now,
-                        max_age,
-                        oldest_age: drv.last_tx_expired_age(),
-                        is_hold,
-                        sent_any: hold_sent_any,
-                    },
-                    Err(crate::driver::ArmDriverError::EstopInhibited) => {
-                        TickOutput::EstopInhibited { is_hold }
-                    }
-                    Err(e) => {
-                        let mut buf = OutputErrorText::empty();
-                        e.write_bounded(&mut buf);
-                        TickOutput::Error {
-                            message: buf,
-                            now,
-                            max_age,
-                            is_hold,
-                            sent_any: hold_sent_any,
-                        }
-                    }
-                }
+                crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res)
             })
             .unwrap_or(TickOutput::None);
         if let Some(ff) = ff {
@@ -1166,34 +1129,68 @@ impl crate::supervisor::SupervisorInner {
     pub(crate) fn mit_expiry_recovery_for_epoch(
         &mut self,
         expected_epoch: Option<u64>,
+        mut pre_ctx: crate::safety::ClearContext,
+        commit: crate::supervisor::ClearFaultCommit,
+        driver_err_override: Option<crate::safety::BoundedText<256>>,
     ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
         use crate::driver::EnableState;
         use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
-        // Single authoritative clear_check FIRST before issuing any recovery disable/reset commands.
-        let mut pre_ctx = self.build_mit_recovery_clear_context();
+        // Recheck live J7 freshness, feedback validity, E-stop, and epoch under the SAME driver
+        // lock guard that issues `drv.mit_expiry_recover()` so there is zero check-to-command gap
+        // if J7 crosses 100 ms before the physical disable runs (ZERO commits & ZERO bus commands).
         pre_ctx.expected_epoch = expected_epoch;
-        pre_ctx.pending_estop = self.estop_request_unapplied();
-        if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
-            if refusal == ClearRefusal::EStopActive {
-                self.consume_pending_estop();
-                if let Some(received) = expected_epoch {
-                    if received != self.safety.epoch_id() {
-                        return Err(SafetyError::EpochMismatch {
-                            expected: self.safety.epoch_id(),
-                            received,
-                        });
+        let (pre_recovery_seqs, res) = if let Some(ref d) = self.driver {
+            let mut drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    pre_ctx.j7_feedback_fresh = false;
+                    pre_ctx.feedback_fresh = false;
+                    pre_ctx.pending_estop = self.estop_request_unapplied();
+                    return Err(self
+                        .safety
+                        .clear_check(&pre_ctx)
+                        .err()
+                        .map_or(SafetyError::FeedbackUnavailable, ClearRefusal::into_safety_error));
+                }
+            };
+            pre_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+            pre_ctx.feedback_fresh = pre_ctx.feedback_fresh && drv.is_feedback_valid();
+            pre_ctx.pending_estop = self.estop_request_unapplied();
+            if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+                drop(drv);
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(SafetyError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            });
+                        }
                     }
                 }
+                return Err(refusal.into_safety_error());
             }
-            return Err(refusal.into_safety_error());
-        }
-        let (pre_recovery_seqs, res) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-            Some(mut drv) => {
-                let pre = drv.feedback_seqs();
-                let r = drv.mit_expiry_recover();
-                (pre, r)
+            let pre = drv.feedback_seqs();
+            let r = drv.mit_expiry_recover();
+            (pre, r)
+        } else {
+            pre_ctx.pending_estop = self.estop_request_unapplied();
+            if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(SafetyError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            });
+                        }
+                    }
+                }
+                return Err(refusal.into_safety_error());
             }
-            None => (Vec::new(), Err("no driver".into())),
+            (Vec::new(), Err("no driver".into()))
         };
         if let Err(e) = res {
             let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
@@ -1210,9 +1207,9 @@ impl crate::supervisor::SupervisorInner {
         self.disable_pending = false;
         self.pending_rearm = false;
 
-        // Refresh supervisor feedback from samples received strictly AFTER the recovery request
-        // (verified by per-joint receive sequence advance AND driver post-recovery RX boundary) —
-        // never evaluate final `clear_check` on cached or pre-recovery feedback.
+        // Read post-recovery feedback strictly AFTER the recovery disable (verified by per-joint
+        // receive sequence advance AND driver post-recovery RX boundary), keeping telemetry,
+        // cooldown, confirmation, and limits STAGED until `clear_with_check(&post_ctx)` commits.
         let post_read = self.driver.as_ref().and_then(|d| {
             d.lock().ok().and_then(|mut drv| {
                 let states = drv.read_joint_states().ok()?;
@@ -1235,6 +1232,7 @@ impl crate::supervisor::SupervisorInner {
                         .iter()
                         .all(|a| a.is_some_and(|t| t <= crate::supervisor::THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                     && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                let j7_fresh = drv.pos_force_feedback_fresh();
                 let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
                 let hw_fault = drv.has_hardware_fault();
                 let state = drv.enable_state();
@@ -1261,6 +1259,8 @@ impl crate::supervisor::SupervisorInner {
                     loads,
                     caps.temperature_feedback,
                     fb_fresh,
+                    j7_fresh,
+                    thermal_below,
                     hw_err,
                     hw_fault,
                     enable_known,
@@ -1269,74 +1269,62 @@ impl crate::supervisor::SupervisorInner {
                 ))
             })
         });
-        let (post_fb_fresh, post_temp_fb, post_hw_err, post_hw_fault, post_enable_known) =
-            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age, next_cd)) = post_read {
-                self.feedback_numeric_valid = fb_fresh;
-                if fb_fresh {
-                    self.last_can_feedback_instant =
-                        oldest_age.and_then(|age| std::time::Instant::now().checked_sub(age));
-                    Self::apply_feedback(
-                        &mut self.measured_positions,
-                        &mut self.measured_velocities,
-                        &mut self.torques,
-                        &mut self.temperatures,
-                        &mut self.loads,
-                        self.config.dof,
-                        &states,
-                        loads.as_deref(),
-                    );
-                    if temp_fb {
-                        self.thermal_cooldown = next_cd;
-                        let temps_copy = self.temperatures.clone();
-                        if let Some((joint_idx, temperature)) = temps_copy
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
-                            .max_by(|a, b| a.1.total_cmp(&b.1))
-                        {
-                            self.thermal_cooldown.reset();
-                            self.safety.latch(
-                                FaultKind::ThermalTrip,
-                                FaultDetail::ThermalTrip {
-                                    joint_idx,
-                                    temperature,
-                                    limit: self.config.max_temperature,
-                                },
-                            );
-                        }
-                    } else {
-                        self.thermal_cooldown.reset();
-                    }
-                } else {
-                    self.last_can_feedback_instant = None;
-                    self.thermal_cooldown.reset();
-                }
-                (fb_fresh, temp_fb, hw_err, hw_fault, enable_known)
-            } else {
-                self.feedback_numeric_valid = false;
-                self.last_can_feedback_instant = None;
-                self.thermal_cooldown.reset();
-                (false, false, None, false, false)
-            };
 
-        if post_fb_fresh && self.measured_positions.iter().all(|q| q.is_finite()) {
-            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
-            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
+        let mut post_ctx = self.build_mit_recovery_clear_context();
+        post_ctx.driver_config_error = if commit.candidate_limits.is_some() || commit.reapply_legacy_limits {
+            None
+        } else {
+            driver_err_override.or(post_ctx.driver_config_error)
+        };
+        if let Some((ref states, _, temp_fb, fb_fresh, j7_fresh, thermal_below, hw_err, hw_fault, enable_known, _, next_cd)) = post_read {
+            if fb_fresh && temp_fb {
+                if let Some((joint_idx, temperature)) = states
+                    .iter()
+                    .take(self.config.dof)
+                    .map(|s| s.temperature)
+                    .enumerate()
+                    .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                {
+                    self.safety.latch(
+                        FaultKind::ThermalTrip,
+                        FaultDetail::ThermalTrip {
+                            joint_idx,
+                            temperature,
+                            limit: self.config.max_temperature,
+                        },
+                    );
+                }
+            }
+            let positions: Vec<f32> = states.iter().take(self.config.dof).map(|s| s.position).collect();
+            post_ctx.feedback_fresh = fb_fresh;
+            post_ctx.j7_feedback_fresh = post_ctx.j7_feedback_fresh && j7_fresh;
+            post_ctx.thermal_sensor_available = temp_fb;
+            post_ctx.thermal_below_threshold = thermal_below;
+            post_ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
+            post_ctx.joint_limit_violation = if fb_fresh {
+                self.joint_limit_clear_violation_for_positions(&positions, commit.candidate_limits.as_ref())
+            } else {
+                self.joint_limit_clear_violation_with_candidates(commit.candidate_limits.as_ref())
+            };
+            post_ctx.hardware_error = hw_err;
+            post_ctx.hardware_reset_required = hw_fault;
+            post_ctx.enable_state_known = enable_known;
+        } else {
+            post_ctx.feedback_fresh = false;
+            post_ctx.j7_feedback_fresh = false;
+            post_ctx.thermal_sensor_available = false;
+            post_ctx.thermal_below_threshold = false;
+            post_ctx.thermal_cooldown_elapsed_ms = 0;
+            post_ctx.hardware_error = None;
+            post_ctx.hardware_reset_required = false;
+            post_ctx.enable_state_known = false;
         }
-        self.commanded_velocities.fill(0.0);
-        self.commanded_accelerations.fill(0.0);
 
         // An E-stop that arrived while the disables were confirmed wins: never end in Idle.
         self.consume_pending_estop();
-        let mut post_ctx = self.build_mit_recovery_clear_context();
         post_ctx.expected_epoch = expected_epoch;
         post_ctx.pending_estop = self.estop_request_unapplied();
-        post_ctx.feedback_fresh = post_fb_fresh;
-        post_ctx.thermal_sensor_available = post_temp_fb;
-        post_ctx.hardware_error = post_hw_err;
-        post_ctx.hardware_reset_required = post_hw_fault;
-        post_ctx.enable_state_known = post_enable_known;
         if let Some(received) = expected_epoch {
             if received != self.safety.epoch_id() {
                 return Err(SafetyError::EpochMismatch {
@@ -1350,7 +1338,30 @@ impl crate::supervisor::SupervisorInner {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
             return Err(SafetyError::EStopActive);
         }
-        if let Err(refusal) = self.safety.clear_with_check(&post_ctx) {
+        // Single authoritative clear commit FIRST — recheck live J7 freshness and feedback
+        // validity under the driver lock guard across `clear_with_check(&post_ctx)` so an earlier
+        // read can never clear a now-stale J7 fault (ZERO feedback/cooldown/limit/confirmation
+        // commits on refusal).
+        let clear_res = if let Some(ref d) = self.driver {
+            match d.lock() {
+                Ok(drv) => {
+                    post_ctx.j7_feedback_fresh =
+                        post_ctx.j7_feedback_fresh && drv.pos_force_feedback_fresh();
+                    post_ctx.feedback_fresh = post_ctx.feedback_fresh && drv.is_feedback_valid();
+                    post_ctx.pending_estop = self.estop_request_unapplied();
+                    self.safety.clear_with_check(&post_ctx)
+                }
+                Err(_) => {
+                    post_ctx.j7_feedback_fresh = false;
+                    post_ctx.feedback_fresh = false;
+                    post_ctx.pending_estop = self.estop_request_unapplied();
+                    self.safety.clear_with_check(&post_ctx)
+                }
+            }
+        } else {
+            self.safety.clear_with_check(&post_ctx)
+        };
+        if let Err(refusal) = clear_res {
             if refusal == ClearRefusal::EStopActive {
                 self.consume_pending_estop();
                 if let Some(received) = expected_epoch {
@@ -1363,6 +1374,45 @@ impl crate::supervisor::SupervisorInner {
                 }
             }
             return Err(refusal.into_safety_error());
+        }
+
+        // Clear committed: apply staged post-recovery feedback, cooldown, limits, and confirmation.
+        self.mit.recovery_confirmed = false;
+        if let Some((states, loads, temp_fb, fb_fresh, _, _, _, _, _, oldest_age, next_cd)) = post_read {
+            self.feedback_numeric_valid = fb_fresh;
+            if fb_fresh {
+                self.last_can_feedback_instant =
+                    oldest_age.and_then(|age| std::time::Instant::now().checked_sub(age));
+                Self::apply_feedback(
+                    &mut self.measured_positions,
+                    &mut self.measured_velocities,
+                    &mut self.torques,
+                    &mut self.temperatures,
+                    &mut self.loads,
+                    self.config.dof,
+                    &states,
+                    loads.as_deref(),
+                );
+                if self.measured_positions.iter().all(|q| q.is_finite()) {
+                    crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+                    crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
+                }
+                if temp_fb {
+                    self.thermal_cooldown = next_cd;
+                } else {
+                    self.thermal_cooldown.reset();
+                }
+            } else {
+                self.last_can_feedback_instant = None;
+                self.thermal_cooldown.reset();
+            }
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        if let Some(ref cand) = commit.candidate_limits {
+            self.commit_driver_limits_bounded(cand);
+        } else if commit.reapply_legacy_limits {
+            self.reapply_driver_limits();
         }
         self.mit.owner = MitOwner::Off;
         self.mit.joints.clear();

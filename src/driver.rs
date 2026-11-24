@@ -400,6 +400,21 @@ pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
 /// Time bound of one Damiao receive pass (with at most 64 frames).
 pub const DAMIAO_RX_PASS: Duration = Duration::from_millis(5);
 
+/// Position-force gripper freshness status observed during the most recent bounded TX pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PosForceTxStatus {
+    /// No active `PosForce` joint was checked in this pass (or pass did not run).
+    #[default]
+    Unobserved,
+    /// Active `PosForce` joint had provably fresh (`<= 100 ms`) feedback throughout the pass.
+    Fresh,
+    /// Active `PosForce` joint feedback was stale (`> 100 ms` or missing receive-queue bound);
+    /// no `0x307` frame was transmitted for `joint`, and a `0xCC` refresh was scheduled.
+    /// `fresh_gen` identifies the most recent provably fresh J7 feedback episode so a fresh RX
+    /// sample arriving between two stale output passes always starts a new staleness episode.
+    Stale { joint: usize, age: Option<Duration>, fresh_gen: u64 },
+}
+
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
@@ -441,6 +456,12 @@ pub trait ArmDriver: Send {
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         let ages = self.feedback_ages();
         ages.len() == dof && ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
+    }
+    /// Every joint listed in `joints` (e.g. arm joints) has feedback no older than `max_age`
+    /// (without allocating in `DamiaoArmDriver`).
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        let ages = self.feedback_ages();
+        joints.iter().all(|&j| ages.get(j).copied().flatten().is_some_and(|age| age <= max_age))
     }
     /// [`Self::feedback_ages`] as whole milliseconds (the observation's `feedback_age_ms`).
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
@@ -541,6 +562,15 @@ pub trait ArmDriver: Send {
     /// (and flush) with no unsent target remaining in the carry-over queue during the most recent
     /// [`Self::write_joint_targets_bounded`] pass. Non-CAN/sim drivers default to `u64::MAX`.
     fn last_target_tx_sent_mask(&self) -> u64 { u64::MAX }
+
+    /// Consumes once the position-force gripper freshness status observed during the most recent
+    /// bounded motion or stopped-hold write pass (`Unobserved` on non-pos-force drivers).
+    fn take_last_pos_force_tx_status(&mut self) -> PosForceTxStatus { PosForceTxStatus::Unobserved }
+
+    /// Live check whether the active position-force gripper joint currently has provably fresh
+    /// (`<= 100 ms` on both receive instant and receive-queue bound, finite position) feedback.
+    /// Returns `true` when no active position-force gripper is configured.
+    fn pos_force_feedback_fresh(&self) -> bool { true }
 
     /// Bounded target write: distinguishes complete submission ([`TxBatchOutcome::Complete`])
     /// from transient deferral ([`TxBatchOutcome::Deferred`]) without faulting or authorizing
@@ -3005,6 +3035,22 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     tx_release_deadline: Option<Instant>,
     /// Active/confirmed CAN transmit probe recorded for clearing `CAN_TX_STALLED` (zero alloc).
     tx_probe: Option<TxProbeState>,
+    /// Attempt-scoped J7 position-force freshness status observed in the most recent bounded TX pass.
+    last_tx_pf_status: PosForceTxStatus,
+    /// Monotonic generation incremented each time a provably fresh (`<= 100 ms`, bounded, finite)
+    /// J7 position-force feedback sample is decoded. Binds owner-side staleness episodes to the
+    /// actual feedback sample so a fresh RX sample between two stale output passes never carries
+    /// over an older stale timer.
+    pf_fresh_gen: u64,
+    /// True when the active `PosForce` joint needs a read-only `0xCC` refresh.
+    pf_refresh_pending: bool,
+    /// Consecutive ticks in which a needed J7 `0xCC` refresh was deferred by TX budget/backpressure;
+    /// when `>= 1`, the next tick prioritizes J7's `0xCC` ahead of competing frames so refresh never starves.
+    pf_refresh_deferred_ticks: u8,
+    /// True once a J7 `0xCC` refresh has been attempted during the active tick (`begin_tx_tick()`).
+    pf_refresh_attempted_this_tick: bool,
+    /// True when an output pass ran since the previous `receive_feedback()` pass.
+    output_ran_since_rx: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3069,6 +3115,9 @@ enum TxRefusal {
     StopInhibited,
     /// Step 4 (pre-build): active MIT deadline fence tripped.
     MitFenceTripped(MitFenceTripReason),
+    /// Step 4/5: active `PosForce` joint feedback aged past `POS_FORCE_FEEDBACK_MAX_AGE` (100 ms)
+    /// before/at submission (`can.transmit`); distinct from FIFO `DeadlinePassed` and `BuildRefused`.
+    PosForceFeedbackExpired(usize),
     /// Step 4: send-time `build` returned `None` (or latched rollback lacked fresh feedback).
     BuildRefused,
     /// Step 5: stop/E-stop generation stamp changed since admission or operation start.
@@ -3234,6 +3283,27 @@ impl PendingTxQueue {
         self.buf[..self.len]
             .iter()
             .any(|slot| slot.is_some_and(|e| e.joint == joint))
+    }
+
+    /// Drop every queued entry targeting `joint`, compacting in place.
+    fn drop_joint(&mut self, joint: usize) -> usize {
+        let mut write = 0usize;
+        let mut dropped = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                if entry.joint == joint {
+                    dropped += 1;
+                } else {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
+        dropped
     }
 
     /// Replace an existing `(joint, frame_id)` slot in place without moving it to the back
@@ -3478,6 +3548,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_last_fresh_feedback: None,
             tx_release_deadline: None,
             tx_probe: None,
+            last_tx_pf_status: PosForceTxStatus::Unobserved,
+            pf_fresh_gen: 0,
+            pf_refresh_pending: false,
+            pf_refresh_deferred_ticks: 0,
+            pf_refresh_attempted_this_tick: false,
+            output_ran_since_rx: false,
         }
     }
 
@@ -3502,6 +3578,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// independently of `read_joint_states()`.
     pub fn begin_tx_tick(&mut self) {
         self.tick_tx = None;
+        self.pf_refresh_attempted_this_tick = false;
     }
 
     #[inline]
@@ -3818,25 +3895,26 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if let TxKind::RollbackHold(joint) = kind {
             if latched_before && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
+                if self.active_pos_force_joint() == Some(joint) {
+                    return Err(TxRefusal::PosForceFeedbackExpired(joint));
+                }
                 return Err(TxRefusal::BuildRefused);
             }
         }
         let Some(frame) = build(self) else {
+            if let TxKind::RollbackHold(joint) = kind {
+                if self.active_pos_force_joint() == Some(joint)
+                    && !self.pos_force_feedback_valid(joint, self.now())
+                {
+                    return Err(TxRefusal::PosForceFeedbackExpired(joint));
+                }
+            }
             return Err(TxRefusal::BuildRefused);
         };
 
-        // 5. Re-read deadline, tick TX cutoff, physical stop latch, pending gate, and
-        //    stop-generation stamp AFTER `build`, immediately before `can.transmit` (host
-        //    submission boundary). Checking only the generation stamp would miss an E-stop latch
-        //    flip before `requested_estop_count` advances; re-checking `deadline` and the tick
-        //    cutoff rejects frames whose age limit or TX start window elapsed during `build`;
-        //    also reject `RollbackHold` if the latch transitioned false -> true during `build`.
-        if deadline.is_some_and(|d| d.passed(self.now())) {
-            return Err(TxRefusal::DeadlinePassed);
-        }
-        if budgeted && !self.can_start_tick_tx() {
-            return Err(TxRefusal::Deferred);
-        }
+        // 5. Re-read physical stop latch, pending gate, stop-generation stamp, MIT fence,
+        //    position-force submission freshness, deadline, and tick TX cutoff AFTER `build`,
+        //    immediately before `can.transmit` (host submission boundary).
         let latched_after = self.stop_gate_for_kind(kind)?;
         if matches!(kind, TxKind::RollbackHold(_)) && !latched_before && latched_after {
             return Err(TxRefusal::StopInhibited);
@@ -3845,6 +3923,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
         {
             return Err(TxRefusal::StopStampChanged);
+        }
+        if fenced {
+            if let Err(ArmDriverError::MitFenceTripped(reason)) = self.fence_check() {
+                return Err(TxRefusal::MitFenceTripped(reason));
+            }
+        }
+        let submit_now = self.now();
+        if let Some(pf_joint) = self.frame_pos_force_joint(&frame) {
+            if !self.pos_force_feedback_valid(pf_joint, submit_now) {
+                return Err(TxRefusal::PosForceFeedbackExpired(pf_joint));
+            }
+        }
+        if deadline.is_some_and(|d| d.passed(submit_now)) {
+            return Err(TxRefusal::DeadlinePassed);
+        }
+        if budgeted && !self.can_start_tick_tx() {
+            return Err(TxRefusal::Deferred);
         }
 
         // 6. Account budget attempt, transmit, and record diagnostics.
@@ -4142,14 +4237,160 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Fresh, finite measured position of joint `i` with a provable receive-age bound:
     /// both the decode instant and the prior observed-empty receive-queue boundary must
     /// exist and be within `max_age` (samples queued before the first empty queue have
-    /// unknown age and return `None`).
-    fn fresh_measured_position(&self, i: usize, max_age: Duration) -> Option<f32> {
+    /// Measured position of joint `i` ONLY when both the receive instant AND the observed-empty
+    /// receive-queue bound are within `max_age` and the cached position is finite (unbounded
+    /// samples have unknown age and return `None`).
+    fn fresh_measured_position_at(&self, i: usize, max_age: Duration, now: Instant) -> Option<f32> {
         let fresh_rx = self.last_feedback_instant.get(i).copied().flatten()
-            .is_some_and(|t| self.since(t) <= max_age);
+            .is_some_and(|t| now.saturating_duration_since(t) <= max_age);
         let fresh_bound = self.feedback_queue_bound.get(i).copied().flatten()
-            .is_some_and(|b| self.since(b) <= max_age);
+            .is_some_and(|b| now.saturating_duration_since(b) <= max_age);
         if !(fresh_rx && fresh_bound) { return None; }
         self.cached_states.get(i).map(|s| s.position).filter(|p| p.is_finite())
+    }
+
+    fn fresh_measured_position(&self, i: usize, max_age: Duration) -> Option<f32> {
+        self.fresh_measured_position_at(i, max_age, self.now())
+    }
+
+    /// Joint index of the active, verified `PosForce` gripper (if configured and currently in `PosForce`).
+    #[inline]
+    fn active_pos_force_joint(&self) -> Option<usize> {
+        let pf = self.pos_force.as_ref()?;
+        (self.pos_force_verified
+            && self.joint_modes.get(pf.joint).copied().flatten() == Some(DamiaoControlMode::PosForce))
+            .then_some(pf.joint)
+    }
+
+    /// Single freshness authority for the `PosForce` gripper: inclusive `<= 100 ms` on BOTH
+    /// `last_feedback_instant[joint]` AND `feedback_queue_bound[joint]`, plus finite position.
+    #[inline]
+    fn pos_force_feedback_valid(&self, joint: usize, now: Instant) -> bool {
+        self.fresh_measured_position_at(joint, POS_FORCE_FEEDBACK_MAX_AGE, now).is_some()
+    }
+
+    /// Diagnostic staleness age for `joint` at `now`: max of receive age and receive-queue-bound
+    /// age ONLY when both timestamps exist and the cached position is finite; otherwise `None` so
+    /// non-finite or unbounded samples fall back to the episode elapsed timer cleanly.
+    fn pos_force_stale_age(&self, joint: usize, now: Instant) -> Option<Duration> {
+        if !self.cached_states.get(joint).is_some_and(|s| s.position.is_finite()) {
+            return None;
+        }
+        let rx_age = self
+            .last_feedback_instant
+            .get(joint)
+            .copied()
+            .flatten()
+            .map(|t| now.saturating_duration_since(t))?;
+        let qb_age = self
+            .feedback_queue_bound
+            .get(joint)
+            .copied()
+            .flatten()
+            .map(|b| now.saturating_duration_since(b))?;
+        Some(rx_age.max(qb_age))
+    }
+
+    /// Returns `Some(pf.joint)` iff `frame` is a Damiao `0x300 + motor_id` PosForce command frame
+    /// targeting the configured `PosForce` gripper joint.
+    #[inline]
+    fn frame_pos_force_joint(&self, frame: &CanFrame) -> Option<usize> {
+        let pf = self.pos_force.as_ref()?;
+        let motor_id = *self.motor_ids.get(pf.joint)?;
+        let expected_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(motor_id);
+        (frame.id == expected_id).then_some(pf.joint)
+    }
+
+    /// Single shared J7 position-force freshness gate used by BOTH unfenced motion
+    /// (`write_joint_targets_bounded`, `drain_pending_tx`, `drain_pending_pass`) AND unfenced
+    /// stopped-hold (`write_estop_hold_bounded`).
+    ///
+    /// - When J7 feedback is provably fresh (`<= 100 ms`), records `Fresh` (unless already marked
+    ///   `Stale` in this pass), clears `pf_refresh_pending` / `pf_refresh_deferred_ticks`, and
+    ///   returns `None`.
+    /// - When J7 feedback is stale (`> 100 ms` or missing queue bound), drops any queued J7 entry
+    ///   from BOTH `pending_tx` and `pending_hold_tx`, records `Stale { joint, age, fresh_gen }`,
+    ///   schedules a `0xCC` refresh (`pf_refresh_pending = true`), and returns `Some(pf_joint)` so
+    ///   callers skip J7 while letting J1–J6 continue. (While J7 updates are skipped, the jaw
+    ///   holds by itself because the Damiao motor firmware keeps its last pos-force target.)
+    ///
+    /// Callers combining J7 freshness with `drop_stale` MUST share the same `now` sample so J7
+    /// crossing 100 ms between the two checks can never be misclassified as FIFO `Expired`.
+    fn check_pos_force_freshness_for_tx_at(&mut self, now: Instant) -> Option<usize> {
+        let pf_joint = self.active_pos_force_joint()?;
+        if self.pos_force_feedback_valid(pf_joint, now) {
+            if !matches!(self.last_tx_pf_status, PosForceTxStatus::Stale { .. }) {
+                self.last_tx_pf_status = PosForceTxStatus::Fresh;
+            }
+            self.pf_refresh_pending = false;
+            self.pf_refresh_deferred_ticks = 0;
+            return None;
+        }
+        let _ = self.pending_tx.drop_joint(pf_joint);
+        let _ = self.pending_hold_tx.drop_joint(pf_joint);
+        let age = self.pos_force_stale_age(pf_joint, now);
+        self.last_tx_pf_status = PosForceTxStatus::Stale {
+            joint: pf_joint,
+            age,
+            fresh_gen: self.pf_fresh_gen,
+        };
+        self.pf_refresh_pending = true;
+        Some(pf_joint)
+    }
+
+    fn check_pos_force_freshness_for_tx(&mut self) -> Option<usize> {
+        let now = self.now();
+        self.check_pos_force_freshness_for_tx_at(now)
+    }
+
+    /// Single refresh sender for a stale active `PosForce` joint (`0xCC` read-only status poll).
+    /// Sends at most ONE `0xCC` per tick (`begin_tx_tick()`) via `send(TxKind::Refresh, ...)`.
+    /// Callers own flushing when this returns `Ok(true)`.
+    fn try_send_pf_refresh(&mut self, expected_stamp: StopStamp) -> Result<bool, ArmDriverError> {
+        let Some(pf_joint) = self.active_pos_force_joint() else {
+            self.pf_refresh_pending = false;
+            self.pf_refresh_deferred_ticks = 0;
+            return Ok(false);
+        };
+        if !self.pf_refresh_pending
+            || self.pf_refresh_attempted_this_tick
+            || !self.poll_tx_allowed()
+        {
+            return Ok(false);
+        }
+        self.pf_refresh_attempted_this_tick = true;
+        match self.send(TxKind::Refresh, Some(expected_stamp), None, false, |d| {
+            Some(damiao::build_refresh_frame(d.motor_ids[pf_joint]))
+        }) {
+            Ok(_) => {
+                self.pf_refresh_pending = false;
+                self.pf_refresh_deferred_ticks = 0;
+                Ok(true)
+            }
+            Err(TxRefusal::Deferred) => {
+                self.pf_refresh_pending = true;
+                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
+                Ok(false)
+            }
+            Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                self.discard_all_pending_tx();
+                Err(ArmDriverError::EstopInhibited)
+            }
+            Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
+                if self.pending_stop_check(Some(expected_stamp)).is_err() {
+                    self.discard_all_pending_tx();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                self.pf_refresh_pending = true;
+                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
+                Ok(false)
+            }
+            Err(_) => {
+                self.pf_refresh_pending = true;
+                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
+                Ok(false)
+            }
+        }
     }
 
     /// Stationary hold target at joint `i`'s fresh (`<= 100 ms`) measured position for
@@ -4289,9 +4530,34 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    /// Validate a `PosForce` target's static parameters (configured joint, finite position/velocity,
+    /// nonzero wire speed encoding) and compute its CAN frame ID WITHOUT checking live feedback
+    /// freshness. Live freshness (`<= 100 ms`) is enforced exclusively by the shared send-time gate
+    /// (`check_pos_force_freshness_for_tx` / `send`) so crossing 100 ms between entry and staging
+    /// skips only J7 and never aborts healthy arm frames.
+    fn validate_pos_force_target_static(&self, i: usize, target: &JointTarget) -> Result<u32, ArmDriverError> {
+        let Some(pf) = self.pos_force.as_ref().filter(|pf| pf.joint == i) else {
+            return Err(ArmDriverError::PosForceTargetUnavailable { joint: i });
+        };
+        if !target.position.is_finite() || target.velocity.is_some_and(|v| !v.is_finite()) {
+            return Err(ArmDriverError::PosForceTargetNotFinite { joint: i });
+        }
+        let requested = target
+            .velocity
+            .filter(|v| *v != 0.0)
+            .map_or(self.vlim(), f32::abs)
+            .min(self.vlim());
+        if damiao::pos_force_vel_raw(requested) == 0
+            || damiao::pos_force_vel_raw(pf.close_speed_rad_s) == 0
+        {
+            return Err(ArmDriverError::PosForceSpeedZero { joint: i });
+        }
+        Ok(u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(self.motor_ids[i]))
+    }
+
     /// Unencoded target commands for joint `i` (stack-allocated, zero heap alloc) staged into
     /// [`PendingTxQueue`] so deferred target frames are always constructed fresh at send time
-    /// inside [`Self::send`].
+    /// inside [`Self::send`]. Does NOT check live feedback freshness during staging.
     fn pending_target_cmds_checked(
         &self,
         i: usize,
@@ -4331,16 +4597,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 )),
                 None,
             ]),
-            Some(DamiaoControlMode::PosForce) => match self.pos_force_frame(i, target) {
-                Some(f) => Ok([
+            Some(DamiaoControlMode::PosForce) => {
+                let frame_id = self.validate_pos_force_target_static(i, target)?;
+                Ok([
                     Some((
-                        f.id,
+                        frame_id,
                         PendingTargetCmd::PosForce { position: target.position, velocity: target.velocity },
                     )),
                     None,
-                ]),
-                None => Err(ArmDriverError::PosForceTargetUnavailable { joint: i }),
-            },
+                ])
+            }
             None if self.base_mode(i) == DamiaoControlMode::PosForce => {
                 Err(ArmDriverError::PosForceModeUnconfirmed { joint: i })
             }
@@ -4361,10 +4627,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// A batch is refused before its first frame when the position-force gripper's mode is not
-    /// confirmed, its target position or velocity is non-finite, or J7 lacks provably fresh
-    /// feedback: capped operation is unavailable (or holding with no motion) and no partial or
-    /// speculative frame is sent (zero heap allocation).
-    fn target_frames_refused(&self, targets: Option<&[JointTarget]>) -> Option<ArmDriverError> {
+    /// confirmed, its target position or velocity is non-finite, or its requested speed encodes
+    /// to 0 on the wire. When `allow_stale_pf` is `false` (MIT-fenced paths), stale J7 feedback
+    /// also refuses the entire batch before frame 0; unfenced paths (`allow_stale_pf = true`)
+    /// route stale J7 through [`Self::check_pos_force_freshness_for_tx`] so J1–J6 continue.
+    fn target_frames_refused(&self, targets: Option<&[JointTarget]>, allow_stale_pf: bool) -> Option<ArmDriverError> {
         let pf = self.pos_force.as_ref()?;
         let mode = self.joint_modes.get(pf.joint).copied().flatten();
         let allowed = (mode == Some(DamiaoControlMode::PosForce) && self.pos_force_verified)
@@ -4374,17 +4641,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if mode == Some(DamiaoControlMode::PosForce) {
             if let Some(target) = targets.and_then(|ts| ts.get(pf.joint)) {
-                if !target.position.is_finite() || target.velocity.is_some_and(|v| !v.is_finite()) {
-                    return Some(ArmDriverError::PosForceTargetNotFinite { joint: pf.joint });
+                if let Err(err) = self.validate_pos_force_target_static(pf.joint, target) {
+                    return Some(err);
                 }
             }
-            if self.fresh_measured_position(pf.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
+            if !allow_stale_pf && !self.pos_force_feedback_valid(pf.joint, self.now()) {
                 return Some(ArmDriverError::PosForceFeedbackStale { joint: pf.joint });
-            }
-            if let Some(target) = targets.and_then(|ts| ts.get(pf.joint)) {
-                if self.pos_force_frame(pf.joint, target).is_none() {
-                    return Some(ArmDriverError::PosForceSpeedZero { joint: pf.joint });
-                }
             }
         }
         None
@@ -4417,6 +4679,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             TxRefusal::Deferred => ArmDriverError::Transport(TransportError::WouldBlock),
             TxRefusal::StopInhibited | TxRefusal::StopStampChanged => ArmDriverError::EstopInhibited,
             TxRefusal::MitFenceTripped(reason) => ArmDriverError::MitFenceTripped(reason),
+            TxRefusal::PosForceFeedbackExpired(joint) => {
+                ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint }
+            }
             TxRefusal::BuildRefused => ArmDriverError::HardwareFault("frame build refused (stale or invalid state)".into()),
             TxRefusal::Transport(e) => e.into(),
         }
@@ -5114,6 +5379,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         pre_dropped_stale: usize,
         pre_oldest_expired: Option<Duration>,
         stop_on_expiry: bool,
+        mut pf_refresh_sent: bool,
     ) -> Result<TxBatchOutcome, ArmDriverError> {
         let _ = self.ensure_tx_pass();
         self.last_target_tx_sent_mask = 0;
@@ -5122,6 +5388,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut dropped_stale_in_pass = 0usize;
         let mut oldest_expired = pre_oldest_expired;
         while let Some(entry) = self.pending_tx.front() {
+            if self.active_pos_force_joint() == Some(entry.joint)
+                && !self.pos_force_feedback_valid(entry.joint, self.now())
+            {
+                let _ = self.check_pos_force_freshness_for_tx();
+                continue;
+            }
             let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
             match self.send(
                 TxKind::Target,
@@ -5148,9 +5420,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         sent_mask |= 1u64 << entry.joint;
                     }
                 }
+                Err(TxRefusal::PosForceFeedbackExpired(_)) => {
+                    let _ = self.check_pos_force_freshness_for_tx();
+                    continue;
+                }
                 Err(TxRefusal::DeadlinePassed) => {
+                    let now = self.now();
+                    if self.active_pos_force_joint() == Some(entry.joint)
+                        && !self.pos_force_feedback_valid(entry.joint, now)
+                    {
+                        let _ = self.check_pos_force_freshness_for_tx_at(now);
+                        continue;
+                    }
                     let _ = self.pending_tx.pop_front();
-                    let age = self.now().saturating_duration_since(entry.queued_at);
+                    let age = now.saturating_duration_since(entry.queued_at);
                     oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
                     dropped_stale_in_pass += 1;
                     crate::diagnostics::tick::record_tx_dropped_stale(1);
@@ -5166,12 +5449,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     return Err(ArmDriverError::EstopInhibited);
                 }
                 Err(TxRefusal::BuildRefused) => {
-                    self.discard_pending_tx_stopped();
                     if matches!(entry.cmd, PendingTargetCmd::PosForce { .. })
-                        && self.fresh_measured_position(entry.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
+                        && self.active_pos_force_joint() == Some(entry.joint)
+                        && !self.pos_force_feedback_valid(entry.joint, self.now())
                     {
-                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: entry.joint });
+                        let _ = self.check_pos_force_freshness_for_tx();
+                        continue;
                     }
+                    self.discard_pending_tx_stopped();
                     return Err(ArmDriverError::PosForceTargetUnavailable { joint: entry.joint });
                 }
                 Err(TxRefusal::MitFenceTripped(reason)) => {
@@ -5184,10 +5469,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         return Err(estop);
                     }
                     if matches!(entry.cmd, PendingTargetCmd::PosForce { .. })
-                        && self.fresh_measured_position(entry.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
+                        && self.active_pos_force_joint() == Some(entry.joint)
+                        && !self.pos_force_feedback_valid(entry.joint, self.now())
                     {
-                        self.discard_pending_tx_stopped();
-                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: entry.joint });
+                        let _ = self.check_pos_force_freshness_for_tx();
                     }
                     break;
                 }
@@ -5198,12 +5483,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
+        // After draining healthy arm targets, emit at most one J7 0xCC refresh before flush.
+        if self.pf_refresh_pending
+            && !self.pf_refresh_attempted_this_tick
+            && self.poll_tx_allowed()
+        {
+            pf_refresh_sent |= self.try_send_pf_refresh(pass_stop_stamp)?;
+        }
         // Pre-flush stop check: a stop/E-stop arriving during the final frame transmit skips flush.
         if let Err(e) = self.strict_stop_check(Some(pass_stop_stamp)) {
             self.discard_pending_tx_stopped();
             return Err(e);
         }
-        if sent_any {
+        if sent_any || pf_refresh_sent {
             if self.flush_cutoff_exceeded() {
                 self.mark_tx_pass_backpressured();
                 self.discard_pending_tx_stopped();
@@ -5231,8 +5523,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         self.last_target_tx_sent_mask = completed_mask;
-        // Recheck freshness AFTER flush so frames expiring during send or flush never carry over.
-        let (late_stale, late_oldest) = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        // Drop any still-queued J7 position-force frame that aged past 100 ms during send/flush
+        // BEFORE `drop_stale` using ONE shared clock sample so stale J7 never carries over or
+        // triggers FIFO `Expired`.
+        let post_now = self.now();
+        if let Some(pf_joint) = self.pending_tx.first_pos_force_joint() {
+            if self.active_pos_force_joint() == Some(pf_joint)
+                && !self.pos_force_feedback_valid(pf_joint, post_now)
+            {
+                let _ = self.check_pos_force_freshness_for_tx_at(post_now);
+            }
+        }
+        // Recheck freshness AFTER flush using the same clock sample so frames expiring during
+        // send or flush never carry over.
+        let (late_stale, late_oldest) = self.pending_tx.drop_stale(post_now, self.tx_budget.frame_max_age);
         if late_stale > 0 {
             dropped_stale_in_pass += late_stale;
             if let Some(age) = late_oldest {
@@ -5247,14 +5551,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             self.last_expired_oldest_age = oldest_expired;
             return Ok(TxBatchOutcome::Expired { dropped: total_dropped_stale, pending: 0 });
-        }
-        // Fail closed if any still-queued position-force frame aged past its 100 ms feedback bound
-        // during the pass (never defer a stale J7 command).
-        if let Some(pf_joint) = self.pending_tx.first_pos_force_joint() {
-            if self.fresh_measured_position(pf_joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
-                self.discard_pending_tx_stopped();
-                return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_joint });
-            }
         }
         let newly_deferred = self.pending_tx.mark_newly_deferred();
         let pending = self.pending_tx.len();
@@ -5274,33 +5570,45 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Drain carried-over pending target frames within the active tick's TX budget (no new targets staged).
     pub fn drain_pending_tx(&mut self) -> Result<TxBatchOutcome, ArmDriverError> {
         self.last_expired_oldest_age = None;
+        self.last_tx_pf_status = PosForceTxStatus::Unobserved;
         if self.torque_hs.is_some() {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::TorqueTransitionPending);
-        }
-        if let Some(e) = self.target_frames_refused(None) {
-            self.reject_target_tx(MitFenceTripReason::PreflightRejected);
-            return Err(e);
         }
         if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::PendingTxDisabledUnderMitFence);
         }
+        if let Some(e) = self.target_frames_refused(None, true) {
+            self.reject_target_tx(MitFenceTripReason::PreflightRejected);
+            return Err(e);
+        }
         if let Err(e) = self.strict_stop_check(None) {
             self.discard_pending_tx_stopped();
             return Err(e);
         }
+        self.output_ran_since_rx = true;
         // Fail closed if any stop/E-stop was requested and applied since these frames were admitted.
         let current_stamp = self.current_stop_stamp();
         if self.pending_tx.has_stopped_entry(current_stamp) {
             self.discard_pending_tx_stopped();
             return Err(ArmDriverError::EstopInhibited);
         }
-        let (stale, pre_oldest) = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        let cleanup_now = self.now();
+        let _ = self.check_pos_force_freshness_for_tx_at(cleanup_now);
+        let (stale, pre_oldest) = self.pending_tx.drop_stale(cleanup_now, self.tx_budget.frame_max_age);
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
         }
-        self.drain_pending_pass(current_stamp, stale, pre_oldest, false)
+        let mut pf_refresh_sent = false;
+        if self.pf_refresh_pending
+            && self.pf_refresh_deferred_ticks >= 1
+            && !self.pf_refresh_attempted_this_tick
+            && self.poll_tx_allowed()
+        {
+            pf_refresh_sent |= self.try_send_pf_refresh(current_stamp)?;
+        }
+        self.drain_pending_pass(current_stamp, stale, pre_oldest, false, pf_refresh_sent)
     }
 
     /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
@@ -6582,7 +6890,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.abort_enable_for_estop();
                     return Err(ArmDriverError::EstopInhibited);
                 }
-                Err(TxRefusal::BuildRefused) => {
+                Err(TxRefusal::BuildRefused | TxRefusal::PosForceFeedbackExpired(_)) => {
                     self.torque_hs = None;
                     self.enable_failed();
                     return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
@@ -7684,6 +7992,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.discard_pending_tx_stopped();
         self.last_hold_tx_sent_any = false;
         self.last_expired_oldest_age = None;
+        self.last_tx_pf_status = PosForceTxStatus::Unobserved;
         if targets.len() != self.motor_ids.len() {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::JointCountMismatch {
@@ -7695,11 +8004,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::TorqueTransitionPending);
         }
-        if let Some(e) = self.target_frames_refused(Some(targets)) {
+        let fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
+        if let Some(e) = self.target_frames_refused(Some(targets), !fenced) {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(e);
         }
-        let fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
         let total_joints = targets.len().min(u8::MAX as usize) as u8;
         if fenced {
             self.discard_pending_hold_tx();
@@ -7802,6 +8111,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             });
                             return Err(ArmDriverError::EstopInhibited);
                         }
+                        Err(TxRefusal::PosForceFeedbackExpired(joint)) => {
+                            self.trip_fence(MitFenceTripReason::TargetUnavailable {
+                                joint: (joint + 1) as u8,
+                                completed_joints: i as u8,
+                                total_joints,
+                            });
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint });
+                        }
                         Err(TxRefusal::BuildRefused) => {
                             let joint = pf_joint.unwrap_or(i);
                             self.trip_fence(MitFenceTripReason::TargetUnavailable {
@@ -7887,15 +8204,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.discard_pending_hold_tx();
             return Err(e);
         }
+        self.output_ran_since_rx = true;
         let start_stamp = self.current_stop_stamp();
         let stopped_carry = self.pending_hold_tx.drop_stopped(start_stamp);
         if stopped_carry > 0 {
             crate::diagnostics::tick::record_tx_dropped_stopped(stopped_carry as u32);
         }
+        // Single shared J7 pos-force staleness gate runs BEFORE `drop_stale` using ONE shared
+        // clock sample so stale J7 is dropped and refreshed (never counted as FIFO expiry) while
+        // J1–J6 continue holding.
+        let cleanup_now = self.now();
+        let skip_pf_joint = self.check_pos_force_freshness_for_tx_at(cleanup_now);
         // Drop stale carried-over holds without resetting `hold_cursor`, then still stage fresh
         // holds so a slow cadence (e.g. 100 ms) rotates across all frame keys instead of stalling.
         let (pre_dropped_stale, mut oldest_expired) =
-            self.pending_hold_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+            self.pending_hold_tx.drop_stale(cleanup_now, self.tx_budget.frame_max_age);
         if pre_dropped_stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(pre_dropped_stale as u32);
         }
@@ -7908,17 +8231,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut staged_ids: [[Option<u32>; 2]; MAX_MODE_JOINTS] = [[None; 2]; MAX_MODE_JOINTS];
         let mut new_keys = 0usize;
         for (i, target) in targets.iter().enumerate() {
-            let (frames, _) = match self.target_frames_checked(i, target) {
+            if skip_pf_joint == Some(i) {
+                continue;
+            }
+            let cmds = match self.pending_target_cmds_checked(i, target) {
                 Ok(v) => v,
                 Err(e) => {
                     self.discard_pending_hold_tx();
                     return Err(e);
                 }
             };
-            for (slot, maybe_frame) in frames.into_iter().enumerate() {
-                if let Some(frame) = maybe_frame {
-                    staged_ids[i][slot] = Some(frame.id);
-                    if self.pending_hold_tx.find_key(i, frame.id).is_none() {
+            for (slot, maybe_cmd) in cmds.into_iter().enumerate() {
+                if let Some((frame_id, _)) = maybe_cmd {
+                    staged_ids[i][slot] = Some(frame_id);
+                    if self.pending_hold_tx.find_key(i, frame_id).is_none() {
                         new_keys += 1;
                     }
                 }
@@ -7955,11 +8281,25 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         let _ = self.ensure_tx_pass();
+        let mut pf_refresh_sent = false;
+        if self.pf_refresh_pending
+            && self.pf_refresh_deferred_ticks >= 1
+            && !self.pf_refresh_attempted_this_tick
+            && self.poll_tx_allowed()
+        {
+            pf_refresh_sent |= self.try_send_pf_refresh(start_stamp)?;
+        }
         let mut sent_any = false;
         let mut dropped_stale_in_pass = 0usize;
         while let Some(entry) = self.pending_hold_tx.front() {
-            let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
             let i = entry.joint;
+            if self.active_pos_force_joint() == Some(i)
+                && !self.pos_force_feedback_valid(i, self.now())
+            {
+                let _ = self.check_pos_force_freshness_for_tx();
+                continue;
+            }
+            let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
             let PendingTargetCmd::RollbackHold { kp, kd, torque, slot } = entry.cmd else {
                 let _ = self.pending_hold_tx.pop_front();
                 continue;
@@ -8003,9 +8343,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         self.hold_cursor = (i * 2 + usize::from(slot) + 1) % total_slots;
                     }
                 }
+                Err(TxRefusal::PosForceFeedbackExpired(_)) => {
+                    let _ = self.check_pos_force_freshness_for_tx();
+                    continue;
+                }
                 Err(TxRefusal::DeadlinePassed) => {
+                    let now = self.now();
+                    if self.active_pos_force_joint() == Some(i)
+                        && !self.pos_force_feedback_valid(i, now)
+                    {
+                        let _ = self.check_pos_force_freshness_for_tx_at(now);
+                        self.drop_hold_key_ages_for_joint(i);
+                        continue;
+                    }
                     let _ = self.pending_hold_tx.pop_front();
-                    let age = self.now().saturating_duration_since(entry.queued_at);
+                    let age = now.saturating_duration_since(entry.queued_at);
                     oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
                     dropped_stale_in_pass += 1;
                     crate::diagnostics::tick::record_tx_dropped_stale(1);
@@ -8017,6 +8369,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     return Err(ArmDriverError::EstopInhibited);
                 }
                 Err(TxRefusal::BuildRefused) => {
+                    if self.active_pos_force_joint() == Some(i)
+                        && !self.pos_force_feedback_valid(i, self.now())
+                    {
+                        let _ = self.check_pos_force_freshness_for_tx();
+                        continue;
+                    }
                     self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                     self.discard_pending_hold_tx();
                     if self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
@@ -8035,12 +8393,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         self.discard_pending_hold_tx();
                         return Err(ArmDriverError::EstopInhibited);
                     }
-                    if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce)
-                        && self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
+                    if self.active_pos_force_joint() == Some(i)
+                        && !self.pos_force_feedback_valid(i, self.now())
                     {
-                        self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
-                        self.discard_pending_hold_tx();
-                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: i });
+                        let _ = self.check_pos_force_freshness_for_tx();
                     }
                     break;
                 }
@@ -8056,12 +8412,26 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
 
+        // After draining healthy hold frames, emit at most one J7 0xCC refresh before flush.
+        if self.pf_refresh_pending
+            && !self.pf_refresh_attempted_this_tick
+            && self.poll_tx_allowed()
+        {
+            match self.try_send_pf_refresh(start_stamp) {
+                Ok(sent) => pf_refresh_sent |= sent,
+                Err(e) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
+                    return Err(e);
+                }
+            }
+        }
+
         if self.pending_stop_check(Some(start_stamp)).is_err() {
             self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
             self.discard_pending_hold_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
-        if sent_any {
+        if sent_any || pf_refresh_sent {
             if self.flush_cutoff_exceeded() {
                 self.mark_tx_pass_backpressured();
                 self.discard_pending_hold_tx();
@@ -8082,23 +8452,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.discard_pending_hold_tx();
             return Err(ArmDriverError::EstopInhibited);
         }
+        // Drop any still-queued stale J7 hold frame BEFORE `drop_stale` using ONE shared clock
+        // sample (never triggers FIFO expiry or emits unflushed post-flush frames).
+        let post_now = self.now();
+        if let Some(pf_joint) = self.active_pos_force_joint() {
+            if self.pending_hold_tx.has_joint(pf_joint)
+                && !self.pos_force_feedback_valid(pf_joint, post_now)
+            {
+                let _ = self.check_pos_force_freshness_for_tx_at(post_now);
+            }
+        }
         let (late_stale, late_oldest) =
-            self.pending_hold_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+            self.pending_hold_tx.drop_stale(post_now, self.tx_budget.frame_max_age);
         if late_stale > 0 {
             dropped_stale_in_pass += late_stale;
             if let Some(age) = late_oldest {
                 oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
             }
             crate::diagnostics::tick::record_tx_dropped_stale(late_stale as u32);
-        }
-        if let Some(pf_joint) = self.pos_force.as_ref().map(|pf| pf.joint) {
-            if self.joint_modes.get(pf_joint).copied().flatten() == Some(DamiaoControlMode::PosForce)
-                && self.pending_hold_tx.has_joint(pf_joint)
-                && self.fresh_measured_position(pf_joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
-            {
-                self.discard_pending_hold_tx();
-                return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_joint });
-            }
         }
 
         self.last_hold_tx_sent_any = sent_any;
@@ -8126,8 +8497,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.last_target_tx_sent_mask
     }
 
+    fn take_last_pos_force_tx_status(&mut self) -> PosForceTxStatus {
+        std::mem::take(&mut self.last_tx_pf_status)
+    }
+
+    fn pos_force_feedback_fresh(&self) -> bool {
+        // Resolve the configured PosForce joint independently of `pos_force_verified` or active
+        // TX mode so a disable or mode invalidation can NEVER bypass the <= 100 ms clear check.
+        let Some(pf) = self.pos_force.as_ref() else {
+            return true;
+        };
+        self.pos_force_feedback_valid(pf.joint, self.now())
+    }
+
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
         self.last_target_tx_sent_mask = 0;
+        self.last_tx_pf_status = PosForceTxStatus::Unobserved;
         self.discard_pending_hold_tx();
         if targets.len() != self.motor_ids.len() {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
@@ -8142,14 +8527,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::TorqueTransitionPending);
         }
-        if let Some(e) = self.target_frames_refused(Some(targets)) {
+        let fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
+        if let Some(e) = self.target_frames_refused(Some(targets), !fenced) {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(e);
         }
 
         let pass = self.ensure_tx_pass();
 
-        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+        if fenced {
             // MIT tracking owns joints: every frame goes through `send(TxKind::Target, .., fenced=true)`;
             // a failed or partial batch (or flush), backpressure, stop/latch, or budget exhaustion trips
             // the group and discards every cached or queued frame (zero alloc).
@@ -8242,6 +8628,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 total_joints,
                             });
                             return Err(ArmDriverError::EstopInhibited);
+                        }
+                        Err(TxRefusal::PosForceFeedbackExpired(joint)) => {
+                            self.trip_fence(MitFenceTripReason::TargetUnavailable {
+                                joint: (joint + 1) as u8,
+                                completed_joints: i as u8,
+                                total_joints,
+                            });
+                            return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint });
                         }
                         Err(TxRefusal::BuildRefused) => {
                             let joint = pf_joint.unwrap_or(i);
@@ -8342,17 +8736,23 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(e);
         }
+        self.output_ran_since_rx = true;
         // 1b. Drop any carried-over frames admitted before an already-applied stop/E-stop.
         let batch_stamp = self.current_stop_stamp();
         let stopped_carry = self.pending_tx.drop_stopped(batch_stamp);
         if stopped_carry > 0 {
             crate::diagnostics::tick::record_tx_dropped_stopped(stopped_carry as u32);
         }
+        // 1c. Single shared J7 pos-force staleness gate runs BEFORE `drop_stale` using ONE shared
+        //     driver-clock sample so stale J7 is dropped and refreshed (never counted as FIFO
+        //     expiry) while J1–J6 continue.
+        let cleanup_now = self.now();
+        let skip_pf_joint = self.check_pos_force_freshness_for_tx_at(cleanup_now);
         // 2. Drop stale carried-over frames (inclusive: age >= frame_max_age) before staging new targets.
         //    Any carried-over motion expiry fails closed immediately: discard any remaining queued
         //    motion frames and transmit ZERO replacement targets before reporting `Expired`.
         self.last_expired_oldest_age = None;
-        let (stale, pre_oldest) = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        let (stale, pre_oldest) = self.pending_tx.drop_stale(cleanup_now, self.tx_budget.frame_max_age);
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
             self.discard_pending_tx_stopped();
@@ -8362,6 +8762,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // 3. Preflight all joint target commands and pending queue capacity before mutating or transmitting.
         let mut new_keys = 0usize;
         for (i, target) in targets.iter().enumerate() {
+            if skip_pf_joint == Some(i) {
+                continue;
+            }
             let cmds = match self.pending_target_cmds_checked(i, target) {
                 Ok(cmds) => cmds,
                 Err(e) => {
@@ -8390,6 +8793,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         //    command parameters so every frame is built fresh at send time inside `send()`.
         let batch_ts = self.now();
         for (i, target) in targets.iter().enumerate() {
+            if skip_pf_joint == Some(i) {
+                continue;
+            }
             let cmds = match self.pending_target_cmds_checked(i, target) {
                 Ok(cmds) => cmds,
                 Err(e) => {
@@ -8402,9 +8808,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
         }
-        // 5. Drain FIFO within the shared per-tick TX pass; any expiry during drain or flush stops
+        // 5. Priority J7 0xCC refresh when previously starved by a full 6-frame budget, then drain
+        //    FIFO within the shared per-tick TX pass; any expiry during drain or flush stops
         //    further motion submissions immediately and reports `TxBatchOutcome::Expired`.
-        self.drain_pending_pass(batch_stamp, 0, None, true)
+        let mut pf_refresh_sent = false;
+        if self.pf_refresh_pending
+            && self.pf_refresh_deferred_ticks >= 1
+            && !self.pf_refresh_attempted_this_tick
+            && self.poll_tx_allowed()
+        {
+            pf_refresh_sent |= self.try_send_pf_refresh(batch_stamp)?;
+        }
+        self.drain_pending_pass(batch_stamp, 0, None, true, pf_refresh_sent)
     }
 
     fn discard_pending_tx(&mut self) {
@@ -8481,6 +8896,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         self.last_feedback_instant.len() == dof && self.last_feedback_instant.iter().all(|t| t.is_some_and(|t| self.since(t) <= max_age))
+    }
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        joints
+            .iter()
+            .all(|&j| self.last_feedback_instant.get(j).copied().flatten().is_some_and(|t| self.since(t) <= max_age))
     }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
         out.clear();
@@ -8594,6 +9014,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     } else {
                         None
                     };
+                    if feedback.position.is_finite()
+                        && queue_bound.is_some_and(|qb| {
+                            rx_at.saturating_duration_since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE
+                        })
+                    {
+                        self.pf_fresh_gen = self.pf_fresh_gen.wrapping_add(1);
+                    }
                 }
                 if feedback.state_or_error != 0 {
                     self.disable_confirmed_sticky = false;
@@ -8720,6 +9147,36 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 crate::diagnostics::tick::record_tx_dropped_stopped(stopped_hold as u32);
             }
         }
+        // Priority J7 0xCC refresh when enabled: if a needed refresh was previously deferred by
+        // full-budget contention (`pf_refresh_deferred_ticks >= 1`) OR no output pass ran since the
+        // previous RX pass (`pf_refresh_pending && !output_ran_since_rx`), emit ONE 0xCC before
+        // competing RX recovery frames so J7 refresh never starves. Otherwise yield the shared TX
+        // budget to the upcoming output pass so healthy J1–J6 targets/holds go first.
+        let mut rx_pf_refresh_sent = false;
+        let enabled_pf_joint = if self.is_enabled { self.active_pos_force_joint() } else { None };
+        if let Some(pf_j) = enabled_pf_joint {
+            if rx_drained
+                && !self.awaiting_rx_boundary
+                && !self.is_enabling
+                && self.poll_tx_allowed()
+                && self.pending_stop_check(Some(rx_stop_stamp)).is_ok()
+            {
+                if self.pos_force_feedback_valid(pf_j, self.now()) {
+                    self.pf_refresh_pending = false;
+                    self.pf_refresh_deferred_ticks = 0;
+                } else {
+                    if self.pf_refresh_pending
+                        && (self.pf_refresh_deferred_ticks >= 1 || !self.output_ran_since_rx)
+                    {
+                        if let Ok(true) = self.try_send_pf_refresh(rx_stop_stamp) {
+                            rx_pf_refresh_sent = true;
+                        }
+                    } else {
+                        self.pf_refresh_pending = true;
+                    }
+                }
+            }
+        }
         if rx_drained && self.is_enabled && !self.is_enabling && self.recovery_tx_allowed()
             && self.enable_state() == EnableState::Enabled {
             let n = self.motor_ids.len();
@@ -8810,7 +9267,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.discard_pending_tx_stopped();
                         break;
                     }
-                    Err(TxRefusal::BuildRefused) => continue,
+                    Err(TxRefusal::BuildRefused | TxRefusal::PosForceFeedbackExpired(_)) => continue,
                     Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
                         if self.strict_stop_check(Some(rx_stop_stamp)).is_err() {
                             self.discard_pending_tx_stopped();
@@ -8846,8 +9303,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if cooldown_ready || self.refresh_unfinished != 0 {
                 // the stale motors as a bit set taken before the first transmit (no allocation)
                 let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+                let rx_now = self.now();
                 let stale = (0..n)
-                    .filter(|&i| self.last_feedback_instant[i].is_none_or(|t| self.since(t) >= REFRESH_AFTER))
+                    .filter(|&i| {
+                        // When enabled, the single J7 refresh scheduler owns the active PosForce
+                        // joint so RX does not double-poll or steal J1–J6 budget on tick 1.
+                        if enabled_pf_joint == Some(i) {
+                            return false;
+                        }
+                        if self.active_pos_force_joint() == Some(i) {
+                            return !self.pos_force_feedback_valid(i, rx_now);
+                        }
+                        self.last_feedback_instant[i].is_none_or(|t| self.since(t) >= REFRESH_AFTER)
+                    })
                     .fold(0u64, |m, i| m | (1 << i));
                 let mut remaining = if self.refresh_unfinished != 0 {
                     let cont = stale & self.refresh_unfinished;
@@ -8898,7 +9366,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             }
                         }
                     }
-                    if refresh_sent
+                    if (refresh_sent || rx_pf_refresh_sent)
                         && !stopped_during_refresh
                         && self.pending_stop_check(Some(rx_stop_stamp)).is_ok()
                     {
@@ -8912,6 +9380,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             self.discard_all_pending_tx();
                             return Err(e.into());
                         }
+                        rx_pf_refresh_sent = false;
                     }
                     self.refresh_unfinished = remaining;
                     if remaining == 0 && refresh_sent {
@@ -8922,6 +9391,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
+        if rx_pf_refresh_sent && self.pending_stop_check(Some(rx_stop_stamp)).is_ok() {
+            if self.flush_cutoff_exceeded() {
+                self.mark_tx_pass_backpressured();
+                self.discard_all_pending_tx();
+                return Err(TransportError::Timeout.into());
+            }
+            if let Err(e) = self.can.flush() {
+                self.mark_tx_pass_backpressured();
+                self.discard_all_pending_tx();
+                return Err(e.into());
+            }
+        }
+        self.output_ran_since_rx = false;
         crate::diagnostics::tick::record_tx_deferred(0, self.total_pending_tx_len());
         Ok(())
     }
