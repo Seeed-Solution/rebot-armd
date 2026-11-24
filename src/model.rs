@@ -78,6 +78,10 @@ macro_rules! fieldwise_clone {
     };
 }
 
+/// Maximum total joint count supported inline across motion planning, trajectories,
+/// power budgeting, and stationary settle tracking: an 8-joint URDF chain plus 1 gripper.
+pub const MAX_MOTION_DOF: usize = crate::chain::MAX_CHAIN_JOINTS + 1;
+
 /// Up to [`ArmJoints::CAP`] joint indices without a heap allocation (the arm joints of a
 /// profile, [`ArmConfig::arm_joints`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1975,6 +1979,13 @@ impl ArmConfig {
         }
         if self.dof == 0 {
             return Err("DOF cannot be zero".into());
+        }
+        if self.dof > MAX_MOTION_DOF {
+            return Err(format!(
+                "DOF {} exceeds maximum supported {MAX_MOTION_DOF} (up to {} arm joints + gripper)",
+                self.dof,
+                crate::chain::MAX_CHAIN_JOINTS
+            ));
         }
         if let Some(t) = &self.calibration_tool { t.validate()?; }
         if self.limits.len() != self.dof {

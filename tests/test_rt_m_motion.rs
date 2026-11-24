@@ -1740,3 +1740,238 @@ fn m3_client_park_first_disable_frame_rechecks_stop_at_driver_tx_gate() {
         assert_ne!(inner.safety.fault_code(), Some(FaultCode::DriverWriteFailed));
     }
 }
+
+// ============================================================================
+// 11. M4: 9-DOF Profile (8-joint URDF chain + gripper) Inline Motion & >9 Rejection
+// ============================================================================
+
+struct TempUrdfFile(std::path::PathBuf);
+impl Drop for TempUrdfFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn write_eight_joint_urdf() -> TempUrdfFile {
+    let mut xml = String::from("<robot name=\"arm8\">\n  <link name=\"base_link\"/>\n");
+    for i in 1..=8 {
+        let parent = if i == 1 { "base_link".to_string() } else { format!("link{}", i - 1) };
+        let child = format!("link{i}");
+        xml.push_str(&format!(
+            "  <link name=\"{child}\"><inertial><origin xyz=\"0.025 0 0\" rpy=\"0 0 0\"/><mass value=\"0.1\"/><inertia ixx=\"1e-4\" ixy=\"0\" ixz=\"0\" iyy=\"1e-4\" iyz=\"0\" izz=\"1e-4\"/></inertial></link>\n\
+             \x20 <joint name=\"joint{i}\" type=\"revolute\">\n\
+             \x20   <parent link=\"{parent}\"/>\n\
+             \x20   <child link=\"{child}\"/>\n\
+             \x20   <origin xyz=\"0.05 0 0\" rpy=\"0 0 0\"/>\n\
+             \x20   <axis xyz=\"0 0 1\"/>\n\
+             \x20   <limit lower=\"-3.14\" upper=\"3.14\" effort=\"10\" velocity=\"2.0\"/>\n\
+             \x20 </joint>\n"
+        ));
+    }
+    xml.push_str("</robot>\n");
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("armd_m4_8dof_{pid}_{nanos}.urdf"));
+    std::fs::write(&path, xml).expect("write temp 8-joint URDF");
+    TempUrdfFile(path)
+}
+
+fn nine_dof_urdf_plus_gripper_config(urdf_path: &std::path::Path) -> ArmConfig {
+    let dm = ArmConfig::rebot_dm();
+    let mut v = serde_json::to_value(&dm).unwrap();
+    let o = v.as_object_mut().unwrap();
+    o.insert("profile_id".into(), "urdf_8dof_plus_gripper".into());
+    o.insert("kinematics".into(), "Urdf".into());
+    o.insert("gravity_model".into(), "Urdf".into());
+    o.insert("urdf".into(), urdf_path.to_str().unwrap().into());
+    o.remove("urdf_sha256");
+    o.remove("model_offsets_rad");
+    o.insert(
+        "chain".into(),
+        json!({
+            "base_link": "base_link",
+            "tip_link": "link8",
+            "joints": (1..=8).map(|i| json!({
+                "urdf_joint": format!("joint{i}"),
+                "offset_rad": 0.0
+            })).collect::<Vec<_>>(),
+        }),
+    );
+    o.remove("workspace");
+    let mut cfg: ArmConfig = serde_json::from_value(v).unwrap();
+    cfg.dof = 9;
+    cfg.zero_reference = None;
+    cfg.joint_names = (1..=8).map(|i| format!("j{i}")).chain(std::iter::once("gripper".into())).collect();
+    cfg.limits = (0..9)
+        .map(|i| JointLimit {
+            name: if i < 8 { format!("j{}", i + 1) } else { "gripper".into() },
+            min_position: -3.0,
+            max_position: 3.0,
+            max_velocity: if i < 8 { 2.0 } else { 3.0 },
+            max_acceleration: 5.0,
+        })
+        .collect();
+    cfg.home_positions = vec![0.0; 9];
+    cfg.gripper_joint = Some(8);
+    cfg.gripper_policy = None;
+    cfg.grasp = None;
+    cfg.gravity_comp = None;
+    cfg.torque_guard = None;
+    cfg.damiao_ranges = None;
+    cfg.servo_max_velocity = None;
+    cfg.planned_max_velocity = None;
+    cfg.speed_cap = None;
+    cfg.power_budget = None;
+    cfg.joint_tracking = None;
+    cfg.lease_timeout_ms = 60_000;
+    cfg.resting_pose = Some(RestingPosePolicy {
+        positions: Some(vec![0.0; 9]),
+        position_tolerances: vec![0.08; 9],
+        max_total_deviation: 0.72,
+        max_velocity: 0.05,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![(0, 1.0)],
+        support_load_limits: vec![],
+        feedback_max_age_ms: 200,
+    });
+    cfg.load_arm_model(None).expect("load 8-joint URDF chain");
+    cfg.validate().expect("9-DOF profile (8-joint URDF + gripper) must validate");
+    cfg
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_nine_dof_urdf_chain_plus_gripper_motion_and_over_limit_rejection() {
+    let urdf = write_eight_joint_urdf();
+    let cfg = nine_dof_urdf_plus_gripper_config(&urdf.0);
+    assert_eq!(cfg.arm_dof(), 8);
+    assert_eq!(cfg.dof, 9);
+    assert_eq!(cfg.gripper_index(), Some(8));
+
+    // 11a. >9 DOF profile is refused at profile load with a clear error (no silent drop).
+    let mut bad_cfg = ArmConfig::default();
+    bad_cfg.dof = armd::model::MAX_MOTION_DOF + 1;
+    bad_cfg.limits = (0..bad_cfg.dof)
+        .map(|i| JointLimit::new(format!("j{}", i + 1), -3.0, 3.0, 2.0, 5.0))
+        .collect();
+    bad_cfg.home_positions = vec![0.0; bad_cfg.dof];
+    let err = bad_cfg.validate().expect_err("DOF > MAX_MOTION_DOF must fail validation");
+    assert!(
+        err.contains("exceeds maximum supported"),
+        "expected clear over-limit error, got: {err}"
+    );
+
+    // 11b. RT executor refuses 9-DOF explicitly (503 UNSUPPORTED_RT_CONFIG) instead of truncating.
+    let (drv_rt, _) = MotionTestDriver::new(vec![0.0; 9], Duration::ZERO, Duration::ZERO, None);
+    let sup_rt = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv_rt)));
+    let rt_err = sup_rt
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
+        .await
+        .err()
+        .expect("RT executor must reject 9-DOF profile explicitly");
+    assert!(
+        matches!(rt_err, ArmError::Rejected { status: 503, ref code, .. } if code == "UNSUPPORTED_RT_CONFIG"),
+        "unexpected RT executor rejection: {rt_err:?}"
+    );
+
+    // 11c. Legacy WS jog, home, unload (park) + ArmSupervisor::{jog,home} move ALL 9 joints
+    //      (including joint 8 and gripper at index 8) without silent drop.
+    let (drv, _) = MotionTestDriver::new(vec![0.0; 9], Duration::ZERO, Duration::ZERO, None);
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+    let (mut ws, gen, _, sup, _) = common::torqued_rig(sup, &[0.0; 9]).await;
+    let epoch = sup.get_observation().await.epoch_id;
+
+    let target9 = vec![0.10, -0.10, 0.15, -0.15, 0.20, -0.20, 0.25, -0.35, 0.45];
+    let jog_ack = common::rpc(
+        &mut ws,
+        gen,
+        epoch,
+        "/api/v1/motion/jog",
+        json!({ "target_positions": target9, "duration_secs": 0.2, "speed_scale": 0.5 }),
+    )
+    .await;
+    assert_eq!(jog_ack["type"], "command_ack", "{jog_ack}");
+    {
+        let inner = sup.inner().read().await;
+        let (caps, cap_dof) = inner
+            .active_trajectory
+            .as_ref()
+            .and_then(|t| t.motion_vel_caps)
+            .expect("9-DOF inline motion_vel_caps populated");
+        assert_eq!(cap_dof, 9);
+        assert!((caps[7] - 1.0).abs() < 1e-5, "arm joint 8 cap scaled by 0.5: {}", caps[7]);
+        assert!((caps[8] - 3.0).abs() < 1e-5, "gripper cap unscaled: {}", caps[8]);
+    }
+    for _ in 0..200 {
+        let mut inner = sup.inner().write().await;
+        inner.tick(0.01);
+        if inner.active_trajectory.is_none() {
+            break;
+        }
+    }
+    assert!(sup.inner().read().await.active_trajectory.is_none(), "9-DOF WS jog trajectory must finish");
+    let obs_after_jog = sup.get_observation().await;
+    assert_eq!(obs_after_jog.commanded_positions.len(), 9);
+    for (i, (&got, &want)) in obs_after_jog.commanded_positions.iter().zip(&target9).enumerate() {
+        assert!((got - want).abs() < 1e-3, "joint {i} did not reach target {want}: got {got}");
+    }
+
+    // Home returns all 9 joints (including j8 and gripper) back to 0.0.
+    let home_ack = common::rpc(&mut ws, gen, epoch, "/api/v1/motion/home", json!({ "duration_secs": 0.2 })).await;
+    assert_eq!(home_ack["type"], "command_ack", "{home_ack}");
+    for _ in 0..200 {
+        let mut inner = sup.inner().write().await;
+        inner.tick(0.01);
+        if inner.active_trajectory.is_none() {
+            break;
+        }
+    }
+    assert!(sup.inner().read().await.active_trajectory.is_none(), "9-DOF WS home trajectory must finish");
+    let obs_after_home = sup.get_observation().await;
+    for (i, &got) in obs_after_home.commanded_positions.iter().enumerate() {
+        assert!(got.abs() < 1e-3, "joint {i} did not home to 0.0: got {got}");
+    }
+
+    // Direct ArmSupervisor::jog and ArmSupervisor::home on 9-DOF profile.
+    let direct_target = vec![0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.22, -0.33];
+    let stamp = sup.capture_admission_stamp();
+    sup.jog(stamp, direct_target.clone(), Some(0.15), Some(epoch)).await.expect("direct 9-DOF jog");
+    for _ in 0..200 {
+        let mut inner = sup.inner().write().await;
+        inner.tick(0.01);
+        if inner.active_trajectory.is_none() {
+            break;
+        }
+    }
+    assert!(sup.inner().read().await.active_trajectory.is_none(), "9-DOF direct jog must finish");
+    let obs_direct = sup.get_observation().await;
+    assert!((obs_direct.commanded_positions[7] - 0.22).abs() < 1e-3);
+    assert!((obs_direct.commanded_positions[8] - (-0.33)).abs() < 1e-3);
+
+    // Unload (park) moves all 9 joints back to resting pose, settles all 9 in UnloadSettleSample,
+    // and disables torque cleanly to SafetyState::Idle.
+    let unload_ack = common::rpc(&mut ws, gen, epoch, "/api/v1/motion/unload", json!({})).await;
+    assert_eq!(unload_ack["type"], "command_ack", "{unload_ack}");
+    let mut saw_9dof_settle = false;
+    for _ in 0..300 {
+        let mut inner = sup.inner().write().await;
+        inner.tick(0.01);
+        if let Some(sample) = inner.unload_settle.as_ref().and_then(|u| u.samples.back()) {
+            assert_eq!(sample.dof, 9, "UnloadSettleSample must track all 9 joints");
+            assert!(sample.positions[8].is_finite(), "gripper settle sample must be finite");
+            saw_9dof_settle = true;
+        }
+        if !inner.pending_normal_unload && !inner.is_torqued {
+            break;
+        }
+    }
+    assert!(saw_9dof_settle, "park settle must record 9-DOF UnloadSettleSample");
+    let final_obs = sup.get_observation().await;
+    assert_eq!(final_obs.safety_state, SafetyState::Idle);
+    assert!(!final_obs.is_torqued);
+    for (i, &got) in final_obs.commanded_positions.iter().enumerate() {
+        assert!(got.abs() < 1e-3, "joint {i} did not reach resting pose 0.0: got {got}");
+    }
+}

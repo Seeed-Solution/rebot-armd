@@ -333,7 +333,7 @@ pub struct TrackingRuntime {
     pub retained_motion_limits: Option<Vec<crate::model::JointLimit>>,
     /// Zero-allocation inline velocity caps (`ActiveTrajectory::motion_vel_caps`) retained
     /// through post-quintic settling until lead is ramped out.
-    pub retained_motion_vel_caps: Option<([f32; 8], usize)>,
+    pub retained_motion_vel_caps: Option<([f32; crate::model::MAX_MOTION_DOF], usize)>,
     /// Ticks whose issued output was the lead withdrawal after the lead candidate failed
     /// validation (`TrackingOutput::withdrawn`); diagnostics only.
     pub withdrawal_ticks: u64,

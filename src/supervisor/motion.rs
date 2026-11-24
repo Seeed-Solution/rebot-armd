@@ -989,14 +989,14 @@ impl SupervisorInner {
     }
 
     /// Planned-motion limits in fixed stack storage (no `Vec` or joint-name `String`
-    /// allocations). Returns `None` if `config.limits.len() > MAX_DOF`.
-    pub(crate) fn planning_limits_inline(&self, speed_scale: Option<f64>) -> Option<([crate::model::JointLimit; crate::rt_core::mailbox::MAX_DOF], usize)> {
+    /// allocations). Returns `None` if `config.limits.len() > MAX_MOTION_DOF`.
+    pub(crate) fn planning_limits_inline(&self, speed_scale: Option<f64>) -> Option<([crate::model::JointLimit; crate::model::MAX_MOTION_DOF], usize)> {
         let dof = self.config.limits.len();
-        if dof > crate::rt_core::mailbox::MAX_DOF { return None; }
+        if dof > crate::model::MAX_MOTION_DOF { return None; }
         let scale = self.config.speed_cap.and_then(|c| c.joint_velocity_scale).unwrap_or(1.0);
         let gripper_idx = self.config.gripper_index();
         let commissioning = self.config.active_tool.commissioning_required;
-        let mut out: [crate::model::JointLimit; crate::rt_core::mailbox::MAX_DOF] = std::array::from_fn(|_| crate::model::JointLimit {
+        let mut out: [crate::model::JointLimit; crate::model::MAX_MOTION_DOF] = std::array::from_fn(|_| crate::model::JointLimit {
             name: String::new(),
             min_position: 0.0,
             max_position: 0.0,
@@ -1202,7 +1202,7 @@ impl SupervisorInner {
             (p.traj, p.power_scale)
         } else {
             // 2. Plan quintic polynomial trajectory from commanded state to target
-            let zero_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+            let zero_buf = [0.0f32; crate::model::MAX_MOTION_DOF];
             let zero_vec;
             let zeros: &[f32] = if self.config.dof <= zero_buf.len() {
                 &zero_buf[..self.config.dof]

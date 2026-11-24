@@ -355,8 +355,8 @@ impl SupervisorInner {
     }
 
     fn servo_slice_inner(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
-        if targets_in.len() > crate::rt_core::mailbox::MAX_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
-        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        if targets_in.len() > crate::model::MAX_MOTION_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
+        let mut buf = [0.0f32; crate::model::MAX_MOTION_DOF];
         let targets = &mut buf[..targets_in.len()];
         targets.copy_from_slice(targets_in);
         #[cfg(feature = "policy-runtime")]
@@ -974,8 +974,8 @@ impl SupervisorInner {
     ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
-        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        let n = targets_in.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut buf = [0.0f32; crate::model::MAX_MOTION_DOF];
+        let n = targets_in.len().min(crate::model::MAX_MOTION_DOF);
         buf[..n].copy_from_slice(&targets_in[..n]);
         let targets = &mut buf[..n];
 

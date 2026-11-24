@@ -2550,7 +2550,7 @@ pub struct ActiveTrajectory {
     /// Per-joint velocity/acceleration limits used when planning this trajectory (e.g. after `speed_scale`).
     pub motion_limits: Option<Vec<JointLimit>>,
     /// Zero-allocation inline per-joint velocity caps (used by RT prepared jog/home/park with `speed_scale`).
-    pub motion_vel_caps: Option<([f32; 8], usize)>,
+    pub motion_vel_caps: Option<([f32; crate::model::MAX_MOTION_DOF], usize)>,
 }
 
 impl ActiveTrajectory {
@@ -2564,7 +2564,7 @@ impl ActiveTrajectory {
         self.motion_limits = Some(limits);
         self
     }
-    pub fn with_motion_vel_caps(mut self, caps: [f32; 8], dof: usize) -> Self {
+    pub fn with_motion_vel_caps(mut self, caps: [f32; crate::model::MAX_MOTION_DOF], dof: usize) -> Self {
         self.motion_vel_caps = Some((caps, dof));
         self
     }

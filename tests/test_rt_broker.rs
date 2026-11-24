@@ -35,11 +35,11 @@ fn auth(fx: &ReleaseFixture<SupervisorInner>) -> Authority { fx.core.authority(&
 use armd::rt_core::requests::motion::{self as req_motion, MotionPlanSnapshot, MotionRequest, PlanAuthority, PreparedMotionSlot};
 
 enum InstallArg {
-    Prim(Primitive),
-    Jog(PreparedMotionSlot),
+    Prim(Box<Primitive>),
+    Jog(Box<PreparedMotionSlot>),
 }
-impl From<Primitive> for InstallArg { fn from(p: Primitive) -> Self { Self::Prim(p) } }
-impl From<PreparedMotionSlot> for InstallArg { fn from(s: PreparedMotionSlot) -> Self { Self::Jog(s) } }
+impl From<Primitive> for InstallArg { fn from(p: Primitive) -> Self { Self::Prim(Box::new(p)) } }
+impl From<PreparedMotionSlot> for InstallArg { fn from(s: PreparedMotionSlot) -> Self { Self::Jog(Box::new(s)) } }
 
 fn prepare_jog_from(fx: &ReleaseFixture<SupervisorInner>, start: &[f32], q: &[f32], duration_s: f64) -> PreparedMotionSlot {
     let mut snap = MotionPlanSnapshot::from_supervisor(&fx.core);
@@ -66,7 +66,7 @@ fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> Pr
 
 fn submit_install(b: &mut Broker<PlanSlot>, seq: u64, a: Authority, deadline: Instant, arg: impl Into<InstallArg>) -> Result<RequestId, AdmitError> {
     match arg.into() {
-        InstallArg::Prim(p) => b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(p))),
+        InstallArg::Prim(p) => b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(*p))),
         InstallArg::Jog(j) => b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| req_motion::stage_jog(slot, &j))),
     }
 }

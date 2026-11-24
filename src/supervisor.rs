@@ -563,21 +563,21 @@ pub const UNLOAD_STILL_RECENT: Duration = Duration::from_millis(300);
 /// A settle pending longer than the hold plus this logs its blocker, at most once per second.
 const UNLOAD_SETTLE_REPORT_AFTER_S: f64 = 1.0;
 
-/// One stationary-settle sample stored inline without heap vectors (`MAX_DOF = 8`),
+/// One stationary-settle sample stored inline without heap vectors (`MAX_MOTION_DOF = 9`),
 /// so clearing the settle window on a deferred output gap never allocates or frees on RT.
 #[derive(Debug, Clone, Copy)]
 pub struct UnloadSettleSample {
     pub t: f64,
     pub dof: usize,
-    pub positions: [f32; crate::rt_core::mailbox::MAX_DOF],
-    pub velocities: [f32; crate::rt_core::mailbox::MAX_DOF],
+    pub positions: [f32; crate::model::MAX_MOTION_DOF],
+    pub velocities: [f32; crate::model::MAX_MOTION_DOF],
 }
 
 impl UnloadSettleSample {
     pub fn from_slices(t: f64, q: &[f32], v: &[f32]) -> Self {
-        let dof = q.len().min(v.len()).min(crate::rt_core::mailbox::MAX_DOF);
-        let mut positions = [f32::NAN; crate::rt_core::mailbox::MAX_DOF];
-        let mut velocities = [f32::NAN; crate::rt_core::mailbox::MAX_DOF];
+        let dof = q.len().min(v.len()).min(crate::model::MAX_MOTION_DOF);
+        let mut positions = [f32::NAN; crate::model::MAX_MOTION_DOF];
+        let mut velocities = [f32::NAN; crate::model::MAX_MOTION_DOF];
         positions[..dof].copy_from_slice(&q[..dof]);
         velocities[..dof].copy_from_slice(&v[..dof]);
         Self { t, dof, positions, velocities }
@@ -1257,7 +1257,7 @@ fn sync_action_obs(
 pub(crate) struct ThermalCooldown {
     first_sample_at: Option<Instant>,
     last_oldest_sample_at: Option<Instant>,
-    last_joint_samples: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
+    last_joint_samples: [Option<Instant>; crate::model::MAX_MOTION_DOF],
     joint_count: usize,
 }
 
@@ -1284,7 +1284,7 @@ impl ThermalCooldown {
             self.reset();
             return;
         };
-        let track_joints = samples.len() <= crate::rt_core::mailbox::MAX_DOF;
+        let track_joints = samples.len() <= crate::model::MAX_MOTION_DOF;
         match (self.first_sample_at, self.last_oldest_sample_at) {
             (Some(first), Some(prev_oldest)) => {
                 let oldest_gapped =
@@ -3110,8 +3110,8 @@ impl SupervisorInner {
             drv.feedback_instants_into(rx_scratch);
         }
         if rx_scratch.len() == dof && rx_scratch.iter().all(Option::is_some) {
-            if dof <= crate::rt_core::mailbox::MAX_DOF {
-                let mut buf = [rx_scratch[0].unwrap(); crate::rt_core::mailbox::MAX_DOF];
+            if dof <= crate::model::MAX_MOTION_DOF {
+                let mut buf = [rx_scratch[0].unwrap(); crate::model::MAX_MOTION_DOF];
                 for (dst, src) in buf.iter_mut().take(dof).zip(rx_scratch.iter()) {
                     *dst = src.unwrap();
                 }
@@ -3125,8 +3125,8 @@ impl SupervisorInner {
         }
         if ages.len() == dof && ages.iter().all(Option::is_some) {
             let drv_now = drv.clock_now();
-            if dof <= crate::rt_core::mailbox::MAX_DOF {
-                let mut buf = [drv_now; crate::rt_core::mailbox::MAX_DOF];
+            if dof <= crate::model::MAX_MOTION_DOF {
+                let mut buf = [drv_now; crate::model::MAX_MOTION_DOF];
                 for (dst, age) in buf.iter_mut().take(dof).zip(ages.iter()) {
                     let a = age.unwrap();
                     *dst = drv_now.checked_sub(a).unwrap_or(drv_now);
@@ -7233,6 +7233,18 @@ impl ArmSupervisor {
                 status: 503,
                 code: "UNSUPPORTED_RT_CONFIG".into(),
                 message: "MIT-configured profiles require synchronous qualification/handover and are not supported under synchronous RT executor step 1".into(),
+            });
+        }
+        if guard.config.dof > crate::rt_core::mailbox::MAX_DOF {
+            restore_legacy(&mut rollback);
+            return Err(ArmError::Rejected {
+                status: 503,
+                code: "UNSUPPORTED_RT_CONFIG".into(),
+                message: format!(
+                    "Profile DOF {} exceeds synchronous RT executor mailbox limit {}; run under legacy owner",
+                    guard.config.dof,
+                    crate::rt_core::mailbox::MAX_DOF
+                ),
             });
         }
         if let Some(ref d) = guard.driver {

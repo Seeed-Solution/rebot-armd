@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::driver::DriverCapabilities;
 use crate::kinematics::{WORKSPACE_EPS, WORKSPACE_PARK_ESCAPE_EPS};
-use crate::model::{ArmConfig, JointLimit, WorkspacePolicy};
+use crate::model::{ArmConfig, JointLimit, WorkspacePolicy, MAX_MOTION_DOF};
 use crate::motion::{ActiveTrajectory, MotionError};
 use crate::power::{PowerBudget, PowerHold};
 use crate::rt_core::broker::{ActionId, BootId, Descriptor};
@@ -247,11 +247,11 @@ impl MotionPlanSnapshot {
 pub struct PreparedMotionSlot {
     pub kind: MotionKind,
     pub dof: u8,
-    pub start: [f32; MAX_DOF],
-    pub v0: [f32; MAX_DOF],
-    pub requested_target: [f32; MAX_DOF],
-    pub target: [f32; MAX_DOF],
-    pub vel_caps: [f32; MAX_DOF],
+    pub start: [f32; MAX_MOTION_DOF],
+    pub v0: [f32; MAX_MOTION_DOF],
+    pub requested_target: [f32; MAX_MOTION_DOF],
+    pub target: [f32; MAX_MOTION_DOF],
+    pub vel_caps: [f32; MAX_MOTION_DOF],
     pub has_speed_scale: bool,
     pub speed_scale: f64,
     pub polynomials: [QuinticPolynomial; INLINE_POLYS],
@@ -416,6 +416,11 @@ fn check_commissioning(
 /// Pure, lock-free off-RT motion preparation (quintic, power fit, swept workspace).
 pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<PreparedMotionPlan, ArmError> {
     let (cfg, arm_cfg, dof) = (&snap.config, &snap.config.config, snap.config.config.dof);
+    if dof == 0 || dof > MAX_MOTION_DOF {
+        return Err(MotionError::InvalidCommand(format!(
+            "profile DOF {dof} exceeds supported inline motion limit {MAX_MOTION_DOF}"
+        )).into());
+    }
     let raw_target: &[f32] = match req.kind {
         MotionKind::Jog => req.target_positions.as_deref().ok_or_else(|| MotionError::InvalidCommand("missing target_positions".into()))?,
         MotionKind::Home => &arm_cfg.home_positions,
@@ -434,7 +439,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         return Ok(PreparedMotionPlan {
             slot: PreparedMotionSlot {
                 kind: MotionKind::Park, dof: dof as u8,
-                start: [0.0; MAX_DOF], v0: [0.0; MAX_DOF], requested_target: [0.0; MAX_DOF], target: [0.0; MAX_DOF], vel_caps: [0.0; MAX_DOF],
+                start: [0.0; MAX_MOTION_DOF], v0: [0.0; MAX_MOTION_DOF], requested_target: [0.0; MAX_MOTION_DOF], target: [0.0; MAX_MOTION_DOF], vel_caps: [0.0; MAX_MOTION_DOF],
                 has_speed_scale: false, speed_scale: 1.0, polynomials: [zero_poly(); INLINE_POLYS],
                 duration: PARK_DURATION_S, power_scale: None, power_budget_hash: cfg.power_budget_hash,
                 tcp_offset: arm_cfg.tcp_offset, checked_workspace: cfg.workspace.is_some(),
@@ -517,16 +522,25 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         check_path_with_tcp_tol(&arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, eps, &start, samples.iter().map(Vec::as_slice)).map_err(map_ws)?;
     }
 
-    let (mut s_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) =
-        ([0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [zero_poly(); INLINE_POLYS]);
-    let inline = dof <= MAX_DOF && traj.polynomials.len() == dof;
-    if inline {
-        s_arr[..dof].copy_from_slice(&start);
-        v_arr[..dof].copy_from_slice(&snap.commanded_velocities);
-        r_arr[..dof].copy_from_slice(&requested_unfiltered);
-        t_arr[..dof].copy_from_slice(&target);
-        for i in 0..dof { vc_arr[i] = limits[i].max_velocity; p_arr[i] = traj.polynomials[i]; }
+    let (mut s_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) = (
+        [0.0f32; MAX_MOTION_DOF],
+        [0.0f32; MAX_MOTION_DOF],
+        [0.0f32; MAX_MOTION_DOF],
+        [0.0f32; MAX_MOTION_DOF],
+        [0.0f32; MAX_MOTION_DOF],
+        [zero_poly(); INLINE_POLYS],
+    );
+    if traj.polynomials.len() != dof || dof > INLINE_POLYS {
+        return Err(MotionError::InvalidCommand(format!(
+            "planned trajectory polynomial count {} does not match profile DOF {dof} (inline max {INLINE_POLYS})",
+            traj.polynomials.len()
+        )).into());
     }
+    s_arr[..dof].copy_from_slice(&start);
+    v_arr[..dof].copy_from_slice(&snap.commanded_velocities);
+    r_arr[..dof].copy_from_slice(&requested_unfiltered);
+    t_arr[..dof].copy_from_slice(&target);
+    for i in 0..dof { vc_arr[i] = limits[i].max_velocity; p_arr[i] = traj.polynomials[i]; }
     Ok(PreparedMotionPlan {
         slot: PreparedMotionSlot {
             kind: req.kind, dof: dof as u8, start: s_arr, v0: v_arr, requested_target: r_arr, target: t_arr, vel_caps: vc_arr,
@@ -538,7 +552,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
             for_holding_after_clear: false,
             for_mit_deferral: false, continuation_action: None,
         },
-        heap_traj: (!inline).then_some(traj),
+        heap_traj: None,
     })
 }
 
@@ -673,7 +687,7 @@ pub fn verify_motion_authority(inner: &SupervisorInner, kind: MotionKind, speed_
 /// Zero-allocation exact freshness check separating `StartDrifted` from `PlanStale`.
 pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlot) -> Result<(Option<usize>, Option<usize>), MotionInstallError> {
     let dof = inner.config.dof;
-    if usize::from(slot.dof) != dof || dof == 0 || dof > MAX_DOF || !slot.duration.is_finite() || slot.duration <= 0.0 {
+    if usize::from(slot.dof) != dof || dof == 0 || dof > MAX_MOTION_DOF || !slot.duration.is_finite() || slot.duration <= 0.0 {
         return Err(MotionInstallError::InvalidCommand);
     }
     if slot.workspace_revision != inner.workspace_revision || slot.motion_config_revision != inner.motion_config_revision
@@ -691,7 +705,7 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
             (None, None)
         }
         MotionKind::Home | MotionKind::Jog => {
-            let mut filtered = [0.0f32; MAX_DOF];
+            let mut filtered = [0.0f32; MAX_MOTION_DOF];
             if slot.kind == MotionKind::Home {
                 if inner.config.home_positions.len() != dof { return Err(MotionInstallError::PlanStale); }
                 filtered[..dof].copy_from_slice(&inner.config.home_positions);
@@ -732,7 +746,7 @@ fn commit_quintic_slot(
     action_kind: &'static str,
 ) -> Result<MotionInstalled, MotionInstallError> {
     let dof = usize::from(slot.dof);
-    if dof == 0 || dof > MAX_DOF { return Err(MotionInstallError::InvalidCommand); }
+    if dof == 0 || dof > MAX_MOTION_DOF { return Err(MotionInstallError::InvalidCommand); }
     verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
     verify_motion_authority(inner, slot.kind, slot.speed_scale_opt(), &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let (torque_clamped, power_clamped) = verify_motion_freshness(inner, slot)?;
@@ -792,7 +806,7 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
 pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool, expected_boot: BootId, now: Instant) -> Result<MotionInstalled, MotionInstallError> {
     if slot.kind != MotionKind::Park { return Err(MotionInstallError::InvalidCommand); }
     let dof = usize::from(slot.dof);
-    if dof == 0 || dof > MAX_DOF { return Err(MotionInstallError::InvalidCommand); }
+    if dof == 0 || dof > MAX_MOTION_DOF { return Err(MotionInstallError::InvalidCommand); }
     verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
     verify_motion_authority(inner, MotionKind::Park, None, &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let holding = inner.holding_after_clear();
@@ -1005,7 +1019,11 @@ fn stage_slot(slot: &mut PlanSlot, prepared: &PreparedMotionSlot, kind: MotionKi
     let mut s = *prepared;
     s.kind = kind;
     s.continuation_action = continuation_action;
-    slot.set(Primitive::JointQuintic { dof: s.dof, start: s.start, q: s.target, duration_s: s.duration });
+    let n = usize::from(s.dof).min(MAX_DOF);
+    let (mut p_start, mut p_q) = ([0.0f32; MAX_DOF], [0.0f32; MAX_DOF]);
+    p_start[..n].copy_from_slice(&s.start[..n]);
+    p_q[..n].copy_from_slice(&s.target[..n]);
+    slot.set(Primitive::JointQuintic { dof: s.dof, start: p_start, q: p_q, duration_s: s.duration });
     slot.motion = Some(s);
 }
 
