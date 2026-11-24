@@ -4160,6 +4160,7 @@ impl SupervisorInner {
                             }
                             let driver_valid = driver.is_feedback_valid();
                             let all_ages = sc.ages.len() == self.config.dof && sc.ages.iter().all(Option::is_some);
+                            self.driver_caps = driver.capabilities();
                             self.last_poll_enable_state = driver.enable_state();
                             self.last_poll_partial_enable = driver.has_known_partial_enable();
                             self.last_poll_feedback_valid = driver_valid;

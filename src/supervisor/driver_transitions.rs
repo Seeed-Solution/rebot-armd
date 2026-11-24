@@ -1454,6 +1454,7 @@ impl SupervisorInner {
             } else {
                 None
             };
+            self.driver_caps = driver.capabilities();
             self.feedback_numeric_valid = true;
             self.last_can_feedback_instant = oldest_age.and_then(|age| Instant::now().checked_sub(age));
             self.last_poll_enable_state = driver.enable_state();
@@ -1870,7 +1871,7 @@ impl SupervisorInner {
         let drv_now = drv.clock_now();
         let span = budget.deadline.saturating_duration_since(budget.now);
         let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
-        let use_budgeted = self.rt_executor_owned || drv.supports_rt_executor().is_ok();
+        let use_budgeted = broker_owned || self.rt_executor_owned || drv.supports_rt_executor().is_ok();
         match t {
             TorqueTransition::Enable { origin, was_torqued, prev_gripper_cmd } => {
                 if self.estop_pending() || self.safety.state().is_stopped() {
