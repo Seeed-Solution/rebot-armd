@@ -316,12 +316,32 @@ fn put_job(inner: &mut SupervisorInner, job: HoverJob) {
 /// `calibration-hover/` next to `calibration.json`.
 pub fn jobs_dir(calibration_path: &Path) -> PathBuf { calibration_path.with_file_name("calibration-hover") }
 
-/// Begin the run (parent action `calib_hover`, tag = job id) and spawn its orchestrator.
-/// Returns (action id, deadline bound s, job id).
-pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>, mut plan: HoverPlan, upstream: crate::api::proxy::DetectorUpstream, dir: PathBuf) -> Result<(u64, f64, String), ArmError> {
-    let (inner, proof) = admitted.consume()?;
-    let stamp = proof.stamp();
-    let id = inner.begin_orchestrated_action_inner(&proof, "calib_hover", Some(plan.job.id.clone()), plan.epoch)?;
+/// Build the A7 [`BeginMacroSpec`] for a prepared calibration hover job (shared by Legacy and RT Executor).
+pub fn begin_macro_spec(
+    plan: &HoverPlan,
+    prepared_boot: crate::rt_core::broker::BootId,
+    deadline: Instant,
+) -> crate::rt_core::requests::actions::BeginMacroSpec {
+    use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+    let mut spec = BeginMacroSpec::new(MacroKind::CalibHover, prepared_boot);
+    spec.check_workspace_revision = true;
+    spec.calibration_revision = Some(plan.calibration_revision);
+    spec.macro_deadline = Some(deadline);
+    spec.timeout_code = crate::safety::BoundedText::new("HOVER_TIMEOUT");
+    spec.tag = crate::model::HolderLabel::new(&plan.job.id);
+    spec
+}
+
+fn finish_begin_hover(
+    inner: &mut SupervisorInner,
+    sup: &Arc<ArmSupervisor>,
+    id: u64,
+    mut plan: HoverPlan,
+    upstream: crate::api::proxy::DetectorUpstream,
+    dir: PathBuf,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline_at: Instant,
+) -> (u64, f64, String) {
     plan.job.state = "running".into();
     plan.job.code = None; plan.job.message = None; plan.job.end = None;
     plan.job.action_id = Some(id);
@@ -329,12 +349,12 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
     plan.job.updated_at = now();
     let job_id = plan.job.id.clone();
     put_job(inner, plan.job.clone());
-    let deadline = plan.deadline_s;
-    tracing::info!("Calibration hover job {job_id} run {} started (action {id}, {} points pending, bound {deadline:.0} s)",
+    let deadline_s = plan.deadline_s;
+    tracing::info!("Calibration hover job {job_id} run {} started (action {id}, {} points pending, bound {deadline_s:.0} s)",
         plan.job.runs, plan.job.points.iter().filter(|p| p.state == "pending").count());
     let sup = sup.clone();
     tokio::spawn(async move {
-        let worker = { let sup = sup.clone(); let dir = dir.clone(); tokio::spawn(async move { run(sup, id, plan, upstream, dir, stamp).await }) };
+        let worker = { let sup = sup.clone(); let dir = dir.clone(); tokio::spawn(async move { run(sup, id, plan, upstream, dir, stamp, deadline_at).await }) };
         if let Err(e) = worker.await {
             tracing::error!("Calibration hover {id} orchestrator failed: {e}");
             let mut inner = sup.inner().write().await;
@@ -344,7 +364,75 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
             }
         }
     });
-    Ok((id, deadline, job_id))
+    (id, deadline_s, job_id)
+}
+
+/// Begin the run under a short write lock through the single owner-side
+/// [`crate::rt_core::requests::actions::install_begin_macro`] function and spawn its orchestrator.
+pub fn begin_with_stamp(
+    inner: &mut SupervisorInner,
+    stamp: crate::supervisor::AdmissionStamp,
+    sup: &Arc<ArmSupervisor>,
+    plan: HoverPlan,
+    upstream: crate::api::proxy::DetectorUpstream,
+    dir: PathBuf,
+) -> Result<(u64, f64, String), ArmError> {
+    use crate::rt_core::requests::actions::{
+        install_begin_macro, ActionStamp, OwnerCheckCtx, DEFAULT_ACTION_DEADLINE,
+    };
+    let deadline_at = Instant::now() + Duration::from_secs_f64(plan.deadline_s);
+    let spec = begin_macro_spec(&plan, inner.boot_id, deadline_at);
+    let action_stamp = ActionStamp {
+        arm: inner.core.id(),
+        boot: inner.boot_id,
+        admission: stamp,
+        config_revision: plan.workspace_revision,
+        calibration_revision: Some(plan.calibration_revision),
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
+    };
+    let owner_ctx = OwnerCheckCtx::for_legacy(inner);
+    let id = install_begin_macro(
+        inner,
+        &action_stamp,
+        &owner_ctx,
+        &spec,
+        Some(plan.job.id.clone()),
+        None,
+    )
+    .map_err(|r| r.into_arm_error(inner))?;
+    Ok(finish_begin_hover(inner, sup, id, plan, upstream, dir, stamp, deadline_at))
+}
+
+/// Begin the run (parent action `calib_hover`, tag = job id) and spawn its orchestrator.
+/// Returns (action id, deadline bound s, job id).
+pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>, plan: HoverPlan, upstream: crate::api::proxy::DetectorUpstream, dir: PathBuf) -> Result<(u64, f64, String), ArmError> {
+    let deadline_at = Instant::now() + Duration::from_secs_f64(plan.deadline_s);
+    let (inner, proof) = admitted.consume()?;
+    let stamp = proof.stamp();
+    if inner.safety.epoch_id() != plan.epoch {
+        return Err(crate::safety::SafetyError::EpochMismatch {
+            expected: inner.safety.epoch_id(),
+            received: plan.epoch,
+        }
+        .into());
+    }
+    let spec = begin_macro_spec(&plan, inner.boot_id, deadline_at);
+    let ws_rev = plan.workspace_revision;
+    let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
+        inner,
+        &proof,
+        &spec,
+        Some(ws_rev),
+        Some(plan.job.id.clone()),
+        None,
+    )?;
+    Ok(finish_begin_hover(inner, sup, id, plan, upstream, dir, stamp, deadline_at))
 }
 
 /// Update the stored job of this run.
@@ -377,6 +465,31 @@ async fn persist(dir: &Path, job: &HoverJob) {
 
 /// Alive, nothing it was checked against changed, telemetry fresh, torque on.
 async fn recheck(ctx: &MacroCtx, plan: &HoverPlan) -> Result<(), Stop> {
+    if ctx.is_executor() {
+        let snap = ctx.snapshot(ctx.deadline).await?;
+        let m = snap.owner.macro_state;
+        if m.active_id != ctx.id || !m.alive { return Err(Stop::Cancelled); }
+        if snap.owner.authority.epoch != plan.epoch { return Err(fail("PLAN_STALE", "the epoch changed during the hovers (stop or e-stop)")); }
+        if snap.owner.authority.config_revision != plan.workspace_revision { return Err(fail("PLAN_STALE", "the workspace, floor or camera mount changed during the hovers")); }
+        if snap.owner.calibration_revision != plan.calibration_revision { return Err(fail("CALIBRATION_CHANGED", "the joint zero or the kinematic correction changed during the hovers")); }
+        if let Some(pub_snap) = ctx.sup.hub().latest() {
+            if !pub_snap.obs.is_torqued { return Err(fail("NOT_ARMED", "torque went off during the hovers")); }
+        }
+        if snap.env.driver_present {
+            let now = Instant::now();
+            let arm = snap.env.config.arm_joint_indices();
+            let fresh = arm.iter().all(|&i| {
+                snap.feedback_instants
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| now.saturating_duration_since(t) <= FEEDBACK_MAX_AGE)
+            });
+            if !fresh { return Err(fail("STALE_TELEMETRY", "joint feedback is stale")); }
+        }
+        if Instant::now() > ctx.deadline { return Err(fail(ctx.timeout_code, ctx.timeout_message.clone())); }
+        return Ok(());
+    }
     let mut inner = ctx.sup.inner().write().await;
     if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
     if inner.safety.epoch_id() != plan.epoch { return Err(fail("PLAN_STALE", "the epoch changed during the hovers (stop or e-stop)")); }
@@ -395,10 +508,9 @@ async fn recheck(ctx: &MacroCtx, plan: &HoverPlan) -> Result<(), Stop> {
 
 /// Measured arm joints, still (all arm joint speeds small) or None.
 async fn measured(ctx: &MacroCtx) -> (Vec<f32>, bool) {
-    let inner = ctx.sup.inner().read().await;
-    let arm = inner.config.arm_joint_indices();
-    let still = arm.iter().all(|&i| inner.measured_velocities.get(i).is_none_or(|v| v.abs() <= 0.02));
-    (inner.measured_positions.clone(), still)
+    let (pos, vel, arm) = ctx.measured_with_vel().await;
+    let still = arm.iter().all(|&i| vel.get(i).is_none_or(|v| v.abs() <= 0.02));
+    (pos, still)
 }
 
 /// One ArUco trigger: (frame_id, board markers, image size).
@@ -432,12 +544,18 @@ async fn capture(ctx: &MacroCtx, plan: &HoverPlan, point: &mut HoverPoint, up: &
     recheck(ctx, plan).await?;
     let (settled, still) = measured(ctx).await;
     if !still { return Err(fail("NOT_SETTLED", "the arm is still moving after the settle time")); }
-    {
+    let arm = if ctx.is_executor() {
+        let env = ctx.sup.hub().prep_env();
+        point.settled_end_m = env
+            .as_ref()
+            .and_then(|e| e.config.arm_model.fk_f32(&settled).map(|f| f.p));
+        env.map_or_else(Vec::new, |e| e.config.arm_joint_indices())
+    } else {
         let inner = ctx.sup.inner().read().await;
         point.settled_end_m = inner.config.arm_model.fk_f32(&settled).map(|f| f.p);
-    }
+        inner.config.arm_joint_indices()
+    };
     point.settled_joints = Some(settled.clone());
-    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
     let mut last: Option<u64> = None;
     for _ in 0..MAX_TRIGGERS {
         if point.observations.len() >= p.frames { break; }
@@ -482,24 +600,41 @@ async fn run_point(ctx: &MacroCtx, plan: &HoverPlan, point: &mut HoverPoint, up:
     let approach = Speed { linear: p.approach_speed_mps, angular: plan.angular_speed_rps };
     let descent = Speed { linear: p.descent_speed_mps, angular: plan.angular_speed_rps };
     recheck(ctx, plan).await.map_err(PointEnd::Abort)?;
-    ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("approach:{}", point.id), 0.0, None, None);
+    if !ctx.is_executor() {
+        ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("approach:{}", point.id), 0.0, None, None);
+    }
     ctx.move_arm_staged("approach", goal(point.approach_m, point.rpy_rad), approach, None).await.map_err(classify)?;
     recheck(ctx, plan).await.map_err(PointEnd::Abort)?;
-    ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("descend:{}", point.id), 0.0, None, None);
+    if !ctx.is_executor() {
+        ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("descend:{}", point.id), 0.0, None, None);
+    }
     ctx.move_arm_staged("descend", goal(point.hover_m, point.rpy_rad), descent, Some(precise())).await.map_err(classify)?;
-    ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{}", point.id), 0.0, None, None);
+    if !ctx.is_executor() {
+        ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{}", point.id), 0.0, None, None);
+    }
     capture(ctx, plan, point, up, t0).await.map_err(PointEnd::Abort)?;
     recheck(ctx, plan).await.map_err(PointEnd::Abort)?;
-    ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("retreat:{}", point.id), 0.0, None, None);
+    if !ctx.is_executor() {
+        ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("retreat:{}", point.id), 0.0, None, None);
+    }
     // the way back up: a refusal here leaves the tip near the paper, so it ends the run
     ctx.move_arm_staged("retreat", goal(point.approach_m, point.rpy_rad), descent, None).await.map_err(|(s, _)| PointEnd::Abort(s))?;
     Ok(())
 }
 
-async fn run(sup: Arc<ArmSupervisor>, id: u64, mut plan: HoverPlan, up: crate::api::proxy::DetectorUpstream, dir: PathBuf, stamp: crate::supervisor::AdmissionStamp) {
+async fn run(
+    sup: Arc<ArmSupervisor>,
+    id: u64,
+    mut plan: HoverPlan,
+    up: crate::api::proxy::DetectorUpstream,
+    dir: PathBuf,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+) {
+    use crate::rt_core::requests::actions::{FinishState, HeldUpdate};
     let ctx = MacroCtx {
         sup: sup.clone(), id, stamp,
-        deadline: Instant::now() + Duration::from_secs_f64(plan.deadline_s),
+        deadline,
         phase_timeout_s: plan.deadline_s,
         timeout_code: "HOVER_TIMEOUT",
         timeout_message: "the hovers did not finish within their time bound".into(),
@@ -511,7 +646,9 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, mut plan: HoverPlan, up: crate::a
     let mut result: Result<(), Stop> = Ok(());
     for i in 0..job.points.len() {
         if job.points[i].state != "pending" { continue; }
-        sup.inner().write().await.set_action_phase(id, &format!("point:{}", job.points[i].id), k / total, None, None);
+        if !ctx.is_executor() {
+            sup.inner().write().await.set_action_phase(id, &format!("point:{}", job.points[i].id), k / total, None, None);
+        }
         let mut point = job.points[i].clone();
         let r = run_point(&ctx, &plan, &mut point, &up, t0).await;
         match r {
@@ -532,28 +669,42 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, mut plan: HoverPlan, up: crate::a
         k += 1.0;
         job.updated_at = now();
         plan.job = job.clone();
-        update(&sup, &job).await;
+        if !ctx.is_executor() {
+            update(&sup, &job).await;
+        }
         persist(&dir, &job).await;
     }
     // end the action and record how the run ended
-    let mut inner = sup.inner().write().await;
     match &result {
-        Ok(()) => inner.finish_macro(id, "done", None, None, None, None),
-        Err(Stop::Fail(code, message)) => inner.finish_macro(id, "failed", Some(code), Some(message.clone()), None, None),
+        Ok(()) => {
+            ctx.finish(FinishState::Done, None, None, None, None, HeldUpdate::Unchanged).await;
+        }
+        Err(Stop::Fail(code, message)) => {
+            ctx.finish(FinishState::Failed, Some(code), Some(message.clone()), None, None, HeldUpdate::Unchanged).await;
+        }
         Err(Stop::Cancelled) => {}
     }
-    let action = inner.last_action.as_ref().filter(|a| a.id == id).cloned();
-    job.state = match &result { Ok(()) => "done".into(), Err(Stop::Fail(..)) => "failed".into(), Err(Stop::Cancelled) => "cancelled".into() };
-    job.code = action.as_ref().and_then(|a| a.code.as_deref().map(str::to_owned));
-    job.message = action.as_ref().and_then(|a| a.message.clone());
-    if let Some(p) = job.points.iter_mut().find(|p| p.state == "pending" && matches!(result, Err(Stop::Cancelled))) {
-        // the run was cancelled while this point ran
-        p.code = job.code.clone();
+    if !ctx.is_executor() {
+        let mut inner = sup.inner().write().await;
+        let action = inner.last_action.as_ref().filter(|a| a.id == id).cloned();
+        job.state = match &result { Ok(()) => "done".into(), Err(Stop::Fail(..)) => "failed".into(), Err(Stop::Cancelled) => "cancelled".into() };
+        job.code = action.as_ref().and_then(|a| a.code.as_deref().map(str::to_owned));
+        job.message = action.as_ref().and_then(|a| a.message.clone());
+        if let Some(p) = job.points.iter_mut().find(|p| p.state == "pending" && matches!(result, Err(Stop::Cancelled))) {
+            // the run was cancelled while this point ran
+            p.code = job.code.clone();
+        }
+        job.end = Some(arm_state(&inner));
+        job.updated_at = now();
+        put_job(&mut inner, job.clone());
+    } else {
+        job.state = match &result { Ok(()) => "done".into(), Err(Stop::Fail(..)) => "failed".into(), Err(Stop::Cancelled) => "cancelled".into() };
+        if let Err(Stop::Fail(code, msg)) = &result {
+            job.code = Some(code.clone());
+            job.message = Some(msg.clone());
+        }
+        job.updated_at = now();
     }
-    job.end = Some(arm_state(&inner));
-    job.updated_at = now();
-    put_job(&mut inner, job.clone());
-    drop(inner);
     tracing::info!("Calibration hover job {} run ended: {} {:?} ({} done, {} skipped)", job.id, job.state, job.code,
         job.points.iter().filter(|p| p.state == "done").count(), job.points.iter().filter(|p| p.state == "skipped").count());
     persist(&dir, &job).await;

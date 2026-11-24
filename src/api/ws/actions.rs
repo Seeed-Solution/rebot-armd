@@ -511,18 +511,14 @@ pub(super) fn dispatch_action_command(
             },
         ),
         Ok(ActionStart::CalibHover(plan)) => Some(
-            match inner
-                .check_admission(stamp)
-                .map_err(ArmError::from)
-                .and_then(|admitted| {
-                    crate::calib_hover::begin(
-                        admitted,
-                        recv_supervisor,
-                        *plan,
-                        recv_calib.upstream.clone(),
-                        crate::calib_hover::jobs_dir(&recv_calib.path),
-                    )
-                }) {
+            match crate::calib_hover::begin_with_stamp(
+                inner,
+                stamp,
+                recv_supervisor,
+                *plan,
+                recv_calib.upstream.clone(),
+                crate::calib_hover::jobs_dir(&recv_calib.path),
+            ) {
                 Ok((id, duration, job_id)) => {
                     let mut ack = command_ack(inner, &value["request_id"], Some((id, duration)));
                     ack["job_id"] = json!(job_id);
