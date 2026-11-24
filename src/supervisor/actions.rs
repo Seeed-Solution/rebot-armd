@@ -802,11 +802,12 @@ impl SupervisorInner {
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
-    /// Effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`, `sequence`,
-    /// `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
-    /// damiao_gripper.close_speed_rad_s when pos_force)`, quantized downward to `0.01 rad/s`
-    /// when `pos_force` is active.
-    pub fn effective_planned_close_speed(&self) -> f64 {
+    /// Unquantized effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`,
+    /// `sequence`, `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
+    /// damiao_gripper.close_speed_rad_s when pos_force)`. Feed this into `GripperRequest` so
+    /// [`crate::motion::GripperMotion::try_with_close_speed_limit`] is the single wire-speed
+    /// quantization point (avoiding `raw 29 -> 0.29_f64 -> raw 28` double flooring).
+    pub(crate) fn unquantized_planned_close_speed(&self) -> f64 {
         let mut v = self.config.gripper_policy.as_ref()
             .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
         if let Some(max_v) = self.config.gripper_index()
@@ -818,9 +819,21 @@ impl SupervisorInner {
         }
         if let Some(cap) = self.gripper_close_speed_limit() {
             v = v.min(f64::from(cap));
+        }
+        v
+    }
+
+    /// Effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`, `sequence`,
+    /// `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
+    /// damiao_gripper.close_speed_rad_s when pos_force)`, quantized once downward to `0.01 rad/s`
+    /// when `pos_force` is active (for reporting and duration estimates; never feed back into
+    /// `GripperRequest`).
+    pub fn effective_planned_close_speed(&self) -> f64 {
+        let v = self.unquantized_planned_close_speed();
+        if self.gripper_close_speed_limit().is_some() {
             let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(v);
             if raw > 0 {
-                v = f64::from(raw) / 100.0;
+                return f64::from(raw) / 100.0;
             }
         }
         v

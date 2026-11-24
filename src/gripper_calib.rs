@@ -504,7 +504,9 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
         let scratch = crate::gripper_baseline::FreeTorqueBaseline::new(policy.closed_rad, policy.open_rad,
             Some(tool.id.clone()), Some(tool.config_digest.clone()), inner.follower.clone());
         let limit = policy.max_close_torque_nm.map_or(CALIBRATION_MAX_TORQUE_NM, |c| CALIBRATION_MAX_TORQUE_FRACTION * c);
-        (policy, g, scratch, limit, inner.effective_planned_close_speed())
+        // Carry the unquantized close speed into `GripperRequest` so `GripperMotion` is the
+        // single wire-speed quantization point (never re-floor a decoded wire speed like 29 -> 0.29 -> 28).
+        (policy, g, scratch, limit, inner.unquantized_planned_close_speed())
     };
     let list = strokes(close_speed);
     for (i, st) in list.iter().enumerate() {
@@ -513,16 +515,20 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
         ctx.phase(&phase, i as f32 / list.len() as f32).await?;
         let request = crate::motion::GripperRequest { command: crate::motion::GripperCommand::Move, fraction: Some(st.fraction), grasp: false, speed: st.speed, timeout_s: None, tag: None };
         let target = policy.closed_rad + st.fraction as f32 * (policy.open_rad - policy.closed_rad);
-        let (ticket, before) = {
+        let (ticket, before, stroke_speed) = {
             let mut inner = ctx.sup.inner().write().await;
             if !inner.macro_alive(ctx.id) { return Err(crate::macro_action::Stop::Cancelled); }
             let before = inner.gripper_calibration.as_ref().map_or(0, |c| c.records.len());
             let (duration, timeout_s, is_pos_force_close) = inner
                 .start_macro_gripper_learning_within(ctx.id, request, crate::motion::LearnMode::Calibration, None, false)
                 .map_err(arm_fail)?;
+            let stroke_speed = match inner.active_trajectory.as_ref().map(|a| &a.reference) {
+                Some(crate::motion::Reference::Gripper(gm)) => gm.planned_speed,
+                _ => st.speed,
+            };
             let limit_s = if is_pos_force_close { timeout_s + 10.0 } else { duration + 10.0 };
             let ticket = ctx.arm_child(&mut inner, &phase, limit_s);
-            (ticket, before)
+            (ticket, before, stroke_speed)
         };
         match ctx.wait_child(ticket.ok_or(crate::macro_action::Stop::Cancelled)?).await {
             Ok(_) => {}
@@ -551,10 +557,10 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
             let (from_start, to_end) = ((q - rec.start_rad) * sign, (rec.end_rad - q) * sign);
             if from_start < crate::gripper_baseline::LEARN_START_GUARD_RAD || to_end < crate::gripper_baseline::LEARN_END_GUARD_RAD { continue; }
             mid += 1;
-            if v < CALIBRATION_MIN_SPEED_FRACTION * st.speed as f32 { slow += 1; }
+            if v < CALIBRATION_MIN_SPEED_FRACTION * stroke_speed as f32 { slow += 1; }
         }
         if mid > 0 && slow as f32 > CALIBRATION_SLOW_SHARE_MAX * mid as f32 {
-            return Err(obstructed(format!("stroke {n}: the jaw moved slower than {:.2} rad/s for {slow} of {mid} samples", CALIBRATION_MIN_SPEED_FRACTION * st.speed as f32)));
+            return Err(obstructed(format!("stroke {n}: the jaw moved slower than {:.2} rad/s for {slow} of {mid} samples", CALIBRATION_MIN_SPEED_FRACTION * stroke_speed as f32)));
         }
         let p95 = torque_quantile(&rec, 0.95);
         if p95 > limit_nm {
