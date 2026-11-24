@@ -70,3 +70,118 @@ pub(super) fn calibration_reject(request_id: &Value, e: &crate::calibration::Cal
     for (k, v) in e.reply_fields() { reply[k] = v; }
     reply
 }
+
+pub(super) fn is_calibration_path(path: &str) -> bool {
+    path == "/api/v1/calibration/apply"
+        || path == "/api/v1/calibration/restore"
+        || path == crate::motor_zero::PATH
+        || path == crate::motor_zero::RESTORE_PATH
+        || path == crate::mit::TIMEOUT_PATH
+        || path == crate::mit::QUALIFICATION_PATH
+}
+
+/// Dispatch a calibration command under the supervisor write lock.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_calibration_command(
+    inner: &mut SupervisorInner,
+    path: &str,
+    value: &Value,
+    local_generation: u64,
+    epoch: u64,
+    pending_calibration: &mut Option<(Value, CalibJob, u64, u64, bool)>,
+) -> Option<Value> {
+    match calibration_job(inner, path, &value["body"]) {
+        Ok(CalibStart::Job(job, busy)) => {
+            *pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy));
+            None
+        }
+        Ok(CalibStart::Reply(reply)) => Some(fields_ack(&value["request_id"], reply)),
+        Err(e) => Some(calibration_reject(&value["request_id"], &e)),
+    }
+}
+
+/// Spawn a tracked calibration job with owner-phase lease/auth/epoch checks and completion reply.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_calibration_job(
+    request_id: Value,
+    job: CalibJob,
+    generation: u64,
+    epoch: u64,
+    busy: bool,
+    recv_supervisor: &Arc<ArmSupervisor>,
+    recv_calib: &crate::calibration::CalibrationDeps,
+    recv_connection: &str,
+    recv_generation: &Arc<AtomicU64>,
+    ack_tx: &mpsc::Sender<Value>,
+    ws_auth: &WsAuth,
+    worker_tasks: &ConnectionTasks,
+) {
+    let (sup, calib, conn, gen_now, tx) = (
+        recv_supervisor.clone(),
+        recv_calib.clone(),
+        recv_connection.to_string(),
+        recv_generation.clone(),
+        ack_tx.clone(),
+    );
+    let ws_auth_c = ws_auth.clone();
+    let tasks_c = worker_tasks.clone();
+    worker_tasks.spawn(async move {
+        let check: crate::calibration::LeaseCheck = Box::new(move |inner: &mut SupervisorInner| {
+            if !ws_auth_c.is_operator() {
+                return Err(crate::calibration::CalibError::new(
+                    403,
+                    "OPERATOR_REQUIRED",
+                    "Operator session expired or locked during calibration",
+                ));
+            }
+            if gen_now.load(Ordering::SeqCst) != generation
+                || !inner.validate_servo_lease(&conn, generation)
+            {
+                return Err(crate::calibration::CalibError::new(
+                    409,
+                    "LEASE_LOST",
+                    "This connection lost the lease during the calibration",
+                ));
+            }
+            if inner.safety.epoch_id() != epoch {
+                return Err(crate::calibration::CalibError::new(
+                    409,
+                    "EPOCH_MISMATCH",
+                    "The epoch changed during the calibration (stop or e-stop)",
+                ));
+            }
+            Ok(())
+        });
+        // the busy flag is released by the guard, also when the job panics
+        let guard = busy.then(|| crate::calibration::BusyGuard::new(sup.clone()));
+        let job_sup = sup.clone();
+        let (job_tx, job_rx) = tokio::sync::oneshot::channel();
+        let job_abort = tasks_c.spawn_abortable(async move {
+            let res = match job {
+                CalibJob::Apply(req) => crate::calibration::apply(&job_sup, &calib, *req, &check).await,
+                CalibJob::Restore(body) => crate::calibration::restore(&job_sup, &calib, &body, &check).await,
+                CalibJob::MotorZero(req) => crate::motor_zero::run(&job_sup, &calib, req, &check).await,
+                CalibJob::JointZeroRestore(name) => crate::motor_zero::restore(&job_sup, &calib, name, &check).await,
+                CalibJob::MitQualification(file) => crate::mit::store_qualification(&job_sup, &calib, *file, &check).await,
+            };
+            let _ = job_tx.send(res);
+        });
+        let _abort_inner = actions::AbortOnDrop(job_abort);
+        let result = job_rx.await.unwrap_or_else(|e| {
+            tracing::error!("calibration task failed: {e}");
+            Err(crate::calibration::CalibError::new(
+                500,
+                "INTERNAL",
+                format!("calibration task failed: {e}; check GET /api/v1/calibration and the backups"),
+            ))
+        });
+        if let Some(g) = guard {
+            g.release().await;
+        }
+        let reply = match result {
+            Ok(v) => fields_ack(&request_id, v),
+            Err(e) => calibration_reject(&request_id, &e),
+        };
+        let _ = tx.send(reply).await;
+    });
+}
