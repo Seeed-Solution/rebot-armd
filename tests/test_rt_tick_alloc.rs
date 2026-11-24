@@ -484,11 +484,53 @@ fn observation_stop_reason_and_phase_transitions_do_not_touch_the_allocator() {
 /// allocator, and refuse a 9th concurrent stage (`PlansFull` / `None`).
 #[test]
 fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
-    use armd::rt_core::broker::{plan_slots, PLAN_SLOTS};
+    use armd::rt_core::broker::{plan_slots, PlanHandle, PlanReader, PlanWriter, PLAN_SLOTS};
     use armd::rt_core::mailbox::MAX_DOF;
     use armd::rt_core::ops::{
         PlanSlot, ALL_PLAN_SLOTS_PAYLOAD_BYTES, MAX_PATH_SAMPLES, PLAN_SLOT_PAYLOAD_BYTES,
     };
+
+    #[inline(never)]
+    fn run_plan_slot_cycle(
+        writer: &mut PlanWriter<PlanSlot>,
+        reader: &mut PlanReader<PlanSlot>,
+        handles: &mut [Option<PlanHandle>],
+        sample: &[f32; MAX_DOF],
+        samples_per_slot: usize,
+        expected_payload_bytes: usize,
+    ) -> ((bool, usize), u64, u64) {
+        let cap = handles.len();
+        let denom = samples_per_slot.saturating_sub(1).max(1) as f64;
+        counted(|| {
+            let mut total_payload_bytes = 0usize;
+            for (idx, slot_h) in handles.iter_mut().enumerate() {
+                let h = writer
+                    .stage(|slot| {
+                        slot.path.clear();
+                        for k in 0..samples_per_slot {
+                            slot.path.push(sample, k as f64 / denom).unwrap();
+                        }
+                    })
+                    .expect("slot available");
+                let pinned = reader.pin(h).expect("slot live");
+                assert_eq!(pinned.path.len(), samples_per_slot);
+                assert_eq!(pinned.path.capacity(), samples_per_slot);
+                assert_eq!(pinned.payload_bytes(), expected_payload_bytes);
+                assert_eq!(pinned.path.samples()[0][0], 0.25);
+                assert_eq!(pinned.path.samples()[samples_per_slot - 1][MAX_DOF - 1], 0.25);
+                total_payload_bytes += pinned.payload_bytes();
+                drop(pinned);
+                *slot_h = Some(h);
+                assert_eq!(writer.free(), cap - 1 - idx);
+            }
+            let exhausted = writer.stage(|_| {}).is_none();
+            for h in handles.iter().flatten().copied() {
+                assert!(reader.retire(h));
+            }
+            assert_eq!(writer.reclaim(), cap);
+            (exhausted, total_payload_bytes)
+        })
+    }
 
     assert_eq!(PLAN_SLOTS, 8);
     assert_eq!(MAX_PATH_SAMPLES, 2048);
@@ -498,25 +540,17 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
 
     let sample = [0.25f32; MAX_DOF];
     let mut handles = [None; PLAN_SLOTS];
-    let mut total_payload_bytes = 0usize;
 
-    // Warm up the staging/pin/retire/reclaim code pages on a 1-slot scratch pool so first-call
-    // `.text` / stack page faults are settled before we construct and measure the 8-slot pool.
+    // Warm up the exact monomorphized staging/pin/retire/reclaim code pages and stack frame on a
+    // 1-slot scratch pool so no demand-paged `.text` or stack minor fault can fire during the
+    // 8-slot measurement regardless of binary page-boundary layout.
     {
         let (mut w0, mut r0) = plan_slots(1, || PlanSlot::with_path_capacity(1));
-        let ((), a0, f0) = counted(|| {
-            let h = w0.stage(|s| { s.path.clear(); s.path.push(&sample, 0.0).unwrap(); }).unwrap();
-            let p = r0.pin(h).unwrap();
-            assert_eq!(p.path.len(), 1);
-            assert_eq!(p.path.capacity(), 1);
-            assert!(p.payload_bytes() > 0);
-            assert_eq!(p.path.samples()[0][0], 0.25);
-            drop(p);
-            assert_eq!(w0.free(), 0);
-            assert!(w0.stage(|_| {}).is_none());
-            assert!(r0.retire(h));
-            assert_eq!(w0.reclaim(), 1);
-        });
+        let mut h0 = [None; 1];
+        let payload0 = PlanSlot::with_path_capacity(1).payload_bytes();
+        let ((ex0, bytes0), a0, f0) = run_plan_slot_cycle(&mut w0, &mut r0, &mut h0, &sample, 1, payload0);
+        assert!(ex0);
+        assert_eq!(bytes0, payload0);
         assert_eq!((a0, f0), (0, 0));
     }
 
@@ -538,34 +572,14 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
 
     // Filling all 8 pre-faulted slots to MAX_PATH_SAMPLES, pinning, reading, retiring and
     // reclaiming must perform zero allocations, zero frees, and zero page faults.
-    let (exhausted_none, allocs, frees) = counted(|| {
-        for (idx, slot_h) in handles.iter_mut().enumerate() {
-            let h = writer
-                .stage(|slot| {
-                    slot.path.clear();
-                    for k in 0..MAX_PATH_SAMPLES {
-                        slot.path.push(&sample, k as f64 / (MAX_PATH_SAMPLES - 1) as f64).unwrap();
-                    }
-                })
-                .expect("slot available");
-            let pinned = reader.pin(h).expect("slot live");
-            assert_eq!(pinned.path.len(), MAX_PATH_SAMPLES);
-            assert_eq!(pinned.path.capacity(), MAX_PATH_SAMPLES);
-            assert_eq!(pinned.payload_bytes(), PLAN_SLOT_PAYLOAD_BYTES);
-            assert_eq!(pinned.path.samples()[0][0], 0.25);
-            assert_eq!(pinned.path.samples()[MAX_PATH_SAMPLES - 1][MAX_DOF - 1], 0.25);
-            total_payload_bytes += pinned.payload_bytes();
-            drop(pinned);
-            *slot_h = Some(h);
-            assert_eq!(writer.free(), PLAN_SLOTS - 1 - idx);
-        }
-        let exhausted = writer.stage(|_| {}).is_none();
-        for h in handles.iter().flatten().copied() {
-            assert!(reader.retire(h));
-        }
-        assert_eq!(writer.reclaim(), PLAN_SLOTS);
-        exhausted
-    });
+    let ((exhausted_none, total_payload_bytes), allocs, frees) = run_plan_slot_cycle(
+        &mut writer,
+        &mut reader,
+        &mut handles,
+        &sample,
+        MAX_PATH_SAMPLES,
+        PLAN_SLOT_PAYLOAD_BYTES,
+    );
 
     #[cfg(target_os = "linux")]
     {
