@@ -333,6 +333,111 @@ async function assertReachable(page, sel, label) {
   assert(info.hitMatches, `${label}: elementFromPoint missed ${sel}, hit ${info.hitDesc}`);
 }
 
+async function assertControlInputsState(page, expectedState, label) {
+  assert(expectedState === 'unavailable' || expectedState === 'active', `${label}: invalid expectedState=${expectedState}`);
+  const errors = await page.evaluate((exp) => {
+    const errs = [];
+    const wantActive = exp === 'active';
+    const hasCtrl = typeof pageHasControl === 'function' ? pageHasControl() : null;
+    if (hasCtrl !== wantActive) errs.push(`pageHasControl()=${hasCtrl} (expected ${wantActive})`);
+    const bodyUnavail = document.body.classList.contains('controls-unavailable');
+    if (bodyUnavail !== !wantActive) errs.push(`body.controls-unavailable=${bodyUnavail} (expected ${!wantActive})`);
+
+    const coreSelectors = [
+      '#pad-sxy', '#pad-srot', '#pad-sz', '#pad-sgrip',
+      'button.preset[data-preset="home"]', 'button.preset[data-preset="inspect"]', 'button.preset[data-preset="park"]',
+      '#btn-home', '#btn-pose', '#grip-range',
+      '#pad-left', '#pad-wrist', '#pad-right', '#pad-cxy', '#pad-cz', '#pad-cp', '#btn-gc',
+    ];
+    for (const sel of coreSelectors) {
+      const el = document.querySelector(sel);
+      if (!el) { errs.push(`missing required element ${sel}`); continue; }
+      if (el.dataset.controlState !== exp) errs.push(`${sel} controlState=${JSON.stringify(el.dataset.controlState)} (expected ${exp})`);
+    }
+
+    const jbtns = [...document.querySelectorAll('.jbtn')];
+    if (jbtns.length < 1) {
+      errs.push(`expected >= 1 .jbtn elements, found ${jbtns.length}`);
+    } else {
+      jbtns.forEach((el, idx) => {
+        if (el.dataset.controlState !== exp) errs.push(`.jbtn[${idx}] controlState=${JSON.stringify(el.dataset.controlState)} (expected ${exp})`);
+      });
+    }
+
+    const isVisible = (el) => {
+      if (!el) return false;
+      const cs = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    };
+    const checkOpacity = (el, desc) => {
+      const opacity = parseFloat(getComputedStyle(el).opacity);
+      if (exp === 'unavailable' && !(opacity < 0.75)) errs.push(`${desc} opacity=${opacity} (expected < 0.75)`);
+      else if (exp === 'active' && !(opacity > 0.95)) errs.push(`${desc} opacity=${opacity} (expected > 0.95)`);
+    };
+    const checkKnobBg = (pad, desc) => {
+      const knob = pad.matches('.disc, .pad') ? pad.querySelector('.knob') : pad.querySelector('.disc .knob, .pad .knob');
+      if (!knob || !isVisible(knob)) { errs.push(`${desc} visible without visible .knob`); return false; }
+      const knobBg = getComputedStyle(knob).backgroundColor;
+      const m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(knobBg);
+      if (!m) { errs.push(`${desc} .knob unparseable knobBg=${JSON.stringify(knobBg)}`); return true; }
+      const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
+      const isGreen = (g - r >= 25 && g - b >= 60);
+      if (exp === 'unavailable' && isGreen) errs.push(`${desc} .knob knobBg=${knobBg} is green (expected non-green/grey)`);
+      else if (exp === 'active' && !isGreen) errs.push(`${desc} .knob knobBg=${knobBg} is not green (expected g-r>=25 && g-b>=60)`);
+      return true;
+    };
+
+    const poseGos = [...document.querySelectorAll('.pose-go')];
+    poseGos.forEach((el, idx) => {
+      if (el.dataset.controlState !== exp) errs.push(`.pose-go[${idx}] controlState=${JSON.stringify(el.dataset.controlState)} (expected ${exp})`);
+      if (isVisible(el)) checkOpacity(el, `.pose-go[${idx}]`);
+    });
+
+    const isSimple = document.body.classList.contains('ui-simple');
+    const isExpert = document.body.classList.contains('ui-expert');
+
+    const simpleSelectors = [
+      '#pad-sxy', '#pad-srot', '#pad-sz', '#pad-sgrip',
+      'button.preset[data-preset="home"]', 'button.preset[data-preset="inspect"]', 'button.preset[data-preset="park"]',
+    ];
+    let simpleChecked = 0;
+    for (const sel of simpleSelectors) {
+      const el = document.querySelector(sel);
+      if (!el || !isVisible(el)) continue;
+      simpleChecked++;
+      checkOpacity(el, sel);
+    }
+    if (isSimple && simpleChecked < 6) errs.push(`expected >= 6 visible simple controls, checked ${simpleChecked}`);
+
+    let knobsChecked = 0;
+    for (const sel of ['#pad-sxy', '#pad-srot', '#pad-sz', '#pad-sgrip']) {
+      const pad = document.querySelector(sel);
+      if (!pad || !isVisible(pad)) continue;
+      if (checkKnobBg(pad, sel)) knobsChecked++;
+    }
+    if (isSimple && knobsChecked < 3) errs.push(`expected >= 3 visible pad knobs, checked ${knobsChecked}`);
+
+    if (isExpert) {
+      const expertEls = [...new Set([...document.querySelectorAll('.pad, .grip-slider, #btn-home, .jbtn')])];
+      let expertChecked = 0, expertKnobsChecked = 0;
+      for (const el of expertEls) {
+        if (!isVisible(el)) continue;
+        const desc = el.id ? `#${el.id}` : `.${[...el.classList].join('.')}`;
+        expertChecked++;
+        checkOpacity(el, desc);
+        if (el.classList.contains('pad') && checkKnobBg(el, desc)) expertKnobsChecked++;
+      }
+      if (expertChecked < 2) errs.push(`expected >= 2 visible expert controls, checked ${expertChecked}`);
+      const isExpertStick = document.body.classList.contains('mode-stick') || document.body.classList.contains('input-stick');
+      if (isExpertStick && expertKnobsChecked < 1) errs.push(`expected >= 1 visible expert .pad .knob, checked ${expertKnobsChecked}`);
+    }
+
+    return errs;
+  }, expectedState);
+  assert.equal(errors.length, 0, `${label} (${expectedState}) control inputs check failed:\n  - ${errors.join('\n  - ')}`);
+}
+
 const clearToasts = (page) => page.evaluate(() => { const tc = document.getElementById('toasts'); if (tc) tc.textContent = ''; });
 const getToasts = (page) => page.evaluate(() => ({ all: [...document.querySelectorAll('#toasts .toast')].map((e) => e.textContent).join(' | '), warns: [...document.querySelectorAll('#toasts .toast.warn')].map((e) => e.textContent).join(' | '), count: document.querySelectorAll('#toasts .toast').length }));
 const startToastWatch = (page) => page.evaluate(() => {
@@ -510,6 +615,7 @@ async function main() {
         assert.equal(st.gen, null);
         assert.equal((await getObs(PORT_MAIN)).lease_holder, null);
         assert(!st.lsHidden && st.lsCls.includes('is-readonly') && /Read-only|No holder/i.test(st.lsTxt) && st.lrHidden);
+        await assertControlInputsState(page, 'unavailable', 'Scenario 1 cold load en-US');
 
         await page.click('#btn-lang'); await page.waitForTimeout(120);
         assert(/只读/.test(await page.textContent('#lease-status-txt')));
@@ -524,6 +630,7 @@ async function main() {
         assert.equal(rec.byType('acquire_lease').length, 0);
         assert.equal(await page.evaluate(() => S.leaseGeneration), null);
         assert.equal((await getObs(PORT_MAIN)).lease_holder, null);
+        await assertControlInputsState(page, 'unavailable', 'Scenario 1 reload en-US');
         guards.assertClean('Scenario 1 en-US');
       } finally { await ctx.close(); }
 
@@ -536,6 +643,7 @@ async function main() {
           await waitForCockpitLive(zhPage); await zhPage.waitForTimeout(600);
           assert(zhRec.byType('acquire_lease').length === 0 && await zhPage.evaluate(() => S.leaseGeneration) === null
             && (await getObs(PORT_MAIN)).lease_holder === null && /只读|无控制方/.test(await zhPage.textContent('#lease-status-txt')));
+          await assertControlInputsState(zhPage, 'unavailable', 'Scenario 1 ' + step + ' zh-CN');
         }
         zhGuards.assertClean('Scenario 1 zh-CN');
         log('PASS Scenario 1: en-US + fresh zh-CN cold load & reload sent 0 acquire_lease, read-only confirmed.');
@@ -582,6 +690,7 @@ async function main() {
         const acq3 = rec.byType('acquire_lease', m3);
         assert.equal(acq3.length, 1); assert.equal(acq3[0].json.force, false);
         assert(await page.evaluate(() => !document.getElementById('lease-status').hidden && document.getElementById('lease-status').className.includes('is-own')));
+        await assertControlInputsState(page, 'active', 'Scenario 3 after Enable');
         const shot3 = path.join(SHOT_DIR, 'cockpit_after_enable_in_control.png');
         await page.screenshot({ path: shot3 }); log(`Saved screenshot: ${shot3}`);
         guards.assertClean('Scenario 3');
@@ -590,20 +699,57 @@ async function main() {
         log('=== Scenario 4: Reconnect after holding lease ===');
         const m4 = rec.mark(), wsBefore4 = rec.wsCount;
         await page.evaluate(() => { S.ws.close(); });
-        await assertReadOnlyReconnect(page, rec, wsBefore4, { waitAfterMs: 2200, timeoutMs: 6000, label: 'Scenario 4 reconnect' });
-        assert.equal(rec.byType('acquire_lease', m4).length, 0);
+        await waitFor(() => rec.wsCount > wsBefore4, { timeoutMs: 6000, label: 'Scenario 4 replacement WS' });
+        await waitForCockpitLive(page, 6000);
+        await waitFn(page, () => !document.getElementById('lease-released').hidden && S.leaseGeneration === null, null, 4000);
         const st4 = await page.evaluate(() => ({
+          state: S.state,
+          torqued: S.obs?.is_torqued === true,
+          enableTxt: document.getElementById('enable-txt')?.textContent?.trim(),
           lrHidden: document.getElementById('lease-released').hidden,
           lrTxt: document.getElementById('lease-released-txt').textContent.trim(),
           retakeVis: document.getElementById('btn-retake').offsetParent !== null,
           retakeTxt: document.getElementById('btn-retake').textContent.trim(),
           lsCls: document.getElementById('lease-status').className,
         }));
+        assert(st4.state === 'Armed' && st4.torqued, `Scenario 4 expected Armed/torqued on reconnect, got ${JSON.stringify(st4)}`);
+        assert.equal(st4.enableTxt, 'Torque on · not in control', `Scenario 4 EN #enable-txt mismatch: "${st4.enableTxt}"`);
         assert(!st4.lrHidden && st4.retakeVis && st4.lsCls.includes('is-released'));
         assert(/Control released/i.test(st4.lrTxt), `Scenario 4 banner text: "${st4.lrTxt}"`);
         assert(/Take control/i.test(st4.retakeTxt), `Scenario 4 retake text: "${st4.retakeTxt}"`);
+
+        await page.click('#btn-lang');
+        await waitFn(page, () => document.getElementById('enable-txt')?.textContent?.trim() === '力矩已开 · 未控制', null, 1000);
+        await page.click('#btn-lang');
+        await waitFn(page, () => document.getElementById('enable-txt')?.textContent?.trim() === 'Torque on · not in control', null, 1000);
+
+        await assertControlInputsState(page, 'unavailable', 'Scenario 4 reconnect while torqued');
         const shot4 = path.join(SHOT_DIR, 'cockpit_reconnect_control_released.png');
         await page.screenshot({ path: shot4 }); log(`Saved screenshot: ${shot4}`);
+
+        for (const padSel of ['#pad-sxy', '#pad-sz', '#pad-sgrip']) {
+          const box = await (await page.waitForSelector(padSel, { state: 'visible', timeout: 2000 })).boundingBox();
+          assert(box && box.width > 0 && box.height > 0, `${padSel} has no boundingBox`);
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+          await page.mouse.down();
+          await page.mouse.up();
+          await waitShown(page, '#take-modal');
+          await page.click('#take-cancel');
+          await waitHidden(page, '#take-modal');
+        }
+        for (const presetSel of ['button[data-preset="home"]', 'button[data-preset="inspect"]', 'button[data-preset="park"]']) {
+          await page.click(presetSel);
+          await waitShown(page, '#take-modal');
+          await page.click('#take-cancel');
+          await waitHidden(page, '#take-modal');
+        }
+        assert.equal(rec.byType('acquire_lease', m4).length, 0);
+
+        await page.waitForTimeout(2200);
+        assert.equal(rec.byType('acquire_lease', m4).length, 0);
+        assert.equal(await page.evaluate(() => S.leaseGeneration), null);
+        assert.equal(await page.evaluate(() => !document.getElementById('lease-released').hidden), true);
+        await assertControlInputsState(page, 'unavailable', 'Scenario 4 reconnect settled');
 
         const m4Retake = rec.mark();
         await page.click('#btn-retake');
@@ -611,6 +757,15 @@ async function main() {
         const acq4 = rec.byType('acquire_lease', m4Retake);
         assert.equal(acq4.length, 1); assert.equal(acq4[0].json.force, false);
         assert.equal((await getObs(PORT_MAIN)).lease_holder, clientId);
+        if (await page.evaluate(() => S.state === 'Moving')) {
+          await waitFn(page, () => S.state === 'Idle' || S.state === 'Armed', null, 5000);
+        }
+        if (await page.evaluate(() => S.state !== 'Armed')) {
+          await holdButton(page, '#btn-enable', 750);
+          await waitFn(page, () => S.state === 'Armed' && S.obs?.is_torqued === true && S.leaseGeneration != null, null, 6000);
+        }
+        assert.equal(rec.byType('acquire_lease', m4Retake).length, 1);
+        await assertControlInputsState(page, 'active', 'Scenario 4 after Retake + Armed');
         guards.assertClean('Scenario 4');
         log('PASS Scenario 4: reconnect sent 0 acquire_lease, showed localized Control released banner, #btn-retake sent 1 acquire_lease.');
       } finally { await ctx.close(); }
@@ -665,7 +820,7 @@ async function main() {
         assert.equal(wsRoute.byType('heartbeat', m6a2).filter((f) => f.json.generation === gen6a2).length, 0);
         assert.equal((await getObs(PORT_MAIN)).lease_holder, null);
         await waitFor(async () => { const o = await getObs(PORT_MAIN); return !o.is_torqued && o.safety_state === 'Idle' && o.lease_holder === null; }, { timeoutMs: 8000, label: '6(a2) park -> Idle' });
-        await waitFn(page, () => S.state === 'Idle' && S.obs?.lease_holder == null);
+        await waitFn(page, () => S.state === 'Idle' && S.obs?.lease_holder == null && document.getElementById('enable-txt')?.textContent?.trim() === 'Enable' && !document.getElementById('btn-enable').disabled);
         log(`PASS 6(a2): held Escape during pending acquire gen=${gen6a2} sent 0 stop, repeats preserved controlEpoch, reconciled with release_lease.`);
 
         // 6(b): Withheld ACK timeout recovery (bounded timing, pending check, timeout toast, 0 hb/motion)
@@ -1097,6 +1252,10 @@ async function main() {
         await page.evaluate(() => { S.ws.close(); });
         await waitForCockpitLive(page, 6000);
         await ensureArmedUnleased(PORT_INTERACT, page);
+        await assertControlInputsState(page, 'unavailable', 'Scenario 5(e) expert cart unleased');
+        await page.click('#input-seg button[data-input="stick"]');
+        await assertControlInputsState(page, 'unavailable', 'Scenario 5(e) expert stick unleased');
+        await page.click('#input-seg button[data-input="btn"]');
         const m5eOpen = wsRoute.mark();
         await dragSlider(page, gripBox, 0.2, 0.65);
         await waitShown(page, '#take-modal');
@@ -1107,6 +1266,10 @@ async function main() {
         await page.keyboard.down('ArrowRight');
         await page.click('#take-confirm');
         await waitFn(page, () => S.leaseGeneration != null && document.getElementById('take-modal').hidden);
+        await assertControlInputsState(page, 'active', 'Scenario 5(e) expert cart active');
+        await page.click('#input-seg button[data-input="stick"]');
+        await assertControlInputsState(page, 'active', 'Scenario 5(e) expert stick active');
+        await page.click('#input-seg button[data-input="btn"]');
         assert.equal(wsRoute.byType('acquire_lease', m5e).length, 1);
         await page.focus('#grip-range');
         for (let i = 0; i < 3; i++) await page.keyboard.down('ArrowRight');
@@ -1414,7 +1577,11 @@ async function main() {
         extObs = await new ExternalWsClient(PORT_AUTH, 'ext-obs').connect();
         await extObs.auth(opToken);
         await extObs.acquireLease({ force: true, heartbeat: true });
-        await waitFn(page, () => S.leaseGeneration === null && S.obs?.lease_holder === 'ext-obs' && document.getElementById('lease-status').className.includes('is-other'));
+        await extObs.command('/api/v1/torque', { enable: true });
+        await waitFn(page, () => S.leaseGeneration === null && S.obs?.lease_holder === 'ext-obs' && S.state === 'Armed' && S.obs?.is_torqued === true && document.getElementById('lease-status').className.includes('is-other'), null, 5000);
+        assert.equal(await page.evaluate(() => document.getElementById('enable-txt')?.textContent?.trim()), 'Torque on · not in control');
+        assert.equal(await page.evaluate(() => document.getElementById('btn-enable').disabled), true);
+        await assertControlInputsState(page, 'unavailable', 'Scenario 7(c) observer armed');
 
         await clearToasts(page);
         assert.equal(await page.evaluate(() => document.getElementById('btn-stop').disabled), false);
