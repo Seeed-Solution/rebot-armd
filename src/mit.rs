@@ -219,11 +219,33 @@ impl MitQualificationFile {
     }
 }
 
+/// Zero-allocation bitmask of 0-based arm joint indices selected for MIT
+/// (0 when MIT is not requested; supports up to 64 joints without heap allocation).
+pub fn mit_joint_mask(cfg: &ArmConfig) -> u64 {
+    let Some(jt) = cfg.joint_tracking.as_ref().filter(|jt| jt.mit_requested()) else {
+        return 0;
+    };
+    let arm = cfg.arm_joints();
+    let mut mask = 0u64;
+    for (k, j) in jt.joints.iter().enumerate() {
+        if j.strategy == crate::tracking::TrackingStrategy::Mit {
+            if let Some(&idx) = arm.get(k) {
+                if idx < 64 {
+                    mask |= 1u64 << idx;
+                }
+            }
+        }
+    }
+    mask
+}
+
 /// 0-based arm joint indices selected for MIT (empty when MIT is not requested).
 pub fn mit_joints(cfg: &ArmConfig) -> Vec<usize> {
-    let Some(jt) = cfg.joint_tracking.as_ref().filter(|jt| jt.mit_requested()) else { return Vec::new() };
-    let arm = cfg.arm_joint_indices();
-    jt.mit_joint_slots().into_iter().filter_map(|k| arm.get(k).copied()).collect()
+    let mask = mit_joint_mask(cfg);
+    if mask == 0 {
+        return Vec::new();
+    }
+    (0..cfg.dof.min(64)).filter(|&i| (mask & (1u64 << i)) != 0).collect()
 }
 
 /// Profile-level MIT rules (only for an enabled block with `mit` joints): gain ceilings from the
@@ -542,15 +564,26 @@ fn quantize_into(tau: f32, lo: f32, hi: f32, l: &damiao::DamiaoLimits) -> Option
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::supervisor::SupervisorInner {
     fn mit_slot(&self, j: usize) -> Option<&crate::tracking::JointTrackingJoint> {
-        let k = self.config.arm_joint_indices().iter().position(|&a| a == j)?;
+        let k = self.config.arm_joints().iter().position(|&a| a == j)?;
         self.config.joint_tracking.as_ref()?.joints.get(k)
     }
 
     pub fn mit_active(&self) -> bool { self.mit.owner == MitOwner::Active }
 
+    /// Zero-allocation MIT motion blocker check (fixed `u64` bitmask, no `Vec`, no `String`):
+    /// true when MIT is requested on an armed arm but does not currently own its joints.
+    pub fn mit_motion_blocked(&self) -> bool {
+        if !self.is_torqued || mit_joint_mask(&self.config) == 0 {
+            return false;
+        }
+        self.mit.park_after_hand_back
+            || self.mit.revoke_pending
+            || self.mit.owner != MitOwner::Active
+    }
+
     /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
     pub fn mit_motion_blocker(&self) -> Option<String> {
-        if !self.is_torqued || mit_joints(&self.config).is_empty() { return None; }
+        if !self.mit_motion_blocked() { return None; }
         if self.mit.park_after_hand_back { return Some("a park waits for the MIT hand back at rest".into()); }
         if self.mit.revoke_pending { return Some("MIT authorization revoked: braking to rest and handing back".into()); }
         match self.mit.owner {
@@ -982,8 +1015,7 @@ impl crate::supervisor::SupervisorInner {
     /// control of an armed arm whose qualification passed at this arm, with nothing else owning
     /// the output (no motion, park, gravity compensation, hold or fault).
     pub(crate) fn mit_maybe_activate(&mut self) {
-        let joints = mit_joints(&self.config);
-        if joints.is_empty() || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
+        if mit_joint_mask(&self.config) == 0 || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
             || self.disable_pending || self.pending_rearm || self.pending_normal_unload || self.gravity_comp.is_some()
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
             || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
@@ -992,6 +1024,7 @@ impl crate::supervisor::SupervisorInner {
             || !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() {
             return;
         }
+        let joints = mit_joints(&self.config);
         let g = match self.mit_gravity() {
             Ok(g) => g,
             Err(e) => { self.mit.handover_error = Some(e); self.mit.armed_ok = false; return; }

@@ -7479,7 +7479,7 @@ impl ArmSupervisor {
                 message: "Cannot transfer ownership while policy runtime is active or loading".into(),
             });
         }
-        if !crate::mit::mit_joints(&guard.config).is_empty() {
+        if crate::mit::mit_joint_mask(&guard.config) != 0 {
             restore_legacy(&mut rollback);
             return Err(ArmError::Rejected {
                 status: 503,

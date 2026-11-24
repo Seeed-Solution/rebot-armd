@@ -381,6 +381,8 @@ fn a6_prepared_actions_commit_and_complete_on_rt_executor() {
             sample_dt: 0.02,
             duration_s: 0.8,
             power_scale: None,
+            approach_duration_s: 0.2,
+            approach_power_scale: None,
             tool_digest,
         },
     );
@@ -816,6 +818,8 @@ fn a7_macro_begin_children_and_finish_lifecycle_with_independent_terminal() {
             sample_dt: 0.02,
             duration_s: 0.4,
             power_scale: None,
+            approach_duration_s: 0.2,
+            approach_power_scale: None,
             tool_digest: snap.env.tool_digest_hash,
         },
     );

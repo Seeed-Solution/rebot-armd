@@ -114,11 +114,21 @@ pub enum PathKind {
     /// run over `duration_s` with the quintic time law of a Cartesian path.
     Cartesian,
     /// Recorded samples every `sample_dt` s of recorded time (`duration_s` recorded), played
-    /// at `speed` after an approach quintic from the commanded position to the first sample
-    /// (planned at the commit: no IK). `gripper` false keeps the gripper's command.
+    /// at `speed` after a pre-planned approach quintic (`approach_duration_s`, optional
+    /// `approach_power_scale`) from the commanded position to the first sample (planned,
+    /// power-fitted, and workspace-swept off-thread at prepare time; install verifies start
+    /// position only). `gripper` false keeps the gripper's command.
     /// `tool_digest`: [`tool_digest_hash`] of the active tool the worker checked the
     /// episode's tool provenance against (`TOOL_MISMATCH` at the commit when it changed).
-    Replay { episode: EpisodeRef, speed: f32, gripper: bool, sample_dt: f64, tool_digest: u64 },
+    Replay {
+        episode: EpisodeRef,
+        speed: f32,
+        gripper: bool,
+        sample_dt: f64,
+        approach_duration_s: f64,
+        approach_power_scale: Option<f64>,
+        tool_digest: u64,
+    },
 }
 
 /// FNV-1a hash of a tool configuration digest (no allocation): the prepared replay names the
@@ -942,19 +952,37 @@ impl CoreOps for SupervisorInner {
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }
-            PathKind::Replay { .. } => {
+            PathKind::Replay { approach_duration_s, approach_power_scale, .. } => {
                 if !start_matches(&start[..n], &self.commanded_positions) {
                     return Err("PLAN_STALE");
                 }
                 match child {
                     None => {
                         let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
-                        let prepared = self.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch).map_err(static_code)?;
+                        let prepared = self.prepared_replay_from_slot_preplanned(
+                            n,
+                            slot,
+                            checked,
+                            duration_s,
+                            power_scale,
+                            approach_duration_s,
+                            approach_power_scale,
+                        )?;
                         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        let prepared = this.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch)?;
+                        let checked = this.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)
+                            .map_err(|code| ArmError::Rejected { status: 409, code: code.into(), message: code.into() })?;
+                        let prepared = this.prepared_replay_from_slot_preplanned(
+                            n,
+                            slot,
+                            checked,
+                            duration_s,
+                            power_scale,
+                            approach_duration_s,
+                            approach_power_scale,
+                        ).map_err(|code| ArmError::Rejected { status: 409, code: code.into(), message: code.into() })?;
                         let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
                         SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),

@@ -1460,7 +1460,7 @@ impl SupervisorInner {
         if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
         if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
         if self.macro_run.as_ref().is_some_and(|m| m.finishing) { return Err("MOTION_BUSY"); }
-        if self.mit_motion_blocker().is_some() { return Err("PLAN_STALE"); }
+        if self.mit_motion_blocked() { return Err("PLAN_STALE"); }
         if self.calibration_busy
             || self.zero_check_persisting.is_some()
             || self.active_trajectory.is_some()

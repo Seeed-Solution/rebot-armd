@@ -303,7 +303,8 @@ pub enum StagedAction {
         /// `speed_scale` checked against `commissioning_required` off-thread.
         speed_scale: Option<f64>,
     },
-    /// Prepared episode replay (resampled trajectory lives in `PlanSlot::path`).
+    /// Prepared episode replay (resampled trajectory lives in `PlanSlot::path`; approach quintic
+    /// to frame 0 is pre-planned, power-fitted, and workspace-swept off-thread at prepare time).
     Replay {
         child: Option<ChildSpec>,
         dof: u8,
@@ -314,6 +315,8 @@ pub enum StagedAction {
         sample_dt: f64,
         duration_s: f64,
         power_scale: Option<f64>,
+        approach_duration_s: f64,
+        approach_power_scale: Option<f64>,
         tool_digest: u64,
     },
 }
@@ -1735,6 +1738,8 @@ impl PreparedReplayAction {
             sample_dt: self.plan.sample_dt,
             duration_s: self.plan.duration,
             power_scale: self.plan.power_scale,
+            approach_duration_s: self.plan.approach.duration,
+            approach_power_scale: self.plan.approach_power_scale,
             tool_digest: self.tool_digest,
         });
         Ok(slot)
@@ -2074,27 +2079,8 @@ pub fn prepare_replay_from_input(
 ) -> Result<PreparedReplayAction, ArmError> {
     let plan = replay::plan(input)?;
     let tool_digest = snap.env.tool_digest_hash;
-    // Estimate expected duration deterministically from start -> samples[0] approach + recorded / speed + 0.5 s.
-    let mut first = plan.samples[0].clone();
-    if let (false, Some(g)) = (plan.input.request.gripper, snap.env.config.gripper_index()) {
-        if g < first.len() && g < snap.commanded_positions.len() {
-            first[g] = snap.commanded_positions[g];
-        }
-    }
-    let limits = snap.env.planning_limits(None);
-    let zeros = vec![0.0f32; snap.env.config.dof];
-    let approach_s = TrajectoryPlanner::plan(
-        &snap.commanded_positions,
-        &snap.commanded_velocities,
-        &first,
-        &zeros,
-        None,
-        &limits,
-    )
-    .map(|t| t.duration)
-    .unwrap_or(0.0);
     let eff_speed = plan.input.request.speed * plan.power_scale.unwrap_or(1.0);
-    let expected_duration_s = approach_s + plan.duration / eff_speed.max(1e-6) + 0.5;
+    let expected_duration_s = plan.approach.duration + plan.duration / eff_speed.max(1e-6) + 0.5;
     let mut stamp = snap.stamp;
     stamp.parent_generation = 0;
     stamp.poses_revision = None;
@@ -2537,6 +2523,8 @@ pub fn prepare_child_replay_slot(
         sample_dt: plan.sample_dt,
         duration_s: plan.duration,
         power_scale: plan.power_scale,
+        approach_duration_s: plan.approach.duration,
+        approach_power_scale: plan.approach_power_scale,
         tool_digest,
     });
     Ok(slot)
@@ -2599,7 +2587,7 @@ fn workspace_samples_and_check_off_lock(
     Ok(samples)
 }
 
-fn check_quintic_workspace_off_lock(
+pub(crate) fn check_quintic_workspace_off_lock(
     traj: &crate::trajectory::MultiJointQuinticTrajectory,
     start: &[f32],
     ws: &WorkspacePolicy,
@@ -3387,8 +3375,22 @@ pub fn install_replay(
             kind,
             duration_s,
             power_scale,
-        } => install_replay_slot_rt(inner, stamp, ctx, dof, &start, slot, kind, duration_s, power_scale)
-            .map_err(|code| ActionRefusal::new(code).into_arm_error(inner)),
+            approach_duration_s,
+            approach_power_scale,
+        } => install_replay_slot_rt(
+            inner,
+            stamp,
+            ctx,
+            dof,
+            &start,
+            slot,
+            kind,
+            duration_s,
+            power_scale,
+            approach_duration_s,
+            approach_power_scale,
+        )
+        .map_err(|code| ActionRefusal::new(code).into_arm_error(inner)),
     }
 }
 
@@ -3402,6 +3404,8 @@ pub enum ReplayInstallPayload {
         kind: PathKind,
         duration_s: f64,
         power_scale: Option<f64>,
+        approach_duration_s: f64,
+        approach_power_scale: Option<f64>,
     },
 }
 
@@ -3416,6 +3420,8 @@ fn install_replay_slot_rt(
     kind: PathKind,
     duration_s: f64,
     power_scale: Option<f64>,
+    approach_duration_s: f64,
+    approach_power_scale: Option<f64>,
 ) -> Result<InstalledAction, &'static str> {
     if dof == 0 || dof > MAX_DOF {
         return Err("INVALID_COMMAND");
@@ -3426,6 +3432,7 @@ fn install_replay_slot_rt(
     if inner.gravity_comp.is_some() {
         return Err("MOTION_BUSY");
     }
+    inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
     let checked = inner.validate_prepared_replay(
         dof,
         &slot.path,
@@ -3433,16 +3440,15 @@ fn install_replay_slot_rt(
         duration_s,
         stamp.admission.estop_epoch,
     )?;
-    let prepared = inner
-        .prepared_replay_from_slot_checked(
-            dof,
-            slot,
-            checked,
-            duration_s,
-            power_scale,
-            stamp.admission.estop_epoch,
-        )
-        .map_err(static_code)?;
+    let prepared = inner.prepared_replay_from_slot_preplanned(
+        dof,
+        slot,
+        checked,
+        duration_s,
+        power_scale,
+        approach_duration_s,
+        approach_power_scale,
+    )?;
     inner
         .check_terminal_fifo_for_new_action()
         .map_err(|e| static_code(e.into()))?;
@@ -4263,6 +4269,8 @@ fn install_macro_child_slot_rt(
             sample_dt,
             duration_s,
             power_scale,
+            approach_duration_s,
+            approach_power_scale,
             tool_digest,
             ..
         } => {
@@ -4271,6 +4279,8 @@ fn install_macro_child_slot_rt(
                 speed,
                 gripper,
                 sample_dt,
+                approach_duration_s,
+                approach_power_scale,
                 tool_digest,
             };
             let checked = inner.validate_prepared_replay(
@@ -4280,16 +4290,15 @@ fn install_macro_child_slot_rt(
                 duration_s,
                 stamp.admission.estop_epoch,
             )?;
-            let prepared = inner
-                .prepared_replay_from_slot_checked(
-                    dof,
-                    slot,
-                    checked,
-                    duration_s,
-                    power_scale,
-                    stamp.admission.estop_epoch,
-                )
-                .map_err(static_code)?;
+            let prepared = inner.prepared_replay_from_slot_preplanned(
+                dof,
+                slot,
+                checked,
+                duration_s,
+                power_scale,
+                approach_duration_s,
+                approach_power_scale,
+            )?;
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {
                 Ok(a) => a,
@@ -4515,6 +4524,8 @@ pub fn commit_action(
                     sample_dt,
                     duration_s,
                     power_scale,
+                    approach_duration_s,
+                    approach_power_scale,
                     tool_digest,
                     ..
                 } => install_replay_slot_rt(
@@ -4529,10 +4540,14 @@ pub fn commit_action(
                         speed,
                         gripper,
                         sample_dt,
+                        approach_duration_s,
+                        approach_power_scale,
                         tool_digest,
                     },
                     duration_s,
                     power_scale,
+                    approach_duration_s,
+                    approach_power_scale,
                 )?,
             };
             Ok(Committed::for_action(d, Some(ActionId(id))))

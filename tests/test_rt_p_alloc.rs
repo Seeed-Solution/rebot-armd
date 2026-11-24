@@ -415,6 +415,8 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
         sample_dt: 0.02,
         duration_s: 0.4,
         power_scale: None,
+        approach_duration_s: 0.2,
+        approach_power_scale: None,
         tool_digest: snap.env.tool_digest_hash,
     });
     let r4 = submit_prep(4, PreparedActionKind::Replay, replay_slot, snap.owner.authority, true);
@@ -801,4 +803,429 @@ async fn b2_pr_p_gripper_refusals_missing_torque_feedback_and_zero_quantized_spe
     );
     assert_eq!(handle2.stats().total_allocs(), AllocCounts::ZERO);
     handle2.stop_and_join();
+}
+
+#[test]
+fn b2_r2_m4_mit_motion_blocker_is_zero_alloc() {
+    // M4: `mit_joint_mask`, `mit_motion_blocked`, unblocked `mit_motion_blocker`, and
+    // prepared-action install refusal on an MIT-configured arm must perform strictly
+    // (0, 0, 0, 0) heap operations (no `Vec` allocation in `mit_joints` / `mit_motion_blocker`).
+    let mut jt = armd::tracking::JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    for j in &mut jt.joints {
+        j.strategy = armd::tracking::TrackingStrategy::Position;
+    }
+    jt.joints[3].strategy = armd::tracking::TrackingStrategy::Mit;
+    jt.joints[3].kp = 10.0;
+    jt.joints[3].kd = 0.3;
+    jt.joints[3].hold_kp = Some(12.0);
+    jt.joints[3].hold_kd = Some(0.4);
+    jt.joints[3].effort_limit_nm = 3.0;
+    jt.joints[3].gravity_scale = 1.0;
+
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let mut inner = SupervisorInner::new(cfg);
+    inner.lease_enabled = false;
+    inner.commanded_positions = INSPECT.to_vec();
+    inner.measured_positions = INSPECT.to_vec();
+    inner.target_positions = INSPECT.to_vec();
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    inner.config.joint_tracking = Some(jt);
+    inner.tick(0.02);
+
+    // Run on a dedicated thread so `TimedAlloc` counts ONLY our checked calls, exercising
+    // `mit_joint_mask`, `mit_motion_blocked`, unblocked `mit_motion_blocker`, AND the real
+    // `ReleaseFixture` + `Broker` prepared-install refusal path with an MIT-configured arm.
+    let boot = BootId(7);
+    let mut s_arr = [0.0f32; MAX_DOF];
+    let mut t_arr = [0.0f32; MAX_DOF];
+    let mv_arr = [1.0f32; MAX_DOF];
+    s_arr[..INSPECT.len()].copy_from_slice(&INSPECT);
+    t_arr[..INSPECT.len()].copy_from_slice(&INSPECT);
+    t_arr[0] += 0.04;
+    let mut slot = PlanSlot::default();
+    slot.set(Primitive::Action(StagedAction::Joint {
+        child: None,
+        kind: PreparedActionKind::MoveToJoint,
+        dof: INSPECT.len() as u8,
+        start: s_arr,
+        target: t_arr,
+        duration_s: 0.2,
+        max_velocity: mv_arr,
+        power_scale: None,
+        settle: true,
+        approach_then: None,
+    }));
+
+    let (mut fx, mut b, _tw, _stop) = armd::rt_core::ops::ReleaseFixture::new(
+        inner,
+        boot,
+        armd::rt_core::broker::Capacities::default(),
+    );
+    // Prewarm triple-buffer observation slots before entering the zero-alloc window.
+    for _ in 0..4 {
+        let _ = fx.step();
+    }
+    let auth = Authority {
+        epoch: fx.core.safety.epoch_id(),
+        stop_generation: fx.core.stop_gen.load(Ordering::Acquire),
+        lease_generation: 0,
+        config_revision: fx.core.workspace_revision,
+        parent_generation: 0,
+    };
+    let w = |dst: &mut PlanSlot| *dst = slot.clone();
+    let req = b
+        .submit(
+            ClientId(1),
+            1,
+            auth,
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w,
+                kind: PreparedActionKind::MoveToJoint,
+                prepared_boot: boot,
+                admission_request_id: 0,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+
+    std::thread::spawn(move || {
+        armd::diagnostics::alloc::time_this_thread();
+        let before = armd::diagnostics::alloc::snapshot_counts();
+
+        assert_eq!(armd::mit::mit_joint_mask(&fx.core.config), 1u64 << 3);
+
+        // MitOwner::Off -> blocked, real RT ReleaseFixture prepared install refused PLAN_STALE, 0 alloc!
+        fx.core.mit.owner = armd::mit::MitOwner::Off;
+        assert!(fx.core.mit_motion_blocked());
+        let rep = fx.step();
+        assert_eq!(rep.command, Some((req, Err("PLAN_STALE"))), "{rep:?}");
+
+        // MitOwner::Lost, revoke_pending, park_after_hand_back -> all blocked with 0 allocs!
+        fx.core.mit.owner = armd::mit::MitOwner::Lost;
+        assert!(fx.core.mit_motion_blocked());
+        fx.core.mit.owner = armd::mit::MitOwner::Active;
+        assert!(!fx.core.mit_motion_blocked());
+        assert!(fx.core.mit_motion_blocker().is_none());
+        fx.core.mit.revoke_pending = true;
+        assert!(fx.core.mit_motion_blocked());
+        fx.core.mit.revoke_pending = false;
+        fx.core.mit.park_after_hand_back = true;
+        assert!(fx.core.mit_motion_blocked());
+        fx.core.mit.park_after_hand_back = false;
+        assert!(!fx.core.mit_motion_blocked());
+        assert!(fx.core.mit_motion_blocker().is_none());
+
+        let after = armd::diagnostics::alloc::snapshot_counts();
+        assert_eq!(
+            after.delta_since(before),
+            AllocCounts::ZERO,
+            "mit_joint_mask / mit_motion_blocked / unblocked mit_motion_blocker / MIT refusal must be strictly 0-alloc"
+        );
+        // Drop heap-owning values outside the measured window.
+        drop(b);
+        drop(fx);
+    })
+    .join()
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b2_r2_m4_prepared_replay_approach_planned_off_thread_is_zero_alloc_on_rt() {
+    // M4: replay approach-to-first-frame (TrajectoryPlanner::plan + power_budget fit +
+    // workspace sweep) is planned OFF-thread at prepare time; on `armd-control`, install
+    // only verifies start position and constructs the inline quintic with strictly 0 allocs
+    // and 0 frees across BOTH standalone and macro-child replays.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut frame0 = INSPECT;
+    frame0[0] += 0.22; // displaced from INSPECT -> non-trivial approach quintic!
+    frame0[1] -= 0.10;
+    let mut frames = Vec::new();
+    for k in 0..=25 {
+        let f = k as f32 / 25.0;
+        let mut q = frame0.to_vec();
+        q[0] -= 0.08 * f;
+        frames.push(armd::recording::RecordFrame {
+            timestamp: 10.0 + k as f64 * 0.02,
+            observation_state: q.clone(),
+            action: q,
+        });
+    }
+    armd::recording::write_frames_to_parquet(&tmp.path().join("ep_displaced.parquet"), &frames)
+        .unwrap();
+
+    let clock = ScriptedClock::new();
+    let drv = ZeroAllocDriver::new(&INSPECT, clock.clone());
+    let mut cfg = ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    if let Some(pb) = cfg.power_budget.as_mut() {
+        pb.enabled = true;
+        pb.planning.enabled = true;
+    }
+    assert!(cfg.workspace.is_some(), "rebot_dm must have workspace enabled to prove off-thread sweep");
+    assert!(
+        cfg.power_budget.as_ref().is_some_and(|p| p.enabled && p.planning.enabled),
+        "rebot_dm must have planning power budget enabled to prove off-thread power fit"
+    );
+
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.episodes = armd::recording::EpisodeStore::new(Some(tmp.path().to_path_buf()));
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        inner.tick(0.02);
+        let env = armd::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner);
+        sup.hub().update_prep_env(Arc::new(env));
+    }
+
+    let period_ns = 20_000_000u64;
+    let mut ec = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
+    ec.alloc_timing = true;
+    let handle = sup
+        .start_executor_with_hooks(
+            ec,
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let boot = handle.boot();
+    clock.run_steps(period_ns, 2);
+
+    // 1) Off-thread prepare_replay plans, power-fits, and workspace-sweeps the approach once!
+    let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let prep = armd::rt_core::requests::actions::prepare_replay(
+        &snap,
+        &json!({"episode": "ep_displaced", "speed": 1.0, "gripper": false}),
+    )
+    .expect("off-thread prepare_replay must succeed");
+    assert!(
+        prep.plan.approach.duration > 0.15,
+        "displaced first frame must produce a non-trivial pre-planned approach, got {}",
+        prep.plan.approach.duration
+    );
+
+    // 2) Start-drift refusal on RT -> PLAN_STALE, 0 alloc!
+    let mut drifted_slot = prep.to_plan_slot(None).unwrap();
+    if let Primitive::Action(StagedAction::Replay { ref mut start, .. }) = drifted_slot.primitive {
+        start[0] += 0.05;
+    }
+    let w_drift = |dst: &mut PlanSlot| *dst = drifted_slot.clone();
+    let r_drift = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            1,
+            snap.owner.authority,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w_drift,
+                kind: PreparedActionKind::Replay,
+                prepared_boot: boot,
+                admission_request_id: 0,
+                check_workspace_revision: true,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 2);
+    let reps = drain(&handle);
+    assert!(
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_drift)),
+        "expected PLAN_STALE for drifted replay start, got {reps:?}"
+    );
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    // 3) Invalid preplanned approach duration (0.0) -> INVALID_COMMAND, 0 alloc!
+    let mut bad_dur_slot = prep.to_plan_slot(None).unwrap();
+    if let Primitive::Action(StagedAction::Replay { ref mut approach_duration_s, .. }) = bad_dur_slot.primitive {
+        *approach_duration_s = 0.0;
+    }
+    let w_bad = |dst: &mut PlanSlot| *dst = bad_dur_slot.clone();
+    let r_bad = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            2,
+            snap.owner.authority,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w_bad,
+                kind: PreparedActionKind::Replay,
+                prepared_boot: boot,
+                admission_request_id: 0,
+                check_workspace_revision: true,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 2);
+    let reps = drain(&handle);
+    assert!(
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "INVALID_COMMAND" } if *request == r_bad)),
+        "expected INVALID_COMMAND for 0 approach duration, got {reps:?}"
+    );
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    // 4) Accepted standalone replay with displaced pre-planned approach -> Completed, 0 alloc!
+    let ok_slot = prep.to_plan_slot(None).unwrap();
+    let w_ok = |dst: &mut PlanSlot| *dst = ok_slot.clone();
+    let r_ok = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            3,
+            snap.owner.authority,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w_ok,
+                kind: PreparedActionKind::Replay,
+                prepared_boot: boot,
+                admission_request_id: 0,
+                check_workspace_revision: true,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 250);
+    let reps = drain(&handle);
+    assert!(
+        reps.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == r_ok)),
+        "expected Completed standalone replay with displaced approach, got {reps:?}"
+    );
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    // 5) Accepted macro-child replay with displaced pre-planned approach -> Done + Completed, 0 alloc!
+    let snap2 = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let begin = BeginMacroSpec::new(MacroKind::Sequence, boot);
+    let r_b = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            4,
+            snap2.owner.authority,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(begin)),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 2);
+    let reps = drain(&handle);
+    let parent = reps
+        .iter()
+        .find_map(|r| match r {
+            Reply::Ack { request, action: Some(a), .. } if *request == r_b => Some(*a),
+            _ => None,
+        })
+        .expect("BeginMacro ACK");
+
+    let snap3 = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let prep_child = armd::rt_core::requests::actions::prepare_replay(
+        &snap3,
+        &json!({"episode": "ep_displaced", "speed": 1.0, "gripper": false}),
+    )
+    .expect("off-thread child prepare_replay must succeed");
+    let c_spec = ChildSpec {
+        ticket: ChildTicket { parent, child_seq: 1 },
+        timeout_s: 15.0,
+        timeout_code: "SEQUENCE_TIMEOUT",
+        contact: None,
+    };
+    let c_slot = armd::rt_core::requests::actions::prepare_child_replay_slot(
+        &snap3.commanded_positions,
+        &prep_child.plan,
+        snap3.env.tool_digest_hash,
+        c_spec,
+    )
+    .unwrap();
+    let w_c = |dst: &mut PlanSlot| *dst = c_slot.clone();
+    handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            5,
+            snap3.owner.authority,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallChild {
+                write: &w_c,
+                prepared_boot: boot,
+                check_workspace_revision: true,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 250);
+    let _ = drain(&handle);
+    assert!(matches!(
+        sup.hub().latest().unwrap().rt.owner.macro_state.child_sub,
+        SubState::Done(_)
+    ));
+    let snap4 = latest_snap(&sup, clock.now() + DEFAULT_FINISH_DEADLINE);
+    let fin = FinishMacroSpec::done(parent, boot);
+    handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            6,
+            snap4.owner.authority,
+            clock.now() + DEFAULT_FINISH_DEADLINE,
+            Submit::Action(ActionSubmit::FinishMacro(fin)),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 3);
+    let reps = drain(&handle);
+    assert!(
+        reps.iter().any(|r| matches!(r, Reply::Terminal { request, action, outcome: Outcome::Completed, children: 1 } if *request == r_b && *action == parent)),
+        "expected macro parent Completed, got {reps:?}"
+    );
+    assert_eq!(handle.stats().release_allocs.snapshot(), AllocCounts::ZERO);
+    assert_eq!(handle.stats().wake_allocs.snapshot(), AllocCounts::ZERO);
+    handle.stop_and_join();
 }

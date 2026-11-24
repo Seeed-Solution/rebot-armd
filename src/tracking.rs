@@ -630,7 +630,7 @@ impl crate::supervisor::SupervisorInner {
         {
             return false;
         }
-        let arm = self.config.arm_joint_indices();
+        let arm = self.config.arm_joints();
         let velocity_feedback = self
             .driver
             .as_ref()
@@ -671,7 +671,7 @@ impl crate::supervisor::SupervisorInner {
             self.tracking.position_sample = None;
             return;
         }
-        let arm = self.config.arm_joint_indices();
+        let arm = self.config.arm_joints();
         let range = self.feedback_instant_range();
         let keep = self.tracking.position_sample.as_ref().is_some_and(|(oldest, newest, q_ref)| {
             // Age of the reference (its oldest reply) against this sample's newest reply
