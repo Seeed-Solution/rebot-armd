@@ -1747,12 +1747,11 @@ impl ReleaseEngine {
         // 5. Urgent recheck + advance control output
         let out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
         let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
-        // 6. Publish
-        core.publish(timestamp, publish_generation);
-        // 7. Deliver aborted/finished transition terminals, urgent stop replies, lifecycle replies,
-        //    Step 3 replies, and active-action terminals strictly AFTER publish. Any earlier
-        //    transition aborted during Steps 2b-5 (e.g. by LeasePreempt / Disconnect / expiry)
-        //    emits its Terminal strictly BEFORE lifecycle replies or any replacement grant.
+        // Consume any earlier in-flight transition aborted during Steps 2b-5 (e.g. by
+        // LeasePreempt, LeaseRelease, Disconnect, or Step 5 expiry) BEFORE Step 6 publication so
+        // the published `OwnerStateSnapshot` coherently reports `torque_transition_pending == false`,
+        // while still deferring Terminal delivery to Step 7 strictly AFTER Step 6 publish and
+        // strictly BEFORE lifecycle replies or any replacement LeaseOutcome::Granted.
         let post_step2_ended_transition = if finished_transition.is_none()
             && !transition_installed_this_release
             && self.transition.is_some()
@@ -1771,6 +1770,10 @@ impl ReleaseEngine {
         } else {
             None
         };
+        // 6. Publish
+        core.publish(timestamp, publish_generation);
+        // 7. Deliver aborted/finished transition terminals, urgent stop replies, lifecycle replies,
+        //    Step 3 replies, and active-action terminals strictly AFTER publish.
         if let Some((t, outcome)) = finished_transition.or(post_step2_ended_transition) {
             self.intake.terminal(t, outcome);
         }
