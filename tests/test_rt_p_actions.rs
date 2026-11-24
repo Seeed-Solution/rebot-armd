@@ -2065,7 +2065,8 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
     assert!(m_ended, "fresh move_to action after calib must complete");
     tokio::time::sleep(Duration::from_millis(15)).await;
 
-    // 3) Fresh A7 BeginMacro -> FinishMacro succeeds!
+    // 3) Fresh A7 BeginMacro -> FinishMacro succeeds once an external reply sink is attached!
+    handle.attach_external_reply_sink(Arc::new(|_, _| DeliveryDecision::Delivered));
     let snap3 = ActionSnapshot::capture(&sup, sup.capture_admission_stamp(), Instant::now() + DEFAULT_ACTION_DEADLINE)
         .await
         .unwrap();
@@ -2548,11 +2549,23 @@ async fn review_m10_reply_router_interleaved_external_and_backpressure() {
             .unwrap();
         ext_reqs.push(r);
     }
-    // Wait until all 3 external replies are in the broker ring / external queue, then apply
-    // downstream Backpressured on poll_external_replies so they remain buffered!
+    // Wait until all 3 external replies are in the broker ring / external queue, then attach
+    // a backpressurable ExternalReplySink so they remain buffered while BeginMacro/MacroCtx run!
     tokio::time::sleep(Duration::from_millis(40)).await;
-    let delivered_bp = handle.poll_external_replies(|_, _| DeliveryDecision::Backpressured);
-    assert_eq!(delivered_bp, 0);
+    let bp_gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let drained_sink = Arc::new(Mutex::new(Vec::<(ClientId, Reply)>::new()));
+    {
+        let gate = Arc::clone(&bp_gate);
+        let out = Arc::clone(&drained_sink);
+        handle.attach_external_reply_sink(Arc::new(move |c, r| {
+            if gate.load(std::sync::atomic::Ordering::Acquire) {
+                DeliveryDecision::Backpressured
+            } else {
+                out.lock().unwrap().push((c, r));
+                DeliveryDecision::Delivered
+            }
+        }));
+    }
     assert_eq!(handle.pending_external_replies(), 3, "external replies must buffer in FIFO without dropping");
 
     // While external consumer is backpressured, drive BeginMacro + MacroCtx::install_joint_child + finish!
@@ -2581,13 +2594,11 @@ async fn review_m10_reply_router_interleaved_external_and_backpressure() {
     ctx.finish(FinishState::Done, None, None, None, None, HeldUpdate::Unchanged).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // Now stop backpressuring and drain external replies -> assert EXACT FIFO order:
+    // Now release sink backpressure and pump -> assert EXACT FIFO order into the attached sink:
     // ext_reqs[0..3] Refused followed by BeginMacro Terminal(Completed), and ZERO internal child/finish ACKs!
-    let mut drained = Vec::new();
-    handle.poll_external_replies(|c, r| {
-        drained.push((c, r));
-        DeliveryDecision::Delivered
-    });
+    bp_gate.store(false, std::sync::atomic::Ordering::Release);
+    handle.pump_broker_replies();
+    let drained = drained_sink.lock().unwrap().clone();
     assert_eq!(drained.len(), 4, "expected 3 external Refused + 1 BeginMacro Terminal, got {drained:?}");
     for (idx, req_id) in ext_reqs.iter().enumerate() {
         assert!(
@@ -2832,30 +2843,38 @@ async fn review_m11_m12_m13_m14_production_adapters_detached_shell_and_same_side
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let wait_macro_end = |sup: Arc<ArmSupervisor>, handle: armd::rt_core::executor::RtExecutorHandle, action_id: u64| async move {
-        let dl = Instant::now() + Duration::from_secs(45);
-        let mut terminal = None;
-        while Instant::now() < dl {
-            handle.poll_external_replies(|_, r| {
-                if let Reply::Terminal { action, outcome, .. } = r {
-                    if action == ActionId(action_id) {
-                        terminal = Some(outcome);
-                    }
+    // Plug in a test external reply sink via PR L's single hook so macro terminals are delivered.
+    let sink_replies = Arc::new(Mutex::new(Vec::<(ClientId, Reply)>::new()));
+    {
+        let sink_out = Arc::clone(&sink_replies);
+        handle.attach_external_reply_sink(Arc::new(move |c, r| {
+            sink_out.lock().unwrap().push((c, r));
+            DeliveryDecision::Delivered
+        }));
+    }
+
+    let wait_macro_end = |sup: Arc<ArmSupervisor>, handle: armd::rt_core::executor::RtExecutorHandle, action_id: u64| {
+        let sink_replies = Arc::clone(&sink_replies);
+        async move {
+            let dl = Instant::now() + Duration::from_secs(45);
+            while Instant::now() < dl {
+                handle.pump_broker_replies();
+                if let Some(o) = sink_replies.lock().unwrap().iter().find_map(|(_, r)| match r {
+                    Reply::Terminal { action, outcome, .. } if *action == ActionId(action_id) => Some(*outcome),
+                    _ => None,
+                }) {
+                    return o;
                 }
-                DeliveryDecision::Delivered
-            });
-            if let Some(o) = terminal {
-                return o;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let latest = sup.hub().latest();
+            panic!(
+                "macro {action_id} did not emit terminal in time; macro={:?} motion_active={:?} safety={:?}",
+                latest.as_ref().map(|s| s.rt.owner.macro_state),
+                latest.as_ref().map(|s| s.rt.owner.motion_active),
+                latest.as_ref().map(|s| &s.obs.safety_state),
+            );
         }
-        let latest = sup.hub().latest();
-        panic!(
-            "macro {action_id} did not emit terminal in time; macro={:?} motion_active={:?} safety={:?}",
-            latest.as_ref().map(|s| s.rt.owner.macro_state),
-            latest.as_ref().map(|s| s.rt.owner.motion_active),
-            latest.as_ref().map(|s| &s.obs.safety_state),
-        );
     };
 
     // 1) Major 13: sequences::begin_executor refuses recording BEFORE starting parent macro!
@@ -3086,4 +3105,130 @@ fn review_m15_rt_gripper_opening_records_baseline_samples_and_recycles_spares() 
         !fx.core.gripper_baseline_pending.is_empty(),
         "Major 15: qualifying RT gripper opening must record MoveSamples into gripper_baseline_pending"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_m1_executor_macro_refused_503_without_reply_sink_and_commits_with_hook() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    }));
+    sup.set_lease_enabled(false).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        for _ in 0..3 {
+            inner.tick(DT);
+        }
+    }
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if sup.hub().latest().is_some_and(|s| !s.rt.owner.boot.is_zero()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!handle.has_external_reply_sink(), "fresh executor must start without a reply sink");
+
+    // 1) Without a reply sink attached, both begin_macro_executor and place::begin_executor MUST
+    //    fail at admission with 503 EXECUTOR_ROUTING_PENDING and commit NOTHING.
+    let mut adm = sup.capture_admission_stamp();
+    adm.connection_id = 41;
+    let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE)
+        .await
+        .unwrap();
+    let begin = BeginMacroSpec::new(MacroKind::Place, handle.boot());
+    let err = armd::macro_action::begin_macro_executor(
+        &sup,
+        &snap.stamp,
+        begin,
+        Instant::now() + DEFAULT_ACTION_DEADLINE,
+    )
+    .await
+    .expect_err("BeginMacro must refuse at admission when no external reply sink is attached");
+    assert!(
+        matches!(err, armd::ArmError::Rejected { status: 503, ref code, .. } if code == "EXECUTOR_ROUTING_PENDING"),
+        "expected 503 EXECUTOR_ROUTING_PENDING, got {err:?}"
+    );
+    let tcp0 = armd::motion::start_pose(&snap.plan_input_in(GoalFrame::Tcp).unwrap()).p;
+    let pending = armd::place::prepare_from_snapshot(
+        &snap,
+        &json!({"position": [tcp0[0] + 0.02, tcp0[1], tcp0[2]], "approach_height_m": 0.02, "release": false, "retreat": false}),
+        snap.owner.authority.epoch,
+    )
+    .unwrap();
+    let planned = armd::place::plan(pending).unwrap();
+    let err_place = armd::place::begin_executor(&sup, adm, planned)
+        .await
+        .expect_err("place::begin_executor must refuse 503 without reply sink");
+    assert!(
+        matches!(err_place, armd::ArmError::Rejected { status: 503, ref code, .. } if code == "EXECUTOR_ROUTING_PENDING"),
+        "expected 503 EXECUTOR_ROUTING_PENDING, got {err_place:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let ms = sup.hub().latest().unwrap().rt.owner.macro_state;
+    assert!(!ms.alive && ms.active_id == 0, "refused macro must not commit: {ms:?}");
+
+    // 2) Attach PR L's reply sink hook -> place::begin_executor admits, commits, and delivers
+    //    Reply::Terminal directly to the attached sink.
+    let delivered = Arc::new(Mutex::new(Vec::<(ClientId, Reply)>::new()));
+    {
+        let out = Arc::clone(&delivered);
+        handle.attach_external_reply_sink(Arc::new(move |c, r| {
+            out.lock().unwrap().push((c, r));
+            DeliveryDecision::Delivered
+        }));
+    }
+    assert!(handle.has_external_reply_sink());
+    let pending2 = armd::place::prepare_from_snapshot(
+        &snap,
+        &json!({"position": [tcp0[0] + 0.02, tcp0[1], tcp0[2]], "approach_height_m": 0.02, "release": false, "retreat": false}),
+        snap.owner.authority.epoch,
+    )
+    .unwrap();
+    let planned2 = armd::place::plan(pending2).unwrap();
+    let (id, _) = armd::place::begin_executor(&sup, adm, planned2).await.unwrap();
+    let wait_dl = Instant::now() + Duration::from_secs(10);
+    let mut found_outcome = None;
+    while Instant::now() < wait_dl {
+        handle.pump_broker_replies();
+        if let Some(o) = delivered.lock().unwrap().iter().find_map(|(c, r)| match r {
+            Reply::Terminal { action, outcome, .. } if *c == ClientId(41) && *action == ActionId(id) => Some(*outcome),
+            _ => None,
+        }) {
+            found_outcome = Some(o);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(found_outcome, Some(Outcome::Completed));
+
+    // 3) Detaching the sink restores fail-closed 503 EXECUTOR_ROUTING_PENDING.
+    handle.detach_external_reply_sink();
+    assert!(!handle.has_external_reply_sink());
+    let snap2 = ActionSnapshot::capture(&sup, sup.capture_admission_stamp(), Instant::now() + DEFAULT_ACTION_DEADLINE)
+        .await
+        .unwrap();
+    let err_after = armd::macro_action::begin_macro_executor(
+        &sup,
+        &snap2.stamp,
+        BeginMacroSpec::new(MacroKind::Place, handle.boot()),
+        Instant::now() + DEFAULT_ACTION_DEADLINE,
+    )
+    .await
+    .expect_err("detached sink must refuse 503 again");
+    assert!(
+        matches!(err_after, armd::ArmError::Rejected { status: 503, ref code, .. } if code == "EXECUTOR_ROUTING_PENDING"),
+        "{err_after:?}"
+    );
+    handle.stop_and_join();
 }

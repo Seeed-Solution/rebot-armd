@@ -1734,17 +1734,49 @@ impl TeardownDisable {
     }
 }
 
+/// Single plug-in hook for PR L's per-connection WebSocket reply router (A6/A7).
+///
+/// In PR P, WebSocket ordinary commands on `OWNER_EXECUTOR` remain gated at `503
+/// EXECUTOR_ROUTING_PENDING` (`src/api/ws.rs:492, 2461`) because connection lifecycle and
+/// per-client reply routing belong to PR L. PR L installs its per-connection router once via
+/// [`RtExecutorHandle::attach_external_reply_sink`]. Until a sink is attached,
+/// [`crate::macro_action::begin_macro_executor`] refuses new executor macros at admission with
+/// `503 EXECUTOR_ROUTING_PENDING` so no macro can commit without a terminal reply sink.
+pub trait ExternalReplySink: Send + Sync {
+    fn deliver(
+        &self,
+        client: ClientId,
+        reply: super::broker::Reply,
+    ) -> super::broker::DeliveryDecision;
+}
+
+impl<F> ExternalReplySink for F
+where
+    F: Fn(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision + Send + Sync,
+{
+    fn deliver(
+        &self,
+        client: ClientId,
+        reply: super::broker::Reply,
+    ) -> super::broker::DeliveryDecision {
+        (self)(client, reply)
+    }
+}
+
 /// Shared bounded FIFO broker reply dispatcher (A7 / Major 10):
 /// routes replies for internal broker RPCs (`BeginMacro` ACK/Refused, `InstallChild`, `FinishMacro`)
 /// directly to their keyed oneshot waiters without head-of-line blocking behind unrelated replies,
 /// while buffering all other replies (including `BeginMacro` `Terminal`s and external client traffic)
-/// in a bounded (`<= external_cap`) FIFO queue for external consumers.
+/// in a bounded (`<= external_cap`) FIFO queue and forwarding them to the attached
+/// [`ExternalReplySink`] (PR L's per-connection WS reply router hook).
 ///
 /// Lock order: ALWAYS lock `RtExecutorShared::broker` BEFORE `RtExecutorShared::reply_router`.
+/// NEVER invoke `ExternalReplySink::deliver` while holding either lock.
 struct ActionReplyRouter {
     waiters: std::collections::HashMap<super::broker::RequestId, tokio::sync::oneshot::Sender<super::broker::Reply>>,
     external: VecDeque<(ClientId, super::broker::Reply)>,
     external_cap: usize,
+    external_sink: Option<Arc<dyn ExternalReplySink>>,
 }
 
 impl ActionReplyRouter {
@@ -1754,6 +1786,7 @@ impl ActionReplyRouter {
             waiters: std::collections::HashMap::new(),
             external: VecDeque::with_capacity(cap),
             external_cap: cap,
+            external_sink: None,
         }
     }
 }
@@ -1966,9 +1999,42 @@ impl RtExecutorHandle {
             .remove(&req_id);
     }
 
-    /// Pumps ready replies from the broker into either matching internal waiters or the bounded
-    /// external FIFO buffer (`<= reply_capacity`), reclaiming retired plan slots.
-    pub fn pump_broker_replies(&self) -> usize {
+    /// Single hook where PR L plugs in its per-connection WebSocket reply router.
+    /// Once attached, [`Self::has_external_reply_sink`] becomes `true`,
+    /// [`crate::macro_action::begin_macro_executor`] admits executor macros, and
+    /// [`Self::pump_broker_replies`] forwards external replies (including `BeginMacro`
+    /// `Reply::Terminal`s) to `sink` in strict FIFO order without holding broker/router locks.
+    pub fn attach_external_reply_sink(&self, sink: Arc<dyn ExternalReplySink>) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink = Some(sink);
+        self.pump_broker_replies();
+    }
+
+    /// Detaches the external reply sink (returning executor macro admission to fail-closed
+    /// `503 EXECUTOR_ROUTING_PENDING`).
+    pub fn detach_external_reply_sink(&self) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink = None;
+    }
+
+    /// Returns `true` when an external reply sink (PR L's per-connection WS reply router) is
+    /// currently attached to this executor handle.
+    pub fn has_external_reply_sink(&self) -> bool {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink
+            .is_some()
+    }
+
+    fn pump_broker_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
         use super::broker::DeliveryDecision;
         let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
         let mut router = self
@@ -1988,7 +2054,49 @@ impl RtExecutorHandle {
             }
         });
         broker.reclaim_plans();
-        n
+        (n, router.external_sink.clone())
+    }
+
+    /// Pumps ready replies from the broker into matching internal waiters or the bounded external
+    /// FIFO buffer (`<= reply_capacity`), forwarding buffered external replies to the attached
+    /// [`ExternalReplySink`] (if any) without holding broker/router locks, and reclaims retired
+    /// plan slots.
+    pub fn pump_broker_replies(&self) -> usize {
+        use super::broker::DeliveryDecision;
+        let (mut total, sink) = self.pump_broker_to_router();
+        if let Some(sink) = sink {
+            let mut delivered_any = false;
+            loop {
+                let next = self
+                    .shared
+                    .reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .external
+                    .pop_front();
+                let Some((client, reply)) = next else {
+                    break;
+                };
+                match sink.deliver(client, reply) {
+                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                        delivered_any = true;
+                    }
+                    DeliveryDecision::Backpressured => {
+                        self.shared
+                            .reply_router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .external
+                            .push_front((client, reply));
+                        break;
+                    }
+                }
+            }
+            if delivered_any {
+                total += self.pump_broker_to_router().0;
+            }
+        }
+        total
     }
 
     /// Drains external (non-internal-waiter) replies in strict broker FIFO order while honouring

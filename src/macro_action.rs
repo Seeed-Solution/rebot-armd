@@ -1427,6 +1427,15 @@ pub async fn begin_macro_executor(
             message: "RT executor is not active".into(),
         });
     };
+    // M1: Refuse at admission before committing any macro if PR L's external reply sink has not
+    // been plugged into `RtExecutorHandle::attach_external_reply_sink`.
+    if !handle.has_external_reply_sink() {
+        return Err(ArmError::Rejected {
+            status: 503,
+            code: "EXECUTOR_ROUTING_PENDING".into(),
+            message: "RT executor has no external reply sink attached for action replies".into(),
+        });
+    }
     let client = ClientId(stamp.admission.connection_id);
     let auth = stamp.broker_authority();
     let (req_id, mut rx) = loop {
