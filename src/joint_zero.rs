@@ -190,6 +190,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
     fn set_tx_budget(&mut self, budget: crate::driver::TxBudget) { self.inner.set_tx_budget(budget); }
+    fn reset_pos_force_boot_state(&mut self) { self.inner.reset_pos_force_boot_state(); }
     fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
     fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
     fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }

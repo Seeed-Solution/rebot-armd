@@ -4775,17 +4775,19 @@ async fn calibration_close_at_raw_29_is_sent_as_raw_29() {
     }
 }
 
-/// Round 5 M1 regression:
+/// Round 5 M1 + Round 8 D1 regression:
 /// 1. A J7 feedback frame that sat 150 ms in the RX queue (both WITH a transport `rx_timestamp`
 ///    near `queue_bound` and WITHOUT `rx_timestamp`) MUST fail the exact same live freshness
 ///    predicate at decode time and NEVER overwrite `pf_last_fresh_position` / freeze target.
 /// 2. With no provably fresh J7 sample ever decoded since boot (`pf_last_fresh_position == None`),
-///    J7 gets the explicit safest zero-motion, zero-force fallback (`vel_raw == 0`, `i_des == 0`)
-///    on both motion and stopped-hold paths.
+///    `POS_FORCE_BOOT_FALLBACK` is `NoOutputUntilFresh`: no `0x307` frame is sent before the first
+///    fresh sample, and enable fails closed.
 #[test]
-fn pos_force_freeze_cache_rejects_150ms_queued_sample_and_boot_fallback_zero_current() {
+fn pos_force_freeze_cache_rejects_150ms_queued_sample_and_boot_fallback_no_output_until_fresh() {
+    use armd::driver::{PosForceBootFallback, POS_FORCE_BOOT_FALLBACK};
     use armd::transport::{CanTransport, TransportError};
     use std::sync::{Arc, Mutex};
+    assert_eq!(POS_FORCE_BOOT_FALLBACK, PosForceBootFallback::NoOutputUntilFresh);
 
     #[derive(Clone)]
     struct TimestampOverrideBus {

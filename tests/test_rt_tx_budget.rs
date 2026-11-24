@@ -4263,11 +4263,7 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
                 ),
                 (
                     "fn frame_pos_force_joint(",
-                    "Read-only CAN ID predicate used by DamiaoArmDriver::send_inner submission guard",
-                ),
-                (
-                    "fn pos_force_freeze_params(",
-                    "Read-only lookup of last_target_frames CAN ID for freeze parameters",
+                    "Read-only CAN ID predicate used by DamiaoArmDriver::send submission guard",
                 ),
                 (
                     "fn is_pos_force_freeze_frame(",

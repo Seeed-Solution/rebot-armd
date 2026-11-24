@@ -6458,3 +6458,147 @@ fn dual_owner_r8_m2_tx_priority_by_change_class1_j7_within_ceil_bound_1_2_6() {
         }
     }
 }
+
+/// Round 8 D1 (`PosForceBootFallback::NoOutputUntilFresh`) on BOTH owners (Legacy and RT Executor):
+/// 1. When J7 has had NO fresh feedback since this `armd` process started (`pf_last_fresh_position == None`),
+///    NO `0x307` frame is transmitted while `0xCC` refresh requests stay active (J7 keeps its own
+///    last firmware command under `TIMEOUT=0`).
+/// 2. Once the first fresh J7 feedback sample is decoded, the next tick emits a `0x307` Hold at
+///    that measured position (`vel_raw = 0`) with the configured `current_ceiling_raw`.
+/// 3. A STOP issued BEFORE the first fresh sample still sends NO `0x307` frame (while keeping
+///    `0xCC` refreshes active), and is applied as Hold at the measured position with the cap once
+///    the first fresh sample arrives.
+#[test]
+fn dual_owner_r8_d1_boot_fallback_no_output_until_fresh_and_stop_before_first_sample() {
+    use armd::driver::{PosForceBootFallback, POS_FORCE_BOOT_FALLBACK};
+    assert_eq!(POS_FORCE_BOOT_FALLBACK, PosForceBootFallback::NoOutputUntilFresh);
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // --- (a) & (b): No 0x307 before first fresh sample (0xCC active), then Hold at measured pos with cap ---
+        {
+            let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            // Simulate process startup with J7 already enabled in mode 4, never having decoded a
+            // fresh J7 sample yet (and J7 currently muted on the bus).
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[6].q = -2.35;
+                s.motors[6].mute_feedback = true;
+            });
+            rig.inner_mut()
+                .driver
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .reset_pos_force_boot_state();
+
+            rig.bus.clear_log();
+            for _ in 0..3 {
+                rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+                rig.step_dt(DT, false);
+            }
+            let pre_log = rig.bus.tx_log();
+            assert!(
+                j7_pf_frames(&pre_log).is_empty(),
+                "{owner:?}: must emit ZERO 0x307 frames before first fresh J7 sample: {pre_log:?}"
+            );
+            assert!(
+                !j7_refresh_frames(&pre_log).is_empty(),
+                "{owner:?}: must keep requesting 0xCC refresh before first fresh J7 sample: {pre_log:?}"
+            );
+
+            // First fresh J7 sample arrives at -2.35 rad -> next tick emits Hold at -2.35 rad,
+            // vel_raw = 0, i_des = pf_cur.
+            rig.bus.clear_log();
+            rig.bus.with(|s| {
+                s.motors[6].mute_feedback = false;
+                s.motors[6].q = -2.35;
+                s.push_all_feedback();
+            });
+            rig.step_dt(DT, false);
+            let post_log = rig.bus.tx_log();
+            let j7_post = j7_pf_frames(&post_log);
+            assert_eq!(
+                j7_post.len(),
+                1,
+                "{owner:?}: expected 1 Hold 0x307 frame after first fresh J7 sample: {post_log:?}"
+            );
+            let p_wire = f32::from_le_bytes(j7_post[0].data[0..4].try_into().unwrap());
+            let v_wire = u16::from_le_bytes([j7_post[0].data[4], j7_post[0].data[5]]);
+            let i_wire = u16::from_le_bytes([j7_post[0].data[6], j7_post[0].data[7]]);
+            assert!(
+                (p_wire - (-2.35)).abs() < 1e-2,
+                "{owner:?}: expected Hold at measured -2.35 rad, got {p_wire}"
+            );
+            assert_eq!(v_wire, 0, "{owner:?}: first fresh Hold must have vel_raw == 0");
+            assert_eq!(i_wire, pf_cur, "{owner:?}: first fresh Hold must use configured cap {pf_cur}");
+        }
+
+        // --- (c): STOP (both regular stop_motion and E-stop) before the first fresh sample still
+        //          sends nothing to J7, and is applied as Hold once fresh ---
+        for is_estop in [false, true] {
+            let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[6].q = -1.65;
+                s.motors[6].mute_feedback = true;
+            });
+            rig.inner_mut()
+                .driver
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .reset_pos_force_boot_state();
+
+            if is_estop {
+                rig.inner_mut().apply_stop_policy(armd::StopPolicy::EStopLatch);
+            } else {
+                rig.inner_mut().stop_motion();
+            }
+            rig.bus.clear_log();
+            for _ in 0..3 {
+                rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+                rig.step_dt(DT, false);
+            }
+            let stop_pre_log = rig.bus.tx_log();
+            assert!(
+                j7_pf_frames(&stop_pre_log).is_empty(),
+                "{owner:?} is_estop={is_estop}: STOP before first fresh J7 sample must send ZERO 0x307 frames: {stop_pre_log:?}"
+            );
+            assert!(
+                !j7_refresh_frames(&stop_pre_log).is_empty(),
+                "{owner:?} is_estop={is_estop}: STOP before first fresh J7 sample must still request 0xCC refresh: {stop_pre_log:?}"
+            );
+
+            // First fresh J7 sample arrives at -1.65 rad -> STOP is applied as Hold at -1.65 rad,
+            // vel_raw = 0, i_des = pf_cur.
+            rig.bus.clear_log();
+            rig.bus.with(|s| {
+                s.motors[6].mute_feedback = false;
+                s.motors[6].q = -1.65;
+                s.push_all_feedback();
+            });
+            rig.step_dt(DT, false);
+            let stop_post_log = rig.bus.tx_log();
+            let j7_stop_post = j7_pf_frames(&stop_post_log);
+            assert_eq!(
+                j7_stop_post.len(),
+                1,
+                "{owner:?} is_estop={is_estop}: STOP must apply as 1 Hold 0x307 frame once first fresh sample arrives: {stop_post_log:?}"
+            );
+            let p_wire = f32::from_le_bytes(j7_stop_post[0].data[0..4].try_into().unwrap());
+            let v_wire = u16::from_le_bytes([j7_stop_post[0].data[4], j7_stop_post[0].data[5]]);
+            let i_wire = u16::from_le_bytes([j7_stop_post[0].data[6], j7_stop_post[0].data[7]]);
+            assert!(
+                (p_wire - (-1.65)).abs() < 1e-2,
+                "{owner:?} is_estop={is_estop}: expected STOP Hold at measured -1.65 rad, got {p_wire}"
+            );
+            assert_eq!(v_wire, 0, "{owner:?} is_estop={is_estop}: STOP Hold once fresh must have vel_raw == 0");
+            assert_eq!(i_wire, pf_cur, "{owner:?} is_estop={is_estop}: STOP Hold once fresh must use configured cap {pf_cur}");
+        }
+    }
+}

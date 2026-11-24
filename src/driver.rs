@@ -419,40 +419,22 @@ pub enum PosForceTxStatus {
 }
 
 /// Boot fallback policy when an active `PosForce` J7 gripper has NEVER decoded a provably fresh
-/// (`<= 100 ms`, bounded, finite) feedback sample since boot (`pf_last_fresh_position == None`).
+/// (`<= 100 ms`, bounded, finite) feedback sample since this `armd` process started
+/// (`pf_last_fresh_position == None`).
 ///
-/// - [`Self::ZeroCurrent`] (default): emit `vel_raw = 0, i_des = 0` at the last commanded `0x307`
-///   position (or `0.0`).
-/// - [`Self::HoldLastCommandedCurrent`]: emit `vel_raw = 0` at the last commanded `0x307` position
-///   (or `0.0`) with the last commanded `0x307` current (capped to the configured current ceiling).
-///
-/// Switching policies is a single-line change to [`POS_FORCE_BOOT_FALLBACK`].
+/// - [`Self::NoOutputUntilFresh`]: send NO `0x307` frame to J7 until the first provably fresh
+///   J7 feedback sample has been decoded (J7 has `TIMEOUT=0`, so any existing grip stays held),
+///   while continuing to request `0xCC` status refreshes. Once the first fresh sample is decoded,
+///   hold at that measured position (`vel_raw = 0`) with the configured `current_ceiling_raw`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PosForceBootFallback {
-    ZeroCurrent,
-    HoldLastCommandedCurrent,
+    NoOutputUntilFresh,
 }
 
-/// Active boot fallback when no provably fresh J7 sample has been decoded since boot.
-/// Change this single constant to [`PosForceBootFallback::HoldLastCommandedCurrent`] to retain
-/// the last commanded current instead of `i_des = 0`.
-pub const POS_FORCE_BOOT_FALLBACK: PosForceBootFallback = PosForceBootFallback::ZeroCurrent;
-
-/// Resolves the `i_des` current-raw field for the J7 `0x307` boot fallback when no provably fresh
-/// J7 sample has been decoded since boot.
-#[inline]
-pub const fn pos_force_boot_fallback_current(
-    last_commanded_current_raw: Option<u16>,
-    configured_current_raw: u16,
-) -> u16 {
-    match POS_FORCE_BOOT_FALLBACK {
-        PosForceBootFallback::ZeroCurrent => 0,
-        PosForceBootFallback::HoldLastCommandedCurrent => match last_commanded_current_raw {
-            Some(c) if c < configured_current_raw => c,
-            _ => configured_current_raw,
-        },
-    }
-}
+/// Active boot fallback when no provably fresh J7 sample has been decoded since this `armd`
+/// process started.
+pub const POS_FORCE_BOOT_FALLBACK: PosForceBootFallback =
+    PosForceBootFallback::NoOutputUntilFresh;
 
 /// Stop-generation and E-stop/safety epoch stamp captured when a J7 [`PosForceIntent`] is
 /// produced. Every J7 intent carries this stamp; the single J7 emitter treats any `Target`
@@ -544,6 +526,10 @@ impl PosForceIntent {
 pub enum PosForceEmitOutcome {
     /// Driver has no active/enabled `PosForce` gripper (complete no-op).
     NotApplicable,
+    /// No provably fresh J7 sample has been decoded since this `armd` process started
+    /// (`POS_FORCE_BOOT_FALLBACK == NoOutputUntilFresh`): no `0x307` frame was transmitted
+    /// (J7 keeps its last command under `TIMEOUT=0`) while `0xCC` refresh polling stays active.
+    AwaitingFirstFresh { joint: usize, pf_status: PosForceTxStatus },
     /// J7 `0x307` frame was transmitted and flushed to the transport.
     Sent { joint: usize, freeze: bool, pf_status: PosForceTxStatus },
     /// J7 `0x307` frame was deferred by per-tick TX budget or backpressure.
@@ -781,6 +767,8 @@ pub trait ArmDriver: Send {
     /// Update the bounded per-tick TX budget dynamically (used by dual-owner tests).
     #[doc(hidden)]
     fn set_tx_budget(&mut self, _budget: TxBudget) {}
+    #[doc(hidden)]
+    fn reset_pos_force_boot_state(&mut self) {}
 
     /// Configured inclusive maximum age for carried-over TX frames (default 45 ms).
     fn tx_frame_max_age(&self) -> Duration { DAMIAO_TX_FRAME_MAX_AGE }
@@ -3326,8 +3314,12 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// across J1–J6 POS_VEL/MIT slots and J7).
     slot_last_tx_seq: [u64; MAX_MODE_JOINTS * 2],
     /// Hint set by `SupervisorInner` before arm output indicating whether this tick's upcoming
-    /// J7 intent is `Hold`/`Stop` (rather than a `Target`). Cleared after `emit_pos_force_j7_impl`.
+    /// J7 intent is `Hold`/`Stop` (rather than a `Target`). Cleared after `pos_force_emitter::emit_tick`.
     pf_next_intent_is_hold: bool,
+    /// Latched while `pf_last_fresh_position == None` under `NoOutputUntilFresh`: forces the
+    /// first `0x307` emission after the first provably fresh J7 sample arrives to be a stationary
+    /// `Hold` at that measured position (`vel_raw = 0`, configured `current_raw`).
+    pf_hold_on_first_fresh: bool,
 }
 
 /// Transmit priority classes (lower value = higher priority):
@@ -3879,6 +3871,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             tx_progress_seq: 0,
             slot_last_tx_seq: [0; MAX_MODE_JOINTS * 2],
             pf_next_intent_is_hold: false,
+            pf_hold_on_first_fresh: false,
         }
     }
 
@@ -4126,7 +4119,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return None;
         }
         let j7_emitting_hold_or_freeze =
-            is_hold_pass || self.pf_next_intent_is_hold || !fresh;
+            is_hold_pass || self.pf_next_intent_is_hold || self.pf_hold_on_first_fresh || !fresh;
         let flat = pf_j.saturating_mul(2);
         let j7_in_hold = self.slot_in_unchanged_hold.get(flat).copied().unwrap_or(false);
         let class = if j7_emitting_hold_or_freeze {
@@ -4760,33 +4753,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Pure parameter computation `(position, vel_raw = 0, i_des)` for the Damiao `0x307` FREEZE
-    /// (or boot-fallback) frame of joint `i` — performs NO `CanFrame` construction.
+    /// frame of joint `i` — performs NO `CanFrame` construction.
     /// - When at least one provably fresh (`<= 100 ms` at decode time) J7 sample has been observed
-    ///   since boot (`pf_last_fresh_position == Some(pos)`): `(pos, 0, pf.current_raw)`.
+    ///   since this `armd` process started (`pf_last_fresh_position == Some(pos)`):
+    ///   `Some((pos, 0, pf.current_raw))`.
     /// - When NO provably fresh J7 sample has ever been observed since boot
-    ///   (`pf_last_fresh_position == None`): `(last_cmd_pos_or_0, 0, pos_force_boot_fallback_current(...))`.
+    ///   (`pf_last_fresh_position == None`, [`PosForceBootFallback::NoOutputUntilFresh`]):
+    ///   `None` (send NO `0x307` frame until the first fresh sample is decoded).
     fn pos_force_freeze_params(&self, i: usize) -> Option<(f32, u16, u16)> {
         let pf = self.pos_force.as_ref().filter(|pf| pf.joint == i)?;
-        let motor_id = *self.motor_ids.get(i)?;
+        let _ = self.motor_ids.get(i)?;
         match self.pf_last_fresh_position.filter(|p| p.is_finite()) {
             Some(pos) => Some((pos, 0, pf.current_raw)),
-            None => {
-                let expected_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(motor_id);
-                let last_cmd = self
-                    .last_target_frames
-                    .get(i)
-                    .and_then(|f| f.as_ref())
-                    .filter(|f| f.id == expected_id && f.dlc == 8);
-                let last_cmd_pos = last_cmd
-                    .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
-                    .filter(|p| p.is_finite())
-                    .unwrap_or(0.0);
-                let last_cmd_cur = last_cmd
-                    .map(|f| u16::from_le_bytes([f.data[6], f.data[7]]))
-                    .filter(|&c| c > 0);
-                let boot_cur = pos_force_boot_fallback_current(last_cmd_cur, pf.current_raw);
-                Some((last_cmd_pos, 0, boot_cur))
-            }
+            None => match POS_FORCE_BOOT_FALLBACK {
+                PosForceBootFallback::NoOutputUntilFresh => None,
+            },
         }
     }
 
@@ -6102,6 +6083,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let intent = self.pf_deferred_intent.unwrap_or_else(|| PosForceIntent::hold(cur_intent_stamp));
         match pos_force_emitter::emit_tick(self, intent, cur_intent_stamp)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
+            PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. } => {
+                self.last_tx_pf_status = pf_status;
+                Ok(arm_out)
+            }
             PosForceEmitOutcome::Sent { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
                 Ok(arm_out)
@@ -9130,6 +9115,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let stop_intent_stamp = self.current_j7_intent_stamp();
         match pos_force_emitter::emit_tick(self, PosForceIntent::stop(stop_intent_stamp), stop_intent_stamp) {
             Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
+            Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
+                self.last_tx_pf_status = pf_status;
+                arm_res
+            }
             Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
                 let pf_bit = joint.saturating_mul(2);
                 let pf_mask = if pf_bit < 64 { 1u64 << pf_bit } else { 0 };
@@ -9496,6 +9485,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let current_intent_stamp = self.current_j7_intent_stamp();
             return match pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp) {
                 Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
+                Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
+                    self.last_tx_pf_status = pf_status;
+                    if arm_res.is_ok() {
+                        self.trip_fence(MitFenceTripReason::TargetUnavailable {
+                            joint: (pf_j + 1) as u8,
+                            completed_joints: pf_j as u8,
+                            total_joints,
+                        });
+                        return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_j });
+                    }
+                    arm_res
+                }
                 Ok(PosForceEmitOutcome::Sent { pf_status, .. }) => {
                     self.last_tx_pf_status = pf_status;
                     if arm_res.is_ok() {
@@ -9618,6 +9619,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let current_intent_stamp = self.current_j7_intent_stamp();
         match pos_force_emitter::emit_tick(self, j7_intent, current_intent_stamp)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
+            PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. } => {
+                self.last_tx_pf_status = pf_status;
+                Ok(arm_out)
+            }
             PosForceEmitOutcome::Sent { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
                 Ok(arm_out)
@@ -9639,6 +9644,26 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_tx_budget(&mut self, budget: TxBudget) {
         self.tx_budget = budget;
+    }
+
+    fn reset_pos_force_boot_state(&mut self) {
+        if let Some(pf) = self.pos_force.as_ref() {
+            let j = pf.joint;
+            if j < self.last_feedback_instant.len() {
+                self.last_feedback_instant[j] = None;
+            }
+            if j < self.feedback_queue_bound.len() {
+                self.feedback_queue_bound[j] = None;
+            }
+            self.pf_last_fresh_feedback = None;
+            self.pf_last_fresh_position = None;
+            self.pf_hold_on_first_fresh = false;
+            self.pf_refresh_pending = false;
+            self.pf_deferred_ticks = 0;
+            self.pf_deferred_motion = false;
+            self.pf_deferred_since = None;
+            self.pf_deferred_intent = None;
+        }
     }
 
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
@@ -10507,7 +10532,11 @@ mod pos_force_emitter {
         let stamp_stale = intent.stamp.stop_gen != current.stop_gen
             || intent.stamp.estop_epoch != current.estop_epoch;
         let effective_kind = match intent.kind {
-            PosForceIntentKind::Target { .. } if stamp_stale => PosForceIntentKind::Hold,
+            PosForceIntentKind::Target { .. }
+                if stamp_stale || driver.pf_hold_on_first_fresh =>
+            {
+                PosForceIntentKind::Hold
+            }
             other => other,
         };
         let is_target_intent = matches!(effective_kind, PosForceIntentKind::Target { .. });
@@ -10522,6 +10551,61 @@ mod pos_force_emitter {
 
         // Clear per-tick J7 hold hint after consulting it in the arm write pass.
         driver.pf_next_intent_is_hold = false;
+
+        // Boot fallback (`PosForceBootFallback::NoOutputUntilFresh`): when NO provably fresh J7
+        // sample has ever been decoded since this `armd` process started, send NO `0x307` frame
+        // (J7 has `TIMEOUT=0`, so an existing grip stays gripped) while keeping `0xCC` refresh
+        // polling active. Once the first fresh sample arrives, `pf_hold_on_first_fresh` ensures
+        // the next emission is a stationary `Hold` at that measured position with `current_raw`.
+        if !driver.pos_force_feedback_valid(pf_j, entry_now)
+            && driver.pf_last_fresh_position.is_none()
+        {
+            match POS_FORCE_BOOT_FALLBACK {
+                PosForceBootFallback::NoOutputUntilFresh => {
+                    driver.pf_hold_on_first_fresh = true;
+                    driver.pf_deferred_ticks = 0;
+                    driver.pf_deferred_motion = false;
+                    driver.pf_deferred_since = None;
+                    driver.pf_deferred_intent = None;
+                    let stop_check = |d: &DamiaoArmDriver<C>| {
+                        if is_target_intent {
+                            d.strict_stop_check(Some(start_stamp))
+                        } else {
+                            d.pending_stop_check(Some(start_stamp))
+                        }
+                    };
+                    if driver.pending_hold_tx.len() == 0
+                        && driver.pending_tx.len() == 0
+                        && driver.pf_refresh_pending
+                        && !driver.pf_refresh_attempted_this_tick
+                        && driver.poll_tx_allowed()
+                        && driver.can_start_tick_tx()
+                    {
+                        if driver.try_send_pf_refresh(start_stamp)? {
+                            if stop_check(driver).is_err() {
+                                return Err(ArmDriverError::EstopInhibited);
+                            }
+                            if driver.flush_cutoff_exceeded() {
+                                driver.mark_tx_pass_backpressured();
+                                return Err(TransportError::Timeout.into());
+                            }
+                            if let Err(e) = driver.can.flush() {
+                                driver.mark_tx_pass_backpressured();
+                                if stop_check(driver).is_err() {
+                                    return Err(ArmDriverError::EstopInhibited);
+                                }
+                                return Err(e.into());
+                            }
+                            if stop_check(driver).is_err() {
+                                return Err(ArmDriverError::EstopInhibited);
+                            }
+                        }
+                    }
+                    let pf_status = driver.take_last_pos_force_tx_status();
+                    return Ok(PosForceEmitOutcome::AwaitingFirstFresh { joint: pf_j, pf_status });
+                }
+            }
+        }
 
         let mut active_kind = effective_kind;
         let mut retried = false;
@@ -10654,6 +10738,7 @@ mod pos_force_emitter {
             return Err(ArmDriverError::EstopInhibited);
         }
 
+        driver.pf_hold_on_first_fresh = false;
         driver.pf_deferred_ticks = 0;
         driver.pf_deferred_motion = false;
         driver.pf_deferred_since = None;
@@ -11434,10 +11519,19 @@ mod tx_chokepoint_tests {
         assert_eq!(bus.tx_len(), 1);
     }
 
+    /// Round 8 D1: Boot fallback (`PosForceBootFallback::NoOutputUntilFresh`).
+    /// 1. With no provably fresh J7 sample since process start (`pf_last_fresh_position == None`),
+    ///    emit ZERO `0x307` frames while keeping `0xCC` refresh requests active (J7 keeps its last
+    ///    firmware command under `TIMEOUT=0`).
+    /// 2. After the first provably fresh J7 sample is decoded, emit a stationary `0x307` Hold at
+    ///    that measured position (`vel_raw = 0`) with the configured `current_raw` cap (even if a
+    ///    `Target` intent is submitted on that first fresh tick).
+    /// 3. A STOP before the first fresh sample still sends NO `0x307` frame (while sending `0xCC`),
+    ///    and is applied as Hold at the measured position with the cap once fresh.
     #[test]
-    fn pos_force_boot_fallback_with_no_fresh_sample_emits_zero_vel_zero_current() {
+    fn pos_force_boot_fallback_no_output_until_fresh_then_holds_measured_with_cap() {
         let limits = damiao::DamiaoLimits::default();
-        let (bus, _clock) = TestBus::new();
+        let (bus, clock) = TestBus::new();
         let pf = GripperPosForce {
             joint: 0,
             current_raw: 460,
@@ -11458,52 +11552,95 @@ mod tx_chokepoint_tests {
         drv.pf_last_fresh_position = None;
         drv.is_enabled = true;
 
-        assert_eq!(POS_FORCE_BOOT_FALLBACK, PosForceBootFallback::ZeroCurrent);
-        assert_eq!(pos_force_boot_fallback_current(Some(320), 460), 0);
-        assert_eq!(pos_force_boot_fallback_current(None, 460), 0);
+        assert_eq!(POS_FORCE_BOOT_FALLBACK, PosForceBootFallback::NoOutputUntilFresh);
+        assert_eq!(drv.pos_force_freeze_params(0), None);
 
-        // 1. No prior target ever commanded -> emits 0x307 with pos=0.0, vel_raw=0, i_des=0.
+        // 1. Before first fresh sample: Target intent -> ZERO 0x307 frames, 0xCC refresh active.
         bus.clear_tx();
         drv.begin_tx_tick();
         let stamp = drv.current_j7_intent_stamp();
-        let out0 = drv.emit_pos_force_j7(PosForceIntent::stop(stamp), stamp).expect("boot fallback emit");
-        assert!(matches!(out0, PosForceEmitOutcome::Sent { joint: 0, freeze: true, .. }));
-        let log0: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
-        let j7_0: Vec<CanFrame> = log0.iter().copied().filter(|f| f.id == 0x307).collect();
-        assert_eq!(j7_0.len(), 1, "expected 1 boot-fallback 0x307 frame: {log0:?}");
-        let frame0 = j7_0[0];
-        assert_eq!(frame0.id, 0x307);
-        assert_eq!(f32::from_le_bytes(frame0.data[0..4].try_into().unwrap()), 0.0);
-        assert_eq!(u16::from_le_bytes([frame0.data[4], frame0.data[5]]), 0);
-        assert_eq!(u16::from_le_bytes([frame0.data[6], frame0.data[7]]), 0);
-        assert!(drv.is_pos_force_freeze_frame(&frame0));
-
-        // 2. Prior commanded target exists (-1.25 rad) -> holds -1.25 with vel_raw=0, i_des=0 (zero force).
-        drv.last_target_frames[0] = Some(
-            CanFrame::new_standard(
-                damiao::POS_FORCE_BASE_ID + 7,
-                &damiao::encode_pos_force_payload(-1.25, 30, 460),
-            )
-            .unwrap(),
+        let out0 = drv
+            .emit_pos_force_j7(PosForceIntent::target(0.0, Some(0.30), None, stamp), stamp)
+            .expect("boot fallback awaiting fresh");
+        assert!(
+            matches!(
+                out0,
+                PosForceEmitOutcome::AwaitingFirstFresh {
+                    joint: 0,
+                    pf_status: PosForceTxStatus::Stale { joint: 0, .. }
+                }
+            ),
+            "expected AwaitingFirstFresh with Stale status, got {out0:?}"
         );
+        let log0: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
+        assert!(
+            log0.iter().all(|f| f.id != 0x307),
+            "must send NO 0x307 frame before first fresh sample: {log0:?}"
+        );
+        assert!(
+            log0.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+            "expected 0xCC refresh while awaiting first fresh sample: {log0:?}"
+        );
+
+        // 2. First fresh J7 sample arrives (-2.40 rad) -> next tick emits Hold at -2.40 rad with
+        //    vel_raw = 0 and configured current_raw = 460 (even if a Target intent is submitted).
+        let now1 = clock.now();
+        drv.cached_states[0].position = -2.40;
+        drv.last_feedback_instant[0] = Some(now1);
+        drv.feedback_queue_bound[0] = Some(now1);
+        drv.pf_last_fresh_position = Some(-2.40);
+        bus.clear_tx();
+        drv.begin_tx_tick();
+        let out1 = drv
+            .emit_pos_force_j7(PosForceIntent::target(0.0, Some(0.30), None, stamp), stamp)
+            .expect("first fresh hold");
+        assert!(matches!(out1, PosForceEmitOutcome::Sent { joint: 0, .. }));
+        let log1: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
+        let j7_1: Vec<CanFrame> = log1.iter().copied().filter(|f| f.id == 0x307).collect();
+        assert_eq!(j7_1.len(), 1, "expected 1 Hold 0x307 frame on first fresh sample: {log1:?}");
+        assert!((f32::from_le_bytes(j7_1[0].data[0..4].try_into().unwrap()) - (-2.40)).abs() < 1e-6);
+        assert_eq!(u16::from_le_bytes([j7_1[0].data[4], j7_1[0].data[5]]), 0);
+        assert_eq!(u16::from_le_bytes([j7_1[0].data[6], j7_1[0].data[7]]), 460);
+
+        // 3. STOP before the first fresh sample: still sends NO 0x307 frame (sends 0xCC), and
+        //    once the first fresh sample arrives (-1.75 rad), applies as Hold with cap 460.
+        drv.reset_pos_force_boot_state();
+        let req = Arc::new(AtomicU64::new(1));
+        let app = Arc::new(AtomicU64::new(1));
+        let latched = Arc::new(AtomicBool::new(true));
+        drv.set_estop_gate(EstopGate::new(req, app));
+        drv.set_abort_flag(latched);
+
         bus.clear_tx();
         drv.begin_tx_tick();
         let targets = [JointTarget::position(0.0)];
-        let outcome = drv.write_estop_hold_bounded(&targets).expect("boot fallback hold");
+        let outcome = drv.write_estop_hold_bounded(&targets).expect("stop before first fresh");
         assert_eq!(outcome, TxBatchOutcome::Complete);
-        let log: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
-        let j7_frames: Vec<CanFrame> = log.iter().copied().filter(|f| f.id == 0x307).collect();
-        assert_eq!(j7_frames.len(), 1, "expected 1 boot-fallback 0x307 frame: {log:?}");
+        let log_stop_pre: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
         assert!(
-            log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
-            "expected 0xCC refresh alongside boot fallback: {log:?}"
+            log_stop_pre.iter().all(|f| f.id != 0x307),
+            "STOP before first fresh sample must send NO 0x307 frame: {log_stop_pre:?}"
         );
-        let sent = j7_frames[0];
-        assert_eq!(sent.id, 0x307);
-        assert!((f32::from_le_bytes(sent.data[0..4].try_into().unwrap()) - (-1.25)).abs() < 1e-6);
-        assert_eq!(u16::from_le_bytes([sent.data[4], sent.data[5]]), 0);
-        assert_eq!(u16::from_le_bytes([sent.data[6], sent.data[7]]), 0);
-        assert!(drv.is_pos_force_freeze_frame(&sent));
+        assert!(
+            log_stop_pre.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+            "STOP before first fresh sample must still request 0xCC refresh: {log_stop_pre:?}"
+        );
+
+        let now2 = clock.now();
+        drv.cached_states[0].position = -1.75;
+        drv.last_feedback_instant[0] = Some(now2);
+        drv.feedback_queue_bound[0] = Some(now2);
+        drv.pf_last_fresh_position = Some(-1.75);
+        bus.clear_tx();
+        drv.begin_tx_tick();
+        let outcome2 = drv.write_estop_hold_bounded(&targets).expect("stop applied once fresh");
+        assert_eq!(outcome2, TxBatchOutcome::Complete);
+        let log_stop_post: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
+        let j7_post: Vec<CanFrame> = log_stop_post.iter().copied().filter(|f| f.id == 0x307).collect();
+        assert_eq!(j7_post.len(), 1, "STOP must apply as Hold once first fresh sample arrives: {log_stop_post:?}");
+        assert!((f32::from_le_bytes(j7_post[0].data[0..4].try_into().unwrap()) - (-1.75)).abs() < 1e-6);
+        assert_eq!(u16::from_le_bytes([j7_post[0].data[4], j7_post[0].data[5]]), 0);
+        assert_eq!(u16::from_le_bytes([j7_post[0].data[6], j7_post[0].data[7]]), 460);
     }
 
     /// Round 8 M1: Type-system capability guard enforcement.

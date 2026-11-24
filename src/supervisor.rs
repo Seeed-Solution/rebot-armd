@@ -4080,6 +4080,27 @@ impl SupervisorInner {
         let max_age = drv.tx_frame_max_age();
         match drv.emit_pos_force_j7(intent, current_stamp) {
             Ok(PosForceEmitOutcome::NotApplicable) => {}
+            Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
+                match tick_output {
+                    TickOutput::None => {
+                        *tick_output = TickOutput::Complete {
+                            is_hold: j7_is_hold,
+                            now,
+                            max_age,
+                            due_mask: 0,
+                            sent_mask: 0,
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Complete { pf_status: dst_pf, .. }
+                    | TickOutput::Deferred { pf_status: dst_pf, .. }
+                    | TickOutput::Expired { pf_status: dst_pf, .. }
+                    | TickOutput::Error { pf_status: dst_pf, .. } => {
+                        *dst_pf = pf_status;
+                    }
+                    TickOutput::EstopInhibited { .. } => {}
+                }
+            }
             Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
                 let pf_bit_hold = if joint.saturating_mul(2) < 64 {
                     1u64 << (joint * 2)
