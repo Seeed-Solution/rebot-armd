@@ -1097,6 +1097,13 @@ pub struct SupervisorInner {
     /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`),
     /// set under the owner lock during teardown and checked on every motion/output install.
     closed_connections: ClosedConnections,
+    /// Fixed-capacity table of currently registered live WS connection IDs (`MAX_LIVE_CONNECTIONS`).
+    /// Zero heap allocations; rejects unknown or closed non-zero connection IDs fail-closed.
+    pub(crate) live_connections: LiveConnections,
+    /// Preallocated string spares recycled across active lease and eviction transitions (0 alloc/free on RT).
+    pub(crate) lease_client_spare: String,
+    pub(crate) lease_label_spare: String,
+    pub(crate) evicted_conn_spare: String,
     /// Bounded, preallocated single-use tracker for consumed global admission request IDs.
     consumed_stamps: ConsumedStamps,
     /// Bounded, preallocated single-use tracker for consumed RT broker `RequestId` values.
@@ -1360,14 +1367,116 @@ pub struct PendingZeroCheckPersist {
     pub active_tool_is_stock: bool,
 }
 
+/// Maximum concurrent live WS connections tracked by the owner (fail-closed when full).
+pub const MAX_LIVE_CONNECTIONS: usize = 64;
+
+/// Fixed-capacity, zero-allocation live WS connection registry (`>= 1`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveConnections {
+    ids: [u64; MAX_LIVE_CONNECTIONS],
+    len: usize,
+    ever_registered: bool,
+}
+
+impl Default for LiveConnections {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LiveConnections {
+    pub(crate) const fn new() -> Self {
+        Self {
+            ids: [0; MAX_LIVE_CONNECTIONS],
+            len: 0,
+            ever_registered: false,
+        }
+    }
+
+    pub(crate) fn register(
+        &mut self,
+        id: u64,
+        closed: &ClosedConnections,
+    ) -> Result<(), &'static str> {
+        if id == 0 {
+            return Err("INVALID_CONNECTION");
+        }
+        if closed.is_closed(id) {
+            return Err("DISCONNECTED");
+        }
+        if self.contains(id) {
+            return Ok(());
+        }
+        if self.len >= MAX_LIVE_CONNECTIONS {
+            return Err("TOO_MANY_CONNECTIONS");
+        }
+        self.ids[self.len] = id;
+        self.len += 1;
+        self.ever_registered = true;
+        Ok(())
+    }
+
+    pub(crate) fn remove(&mut self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        for i in 0..self.len {
+            if self.ids[i] == id {
+                self.len -= 1;
+                self.ids[i] = self.ids[self.len];
+                self.ids[self.len] = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        id != 0 && self.ids[..self.len].contains(&id)
+    }
+
+    #[inline]
+    pub(crate) fn ever_registered(&self) -> bool {
+        self.ever_registered
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Preallocated capacity for [`ClosedConnections`] intervals: with at most `MAX_LIVE_CONNECTIONS`
+/// concurrent open connections, disjoint closed intervals can never exceed `MAX_LIVE_CONNECTIONS + 1`.
+const CLOSED_CONNECTIONS_PREALLOC: usize = MAX_LIVE_CONNECTIONS + 4;
+
 /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`).
-/// Bounded by `open_connections + 1` with zero eviction and O(log K) zero-alloc lookup.
-#[derive(Debug, Default)]
+/// Bounded by `open_connections + 1` with zero eviction, zero RT allocation, and O(log K) lookup.
+#[derive(Debug)]
 pub(crate) struct ClosedConnections {
     intervals: Vec<(u64, u64)>,
 }
 
+impl Default for ClosedConnections {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClosedConnections {
+    pub(crate) fn new() -> Self {
+        Self {
+            intervals: Vec::with_capacity(CLOSED_CONNECTIONS_PREALLOC),
+        }
+    }
+
+    pub(crate) fn reserve_rt(&mut self) {
+        if self.intervals.capacity() < CLOSED_CONNECTIONS_PREALLOC {
+            self.intervals
+                .reserve(CLOSED_CONNECTIONS_PREALLOC - self.intervals.len());
+        }
+    }
     pub(crate) fn mark_closed(&mut self, id: u64) {
         if id == 0 {
             return;
@@ -1750,7 +1859,11 @@ impl SupervisorInner {
             pending_retired_stops: std::collections::VecDeque::with_capacity(
                 crate::rt_core::urgent::URGENT_STOP_CAPACITY,
             ),
-            closed_connections: ClosedConnections::default(),
+            closed_connections: ClosedConnections::new(),
+            live_connections: LiveConnections::new(),
+            lease_client_spare: String::with_capacity(64),
+            lease_label_spare: String::with_capacity(128),
+            evicted_conn_spare: String::with_capacity(64),
             consumed_stamps: ConsumedStamps::new(),
             consumed_broker_stamps: ConsumedStamps::new(),
             terminals: None,
@@ -1814,11 +1927,14 @@ impl SupervisorInner {
         }
     }
 
-    /// Current valid (unexpired) active lease generation, or `0` when no valid lease is held.
+    /// Current valid (unexpired, unfenced) active lease generation, or `0` when no valid lease is held.
     pub fn current_active_lease_gen(&self) -> u64 {
         self.active_lease
             .as_ref()
-            .filter(|a| a.acquired_at.elapsed() < self.lease_timeout)
+            .filter(|a| {
+                a.generation > self.fenced_lease_generation
+                    && a.acquired_at.elapsed() < self.lease_timeout
+            })
             .map_or(0, |a| a.generation)
     }
 
@@ -1834,9 +1950,18 @@ impl SupervisorInner {
         }
     }
 
-    /// Marks WS connection `connection_id` (`>= 1`) closed under the owner lock so no
-    /// resuming async install or stale [`Admitted`] token from that connection can start motion.
+    /// Registers a live WS connection ID (`>= 1`) under the owner lock (fail-closed at
+    /// [`MAX_LIVE_CONNECTIONS`]).
+    pub fn register_live_connection(&mut self, connection_id: u64) -> Result<(), &'static str> {
+        self.live_connections
+            .register(connection_id, &self.closed_connections)
+    }
+
+    /// Marks WS connection `connection_id` (`>= 1`) closed under the owner lock and removes it
+    /// from the live connection table so no resuming async install, queued broker command, or
+    /// stale [`Admitted`] token from that connection can commit or start motion.
     pub fn mark_connection_closed(&mut self, connection_id: u64) {
+        self.live_connections.remove(connection_id);
         self.closed_connections.mark_closed(connection_id);
     }
 
@@ -1844,6 +1969,144 @@ impl SupervisorInner {
     pub fn is_connection_closed(&self, connection_id: u64) -> bool {
         self.closed_connections.is_closed(connection_id)
     }
+
+    /// Returns true if `connection_id` (`>= 1`) is currently registered and open.
+    pub fn is_connection_live(&self, connection_id: u64) -> bool {
+        !self.closed_connections.is_closed(connection_id)
+            && self.live_connections.contains(connection_id)
+    }
+
+    /// Single owner-side connection liveness check for broker commits:
+    /// - `client_id == 0`: non-WS / internal caller -> allowed.
+    /// - `client_id != 0`: always refuses closed IDs; when `require_registered` is true (all
+    ///   `LeaseRequest` ops, and all broker commands once any WS connection has registered),
+    ///   also refuses unknown / unregistered non-zero IDs fail-closed.
+    pub(crate) fn check_client_connection_live(
+        &self,
+        client_id: u64,
+        require_registered: bool,
+    ) -> Result<(), &'static str> {
+        if client_id == 0 {
+            return Ok(());
+        }
+        if self.closed_connections.is_closed(client_id) {
+            return Err("DISCONNECTED");
+        }
+        if (require_registered || self.live_connections.ever_registered())
+            && !self.live_connections.contains(client_id)
+        {
+            return Err("DISCONNECTED");
+        }
+        Ok(())
+    }
+
+    /// Single-use request ID consumption reusing A1's [`ConsumedStamps`] (zero second tracker).
+    pub(crate) fn consume_single_use_request_id(&mut self, request_id: u64) -> Result<(), &'static str> {
+        if self.is_stamp_consumed(request_id) {
+            return Err("STAMP_REUSED");
+        }
+        self.record_consumed_stamp(request_id);
+        Ok(())
+    }
+
+    /// Installs or updates `active_lease` in place reusing preallocated string spares (0 alloc / 0 free on RT).
+    pub(crate) fn set_active_lease_in_place(
+        &mut self,
+        conn_id: u64,
+        conn_str: &str,
+        label: &str,
+        generation: u64,
+        now: Instant,
+    ) {
+        if let Some(ref mut active) = self.active_lease {
+            active.client_id.clear();
+            active.client_id.push_str(conn_str);
+            active.label.clear();
+            active.label.push_str(label);
+            active.generation = generation;
+            active.acquired_at = now;
+            active.last_valid_motion_instant = None;
+        } else {
+            let mut client_buf = std::mem::take(&mut self.lease_client_spare);
+            client_buf.clear();
+            client_buf.push_str(conn_str);
+            let mut label_buf = std::mem::take(&mut self.lease_label_spare);
+            label_buf.clear();
+            label_buf.push_str(label);
+            self.active_lease = Some(ActiveLease {
+                client_id: client_buf,
+                generation,
+                label: label_buf,
+                acquired_at: now,
+                last_valid_motion_instant: None,
+            });
+        }
+        self.active_lease_conn_id = conn_id;
+        self.sync_lease_gen_mirror();
+    }
+
+    /// Clears `active_lease`, recycling its heap buffers back into spares (0 alloc / 0 free on RT).
+    pub(crate) fn clear_active_lease_in_place(&mut self) -> Option<u64> {
+        let old = self.active_lease.take()?;
+        let gen = old.generation;
+        if old.client_id.capacity() >= self.lease_client_spare.capacity() {
+            let mut buf = old.client_id;
+            buf.clear();
+            self.lease_client_spare = buf;
+        }
+        if old.label.capacity() >= self.lease_label_spare.capacity() {
+            let mut buf = old.label;
+            buf.clear();
+            self.lease_label_spare = buf;
+        }
+        self.active_lease_conn_id = 0;
+        self.sync_lease_gen_mirror();
+        Some(gen)
+    }
+
+    /// Records the most recently evicted `(conn_str, generation)` in place using `evicted_conn_spare`
+    /// (0 alloc / 0 free on RT).
+    pub(crate) fn set_last_evicted_in_place(&mut self, conn_str: &str, generation: u64) {
+        if let Some((ref mut buf, ref mut gen)) = self.last_evicted {
+            buf.clear();
+            buf.push_str(conn_str);
+            *gen = generation;
+        } else {
+            let mut buf = std::mem::take(&mut self.evicted_conn_spare);
+            buf.clear();
+            buf.push_str(conn_str);
+            self.last_evicted = Some((buf, generation));
+        }
+    }
+
+    /// Single owner-side entry point fencing a displaced lease generation (release, expiry,
+    /// preemption, or disconnect) BEFORE another owner's output can run.
+    pub(crate) fn fence_displaced_lease_generation(
+        &mut self,
+        displaced_gen: u64,
+        stop_active_motion: bool,
+    ) {
+        if displaced_gen == 0 {
+            return;
+        }
+        self.fenced_lease_generation = self.fenced_lease_generation.max(displaced_gen);
+        self.core.revoke_stream();
+        if self.gripper_stream_lease == Some(displaced_gen) {
+            self.end_gripper_stream();
+        }
+        if self.action_lease_generation == Some(displaced_gen) {
+            self.pending_deferred_done = None;
+        }
+        self.sync_lease_gen_mirror();
+        if stop_active_motion {
+            self.stop_motion();
+        }
+        self.abort_enable_transition_for_fenced_lease(displaced_gen);
+    }
+
+    /// L2 hook: aborts any in-flight `TorqueTransition::Enable` owned by `displaced_gen`.
+    /// No-op stub in L1; wired in L2 alongside torque transitions.
+    pub(crate) fn abort_enable_transition_for_fenced_lease(&mut self, _displaced_gen: u64) {}
 
     /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
     /// superseded by this start plus the new action's eventual terminal (never drops a terminal).
@@ -2535,6 +2798,29 @@ impl SupervisorInner {
         self.joint_feedback_queue_bounds.reserve(dof);
         self.motor_errors.reserve(dof);
         self.gravity_torques.reserve(arm_dof);
+        self.closed_connections.reserve_rt();
+        if self.lease_client_spare.capacity() < 64 {
+            self.lease_client_spare.reserve(64 - self.lease_client_spare.len());
+        }
+        if self.lease_label_spare.capacity() < 128 {
+            self.lease_label_spare.reserve(128 - self.lease_label_spare.len());
+        }
+        if self.evicted_conn_spare.capacity() < 64 {
+            self.evicted_conn_spare.reserve(64 - self.evicted_conn_spare.len());
+        }
+        if let Some(ref mut a) = self.active_lease {
+            if a.client_id.capacity() < 64 {
+                a.client_id.reserve(64 - a.client_id.len());
+            }
+            if a.label.capacity() < 128 {
+                a.label.reserve(128 - a.label.len());
+            }
+        }
+        if let Some((ref mut c, _)) = self.last_evicted {
+            if c.capacity() < 64 {
+                c.reserve(64 - c.len());
+            }
+        }
         let tmpl = self.current_observation();
         self.core.try_prewarm_observations(|| {
             let mut obs = tmpl.clone();
@@ -4413,6 +4699,20 @@ impl SupervisorInner {
         copy_into(&mut sc.before_velocities, &self.commanded_velocities);
         // the scratch goes back for the helpers below; `before_velocities` stays in it
         self.scratch = sc;
+
+        // 0.0 Fence an expired lease generation BEFORE gripper/motion/watchdog output runs
+        // (preserves `active_lease = Some(expired)` for expiry telemetry and never cancels a watchdog park).
+        if let Some(expired_gen) = self
+            .active_lease
+            .as_ref()
+            .filter(|a| {
+                a.generation > self.fenced_lease_generation
+                    && a.acquired_at.elapsed() >= self.lease_timeout
+            })
+            .map(|a| a.generation)
+        {
+            self.fence_displaced_lease_generation(expired_gen, false);
+        }
 
         // 0.1 Gripper stall protection state machine
         if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload

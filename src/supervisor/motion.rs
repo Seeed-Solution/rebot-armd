@@ -516,7 +516,8 @@ impl SupervisorInner {
         }
         let now = Instant::now();
         if let Some(ref active) = self.active_lease {
-            let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
+            let is_expired = active.generation <= self.fenced_lease_generation
+                || active.acquired_at.elapsed() >= self.lease_timeout;
             if active.client_id == conn && !is_expired {
                 return Ok((active.generation, None));
             }
@@ -535,7 +536,9 @@ impl SupervisorInner {
         self.cancel_watchdog_park_for_new_lease(conn);
 
         #[cfg(feature = "policy-runtime")]
-        self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+        if self.policy_run.is_some() {
+            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+        }
 
         // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
         let confirmed_hardware_disabled = match &self.driver {
@@ -552,35 +555,35 @@ impl SupervisorInner {
                 }),
         };
 
-        if confirmed_hardware_disabled
+        let old_gen = self.active_lease.as_ref().map_or(0, |a| a.generation);
+        let needs_stop = !(confirmed_hardware_disabled
             || self.safety.state().is_stopped()
-            || self.is_fully_settled_armed_hold()
-        {
-            self.handover_settling_since = None;
-        } else {
-            self.stop_motion();
+            || self.is_fully_settled_armed_hold());
+        if needs_stop {
             self.handover_settling_since = Some(now);
+        } else {
+            self.handover_settling_since = None;
+        }
+        if old_gen != 0 {
+            self.fence_displaced_lease_generation(old_gen, needs_stop);
+        } else if needs_stop {
+            self.stop_motion();
         }
 
         let evicted = self.active_lease.as_ref().filter(|a| a.client_id != conn).map(|a| (a.client_id.clone(), a.generation));
 
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
-        self.active_lease = Some(ActiveLease {
-            client_id: conn.to_string(),
-            generation: gen,
-            label: label.to_string(),
-            acquired_at: now,
-            last_valid_motion_instant: None,
-        });
-        self.sync_lease_gen_mirror();
+        self.set_active_lease_in_place(0, conn, label, gen, now);
         self.last_heartbeat = now;
-        if evicted.is_some() {
+        if let Some((ref ev_conn, ev_gen)) = evicted {
             self.last_preemption = Some(now);
-            self.last_evicted = evicted.clone();
+            self.set_last_evicted_in_place(ev_conn, ev_gen);
         }
 
-        tracing::info!("Preempted lease for connection {} (label {}), generation {}, evicted: {:?}", conn, label, gen, evicted);
+        if !self.rt_executor_owned {
+            tracing::info!("Preempted lease for connection {} (label {}), generation {}, evicted: {:?}", conn, label, gen, evicted);
+        }
         Ok((gen, evicted))
     }
 
@@ -590,7 +593,8 @@ impl SupervisorInner {
         }
         let now = Instant::now();
         if let Some(ref active) = self.active_lease {
-            let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
+            let is_expired = active.generation <= self.fenced_lease_generation
+                || active.acquired_at.elapsed() >= self.lease_timeout;
             if !is_expired {
                 if active.client_id == client_id { return Ok(active.generation); }
                 return Err((active.client_id.clone(), active.generation));
@@ -600,18 +604,15 @@ impl SupervisorInner {
         // nor a watchdog park started after the previous lease was released.
         self.cancel_watchdog_park_for_new_lease(client_id);
         #[cfg(feature = "policy-runtime")]
-        self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
-        if self.active_lease.is_some() { self.stop_motion(); }
+        if self.policy_run.is_some() {
+            self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
+        }
+        if let Some(old_gen) = self.active_lease.as_ref().map(|a| a.generation) {
+            self.fence_displaced_lease_generation(old_gen, true);
+        }
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
-        self.active_lease = Some(ActiveLease {
-            client_id: client_id.to_string(),
-            generation: gen,
-            label: String::new(),
-            acquired_at: now,
-            last_valid_motion_instant: None,
-        });
-        self.sync_lease_gen_mirror();
+        self.set_active_lease_in_place(0, client_id, "", gen, now);
         Ok(gen)
     }
 
@@ -619,7 +620,9 @@ impl SupervisorInner {
     /// motion is cancelled like any other queued motion and the arm brakes to a hold.
     pub(super) fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
         if self.watchdog_park.take().is_some() && self.pending_normal_unload {
-            tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
+            if !self.rt_executor_owned {
+                tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
+            }
             self.stop_motion();
         }
     }
@@ -776,11 +779,14 @@ impl SupervisorInner {
         }
         if let Some(ref active) = self.active_lease {
             if active.client_id == client_id && active.generation == generation {
-                let valid = active.acquired_at.elapsed() < self.lease_timeout;
-                self.active_lease = None;
-                self.sync_lease_gen_mirror();
+                let valid = active.generation > self.fenced_lease_generation
+                    && active.acquired_at.elapsed() < self.lease_timeout;
+                let displaced = self.clear_active_lease_in_place().unwrap_or(generation);
+                self.fence_displaced_lease_generation(displaced, false);
                 #[cfg(feature = "policy-runtime")]
-                self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
+                if self.policy_run.is_some() {
+                    self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
+                }
                 return valid;
             }
         }
@@ -856,7 +862,13 @@ impl SupervisorInner {
 
     /// [`Self::lease_holder`] without the copy.
     pub fn lease_holder_str(&self) -> Option<&str> {
-        self.active_lease.as_ref().filter(|a| a.acquired_at.elapsed() < self.lease_timeout).map(|a| a.label.as_str())
+        self.active_lease
+            .as_ref()
+            .filter(|a| {
+                a.generation > self.fenced_lease_generation
+                    && a.acquired_at.elapsed() < self.lease_timeout
+            })
+            .map(|a| a.label.as_str())
     }
 
     /// Why `client_id` no longer holds `generation`: "preempted" when a forced acquire
@@ -870,7 +882,8 @@ impl SupervisorInner {
 
     pub fn is_lease_active(&self) -> bool {
         if let Some(ref active) = self.active_lease {
-            active.acquired_at.elapsed() < self.lease_timeout
+            active.generation > self.fenced_lease_generation
+                && active.acquired_at.elapsed() < self.lease_timeout
         } else {
             false
         }
@@ -887,10 +900,13 @@ impl SupervisorInner {
             });
         }
         if let Some(ref mut active) = self.active_lease {
-            if active.client_id == client_id && active.acquired_at.elapsed() < self.lease_timeout {
+            if active.client_id == client_id
+                && active.generation > self.fenced_lease_generation
+                && active.acquired_at.elapsed() < self.lease_timeout
+            {
                 active.acquired_at = Instant::now();
                 self.last_heartbeat = Instant::now();
-            } else {
+            } else if !self.rt_executor_owned {
                 tracing::debug!(
                     "Heartbeat ignored from non-lease owner '{}' (lease owner is '{}')",
                     client_id, active.client_id
