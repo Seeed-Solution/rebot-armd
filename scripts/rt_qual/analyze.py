@@ -3,8 +3,9 @@
 
 Reads load.jsonl (or legacy dev6 tickload.json) plus optional devstat.txt and
 outputs a Markdown qualification report covering:
-- release max/p99/p50 per load phase, wake lateness proxy, skipped deadlines / late_count,
-  RX age, enqueue-to-wire latency (if exposed), and per-phase lock breakdown with wall-vs-CPU;
+- release max/p99/p50 per load phase, wake lateness (or legacy period proxy), skipped releases,
+  diagnostic ring drops (`diag_dropped`), RX age, enqueue-to-wire latency (if exposed), and
+  per-phase lock breakdown with wall-vs-CPU;
 - IRQ and softirq count deltas per interval joined to the worst release intervals;
 - CAN error counter deltas;
 - Pass/Fail verdict against the Stage 3 §6 gate criteria.
@@ -64,6 +65,28 @@ def median_or_none(vals: list[float]) -> float | None:
 
 def max_or_none(vals: list[float]) -> float | None:
     return max(vals) if vals else None
+
+
+def cumulative_delta(
+    samples: list[LoadSample], key: str
+) -> tuple[bool, int | None, int | None, int | None]:
+    """Return (present, start, end, delta) for a monotonic cumulative integer field in `tick`."""
+    vals = [
+        int(s.tick[key])
+        for s in samples
+        if isinstance(s.tick.get(key), int) and not isinstance(s.tick.get(key), bool)
+    ]
+    if not vals:
+        return (False, None, None, None)
+    start, end = vals[0], vals[-1]
+    if len(vals) == 1:
+        delta = end
+    elif end >= start:
+        delta = end - start
+    else:
+        # Daemon restarted mid-run; fall back to post-restart count.
+        delta = end
+    return (True, start, end, delta)
 
 
 @dataclass
@@ -618,14 +641,33 @@ def analyze(
     )
     late_any_nonzero = any((s.tick.get("late_count") or 0) > 0 for s in samples)
 
-    # Check if future armd exposes skipped_releases / enqueue_to_wire_us / control_thread_lock_attempts / wake_lateness_us.
-    has_skipped_releases = any("skipped_releases" in s.tick for s in samples)
-    skipped_delta: int | None = None
-    if has_skipped_releases:
-        s0 = samples[0].tick.get("skipped_releases")
-        s1 = samples[-1].tick.get("skipped_releases")
-        if isinstance(s0, int) and isinstance(s1, int):
-            skipped_delta = s1 - s0
+    # Q1 executor/legacy timing fields (absent in older JSON; keep proxy fallbacks).
+    has_skipped_releases, skipped_start, skipped_end, skipped_delta = cumulative_delta(samples, "skipped_releases")
+    has_diag_dropped, diag_dropped_start, diag_dropped_end, diag_dropped_delta = cumulative_delta(samples, "diag_dropped")
+    diag_samples_lost = bool(has_diag_dropped and diag_dropped_delta is not None and diag_dropped_delta > 0)
+
+    wake_dicts = [s.tick["wake_lateness_us"] for s in samples if isinstance(s.tick.get("wake_lateness_us"), dict)]
+    has_wake_lateness = bool(wake_dicts)
+    wake_lateness_max_us = (
+        max(int(w.get("max", 0)) for w in wake_dicts) if has_wake_lateness else None
+    )
+    wake_lateness_p99_max_us = (
+        max(int(w.get("p99", 0)) for w in wake_dicts) if has_wake_lateness else None
+    )
+    wake_lateness_p50_med_us = (
+        median_or_none([float(w["p50"]) for w in wake_dicts if w.get("p50") is not None])
+        if has_wake_lateness
+        else None
+    )
+    has_wake_over_1ms, _, wake_over_1ms_end, wake_over_1ms_delta = cumulative_delta(samples, "wake_lateness_over_1ms")
+    has_wake_over_5ms, _, wake_over_5ms_end, wake_over_5ms_delta = cumulative_delta(samples, "wake_lateness_over_5ms")
+    has_wake_over_10ms, _, wake_over_10ms_end, wake_over_10ms_delta = cumulative_delta(samples, "wake_lateness_over_10ms")
+
+    owner_mode: str | None = None
+    for s in reversed(samples):
+        if isinstance(s.tick.get("owner_mode"), str) and s.tick["owner_mode"]:
+            owner_mode = s.tick["owner_mode"]
+            break
 
     has_enqueue_to_wire = any("enqueue_to_wire_us" in s.tick for s in samples)
     enqueue_to_wire_max_us = (
@@ -681,8 +723,13 @@ def analyze(
             "max_ms": us_to_ms(max_or_none(maxs)),
         }
 
-    # Wake lateness proxy & MIT budget computation.
-    wake_overrun_ms = max(0.0, (period_max_us - nom_period_us) / 1000.0)
+    # Wake lateness (real Q1 field when present; legacy period_us proxy otherwise) & MIT budget.
+    if has_wake_lateness and wake_lateness_max_us is not None:
+        wake_extra_ms = wake_lateness_max_us / 1000.0
+        wake_extra_label = "wake lateness"
+    else:
+        wake_extra_ms = max(0.0, (period_max_us - nom_period_us) / 1000.0)
+        wake_extra_label = "sched overrun proxy"
     rx_max_ms = phase_stats["rx_us"]["max_ms"] or 0.0
     tx_max_ms = phase_stats["tx_us"]["max_ms"] or 0.0
     # Worst start-to-TX completion observed in any breakdown (wait + pre + rx + control + tx),
@@ -702,7 +749,7 @@ def analyze(
         default=us_to_ms(tick_max_us) or 0.0,
     )
     enq_ms = (enqueue_to_wire_max_us / 1000.0) if enqueue_to_wire_max_us is not None else 0.0
-    worst_extra_ms = wake_overrun_ms + start_to_tx_ms + enq_ms
+    worst_extra_ms = wake_extra_ms + start_to_tx_ms + enq_ms
     mit_total_ms = MIT_PERIOD_MS + worst_extra_ms + MIT_MARGIN_MS
 
     # Control thread info (latest non-null).
@@ -718,11 +765,26 @@ def analyze(
 
     # ---- Gate Evaluation ----
     release_pass = (tick_max_us / 1000.0) < RELEASE_BUDGET_MS
+    if not release_pass:
+        release_status = "FAIL"
+    elif diag_samples_lost:
+        release_status = "INCOMPLETE (diag_dropped > 0)"
+    else:
+        release_status = "PASS"
+    release_detail = (
+        f"`tick_us.max` = **{fmt_ms(us_to_ms(tick_max_us))} ms** "
+        f"(p99 max {fmt_ms(us_to_ms(tick_p99_max_us))} ms, p50 med {fmt_ms(us_to_ms(tick_p50_med_us))} ms)"
+        + (f" (incomplete: `diag_dropped` delta={diag_dropped_delta})" if diag_samples_lost else "")
+    )
 
     if has_skipped_releases and skipped_delta is not None:
         skipped_pass = skipped_delta == 0
         skipped_status = "PASS" if skipped_pass else "FAIL"
-        skipped_detail = f"skipped_releases delta={skipped_delta}, late_count delta={late_delta}"
+        diag_note = f", diag_dropped delta={diag_dropped_delta}" if has_diag_dropped else ""
+        skipped_detail = (
+            f"skipped_releases delta={skipped_delta} (start={fmt_int(skipped_start)}, end={fmt_int(skipped_end)}), "
+            f"late_count delta={fmt_int(late_delta)}{diag_note}"
+        )
     else:
         skipped_pass = (late_delta == 0 if late_delta is not None else not late_any_nonzero) and period_max_us <= (2 * nom_period_us)
         skipped_status = "PASS (proxy)" if skipped_pass else "FAIL"
@@ -777,24 +839,42 @@ def analyze(
         )
 
     mit_observable_pass = mit_total_ms < MIT_WATCHDOG_MS
+    mit_gaps: list[str] = []
+    if diag_samples_lost:
+        mit_gaps.append(f"diag_dropped delta={diag_dropped_delta} lost tick/wake samples")
+    if not has_wake_lateness:
+        mit_gaps.append("wake_lateness_us not exposed (using period proxy)")
+    if not has_enqueue_to_wire:
+        mit_gaps.append("enqueue-to-wire CAN latency not exposed")
     if not mit_observable_pass:
         mit_status = "FAIL"
-    elif has_enqueue_to_wire:
+    elif diag_samples_lost:
+        mit_status = "INCOMPLETE (diag_dropped > 0)"
+    elif not mit_gaps:
         mit_status = "PASS"
     else:
         mit_status = "INCOMPLETE (observable PASS)"
     mit_detail = (
-        f"20.00 + {wake_overrun_ms:.2f} (sched overrun) + {start_to_tx_ms:.2f} (start->TX) "
+        f"20.00 + {wake_extra_ms:.2f} ({wake_extra_label}) + {start_to_tx_ms:.2f} (start->TX) "
         f"+ {enq_ms:.2f} (enqueue->wire) + 5.00 = {mit_total_ms:.2f} ms vs 45.00 ms"
-        + ("" if has_enqueue_to_wire else " (gap: enqueue-to-wire CAN latency not exposed)")
+        + (f" (gap: {'; '.join(mit_gaps)})" if mit_gaps else "")
     )
 
     fault_pass = len(faults_seen) == 0
 
     hard_fail = (not release_pass) or (not skipped_pass) or (not lock_pass) or (not alloc_pass) or (not mit_observable_pass) or (not fault_pass)
-    any_gaps = (not has_skipped_releases) or (not has_lock_attempts) or (not has_enqueue_to_wire) or (not alloc_timing_confirmed)
+    any_gaps = (
+        (not has_skipped_releases)
+        or (not has_wake_lateness)
+        or diag_samples_lost
+        or (not has_lock_attempts)
+        or (not has_enqueue_to_wire)
+        or (not alloc_timing_confirmed)
+    )
     if hard_fail:
         overall_verdict = "FAIL"
+    elif diag_samples_lost:
+        overall_verdict = f"INCOMPLETE (diagnostic samples dropped: diag_dropped delta={diag_dropped_delta})"
     elif any_gaps:
         overall_verdict = "INCOMPLETE (all observable criteria PASS; diagnostic gaps remain)"
     else:
@@ -815,8 +895,8 @@ def analyze(
     out.append("|---|---|---|---|")
     out.append(
         f"| Every measured release | `< {RELEASE_BUDGET_MS:.0f} ms` | "
-        f"`tick_us.max` = **{fmt_ms(us_to_ms(tick_max_us))} ms** (p99 max {fmt_ms(us_to_ms(tick_p99_max_us))} ms, p50 med {fmt_ms(us_to_ms(tick_p50_med_us))} ms) | "
-        f"{'PASS' if release_pass else 'FAIL'} |"
+        f"{release_detail} | "
+        f"{release_status} |"
     )
     out.append(f"| Zero skipped deadlines | `0` | {skipped_detail} | {skipped_status} |")
     out.append(f"| Lock gate (zero supervisor-lock attempts) | `0` | {lock_detail} | {lock_status} |")
@@ -842,6 +922,27 @@ def analyze(
         out.append(f"- **Target**: `{load_run.meta['target']}` | **armd version**: `{armd_ver}`")
     if release_count is not None:
         out.append(f"- **Releases covered**: `{release_count}` (`since_boot_ticks`: {first_ticks} -> {last_ticks})")
+    if owner_mode is not None:
+        out.append(f"- **Owner mode**: `{owner_mode}`")
+    if has_wake_lateness:
+        thresh_parts: list[str] = []
+        if has_wake_over_1ms:
+            thresh_parts.append(f"`>1ms` Δ={fmt_int(wake_over_1ms_delta)} (total {fmt_int(wake_over_1ms_end)})")
+        if has_wake_over_5ms:
+            thresh_parts.append(f"`>5ms` Δ={fmt_int(wake_over_5ms_delta)} (total {fmt_int(wake_over_5ms_end)})")
+        if has_wake_over_10ms:
+            thresh_parts.append(f"`>10ms` Δ={fmt_int(wake_over_10ms_delta)} (total {fmt_int(wake_over_10ms_end)})")
+        thresh_suffix = (" | " + ", ".join(thresh_parts)) if thresh_parts else ""
+        out.append(
+            f"- **Wake lateness (`wake_lateness_us`)**: p50 med=`{fmt_ms(us_to_ms(wake_lateness_p50_med_us))} ms`, "
+            f"p99 max=`{fmt_ms(us_to_ms(wake_lateness_p99_max_us))} ms`, "
+            f"max=`{fmt_ms(us_to_ms(wake_lateness_max_us))} ms`{thresh_suffix}"
+        )
+    if has_diag_dropped:
+        out.append(
+            f"- **Diagnostic ring drops (`diag_dropped`)**: delta=`{fmt_int(diag_dropped_delta)}` "
+            f"(start={fmt_int(diag_dropped_start)}, end={fmt_int(diag_dropped_end)})"
+        )
     if ctl_sched:
         out.append(
             f"- **Control thread (`diagnostics/tick`)**: policy=`{ctl_sched.get('policy')}`, "
@@ -891,10 +992,12 @@ def analyze(
             by_phase[s.phase] = []
         by_phase[s.phase].append(s)
 
+    wake_col_hdr = "`wake_lateness_us` p99/max (ms)" if has_wake_lateness else "Wake Overrun Proxy (ms)"
+    skip_col_hdr = "`skipped`/`late` Δ" if has_skipped_releases else "`late_count` Δ"
     out.append(
-        "| Phase | Samples | `tick_us` p50 med (ms) | `tick_us` p99 max (ms) | `tick_us` max (ms) | "
-        "`lock_us` max (ms) | `wait_us` max (ms) | `period_us` max (ms) | Wake Overrun Proxy (ms) | "
-        "`late_count` Δ | RX Age p99/max (ms) | Enqueue→Wire |"
+        f"| Phase | Samples | `tick_us` p50 med (ms) | `tick_us` p99 max (ms) | `tick_us` max (ms) | "
+        f"`lock_us` max (ms) | `wait_us` max (ms) | `period_us` max (ms) | {wake_col_hdr} | "
+        f"{skip_col_hdr} | RX Age p99/max (ms) | Enqueue→Wire |"
     )
     out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 
@@ -906,18 +1009,47 @@ def analyze(
         w_max = us_to_ms(max_or_none([float(x.tick["wait_us"]["max"]) for x in grp if "wait_us" in x.tick]))
         p_max_us = max_or_none([float(x.tick["period_us"]["max"]) for x in grp if "period_us" in x.tick])
         p_max = us_to_ms(p_max_us)
-        wake_p = max(0.0, (p_max_us - nom_period_us) / 1000.0) if p_max_us is not None else None
+        if has_wake_lateness:
+            wl_p99 = us_to_ms(
+                max_or_none(
+                    [
+                        float(x.tick["wake_lateness_us"]["p99"])
+                        for x in grp
+                        if isinstance(x.tick.get("wake_lateness_us"), dict)
+                        and x.tick["wake_lateness_us"].get("p99") is not None
+                    ]
+                )
+            )
+            wl_max = us_to_ms(
+                max_or_none(
+                    [
+                        float(x.tick["wake_lateness_us"]["max"])
+                        for x in grp
+                        if isinstance(x.tick.get("wake_lateness_us"), dict)
+                        and x.tick["wake_lateness_us"].get("max") is not None
+                    ]
+                )
+            )
+            wake_str = f"{fmt_ms(wl_p99)} / {fmt_ms(wl_max)}" if wl_max is not None else "n/a"
+        else:
+            wake_p = max(0.0, (p_max_us - nom_period_us) / 1000.0) if p_max_us is not None else None
+            wake_str = fmt_ms(wake_p)
         l0 = grp[0].tick.get("late_count")
         l1 = grp[-1].tick.get("late_count")
         ld = (int(l1) - int(l0)) if isinstance(l0, int) and isinstance(l1, int) else None
+        if has_skipped_releases:
+            _, _, _, sd = cumulative_delta(grp, "skipped_releases")
+            skip_str = f"{fmt_int(sd)} / {fmt_int(ld)}"
+        else:
+            skip_str = fmt_int(ld)
         r_p99 = max_or_none([float(x.rx_age_ms["p99"]) for x in grp if x.rx_age_ms and x.rx_age_ms.get("p99") is not None])
         r_max = max_or_none([float(x.rx_age_ms["max"]) for x in grp if x.rx_age_ms and x.rx_age_ms.get("max") is not None])
         rx_str = f"{fmt_ms(r_p99, 1)} / {fmt_ms(r_max, 1)}" if r_max is not None else "n/a"
         enq_str = fmt_ms(us_to_ms(enqueue_to_wire_max_us)) + " ms" if has_enqueue_to_wire else "not exposed"
         return (
             f"| `{name}` | {len(grp)} | {fmt_ms(t_p50)} | {fmt_ms(t_p99)} | **{fmt_ms(t_max)}** | "
-            f"{fmt_ms(l_max)} | {fmt_ms(w_max)} | {fmt_ms(p_max)} | {fmt_ms(wake_p)} | "
-            f"{fmt_int(ld)} | {rx_str} | {enq_str} |"
+            f"{fmt_ms(l_max)} | {fmt_ms(w_max)} | {fmt_ms(p_max)} | {wake_str} | "
+            f"{skip_str} | {rx_str} | {enq_str} |"
         )
 
     for ph in phases_ordered:
@@ -1144,10 +1276,16 @@ def analyze(
             "`skipped_releases`: tracked in `ExecutorStats::skipped_releases` (`src/rt_core/executor.rs`), "
             "not serialized in `GET /api/v1/diagnostics/tick` (only `late_count` for `dt > 2 * period` is exposed)."
         )
-    gaps.append(
-        "`wake_lateness_us`: scheduled release time vs actual wakeup offset is not in `TickSample`; "
-        "only start-to-start `period_us` is exposed."
-    )
+    if not has_wake_lateness:
+        gaps.append(
+            "`wake_lateness_us`: scheduled release time vs actual wakeup offset is not in `TickSample`; "
+            "only start-to-start `period_us` is exposed."
+        )
+    if diag_samples_lost:
+        gaps.append(
+            f"`diag_dropped`: {diag_dropped_delta} diagnostic tick sample(s) were dropped by the full ring during this run; "
+            "window maxima (`tick_us.max`, `wake_lateness_us.max`) may miss unrecorded peaks."
+        )
     if not has_enqueue_to_wire:
         gaps.append(
             "`enqueue_to_wire_us`: `lock_phases.tx_us` covers encoding + nonblocking SocketCAN `write()` syscall only, "
