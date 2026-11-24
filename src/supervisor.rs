@@ -744,6 +744,8 @@ pub struct ParkContinuation {
     pub lease_gen: Option<u64>,
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
+    /// Original park request deadline enforced on both owners; never extended by continuations.
+    pub deadline: Instant,
 }
 
 /// Pending off-thread preparation state for a lease-expiry watchdog park (zero heap allocations).

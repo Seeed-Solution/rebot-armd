@@ -839,7 +839,7 @@ pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot:
         let id = this.begin_action_rt("park");
         debug_assert_eq!(id, tentative_id);
         let phase = match rearm { ParkRearmStart::ConfirmedNow => ParkContinuationPhase::ReadyForPlan, ParkRearmStart::Pending => ParkContinuationPhase::WaitingRearm };
-        this.park_continuation = Some(ParkContinuation { action_id: id, phase, epoch: this.safety.epoch_id(), stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
+        this.park_continuation = Some(ParkContinuation { action_id: id, phase, epoch: this.safety.epoch_id(), stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev, deadline: slot.authority.deadline });
         if phase == ParkContinuationPhase::ReadyForPlan { this.notify_park_continuation(); }
         return Ok(MotionInstalled::DeferredContinuation { epoch: this.safety.epoch_id(), action_id: id, expected_duration_s: PARK_DURATION_S + PARK_EXTRA_DURATION_S });
     }
@@ -854,7 +854,7 @@ pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot:
         this.mit.park_after_hand_back = true;
         this.mit.deferred_park_off_owner = true;
         let id = this.begin_action_rt("park");
-        this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::WaitingMitHandback, epoch, stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
+        this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::WaitingMitHandback, epoch, stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev, deadline: slot.authority.deadline });
         return Ok(MotionInstalled::DeferredContinuation { epoch, action_id: id, expected_duration_s: PARK_DURATION_S + PARK_EXTRA_DURATION_S });
     }
     install_park_trajectory(this, ParkActionMode::New, slot, heap_traj)
@@ -867,7 +867,13 @@ pub fn install_park_continuation(inner: &mut SupervisorInner, action_id: u64, sl
 
 pub fn install_park_continuation_at(inner: &mut SupervisorInner, action_id: u64, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool, expected_boot: BootId, now: Instant) -> Result<MotionInstalled, MotionInstallError> {
     if slot.kind != MotionKind::Park || slot.for_holding_after_clear || slot.for_mit_deferral { return Err(MotionInstallError::InvalidCommand); }
-    verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
+    // Bound continuation authority by the ORIGINAL park request deadline stored in `ParkContinuation`
+    // so a separately timed `ContinuePark` or freshly prepared slot cannot outlive the original park.
+    let mut bounded_slot = *slot;
+    if let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id) {
+        bounded_slot.authority.deadline = bounded_slot.authority.deadline.min(cont.deadline);
+    }
+    verify_slot_authority(inner, &bounded_slot, expected_boot, expected_epoch, now)?;
     let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id && c.phase == ParkContinuationPhase::ReadyForPlan) else {
         return Err(MotionInstallError::ContinuationMismatch);
     };
@@ -1047,7 +1053,9 @@ pub(crate) fn commit_home(inner: &mut SupervisorInner, d: &Descriptor, slot: &Pr
     commit_broker(inner, d, ctx, |i, stamp, ep| install_home_at(i, stamp, slot, None, Some(ep), true, ctx.boot, ctx.now))
 }
 pub(crate) fn commit_park(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-    commit_broker(inner, d, ctx, |i, stamp, ep| install_park_at(i, stamp, slot, None, Some(ep), true, ctx.boot, ctx.now))
+    let mut bounded = *slot;
+    bounded.authority.deadline = bounded.authority.deadline.min(d.stamp.deadline);
+    commit_broker(inner, d, ctx, |i, stamp, ep| install_park_at(i, stamp, &bounded, None, Some(ep), true, ctx.boot, ctx.now))
 }
 pub(crate) fn commit_park_continuation(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
     let Some(action_id) = slot.continuation_action else { return Err("INVALID_COMMAND"); };

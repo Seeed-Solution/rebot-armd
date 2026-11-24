@@ -2230,3 +2230,216 @@ async fn m4_nine_dof_urdf_chain_plus_gripper_motion_and_over_limit_rejection() {
         assert!(got.abs() < 1e-3, "joint {i} did not reach resting pose 0.0: got {got}");
     }
 }
+
+// ============================================================================
+// 12. Round 3 Item 2: Deferred park carries ORIGINAL request deadline on BOTH owners
+//     (no fresh 15 s timeout, no separately timed ContinuePark past original deadline)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_deferred_park_enforces_original_deadline_on_both_owners() {
+    // 12a. Legacy WS owner: deferred park continuation uses the ORIGINAL request deadline
+    //      (80 ms here, NOT a fresh 15 s timeout); when rearm outlives the original deadline,
+    //      continuation fails DEADLINE_EXPIRED with no motion, and direct install past
+    //      `cont.deadline` is refused even with a freshly-extended slot deadline.
+    {
+        let (drv, _knobs) = MotionTestDriver::new(
+            vec![0.4, 0.2],
+            Duration::from_millis(200), // longer than the 80 ms original request deadline
+            Duration::from_millis(5),
+            None,
+        );
+        let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+        let (mut ws, gen, _, sup, _) = common::torqued_rig(sup, &[0.4, 0.2]).await;
+
+        // Enter holding_after_clear via E-stop + clear_fault.
+        let _ = sup.trigger_e_stop().await;
+        sup.inner().write().await.tick(0.01);
+        sup.clear_fault().await.expect("clear_fault -> holding_after_clear");
+        assert!(sup.inner().read().await.holding_after_clear());
+
+        sup.set_motion_plan_deadline(Duration::from_millis(80)).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let req_started = Instant::now();
+        let ack = common::rpc(&mut ws, gen, epoch, "/api/v1/motion/unload", json!({})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+
+        let cont = sup
+            .inner()
+            .read()
+            .await
+            .park_continuation()
+            .expect("deferred park continuation installed");
+        assert_eq!(cont.phase, ParkContinuationPhase::WaitingRearm);
+        assert!(
+            cont.deadline <= req_started + Duration::from_millis(500),
+            "continuation deadline must reflect the original ~80 ms request deadline, not a fresh 15 s timeout"
+        );
+
+        // Wait past the original 80 ms deadline (well under 15 s) without letting rearm complete first.
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        for _ in 0..10 {
+            sup.inner().write().await.tick(0.01);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if sup.inner().read().await.park_continuation().is_none() {
+                break;
+            }
+        }
+        let inner = sup.inner().read().await;
+        assert!(inner.park_continuation().is_none(), "expired park continuation must be cleared");
+        assert!(inner.active_trajectory.is_none(), "no motion may start after original deadline");
+        assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("DEADLINE_EXPIRED"));
+        assert!(inner.is_torqued && !inner.pending_normal_unload);
+    }
+
+    // 12b. Direct `install_park_continuation_at`: even when `slot.authority.deadline` is freshly
+    //      extended far into the future, `now > cont.deadline` is refused with `DeadlineExpired`.
+    {
+        let (drv, _) = MotionTestDriver::new(vec![0.4, 0.2], Duration::ZERO, Duration::ZERO, None);
+        let mut inner = SupervisorInner::new(parkable_2dof_config()).with_driver(Box::new(drv));
+        let stamp = inner.current_admission_stamp();
+        SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+        inner.tick(0.01);
+        inner.execute_stop(armd::safety::StopPolicy::EStopLatch);
+        inner.tick(0.01);
+        inner.clear_fault().unwrap();
+        assert!(inner.holding_after_clear());
+
+        let t0 = Instant::now();
+        let orig_deadline = t0 + Duration::from_millis(50);
+        let snap = MotionPlanSnapshot::from_supervisor(&inner).with_deadline(orig_deadline);
+        let park = req::prepare_motion(&snap, &MotionRequest::park()).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let ep = inner.safety.epoch_id();
+        let boot = inner.boot_id();
+        let installed = req::install_park_at(&mut inner, stamp, &park.slot, None, Some(ep), false, boot, t0).unwrap();
+        let action_id = installed.action_id();
+        assert_eq!(inner.park_continuation().unwrap().deadline, orig_deadline);
+        inner.tick(0.01);
+        assert_eq!(inner.park_continuation().unwrap().phase, ParkContinuationPhase::ReadyForPlan);
+
+        let fresh_snap = MotionPlanSnapshot::from_supervisor(&inner)
+            .with_deadline(t0 + Duration::from_secs(60));
+        let cont_plan = req::prepare_motion(&fresh_snap, &MotionRequest::park()).unwrap();
+        let ep2 = inner.safety.epoch_id();
+        let err = req::install_park_continuation_at(
+            &mut inner,
+            action_id,
+            &cont_plan.slot,
+            None,
+            Some(ep2),
+            false,
+            boot,
+            orig_deadline + Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert_eq!(err, MotionInstallError::DeadlineExpired);
+        assert!(inner.active_trajectory.is_none());
+    }
+
+    // 12c. RT executor owner: `Submit::InstallPark` records original deadline on `ParkContinuation`;
+    //      advancing `ScriptedClock` past it causes `Submit::ContinuePark` (even with a fresh 10 s
+    //      broker deadline and fresh slot deadline) to be refused `DEADLINE_EXPIRED` with 0 alloc.
+    {
+        let period = Duration::from_millis(5);
+        let period_ns = period.as_nanos() as u64;
+        let clock = ScriptedClock::new();
+        let (drv, _) = MotionTestDriver::new(
+            vec![0.4, 0.2],
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+            Some(clock.clone()),
+        );
+        let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+        let handle = start_scripted_executor(&sup, period, clock.clone(), true).await;
+        clock.run_steps(period_ns, 2);
+        let _ = submit_enable_and_wait(&sup, &handle, &clock, period_ns, 1);
+
+        let maint_done = Arc::new(AtomicBool::new(false));
+        let maint_done_bg = maint_done.clone();
+        let clock_step = clock.clone();
+        let step_jh = tokio::task::spawn_blocking(move || {
+            while !maint_done_bg.load(Ordering::Acquire) {
+                clock_step.run_steps(period_ns, 1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let _ = sup.trigger_e_stop().await;
+        handle.clear_fault_async().await.unwrap().expect("clear_fault succeeds");
+        maint_done.store(true, Ordering::Release);
+        step_jh.await.unwrap();
+        clock.run_steps(period_ns, 2);
+
+        let held_snap = sup.hub().latest().unwrap();
+        assert!(held_snap.rt.holding_after_clear);
+        let hub_cfg = sup.hub().motion_config().unwrap();
+        let orig_deadline = clock.now() + Duration::from_millis(40);
+        let p_snap = MotionPlanSnapshot::from_published(&held_snap, hub_cfg.clone())
+            .unwrap()
+            .with_deadline(orig_deadline);
+        let park_rearm = req::prepare_motion(&p_snap, &MotionRequest::park()).unwrap();
+        let auth_clear = auth_from_hub(&sup, &handle);
+        let r_park = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                3,
+                auth_clear,
+                orig_deadline,
+                Submit::InstallPark(&|s: &mut PlanSlot| req::stage_park(s, &park_rearm.slot)),
+            )
+            .unwrap();
+        clock.run_steps(period_ns, 1);
+        let park_action = drain_replies(&handle)
+            .iter()
+            .find_map(|r| match r {
+                Reply::Ack { request, action: Some(a), .. } if *request == r_park => Some(a.0),
+                _ => None,
+            })
+            .expect("InstallPark ACK with action_id");
+
+        // Wait for ParkRearm to confirm (10 ms), then advance clock PAST original 40 ms deadline.
+        for _ in 0..20 {
+            clock.run_steps(period_ns, 1);
+            if clock.now() > orig_deadline + Duration::from_millis(10) {
+                break;
+            }
+        }
+        assert!(clock.now() > orig_deadline);
+        let ready_snap = sup.hub().latest().unwrap();
+        assert!(!ready_snap.rt.holding_after_clear && ready_snap.obs.safety_state == SafetyState::Armed);
+        let pos_before = ready_snap.obs.commanded_positions.clone();
+
+        // Attempt a separately timed `ContinuePark` with a fresh 10 s deadline on BOTH slot and broker.
+        let fresh_deadline = clock.now() + Duration::from_secs(10);
+        let cont_snap = MotionPlanSnapshot::from_published(&ready_snap, hub_cfg)
+            .unwrap()
+            .with_deadline(fresh_deadline);
+        let cont_plan = req::prepare_motion(&cont_snap, &MotionRequest::park()).unwrap();
+        let r_cont = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                4,
+                auth_from_hub(&sup, &handle),
+                fresh_deadline,
+                Submit::ContinuePark(&|s: &mut PlanSlot| req::stage_park_continuation(s, park_action, &cont_plan.slot)),
+            )
+            .unwrap();
+        clock.run_steps(period_ns, 4);
+        let rs = drain_replies(&handle);
+        assert!(
+            rs.iter().any(|r| matches!(r, Reply::Refused { request, code: "DEADLINE_EXPIRED", .. } if *request == r_cont)),
+            "ContinuePark past original deadline must be refused DEADLINE_EXPIRED; got {rs:?}"
+        );
+        let snap_after = sup.hub().latest().unwrap();
+        assert_eq!(snap_after.obs.commanded_positions, pos_before, "no motion may start after deadline expiry");
+        assert!(snap_after.obs.is_torqued);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+        drop(handle);
+    }
+}

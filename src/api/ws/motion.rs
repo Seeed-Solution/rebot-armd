@@ -13,7 +13,6 @@ use super::dispatch::{
 use crate::rt_core::requests::motion as req;
 
 const MAX_START_DRIFT_RETRIES: usize = 5;
-const PARK_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
@@ -255,10 +254,11 @@ pub(super) async fn complete_pending_motion(
             }
             Ok(req::MotionInstalled::DeferredContinuation { action_id, expected_duration_s, .. }) => {
                 let notify = Arc::clone(&inner.park_continuation_notify);
+                let deadline = inner.park_continuation.map_or(snapshot.authority.deadline, |c| c.deadline);
                 let ack = format_motion_ack(&inner, &reply_kind, Some((action_id, expected_duration_s)));
                 drop(inner);
                 spawn_park_continuation(
-                    action_id, epoch, stamp.stop_gen, recv_connection.to_string(), notify, recv_supervisor.clone(), worker_closing.clone(), worker_tasks,
+                    action_id, epoch, stamp.stop_gen, deadline, recv_connection.to_string(), notify, recv_supervisor.clone(), worker_closing.clone(), worker_tasks,
                 );
                 return Some(ack);
             }
@@ -286,6 +286,7 @@ fn spawn_park_continuation(
     action_id: u64,
     epoch: u64,
     request_stop_gen: u64,
+    deadline: Instant,
     connection_id: String,
     notify: Arc<tokio::sync::Notify>,
     supervisor: Arc<ArmSupervisor>,
@@ -293,13 +294,19 @@ fn spawn_park_continuation(
     worker_tasks: &ConnectionTasks,
 ) {
     worker_tasks.spawn(async move {
-        let deadline = Instant::now() + PARK_CONTINUATION_TIMEOUT;
         let mut retries = 0usize;
         loop {
-            if closing.load(Ordering::Acquire) || Instant::now() >= deadline {
+            let disconnected = closing.load(Ordering::Acquire);
+            let expired = Instant::now() > deadline;
+            if disconnected || expired {
                 let mut inner = supervisor.inner().write().await;
                 if !inner.detached {
-                    req::fail_park_continuation(&mut inner, action_id, "UNLOAD_FAILED", "Park continuation timed out or disconnected");
+                    let (code, text) = if expired {
+                        ("DEADLINE_EXPIRED", "Park continuation exceeded original request deadline")
+                    } else {
+                        ("UNLOAD_FAILED", "Park continuation disconnected")
+                    };
+                    req::fail_park_continuation(&mut inner, action_id, code, text);
                 }
                 return;
             }
@@ -311,14 +318,17 @@ fn spawn_park_continuation(
                 if cont.phase == crate::supervisor::ParkContinuationPhase::ReadyForPlan {
                     let mut snap = req::MotionPlanSnapshot::from_supervisor(&inner);
                     snap.authority.stop_generation = request_stop_gen;
-                    snap.authority.deadline = deadline;
+                    snap.authority.deadline = cont.deadline;
                     Some(snap)
                 } else {
                     None
                 }
             };
             let Some(snap) = ready_snapshot else {
-                let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
+                let wait = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(50));
+                if !wait.is_zero() {
+                    let _ = tokio::time::timeout(wait, notified).await;
+                }
                 continue;
             };
             let cancel = closing.clone();
@@ -335,8 +345,15 @@ fn spawn_park_continuation(
             {
                 return;
             }
-            if closing.load(Ordering::Acquire) || Instant::now() >= deadline {
-                req::fail_park_continuation(&mut inner, action_id, "UNLOAD_FAILED", "Park continuation timed out or disconnected before install");
+            let disconnected = closing.load(Ordering::Acquire);
+            let expired = Instant::now() > deadline;
+            if disconnected || expired {
+                let (code, text) = if expired {
+                    ("DEADLINE_EXPIRED", "Park continuation exceeded original request deadline before install")
+                } else {
+                    ("UNLOAD_FAILED", "Park continuation disconnected before install")
+                };
+                req::fail_park_continuation(&mut inner, action_id, code, text);
                 return;
             }
             let plan = match planned {
