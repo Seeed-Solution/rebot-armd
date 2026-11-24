@@ -6602,3 +6602,245 @@ fn dual_owner_r8_d1_boot_fallback_no_output_until_fresh_and_stop_before_first_sa
         }
     }
 }
+
+/// Torque-on pre-enable J7 Hold invariant on BOTH owners (Legacy and RT Executor):
+/// The very first `0x307` transmitted after fresh J7 feedback on the torque-on path MUST be a
+/// zero-velocity `Hold` (`vel_raw == 0`, `position == measured`, `i_des == current_ceiling_raw`),
+/// obeying `NoOutputUntilFresh -> Hold` rather than emitting a `Target` carrying `close_speed`.
+/// Verified for both cold mode-4 restore (`already_mode_4 == false`) and host-restart readback
+/// (`already_mode_4 == true`), starting with J7 silent (no fresh feedback yet -> 0 `0x307` frames)
+/// until fresh J7 feedback arrives during the torque-on handshake.
+#[test]
+fn dual_owner_torque_on_first_0x307_is_zero_vel_hold_at_measured_position() {
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+    let j7_q = -1.85_f32;
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        for already_mode_4 in [false, true] {
+            let cfg = base_cfg();
+            let limits = dm_limits();
+            let clock = MockClock::new();
+            let bus = FakeBus::with_clock(&limits, clock.clone());
+            bus.with(|s| {
+                s.motors[6].q = j7_q;
+                s.motors[6].set_reg_u32(
+                    armd::protocol::damiao::RID_CTRL_MODE,
+                    if already_mode_4 {
+                        armd::protocol::damiao::CTRL_MODE_POS_FORCE
+                    } else {
+                        armd::protocol::damiao::CTRL_MODE_POS_VEL
+                    },
+                );
+                // Start with J7 feedback muted so no fresh J7 sample exists yet.
+                s.motors[6].mute_feedback = true;
+                s.immediate_replies = true;
+                s.follow_commands = true;
+                for i in 0..6 {
+                    s.push_feedback(i);
+                }
+            });
+            let tx_budget = cfg.damiao_tx_budget();
+            let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force gripper drive");
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(limits)
+                .unwrap()
+                .with_gripper_drive(grip)
+                .unwrap()
+                .with_tx_budget(tx_budget);
+            drv.read_joint_states().unwrap();
+            drv.read_joint_states().unwrap();
+            drv.check_mapping_ranges();
+            assert_eq!(drv.pos_force_last_fresh_position(), None);
+
+            let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+            inner.lease_enabled = false;
+            inner.tick(DT);
+            bus.clear_log();
+
+            match owner {
+                Owner::Legacy => {
+                    // Before fresh J7 feedback arrives, idle ticks send ZERO 0x307 frames.
+                    for _ in 0..2 {
+                        clock.advance(ms(20));
+                        bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+                        inner.tick(DT);
+                    }
+                    assert!(
+                        j7_pf_frames(&bus.tx_log()).is_empty(),
+                        "Legacy already_mode_4={already_mode_4}: must emit ZERO 0x307 before fresh feedback"
+                    );
+
+                    // Deliver fresh stationary torque-off J7 feedback and run torque-on.
+                    bus.clear_log();
+                    clock.advance(ms(20));
+                    bus.with(|s| {
+                        s.motors[6].mute_feedback = false;
+                        s.motors[6].q = j7_q;
+                        s.push_all_feedback();
+                    });
+                    inner.tick(DT);
+                    assert!(
+                        j7_pf_frames(&bus.tx_log()).is_empty(),
+                        "Legacy already_mode_4={already_mode_4}: disabled tick must not emit 0x307"
+                    );
+
+                    let stamp = inner.current_admission_stamp();
+                    let admitted = inner.check_admission(stamp).expect("admit torque-on");
+                    SupervisorInner::enable_torque(admitted).expect("legacy torque-on");
+
+                    let log = bus.tx_log();
+                    let first_pf_idx = log
+                        .iter()
+                        .position(|f| f.id == 0x307)
+                        .expect("Legacy: expected pre-enable 0x307 Hold");
+                    let enable_idx = log
+                        .iter()
+                        .position(|f| f.id == 7 && f.data == armd::protocol::damiao::CMD_ENABLE)
+                        .expect("Legacy: expected J7 CMD_ENABLE");
+                    assert!(
+                        first_pf_idx < enable_idx,
+                        "Legacy already_mode_4={already_mode_4}: first 0x307 ({first_pf_idx}) must precede CMD_ENABLE ({enable_idx})"
+                    );
+                    let first = log[first_pf_idx];
+                    let p_wire = f32::from_le_bytes(first.data[0..4].try_into().unwrap());
+                    let v_wire = u16::from_le_bytes([first.data[4], first.data[5]]);
+                    let i_wire = u16::from_le_bytes([first.data[6], first.data[7]]);
+                    assert!(
+                        (p_wire - j7_q).abs() < 1e-2,
+                        "Legacy already_mode_4={already_mode_4}: first 0x307 pos={p_wire} != measured {j7_q}"
+                    );
+                    assert_eq!(
+                        v_wire, 0,
+                        "Legacy already_mode_4={already_mode_4}: first 0x307 on torque-on must be zero-velocity Hold (vel_raw=0), got {v_wire}"
+                    );
+                    assert_eq!(i_wire, pf_cur);
+
+                    // Confirm subsequent operational tick succeeds with zero faults after torque-on.
+                    bus.clear_log();
+                    bus.with(|s| {
+                        s.immediate_replies = false;
+                        s.push_all_feedback();
+                    });
+                    clock.advance(ms(20));
+                    inner.tick(DT);
+                    assert!(
+                        inner.safety.state().is_operational(),
+                        "Legacy already_mode_4={already_mode_4}: expected operational after torque-on: {:?}",
+                        inner.safety.state()
+                    );
+                }
+                Owner::Executor => {
+                    inner.rt_executor_owned = true;
+                    let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+                        inner,
+                        BootId(89),
+                        Capacities { commands: 8, plans: 4, replies: 16 },
+                        VirtualClock::from_mock_clock(clock.clone()),
+                    );
+
+                    // Submit TorqueOn while J7 is STILL muted: step 1 commits the transition
+                    // (`budget = 0`), step 2 polls the handshake which sends 0xCC refresh and
+                    // emits ZERO 0x307 frames until fresh J7 feedback arrives!
+                    let auth = fx.core.authority(&fx.ctx(fx.now()));
+                    broker
+                        .submit(
+                            ClientId(1),
+                            1,
+                            auth,
+                            fx.now() + Duration::from_secs(5),
+                            Submit::Transition(TransitionOp::TorqueOn),
+                        )
+                        .expect("submit TorqueOn");
+                    fx.dt = DT;
+                    let rep = fx.step();
+                    assert!(
+                        rep.command.as_ref().is_some_and(|(_, r)| r.is_ok()),
+                        "Executor already_mode_4={already_mode_4}: TorqueOn submit: {rep:?}"
+                    );
+                    // Step 2 polls `RefreshBeforeRestore` (when `!already_mode_4`, 20 ms < 50 ms
+                    // reply deadline) or sends `REG_READ` readback (`already_mode_4`); step 3
+                    // enters `PreEnableRefresh` (`already_mode_4`) so both paths have sent `0xCC`
+                    // while staying inside the 50 ms reply window with ZERO `0x307` frames.
+                    let pre_steps = if already_mode_4 { 2 } else { 1 };
+                    for _ in 0..pre_steps {
+                        bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+                        fx.step();
+                    }
+                    assert!(
+                        fx.core.torque_transition_pending(),
+                        "Executor already_mode_4={already_mode_4}: TorqueOn must stay pending while J7 lacks fresh feedback"
+                    );
+                    let pre_log = bus.tx_log();
+                    assert!(
+                        j7_pf_frames(&pre_log).is_empty(),
+                        "Executor already_mode_4={already_mode_4}: must emit ZERO 0x307 before first fresh J7 sample: {pre_log:?}"
+                    );
+                    assert!(
+                        !j7_refresh_frames(&pre_log).is_empty(),
+                        "Executor already_mode_4={already_mode_4}: expected 0xCC refresh while awaiting fresh J7 sample: {pre_log:?}"
+                    );
+
+                    // Unmute J7 and deliver fresh stationary torque-off feedback -> TorqueOn completes,
+                    // and the VERY FIRST 0x307 on the wire is a zero-velocity Hold at j7_q with pf_cur!
+                    bus.clear_log();
+                    bus.with(|s| {
+                        s.motors[6].mute_feedback = false;
+                        s.motors[6].q = j7_q;
+                        s.push_all_feedback();
+                    });
+                    for _ in 0..10 {
+                        if !fx.core.torque_transition_pending() {
+                            break;
+                        }
+                        bus.with(|s| s.push_all_feedback());
+                        fx.step();
+                    }
+                    assert!(
+                        fx.core.is_torqued && !fx.core.torque_transition_pending(),
+                        "Executor already_mode_4={already_mode_4}: TorqueOn must complete once fresh J7 feedback arrives"
+                    );
+
+                    let log = bus.tx_log();
+                    let first_pf_idx = log
+                        .iter()
+                        .position(|f| f.id == 0x307)
+                        .expect("Executor: expected pre-enable 0x307 Hold");
+                    let enable_idx = log
+                        .iter()
+                        .position(|f| f.id == 7 && f.data == armd::protocol::damiao::CMD_ENABLE)
+                        .expect("Executor: expected J7 CMD_ENABLE");
+                    assert!(
+                        first_pf_idx < enable_idx,
+                        "Executor already_mode_4={already_mode_4}: first 0x307 ({first_pf_idx}) must precede CMD_ENABLE ({enable_idx})"
+                    );
+                    let first = log[first_pf_idx];
+                    let p_wire = f32::from_le_bytes(first.data[0..4].try_into().unwrap());
+                    let v_wire = u16::from_le_bytes([first.data[4], first.data[5]]);
+                    let i_wire = u16::from_le_bytes([first.data[6], first.data[7]]);
+                    assert!(
+                        (p_wire - j7_q).abs() < 1e-2,
+                        "Executor already_mode_4={already_mode_4}: first 0x307 pos={p_wire} != measured {j7_q}"
+                    );
+                    assert_eq!(
+                        v_wire, 0,
+                        "Executor already_mode_4={already_mode_4}: first 0x307 on torque-on must be zero-velocity Hold (vel_raw=0), got {v_wire}"
+                    );
+                    assert_eq!(i_wire, pf_cur);
+
+                    // Confirm subsequent operational RT tick succeeds with zero faults after torque-on.
+                    bus.clear_log();
+                    bus.with(|s| {
+                        s.immediate_replies = false;
+                        s.push_all_feedback();
+                    });
+                    fx.step();
+                    assert!(
+                        fx.core.safety.state().is_operational(),
+                        "Executor already_mode_4={already_mode_4}: expected operational after torque-on: {:?}",
+                        fx.core.safety.state()
+                    );
+                }
+            }
+        }
+    }
+}

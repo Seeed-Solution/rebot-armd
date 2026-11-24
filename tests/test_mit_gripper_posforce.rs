@@ -99,7 +99,7 @@ fn enable_writes_mode_4_reads_it_back_then_enables() {
     let hold_vel = u16::from_le_bytes([cmds[0].data[4], cmds[0].data[5]]);
     let hold_cur = u16::from_le_bytes([cmds[0].data[6], cmds[0].data[7]]);
     assert!((hold_pos - (-1.0)).abs() < 1e-3, "hold position {hold_pos}");
-    assert!(hold_vel <= damiao::pos_force_vel_raw(0.30), "hold velocity {hold_vel}");
+    assert_eq!(hold_vel, 0, "pre-enable hold must be zero-velocity Hold (vel_raw=0), got {hold_vel}");
     assert_eq!(hold_cur, RAW);
     assert_eq!(log.iter().filter(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE).count(), 1, "only J7's mode is written");
     assert_eq!(bus.with(|s| s.motors[J7].ctrl_mode()), damiao::CTRL_MODE_POS_FORCE);
@@ -147,11 +147,18 @@ fn enable_after_restart_with_j7_already_in_mode_4_emits_readback_hold_enable() {
     let hold_vel = u16::from_le_bytes([cmds[0].data[4], cmds[0].data[5]]);
     let hold_cur = u16::from_le_bytes([cmds[0].data[6], cmds[0].data[7]]);
     assert!((hold_pos - (-1.75)).abs() < 1e-3, "hold position {hold_pos}");
-    assert_eq!(hold_vel, 30, "pre-enable hold must quantize 0.306 downward to 30 (0.30 rad/s), got {hold_vel}");
+    assert_eq!(hold_vel, 0, "pre-enable hold must be zero-velocity Hold (vel_raw=0), got {hold_vel}");
     assert_eq!(hold_cur, RAW);
     let last_pf = bus.with(|s| s.motors[J7].last_pos_force).expect("motor received pre-enable hold");
-    assert!((last_pf.0 - (-1.75)).abs() < 1e-3 && last_pf.1 == 30 && last_pf.2 == RAW, "{last_pf:?}");
+    assert!((last_pf.0 - (-1.75)).abs() < 1e-3 && last_pf.1 == 0 && last_pf.2 == RAW, "{last_pf:?}");
     assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+    // Subsequent closing target still quantizes 0.306 downward to 30 (0.30 rad/s).
+    bus.clear_log();
+    d.write_joint_targets(&targets(-1.0)).expect("closing target");
+    let close_cmds = j7_commands(&bus.tx_log());
+    assert_eq!(close_cmds.len(), 1);
+    let close_vel = u16::from_le_bytes([close_cmds[0].data[4], close_cmds[0].data[5]]);
+    assert_eq!(close_vel, 30, "closing target must quantize 0.306 downward to 30 (0.30 rad/s), got {close_vel}");
 
     // Without fresh J7 feedback after restart (mode already 4), enable must fail closed before sending a hold or enable.
     let clock = MockClock::new();
@@ -2255,7 +2262,7 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
             let hold_pos = f32::from_le_bytes([hold_f.data[0], hold_f.data[1], hold_f.data[2], hold_f.data[3]]);
             let hold_vel = u16::from_le_bytes([hold_f.data[4], hold_f.data[5]]);
             assert!((hold_pos - (-1.2)).abs() < 1e-3, "expected newest validated hold position -1.2, got {hold_pos}");
-            assert!(hold_vel <= damiao::pos_force_vel_raw(0.30), "pre-enable hold exceeded close_speed_rad_s: vel_raw={hold_vel}");
+            assert_eq!(hold_vel, 0, "pre-enable hold must be zero-velocity Hold (vel_raw=0), got {hold_vel}");
         }
     }
 

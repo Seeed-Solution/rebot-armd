@@ -7283,17 +7283,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 format!("pre-enable hold refused: needs stationary torque-off feedback (still {still}, torque off {off}, status {status}{fault})"),
             );
         }
-        let Some(close_speed) = self.pos_force.as_ref().filter(|pf| pf.joint == joint).map(|pf| pf.close_speed_rad_s) else {
+        if !self.pos_force.as_ref().is_some_and(|pf| pf.joint == joint) {
             return self.readback_failed(joint, "pre-enable hold frame unavailable".into());
-        };
-        // Build and emit the capped 0x307 pre-enable hold frame through the private
+        }
+        // Build and emit the zero-velocity 0x307 pre-enable Hold frame through the private
         // `pos_force_emitter` narrow pre-enable API (`allow_freeze = false`: enable requires
-        // provably fresh <= 100 ms stationary feedback).
+        // provably fresh <= 100 ms stationary feedback; `vel_raw = 0`, configured `current_raw`).
         let hold = match pos_force_emitter::emit_pre_enable_hold(
             self,
             self.enable_stop_stamp,
-            hold_pos,
-            close_speed,
         ) {
             Ok(frame) => frame,
             Err(TxRefusal::Deferred) => {
@@ -10445,21 +10443,18 @@ mod pos_force_emitter {
 
     /// Narrow pre-enable hold API: called ONLY from `DamiaoArmDriver::finish_pos_force_readback`
     /// while the motor is still disabled right after `CTRL_MODE` readback (`allow_freeze = false`).
+    /// Emits a zero-velocity stationary `Hold` (`vel_raw = 0`, configured `current_raw`) at the
+    /// fresh measured J7 position so the first `0x307` after fresh feedback on the torque-on path
+    /// obeys `NoOutputUntilFresh -> Hold`.
     pub(super) fn emit_pre_enable_hold<C: CanTransport>(
         driver: &mut DamiaoArmDriver<C>,
         expected_stamp: Option<StopStamp>,
-        hold_pos: f32,
-        close_speed: f32,
     ) -> Result<CanFrame, TxRefusal> {
         send_frame(
             driver,
             TxKind::Handshake,
             expected_stamp,
-            PosForceIntentKind::Target {
-                position: hold_pos,
-                velocity: Some(close_speed),
-                current_raw: None,
-            },
+            PosForceIntentKind::Hold,
             false,
             false,
             false,
