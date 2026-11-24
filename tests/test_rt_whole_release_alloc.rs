@@ -760,6 +760,9 @@ async fn stalled_consumers_normal_refused_commits_urgent_stop_terminal_retiremen
     assert_eq!(handle.stop_requests().applied(), stop_gen);
 
     // (c) Saturate diagnostics ring (> 256 releases) while observation hub + broker stay stalled!
+    // Wait until `armd-dispatch` has exited its pre-lock `drain_sinks()` call and blocked on
+    // `StateHub::latest()`, so it cannot drain `diag_rx` partway through the saturation burst.
+    wait_for_dispatcher_blocked_on_hub(&sup, Duration::from_secs(5));
     clock.run_steps(period_ns, DIAG_RING_CAPACITY as u64 + 30);
     assert!(
         handle.stats().diag_dropped.load(Ordering::Relaxed) >= 25,
