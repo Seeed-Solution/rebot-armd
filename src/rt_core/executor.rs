@@ -2187,21 +2187,21 @@ impl RtExecutorHandle {
                 .reply
                 .take()
                 .ok_or((
-                    super::requests::config::ConfigRequest::CalibrationClearLoadError,
+                    super::requests::config::ConfigRequest::SampleTableCapture,
                     OwnerError::Protocol,
                 )),
             Ok(_) => Err((
-                super::requests::config::ConfigRequest::CalibrationClearLoadError,
+                super::requests::config::ConfigRequest::SampleTableCapture,
                 OwnerError::Protocol,
             )),
             Err((MaintenanceOp::Config(mut ex), err)) => Err((
                 ex.req
                     .take()
-                    .unwrap_or(super::requests::config::ConfigRequest::CalibrationClearLoadError),
+                    .unwrap_or(super::requests::config::ConfigRequest::SampleTableCapture),
                 err,
             )),
             Err((_, err)) => Err((
-                super::requests::config::ConfigRequest::CalibrationClearLoadError,
+                super::requests::config::ConfigRequest::SampleTableCapture,
                 err,
             )),
         }

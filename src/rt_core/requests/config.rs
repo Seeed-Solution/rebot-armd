@@ -30,9 +30,7 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::calibration::{
-    CalibError, CalibrationFile, CalibrationStale,
-};
+use crate::calibration::{CalibrationFile, CalibrationStale};
 use crate::chain::{ArmModel, EvalBufs};
 use crate::collision::{CollisionConfig, CollisionPolicy, Sensitivity};
 use crate::grasp::GraspSetup;
@@ -63,13 +61,6 @@ use crate::supervisor::{
 use crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
 
 static NEXT_CONFIG_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
-static NEXT_CALIB_JOB_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// Allocates a unique monotonic job token for binding `calibration_busy` acquisition,
-/// owner mutations, and cleanup to the same calibration / motor-zero transaction.
-pub fn next_calib_job_token() -> u64 {
-    NEXT_CALIB_JOB_TOKEN.fetch_add(1, Ordering::Relaxed)
-}
 
 // ============================================================================
 // Published configuration snapshot (off-RT readers + off-thread prepare)
@@ -876,62 +867,6 @@ impl ConfigError {
             },
         }
     }
-
-    pub fn to_calib_error(&self) -> CalibError {
-        match self {
-            Self::RevisionMismatch { expected, current } => {
-                let mut err = CalibError::new(
-                    409,
-                    "POLICY_REVISION_MISMATCH",
-                    format!("Policy revision mismatch: expected {expected}, current {current}"),
-                );
-                err.extra.insert("current_revision".into(), json!(current));
-                err
-            }
-            Self::Busy(msg) => CalibError::new(409, "CONFIG_BUSY", *msg),
-            Self::Unsupported(msg) => CalibError::new(400, "UNSUPPORTED", *msg),
-            Self::MotionBusy { subject, reason } => {
-                CalibError::new(409, "MOTION_BUSY", format!("{subject} cannot change while {reason}"))
-            }
-            Self::LeaseLost | Self::ConnectionClosed => CalibError::new(
-                409,
-                "LEASE_LOST",
-                "This connection lost the lease during the calibration",
-            ),
-            Self::EpochMismatch { .. } => CalibError::new(
-                409,
-                "EPOCH_MISMATCH",
-                "The epoch changed during the calibration (stop or e-stop)",
-            ),
-            Self::Stopped => CalibError::new(
-                409,
-                "STOPPED",
-                "An authorized stop intervened during the calibration",
-            ),
-            Self::CalibPrecondition { status, code, message } => CalibError::new(*status, code, *message),
-            Self::ExecutorCapabilityUnsupported(msg) => {
-                CalibError::new(503, "EXECUTOR_CAPABILITY_UNSUPPORTED", *msg)
-            }
-            Self::Reconciling(code) => CalibError::new(
-                409,
-                code,
-                format!("calibration persisted on disk but activation failed ({code}); reconciling required"),
-            ),
-            other => match other.to_arm_error() {
-                ArmError::Rejected { status, code, message } => CalibError::new(status, &code, message),
-                ArmError::PolicyRevisionMismatch { expected, current } => {
-                    let mut err = CalibError::new(
-                        409,
-                        "POLICY_REVISION_MISMATCH",
-                        format!("Policy revision mismatch: expected {expected}, current {current}"),
-                    );
-                    err.extra.insert("current_revision".into(), json!(current));
-                    err
-                }
-                e => CalibError::new(500, "INTERNAL", e.to_string()),
-            },
-        }
-    }
 }
 
 // ============================================================================
@@ -1022,15 +957,6 @@ pub enum ReservePrecheck {
         tool_id: HolderLabel,
         tool_config_digest: HolderLabel,
     },
-    Calibration {
-        kin_changes: bool,
-        allow_during_calibration_busy: bool,
-    },
-    JointZeroCommit {
-        require_zero_idle: bool,
-        job_token: Option<u64>,
-        expected_gripper_calib_revision: Option<u64>,
-    },
 }
 
 /// Pre-built candidate payload swapped into `SupervisorInner` in-place during [`ActivateConfig`].
@@ -1066,56 +992,6 @@ pub enum ConfigCandidate {
         tool_config_digest: HolderLabel,
         confirmed_at: String,
     },
-    Calibration(Box<CalibrationCandidate>),
-    JointZeroCommit(Box<JointZeroCommitCandidate>),
-}
-
-/// Pre-built calibration live-state payload (zero heap alloc/free on RT swap).
-pub struct CalibrationCandidate {
-    pub calibration: Option<CalibrationFile>,
-    pub camera_mount: CameraMount,
-    pub kin_changed: bool,
-    pub arm_model: Option<ArmModel>,
-    pub pose_tcps: Option<Vec<(String, Option<PoseTcp>)>>,
-    pub effective_floor: Option<(f32, &'static str)>,
-    pub ws_eval_bufs: Option<EvalBufs>,
-    #[cfg(feature = "policy-runtime")]
-    pub calibration_digest: String,
-    pub require_kinematics_disarmed: bool,
-}
-
-/// Pre-built atomic joint-zero + invalidation live payload (swapped in-place on RT with
-/// zero heap allocation and zero heap free).
-pub struct JointZeroCommitCandidate {
-    /// Software/restore zero offsets installed strictly at activation (after rename + dir-sync).
-    /// `None` for post-motor-zero or pre-motor-zero MIT invalidations that do not change offsets.
-    pub new_offsets: Option<Vec<f32>>,
-    pub file_changes: bool,
-    pub calibration: Option<CalibrationFile>,
-    pub arm_model_uncorrected: Option<ArmModel>,
-    pub pose_tcps: Option<Vec<(String, Option<PoseTcp>)>>,
-    pub effective_floor: Option<(f32, &'static str)>,
-    pub ws_eval_bufs: Option<EvalBufs>,
-    #[cfg(feature = "policy-runtime")]
-    pub calibration_digest: Option<String>,
-    pub next_poses: Option<PoseList>,
-    pub gripper_stale: Option<CalibrationStale>,
-    pub reset_gripper_baseline: bool,
-    pub require_zero_idle: bool,
-    pub job_token: Option<u64>,
-    pub expected_gripper_calib_revision: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct CalibBeginCheck {
-    pub check_grasp: bool,
-    pub check_kinematics_armed: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CalibBeginSnapshot {
-    pub is_torqued: bool,
-    pub epoch_id: u64,
 }
 
 /// Reserve `proposal.domain` at `proposal.expected_revision` after authority + domain prechecks.
@@ -1249,32 +1125,7 @@ pub enum ConfigRequest {
     Persisted(PersistedConfig),
     Activate(ActivateConfig),
     Release(ReleaseConfig),
-    SetCalibrationBusy {
-        busy: bool,
-        motor_zero: bool,
-        job_token: u64,
-        check_begin: Option<CalibBeginCheck>,
-    },
-    CalibrationRevert {
-        before: Box<CalibrationCandidate>,
-    },
-    CalibrationClearLoadError,
     ForceReconcile(ConfigDomain),
-    SetJointZeroOffsets {
-        offsets: Vec<f32>,
-        precomputed_floor: Option<(f32, &'static str)>,
-        auth: Option<ConfigAuthContext>,
-        expected_stop_gen: Option<u64>,
-        deadline: Option<Instant>,
-        job_token: Option<u64>,
-    },
-    SetMotorZero {
-        joint: usize,
-        auth: Option<ConfigAuthContext>,
-        expected_stop_gen: Option<u64>,
-        deadline: Option<Instant>,
-        job_token: Option<u64>,
-    },
     SampleTableCapture,
     GravityComp(GravityCompOp),
     InspectHold(ConfigDomain),
@@ -1290,15 +1141,7 @@ pub enum ConfigReply {
     Persisted(Result<Reservation, ConfigError>),
     Activated(Result<ConfigActivated, ConfigError>),
     Released(Released),
-    CalibrationBusySet(Result<CalibBeginSnapshot, ConfigError>),
-    CalibrationReverted {
-        calibration_revision: u64,
-        workspace_revision: u64,
-    },
-    CalibrationLoadErrorCleared,
     ReconcilingForced,
-    JointZeroOffsetsSet(Result<(), ConfigError>),
-    MotorZeroSet(Result<(), ConfigError>),
     TableCaptureSampled(Result<([f32; 8], usize), ConfigError>),
     GravityCompDone(Result<GravityCompReply, ConfigError>),
     HoldInspected {
@@ -1325,16 +1168,8 @@ pub struct ConfigRetiredPayloads {
     pub steps: Option<Vec<Step>>,
     pub grasp_setup: Option<GraspSetup>,
     pub string_a: Option<String>,
-    pub string_b: Option<String>,
-    pub calibration_file: Option<CalibrationFile>,
-    pub arm_model: Option<ArmModel>,
-    pub pose_tcps: Option<Vec<(String, Option<PoseTcp>)>>,
-    pub calib_candidate: Option<Box<CalibrationCandidate>>,
-    pub joint_zero_commit_candidate: Option<Box<JointZeroCommitCandidate>>,
     pub gravity_comp_policy: Option<crate::model::GravityCompPolicy>,
     pub unused_candidate: Option<ConfigCandidate>,
-    pub gripper_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
-    pub offsets: Option<Vec<f32>>,
 }
 
 /// Single heap allocation carrying a config request into `armd-control` and its reply +
@@ -1398,68 +1233,11 @@ pub(crate) fn handle_config_exchange(
             }
             ConfigReply::Released(released)
         }
-        ConfigRequest::SetCalibrationBusy {
-            busy,
-            motor_zero,
-            job_token,
-            check_begin,
-        } => ConfigReply::CalibrationBusySet(install_set_calibration_busy(
-            core,
-            busy,
-            motor_zero,
-            job_token,
-            check_begin,
-        )),
-        ConfigRequest::CalibrationRevert { before } => {
-            let (calibration_revision, workspace_revision) =
-                install_calibration_revert(core, before, &mut ex.retired);
-            ConfigReply::CalibrationReverted {
-                calibration_revision,
-                workspace_revision,
-            }
-        }
-        ConfigRequest::CalibrationClearLoadError => {
-            ex.retired.string_a = core.calibration_load_error.take();
-            ConfigReply::CalibrationLoadErrorCleared
-        }
         ConfigRequest::ForceReconcile(domain) => {
             let active_rev = ConfigAuthority::revision(core, domain);
             core.core.config_mut().force_reconcile(domain, active_rev);
             ConfigReply::ReconcilingForced
         }
-        ConfigRequest::SetJointZeroOffsets {
-            offsets,
-            precomputed_floor,
-            auth,
-            expected_stop_gen,
-            deadline,
-            job_token,
-        } => ConfigReply::JointZeroOffsetsSet(install_set_joint_zero_offsets(
-            core,
-            ctx,
-            offsets,
-            precomputed_floor,
-            auth,
-            expected_stop_gen,
-            deadline,
-            job_token,
-            &mut ex.retired,
-        )),
-        ConfigRequest::SetMotorZero {
-            joint,
-            auth,
-            expected_stop_gen,
-            deadline,
-            job_token,
-        } => ConfigReply::MotorZeroSet(install_set_motor_zero(
-            core,
-            ctx,
-            joint,
-            auth,
-            expected_stop_gen,
-            deadline,
-            job_token,
-        )),
         ConfigRequest::SampleTableCapture => ConfigReply::TableCaptureSampled(install_sample_table_capture(core)),
         ConfigRequest::GravityComp(op) => {
             ConfigReply::GravityCompDone(install_gravity_comp(core, ctx, op, &mut ex.retired))
@@ -1473,23 +1251,6 @@ pub(crate) fn handle_config_exchange(
         }
     };
     ex.reply = Some(reply);
-}
-
-fn check_kinematics_armed_static(core: &SupervisorInner) -> Result<(), ConfigError> {
-    let running = core.last_action.as_ref().is_some_and(|a| a.is_running()) || core.macro_run.is_some();
-    if core.is_torqued || running {
-        let message = if running {
-            "the kinematic correction can change only with torque off and no action running (an action is running); park or disable torque first"
-        } else {
-            "the kinematic correction can change only with torque off and no action running (torque is on); park or disable torque first"
-        };
-        return Err(ConfigError::CalibPrecondition {
-            status: 409,
-            code: "KINEMATICS_ARMED",
-            message,
-        });
-    }
-    Ok(())
 }
 
 fn run_reserve_precheck(
@@ -1623,57 +1384,6 @@ fn run_reserve_precheck(
                 || core.config.active_tool.config_digest != tool_config_digest.as_str()
             {
                 return Err(ConfigError::PlanStale("active tool changed before commissioning confirm"));
-            }
-            Ok(())
-        }
-        ReservePrecheck::Calibration {
-            kin_changes,
-            allow_during_calibration_busy,
-        } => {
-            if !allow_during_calibration_busy && core.calibration_busy {
-                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
-            }
-            if kin_changes {
-                check_kinematics_armed_static(core)?;
-            }
-            Ok(())
-        }
-        ReservePrecheck::JointZeroCommit {
-            require_zero_idle,
-            job_token,
-            expected_gripper_calib_revision,
-        } => {
-            if let Some(tok) = job_token {
-                if !core.calibration_busy || core.calibration_busy_token != Some(tok) {
-                    return Err(ConfigError::Busy(
-                        "motor zero job no longer holds calibration lock",
-                    ));
-                }
-            }
-            if let Some(exp_grip) = expected_gripper_calib_revision {
-                if core.gripper_calib_revision != exp_grip {
-                    return Err(ConfigError::PlanStale(
-                        "gripper calibration changed while preparing joint zero commit",
-                    ));
-                }
-            }
-            if require_zero_idle {
-                if core.rt_executor_owned && core.driver.is_some() {
-                    return Err(ConfigError::ExecutorCapabilityUnsupported(
-                        "software joint zero with attached hardware driver is unsupported on the RT executor",
-                    ));
-                }
-                if *core.safety.state() != crate::safety::SafetyState::Idle
-                    || core.is_torqued
-                    || core.disable_pending
-                    || core.active_trajectory.is_some()
-                {
-                    return Err(ConfigError::CalibPrecondition {
-                        status: 409,
-                        code: "MOTOR_ZERO_FAILED",
-                        message: "Arm must be Idle with torque off and no active trajectory to set joint zero offsets",
-                    });
-                }
             }
             Ok(())
         }
@@ -1887,19 +1597,6 @@ fn fail_activation(
                     subject: "configuration",
                     reason: "motion started before activation",
                 },
-                "KINEMATICS_ARMED" => ConfigError::CalibPrecondition {
-                    status: 409,
-                    code: "KINEMATICS_ARMED",
-                    message: "the kinematic correction can change only with torque off and no action running",
-                },
-                "MOTOR_ZERO_FAILED" => ConfigError::CalibPrecondition {
-                    status: 409,
-                    code: "MOTOR_ZERO_FAILED",
-                    message: "Arm must be Idle with torque off and no active trajectory to set joint zero offsets",
-                },
-                "EXECUTOR_CAPABILITY_UNSUPPORTED" => ConfigError::ExecutorCapabilityUnsupported(
-                    "software joint zero with attached hardware driver is unsupported on the RT executor",
-                ),
                 other => ConfigError::Busy(other),
             }
         }
@@ -2029,41 +1726,6 @@ fn install_activate_config(
                 Ok(())
             }
         }
-        ConfigCandidate::Calibration(cand) => {
-            if cand.require_kinematics_disarmed && check_kinematics_armed_static(core).is_err() {
-                Err("KINEMATICS_ARMED")
-            } else {
-                Ok(())
-            }
-        }
-        ConfigCandidate::JointZeroCommit(cand) => {
-            if let Some(tok) = cand.job_token {
-                if !core.calibration_busy || core.calibration_busy_token != Some(tok) {
-                    return Err(fail_activation(core, reservation, "CONFIG_BUSY", candidate, retired));
-                }
-            }
-            if let Some(exp_grip) = cand.expected_gripper_calib_revision {
-                if core.gripper_calib_revision != exp_grip {
-                    return Err(fail_activation(core, reservation, "PLAN_STALE", candidate, retired));
-                }
-            }
-            if cand.new_offsets.is_some() && core.rt_executor_owned && core.driver.is_some() {
-                Err("EXECUTOR_CAPABILITY_UNSUPPORTED")
-            } else if (cand.require_zero_idle
-                && (*core.safety.state() != crate::safety::SafetyState::Idle
-                    || core.is_torqued
-                    || core.disable_pending
-                    || core.active_trajectory.is_some()))
-                || cand
-                    .new_offsets
-                    .as_ref()
-                    .is_some_and(|o| o.len() != core.config.dof || o.iter().any(|v| !v.is_finite()))
-            {
-                Err("MOTOR_ZERO_FAILED")
-            } else {
-                Ok(())
-            }
-        }
         ConfigCandidate::Poses { .. } | ConfigCandidate::Sequences { .. } => Ok(()),
     };
     if let Err(code) = domain_ok {
@@ -2153,12 +1815,6 @@ fn install_activate_config(
             retired.string_a = core.tool_commissioning_confirmed_at.replace(confirmed_at);
             core.tool_commissioning_revision += 1;
         }
-        ConfigCandidate::Calibration(cand) => {
-            apply_calibration_candidate_in_place(core, cand, true, retired);
-        }
-        ConfigCandidate::JointZeroCommit(cand) => {
-            apply_joint_zero_commit_in_place(core, cand, retired);
-        }
     }
 
     if durability == Durability::Durable {
@@ -2183,316 +1839,6 @@ fn install_activate_config(
         }
         Activated::Reconciling { code } => Err(ConfigError::Reconciling(code)),
     }
-}
-
-fn apply_calibration_candidate_in_place(
-    core: &mut SupervisorInner,
-    mut cand: Box<CalibrationCandidate>,
-    advance_calib_revision: bool,
-    retired: &mut ConfigRetiredPayloads,
-) {
-    let mut workspace_bumped = false;
-    if cand.kin_changed {
-        if let Some(new_model) = cand.arm_model.take() {
-            retired.arm_model = Some(std::mem::replace(&mut core.config.arm_model, new_model));
-            workspace_bumped = true;
-        }
-        if let Some(tcps) = cand.pose_tcps.take() {
-            for (pose, (id, tcp)) in core.poses.list.poses.iter_mut().zip(tcps.iter()) {
-                if pose.id == *id {
-                    pose.tcp = tcp.clone();
-                }
-            }
-            retired.pose_tcps = Some(tcps);
-        }
-    }
-    if core.config.camera_mount != cand.camera_mount {
-        workspace_bumped = true;
-    }
-    core.config.camera_mount = cand.camera_mount.clone();
-    let tilt = f64::from(core.config.camera_mount.tilt_deg);
-    if let Some(g) = core.config.grasp.as_mut() {
-        g.camera_tilt_deg = tilt;
-    }
-    retired.calibration_file = std::mem::replace(&mut core.calibration, cand.calibration.take());
-    #[cfg(feature = "policy-runtime")]
-    {
-        let new_digest = std::mem::take(&mut cand.calibration_digest);
-        retired.string_a = Some(std::mem::replace(&mut core.calibration_digest, new_digest));
-    }
-    if let Some((floor, source)) = cand.effective_floor {
-        core.floor_source = source;
-        if let Some(ws) = core.config.workspace.as_mut() {
-            if ws.floor_z_m != floor {
-                ws.floor_z_m = floor;
-                workspace_bumped = true;
-            }
-        }
-    }
-    if workspace_bumped {
-        core.workspace_revision += 1;
-        core.retire_servo_ws_min_depths();
-    }
-    if let Some(bufs) = cand.ws_eval_bufs.take() {
-        retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
-    }
-    if advance_calib_revision {
-        core.calibration_revision += 1;
-    }
-    // Keep the Box<CalibrationCandidate> shell alive until off-thread drop (0 dealloc on RT).
-    retired.calib_candidate = Some(cand);
-}
-
-fn install_set_calibration_busy(
-    core: &mut SupervisorInner,
-    busy: bool,
-    motor_zero: bool,
-    job_token: u64,
-    check_begin: Option<CalibBeginCheck>,
-) -> Result<CalibBeginSnapshot, ConfigError> {
-    if busy {
-        if let Some(chk) = check_begin {
-            if core.calibration_busy {
-                return Err(ConfigError::Busy("a calibration apply or restore is running"));
-            }
-            if let Some(reason) = core.workspace_change_blocker_static() {
-                return Err(ConfigError::MotionBusy {
-                    subject: "the camera calibration",
-                    reason,
-                });
-            }
-            if chk.check_grasp
-                && (core.config.grasp.is_none()
-                    || !core.config.has_cartesian_with_gripper()
-                    || core.config.kinematics.is_none()
-                    || core.config.gripper_policy.is_none())
-            {
-                return Err(ConfigError::Unsupported("This profile has no grasp setup"));
-            }
-            if chk.check_kinematics_armed {
-                check_kinematics_armed_static(core)?;
-            }
-        } else if core.calibration_busy {
-            return Err(ConfigError::Busy("a calibration apply, restore or zero is running"));
-        }
-        core.calibration_busy = true;
-        core.calibration_busy_token = Some(job_token);
-        if motor_zero {
-            core.motor_zero_busy = true;
-        }
-    } else if job_token == 0 || core.calibration_busy_token.is_none() || core.calibration_busy_token == Some(job_token) {
-        core.calibration_busy = false;
-        core.calibration_busy_token = None;
-        core.motor_zero_busy = false;
-    }
-    Ok(CalibBeginSnapshot {
-        is_torqued: core.is_torqued,
-        epoch_id: core.safety.epoch_id(),
-    })
-}
-
-fn install_calibration_revert(
-    core: &mut SupervisorInner,
-    before: Box<CalibrationCandidate>,
-    retired: &mut ConfigRetiredPayloads,
-) -> (u64, u64) {
-    apply_calibration_candidate_in_place(core, before, true, retired);
-    (core.calibration_revision, core.workspace_revision)
-}
-
-fn check_motor_zero_authority(
-    core: &mut SupervisorInner,
-    ctx: &CommitCtx,
-    auth: Option<ConfigAuthContext>,
-    expected_stop_gen: Option<u64>,
-    deadline: Option<Instant>,
-    job_token: Option<u64>,
-) -> Result<(), ConfigError> {
-    if let Some(tok) = job_token {
-        if !core.calibration_busy || core.calibration_busy_token != Some(tok) {
-            return Err(ConfigError::Busy("motor zero job no longer holds calibration lock"));
-        }
-    }
-    if let Some(dl) = deadline {
-        if ctx.now > dl {
-            return Err(ConfigError::DeadlineExpired);
-        }
-    }
-    if let Some(a) = auth {
-        if a.admission.connection_id != 0 && core.is_connection_closed(a.admission.connection_id) {
-            return Err(ConfigError::ConnectionClosed);
-        }
-        if core.estop_request_unapplied() || core.safety.epoch_id() != a.admission.estop_epoch {
-            return Err(ConfigError::EpochMismatch {
-                current_epoch: core.safety.epoch_id(),
-            });
-        }
-        if core.urgent_stop_unapplied() {
-            return Err(ConfigError::Stopped);
-        }
-        if let Some(exp_stop) = expected_stop_gen {
-            if ctx.stop_generation != exp_stop {
-                return Err(ConfigError::Stopped);
-            }
-        }
-        if let Some((conn, gen)) = a.lease_holder {
-            if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
-                return Err(ConfigError::LeaseLost);
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn install_set_joint_zero_offsets(
-    core: &mut SupervisorInner,
-    ctx: &CommitCtx,
-    mut offsets: Vec<f32>,
-    precomputed_floor: Option<(f32, &'static str)>,
-    auth: Option<ConfigAuthContext>,
-    expected_stop_gen: Option<u64>,
-    deadline: Option<Instant>,
-    job_token: Option<u64>,
-    retired: &mut ConfigRetiredPayloads,
-) -> Result<(), ConfigError> {
-    let res = (|| {
-        check_motor_zero_authority(core, ctx, auth, expected_stop_gen, deadline, job_token)?;
-        if core.rt_executor_owned && core.driver.is_some() {
-            return Err(ConfigError::ExecutorCapabilityUnsupported(
-                "software joint zero with attached hardware driver is unsupported on the RT executor",
-            ));
-        }
-        if *core.safety.state() != crate::safety::SafetyState::Idle
-            || core.is_torqued
-            || core.disable_pending
-            || core.active_trajectory.is_some()
-        {
-            return Err(ConfigError::CalibPrecondition {
-                status: 409,
-                code: "MOTOR_ZERO_FAILED",
-                message: "Arm must be Idle with torque off and no active trajectory to set joint zero offsets",
-            });
-        }
-        match core.set_joint_zero_offsets_in_place(&mut offsets, precomputed_floor) {
-            Ok(retired_base) => {
-                retired.gripper_baseline = retired_base;
-                Ok(())
-            }
-            Err(msg) => Err(ConfigError::CalibPrecondition {
-                status: 409,
-                code: "MOTOR_ZERO_FAILED",
-                message: msg,
-            }),
-        }
-    })();
-    retired.offsets = Some(offsets);
-    res
-}
-
-fn install_set_motor_zero(
-    core: &mut SupervisorInner,
-    ctx: &CommitCtx,
-    joint: usize,
-    auth: Option<ConfigAuthContext>,
-    expected_stop_gen: Option<u64>,
-    deadline: Option<Instant>,
-    job_token: Option<u64>,
-) -> Result<(), ConfigError> {
-    check_motor_zero_authority(core, ctx, auth, expected_stop_gen, deadline, job_token)?;
-    if core.driver.is_some() {
-        return Err(ConfigError::ExecutorCapabilityUnsupported(
-            "hardware motor zero requires synchronous CAN register I/O unsupported on the RT executor",
-        ));
-    }
-    if *core.safety.state() != crate::safety::SafetyState::Idle
-        || core.is_torqued
-        || core.disable_pending
-    {
-        return Err(ConfigError::CalibPrecondition {
-            status: 409,
-            code: "MOTOR_ZERO_FAILED",
-            message: "Arm must be Idle with torque off to set motor zero",
-        });
-    }
-    core.set_motor_zero_in_place(joint).map_err(|msg| ConfigError::CalibPrecondition {
-        status: 409,
-        code: "MOTOR_ZERO_FAILED",
-        message: msg,
-    })
-}
-
-fn apply_joint_zero_commit_in_place(
-    core: &mut SupervisorInner,
-    mut cand: Box<JointZeroCommitCandidate>,
-    retired: &mut ConfigRetiredPayloads,
-) {
-    let start_calib_rev = core.calibration_revision;
-    let mut workspace_bumped = false;
-    if let Some(mut new_offsets) = cand.new_offsets.take() {
-        // Offsets length and finiteness were validated in install_activate_config before swapping.
-        if let Ok(Some(gb)) = core.set_joint_zero_offsets_in_place(&mut new_offsets, cand.effective_floor) {
-            retired.gripper_baseline = Some(gb);
-        }
-        retired.offsets = Some(new_offsets);
-    }
-    if let Some(uncorrected) = cand.arm_model_uncorrected.take() {
-        if uncorrected.correction() != core.config.arm_model.correction() {
-            retired.arm_model = Some(std::mem::replace(&mut core.config.arm_model, uncorrected));
-            workspace_bumped = true;
-            if let Some(tcps) = cand.pose_tcps.take() {
-                for (pose, (id, tcp)) in core.poses.list.poses.iter_mut().zip(tcps.iter()) {
-                    if pose.id == *id {
-                        pose.tcp = tcp.clone();
-                    }
-                }
-                retired.pose_tcps = Some(tcps);
-            }
-        } else {
-            retired.arm_model = Some(uncorrected);
-        }
-    }
-    if cand.file_changes {
-        retired.calibration_file = std::mem::replace(&mut core.calibration, cand.calibration.take());
-        #[cfg(feature = "policy-runtime")]
-        if let Some(new_digest) = cand.calibration_digest.take() {
-            retired.string_a = Some(std::mem::replace(&mut core.calibration_digest, new_digest));
-        }
-    }
-    if let Some((floor, source)) = cand.effective_floor {
-        core.floor_source = source;
-        if let Some(ws) = core.config.workspace.as_mut() {
-            if ws.floor_z_m != floor {
-                ws.floor_z_m = floor;
-                workspace_bumped = true;
-            }
-        }
-    }
-    if workspace_bumped {
-        core.workspace_revision += 1;
-        core.retire_servo_ws_min_depths();
-    }
-    if let Some(bufs) = cand.ws_eval_bufs.take() {
-        retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
-    }
-    if let Some(next_poses) = cand.next_poses.take() {
-        retired.pose_list = Some(std::mem::replace(&mut core.poses.list, next_poses));
-        core.poses.revision += 1;
-    }
-    if cand.reset_gripper_baseline {
-        if let Some(gb) = core.gripper_baseline.take() {
-            retired.gripper_baseline = Some(gb);
-        }
-        core.gripper_baseline_pending.clear();
-        core.gripper_baseline_dirty = false;
-        core.gripper_baseline_generation += 1;
-    }
-    if let Some(stale) = cand.gripper_stale.take() {
-        retired.gripper_stale = core.gripper_calib_stale.replace(stale);
-        core.gripper_calib_revision += 1;
-    }
-    core.calibration_revision = start_calib_rev + 1;
-    retired.joint_zero_commit_candidate = Some(cand);
 }
 
 fn install_sample_table_capture(core: &SupervisorInner) -> Result<([f32; 8], usize), ConfigError> {
@@ -2844,31 +2190,15 @@ impl Drop for ReservationGuard {
     }
 }
 
-/// One atomic file mutation inside a [`ConfigWriteOp::Batch`].
-pub enum FileWriteOp {
-    /// Stage `PendingWrite` off-thread (write + file `sync_all()`), then atomically rename into place.
-    Replace(PendingWrite),
-    /// Remove an existing config file on disk if present.
-    Remove(PathBuf),
-}
-
 /// Filesystem operation performed during a unified [`run_config_commit_detailed`] transaction.
 ///
-/// Every variant runs its staging, file fsync, rename/unlink, and parent-directory fsync
+/// Every persisted write runs its staging, file fsync, rename, and parent-directory fsync
 /// strictly AFTER [`ReserveConfig`] and strictly BEFORE [`ActivateConfig`].
 pub enum ConfigWriteOp {
     /// Memory-only (volatile) configuration update with no disk file.
     Volatile,
     /// Stage `PendingWrite` off-thread after reservation, then rename + dir-sync before activation.
     StageAndReplace(PendingWrite),
-    /// Remove an existing config file on disk (e.g., calibration restore to uncalibrated backup),
-    /// using the exact same cancellation-safe reservation + pre-unlink live authority + reconciliation protocol.
-    Remove(PathBuf),
-    /// Multi-file atomic commit executed under one reservation (e.g., joint zero writing
-    /// `calibration.json` + stale `poses.json` + stale `gripper_calib.json` together).
-    /// All replacements are staged + file-fsynced before any rename; the first entry is renamed
-    /// first so a failure on it leaves all other files untouched and releases cleanly.
-    Batch(Vec<FileWriteOp>),
 }
 
 impl From<Option<PendingWrite>> for ConfigWriteOp {
@@ -3032,11 +2362,9 @@ where
         }
     }
 
-    let file_ops: Vec<FileWriteOp> = match write {
-        ConfigWriteOp::Volatile => Vec::new(),
-        ConfigWriteOp::StageAndReplace(w) => vec![FileWriteOp::Replace(w)],
-        ConfigWriteOp::Remove(path) => vec![FileWriteOp::Remove(path)],
-        ConfigWriteOp::Batch(ops) => ops,
+    let pending_write: Option<PendingWrite> = match write {
+        ConfigWriteOp::Volatile => None,
+        ConfigWriteOp::StageAndReplace(w) => Some(w),
     };
 
     if let Some(h) = hooks.before_reserve.as_ref() {
@@ -3110,55 +2438,24 @@ where
         };
 
     // 2. Off-thread stage + file fsync (`StagedWrite::stage`) strictly AFTER reserve.
-    enum StagedOp {
-        Replace(StagedWrite),
-        Remove(PathBuf),
-    }
-    let abort_staged = |ops: Vec<StagedOp>| {
-        for op in ops {
-            if let StagedOp::Replace(s) = op {
-                s.abort();
-            }
-        }
-    };
-
-    let staged_ops: Vec<StagedOp> = if file_ops.is_empty() {
-        Vec::new()
-    } else {
-        let stage_res = tokio::task::spawn_blocking(move || -> Result<Vec<StagedOp>, String> {
-            let mut out = Vec::with_capacity(file_ops.len());
-            for op in file_ops {
-                match op {
-                    FileWriteOp::Replace(w) => match StagedWrite::stage(w.path, w.text) {
-                        Ok(s) => out.push(StagedOp::Replace(s)),
-                        Err(e) => {
-                            for prev in out {
-                                if let StagedOp::Replace(s) = prev {
-                                    s.abort();
-                                }
-                            }
-                            return Err(e);
-                        }
-                    },
-                    FileWriteOp::Remove(p) => out.push(StagedOp::Remove(p)),
+    let staged_opt: Option<StagedWrite> = match pending_write {
+        None => None,
+        Some(w) => {
+            let stage_res = tokio::task::spawn_blocking(move || StagedWrite::stage(w.path, w.text))
+                .await
+                .map_err(|e| format!("stage task failed: {e}"))
+                .and_then(|r| r);
+            match stage_res {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    release_pre_rename(Arc::clone(&sup), guard).await;
+                    tracing::warn!("State file not staged: {e}");
+                    return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
+                        status: 500,
+                        code: "PERSIST_FAILED".into(),
+                        message: format!("Failed to persist configuration: {e}"),
+                    }));
                 }
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| format!("stage task failed: {e}"))
-        .and_then(|r| r);
-
-        match stage_res {
-            Ok(ops) => ops,
-            Err(e) => {
-                release_pre_rename(Arc::clone(&sup), guard).await;
-                tracing::warn!("State file not staged: {e}");
-                return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
-                    status: 500,
-                    code: "PERSIST_FAILED".into(),
-                    message: format!("Failed to persist configuration: {e}"),
-                }));
             }
         }
     };
@@ -3169,7 +2466,9 @@ where
 
     // 3. Fresh pre-rename authority recheck (off-thread auth + live owner VerifyAuthority).
     if let Err((_, err)) = auth_check() {
-        abort_staged(staged_ops);
+        if let Some(s) = staged_opt {
+            s.abort();
+        }
         release_pre_rename(Arc::clone(&sup), guard).await;
         return Err(ConfigCommitError::pre_publish(err));
     }
@@ -3186,17 +2485,23 @@ where
     {
         Ok(ConfigReply::AuthorityVerified(Ok(()))) => {}
         Ok(ConfigReply::AuthorityVerified(Err(e))) => {
-            abort_staged(staged_ops);
+            if let Some(s) = staged_opt {
+                s.abort();
+            }
             release_pre_rename(Arc::clone(&sup), guard).await;
             return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
         }
         Err(e) => {
-            abort_staged(staged_ops);
+            if let Some(s) = staged_opt {
+                s.abort();
+            }
             release_pre_rename(Arc::clone(&sup), guard).await;
             return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
         }
         _ => {
-            abort_staged(staged_ops);
+            if let Some(s) = staged_opt {
+                s.abort();
+            }
             release_pre_rename(Arc::clone(&sup), guard).await;
             return Err(ConfigCommitError::pre_publish(ArmError::Internal(
                 "unexpected authority verification reply".into(),
@@ -3204,73 +2509,38 @@ where
         }
     }
 
-    // 4. Rename / unlink files off-thread, then record Persisted(DurableUnconfirmed),
+    // 4. Rename off-thread, then record Persisted(DurableUnconfirmed),
     //    then parent-directory fsync strictly BEFORE activation.
     let mut disk_published = false;
-    if !staged_ops.is_empty() {
+    if let Some(staged) = staged_opt {
         let sim_rename_fail = hooks
             .fail_rename_once
             .as_ref()
             .is_some_and(|f| f.swap(false, Ordering::AcqRel));
 
         let rename_outcome = tokio::task::spawn_blocking(move || {
-            let mut dir_syncs: Vec<crate::persist::PendingDirSync> = Vec::with_capacity(staged_ops.len());
-            let mut published_any = false;
-            let mut iter = staged_ops.into_iter();
-            while let Some(op) = iter.next() {
-                match op {
-                    StagedOp::Replace(staged) => {
-                        if sim_rename_fail {
-                            staged.abort();
-                            for rem in iter {
-                                if let StagedOp::Replace(s) = rem {
-                                    s.abort();
-                                }
-                            }
-                            return (published_any, dir_syncs, Err("simulated rename failure".to_string()));
-                        }
-                        match staged.rename_only() {
-                            Ok(ds) => {
-                                published_any = true;
-                                dir_syncs.push(ds);
-                            }
-                            Err(e) => {
-                                for rem in iter {
-                                    if let StagedOp::Replace(s) = rem {
-                                        s.abort();
-                                    }
-                                }
-                                return (published_any, dir_syncs, Err(e));
-                            }
-                        }
-                    }
-                    StagedOp::Remove(path) => match std::fs::remove_file(&path) {
-                        Ok(()) => {
-                            published_any = true;
-                            dir_syncs.push(crate::persist::PendingDirSync::for_path(&path));
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => {
-                            for rem in iter {
-                                if let StagedOp::Replace(s) = rem {
-                                    s.abort();
-                                }
-                            }
-                            return (
-                                published_any,
-                                dir_syncs,
-                                Err(format!("remove {}: {e}", path.display())),
-                            );
-                        }
-                    },
-                }
+            if sim_rename_fail {
+                staged.abort();
+                return Err("simulated rename failure".to_string());
             }
-            (published_any, dir_syncs, Ok(()))
+            staged.rename_only()
         })
         .await;
 
-        let (published_any, dir_syncs, rename_res) = match rename_outcome {
-            Ok(tuple) => tuple,
+        let dir_sync = match rename_outcome {
+            Ok(Ok(ds)) => {
+                guard.mark_renamed();
+                ds
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("State file not published: {e}");
+                release_pre_rename(Arc::clone(&sup), guard).await;
+                return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
+                    status: 500,
+                    code: "PERSIST_FAILED".into(),
+                    message: format!("Failed to persist configuration: {e}"),
+                }));
+            }
             Err(e) => {
                 // JoinError after spawn_blocking started: conservatively treat as post-publish
                 // reconciling because a rename may have completed before the panic/abort.
@@ -3307,172 +2577,113 @@ where
             }
         };
 
-        if published_any {
-            guard.mark_renamed();
-        }
-
-        if let Err(e) = rename_res {
-            tracing::warn!("State file not published: {e}");
-            if !published_any {
-                release_pre_rename(Arc::clone(&sup), guard).await;
-                return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
-                    status: 500,
-                    code: "PERSIST_FAILED".into(),
-                    message: format!("Failed to persist configuration: {e}"),
-                }));
-            }
-            // At least one file was already renamed/removed before a later file in the batch failed:
-            // disk and live state may diverge -> enter Reconciling and keep motion inhibited.
+        disk_published = true;
+        let sim_persisted_fail = hooks
+            .fail_persisted_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+        let r = guard.take().expect("reservation held by guard");
+        if sim_persisted_fail {
             if let Some(pg) = episode_pin_guard.take() {
                 pg.keep_pinned_for_reconcile();
             }
-            if let Some(r) = guard.take() {
-                if let Ok(ConfigReply::Persisted(Ok(pr))) = sup
-                    .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
-                        PersistedConfig {
-                            reservation: r,
-                            durability: Durability::DurableUnconfirmed,
-                        },
+            if let Ok(ConfigReply::Persisted(Ok(r))) = sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
+                    PersistedConfig {
+                        reservation: r,
+                        durability: Durability::DurableUnconfirmed,
+                    },
+                ))
+                .await
+            {
+                let _ = sup
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(
+                        ReleaseConfig { reservation: r },
                     ))
-                    .await
-                {
-                    let _ = sup
-                        .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                            ReleaseConfig { reservation: pr },
-                        ))
-                        .await;
-                } else {
-                    let _ = sup
-                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
-                        .await;
-                }
+                    .await;
             }
+            return Err(ConfigCommitError::post_publish_reconciling(
+                ConfigError::Reconciling("SIMULATED_PERSISTED_ERR").to_arm_error(),
+            ));
+        }
+        let persisted_r = match sup
+            .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(PersistedConfig {
+                reservation: r,
+                durability: Durability::DurableUnconfirmed,
+            }))
+            .await
+        {
+            Ok(ConfigReply::Persisted(Ok(r))) => r,
+            Ok(ConfigReply::Persisted(Err(e))) => {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+                return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
+            }
+            Err(e) => {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+                return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
+            }
+            _ => {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+                return Err(ConfigCommitError::post_publish_reconciling(
+                    ArmError::Internal("unexpected config persisted reply".into()),
+                ));
+            }
+        };
+        guard = ReservationGuard::new(Arc::clone(&sup), persisted_r);
+        guard.mark_renamed();
+
+        // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
+        //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
+        //    motion inhibited until reconciliation succeeds.
+        let sim_dir_sync_fail = hooks
+            .fail_dir_sync_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+        let dir_sync_res: Result<(), String> = if sim_dir_sync_fail {
+            Err("simulated parent dir fsync failure".into())
+        } else {
+            tokio::task::spawn_blocking(move || match dir_sync.sync_parent_dir() {
+                PublishOutcome::Published => Ok(()),
+                PublishOutcome::PublishedDurabilityUnconfirmed(w) => Err(w),
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
+        };
+
+        if let Err(warn) = dir_sync_res {
+            if let Some(pg) = episode_pin_guard.take() {
+                pg.keep_pinned_for_reconcile();
+            }
+            let r = guard.take().expect("persisted reservation held by guard");
+            let rel = sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                    reservation: r,
+                }))
+                .await;
+            if !matches!(rel, Ok(ConfigReply::Released(Released::Reconciling))) {
+                let _ = sup
+                    .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                    .await;
+            }
+            tracing::error!(
+                "Parent directory fsync failed after rename ({warn}); keeping old policy active and entering Reconciling"
+            );
             return Err(ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
                 status: 500,
                 code: "PERSIST_FAILED".into(),
-                message: format!("Failed to persist configuration batch after partial rename: {e}; reconciliation required"),
+                message: format!("Parent directory fsync failed after rename ({warn}); reconciliation required"),
             }));
         }
 
-        if published_any {
-            disk_published = true;
-            let sim_persisted_fail = hooks
-                .fail_persisted_once
-                .as_ref()
-                .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-            let r = guard.take().expect("reservation held by guard");
-            if sim_persisted_fail {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-                if let Ok(ConfigReply::Persisted(Ok(r))) = sup
-                    .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
-                        PersistedConfig {
-                            reservation: r,
-                            durability: Durability::DurableUnconfirmed,
-                        },
-                    ))
-                    .await
-                {
-                    let _ = sup
-                        .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                            ReleaseConfig { reservation: r },
-                        ))
-                        .await;
-                }
-                return Err(ConfigCommitError::post_publish_reconciling(
-                    ConfigError::Reconciling("SIMULATED_PERSISTED_ERR").to_arm_error(),
-                ));
-            }
-            let persisted_r = match sup
-                .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(PersistedConfig {
-                    reservation: r,
-                    durability: Durability::DurableUnconfirmed,
-                }))
-                .await
-            {
-                Ok(ConfigReply::Persisted(Ok(r))) => r,
-                Ok(ConfigReply::Persisted(Err(e))) => {
-                    if let Some(pg) = episode_pin_guard.take() {
-                        pg.keep_pinned_for_reconcile();
-                    }
-                    return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
-                }
-                Err(e) => {
-                    if let Some(pg) = episode_pin_guard.take() {
-                        pg.keep_pinned_for_reconcile();
-                    }
-                    return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
-                }
-                _ => {
-                    if let Some(pg) = episode_pin_guard.take() {
-                        pg.keep_pinned_for_reconcile();
-                    }
-                    return Err(ConfigCommitError::post_publish_reconciling(
-                        ArmError::Internal("unexpected config persisted reply".into()),
-                    ));
-                }
-            };
-            guard = ReservationGuard::new(Arc::clone(&sup), persisted_r);
-            guard.mark_renamed();
-
-            // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
-            //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
-            //    motion inhibited until reconciliation succeeds.
-            let sim_dir_sync_fail = hooks
-                .fail_dir_sync_once
-                .as_ref()
-                .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-            let dir_sync_res: Result<(), String> = if sim_dir_sync_fail {
-                Err("simulated parent dir fsync failure".into())
-            } else {
-                tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let mut synced_dirs: Vec<PathBuf> = Vec::new();
-                    for ds in dir_syncs {
-                        let dir = ds.dir().to_path_buf();
-                        if synced_dirs.iter().any(|d| d == &dir) {
-                            continue;
-                        }
-                        match ds.sync_parent_dir() {
-                            PublishOutcome::Published => synced_dirs.push(dir),
-                            PublishOutcome::PublishedDurabilityUnconfirmed(w) => return Err(w),
-                        }
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r)
-            };
-
-            if let Err(warn) = dir_sync_res {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-                let r = guard.take().expect("persisted reservation held by guard");
-                let rel = sup
-                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
-                        reservation: r,
-                    }))
-                    .await;
-                if !matches!(rel, Ok(ConfigReply::Released(Released::Reconciling))) {
-                    let _ = sup
-                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
-                        .await;
-                }
-                tracing::error!(
-                    "Parent directory fsync failed after rename ({warn}); keeping old policy active and entering Reconciling"
-                );
-                return Err(ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
-                    status: 500,
-                    code: "PERSIST_FAILED".into(),
-                    message: format!("Parent directory fsync failed after rename ({warn}); reconciliation required"),
-                }));
-            }
-
-            if let Some(h) = hooks.after_rename_before_activate.as_ref() {
-                h();
-            }
+        if let Some(h) = hooks.after_rename_before_activate.as_ref() {
+            h();
         }
     }
 

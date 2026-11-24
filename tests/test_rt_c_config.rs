@@ -18,10 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use armd::auth::OperatorAuth;
-use armd::calibration::{
-    apply_with_auth, restore_with_auth, ApplyRequest, CalibCommitAuth, CalibrationDeps,
-    CalibrationFile,
-};
+use armd::calibration::{ApplyRequest, CalibrationDeps, CalibrationFile};
 use armd::diagnostics::alloc::{AllocCounts, TimedAlloc};
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, JointTarget};
 use armd::grasp::GraspDeps;
@@ -1590,12 +1587,14 @@ async fn reservation_guard_drop_before_and_after_rename_executor() {
 }
 
 // ============================================================================
-// 6. Calibration apply/restore + motor_zero + MIT refusal (both owners)
+// 6. Legacy calibration apply/restore + motor zero (pre-PR-C eb101bb parity)
+//    and Executor fail-closed 409 EXECUTOR_UNSUPPORTED per-op refusal tests
 // ============================================================================
 
-async fn run_calibration_and_zero_test(owner: RtOwner) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calibration_apply_restore_and_motor_zero_legacy() {
     let (vision_addr, _vision_state, vision_jh) = spawn_mock_vision().await;
-    let rig = Rig::new(owner, |_| {}).await;
+    let rig = Rig::new(RtOwner::Legacy, |_| {}).await;
     let (base, server_jh) = spawn_http_router(&rig, Some(vision_addr), OperatorAuth::disabled()).await;
     let client = reqwest::Client::new();
 
@@ -1605,12 +1604,6 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
         Some(rig.setup_path.clone()),
         det_up,
     );
-
-    let _detached_guard = if owner == RtOwner::Executor {
-        Some(rig.sup.inner().write().await)
-    } else {
-        None
-    };
 
     let valid_q = armd::kinematics::r_to_quat(
         &armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -25.0),
@@ -1630,17 +1623,10 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
     });
     let req: ApplyRequest = armd::calibration::parse_apply(&apply_body).expect("parse apply");
     let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
-    let auth = CalibCommitAuth {
-        admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
-        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
-        off_thread_check: Arc::new(|| Ok(())),
-        job_token: None,
-        deadline: Instant::now() + Duration::from_secs(30),
-    };
 
-    let applied = apply_with_auth(&rig.sup, &cal_deps, req, &check, &auth)
+    let applied = armd::calibration::apply(&rig.sup, &cal_deps, req, &check)
         .await
-        .expect("calibration apply");
+        .expect("legacy calibration apply");
     let backup_path = applied["backup"].as_str().unwrap().to_string();
     let backup_name = Path::new(&backup_path)
         .file_name()
@@ -1649,7 +1635,6 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
         .to_string();
     assert!(rig.calib_path.exists());
 
-    // REST GET /api/v1/calibration & /api/v1/grasp/setup reflect the applied calibration immediately.
     let cal_v: Value = client
         .get(format!("{base}/api/v1/calibration"))
         .send()
@@ -1669,23 +1654,9 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
         .unwrap();
     assert!((gs_v["setup"]["table_z_m"].as_f64().unwrap() - 0.012).abs() < 1e-6);
 
-    // Calibration restore back to pre-apply backup.
-    let restore_auth = CalibCommitAuth {
-        admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
-        lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
-        off_thread_check: Arc::new(|| Ok(())),
-        job_token: None,
-        deadline: Instant::now() + Duration::from_secs(30),
-    };
-    let restored = restore_with_auth(
-        &rig.sup,
-        &cal_deps,
-        &json!({ "backup": backup_name }),
-        &check,
-        &restore_auth,
-    )
-    .await
-    .expect("calibration restore");
+    let restored = armd::calibration::restore(&rig.sup, &cal_deps, &json!({ "backup": backup_name }), &check)
+        .await
+        .expect("legacy calibration restore");
     assert!(restored["backup"].is_string());
     let cal_after: Value = client
         .get(format!("{base}/api/v1/calibration"))
@@ -1697,7 +1668,6 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
         .unwrap();
     assert_eq!(cal_after["calibrated"], false);
 
-    // Mock motor zero via `motor_zero::run` (routes through `set_motor_zero_async` + `InvalidateAfterZero` on Executor).
     let mz_req = MotorZeroRequest {
         joints: vec![0],
         dry_run: false,
@@ -1706,39 +1676,213 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
     };
     let mz_res = motor_zero::run(&rig.sup, &cal_deps, mz_req, &check)
         .await
-        .expect("mock motor zero");
+        .expect("legacy mock motor zero");
     assert_eq!(mz_res["zero_method"], "motor");
     assert_eq!(mz_res["joints"][0]["verified"], true);
 
-    // MIT qualification in Executor mode MUST fail closed with 503 EXECUTOR_CAPABILITY_UNSUPPORTED.
-    if owner == RtOwner::Executor {
-        let mit_err = armd::mit::store_qualification(
-            &rig.sup,
-            &cal_deps,
-            CalibrationFile::default(),
-            &check,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(mit_err.status, 503);
-        assert_eq!(mit_err.code, "EXECUTOR_CAPABILITY_UNSUPPORTED");
-    }
-
-    rig.assert_executor_zero_alloc("calibration apply/restore + mock motor zero");
-    drop(_detached_guard);
     server_jh.abort();
     vision_jh.abort();
     rig.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn calibration_apply_restore_and_motor_zero_legacy() {
-    run_calibration_and_zero_test(RtOwner::Legacy).await;
+/// Shared harness for per-op Executor capability refusal tests: seeds on-disk calibration/grasp/
+/// poses/gripper files, runs one excluded operation via WS and via direct Rust API, and proves
+/// `409 EXECUTOR_UNSUPPORTED` with zero changes on disk, zero changes in live state, and zero RT allocs.
+async fn assert_executor_refuses_op_cleanly(
+    path: &str,
+    ws_body: Value,
+    direct_call: impl for<'a> FnOnce(
+        &'a Arc<ArmSupervisor>,
+        &'a CalibrationDeps,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<Result<Value, armd::calibration::CalibError>>> + Send + 'a>,
+    >,
+) {
+    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    let calib_seed = "{\n  \"version\": 1,\n  \"sentinel\": \"untouched\"\n}\n";
+    let setup_seed = "{\n  \"table_z_m\": 0.05\n}\n";
+    let poses_seed = "{\n  \"joint_names\": [],\n  \"poses\": []\n}\n";
+    let grip_seed = "{\n  \"offset_rad\": 0.01\n}\n";
+    std::fs::write(&rig.calib_path, calib_seed).unwrap();
+    std::fs::write(&rig.setup_path, setup_seed).unwrap();
+    std::fs::write(&rig.poses_path, poses_seed).unwrap();
+    std::fs::write(&rig.gripper_calib_path, grip_seed).unwrap();
+
+    let (base, server_jh) = spawn_http_router(&rig, None, OperatorAuth::disabled()).await;
+    let ws_url = format!("{}/api/v1/ws", base.replace("http://", "ws://"));
+    let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let cal_deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
+
+    let _detached_guard = rig.sup.inner().write().await;
+    let pub_before = rig.sup.published_config().await.unwrap();
+    let obs_before = rig.sup.hub().latest().unwrap().obs.clone();
+
+    let expected_msg =
+        format!("{path} is not available while the RT executor owns the arm; use the legacy owner");
+
+    // 1. WS call on Executor MUST fail closed with 409 EXECUTOR_UNSUPPORTED.
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let rej = ws_send_recv(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": 1,
+            "generation": rig.lease_gen,
+            "epoch_id": rig.epoch,
+            "path": path,
+            "body": ws_body,
+        }),
+    )
+    .await;
+    assert_eq!(rej["type"], "command_reject", "{path}: {rej}");
+    assert_eq!(rej["status"], 409, "{path}: {rej}");
+    assert_eq!(rej["code"], "EXECUTOR_UNSUPPORTED", "{path}: {rej}");
+    assert_eq!(rej["message"], expected_msg, "{path}: {rej}");
+
+    // 2. Direct Rust entry point on Executor MUST also fail closed with 409 EXECUTOR_UNSUPPORTED.
+    if let Some(res) = direct_call(&rig.sup, &cal_deps).await {
+        let err = res.expect_err("direct op on executor must fail closed");
+        assert_eq!(err.status, 409, "{path}: {err:?}");
+        assert_eq!(err.code, "EXECUTOR_UNSUPPORTED", "{path}: {err:?}");
+        assert_eq!(err.message, expected_msg, "{path}: {err:?}");
+    }
+
+    // 3. Disk untouched (exact bytes + no backups directory created).
+    assert_eq!(std::fs::read_to_string(&rig.calib_path).unwrap(), calib_seed);
+    assert_eq!(std::fs::read_to_string(&rig.setup_path).unwrap(), setup_seed);
+    assert_eq!(std::fs::read_to_string(&rig.poses_path).unwrap(), poses_seed);
+    assert_eq!(std::fs::read_to_string(&rig.gripper_calib_path).unwrap(), grip_seed);
+    assert!(
+        !cal_deps.backup_dir.exists(),
+        "{path}: refused executor op must not create backup directory"
+    );
+
+    // 4. Live state untouched + no config hold/reconciliation + 0 RT allocations.
+    let pub_after = rig.sup.published_config().await.unwrap();
+    let obs_after = rig.sup.hub().latest().unwrap().obs.clone();
+    assert_eq!(pub_after.joint_zero_offsets, pub_before.joint_zero_offsets);
+    assert_eq!(pub_after.calibration_revision, pub_before.calibration_revision);
+    assert_eq!(pub_after.workspace_revision, pub_before.workspace_revision);
+    assert_eq!(pub_after.poses.revision, pub_before.poses.revision);
+    assert_eq!(pub_after.gripper_calib_revision, pub_before.gripper_calib_revision);
+    assert!(!pub_after.calibration_busy);
+    assert!(!rig.is_config_inhibited().await);
+    assert_eq!(obs_after.positions, obs_before.positions);
+    assert_eq!(obs_after.epoch_id, obs_before.epoch_id);
+    rig.assert_executor_zero_alloc(&format!("executor refusal of {path}"));
+
+    drop(_detached_guard);
+    server_jh.abort();
+    rig.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn calibration_apply_restore_and_motor_zero_executor() {
-    run_calibration_and_zero_test(RtOwner::Executor).await;
+async fn executor_refuses_calibration_apply_without_side_effects() {
+    let valid_q = armd::kinematics::r_to_quat(
+        &armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -25.0),
+    );
+    let body = json!({
+        "dry_run": false,
+        "camera_mount": { "offset_m": [0.01, -0.02, 0.05], "q_end_cam": valid_q },
+        "intrinsics": {
+            "fx": 831.5, "fy": 830.0, "cx": 321.0, "cy": 179.0,
+            "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+            "width": 640, "height": 360
+        },
+        "table_z_m": 0.012
+    });
+    let req: ApplyRequest = armd::calibration::parse_apply(&body).unwrap();
+    assert_executor_refuses_op_cleanly("/api/v1/calibration/apply", body, move |sup, deps| {
+        Box::pin(async move {
+            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+            Some(armd::calibration::apply(sup, deps, req, &check).await)
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_refuses_calibration_restore_without_side_effects() {
+    let body = json!({ "backup": "2026-01-01T00-00-00Z" });
+    let body_c = body.clone();
+    assert_executor_refuses_op_cleanly("/api/v1/calibration/restore", body, move |sup, deps| {
+        Box::pin(async move {
+            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+            Some(armd::calibration::restore(sup, deps, &body_c, &check).await)
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_refuses_software_joint_zero_without_side_effects() {
+    let body = json!({ "joints": [1, 2], "method": "software", "force": true, "dry_run": false });
+    let req = MotorZeroRequest {
+        joints: vec![0, 1],
+        dry_run: false,
+        force: true,
+        method: Some("software".into()),
+    };
+    assert_executor_refuses_op_cleanly(motor_zero::PATH, body, move |sup, deps| {
+        Box::pin(async move {
+            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+            Some(motor_zero::run(sup, deps, req, &check).await)
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_refuses_hardware_motor_zero_without_side_effects() {
+    let body = json!({ "joints": [1], "method": "motor", "dry_run": false });
+    let req = MotorZeroRequest {
+        joints: vec![0],
+        dry_run: false,
+        force: false,
+        method: Some("motor".into()),
+    };
+    assert_executor_refuses_op_cleanly(motor_zero::PATH, body, move |sup, deps| {
+        Box::pin(async move {
+            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+            Some(motor_zero::run(sup, deps, req, &check).await)
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_refuses_joint_zero_restore_without_side_effects() {
+    let body = json!({ "backup": "2026-01-01T00-00-00Z" });
+    assert_executor_refuses_op_cleanly(motor_zero::RESTORE_PATH, body, move |sup, deps| {
+        Box::pin(async move {
+            let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+            Some(motor_zero::restore(sup, deps, "2026-01-01T00-00-00Z".into(), &check).await)
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_refuses_mit_timeout_without_side_effects() {
+    assert_executor_refuses_op_cleanly(armd::mit::TIMEOUT_PATH, json!({}), |_, _| {
+        Box::pin(async { None })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_refuses_mit_qualification_without_side_effects() {
+    assert_executor_refuses_op_cleanly(
+        armd::mit::QUALIFICATION_PATH,
+        json!({ "joints": [1] }),
+        |sup, deps| {
+            Box::pin(async move {
+                let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+                Some(armd::mit::store_qualification(sup, deps, CalibrationFile::default(), &check).await)
+            })
+        },
+    )
+    .await;
 }
 
 // ============================================================================
@@ -1850,13 +1994,6 @@ async fn gravity_comp_mock_zero_alloc_and_hw_capability_refusals_executor() {
         "expected 503 EXECUTOR_CAPABILITY_UNSUPPORTED on exit, got {err_exit:?}"
     );
 
-    let pub_hw = sup_hw.published_config().await.unwrap();
-    let obs_hw = sup_hw.hub().latest().unwrap().obs.clone();
-    let mz_hw_err = motor_zero::check_executor(&pub_hw, &obs_hw, &json!({ "joints": [1], "method": "motor" }))
-        .unwrap_err();
-    assert_eq!(mz_hw_err.status, 503);
-    assert_eq!(mz_hw_err.code, "EXECUTOR_CAPABILITY_UNSUPPORTED");
-
     assert_eq!(handle_hw.stats().total_allocs(), AllocCounts::ZERO);
     assert_eq!(sup_hw.inner().control_thread_attempts(), 0);
     drop(_detached_hw);
@@ -1960,7 +2097,7 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
     assert_eq!(gc_rej["status"], 409);
     assert_eq!(gc_rej["code"], "LEASE_LOST");
 
-    // 4. PR C calibration path without lease MUST also be routed by PR C (409 LEASE_LOST).
+    // 4. Out-of-scope calibration/MIT path on Executor MUST fail closed 409 EXECUTOR_UNSUPPORTED.
     let cal_rej = ws_send_recv(
         &mut ws,
         json!({
@@ -1968,14 +2105,14 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
             "request_id": 4,
             "generation": 1,
             "epoch_id": 1,
-            "path": "/api/v1/calibration/mit_timeout",
+            "path": armd::mit::TIMEOUT_PATH,
             "body": {}
         }),
     )
     .await;
     assert_eq!(cal_rej["type"], "command_reject");
     assert_eq!(cal_rej["status"], 409);
-    assert_eq!(cal_rej["code"], "LEASE_LOST");
+    assert_eq!(cal_rej["code"], "EXECUTOR_UNSUPPORTED");
 
     rig.assert_executor_zero_alloc("WS executor PR C routing");
     drop(_detached_guard);
@@ -2027,21 +2164,8 @@ async fn codex_review_regression_invariants_executor() {
     assert!(!rig.keepout_path.exists(), "destination file must not be renamed after pre-rename stop");
     assert!(!rig.is_config_inhibited().await, "hold must be Cleared after pre-rename stop");
 
-    // 9c. Ordinary motor-zero / offset refusal under E-stop allocates 0 on armd-control.
+    // 9c. Maintenance `set_joint_zero_offsets_async` refusal under E-stop allocates 0 on armd-control.
     let _ = rig.sup.trigger_e_stop().await;
-    let res = rig
-        .sup
-        .dispatch_config_request(ConfigRequest::SetJointZeroOffsets {
-            offsets: vec![0.0; 7],
-            precomputed_floor: None,
-            auth: None,
-            expected_stop_gen: None,
-            deadline: None,
-            job_token: None,
-        })
-        .await
-        .unwrap();
-    assert!(matches!(res, ConfigReply::JointZeroOffsetsSet(Err(_))));
     let handle_ref = rig.sup.executor_handle().unwrap();
     let legacy_err = handle_ref.set_joint_zero_offsets_async(vec![0.0; 7]).await.unwrap();
     assert!(legacy_err.is_err());
@@ -2213,241 +2337,6 @@ async fn automatic_gravity_comp_exit_default_resting_pose_zero_alloc_executor() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_gravity_comp_exit_without_park_zero_alloc_executor() {
     run_automatic_gravity_comp_exit_alloc_test(true).await;
-}
-
-// ============================================================================
-// 10. B1: Software joint zero + stale poses/gripper atomic commit (both owners)
-// ============================================================================
-
-async fn run_joint_zero_calib_is_dir_test(owner: RtOwner) {
-    let dir = tempfile::tempdir().unwrap();
-    let calib_path = dir.path().join("calibration.json");
-    let poses_path = dir.path().join("poses.json");
-    let gripper_path = dir.path().join("gripper_calib.json");
-    let backup_dir = dir.path().join("backups");
-
-    // Pre-create calibration.json as a DIRECTORY so atomic rename_only() MUST fail.
-    std::fs::create_dir(&calib_path).unwrap();
-
-    // Seed valid poses.json and gripper_calib.json on disk.
-    let pose_seed = json!({
-        "joint_names": ["joint_1","joint_2","joint_3","joint_4","joint_5","joint_6","gripper"],
-        "poses": [{
-            "id": "01J00000000000000000000001",
-            "name": "p_zero_test",
-            "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "saved_at_ms": 1_700_000_000_000u64,
-            "profile_id": "rebot_b601dm",
-            "arm_dof": 6,
-            "gripper_joint": 6,
-            "stale": null
-        }]
-    });
-    let poses_before = serde_json::to_string_pretty(&pose_seed).unwrap();
-    std::fs::write(&poses_path, &poses_before).unwrap();
-
-    let grip_seed = json!({
-        "offset_rad": 0.02,
-        "ts": 1_700_000_000u64,
-        "stale": null
-    });
-    let grip_before = serde_json::to_string_pretty(&grip_seed).unwrap();
-    std::fs::write(&gripper_path, &grip_before).unwrap();
-
-    // Build supervisor shifted on J2 and gripper J7 by > STALE_THRESHOLD_RAD so software zero
-    // will compute non-zero offsets and mark BOTH poses and gripper calibration stale.
-    let shifted: [f32; 7] = [0.0, 0.15, 0.0, 0.0, 0.0, 0.0, -0.15];
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    armd::poses::load_into(&sup, &poses_path).await;
-    armd::gripper_calib::load_into(&sup, &gripper_path).await;
-    let lease_conn = "b1-zero-conn";
-    let (lease_gen, epoch) = {
-        let mut inner = sup.inner().write().await;
-        inner.measured_positions = shifted.to_vec();
-        inner.commanded_positions = shifted.to_vec();
-        inner.target_positions = shifted.to_vec();
-        inner.is_torqued = false;
-        let lgen = inner.acquire_lease(lease_conn).unwrap();
-        let ep = inner.safety.epoch_id();
-        (lgen, ep)
-    };
-    let handle = if owner == RtOwner::Executor {
-        let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
-        ecfg.alloc_timing = true;
-        let h = sup.start_executor(ecfg).await.unwrap();
-        let dl = Instant::now() + Duration::from_secs(3);
-        while sup.hub().latest().is_none() {
-            assert!(Instant::now() < dl);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        Some(h)
-    } else {
-        sup.tick(0.02).await;
-        None
-    };
-
-    let _detached = if owner == RtOwner::Executor {
-        Some(sup.inner().write().await)
-    } else {
-        None
-    };
-
-    let up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
-    let mut deps = armd::calibration::CalibrationDeps::new(calib_path.clone(), None, up);
-    deps.backup_dir = backup_dir;
-
-    let job_token = armd::rt_core::requests::config::next_calib_job_token();
-    let busy_res = sup
-        .dispatch_config_request(ConfigRequest::SetCalibrationBusy {
-            busy: true,
-            motor_zero: true,
-            job_token,
-            check_begin: None,
-        })
-        .await
-        .unwrap();
-    assert!(matches!(busy_res, ConfigReply::CalibrationBusySet(Ok(_))));
-
-    let adm = capture_config_admission(&sup, 501, lease_gen, Some(epoch));
-    let auth = armd::calibration::CalibCommitAuth {
-        admission: adm,
-        lease_holder: Some((HolderLabel::new(lease_conn), lease_gen)),
-        off_thread_check: Arc::new(|| Ok(())),
-        job_token: Some(job_token),
-        deadline: Instant::now() + Duration::from_secs(10),
-    };
-    let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
-    let req = armd::motor_zero::MotorZeroRequest {
-        joints: vec![1, 6], // 0-based J2 and J7 (gripper)
-        force: true,
-        dry_run: false,
-        method: Some("software".into()),
-    };
-
-    // 1. Rename of calibration.json fails because target is a directory:
-    //    live offsets MUST stay unchanged and poses.json / gripper_calib.json MUST be untouched.
-    let err = armd::motor_zero::run_with_auth(&sup, &deps, req.clone(), &check, &auth)
-        .await
-        .expect_err("software zero must fail when calibration.json is a directory");
-    assert_eq!(err.code, "PERSIST_FAILED", "{err:?}");
-
-    let pub_after_fail = sup.published_config().await.unwrap();
-    assert_eq!(
-        pub_after_fail.joint_zero_offsets,
-        vec![0.0; 7],
-        "live joint_zero_offsets must be unchanged after calibration.json rename failure"
-    );
-    assert!(
-        pub_after_fail.poses.list.poses[0].stale.is_none(),
-        "live pose stale flag must stay None after rename failure"
-    );
-    assert!(
-        pub_after_fail.gripper_calib_stale.is_none(),
-        "live gripper_calib_stale must stay None after rename failure"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&poses_path).unwrap(),
-        poses_before,
-        "poses.json on disk must be completely untouched"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&gripper_path).unwrap(),
-        grip_before,
-        "gripper_calib.json on disk must be completely untouched"
-    );
-    assert!(calib_path.is_dir(), "calibration.json directory must remain intact");
-    // Verify no leftover temp files remain in the directory.
-    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".tmp-"))
-        .collect();
-    assert!(leftovers.is_empty(), "aborted temp files leaked: {leftovers:?}");
-
-    // Hold must be Cleared (NOT Reconciling), and live positions unchanged.
-    let held = sup
-        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::Calibration))
-        .await
-        .unwrap();
-    match held {
-        ConfigReply::HoldInspected { config_inhibited, state } => {
-            assert!(!config_inhibited, "pre-rename failure must not inhibit motion");
-            assert_eq!(state, None, "pre-rename failure must release hold Cleared");
-        }
-        _ => panic!("unexpected InspectHold reply"),
-    }
-    if owner == RtOwner::Legacy {
-        let inner = sup.inner().read().await;
-        assert_eq!(inner.joint_zero_offsets, vec![0.0; 7]);
-        assert!(inner.poses.list.poses[0].stale.is_none());
-        assert!(inner.gripper_calib_stale.is_none());
-    } else {
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let obs = sup.hub().latest().unwrap().obs.clone();
-        assert!((obs.positions[1] - 0.15).abs() < 1e-4, "live J2 reading changed before persist: {:?}", obs.positions);
-        assert!((obs.positions[6] - (-0.15)).abs() < 1e-4, "live J7 reading changed before persist: {:?}", obs.positions);
-    }
-
-    // 2. Remove the blocking directory and retry: software zero commits calibration.json,
-    //    poses.json, gripper_calib.json, and live offsets atomically inside one reservation.
-    std::fs::remove_dir(&calib_path).unwrap();
-    let adm2 = capture_config_admission(&sup, 502, lease_gen, Some(epoch));
-    let auth2 = armd::calibration::CalibCommitAuth {
-        admission: adm2,
-        lease_holder: Some((HolderLabel::new(lease_conn), lease_gen)),
-        off_thread_check: Arc::new(|| Ok(())),
-        job_token: Some(job_token),
-        deadline: Instant::now() + Duration::from_secs(10),
-    };
-    let ok = armd::motor_zero::run_with_auth(&sup, &deps, req, &check, &auth2)
-        .await
-        .expect("software zero should succeed once calibration.json path is writable");
-    assert_eq!(ok["persist_verified"], json!(true), "{ok}");
-    assert_eq!(ok["invalidated"]["gripper_calibration_stale"], json!(true), "{ok}");
-    assert_eq!(ok["invalidated"]["poses_stale"], json!(["p_zero_test"]), "{ok}");
-    assert!(calib_path.is_file(), "calibration.json must be persisted");
-    let poses_disk: Value = serde_json::from_str(&std::fs::read_to_string(&poses_path).unwrap()).unwrap();
-    assert!(poses_disk["poses"][0]["stale"].is_object(), "poses.json must be marked stale on disk");
-    let grip_disk: Value = serde_json::from_str(&std::fs::read_to_string(&gripper_path).unwrap()).unwrap();
-    assert!(grip_disk["stale"].is_object(), "gripper_calib.json must be marked stale on disk");
-    let pub_ok = sup.published_config().await.unwrap();
-    assert!(pub_ok.joint_zero_offsets[1].abs() > 0.05, "J2 offset must now be active: {:?}", pub_ok.joint_zero_offsets);
-    assert!(pub_ok.poses.list.poses[0].stale.is_some());
-    assert!(pub_ok.gripper_calib_stale.is_some());
-
-    let _ = sup
-        .dispatch_config_request(ConfigRequest::SetCalibrationBusy {
-            busy: false,
-            motor_zero: false,
-            job_token,
-            check_begin: None,
-        })
-        .await;
-
-    if let Some(h) = handle {
-        assert_eq!(
-            h.stats().total_allocs(),
-            AllocCounts::ZERO,
-            "B1 software zero fail+success allocated on armd-control: {:?}",
-            h.stats().total_allocs()
-        );
-        assert_eq!(sup.inner().control_thread_attempts(), 0);
-        drop(_detached);
-        tokio::task::spawn_blocking(move || h.stop_and_join())
-            .await
-            .unwrap();
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn joint_zero_rename_failure_leaves_offsets_poses_and_gripper_untouched_legacy() {
-    run_joint_zero_calib_is_dir_test(RtOwner::Legacy).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn joint_zero_rename_failure_leaves_offsets_poses_and_gripper_untouched_executor() {
-    run_joint_zero_calib_is_dir_test(RtOwner::Executor).await;
 }
 
 // ============================================================================

@@ -902,8 +902,6 @@ pub struct SupervisorInner {
     /// A calibration apply / restore transaction is running: motion commands are refused
     /// (MOTION_BUSY) and other configuration writes too (CONFIG_BUSY).
     pub calibration_busy: bool,
-    /// Monotonic job token owning `calibration_busy` so stale/raced cleanup never clears a newer job.
-    pub(crate) calibration_busy_token: Option<u64>,
     /// A motor zero runs (`crate::motor_zero`, with `calibration_busy`): torque on and
     /// clear_fault are refused too.
     pub motor_zero_busy: bool,
@@ -1719,7 +1717,6 @@ impl SupervisorInner {
             floor_source: "profile",
             hover_jobs: Vec::new(),
             calibration_busy: false,
-            calibration_busy_token: None,
             motor_zero_busy: false,
             cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,

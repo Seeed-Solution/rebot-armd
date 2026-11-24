@@ -1568,6 +1568,16 @@ pub(super) async fn handle_executor_ws_command(
     }
 
     let request_id_val = value.get("request_id").cloned().unwrap_or(Value::Null);
+    let epoch = current_epoch_off_lock(recv_supervisor, 1);
+
+    // Out-of-scope calibration, joint/motor zero, zero restore, and MIT ops fail closed
+    // unconditionally on the RT executor before touching any file or live state.
+    if is_cal {
+        let _ = recv_calib;
+        return Some(Some(calibration::dispatch_executor_calibration_command(
+            path, value, epoch,
+        )));
+    }
 
     // 1. Lease check (same rules as `lease::check_lease_authority`, without `SupervisorLock`).
     let local_generation = recv_generation.load(Ordering::SeqCst);
@@ -1576,7 +1586,6 @@ pub(super) async fn handle_executor_ws_command(
         let lbl = recv_client_label.lock().unwrap_or_else(|e| e.into_inner());
         value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
     };
-    let epoch = current_epoch_off_lock(recv_supervisor, 1);
     if local_generation == 0 || supplied_generation != local_generation || !label_matches {
         return Some(Some(json!({
             "type": "command_reject",
@@ -1647,26 +1656,6 @@ pub(super) async fn handle_executor_ws_command(
             ws_auth,
             recv_connection,
             recv_generation,
-            worker_tasks,
-        )
-        .await;
-        return Some(reply);
-    }
-
-    if is_cal {
-        let reply = calibration::dispatch_executor_calibration_command(
-            path,
-            value,
-            stamp,
-            recv_conn_id,
-            local_generation,
-            epoch,
-            recv_supervisor,
-            recv_calib,
-            recv_connection,
-            recv_generation,
-            ack_tx,
-            ws_auth,
             worker_tasks,
         )
         .await;

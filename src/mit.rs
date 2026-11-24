@@ -458,9 +458,9 @@ pub async fn store_qualification(sup: &crate::supervisor::ArmSupervisor, deps: &
     file: crate::calibration::CalibrationFile, check: &crate::calibration::LeaseCheck) -> Result<Value, CalibError> {
     if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
         return Err(CalibError::new(
-            503,
-            "EXECUTOR_CAPABILITY_UNSUPPORTED",
-            "MIT qualification is not supported under the synchronous RT executor",
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            format!("{QUALIFICATION_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
         ));
     }
     {

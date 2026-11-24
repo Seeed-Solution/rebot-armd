@@ -75,11 +75,6 @@ impl PendingDirSync {
         &self.target
     }
 
-    /// The parent directory that will be synced.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     pub fn sync_parent_dir(self) -> PublishOutcome {
         self.sync_with(|dir| std::fs::File::open(dir)?.sync_all())
     }

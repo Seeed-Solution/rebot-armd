@@ -299,13 +299,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn range_check(&self) -> Option<DriverRangeCheck> { self.inner.range_check() }
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }
     fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.set_zero_position(joint) }
-    fn set_joint_zero_offsets(&mut self, offsets: &[f32]) {
-        if self.offsets.len() == offsets.len() {
-            self.offsets.copy_from_slice(offsets);
-        } else {
-            self.offsets = offsets.to_vec();
-        }
-    }
+    fn set_joint_zero_offsets(&mut self, offsets: &[f32]) { self.offsets = offsets.to_vec(); }
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { Some(self.offsets.clone()) }
     fn take_recovery_writes(&mut self) -> Vec<usize> { self.inner.take_recovery_writes() }
     fn set_strict_mode_handover(&mut self, strict: bool) { self.inner.set_strict_mode_handover(strict) }
