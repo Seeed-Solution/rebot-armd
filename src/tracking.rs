@@ -708,6 +708,16 @@ impl crate::supervisor::SupervisorInner {
                     l.max_velocity = l.max_velocity.min(m.max_velocity);
                     l.max_acceleration = l.max_acceleration.min(m.max_acceleration);
                 }
+            } else if let Some(max_v) = self
+                .active_trajectory
+                .as_ref()
+                .and_then(|a| a.motion_max_velocity)
+            {
+                for (i, l) in base.iter_mut().enumerate().take(max_v.len()) {
+                    if max_v[i].is_finite() && max_v[i] > 0.0 {
+                        l.max_velocity = l.max_velocity.min(max_v[i]);
+                    }
+                }
             }
             base
         };

@@ -734,6 +734,29 @@ impl GripperPolicy {
     /// `close_speed_rad_s` or [`DEFAULT_CLOSE_SPEED_RAD_S`] (rad/s).
     pub fn close_speed(&self) -> f64 { f64::from(self.close_speed_rad_s.unwrap_or(DEFAULT_CLOSE_SPEED_RAD_S)) }
 
+    /// Zero-allocation copy of all scalar policy fields with `jaw_opening: None`
+    /// (used on the RT thread when constructing [`crate::motion::GripperMotion`], which never
+    /// reads `jaw_opening`).
+    pub fn clone_without_jaw_opening(&self) -> Self {
+        Self {
+            closed_rad: self.closed_rad,
+            open_rad: self.open_rad,
+            holding_gap_rad: self.holding_gap_rad,
+            holding_torque_nm: self.holding_torque_nm,
+            squeeze_rad: self.squeeze_rad,
+            settle_ms: self.settle_ms,
+            jaw_opening: None,
+            zero_check_supported: self.zero_check_supported,
+            holding_mode: self.holding_mode,
+            holding_load_fraction: self.holding_load_fraction,
+            max_close_torque_nm: self.max_close_torque_nm,
+            contact_torque_nm: self.contact_torque_nm,
+            max_lead_rad: self.max_lead_rad,
+            stream_contact_speed_rad_s: self.stream_contact_speed_rad_s,
+            close_speed_rad_s: self.close_speed_rad_s,
+        }
+    }
+
     /// Thresholds from the MIT-mode project; holding torque and squeeze need verification in POS_VEL.
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).

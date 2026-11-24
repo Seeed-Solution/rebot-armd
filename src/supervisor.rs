@@ -94,11 +94,23 @@ impl AdmissionStamp {
         lease_gen: u64,
         broker_request_id: u64,
     ) -> Self {
+        Self::from_broker_conn(stop_gen, estop_epoch, lease_gen, 0, broker_request_id)
+    }
+
+    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request carrying the original
+    /// WS `connection_id` (`0` for non-WS callers) so closed-connection checks run on `armd-control`.
+    pub(crate) fn from_broker_conn(
+        stop_gen: u64,
+        estop_epoch: u64,
+        lease_gen: u64,
+        connection_id: u64,
+        broker_request_id: u64,
+    ) -> Self {
         Self {
             stop_gen,
             estop_epoch,
             lease_gen,
-            connection_id: 0,
+            connection_id,
             request_id: if broker_request_id == 0 {
                 0
             } else {
@@ -661,6 +673,11 @@ pub(crate) enum DeferredCompletionTarget {
         action_id: u64,
         ticket: crate::macro_action::ChildTicket,
     },
+    MacroFinish {
+        action_id: u64,
+        state: crate::model::HolderLabel,
+        code: Option<crate::model::HolderLabel>,
+    },
     ParkRelease(ParkRelease),
     Anonymous,
 }
@@ -1127,6 +1144,14 @@ pub struct SupervisorInner {
     pub(crate) retired_trajectories: std::collections::VecDeque<ActiveTrajectory>,
     /// Preallocated reusable `UnloadSettle` ring returned on stop/finish (0 alloc / 0 free on RT).
     pub(crate) unload_settle_spare: Option<UnloadSettle>,
+    /// Preallocated reusable `Box<GripperMotion>` shell for zero-alloc / zero-free RT gripper actions.
+    pub(crate) gripper_motion_spare: Option<Box<GripperMotion>>,
+    /// Owner boot identity (matches process boot in Legacy mode and `ExecutorConfig::boot` on RT).
+    pub(crate) boot_id: crate::rt_core::broker::BootId,
+    /// Monotonic revision for `config.power_budget` (starts at 1; checked by prepared actions).
+    pub(crate) power_budget_revision: u64,
+    /// Lock-free exact closed-connection bitset shared with the RT `Broker` (checked on RT commits).
+    rt_closed_connections: Option<Arc<crate::rt_core::requests::actions::ClosedBitset>>,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -1759,6 +1784,10 @@ impl SupervisorInner {
             ],
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
+            gripper_motion_spare: None,
+            boot_id: crate::rt_core::broker::BootId::process(),
+            power_budget_revision: 1,
+            rt_closed_connections: None,
         };
         inner.prepare_workspace_eval_bufs();
         inner
@@ -1825,11 +1854,27 @@ impl SupervisorInner {
     /// resuming async install or stale [`Admitted`] token from that connection can start motion.
     pub fn mark_connection_closed(&mut self, connection_id: u64) {
         self.closed_connections.mark_closed(connection_id);
+        if let Some(rt) = self.rt_closed_connections.as_ref() {
+            rt.mark_closed(connection_id);
+        }
     }
 
-    /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under the owner lock.
+    /// Attaches the broker's lock-free closed-connection bitset read on `armd-control`.
+    pub(crate) fn attach_closed_bitset(
+        &mut self,
+        bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
+    ) {
+        self.rt_closed_connections = Some(bitset);
+    }
+
+    /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under
+    /// either the legacy owner lock or the lock-free RT broker bitset.
     pub fn is_connection_closed(&self, connection_id: u64) -> bool {
         self.closed_connections.is_closed(connection_id)
+            || self
+                .rt_closed_connections
+                .as_ref()
+                .is_some_and(|rt| rt.is_closed(connection_id))
     }
 
     /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
@@ -2371,8 +2416,28 @@ impl SupervisorInner {
         if let Some(ref hook) = self.before_publish_hook {
             hook();
         }
-        let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
-        core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
+        let owner = self.published_owner_meta();
+        let SupervisorInner {
+            core,
+            measured_positions,
+            measured_velocities,
+            commanded_positions,
+            commanded_velocities,
+            joint_feedback_queue_bounds,
+            ..
+        } = self;
+        core.publish_with_rt_meta(
+            obs,
+            generation,
+            sampled_at,
+            valid_until,
+            measured_positions,
+            measured_velocities,
+            commanded_positions,
+            commanded_velocities,
+            joint_feedback_queue_bounds,
+            owner,
+        );
         TickPublished { kept, body_end }
     }
 
@@ -2416,6 +2481,36 @@ impl SupervisorInner {
         self.joint_feedback_queue_bounds.reserve(dof);
         self.motor_errors.reserve(dof);
         self.gravity_torques.reserve(arm_dof);
+        if self.gripper_motion_spare.is_none() {
+            if let (Some(g_idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) {
+                let lim = &self.config.limits[g_idx];
+                let limit_zero = crate::model::JointLimit {
+                    name: String::new(),
+                    min_position: lim.min_position,
+                    max_position: lim.max_position,
+                    max_velocity: lim.max_velocity,
+                    max_acceleration: lim.max_acceleration,
+                };
+                let req = crate::motion::GripperRequest {
+                    command: crate::motion::GripperCommand::Open,
+                    fraction: None,
+                    grasp: false,
+                    speed: 0.5,
+                    timeout_s: None,
+                    tag: None,
+                };
+                if let Ok(m) = crate::motion::GripperMotion::try_with_close_speed_limit(
+                    req,
+                    policy.clone_without_jaw_opening(),
+                    limit_zero,
+                    self.commanded_positions.get(g_idx).copied().unwrap_or(0.0),
+                    g_idx,
+                    None,
+                ) {
+                    self.gripper_motion_spare = Some(Box::new(m));
+                }
+            }
+        }
         let tmpl = self.current_observation();
         self.core.try_prewarm_observations(|| {
             let mut obs = tmpl.clone();
@@ -3307,13 +3402,222 @@ impl SupervisorInner {
         true
     }
 
+    /// Replaces `self.active_trajectory`, retiring any previous trajectory without RT frees.
+    pub(crate) fn replace_active_trajectory(&mut self, next: Option<ActiveTrajectory>) {
+        if let Some(old) = std::mem::replace(&mut self.active_trajectory, next) {
+            self.retire_active_trajectory(old);
+        }
+    }
+
     /// Queue a replaced `ActiveTrajectory` for off-thread drop when owned by the RT executor
     /// (prevents dropping heap-backed `motion_limits` / path data on `armd-control`).
+    /// Zero-heap trajectories (e.g., pinned `PlanSlotRef` paths/replays or inline quintics)
+    /// drop immediately so `PlanSlotRef` pins return to 0 without consuming `retired_trajectories`;
+    /// clean `Box<GripperMotion>` shells are recycled into `gripper_motion_spare` (0 dealloc).
     pub(crate) fn retire_active_trajectory(&mut self, traj: ActiveTrajectory) {
-        if self.rt_executor_owned
-            && self.retired_trajectories.len() < self.retired_trajectories.capacity()
-        {
+        if !self.rt_executor_owned {
+            drop(traj);
+            return;
+        }
+        if traj.motion_limits.is_none() && traj.then.is_none() {
+            if let Reference::Gripper(b) = traj.reference {
+                if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() {
+                    self.gripper_motion_spare = Some(b);
+                    return;
+                }
+                let traj = ActiveTrajectory {
+                    action_id: traj.action_id,
+                    reference: Reference::Gripper(b),
+                    then: None,
+                    span: traj.span,
+                    motion_limits: None,
+                    motion_max_velocity: traj.motion_max_velocity,
+                };
+                if self.retired_trajectories.len() < self.retired_trajectories.capacity() {
+                    self.retired_trajectories.push_back(traj);
+                }
+                return;
+            }
+        }
+        if !traj.has_heap_storage() {
+            drop(traj);
+            return;
+        }
+        if self.retired_trajectories.len() < self.retired_trajectories.capacity() {
             self.retired_trajectories.push_back(traj);
+        }
+    }
+
+    /// Boxes a `GripperMotion` reusing `gripper_motion_spare` when available (0 alloc on RT).
+    pub(crate) fn box_gripper_motion_rt(&mut self, motion: GripperMotion) -> Box<GripperMotion> {
+        if let Some(mut spare) = self.gripper_motion_spare.take() {
+            *spare = motion;
+            spare
+        } else {
+            Box::new(motion)
+        }
+    }
+
+    /// Zero-alloc `Copy` snapshot of the active tool's free-motion gripper torque baseline
+    /// (`None` if unlearned or belonging to another tool/follower/stroke).
+    pub(crate) fn gripper_baseline_data_rt(&self) -> Option<crate::gripper_baseline::BaselineData> {
+        let policy = self.config.gripper_policy.as_ref()?;
+        let tool = &self.config.active_tool;
+        let follower = self.follower.as_deref();
+        let lo = policy.closed_rad.min(policy.open_rad);
+        let hi = policy.closed_rad.max(policy.open_rad);
+        self.gripper_baseline
+            .as_ref()
+            .filter(|b| {
+                b.belongs_to(&tool.id, &tool.config_digest, follower)
+                    && (b.lo_rad - lo).abs() < 1e-3
+                    && (b.hi_rad - hi).abs() < 1e-3
+            })
+            .map(|b| crate::gripper_baseline::BaselineData {
+                lo_rad: b.lo_rad,
+                hi_rad: b.hi_rad,
+                close_fast: b.close_fast,
+                close_slow: b.close_slow,
+                open_fast: b.open_fast,
+                open_slow: b.open_slow,
+                close_moves: b.close_moves,
+                open_moves: b.open_moves,
+                rejected_moves: b.rejected_moves,
+                ts: b.ts,
+            })
+    }
+
+    /// Updates `self.held` on RT without allocating heap memory.
+    pub(crate) fn set_held_rt(&mut self, label: crate::model::HolderLabel, spill_safe: bool) {
+        if let Some(existing) = self.held.as_mut() {
+            existing.spill_safe = spill_safe;
+            if existing.label.capacity() >= label.as_str().len() {
+                existing.label.clear();
+                existing.label.push_str(label.as_str());
+            } else {
+                existing.label.clear();
+            }
+        } else {
+            self.held = Some(HeldObject {
+                label: String::new(),
+                spill_safe,
+            });
+        }
+    }
+
+    /// True while macro parent `parent_id` has an active child trajectory, quintic settle,
+    /// deferred TX completion (`MacroSub`), or `SubState::Running`.
+    pub(crate) fn macro_child_running(&self, parent_id: u64) -> bool {
+        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == parent_id) else {
+            return false;
+        };
+        if run.sub == crate::macro_action::SubState::Running {
+            return true;
+        }
+        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(parent_id)) {
+            return true;
+        }
+        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == parent_id) {
+            return true;
+        }
+        self.pending_deferred_done.as_ref().is_some_and(|d| {
+            matches!(d.target, DeferredCompletionTarget::MacroSub { action_id, .. } if action_id == parent_id)
+        })
+    }
+
+    /// Allocation-free quiesce of any active child motion/settle/deferred completion belonging
+    /// to macro `id` (preserving gripper measured-position hold safety semantics!).
+    pub(crate) fn quiesce_macro_children_rt(&mut self, id: u64) {
+        let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
+        if carried {
+            let is_gripper = self
+                .active_trajectory
+                .as_ref()
+                .is_some_and(|a| matches!(a.reference, Reference::Gripper(_)));
+            if is_gripper {
+                self.hold_gripper_at_measured();
+                self.releasing = false;
+            }
+            self.replace_active_trajectory(None);
+            self.commanded_velocities.fill(0.0);
+            self.commanded_accelerations.fill(0.0);
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+            self.safety.mark_motion_finished();
+        }
+        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
+            self.quintic_settle = None;
+        }
+        if self.pending_deferred_done.as_ref().is_some_and(|d| {
+            matches!(d.target, DeferredCompletionTarget::MacroSub { action_id, .. } if action_id == id)
+        }) {
+            self.pending_deferred_done = None;
+        }
+    }
+
+    /// Zero-allocation `Copy` owner metadata published on every control tick into `RtSample`.
+    pub(crate) fn published_owner_meta(&self) -> crate::rt_core::publish::PublishedOwnerMeta {
+        use crate::rt_core::publish::{PublishedHeld, PublishedMacroState, PublishedOwnerMeta};
+        let authority = crate::rt_core::broker::Authority {
+            lease_generation: self.current_active_lease_gen(),
+            epoch: self.safety.epoch_id(),
+            stop_generation: self.current_stop_gen(),
+            config_revision: self.workspace_revision,
+            parent_generation: self
+                .last_action
+                .as_ref()
+                .filter(|a| a.is_running())
+                .map_or(0, |a| a.id),
+        };
+        let held = self.held.as_ref().map(|h| PublishedHeld {
+            label: crate::model::HolderLabel::new(&h.label),
+            spill_safe: h.spill_safe,
+        });
+        let macro_state = self
+            .macro_run
+            .as_ref()
+            .map(|m| PublishedMacroState {
+                active_id: m.id,
+                alive: !m.stop_requested
+                    && self
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|a| a.id == m.id && a.is_running()),
+                children: m.children,
+                child_seq: m.child.seq,
+                child_running: self.macro_child_running(m.id),
+                child_sub: m.sub,
+                child_watch: m.child.watch,
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "policy-runtime")]
+        let policy_busy = self.policy_loading || self.policy_run.is_some();
+        #[cfg(not(feature = "policy-runtime"))]
+        let policy_busy = false;
+        PublishedOwnerMeta {
+            arm: self.core.id(),
+            boot: self.boot_id,
+            authority,
+            calibration_revision: self.calibration_revision,
+            poses_revision: self.poses.revision,
+            sequences_revision: self.sequences.revision,
+            grasp_setup_revision: self.grasp_setup_revision,
+            gripper_calib_revision: self.gripper_calib_revision,
+            power_budget_revision: self.power_budget_revision,
+            tool_digest_hash: crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest),
+            motion_active: self.active_trajectory.is_some() || self.servo_target.is_some(),
+            config_inhibited: self.core.motion_inhibited_by_config(),
+            calibration_busy: self.calibration_busy,
+            feedback_valid: self.commit_feedback_valid(),
+            is_torqued: self.is_torqued,
+            pending_rearm: self.pending_rearm,
+            pending_normal_unload: self.pending_normal_unload,
+            collision_hold: self.collision.hold.is_some(),
+            handover_settling: self.handover_settling_since.is_some(),
+            gravity_comp_active: self.gravity_comp.is_some(),
+            policy_busy,
+            zero_check_persisting: self.zero_check_persisting.is_some(),
+            held,
+            macro_state,
         }
     }
 
@@ -5847,13 +6151,14 @@ impl SupervisorInner {
             self.step_gravity_comp_exit(servo_dt, gravity_stiff_hold_completed);
         }
 
+        let tick_now = release_bound.map_or_else(Instant::now, |(now, _)| now);
         if let Some(done) = deferred_done {
             if !self.safety.state().is_stopped() {
                 self.pending_deferred_done = Some(done);
             }
         }
         if self.macro_run.is_some() {
-            self.expire_macro_child(Instant::now());
+            self.expire_macro_child(tick_now);
         }
         if self.pending_deferred_done.is_some() {
             let current_epoch = self.safety.epoch_id();
@@ -5875,6 +6180,9 @@ impl SupervisorInner {
                                     && !m.stop_requested
                                     && m.sub == SubState::Running
                             })
+                        }
+                        DeferredCompletionTarget::MacroFinish { action_id, .. } => {
+                            self.macro_alive(action_id)
                         }
                         DeferredCompletionTarget::ParkRelease(phase) => {
                             self.pending_normal_unload && self.park_release == Some(phase)
@@ -5908,9 +6216,19 @@ impl SupervisorInner {
                                     settled: done.settled,
                                     holding: done.holding,
                                     gripper_gap_rad: done.gripper_gap_rad,
-                                    at: Instant::now(),
+                                    at: tick_now,
                                 });
                             }
+                        }
+                        DeferredCompletionTarget::MacroFinish { action_id, state, code } => {
+                            self.finish_macro(
+                                action_id,
+                                state.as_str(),
+                                code.as_deref(),
+                                None,
+                                done.holding,
+                                done.gripper_gap_rad,
+                            );
                         }
                         DeferredCompletionTarget::Action(id) => {
                             self.finish_action(
@@ -6018,7 +6336,7 @@ impl SupervisorInner {
 
         // Settle and action completion require an accepted output on both tracking-on and
         // tracking-off paths so deferred releases never finalize an action early.
-        self.reconcile_action(servo_dt, tick_output_accepted);
+        self.reconcile_action(servo_dt, tick_output_accepted, tick_now);
         self.expire_motion_limit();
         self.tick_phase(3);
         let timestamp = self.start_time.elapsed().as_secs_f64();
@@ -6088,16 +6406,16 @@ pub struct JointGoalSnapshot {
 /// ([`prepare_quintic`]), with the inputs it was made from.
 #[derive(Debug, Clone)]
 pub struct PreparedQuintic {
-    start: Vec<f32>,
-    v0: Vec<f32>,
-    target: Vec<f32>,
-    limits: Vec<crate::model::JointLimit>,
-    workspace_revision: u64,
-    tcp_offset: [f64; 3],
-    power: Option<crate::power::PowerBudget>,
-    checked_workspace: bool,
-    traj: MultiJointQuinticTrajectory,
-    power_scale: Option<f64>,
+    pub(crate) start: Vec<f32>,
+    pub(crate) v0: Vec<f32>,
+    pub(crate) target: Vec<f32>,
+    pub(crate) limits: Vec<crate::model::JointLimit>,
+    pub(crate) workspace_revision: u64,
+    pub(crate) tcp_offset: [f64; 3],
+    pub(crate) power: Option<crate::power::PowerBudget>,
+    pub(crate) checked_workspace: bool,
+    pub(crate) traj: MultiJointQuinticTrajectory,
+    pub(crate) power_scale: Option<f64>,
 }
 
 /// The work of [`SupervisorInner::start_quintic`] that needs no lock, for the joints `q`:
@@ -6628,6 +6946,7 @@ impl ArmSupervisor {
         let template_obs = inner.current_observation();
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
+        hub.update_prep_env(Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner)));
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
         let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
         static NEXT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -6739,6 +7058,20 @@ impl ArmSupervisor {
         match &*slot {
             OwnerSlot::Executor(h) => Some(h.clone()),
             _ => None,
+        }
+    }
+
+    /// Re-publishes the revision-tagged off-thread [`ActionPrepEnv`] snapshot into [`StateHub`]
+    /// from the Legacy owner lock (no-op in Executor mode, where config mutations update `StateHub`).
+    pub async fn refresh_prep_env(&self) {
+        if self.owner_mode() != OWNER_LEGACY {
+            return;
+        }
+        let inner = self.inner.read().await;
+        if !inner.detached {
+            self.hub.update_prep_env(Arc::new(
+                crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner),
+            ));
         }
     }
 

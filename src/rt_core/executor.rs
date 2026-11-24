@@ -1723,6 +1723,7 @@ impl TeardownDisable {
 }
 
 struct RtExecutorShared {
+    boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
     target_writer: Arc<Mutex<TargetWriter>>,
     stop_requests: StopRequests,
@@ -1873,7 +1874,11 @@ pub struct RtExecutorHandle {
 }
 
 impl RtExecutorHandle {
+    pub fn boot(&self) -> BootId { self.shared.boot }
     pub fn broker(&self) -> &Arc<Mutex<Broker<PlanSlot>>> { &self.shared.broker }
+    pub fn disconnect_client(&self, client: ClientId) {
+        self.shared.broker.lock().unwrap_or_else(|e| e.into_inner()).disconnect(client);
+    }
     pub fn target_writer(&self) -> &Arc<Mutex<TargetWriter>> { &self.shared.target_writer }
     pub fn stop_requests(&self) -> &StopRequests { &self.shared.stop_requests }
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
@@ -2138,6 +2143,9 @@ pub(crate) fn spawn_executor(
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
     core.attach_stop_requests(stop_requests.clone());
+    core.attach_closed_bitset(broker.closed_bitset());
+    core.boot_id = cfg.boot;
+    hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
     let (diag_amend_tx, diag_amend_rx) = RingBuffer::<(u64, u32)>::new(DIAG_RING_CAPACITY);
@@ -2293,6 +2301,7 @@ pub(crate) fn spawn_executor(
     let monitor_thread = stats.spawn_monitor(control_stop.clone()).ok();
 
     let shared = Arc::new(RtExecutorShared {
+        boot: cfg.boot,
         broker: Arc::new(Mutex::new(broker)),
         target_writer: Arc::new(Mutex::new(target_writer)),
         stop_requests,

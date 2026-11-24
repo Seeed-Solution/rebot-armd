@@ -76,7 +76,37 @@ impl SupervisorInner {
     pub(crate) fn retire_motion_payloads(&mut self) {
         self.release_servo_target();
         let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
-        let trajectory = self.active_trajectory.take().filter(|t| t.has_heap_storage());
+        let trajectory = match self.active_trajectory.take() {
+            Some(traj) => {
+                if self.rt_executor_owned
+                    && traj.motion_limits.is_none()
+                    && traj.then.is_none()
+                {
+                    match traj.reference {
+                        Reference::Gripper(b)
+                            if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() =>
+                        {
+                            self.gripper_motion_spare = Some(b);
+                            None
+                        }
+                        reference => {
+                            let rebuilt = ActiveTrajectory {
+                                action_id: traj.action_id,
+                                reference,
+                                then: None,
+                                span: traj.span,
+                                motion_limits: None,
+                                motion_max_velocity: traj.motion_max_velocity,
+                            };
+                            rebuilt.has_heap_storage().then_some(rebuilt)
+                        }
+                    }
+                } else {
+                    traj.has_heap_storage().then_some(traj)
+                }
+            }
+            None => None,
+        };
         self.clear_unload_settle();
         let unload_settle = self.unload_settle.take();
         if trajectory.is_some() || unload_settle.is_some() || servo_ws_min_depths.is_some() {

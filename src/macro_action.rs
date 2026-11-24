@@ -62,7 +62,7 @@ pub fn arm_fail(e: ArmError) -> Stop {
 }
 
 /// Result of a finished sub-motion.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SubDone {
     pub settled: Option<bool>,
     pub holding: Option<bool>,
@@ -70,7 +70,7 @@ pub struct SubDone {
     pub at: Instant,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SubState {
     Idle,
     Running,
@@ -89,8 +89,11 @@ pub struct MacroRun {
     pub sub: SubState,
     /// `/motion/stop` arrived while no sub-motion was running.
     pub stop_requested: bool,
-    pub phase: Option<String>,
+    pub phase: Option<crate::model::HolderLabel>,
     pub phase_start: Option<Instant>,
+    /// Optional owner-enforced whole-macro deadline and failure code.
+    pub deadline: Option<Instant>,
+    pub timeout_code: crate::safety::BoundedText<48>,
     /// Children physically installed so far.
     pub children: u32,
     /// RT record of the current (last installed) child.
@@ -103,13 +106,27 @@ impl MacroRun {
     /// A run without children.
     pub fn new(id: u64, epoch: u64, stamp: AdmissionStamp) -> Self {
         Self { id, epoch, stamp, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None,
+            deadline: None, timeout_code: crate::safety::BoundedText::empty(),
             children: 0, child: ChildRecord::default(), next_guard: None }
+    }
+
+    /// Sets an owner-enforced whole-macro deadline and timeout failure code.
+    pub fn with_deadline(mut self, deadline: Option<Instant>, timeout_code: &str) -> Self {
+        self.deadline = deadline;
+        self.timeout_code = crate::safety::BoundedText::new(timeout_code);
+        self
+    }
+
+    /// Next strictly monotonic child sequence number (never wraps to 0).
+    pub fn next_child_seq(&self) -> Option<u32> {
+        self.child.seq.checked_add(1)
     }
 
     /// A child was installed: the next sequence number, the pending guard, state Running.
     pub fn begin_child(&mut self) {
-        self.children += 1;
-        self.child = ChildRecord { seq: self.child.seq.wrapping_add(1), guard: self.next_guard.take(), ..ChildRecord::default() };
+        let next = self.child.seq.checked_add(1).expect("macro child sequence exhausted");
+        self.children = self.children.saturating_add(1);
+        self.child = ChildRecord { seq: next, guard: self.next_guard.take(), ..ChildRecord::default() };
         self.sub = SubState::Running;
     }
 
