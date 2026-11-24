@@ -26,6 +26,12 @@ pub(crate) struct CandidateDriverLimits {
     vel: [f32; crate::rt_core::mailbox::MAX_DOF],
 }
 
+/// Bounded, inline error returned by [`SupervisorInner::request_disable_bounded`] (0 heap allocs).
+pub(crate) struct RequestDisableError {
+    pub(crate) code: &'static str,
+    pub(crate) message: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+}
+
 /// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanicDisableOutcome {
@@ -929,17 +935,27 @@ impl SupervisorInner {
         (self.measured_positions.clone(), vels, instants, seqs)
     }
 
-    /// A successful transport write is not confirmation that torque was removed.
-    pub(super) fn request_disable(&mut self) -> Result<(), SafetyError> {
+    /// Bounded, zero-allocation error from [`Self::request_disable_bounded`].
+    pub(crate) fn request_disable_bounded(&mut self) -> Result<(), RequestDisableError> {
         // a blocking disable (park, thermal trip, fault path) replaces a transition in flight
         // (the driver's disable replaces its pending enable): that transition ends SUPERSEDED
         if self.torque_transition.take().is_some() { self.core.begin_transition(Err("SUPERSEDED")); }
         self.disable_requested();
         if let Some(ref d) = self.driver {
-            let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+            let mut drv = d.lock().map_err(|_| RequestDisableError {
+                code: "FEEDBACK_UNAVAILABLE",
+                message: crate::safety::BoundedText::new("Feedback unavailable"),
+            })?;
             if self.rt_executor_owned {
-                let res = drv.begin_torque_budgeted(false, 0)
-                    .map_err(|e| SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")))?;
+                let res = drv.begin_torque_budgeted(false, 0).map_err(|e| {
+                    let mut message = crate::safety::BoundedText::empty();
+                    message.push_str("Torque disable transmission failed: ");
+                    e.write_bounded(&mut message);
+                    let code = crate::driver::handshake::rt_progress(false, Err(e))
+                        .err()
+                        .unwrap_or("HARDWARE_FAULT");
+                    RequestDisableError { code, message }
+                })?;
                 let confirmed_now = matches!(res, crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
                     && DisableConfirm::confirmed(&**drv);
                 drop(drv);
@@ -950,17 +966,41 @@ impl SupervisorInner {
                 }
                 return Ok(());
             }
-            drv.set_torque(false).map_err(|e| SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")))?;
+            drv.set_torque(false).map_err(|e| {
+                let mut message = crate::safety::BoundedText::empty();
+                message.push_str("Torque disable transmission failed: ");
+                e.write_bounded(&mut message);
+                let code = crate::driver::handshake::rt_progress(false, Err(e))
+                    .err()
+                    .unwrap_or("HARDWARE_FAULT");
+                RequestDisableError { code, message }
+            })?;
             let mut confirm = DisableConfirm::start(drv.clock_now());
             while confirm.serve(&mut **drv).is_none() {
                 drv.clock_pause(DISABLE_CONFIRM_SERVICE);
             }
             if !DisableConfirm::confirmed(&**drv) {
-                return Err(SafetyError::ClearFaultRejected("Torque disable has not been confirmed by fresh hardware feedback".into()));
+                return Err(RequestDisableError {
+                    code: "FEEDBACK_UNCONFIRMED",
+                    message: crate::safety::BoundedText::new(
+                        "Torque disable has not been confirmed by fresh hardware feedback",
+                    ),
+                });
             }
         }
         self.disable_confirmed();
         Ok(())
+    }
+
+    /// A successful transport write is not confirmation that torque was removed.
+    pub(super) fn request_disable(&mut self) -> Result<(), SafetyError> {
+        self.request_disable_bounded().map_err(|e| {
+            if e.code == "FEEDBACK_UNAVAILABLE" {
+                SafetyError::FeedbackUnavailable
+            } else {
+                SafetyError::ClearFaultRejected(e.message.as_str().to_string())
+            }
+        })
     }
 
     /// State at the first disable frame: MIT off, `disable_pending` until confirmed.
@@ -1416,16 +1456,16 @@ impl SupervisorInner {
         self.torque_off_check_rt()?;
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
-        if let Err(error) = self.request_disable() {
+        if let Err(error) = self.request_disable_bounded() {
             if !self.torque_off_stopped() {
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
-                        let _ = core::fmt::write(buf, format_args!("{error}"));
+                        buf.push_str(error.message.as_str());
                     }),
                 );
             }
-            return Err(crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(error)));
+            return Err(error.code);
         }
         self.torque_off_finish_in_place()
             .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))

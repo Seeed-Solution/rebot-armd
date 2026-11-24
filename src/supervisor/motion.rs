@@ -409,7 +409,11 @@ impl SupervisorInner {
                 if !self.disable_pending
                     || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
                 {
-                    if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }
+                    if let Err(e) = self.request_disable_bounded() {
+                        if !self.safety.deferred_logging() {
+                            tracing::error!("Thermal shutdown not confirmed: {}", e.message.as_str());
+                        }
+                    }
                 }
             }
             StopPolicy::BusLossFallback => {

@@ -1843,7 +1843,7 @@ impl SupervisorInner {
         if unknown && self.shutdown_refused_unknown && (!self.is_torqued || self.disable_pending) {
             if self.rt_executor_owned {
                 if self.torque_transition.is_none() {
-                    let _ = self.request_disable();
+                    let _ = self.request_disable_bounded();
                 }
             } else {
                 let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
@@ -2954,8 +2954,10 @@ impl SupervisorInner {
         if !self.confirm_background_disable_if_ready()
             && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
         {
-            if let Err(e) = self.request_disable() {
-                tracing::warn!("Torque shutdown remains unconfirmed: {e}");
+            if let Err(e) = self.request_disable_bounded() {
+                if !self.safety.deferred_logging() {
+                    tracing::warn!("Torque shutdown remains unconfirmed: {}", e.message.as_str());
+                }
             }
         }
         // Detect sustained physical tracking error, never compare against stale samples.

@@ -374,10 +374,62 @@ fn stopped_torque_off_tx_failure_zero_alloc() {
     assert_eq!(fx.core.safety.epoch_id(), epoch_before);
     assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
     assert_eq!(fx.core.safety.fault(), fault_before);
+    assert!(fx.core.disable_pending, "sticky disable_pending stays set after TX failure");
     assert_eq!(
         (a1 + a2, f1 + f2),
         (0, 0),
         "TX failure in disable_step_failed while already stopped must allocate 0"
+    );
+
+    // Trigger the periodic (>= 250 ms) background RT disable retry (`supervisor.rs:2946` ->
+    // `request_disable_bounded`) while TX still fails: MUST allocate 0 and preserve EStop/epoch.
+    fx.core.last_disable_attempt = Some(std::time::Instant::now() - Duration::from_millis(300));
+    bus.with(|s| s.push_all_feedback());
+    let (retry_rep, a3, f3) = counted(|| fx.step());
+    clock.advance(RELEASE);
+    assert!(retry_rep.command.is_none());
+    assert!(fx.core.disable_pending);
+    assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before);
+    assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(fx.core.safety.fault(), fault_before);
+    assert_eq!(
+        (a3, f3),
+        (0, 0),
+        "failed periodic RT background disable retry must allocate 0"
+    );
+
+    // Also verify `ImmediateOp::TorqueOff` (`torque_off_rt_immediate` -> `request_disable_bounded`)
+    // TX failure allocates 0 while already stopped.
+    bus.with(|s| s.push_all_feedback());
+    let ctx = fx.ctx(fx.now());
+    let d_imm = armd::rt_core::broker::Descriptor {
+        stamp: armd::rt_core::broker::Stamp {
+            arm: ctx.arm,
+            boot: ctx.boot,
+            request: armd::rt_core::broker::RequestId(101),
+            client: ClientId(1),
+            client_seq: 101,
+            authority: fx.core.authority(&ctx),
+            deadline: ctx.now + Duration::from_secs(5),
+        },
+        kind: armd::rt_core::broker::CommandKind::Immediate(
+            armd::rt_core::broker::ImmediateOp::TorqueOff,
+        ),
+    };
+    let (imm_res, a4, f4) = counted(|| {
+        fx.core
+            .commit_immediate(&d_imm, armd::rt_core::broker::ImmediateOp::TorqueOff, &ctx)
+    });
+    assert!(imm_res.is_err());
+    assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before);
+    assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(fx.core.safety.fault(), fault_before);
+    assert_eq!(
+        (a4, f4),
+        (0, 0),
+        "failed ImmediateOp::TorqueOff while already stopped must allocate 0"
     );
 }
 
