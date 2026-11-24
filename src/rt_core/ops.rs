@@ -686,6 +686,14 @@ impl SupervisorInner {
         if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
         Ok(())
     }
+
+    /// Stop-direction variant of [`Self::check_commit`]: exempt from `stop_generation` checks
+    /// so an authorized Stop never blocks a queued torque disable.
+    fn check_commit_stop_direction(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        if let Some(code) = d.stamp.check_stop_direction(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
+        if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        Ok(())
+    }
 }
 
 impl SupervisorInner {
@@ -887,7 +895,10 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-        self.check_commit(d, ctx)?;
+        match op {
+            ImmediateOp::TorqueOff => self.check_commit_stop_direction(d, ctx)?,
+            ImmediateOp::Heartbeat | ImmediateOp::TorqueOn => self.check_commit(d, ctx)?,
+        }
         let r = match op {
             // renews the lease the command was admitted under, if it is still valid at the
             // commit instant (a queued renewal cannot resurrect an expired lease)
@@ -918,6 +929,7 @@ impl CoreOps for SupervisorInner {
                     .map(drop)
                     .map_err(ArmError::Safety)
             }
+            // Stop-direction action: exempt from stop-generation checks and Admitted.
             ImmediateOp::TorqueOff => {
                 if self.driver.is_some() {
                     return Err("UNSUPPORTED");
@@ -929,7 +941,10 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-        self.check_commit(d, ctx)?;
+        match op {
+            TransitionOp::TorqueOff => self.check_commit_stop_direction(d, ctx)?,
+            TransitionOp::TorqueOn => self.check_commit(d, ctx)?,
+        }
         if self.core.transition_pending() || self.torque_transition_pending() { return Err("TRANSITION_BUSY"); }
         // starts the bus owner's handshake (ArmDriver::begin_torque); a refusal before any
         // frame refuses the commit, a later failure is the transition's terminal
@@ -944,6 +959,7 @@ impl CoreOps for SupervisorInner {
                 };
                 self.check_admission(stamp).and_then(|admitted| self.begin_enable_torque_transition(admitted))
             }
+            // Stop-direction action: exempt from stop-generation checks and Admitted.
             TransitionOp::TorqueOff => self.begin_disable_torque_transition(),
         }
         .map_err(|e| static_code(ArmError::Safety(e)))?;

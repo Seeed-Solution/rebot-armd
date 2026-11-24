@@ -3807,3 +3807,173 @@ async fn teardown_marks_connection_closed_under_owner_lock_before_awaiting_joins
     }
     armd::api::ws::set_test_ws_write_paused(&conn_id_str, false);
 }
+
+// 24. Round-6 Item 3: a Stop never cancels a queued torque disable on WS (`drain_cancellable`)
+//     and never blocks RT broker `ImmediateOp::TorqueOff` or `TransitionOp::TorqueOff`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_never_cancels_or_blocks_queued_torque_disable_on_ws_and_rt_broker() {
+    // (a) WS queued `/api/v1/torque` and `/api/v1/arm` with `enable: false` survive urgent Stop.
+    for (idx, disable_path) in ["/api/v1/torque", "/api/v1/arm"].iter().enumerate() {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 30_000;
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let addr = serve(sup.clone()).await;
+        let (mut ws, gen) = controller(addr).await;
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        assert!(sup.inner().read().await.is_torqued);
+        let ep = sup.get_observation().await.epoch_id;
+        let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let base_req = 8500 + (idx as u64) * 100;
+
+        // Hold worker on a first jog so a queued jog AND a queued torque-off sit in `ordinary_queue`.
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+        send(&mut ws, json!({
+            "type": "command", "request_id": base_req + 1, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/motion/jog",
+            "body": {"target_positions": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 0.5}
+        })).await;
+        wait_until(Duration::from_secs(1), || {
+            armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1
+        }).await;
+        send(&mut ws, json!({
+            "type": "command", "request_id": base_req + 2, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/motion/jog",
+            "body": {"target_positions": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 0.5}
+        })).await;
+        send(&mut ws, json!({
+            "type": "command", "request_id": base_req + 3, "generation": gen, "epoch_id": ep,
+            "path": disable_path,
+            "body": {"enable": false}
+        })).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Send urgent Stop while both jog+2 and torque-disable+3 are sitting in `ordinary_queue`.
+        send(&mut ws, json!({
+            "type": "command", "request_id": base_req + 4, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/motion/stop", "body": {}
+        })).await;
+        // Release worker after Stop has been applied.
+        let mut replies = std::collections::HashMap::<u64, serde_json::Value>::new();
+        let stop_deadline = Instant::now() + Duration::from_secs(2);
+        while !replies.contains_key(&(base_req + 4)) && Instant::now() < stop_deadline {
+            let v = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+            if let Some(id) = v.get("request_id").and_then(|r| r.as_u64()) {
+                replies.insert(id, v);
+            }
+        }
+        assert_eq!(replies.get(&(base_req + 4)).and_then(|v| v["type"].as_str()), Some("command_ack"));
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while replies.len() < 4 && Instant::now() < deadline {
+            let v = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+            if let Some(id) = v.get("request_id").and_then(|r| r.as_u64()) {
+                replies.insert(id, v);
+            }
+        }
+        assert_eq!(replies[&(base_req + 1)]["type"], "command_reject", "{disable_path}: jog1 {:?}", replies[&(base_req + 1)]);
+        assert_eq!(replies[&(base_req + 1)]["code"], "STOPPED");
+        assert_eq!(replies[&(base_req + 2)]["type"], "command_reject", "{disable_path}: jog2 {:?}", replies[&(base_req + 2)]);
+        assert_eq!(replies[&(base_req + 2)]["code"], "STOPPED");
+        assert_eq!(replies[&(base_req + 3)]["type"], "command_ack", "{disable_path}: queued disable must execute after Stop: {:?}", replies[&(base_req + 3)]);
+        assert!(!sup.inner().read().await.is_torqued, "{disable_path}: torque must be disabled");
+    }
+
+    // (b) RT broker ImmediateOp::TorqueOff (driverless) and TransitionOp::TorqueOff (with driver)
+    //     both commit across an intervening Stop, while TorqueOn with stale stop_gen is refused.
+    {
+        use armd::rt_core::broker::{ImmediateOp, Submit, TransitionOp};
+        use armd::rt_core::ops::ReleaseFixture;
+
+        // Driverless: ImmediateOp::TorqueOff succeeds after Stop; ImmediateOp::TorqueOn fails STOPPED.
+        let mut core = SupervisorInner::new(ArmConfig::rebot_dm());
+        core.lease_enabled = false;
+        let st = core.current_admission_stamp();
+        let adm = core.check_admission(st).unwrap();
+        core.enable_torque(adm).unwrap();
+        assert!(core.is_torqued);
+
+        let (mut fx, mut broker, _tw, stop) = ReleaseFixture::new(core, BootId(1), Capacities::default());
+        let auth_before_stop = Authority {
+            lease_generation: 0,
+            epoch: fx.core.safety.epoch_id(),
+            stop_generation: 0,
+            config_revision: fx.core.workspace_revision,
+            parent_generation: 0,
+        };
+        let dl = fx.now() + Duration::from_secs(5);
+        broker.submit(ClientId(1), 1, auth_before_stop, dl, Submit::Immediate(ImmediateOp::TorqueOff)).unwrap();
+        // Urgent Stop advances stop_generation to 1 BEFORE Step 3 commits the queued TorqueOff.
+        let _ = stop.request();
+        let rep = fx.step();
+        assert!(rep.stopped);
+        assert!(matches!(rep.command, Some((_, Ok(_)))), "ImmediateOp::TorqueOff must commit after Stop: {:?}", rep.command);
+        assert!(!fx.core.is_torqued);
+
+        // Stale-stop ImmediateOp::TorqueOn MUST still be refused with STOPPED.
+        broker.submit(ClientId(1), 2, auth_before_stop, dl, Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
+        let rep_on = fx.step();
+        assert!(matches!(rep_on.command, Some((_, Err("STOPPED")))), "stale ImmediateOp::TorqueOn must fail STOPPED: {:?}", rep_on.command);
+        assert!(!fx.core.is_torqued);
+
+        // With real DamiaoArmDriver<FakeBus>: TransitionOp::TorqueOff succeeds after Stop;
+        // TransitionOp::TorqueOn with stale stop_generation fails STOPPED.
+        let dm_lim: Vec<armd::protocol::damiao::DamiaoLimits> = ArmConfig::rebot_dm()
+            .damiao_ranges
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect();
+        let clock = armd::transport::MockClock::new();
+        let cfg_drv = ArmConfig::rebot_dm();
+        let rest_pos = cfg_drv.resting_positions().to_vec();
+        let bus = FakeBus::with_clock(&dm_lim, clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for (m, &q) in s.motors.iter_mut().zip(&rest_pos) {
+                m.q = q;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = armd::driver::DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_lim)
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut core_drv = SupervisorInner::new(cfg_drv).with_driver(Box::new(drv));
+        core_drv.lease_enabled = false;
+        core_drv.tick(0.02);
+        let st = core_drv.current_admission_stamp();
+        let adm = core_drv.check_admission(st).unwrap();
+        core_drv.enable_torque(adm).unwrap();
+        assert!(core_drv.is_torqued);
+
+        let (mut fx_d, mut broker_d, _tw_d, stop_d) = ReleaseFixture::new(core_drv, BootId(2), Capacities::default());
+        let auth_drv = Authority {
+            lease_generation: 0,
+            epoch: fx_d.core.safety.epoch_id(),
+            stop_generation: 0,
+            config_revision: fx_d.core.workspace_revision,
+            parent_generation: 0,
+        };
+        let dl_d = fx_d.now() + Duration::from_secs(5);
+        broker_d.submit(ClientId(1), 1, auth_drv, dl_d, Submit::Transition(TransitionOp::TorqueOff)).unwrap();
+        let _ = stop_d.request();
+        let rep_d = fx_d.step();
+        assert!(rep_d.stopped);
+        assert!(matches!(rep_d.command, Some((_, Ok(_)))), "TransitionOp::TorqueOff must commit after Stop: {:?}", rep_d.command);
+        for _ in 0..10 {
+            if !fx_d.core.is_torqued { break; }
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| s.push_all_feedback());
+            let _ = fx_d.step();
+        }
+        assert!(!fx_d.core.is_torqued);
+
+        broker_d.submit(ClientId(1), 2, auth_drv, dl_d, Submit::Transition(TransitionOp::TorqueOn)).unwrap();
+        let rep_d_on = fx_d.step();
+        assert!(matches!(rep_d_on.command, Some((_, Err("STOPPED")))), "stale TransitionOp::TorqueOn must fail STOPPED: {:?}", rep_d_on.command);
+        assert!(!fx_d.core.is_torqued);
+    }
+}

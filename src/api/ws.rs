@@ -1173,6 +1173,21 @@ struct OrdinaryQueue {
     notify: Arc<tokio::sync::Notify>,
 }
 
+/// Torque disable (`/api/v1/torque` or `/api/v1/arm` with `enable: false`) is a stop-direction
+/// action: an ordinary Stop must never cancel or drain it from the queue.
+fn is_torque_disable_command(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("command")
+        && matches!(
+            value.get("path").and_then(Value::as_str),
+            Some("/api/v1/torque" | "/api/v1/arm")
+        )
+        && value
+            .get("body")
+            .and_then(|b| b.get("enable"))
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
 impl OrdinaryQueue {
     fn new() -> Self {
         Self {
@@ -1230,9 +1245,11 @@ impl OrdinaryQueue {
             for _ in 0..n {
                 if let Some(item) = g.items.pop_front() {
                     let kind = item.value.get("type").and_then(Value::as_str).unwrap_or("");
-                    let cancellable = matches!(kind, "command" | "preset" | "servo")
-                        || item.value.get("positions").is_some()
-                        || item.value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream");
+                    let exempt_disable = code == "STOPPED" && is_torque_disable_command(&item.value);
+                    let cancellable = !exempt_disable
+                        && (matches!(kind, "command" | "preset" | "servo")
+                            || item.value.get("positions").is_some()
+                            || item.value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream"));
                     if cancellable {
                         to_cancel.push(item.value);
                     } else {
