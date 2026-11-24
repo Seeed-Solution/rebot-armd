@@ -737,6 +737,7 @@ impl CoreOps for SupervisorInner {
             stop_gen: d.stamp.authority.stop_generation,
             estop_epoch: d.stamp.authority.epoch,
             lease_gen: d.stamp.authority.lease_generation,
+            connection_id: 0,
         };
         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
         match primitive {
@@ -780,6 +781,7 @@ impl CoreOps for SupervisorInner {
             stop_gen: d.stamp.authority.stop_generation,
             estop_epoch: d.stamp.authority.epoch,
             lease_gen: d.stamp.authority.lease_generation,
+            connection_id: 0,
         };
         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = *primitive else {
@@ -834,6 +836,7 @@ impl CoreOps for SupervisorInner {
             stop_gen: d.stamp.authority.stop_generation,
             estop_epoch: d.stamp.authority.epoch,
             lease_gen: d.stamp.authority.lease_generation,
+            connection_id: 0,
         };
         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = primitive else {
@@ -907,6 +910,7 @@ impl CoreOps for SupervisorInner {
                     stop_gen: d.stamp.authority.stop_generation,
                     estop_epoch: d.stamp.authority.epoch,
                     lease_gen: d.stamp.authority.lease_generation,
+                    connection_id: 0,
                 };
                 self.check_admission(stamp)
                     .and_then(|admitted| self.enable_torque(admitted))
@@ -935,6 +939,7 @@ impl CoreOps for SupervisorInner {
                     stop_gen: d.stamp.authority.stop_generation,
                     estop_epoch: d.stamp.authority.epoch,
                     lease_gen: d.stamp.authority.lease_generation,
+                    connection_id: 0,
                 };
                 self.check_admission(stamp).and_then(|admitted| self.begin_enable_torque_transition(admitted))
             }

@@ -1792,7 +1792,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     };
 
     // This identity never comes from a client payload and is never disclosed.
-    let connection = format!("connection:{}", NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed));
+    let conn_id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+    let connection = format!("connection:{conn_id}");
     let connection_generation = Arc::new(AtomicU64::new(0));
     let client_label: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Urgent Stop request_id ordering is tracked independently of ordinary RPCs so an urgent Stop
@@ -2191,6 +2192,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // Task 1: Reader task. Only reads frames and classifies them; never awaits planning, IO,
     // detector, supervisor lock, or channel capacity.
     let reader_supervisor = supervisor.clone();
+    let reader_conn_id = conn_id;
     let reader_connection = connection.clone();
     let reader_generation = connection_generation.clone();
     let reader_client_label = client_label.clone();
@@ -2465,6 +2467,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     .get("generation")
                     .and_then(Value::as_u64)
                     .unwrap_or_else(|| reader_generation.load(Ordering::SeqCst)),
+                connection_id: reader_conn_id,
             };
             // Every other frame goes onto the connection's bounded ordinary queue (non-blocking).
             if let Err(value) = reader_ordinary_queue.try_push(value, stamp) {
@@ -2482,6 +2485,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // Task 2: Ordinary worker task. Processes ordinary commands one at a time, in order, and
     // may await planning, replay, dry-run, and the detector without blocking reader/urgent paths.
     let recv_supervisor = supervisor.clone();
+    let recv_conn_id = conn_id;
     let recv_connection = connection.clone();
     let recv_generation = connection_generation.clone();
     let recv_client_label = client_label.clone();
@@ -2693,10 +2697,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 if kind == "acquire_lease" {
-                    if worker_closing.load(Ordering::SeqCst) {
-                        // Teardown already started while waiting for the owner lock: never keep
-                        // (or evict another client for) a late lease acquire.
-                        let _ = inner.release_lease_for_connection(&recv_connection);
+                    if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
+                        // Teardown already started while waiting for the owner lock: stop any
+                        // existing lease's motion first, then release it; never acquire or evict.
+                        let _ = inner.release_lease_for_connection_and_stop(&recv_connection);
                         recv_generation.store(0, Ordering::SeqCst);
                         response = None;
                     } else {
@@ -2736,9 +2740,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         } else {
                                             match inner.preempt_lease(&recv_connection, label) {
                                                 Ok((generation, evicted)) => {
-                                                    if worker_closing.load(Ordering::SeqCst) {
-                                                        // Late acquire completing after teardown started: release immediately.
-                                                        let _ = inner.release_lease(&recv_connection, generation);
+                                                    if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
+                                                        // Late acquire completing after teardown started: stop motion first, then release.
+                                                        let _ = inner.release_lease_and_stop(&recv_connection, generation);
                                                         recv_generation.store(0, Ordering::SeqCst);
                                                         response = None;
                                                     } else {
@@ -2778,9 +2782,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     } else {
                                         match inner.acquire_lease(&recv_connection) {
                                             Ok(generation) => {
-                                                if worker_closing.load(Ordering::SeqCst) {
-                                                    // Late acquire completing after teardown started: release immediately.
-                                                    let _ = inner.release_lease(&recv_connection, generation);
+                                                if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
+                                                    // Late acquire completing after teardown started: stop motion first, then release.
+                                                    let _ = inner.release_lease_and_stop(&recv_connection, generation);
                                                     recv_generation.store(0, Ordering::SeqCst);
                                                     response = None;
                                                 } else {
@@ -2842,10 +2846,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(&recv_connection, local_generation)})
                             });
                         } else if kind == "release_lease" {
-                            let released = inner.release_lease(&recv_connection, local_generation);
+                            let released = inner.release_lease_and_stop(&recv_connection, local_generation);
                             recv_generation.store(0, Ordering::SeqCst);
                             *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                            inner.stop_motion();
                             response = Some(json!({"type":"lease_released", "success":released}));
                         } else {
                             let epoch = inner.safety.epoch_id();
@@ -3381,18 +3384,25 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             Ok(Ok((prepared_policy, fps, verified_release_gate, speed))) => {
                                 let deadline_res = crate::policy_runtime::compute_policy_deadline(pending.request.max_seconds)
                                     .map_err(ArmError::from);
+                                // Fetch deployment context BEFORE taking the owner lock so NO `.await`
+                                // ever happens while holding `inner` and connection-closed is checked
+                                // atomically under the same lock as install.
+                                let active_scene_tool = if verified_release_gate.is_some() {
+                                    Some(sandbox_c.active_scene_and_tool().await)
+                                } else {
+                                    None
+                                };
+                                maybe_pause_worker_before_lock(&conn).await;
 
                                 let mut inner = sup.inner().write().await;
                                 loading_guard.clear(&mut inner);
-                                if ws_closed_c.load(Ordering::SeqCst) {
+                                if ws_closed_c.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
                                     return;
                                 }
                                 if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn, generation) {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while loading policy", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                                 } else if inner.safety.epoch_id() != epoch_id {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":inner.safety.epoch_id()})
-                                } else if let Err(err) = inner.check_admission(policy_stamp).map(drop) {
-                                    command_reject(&inner, &request_id, ArmError::from(err).into())
                                 } else if !inner.policy_live_allowed() && !ws_auth_c.is_operator() {
                                     // the operator session may have expired or been locked while loading
                                     command_reject(&inner, &request_id, ApiError::operator_required("policy/start (real arm)"))
@@ -3405,7 +3415,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         Err(err) => command_reject(&inner, &request_id, err.into()),
                                         Ok(deadline) => {
                                             let deployment_check = if let Some(ref gate) = verified_release_gate {
-                                                let (cur_scene, cur_tool) = sandbox_c.active_scene_and_tool().await;
+                                                let (cur_scene, cur_tool) = active_scene_tool.unwrap_or_default();
                                                 let cur_ctx = crate::policy_runtime::ActiveDeploymentContext {
                                                     scene_id: cur_scene,
                                                     tool_id: cur_tool,
@@ -3614,6 +3624,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         auth_task.abort();
         let _ = auth_task.await;
     }
+    // Set connection-closed under the owner lock immediately at teardown start so no resuming
+    // async install (policy/start after deployment lookup, planning, macro) or stale `Admitted`
+    // token from this connection can install motion while teardown finishes flushing and joining.
+    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+        let mut inner = supervisor.inner().write().await;
+        if !inner.detached {
+            inner.mark_connection_closed(conn_id);
+        }
+    }
     let fatal_close = fatal_triggered.load(Ordering::Acquire);
     if !fatal_close && !matches!(first_exit, FirstExit::Reader) {
         reader_task.abort();
@@ -3646,10 +3665,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
         supervisor.recorder_connection_closed(&connection).await;
-        // Take the owner lock FIRST and release whichever lease this connection currently holds.
+        // Take the owner lock FIRST, keep connection marked closed, and stop motion before
+        // releasing whichever lease this connection currently holds.
         let mut inner = supervisor.inner().write().await;
-        if !inner.detached && inner.release_lease_for_connection(&connection) {
-            inner.stop_motion();
+        if !inner.detached {
+            inner.mark_connection_closed(conn_id);
+            let _ = inner.release_lease_for_connection_and_stop(&connection);
         }
         connection_generation.store(0, Ordering::SeqCst);
     }

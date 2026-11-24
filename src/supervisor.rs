@@ -39,6 +39,10 @@ pub struct AdmissionStamp {
     pub stop_gen: u64,
     pub estop_epoch: u64,
     pub lease_gen: u64,
+    /// Monotonic WS connection ID (`>= 1`) captured at WS admission, or `0` for non-WS callers.
+    /// Checked against the owner-lock closed-connection set so a stale stamp or `Admitted` token
+    /// from a closed connection is always refused.
+    pub connection_id: u64,
 }
 
 /// Opaque, single-use admission proof token created ONLY by [`SupervisorInner::check_admission`]
@@ -49,7 +53,7 @@ pub struct AdmissionStamp {
 ///
 /// ```compile_fail
 /// use armd::{AdmissionStamp, Admitted};
-/// let _forged = Admitted(AdmissionStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0 });
+/// let _forged = Admitted(AdmissionStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0, connection_id: 0 });
 /// ```
 ///
 /// ```compile_fail
@@ -728,6 +732,9 @@ pub struct SupervisorInner {
     pub(crate) estop_ack_overflow_gen: u64,
     /// Preallocated queue of heap-owning motion payloads retired on `armd-control` for off-thread drop.
     pub(crate) pending_retired_stops: std::collections::VecDeque<crate::rt_core::urgent::RetiredStopPayloads>,
+    /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`),
+    /// set under the owner lock during teardown and checked on every motion/output install.
+    closed_connections: ClosedConnections,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
     pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -781,6 +788,46 @@ pub struct PendingZeroCheckPersist {
     pub current_calib_jaw: Option<crate::model::JawOpening>,
     pub gripper_limit: Option<crate::model::JointLimit>,
     pub active_tool_is_stock: bool,
+}
+
+/// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`).
+/// Bounded by `open_connections + 1` with zero eviction and O(log K) zero-alloc lookup.
+#[derive(Debug, Default)]
+pub(crate) struct ClosedConnections {
+    intervals: Vec<(u64, u64)>,
+}
+
+impl ClosedConnections {
+    pub(crate) fn mark_closed(&mut self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let idx = self
+            .intervals
+            .partition_point(|&(_, end)| end.saturating_add(1) < id);
+        if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
+            let (lo, hi) = self.intervals[idx];
+            let new_lo = lo.min(id);
+            let mut new_hi = hi.max(id);
+            if idx + 1 < self.intervals.len()
+                && self.intervals[idx + 1].0 <= new_hi.saturating_add(1)
+            {
+                new_hi = new_hi.max(self.intervals[idx + 1].1);
+                self.intervals.remove(idx + 1);
+            }
+            self.intervals[idx] = (new_lo, new_hi);
+        } else {
+            self.intervals.insert(idx, (id, id));
+        }
+    }
+
+    pub(crate) fn is_closed(&self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let idx = self.intervals.partition_point(|&(_, end)| end < id);
+        idx < self.intervals.len() && self.intervals[idx].0 <= id
+    }
 }
 
 impl SupervisorInner {
@@ -1014,6 +1061,7 @@ impl SupervisorInner {
             pending_retired_stops: std::collections::VecDeque::with_capacity(
                 crate::rt_core::urgent::URGENT_STOP_CAPACITY,
             ),
+            closed_connections: ClosedConnections::default(),
             before_publish_hook: None,
         }
     }
@@ -1060,7 +1108,19 @@ impl SupervisorInner {
             stop_gen: self.current_stop_gen(),
             estop_epoch: self.safety.epoch_id(),
             lease_gen: self.current_active_lease_gen(),
+            connection_id: 0,
         }
+    }
+
+    /// Marks WS connection `connection_id` (`>= 1`) closed under the owner lock so no
+    /// resuming async install or stale [`Admitted`] token from that connection can start motion.
+    pub fn mark_connection_closed(&mut self, connection_id: u64) {
+        self.closed_connections.mark_closed(connection_id);
+    }
+
+    /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under the owner lock.
+    pub fn is_connection_closed(&self, connection_id: u64) -> bool {
+        self.closed_connections.is_closed(connection_id)
     }
 
     /// Advance the stop generation under the owner lock whenever a Stop applies.
@@ -1079,6 +1139,9 @@ impl SupervisorInner {
     }
 
     fn verify_admission_stamp(&self, stamp: AdmissionStamp) -> Result<(), SafetyError> {
+        if stamp.connection_id != 0 && self.is_connection_closed(stamp.connection_id) {
+            return Err(SafetyError::LeaseLost);
+        }
         if stamp.stop_gen != self.current_stop_gen() {
             return Err(SafetyError::Stopped);
         }
@@ -4397,6 +4460,7 @@ impl ArmSupervisor {
             stop_gen: self.stop_generation(),
             estop_epoch: self.estop_epoch(),
             lease_gen: self.lease_generation(),
+            connection_id: 0,
         }
     }
 

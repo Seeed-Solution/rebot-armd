@@ -2235,14 +2235,14 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
         let (sup, gen, ep) = make_armed().await;
         let inner = sup.inner().read().await;
         let sg = inner.current_stop_gen();
-        let err_lease = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen + 1 }).unwrap_err();
+        let err_lease = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen + 1, connection_id: 0 }).unwrap_err();
         assert_eq!(ApiError::from(ArmError::from(err_lease)).code.as_deref(), Some("LEASE_LOST"));
-        let err_ep = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep + 9, lease_gen: gen }).unwrap_err();
+        let err_ep = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep + 9, lease_gen: gen, connection_id: 0 }).unwrap_err();
         assert_eq!(ApiError::from(ArmError::from(err_ep)).code.as_deref(), Some("EPOCH_MISMATCH"));
         drop(inner);
         let _ = sup.trigger_e_stop_checked().await.unwrap();
         let inner = sup.inner().read().await;
-        let err_estop = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen }).unwrap_err();
+        let err_estop = inner.check_admission(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen, connection_id: 0 }).unwrap_err();
         assert_eq!(ApiError::from(ArmError::from(err_estop)).code.as_deref(), Some("ESTOP_ACTIVE"));
     }
     let _ = BacklashRequest::Profile;
@@ -3137,5 +3137,227 @@ async fn write_timeout_abandons_stalled_write_and_attempts_queued_estop_replies_
         let t_err = trace.iter().position(|e| e == "text:error").expect("fatal error frame must be attempted before Close");
         let t_close = trace.iter().position(|e| e.starts_with("close:ESTOP_LATCHED")).expect("ESTOP_LATCHED Close must be attempted");
         assert!(t_estop < t_err && t_err < t_close, "permanent stall must attempt E-stop -> error -> Close(ESTOP_LATCHED): {trace:?}");
+    }
+}
+
+// 22. Round-5 Item 5 (Teardown cannot leave motion):
+//     (a) Owner-lock connection-closed flag refuses both new `check_admission` and any pre-created
+//         stale `Admitted` token from a closed connection (`jog_action`, `enable_torque`,
+//         `begin_policy_run`), leaving zero motion or policy installed.
+//     (b) Policy start resuming after its deployment lookup (`active_scene_and_tool().await`)
+//         once teardown began cannot install a policy run or leave motion behind.
+//     (c) Acquire path hitting closing while this connection holds an active lease with running
+//         motion stops that lease's motion first before releasing it (no unowned motion left).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_closes_connection_under_owner_lock_and_acquire_release_stops_motion() {
+    use armd::api::rest::ApiError;
+    use armd::AdmissionStamp;
+
+    // (a) Owner-lock connection-closed flag refuses stale `Admitted` and `AdmissionStamp`.
+    {
+        let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() });
+        let gen = inner.acquire_lease("connection:42").unwrap();
+        let s0 = AdmissionStamp { connection_id: 42, ..inner.current_admission_stamp() };
+        let a_en = inner.check_admission(s0).unwrap();
+        inner.enable_torque(a_en).unwrap();
+        let ep = inner.safety.epoch_id();
+        let stamp_conn42 = AdmissionStamp { stop_gen: inner.current_stop_gen(), estop_epoch: ep, lease_gen: gen, connection_id: 42 };
+        // Pre-create valid `Admitted` tokens BEFORE teardown marks connection 42 closed.
+        let stale_admitted_jog = inner.check_admission(stamp_conn42).unwrap();
+        #[cfg(feature = "policy-runtime")]
+        let stale_admitted_pol = inner.check_admission(stamp_conn42).unwrap();
+
+        // Teardown marks connection 42 closed under the owner lock (and also exercise coalescing).
+        inner.mark_connection_closed(41);
+        inner.mark_connection_closed(43);
+        inner.mark_connection_closed(42);
+        assert!(inner.is_connection_closed(41) && inner.is_connection_closed(42) && inner.is_connection_closed(43));
+        assert!(!inner.is_connection_closed(40) && !inner.is_connection_closed(44) && !inner.is_connection_closed(0));
+
+        // Even while lease/epoch/stop_gen still match, BOTH `check_admission` AND pre-created
+        // `Admitted` tokens for connection 42 MUST be refused with LEASE_LOST!
+        let err_check = inner.check_admission(stamp_conn42).unwrap_err();
+        assert_eq!(ApiError::from(ArmError::from(err_check)).code.as_deref(), Some("LEASE_LOST"));
+        let err_jog = inner.jog_action(stale_admitted_jog, INSPECT.to_vec(), Some(1.0), Some(ep), "closed_jog").unwrap_err();
+        assert_eq!(ApiError::from(err_jog).code.as_deref(), Some("LEASE_LOST"));
+        assert!(inner.active_trajectory.is_none());
+        #[cfg(feature = "policy-runtime")]
+        {
+            let err_pol = inner.begin_policy_run(stale_admitted_pol, armd::policy_runtime::PolicyRunStart {
+                epoch_id: ep,
+                connection_id: "connection:42".into(),
+                lease_generation: gen,
+                policy_id: "closed_pol".into(),
+                artifact_digest: "sha256:0000".into(),
+                backend: "mlp".into(),
+                mode: armd::policy_runtime::PolicyMode::Shadow,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
+            }).unwrap_err();
+            assert_eq!(ApiError::from(err_pol).code.as_deref(), Some("LEASE_LOST"));
+            assert!(inner.policy_run.is_none());
+        }
+    }
+
+    // (b) WS policy/start resuming right after deployment lookup / before install lock once teardown
+    //     began must be refused under the owner lock and leave no policy_run, trajectory, or lease.
+    #[cfg(feature = "policy-runtime")]
+    {
+        use armd::api::create_router_with_sandbox;
+        use armd::api::sandbox::SandboxState;
+        use armd::policy_runtime::{encode_rmlp_bytes, Activation, MlpLayerSpec};
+
+        let mut cfg = ArmConfig::default();
+        cfg.lease_timeout_ms = 15_000;
+        let jnames: Vec<&str> = cfg.limits.iter().map(|l| l.name.as_str()).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("policies").join("td_deploy_pol");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let layers = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        std::fs::write(pack_dir.join("model.rmlp"), encode_rmlp_bytes(&layers).unwrap()).unwrap();
+        std::fs::write(
+            pack_dir.join("policy.json"),
+            serde_json::to_vec(&json!({
+                "format": "rebot-onnx-policy/v1",
+                "id": "td_deploy_pol",
+                "name": "td_deploy_pol",
+                "unit_mode": "rad",
+                "action_dim": 6,
+                "action_space": "joint_positions",
+                "joint_names": jnames,
+                "inputs": {"state": {"shape": [1, 6], "joint_names": jnames}},
+                "outputs": {"action": {"shape": [1, 6], "space": "joint_positions"}},
+                "model_file": "model.rmlp"
+            })).unwrap(),
+        ).unwrap();
+
+        let sandbox = Arc::new(SandboxState::new(dir.path().to_path_buf()));
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let ep = sup.get_observation().await.epoch_id;
+
+        // Pause the policy-start task right after deployment lookup, right before acquiring inner.write().
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn, true);
+        // Wait: worker_task also calls maybe_pause_worker_before_lock for the initial command;
+        // pause ONLY after policy_loading starts!
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn, false);
+        send(&mut ws, json!({
+            "type": "command", "request_id": 9301, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/action/policy/start",
+            "body": {"policy_id": "td_deploy_pol", "mode": "shadow"}
+        })).await;
+        // Wait for policy_loading to flip true, then pause right before install lock.
+        // Use a tiny blocking delay so the spawned task hasn't reached the install pause yet.
+        wait_until(Duration::from_secs(2), || {
+            let g = sup.inner().try_read();
+            g.is_ok_and(|inner| inner.policy_loading || inner.policy_run.is_some())
+        }).await;
+        // Even cleaner: disconnect while paused in blocking_plan or before_lock (use fresh connection with delay).
+        drop(ws);
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+        // Deterministic post-deployment pause test with sandbox delay so policy_loading is active when we pause:
+        let sandbox2 = Arc::new(SandboxState::new(dir.path().to_path_buf()));
+        sandbox2.set_policy_load_delay_ms(60);
+        let sup2 = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::default() }));
+        let router2 = create_router_with_sandbox(sup2.clone(), OperatorAuth::disabled(), sandbox2);
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener2, router2).await.unwrap(); });
+
+        let (mut ws2, gen2) = controller(addr2).await;
+        let conn2 = sup2.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let ep2 = sup2.get_observation().await.epoch_id;
+        send(&mut ws2, json!({
+            "type": "command", "request_id": 9302, "generation": gen2, "epoch_id": ep2,
+            "path": "/api/v1/action/policy/start",
+            "body": {"policy_id": "td_deploy_pol", "mode": "shadow"}
+        })).await;
+        wait_until(Duration::from_secs(2), || {
+            sup2.inner().try_read().is_ok_and(|g| g.policy_loading)
+        }).await;
+        // Now arm the before-install pause hook so the policy task pauses right after deployment lookup.
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn2, true);
+        wait_until(Duration::from_secs(2), || {
+            armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn2) >= 1
+        }).await;
+        // Disconnect while policy task is suspended right after deployment lookup, then unpause it.
+        drop(ws2);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn2, false);
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn2)
+        }).await;
+        let inner2 = sup2.inner().read().await;
+        assert!(inner2.active_lease.is_none(), "teardown must release lease");
+        assert!(inner2.policy_run.is_none(), "resuming policy/start after teardown must NOT install");
+        assert!(!inner2.policy_loading, "policy_loading must be cleared");
+    }
+
+    // (c) Acquire path releasing an existing lease during closing MUST stop that lease's motion first.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let ep1 = sup.get_observation().await.epoch_id;
+        assert_eq!(
+            rpc(&mut ws, gen, ep1, "/api/v1/motion/jog", json!({"target_positions": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 3.0})).await["type"],
+            "command_ack"
+        );
+        assert!(sup.inner().read().await.active_trajectory.is_some(), "motion must be active before acquire-during-close");
+
+        // Pause worker right before inner.write() on a second `acquire_lease`, then close the socket
+        // (setting `connection_closing = true` while worker waits to enter the acquire branch).
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn, true);
+        send(&mut ws, json!({"type": "acquire_lease", "client_id": "test_controller", "seq": 99})).await;
+        wait_until(Duration::from_secs(2), || {
+            armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn) >= 1
+        }).await;
+        // Hold a read/write barrier or close socket then release pause so acquire enters the closing branch.
+        drop(ws);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn, false);
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+        let inner = sup.inner().read().await;
+        assert!(inner.active_lease.is_none(), "lease must be released");
+        assert!(inner.active_trajectory.is_none(), "acquire-during-closing releasing existing lease must stop motion first");
+
+        // Direct unit check on `release_lease_and_stop` / `release_lease_for_connection_and_stop`:
+        drop(inner);
+        let mut direct = SupervisorInner::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() });
+        let g = direct.acquire_lease("connection:99").unwrap();
+        let a1 = direct.check_admission(direct.current_admission_stamp()).unwrap();
+        direct.enable_torque(a1).unwrap();
+        let ep_d = direct.safety.epoch_id();
+        let a2 = direct.check_admission(direct.current_admission_stamp()).unwrap();
+        direct.jog_action(a2, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_d), "direct_jog").unwrap();
+        assert!(direct.active_trajectory.is_some());
+        assert!(direct.release_lease_for_connection_and_stop("connection:99"));
+        assert!(direct.active_lease.is_none());
+        assert!(direct.active_trajectory.is_none(), "release_lease_for_connection_and_stop must stop motion");
+
+        let g2 = direct.acquire_lease("connection:100").unwrap();
+        assert!(g2 > g);
+        let a3 = direct.check_admission(direct.current_admission_stamp()).unwrap();
+        direct.jog_action(a3, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_d), "direct_jog2").unwrap();
+        assert!(direct.active_trajectory.is_some());
+        assert!(direct.release_lease_and_stop("connection:100", g2));
+        assert!(direct.active_lease.is_none());
+        assert!(direct.active_trajectory.is_none(), "release_lease_and_stop must stop motion");
     }
 }

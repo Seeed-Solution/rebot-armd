@@ -705,6 +705,41 @@ impl SupervisorInner {
         self.release_lease(client_id, gen)
     }
 
+    /// Stops active motion FIRST if `client_id`/`generation` currently owns a valid lease, then
+    /// releases that lease (matching normal WS `release_lease` semantics). An expired lease is
+    /// dropped without cancelling a running watchdog park.
+    pub fn release_lease_and_stop(&mut self, client_id: &str, generation: u64) -> bool {
+        if self.detached {
+            return false;
+        }
+        let is_valid_owner = self.active_lease.as_ref().is_some_and(|a| {
+            a.client_id == client_id
+                && a.generation == generation
+                && a.acquired_at.elapsed() < self.lease_timeout
+        });
+        if is_valid_owner {
+            self.stop_motion();
+        }
+        self.release_lease(client_id, generation)
+    }
+
+    /// Stops active motion FIRST if `client_id` currently owns a valid lease (any generation),
+    /// then releases that lease under the owner lock.
+    pub fn release_lease_for_connection_and_stop(&mut self, client_id: &str) -> bool {
+        if self.detached {
+            return false;
+        }
+        let Some(gen) = self
+            .active_lease
+            .as_ref()
+            .filter(|active| active.client_id == client_id)
+            .map(|active| active.generation)
+        else {
+            return false;
+        };
+        self.release_lease_and_stop(client_id, gen)
+    }
+
     /// Records the label a lease holder sent with `acquire_lease` (shown to other clients).
     pub fn set_lease_label(&mut self, client_id: &str, generation: u64, label: &str) {
         if self.detached {

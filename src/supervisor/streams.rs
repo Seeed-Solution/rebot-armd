@@ -1687,6 +1687,7 @@ pub mod targets {
                         stop_gen: self.current_stop_gen(),
                         estop_epoch: self.safety.epoch_id(),
                         lease_gen: g,
+                        connection_id: 0,
                     };
                     if let Ok(admitted) = self.check_admission(stamp) {
                         let _ = self.authorize_servo_stream(admitted, g);
@@ -1764,6 +1765,7 @@ pub mod targets {
                 stop_gen: frame.authority.stop_generation,
                 estop_epoch: frame.authority.epoch,
                 lease_gen: frame.authority.lease_generation,
+                connection_id: 0,
             };
             let admitted = self.check_admission(stamp).map_err(|e| Refusal::code(safety_code(&e)))?;
             self.servo_slice(admitted, frame.positions(), frame.authority.epoch).map_err(|e| {
