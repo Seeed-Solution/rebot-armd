@@ -714,7 +714,10 @@ pub enum JointHoldStatus {
     /// Motor has fresh measured feedback and a verified hold mode; hold frame transmitted and
     /// flushed on the bus.
     Held,
-    /// Motor could not be held: feedback missing, stale (> 100 ms), or unbounded.
+    /// Motor feedback is missing or stale (> 100 ms), so the owner continues holding at its last
+    /// captured hold target (never dropping holds while `torque_intent == On`).
+    HeldStaleTarget,
+    /// Motor could not be held: feedback has never been captured (missing/stale/unbounded).
     UnheldNoFreshFeedback,
     /// Motor could not be held: control mode is unverified/unavailable.
     UnheldNoVerifiedMode,
@@ -729,6 +732,7 @@ impl JointHoldStatus {
             Self::SkippedOff => "skip",
             Self::Queued => "queued",
             Self::Held => "held",
+            Self::HeldStaleTarget => "hold target stale",
             Self::UnheldNoFreshFeedback => "unheld(no_fresh_fb)",
             Self::UnheldNoVerifiedMode => "unheld(no_mode)",
             Self::UnheldTxFailed => "unheld(tx_err)",
@@ -1150,11 +1154,24 @@ pub trait ArmDriver: Send {
         }
         let outcome = self.write_estop_hold_bounded(targets)?;
         let sent_any = self.last_hold_tx_sent_any();
+        let fb_fresh = self.is_feedback_valid();
         for i in 0..dof {
             if (eff_mask & (1u64 << i)) != 0 {
                 report.joint_status[i] = match outcome {
-                    TxBatchOutcome::Complete if sent_any => JointHoldStatus::Held,
-                    TxBatchOutcome::Deferred { .. } => JointHoldStatus::Queued,
+                    TxBatchOutcome::Complete if sent_any => {
+                        if fb_fresh {
+                            JointHoldStatus::Held
+                        } else {
+                            JointHoldStatus::HeldStaleTarget
+                        }
+                    }
+                    TxBatchOutcome::Deferred { .. } => {
+                        if fb_fresh {
+                            JointHoldStatus::Queued
+                        } else {
+                            JointHoldStatus::HeldStaleTarget
+                        }
+                    }
                     _ => JointHoldStatus::UnheldTxFailed,
                 };
             }
@@ -4146,6 +4163,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         // R1: Reuse preallocated buffers for goal positions and SYNC_WRITE packet (0 heap allocs).
         self.hold_positions_buf.clear();
         let mut held_mask = 0u64;
+        let mut stale_mask = 0u64;
         let default_calib = feetech::FeetechJointCalib::default();
         for (i, target) in targets.iter().enumerate().take(dof) {
             let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
@@ -4157,17 +4175,26 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 };
                 continue;
             }
-            let Some(fresh_pos) = fresh else {
+            let pos = if target.position.is_finite() {
+                target.position
+            } else if let Some(fresh_pos) = fresh {
+                fresh_pos
+            } else {
                 report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
                 continue;
             };
-            let pos = if target.position.is_finite() { target.position } else { fresh_pos };
+            let is_stale = fresh.is_none();
             let calib = self.config.joints.get(i).unwrap_or(&default_calib);
             let range = self.effective_ranges.get(i).copied().unwrap_or_else(|| calib.effective_range_steps());
             match calib.checked_rad_to_steps_in_range(pos, range) {
                 Ok(raw_steps) => {
                     self.hold_positions_buf.push((self.servo_ids[i], raw_steps));
-                    report.joint_status[i] = JointHoldStatus::Queued;
+                    report.joint_status[i] = if is_stale {
+                        stale_mask |= 1u64 << i;
+                        JointHoldStatus::HeldStaleTarget
+                    } else {
+                        JointHoldStatus::Queued
+                    };
                     held_mask |= 1u64 << i;
                 }
                 Err(_) => {
@@ -4200,7 +4227,11 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
             for i in 0..dof {
                 if (held_mask & (1u64 << i)) != 0 {
-                    report.joint_status[i] = JointHoldStatus::Held;
+                    report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
+                        JointHoldStatus::HeldStaleTarget
+                    } else {
+                        JointHoldStatus::Held
+                    };
                 }
             }
             report.sent_any = true;
@@ -4667,6 +4698,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         let dof = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
         let mut report = HoldPassReport::empty(dof);
         let mut sent_mask = 0u64;
+        let mut stale_mask = 0u64;
         for (i, target) in targets.iter().enumerate().take(dof) {
             let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
             if (hold_mask & (1u64 << i)) == 0 {
@@ -4677,20 +4709,25 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                 };
                 continue;
             }
-            let Some(fresh_pos) = fresh else {
+            let pos = if target.position.is_finite() {
+                target.position
+            } else if let Some(fresh_pos) = fresh {
+                fresh_pos
+            } else {
                 report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
                 continue;
             };
-            let pos = if target.position.is_finite() { target.position } else { fresh_pos };
+            let is_stale = fresh.is_none();
             let angle_tenth = fashionstar::rad_to_tenth_deg(pos);
             let pkt = fashionstar::build_set_angle(self.servo_ids[i], angle_tenth, 20, 1000);
             self.pending_stop_check(Some(start_stamp))?;
-            if self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
-                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
-                continue;
-            }
             self.transport.write_all(&pkt)?;
-            report.joint_status[i] = JointHoldStatus::Queued;
+            if is_stale {
+                stale_mask |= 1u64 << i;
+                report.joint_status[i] = JointHoldStatus::HeldStaleTarget;
+            } else {
+                report.joint_status[i] = JointHoldStatus::Queued;
+            }
             sent_mask |= 1u64 << i;
             report.sent_any = true;
         }
@@ -4699,7 +4736,11 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             self.transport.flush()?;
             for i in 0..dof {
                 if (sent_mask & (1u64 << i)) != 0 {
-                    report.joint_status[i] = JointHoldStatus::Held;
+                    report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
+                        JointHoldStatus::HeldStaleTarget
+                    } else {
+                        JointHoldStatus::Held
+                    };
                 }
             }
         }
@@ -5342,6 +5383,11 @@ enum TxKind {
     /// measured feedback and the hold frame is rebuilt in step 4. Never used for `CTRL_MODE`
     /// register writes (those are always `ModeWrite`).
     RollbackHold(usize),
+    /// Owner-captured measured-position stationary hold frame for `joint` (emitted by
+    /// `write_measured_hold_masked`): obeys the same stop gate as `RollbackHold` and never resets
+    /// `rest_pose_window`, while continuing to hold the owner's last captured finite position if
+    /// feedback later goes stale (`JointHoldStatus::HeldStaleTarget`).
+    MeasuredHold(usize),
     /// `CTRL_MODE` write or non-read-only configuration write (`RID_TIMEOUT`, `CMD_SET_ZERO`).
     ModeWrite,
     /// Read-only status poll (`0xCC` refresh) or read-only register read: refused while a stop
@@ -6428,7 +6474,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.check_stopped_disable_requested(started_at, rollback)?;
             }
             TxKind::DisableProtective { .. } | TxKind::DisableProbe => {}
-            TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => {
+            TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::MeasuredHold(_) | TxKind::ClearFault => {
                 if pending {
                     return Err(TxRefusal::StopInhibited);
                 }
@@ -6512,7 +6558,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         //    position-force submission freshness, deadline, and tick TX cutoff AFTER `build`,
         //    immediately before `can.transmit` (host submission boundary).
         let latched_after = self.stop_gate_for_kind(kind)?;
-        if matches!(kind, TxKind::RollbackHold(_)) && !latched_before && latched_after {
+        if matches!(kind, TxKind::RollbackHold(_) | TxKind::MeasuredHold(_))
+            && !latched_before
+            && latched_after
+        {
             return Err(TxRefusal::StopInhibited);
         }
         if !Self::is_disable_tx_kind(kind)
@@ -12084,6 +12133,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // Any `PosForce` joint is strictly excluded from arm `pending_hold_tx` so `0x307` is
         // emitted exclusively by `pos_force_emitter`.
         let mut active_mask = 0u64;
+        let mut stale_mask = 0u64;
         for i in 0..n {
             let fresh_ok = self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_some();
             let mode = self.verified_hold_mode(i);
@@ -12104,13 +12154,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 report.joint_status[i] = if !mode_ok {
                     JointHoldStatus::UnheldNoVerifiedMode
                 } else if !fresh_ok {
-                    JointHoldStatus::UnheldNoFreshFeedback
+                    JointHoldStatus::HeldStaleTarget
                 } else {
                     JointHoldStatus::Queued
                 };
                 continue;
             }
-            if !fresh_ok || !targets[i].position.is_finite() {
+            if !targets[i].position.is_finite() {
                 let _ = self.pending_hold_tx.drop_joint(i);
                 report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
                 continue;
@@ -12133,13 +12183,25 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 continue;
             }
             active_mask |= 1u64 << i;
-            report.joint_status[i] = JointHoldStatus::Queued;
+            if !fresh_ok {
+                stale_mask |= 1u64 << i;
+                report.joint_status[i] = JointHoldStatus::HeldStaleTarget;
+            } else {
+                report.joint_status[i] = JointHoldStatus::Queued;
+            }
         }
 
+        // Only apply the MIT fence when at least one MIT-mode joint is in `active_mask`; when
+        // MIT ownership is Lost and MIT joints are masked out, non-MIT position joints must still
+        // receive their stationary holds through the unfenced hold path.
+        let active_has_mit = (0..n).any(|i| {
+            (active_mask & (1u64 << i)) != 0
+                && self.verified_hold_mode(i) == Some(DamiaoControlMode::Mit)
+        });
         let arm_res: Result<(), ArmDriverError> = if active_mask == 0 {
             let _ = self.pending_hold_tx.drop_outside_mask(0);
             Ok(())
-        } else if fenced {
+        } else if fenced && active_has_mit {
             (|| -> Result<(), ArmDriverError> {
                 self.discard_pending_hold_tx();
                 self.fence_check()?;
@@ -12199,10 +12261,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     if started[i].is_none() {
                         started[i] = Some(self.now());
                     }
-                    match self.send(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
-                        if d.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none()
-                            || !captured_pos.is_finite()
-                        {
+                    match self.send(TxKind::MeasuredHold(i), Some(start_stamp), None, true, |d| {
+                        if !captured_pos.is_finite() {
                             return None;
                         }
                         let hold_target = JointTarget {
@@ -12320,7 +12380,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         self.mit_fence_last_cmd[i] = t;
                     }
                     if (sent_mask & (1u64 << i)) != 0 {
-                        report.joint_status[i] = JointHoldStatus::Held;
+                        report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
+                            JointHoldStatus::HeldStaleTarget
+                        } else {
+                            JointHoldStatus::Held
+                        };
                         self.record_flushed_joint_tx(i, 0, false);
                     }
                 }
@@ -12435,14 +12499,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         continue;
                     };
                     match self.send(
-                        TxKind::RollbackHold(i),
+                        TxKind::MeasuredHold(i),
                         Some(entry.stop_stamp),
                         Some(entry_deadline),
                         false,
                         |d| {
-                            if d.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none()
-                                || !position.is_finite()
-                            {
+                            if !position.is_finite() {
                                 return None;
                             }
                             let hold_target = JointTarget {
@@ -12523,15 +12585,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 self.discard_pending_hold_tx();
                                 return Err(ArmDriverError::EstopInhibited);
                             }
-                            if self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
-                                let flat_bit = i.saturating_mul(2);
-                                if flat_bit < 64 {
-                                    due_mask &= !(1u64 << flat_bit);
-                                }
-                                let _ = self.pending_hold_tx.drop_joint(i);
-                                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
-                                continue;
-                            }
                             break;
                         }
                         Err(TxRefusal::Transport(e)) => {
@@ -12606,23 +12659,32 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     crate::diagnostics::tick::record_tx_dropped_stale(late_stale as u32);
                 }
                 // Per-joint post-pass status reconciliation:
-                // - Drop any queued joint whose feedback went stale.
-                // - Mark `Held` ONLY for joints that actually transmitted & flushed in this pass with no
-                //   remaining queued frame; joints still in `pending_hold_tx` stay `Queued`; joints whose
-                //   frame expired without transmitting become `UnheldTxFailed`.
+                // - Keep holding joints whose feedback went stale at their last captured hold
+                //   target, reporting `HeldStaleTarget` ("hold target stale").
+                // - Mark `Held` ONLY for fresh joints that actually transmitted & flushed in this
+                //   pass with no remaining queued frame; fresh joints still in `pending_hold_tx`
+                //   stay `Queued`; joints whose frame expired without transmitting become
+                //   `UnheldTxFailed`.
                 for i in 0..n {
+                    let is_stale = (stale_mask & (1u64 << i)) != 0;
                     if self.pending_hold_tx.has_joint(i) {
-                        if self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
-                            let _ = self.pending_hold_tx.drop_joint(i);
-                            report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                        report.joint_status[i] = if is_stale {
+                            JointHoldStatus::HeldStaleTarget
                         } else {
-                            report.joint_status[i] = JointHoldStatus::Queued;
-                        }
+                            JointHoldStatus::Queued
+                        };
                     } else if (active_mask & (1u64 << i)) != 0 {
                         if (sent_mask & (1u64 << i)) != 0 {
-                            report.joint_status[i] = JointHoldStatus::Held;
+                            report.joint_status[i] = if is_stale {
+                                JointHoldStatus::HeldStaleTarget
+                            } else {
+                                JointHoldStatus::Held
+                            };
                         } else if (expired_mask & (1u64 << i)) != 0
-                            || report.joint_status[i] == JointHoldStatus::Queued
+                            || matches!(
+                                report.joint_status[i],
+                                JointHoldStatus::Queued | JointHoldStatus::HeldStaleTarget
+                            )
                         {
                             report.joint_status[i] = JointHoldStatus::UnheldTxFailed;
                         }
@@ -12679,7 +12741,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.last_tx_pf_status = pf_status;
                 report.sent_any = true;
                 if joint < report.joint_status.len() {
-                    report.joint_status[joint] = JointHoldStatus::Held;
+                    report.joint_status[joint] = if matches!(pf_status, PosForceTxStatus::Stale { .. }) {
+                        JointHoldStatus::HeldStaleTarget
+                    } else {
+                        JointHoldStatus::Held
+                    };
                 }
                 arm_res.map(|()| report)
             }
@@ -15178,6 +15244,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         let dof = self.motor_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
         let mut report = HoldPassReport::empty(dof);
         let mut sent_mask = 0u64;
+        let mut stale_mask = 0u64;
         for (i, target) in targets.iter().enumerate().take(dof) {
             let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
             if (hold_mask & (1u64 << i)) == 0 {
@@ -15188,11 +15255,15 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 };
                 continue;
             }
-            let Some(fresh_pos) = fresh else {
+            let pos = if target.position.is_finite() {
+                target.position
+            } else if let Some(fresh_pos) = fresh {
+                fresh_pos
+            } else {
                 report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
                 continue;
             };
-            let pos = if target.position.is_finite() { target.position } else { fresh_pos };
+            let is_stale = fresh.is_none();
             let kp = target.kp.unwrap_or(self.default_kp);
             let kd = target.kd.unwrap_or(self.default_kd);
             let torque = target.torque.unwrap_or(0.0);
@@ -15206,10 +15277,6 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 &self.limits,
             );
             self.pending_stop_check(Some(start_stamp))?;
-            if self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
-                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
-                continue;
-            }
             let t0 = Instant::now();
             let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
             let res = self.can.transmit(&frame);
@@ -15223,7 +15290,12 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             };
             crate::diagnostics::tick::record_tx_attempt(kind, wall_ns, cpu_ns);
             res?;
-            report.joint_status[i] = JointHoldStatus::Queued;
+            if is_stale {
+                stale_mask |= 1u64 << i;
+                report.joint_status[i] = JointHoldStatus::HeldStaleTarget;
+            } else {
+                report.joint_status[i] = JointHoldStatus::Queued;
+            }
             sent_mask |= 1u64 << i;
             report.sent_any = true;
         }
@@ -15232,7 +15304,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             self.can.flush()?;
             for i in 0..dof {
                 if (sent_mask & (1u64 << i)) != 0 {
-                    report.joint_status[i] = JointHoldStatus::Held;
+                    report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
+                        JointHoldStatus::HeldStaleTarget
+                    } else {
+                        JointHoldStatus::Held
+                    };
                 }
             }
         }

@@ -2050,7 +2050,7 @@ fn rt_round5_b1_m1_m2_m3_paths_zero_alloc_and_zero_free() {
         }
     }
     assert!(stalled, "M2 stale J1 + WouldBlock must latch CAN_TX_STALLED");
-    assert_eq!(inner.hold_tx_no_progress_ticks()[0], 0);
+    assert!(inner.hold_tx_no_progress_ticks()[2] >= 3, "J2 must accumulate stall ticks");
 }
 
 /// R2 + R1 zero-allocation proof on `armd-control`:

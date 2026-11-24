@@ -3889,7 +3889,9 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
     assert!(pending_before_stale > 0);
 
     // Cross the 100 ms freshness boundary by advancing 20 ms (J3 age = 105..110 ms > 100 ms, while
-    // J3's queued hold TX age is only 20 ms < 45 ms). Do NOT discard the trace of this first stale pass!
+    // J3's queued hold TX age is only 20 ms < 45 ms). Under R11 B2, J3 MUST NOT drop its already-
+    // captured hold while torque_intent == On: it keeps holding at `initial_pose[2]` and is
+    // reported `JointHoldStatus::HeldStaleTarget` ("hold target stale") while peers keep holding!
     clock.advance(Duration::from_millis(20));
     bus.with(|s| {
         for j in [0, 1, 3, 4, 5, 6] {
@@ -3901,22 +3903,20 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
 
     assert_eq!(
         inner.joint_hold_status()[2],
-        JointHoldStatus::UnheldNoFreshFeedback,
-        "stale J3 must be reported UnheldNoFreshFeedback on the very first stale pass"
+        JointHoldStatus::HeldStaleTarget,
+        "B2: stale J3 with captured hold must be reported HeldStaleTarget on the first stale pass"
     );
+    assert_eq!(inner.joint_hold_status()[2].short_tag(), "hold target stale");
     let first_stale_tx = bus.tx_log();
     assert!(
-        first_stale_tx.iter().all(|f| f.id != 0x103),
-        "queued J3 hold must be dropped with ZERO 0x103 TX on the very first stale pass: {first_stale_tx:?}"
-    );
-    assert!(
-        first_stale_tx.iter().any(|f| f.id >= 0x101 && f.id <= 0x107 && f.id != 0x103),
-        "eligible peers must still transmit on the first stale pass: {first_stale_tx:?}"
+        first_stale_tx.iter().any(|f| f.id >= 0x101 && f.id <= 0x107),
+        "eligible joints must still transmit on the first stale pass: {first_stale_tx:?}"
     );
 
-    // Run 3 more 10 ms ticks so every eligible peer (including J1) rotates through the 2-frame/tick
-    // budget while J3 stays silent, proving J1's captured hold stayed fixed at `initial_pose[0]`.
-    for _ in 0..3 {
+    // Run 4 more 10 ms ticks so every joint (including J1 and stale J3) rotates through the
+    // 2-frame/tick budget while J3 stays silent, proving J1 keeps `initial_pose[0]` AND stale J3
+    // keeps holding its LAST captured target `initial_pose[2]`!
+    for _ in 0..4 {
         clock.advance(Duration::from_millis(10));
         bus.with(|s| {
             for j in [0, 1, 3, 4, 5, 6] {
@@ -3926,14 +3926,20 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         inner.tick(0.02);
     }
 
-    assert_eq!(inner.joint_hold_status()[2], JointHoldStatus::UnheldNoFreshFeedback);
+    assert_eq!(inner.joint_hold_status()[2], JointHoldStatus::HeldStaleTarget);
     for j in [0, 1, 3, 4, 5, 6] {
         assert!(matches!(inner.joint_hold_status()[j], JointHoldStatus::Held | JointHoldStatus::Queued));
     }
     let tx_stale = bus.tx_log();
+    let j3_stale_frame = tx_stale
+        .iter()
+        .find(|f| f.id == 0x103)
+        .expect("B2: stale J3 must keep transmitting its last captured hold target");
     assert!(
-        tx_stale.iter().all(|f| f.id != 0x103),
-        "stale J3 must send ZERO 0x103 frames across all stale passes: {tx_stale:?}"
+        (decode_damiao_pos_vel_pos(j3_stale_frame) - initial_pose[2]).abs() < 2e-3,
+        "B2: stale J3 must keep holding its last captured target {}, got {}",
+        initial_pose[2],
+        decode_damiao_pos_vel_pos(j3_stale_frame)
     );
     let j1_frame = tx_stale.iter().find(|f| f.id == 0x101).expect("J1 hold frame expected");
     assert!(
@@ -4418,8 +4424,9 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
         assert!((j2_before_gap[0] - 0.30).abs() < 2e-3, "initial hold must be 0.30: {j2_before_gap:?}");
 
         // M-09: Unobserved > 100 ms gap (120 ms) with NO intermediate tick, J2 moves to 0.55 and
-        // feedback resumes: first tick drains RX and establishes a fresh empty-queue bound (sending
-        // 0 stale 0.30 frames!), then fresh post-empty feedback at 0.55 recaptures 0.55 (NOT 0.30)!
+        // feedback resumes: under R11 B2, the first tick (whose empty-queue bound is still stale)
+        // keeps holding J2's last captured target 0.30 (`HeldStaleTarget`, never dropping holds
+        // while torque_intent == On), then fresh post-empty feedback at 0.55 recaptures 0.55!
         clock.advance(Duration::from_millis(120));
         bus.with(|s| {
             s.motors[1].q = 0.55;
@@ -4427,6 +4434,7 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
         });
         bus.clear_log();
         inner.tick(0.02);
+        assert_eq!(inner.joint_hold_status()[1], JointHoldStatus::HeldStaleTarget);
         let j2_stale_bound: Vec<f32> = bus
             .tx_log()
             .into_iter()
@@ -4434,8 +4442,8 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
             .map(|f| decode_damiao_pos_vel_pos(&f))
             .collect();
         assert!(
-            j2_stale_bound.is_empty(),
-            "M-09: stale empty-queue bound after 120 ms gap must not emit stale 0.30 hold: {j2_stale_bound:?}"
+            !j2_stale_bound.is_empty() && (j2_stale_bound[0] - 0.30).abs() < 2e-3,
+            "B2: stale empty-queue bound after 120 ms gap must keep last captured 0.30 hold: {j2_stale_bound:?}"
         );
         clock.advance(Duration::from_millis(5));
         bus.with(|s| s.push_all_feedback());
@@ -7963,4 +7971,160 @@ fn r11_b1_pending_disable_continues_holds_until_first_disable_frame_accepted() {
     assert!(completed, "B1: disable transition must complete cleanly after repeats");
     assert!(!r.fx.core.disable_pending);
     assert_eq!(r.fx.core.torque_intent, TorqueIntent::Off);
+}
+
+/// R11 B2: Holds must NEVER be dropped while `torque_intent == On`:
+/// 1. J3 loses feedback -> J1, J2, J4–J7 are still held, and J3 keeps holding its LAST captured
+///    hold target and is reported `HeldStaleTarget` ("hold target stale").
+/// 2. When MIT ownership is `MitOwner::Lost`, `service_stopped_measured_hold` does NOT return
+///    early: MIT joints are excluded while ALL non-MIT position joints (J1–J3, J5–J7) stay held!
+#[test]
+fn r11_b2_holds_never_dropped_on_stale_feedback_or_mit_owner_lost() {
+    use armd::driver::JointHoldStatus;
+    use armd::mit::MitOwner;
+    use armd::TorqueIntent;
+
+    // Part 1: J3 loses feedback -> J1, J2, J4–J7 remain held; J3 keeps its last captured target
+    // and reports `HeldStaleTarget` ("hold target stale").
+    {
+        let (mut inner, bus, clock) = make_driver_rig();
+        let captured_pose = [0.12_f32, -0.25, 0.42, -0.18, 0.20, -0.10, 0.05];
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = captured_pose[i];
+            }
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        enable_torque_admitted(&mut inner).unwrap();
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+        // Capture holds on all 7 joints while fresh.
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        assert_eq!(inner.torque_intent, TorqueIntent::On);
+        assert_eq!(inner.joint_hold_status(), &[JointHoldStatus::Held; 7]);
+
+        // Mute ONLY J3 and advance past 100 ms (140 ms, below 500 ms BUS_LOSS) while feeding J1, J2, J4–J7.
+        bus.with(|s| {
+            s.motors[2].silent = true;
+        });
+        for _ in 0..7 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| {
+                for j in [0, 1, 3, 4, 5, 6] {
+                    s.push_feedback(j);
+                }
+            });
+            bus.clear_log();
+            inner.tick(0.02);
+        }
+
+        // J3 must report `HeldStaleTarget` ("hold target stale") AND keep sending its last target 0.42!
+        assert_eq!(inner.joint_hold_status()[2], JointHoldStatus::HeldStaleTarget);
+        assert_eq!(inner.joint_hold_status()[2].short_tag(), "hold target stale");
+        for j in [0, 1, 3, 4, 5, 6] {
+            assert_eq!(
+                inner.joint_hold_status()[j],
+                JointHoldStatus::Held,
+                "B2: joint J{} must remain Held when J3 goes stale",
+                j + 1
+            );
+        }
+        let tx = bus.tx_log();
+        for (j, &expected_q) in captured_pose.iter().enumerate() {
+            let can_id = 0x101u32 + j as u32;
+            let f = tx
+                .iter()
+                .find(|f| f.id == can_id)
+                .unwrap_or_else(|| panic!("B2: expected hold frame 0x{can_id:03X}, log={tx:?}"));
+            let sent_q = decode_damiao_pos_vel_pos(f);
+            assert!(
+                (sent_q - expected_q).abs() < 2e-3,
+                "B2: J{} must hold captured target {expected_q}, got {sent_q}",
+                j + 1
+            );
+        }
+    }
+
+    // Part 2: MIT ownership Lost (with J4 configured as MIT and driver MIT fence tripped) ->
+    // MIT joint J4 receives 0 frames while ALL non-MIT position joints (J1–J3, J5–J7) stay held!
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mut jt = armd::tracking::JointTrackingConfig::rebot_dm();
+        jt.enabled = false;
+        jt.joints[3].strategy = armd::tracking::TrackingStrategy::Mit; // J4 is MIT
+        jt.joints[3].kp = 10.0;
+        jt.joints[3].kd = 0.5;
+        jt.joints[3].effort_limit_nm = 3.0;
+        jt.joints[3].gravity_scale = 0.0;
+        jt.joints[3].hold_kp = Some(10.0);
+        jt.joints[3].hold_kd = Some(0.5);
+        cfg.joint_tracking = Some(jt);
+
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        let hold_pose = [0.10_f32, 0.20, -0.15, 0.30, -0.20, 0.05, 0.0];
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = hold_pose[i];
+            }
+            s.push_all_feedback();
+        });
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(dm));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        enable_torque_admitted(&mut inner).unwrap();
+        inner.config.joint_tracking.as_mut().unwrap().enabled = true;
+
+        // Simulate MIT ownership loss + tripped driver MIT fence while stopped.
+        inner.mit.owner = MitOwner::Lost;
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            drv.set_mit_deadline_fence(Some(Duration::from_millis(50)), Duration::ZERO);
+        }
+
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+
+        let tx = bus.tx_log();
+        // J4 (MIT joint, index 3 -> 0x004 / 0x104) MUST NOT be commanded.
+        assert!(
+            tx.iter().all(|f| f.id != 0x004 && f.id != 0x104),
+            "B2: MIT-lost joint J4 must not be commanded: {tx:?}"
+        );
+        // Every non-MIT position joint (J1, J2, J3, J5, J6, J7 -> 0x101..0x103, 0x105..0x107) MUST be held!
+        for j in [0usize, 1, 2, 4, 5, 6] {
+            let can_id = 0x101u32 + j as u32;
+            let f = tx
+                .iter()
+                .find(|f| f.id == can_id)
+                .unwrap_or_else(|| panic!("B2: non-MIT joint J{} (0x{can_id:03X}) must still be held under MitOwner::Lost: {tx:?}", j + 1));
+            let sent_q = decode_damiao_pos_vel_pos(f);
+            assert!(
+                (sent_q - hold_pose[j]).abs() < 2e-3,
+                "B2: non-MIT J{} must hold {}, got {sent_q}",
+                j + 1,
+                hold_pose[j]
+            );
+            assert_eq!(inner.joint_hold_status()[j], JointHoldStatus::Held);
+        }
+    }
 }

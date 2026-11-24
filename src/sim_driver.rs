@@ -929,6 +929,7 @@ impl ArmDriver for SimArmDriver {
         let dof = self.dof.min(crate::rt_core::mailbox::MAX_DOF);
         let mut report = HoldPassReport::empty(dof);
         let mut held_mask = 0u64;
+        let mut stale_mask = 0u64;
         let mut hold_pos = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         for (i, target) in targets.iter().enumerate().take(dof) {
             let fresh = self.fresh_measured_position_for(i, crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE);
@@ -940,12 +941,20 @@ impl ArmDriver for SimArmDriver {
                 };
                 continue;
             }
-            let Some(fresh_p) = fresh else {
+            if target.position.is_finite() {
+                hold_pos[i] = target.position;
+            } else if let Some(fresh_p) = fresh {
+                hold_pos[i] = fresh_p;
+            } else {
                 report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
                 continue;
-            };
-            hold_pos[i] = if target.position.is_finite() { target.position } else { fresh_p };
-            report.joint_status[i] = JointHoldStatus::Queued;
+            }
+            if fresh.is_none() {
+                stale_mask |= 1u64 << i;
+                report.joint_status[i] = JointHoldStatus::HeldStaleTarget;
+            } else {
+                report.joint_status[i] = JointHoldStatus::Queued;
+            }
             held_mask |= 1u64 << i;
         }
         if held_mask == 0 {
@@ -977,7 +986,11 @@ impl ArmDriver for SimArmDriver {
         self.send_ref(false, true, None, SendGate::Target, Some(start_stamp))?;
         for i in 0..dof {
             if (held_mask & (1u64 << i)) != 0 {
-                report.joint_status[i] = JointHoldStatus::Held;
+                report.joint_status[i] = if (stale_mask & (1u64 << i)) != 0 {
+                    JointHoldStatus::HeldStaleTarget
+                } else {
+                    JointHoldStatus::Held
+                };
             }
         }
         report.sent_any = true;

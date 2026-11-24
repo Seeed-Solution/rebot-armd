@@ -598,8 +598,18 @@ fn mit_bus_loss_cancels_the_group() {
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     bus.clear_log();
     for _ in 0..10 { clock.advance(std::time::Duration::from_millis(5)); inner.tick(DT); }
-    assert!(bus.tx_log().iter().all(|f| f.id == 0x7FF), "output after the loss: {:?}", bus.tx_log());
-    assert!(command_frames(&bus.tx_log()).is_empty());
+    assert!(
+        bus.tx_log().iter().all(|f| f.id != 4 && f.id != 0x104),
+        "MIT joint J4 must receive zero output after loss: {:?}",
+        bus.tx_log()
+    );
+    assert!(
+        [0x101u32, 0x102, 0x103, 0x105, 0x106, 0x107]
+            .iter()
+            .all(|&id| bus.tx_log().iter().any(|f| f.id == id)),
+        "B2: non-MIT position joints must keep receiving stationary holds under MitOwner::Lost: {:?}",
+        bus.tx_log()
+    );
 }
 
 fn command_frames(log: &[armd::transport::CanFrame]) -> Vec<armd::transport::CanFrame> {
@@ -620,12 +630,20 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     bus.with(|s| s.fail_tx_after = None);
     bus.clear_log();
     for _ in 0..5 { inner.tick(DT); }
-    assert!(command_frames(&bus.tx_log()).is_empty(), "{:?}", bus.tx_log());
-    // time alone resumes nothing
+    assert!(
+        bus.tx_log().iter().all(|f| f.id != 4 && f.id != 0x104),
+        "MIT joint J4 must receive zero commands after partial-send loss: {:?}",
+        bus.tx_log()
+    );
+    // time alone resumes nothing for the lost MIT group; non-MIT position joints stay held (B2)
     clock.advance(std::time::Duration::from_millis(400));
     bus.clear_log();
     for _ in 0..5 { inner.tick(DT); }
-    assert!(bus.tx_log().is_empty(), "polls resumed without clearance: {:?}", bus.tx_log());
+    assert!(
+        bus.tx_log().iter().all(|f| f.id != 4 && f.id != 0x104),
+        "MIT joint J4 must not resume without clearance: {:?}",
+        bus.tx_log()
+    );
     // reconnect: away from rest while other arm motors still hold torque, recovery is refused with
     // TORQUE_OFF_WOULD_DROP; once at the resting pose, explicit clearance recovers with torque off,
     // rearm restores base modes, and a fresh handover follows.
@@ -1226,6 +1244,8 @@ fn expired_after_loss_at_rest() -> (SupervisorInner, FakeBus, armd::transport::M
     let (mut inner, bus, clock) = expired_after_loss();
     bus.with(|s| {
         s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
         for m in s.motors.iter_mut() {
             m.q = 0.0;
         }
@@ -1234,7 +1254,11 @@ fn expired_after_loss_at_rest() -> (SupervisorInner, FakeBus, armd::transport::M
         if i > 0 {
             clock.advance(std::time::Duration::from_millis(12));
         }
-        bus.with(|s| s.push_all_feedback());
+        bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
         inner.tick(DT);
     }
     (inner, bus, clock)
@@ -1303,7 +1327,11 @@ fn mit_expiry_recovery_needs_the_operator_confirmation() {
     assert!(msg.contains("torque off on every joint") && msg.to_lowercase().contains("support"), "{msg}");
     let log = bus.tx_log();
     assert_eq!(recovery_commands(&log), 0, "recovery commands without confirmation");
-    assert!(motion_frames(&log).is_empty(), "{:?}", motion_frames(&log));
+    assert!(
+        log.iter().all(|f| f.id != 4 && f.id != 0x104),
+        "MIT joint J4 must receive zero frames: {:?}",
+        log
+    );
     assert!(log[start..].iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC), "{:?}", &log[start..]);
     assert!(inner.safety.state().is_stopped());
 }

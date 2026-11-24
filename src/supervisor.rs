@@ -5652,7 +5652,12 @@ impl SupervisorInner {
                 }
             }
             Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
-                hold_status_update = Some((joint, JointHoldStatus::Held));
+                let status = if matches!(pf_status, crate::driver::PosForceTxStatus::Stale { .. }) {
+                    JointHoldStatus::HeldStaleTarget
+                } else {
+                    JointHoldStatus::Held
+                };
+                hold_status_update = Some((joint, status));
                 let pf_bit_hold = if joint.saturating_mul(2) < 64 {
                     1u64 << (joint * 2)
                 } else {

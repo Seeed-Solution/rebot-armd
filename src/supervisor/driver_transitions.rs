@@ -1459,6 +1459,9 @@ impl SupervisorInner {
                 refused_by_chokepoint: false,
             });
         }
+        if is_protective {
+            self.mit_torque_off();
+        }
         self.active_disable_kind = Some(kind);
         self.disable_requested();
         if let Some(ref d) = self.driver {
@@ -1706,6 +1709,10 @@ impl SupervisorInner {
     #[inline]
     pub(crate) fn stopped_hold_eligible(&self) -> bool {
         self.torque_intent == TorqueIntent::On
+            && !matches!(
+                self.active_disable_kind,
+                Some(crate::driver::DisableKind::DisableProtective { .. })
+            )
     }
 
     /// Refreshes [`Self::owner_driver_snapshot`] from an already-locked driver reference without
@@ -1795,13 +1802,24 @@ impl SupervisorInner {
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         self.measured_hold.dof = dof;
         if !self.owner_driver_snapshot.valid {
+            let mut hold_mask = 0u64;
+            let mut invalidated_mask = 0u64;
             for j in 0..dof {
-                self.measured_hold.captured_positions[j] = None;
-                self.measured_hold.captured_continuity_epoch[j] = None;
-                self.measured_hold.last_seen_fresh_at[j] = None;
-                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                if self.measured_hold.captured_positions[j].is_some() {
+                    if self.owner_driver_snapshot.hold_mode_verified[j] {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::HeldStaleTarget;
+                        hold_mask |= 1u64 << j;
+                    } else {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+                    }
+                } else {
+                    self.measured_hold.captured_continuity_epoch[j] = None;
+                    self.measured_hold.last_seen_fresh_at[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    invalidated_mask |= 1u64 << j;
+                }
             }
-            return (0, u64::MAX);
+            return (hold_mask, invalidated_mask);
         }
         let snap = self.owner_driver_snapshot;
         let drv_now = snap.captured_at.unwrap_or_else(Instant::now);
@@ -1809,17 +1827,27 @@ impl SupervisorInner {
         let mut invalidated_mask = 0u64;
         for j in 0..dof {
             let Some((pos, epoch)) = snap.fresh_samples[j] else {
-                self.measured_hold.captured_positions[j] = None;
-                self.measured_hold.captured_continuity_epoch[j] = None;
-                self.measured_hold.last_seen_fresh_at[j] = None;
-                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
-                invalidated_mask |= 1u64 << j;
+                // B2: Never drop an already-captured hold while torque_intent == On.
+                // Keep the last captured target and report `HeldStaleTarget` ("hold target stale")
+                // once mode is verified; if mode is unverified, follow L2 (200 ms readback -> fault)
+                // while preserving the captured hold target.
+                if self.measured_hold.captured_positions[j].is_some() {
+                    if snap.hold_mode_verified[j] {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::HeldStaleTarget;
+                        hold_mask |= 1u64 << j;
+                    } else {
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+                    }
+                } else {
+                    self.measured_hold.captured_continuity_epoch[j] = None;
+                    self.measured_hold.last_seen_fresh_at[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    invalidated_mask |= 1u64 << j;
+                }
                 continue;
             };
             if !snap.hold_mode_verified[j] {
-                self.measured_hold.captured_positions[j] = None;
-                self.measured_hold.captured_continuity_epoch[j] = None;
-                self.measured_hold.last_seen_fresh_at[j] = None;
+                // L2: 200 ms readback -> else fault; preserve any already-captured hold target.
                 self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
                 invalidated_mask |= 1u64 << j;
                 continue;
@@ -1950,14 +1978,20 @@ impl SupervisorInner {
         if self.urgent_stop_unapplied() {
             return TickOutput::None;
         }
-        if self.mit.owner == crate::mit::MitOwner::Lost {
-            return TickOutput::None;
-        }
         if self.driver.is_none() {
             return TickOutput::None;
         }
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         let (mut hold_mask, invalidated_mask) = self.snapshot_measured_hold_with_invalidated();
+        // B2: When MIT ownership is Lost, do NOT return early — exclude ONLY MIT-owned joints so
+        // every other position joint continues receiving its stationary hold.
+        let mit_lost_mask = if self.mit.owner == crate::mit::MitOwner::Lost {
+            let mask = crate::mit::mit_joint_mask(&self.config);
+            hold_mask &= !mask;
+            mask
+        } else {
+            0
+        };
 
         let mut targets = std::mem::take(&mut self.scratch.targets);
         targets.clear();
@@ -1991,10 +2025,11 @@ impl SupervisorInner {
             if rejected != 0 {
                 for j in 0..dof {
                     if (rejected & (1u64 << j)) != 0 {
-                        self.measured_hold.captured_positions[j] = None;
-                        self.measured_hold.captured_continuity_epoch[j] = None;
-                        self.measured_hold.last_seen_fresh_at[j] = None;
-                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                        self.measured_hold.joint_status[j] = if self.measured_hold.captured_positions[j].is_some() {
+                            JointHoldStatus::HeldStaleTarget
+                        } else {
+                            JointHoldStatus::UnheldNoFreshFeedback
+                        };
                     }
                 }
             }
@@ -2113,10 +2148,20 @@ impl SupervisorInner {
                 let mut next_pending_mask = 0u64;
                 for j in 0..n {
                     self.measured_hold.joint_status[j] = report.joint_status[j];
-                    if report.joint_status[j] == JointHoldStatus::Queued {
+                    if matches!(
+                        report.joint_status[j],
+                        JointHoldStatus::Queued | JointHoldStatus::HeldStaleTarget
+                    ) && has_pending_holds
+                    {
+                        next_pending_mask |= 1u64 << j;
+                    } else if report.joint_status[j] == JointHoldStatus::Queued {
                         next_pending_mask |= 1u64 << j;
                     }
-                    if !matches!(report.joint_status[j], JointHoldStatus::Held | JointHoldStatus::Queued) {
+                    // B2: Preserve captured hold targets while torque_intent == On; only clear
+                    // when explicitly SkippedOff (and not merely masked out for MIT loss).
+                    if report.joint_status[j] == JointHoldStatus::SkippedOff
+                        && (mit_lost_mask & (1u64 << j)) == 0
+                    {
                         self.measured_hold.captured_positions[j] = None;
                         self.measured_hold.captured_continuity_epoch[j] = None;
                         self.measured_hold.last_seen_fresh_at[j] = None;

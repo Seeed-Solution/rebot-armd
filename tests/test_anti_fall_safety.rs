@@ -505,7 +505,9 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
         assert_eq!(guard[0].velocity, Some(0.0));
     }
 
-    // Simulate duration > 3000ms after feedback loss
+    // Simulate duration > 3000ms after feedback loss: under R11 B2, holds are NEVER dropped while
+    // `torque_intent == On` — the joint keeps holding its LAST captured target (0.35 rad, v=0.0)
+    // and is reported `HeldStaleTarget` ("hold target stale").
     feedback_valid.store(false, Ordering::SeqCst);
     {
         let mut inner = supervisor.inner().write().await;
@@ -515,8 +517,17 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
     supervisor.tick(0.02).await;
     let writes_after = write_count.load(Ordering::SeqCst);
     assert!(
-        writes_after == writes_before,
-        "Stale feedback must suppress old control targets until feedback recovers"
+        writes_after > writes_before,
+        "B2: stale feedback must keep holding the last captured target while torque_intent == On"
+    );
+    {
+        let guard = written.lock().unwrap();
+        assert_eq!(guard[0].position, 0.35);
+        assert_eq!(guard[0].velocity, Some(0.0));
+    }
+    assert_eq!(
+        supervisor.inner().read().await.joint_hold_status()[0],
+        armd::driver::JointHoldStatus::HeldStaleTarget
     );
 }
 

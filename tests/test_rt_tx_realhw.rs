@@ -5047,8 +5047,14 @@ fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
 
             let log = rig.bus.tx_log();
             assert!(
-                !log.iter().any(is_mit_or_arm_cmd),
-                "{owner:?} (estop={is_estop}): tripped MIT fence must suppress all MIT/arm frames: {log:?}"
+                !log.iter().any(|f| f.id == 4 || f.id == 0x104),
+                "{owner:?} (estop={is_estop}): tripped MIT fence must suppress MIT joint J4 frames: {log:?}"
+            );
+            assert!(
+                [0x101u32, 0x102, 0x103, 0x105, 0x106]
+                    .iter()
+                    .all(|&id| log.iter().any(|f| f.id == id)),
+                "{owner:?} (estop={is_estop}): B2 non-MIT position joints must remain held under MitOwner::Lost: {log:?}"
             );
             assert_j7_freeze_frames(
                 &j7_pf_frames(&log),
@@ -5098,17 +5104,13 @@ fn dual_owner_stale_j1_refusal_never_hides_j2_wouldblock_can_tx_stalled() {
                 "{owner:?} (pf={use_pos_force}): stale J1 alone without TX backpressure must not latch CAN_TX_STALLED"
             );
 
-            // Now inject WouldBlock on J2 (0x102) while J1 remains stale (`BuildRefused` every tick).
+            // Now inject WouldBlock on J2 (0x102) while J1 remains stale (B2: holds its last
+            // captured target as HeldStaleTarget; J2's persistent WouldBlock still latches CAN_TX_STALLED).
             rig.bus.with(|s| s.backpressure_tx_ids = vec![0x102]);
             let mut latched = false;
             for _ in 0..6 {
                 rig.bus.with(|s| for i in 1..7 { s.push_feedback(i); });
                 rig.step_dt(DT, false);
-                assert_eq!(
-                    rig.inner().hold_tx_no_progress_ticks()[0],
-                    0,
-                    "{owner:?} (pf={use_pos_force}): refused J1 slot 0 must not accumulate TX stall ticks"
-                );
                 if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
                     latched = true;
                     break;
@@ -5762,21 +5764,23 @@ fn dual_owner_single_j7_emitter_covers_all_fenced_and_invalid_target_paths() {
             });
             rig.clock.advance(ms(50));
             rig.bus.with(|s| for i in [0, 1, 2, 4, 5, 6] { s.push_feedback(i); });
-            // Tick 1 trips fence via J4 outage (J7 still fresh at -2.5) -> 0 MIT + exact 1 Hold frame (vel 0).
+            // Tick 1 trips fence via J4 outage (J7 still fresh at -2.5) -> 0 MIT J4 frames,
+            // non-MIT position joints keep holding (B2), + exact 1 Hold frame (vel 0) for J7.
             rig.bus.clear_log();
             rig.step_dt(DT, false);
             let log1 = rig.bus.tx_log();
-            assert!(!log1.iter().any(is_mit_or_arm_cmd), "{owner:?} B2a sent MIT/arm frame: {log1:?}");
+            assert!(!log1.iter().any(|f| f.id == 4 || f.id == 0x104), "{owner:?} B2a sent MIT J4 frame: {log1:?}");
             assert_exact_one_j7(&log1, -2.5, 0, pf_cur, &format!("{owner:?} B2a fence tripped (fresh J7)"));
 
-            // Tick 2 while MitOwner::Lost and J7 now stale > 100 ms -> 0 MIT + exact 1 FREEZE frame (vel 0).
+            // Tick 2 while MitOwner::Lost and J7 now stale > 100 ms -> 0 MIT J4 frames,
+            // non-MIT position joints keep holding (B2), + exact 1 FREEZE frame (vel 0) for J7.
             rig.bus.with(|s| s.motors[6].mute_feedback = true);
             rig.clock.advance(ms(115));
             rig.bus.with(|s| for i in [0, 1, 2, 4, 5] { s.push_feedback(i); });
             rig.bus.clear_log();
             rig.step_dt(DT, false);
             let log2 = rig.bus.tx_log();
-            assert!(!log2.iter().any(is_mit_or_arm_cmd), "{owner:?} B2b sent MIT/arm frame: {log2:?}");
+            assert!(!log2.iter().any(|f| f.id == 4 || f.id == 0x104), "{owner:?} B2b sent MIT J4 frame: {log2:?}");
             assert_exact_one_j7(&log2, -2.5, 0, pf_cur, &format!("{owner:?} B2b fence already tripped (stale J7)"));
         }
 
