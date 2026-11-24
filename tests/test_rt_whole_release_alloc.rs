@@ -1204,7 +1204,7 @@ async fn b3_blocked_torque_transition_failure_zero_alloc() {
 }
 
 #[test]
-#[ignore = "blocked on A8/C: gripper zero_check(store_offset=true) serializes JSON and allocates PendingZeroCheckPersist/error Strings on RT in src/supervisor/actions.rs:197-246; config commits remain gated until A8/A9"]
+#[ignore = "blocked on A8/C: gripper zero_check(store_offset=true) builds candidate and serializes JSON at src/supervisor/actions.rs:197-216 plus saturation error Strings at :222-223 (and PendingZeroCheckPersist at :233-246 when capacity is available); config commits remain gated until A8/A9"]
 fn a8_blocked_zero_check_store_offset_serialization_zero_alloc() {
     thread::spawn(|| {
         let dir = tempfile::tempdir().unwrap();

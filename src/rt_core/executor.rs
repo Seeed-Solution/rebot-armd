@@ -3794,34 +3794,44 @@ mod tests {
         assert!(weak_a.upgrade().is_some(), "fault_a must stay alive in reclaim_state_tx");
         assert!(weak_b.upgrade().is_some(), "fault_b must stay alive in pending_estop_acks");
 
-        // With `reclaim_state_tx` full and a pool wanting replenishment, a returned `Arc` that
-        // `return_fault_arc` would reject must NOT be popped or dropped on RT.
-        let rejected_ret = Arc::new(SafetyState::Fault(crate::safety::FaultReason::Other("rejected-ret".into())));
-        let weak_ret = Arc::downgrade(&rejected_ret);
+        // With `reclaim_state_tx` full, `fault_arc_pool` below capacity, and `formatted_fault_arc_pool`
+        // full, push a uniquely-owned (`strong_count == 1, weak_count == 0`), empty, pre-sized
+        // `Other` slot so `return_fault_arc` passes the ownership check and rejects strictly on the
+        // full target variant pool — verifying it stays queued while `reclaim_state_tx` is full
+        // and forwards the exact `Arc` pointer to `reclaim_state_rx` once a slot opens.
+        assert_eq!(core.safety.formatted_fault_arc_pool_len(), FORMATTED_FAULT_ARC_POOL_CAPACITY);
+        let rejected_ret = Arc::new(SafetyState::Fault(crate::safety::FaultReason::Other(
+            String::with_capacity(crate::safety::SAFETY_LOG_TEXT_CAPACITY),
+        )));
+        let rejected_ptr = Arc::as_ptr(&rejected_ret);
         reclaim_return_tx.push(rejected_ret).unwrap();
         state.drain_retired_states(&mut core);
         assert_eq!(reclaim_return_tx.slots(), 1, "rejected return must stay queued while reclaim_state_tx is full");
-        assert!(weak_ret.upgrade().is_some(), "rejected return must not drop on RT");
 
         // Free 1 slot in `reclaim_state_rx`: `drain_retired_states` pops the rejected return and
-        // forwards it into `reclaim_state_tx` (still alive until off-thread drain).
+        // forwards the exact same `Arc` into `reclaim_state_tx` (not dropped on RT).
         let _ = reclaim_state_rx.pop().unwrap();
         state.drain_retired_states(&mut core);
         assert_eq!(reclaim_return_tx.slots(), 2, "rejected return popped once reclaim_state_tx had a free slot");
-        assert!(weak_ret.upgrade().is_some(), "rejected return must stay alive in reclaim_state_tx");
 
         // Clean-exit drain while both rings remain full moves fault_b into lock-free `offload_reclaim_tx`.
         state.drain_estop_and_retired_stopped(&mut core);
         assert!(core.pending_estop_acks.is_empty());
         assert!(weak_b.upgrade().is_some(), "fault_b must stay alive until off-thread drain");
 
-        // Off-thread drain drops all three cleanly.
+        // Off-thread drain observes the exact forwarded `rejected_ptr` and drops all arcs cleanly.
+        let mut saw_rejected_ptr = false;
         while let Ok(a) = estop_ack_rx.pop() { drop(a); }
-        while let Ok(a) = reclaim_state_rx.pop() { drop(a); }
+        while let Ok(a) = reclaim_state_rx.pop() {
+            if Arc::as_ptr(&a) == rejected_ptr {
+                saw_rejected_ptr = true;
+            }
+            drop(a);
+        }
         while let Ok(item) = offload_reclaim_rx.pop() { drop(item); }
+        assert!(saw_rejected_ptr, "variant-rejected return Arc must reach outbound reclaim_state_rx");
         assert!(weak_a.upgrade().is_none(), "fault_a dropped off-thread");
         assert!(weak_b.upgrade().is_none(), "fault_b dropped off-thread");
-        assert!(weak_ret.upgrade().is_none(), "rejected return dropped off-thread");
     }
 
     #[test]
