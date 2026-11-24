@@ -57,17 +57,22 @@ fn sample_terminal(
     safety_state: Value,
     epoch_id: u64,
 ) -> RecordedEvent {
+    let mut act = json!({
+        "id": action_id,
+        "kind": "joint_move",
+        "state": state,
+        "code": code,
+        "message": message,
+        "progress": if state == "done" { 1.0 } else { 0.42 },
+        "started_at": 1700000000.0,
+        "finished_at": 1700000001.0
+    });
+    if state == "done" {
+        act["gripper_gap_rad"] = json!(0.15);
+    }
     RecordedEvent::ActionTerminal {
         client: "c0".into(),
-        action_id,
-        kind: "joint_move".into(),
-        state: state.into(),
-        code: code.map(str::to_string),
-        message: message.map(str::to_string),
-        tag: None,
-        settled: None,
-        holding: None,
-        progress: (state == "done").then_some(1.0),
+        action: act,
         safety_state,
         epoch_id,
         is_torqued: true,
@@ -154,10 +159,39 @@ fn comparator_accepts_bijective_nondeterministic_renumbering_and_rejects_every_s
 
     // Broken action_id bijection -> diff.
     let mut bad_action = shifted.clone();
-    if let RecordedEvent::ActionTerminal { action_id, .. } = &mut bad_action.events[2] {
-        *action_id = 1000;
+    if let RecordedEvent::ActionTerminal { action, .. } = &mut bad_action.events[2] {
+        action["id"] = json!(1000);
     }
     assert!(!compare_transcripts(&base, &bad_action).is_empty());
+
+    // Reserved zero epoch_id / action_id MUST NOT normalize to positive IDs.
+    let mut zero_action = shifted.clone();
+    if let RecordedEvent::ActionTerminal { action, .. } = &mut zero_action.events[2] {
+        action["id"] = json!(0);
+    }
+    assert!(!compare_transcripts(&base, &zero_action).is_empty());
+
+    let mut zero_epoch = shifted.clone();
+    if let RecordedEvent::ServerFrame { frame, .. } = &mut zero_epoch.events[3] {
+        frame["epoch_id"] = json!(0);
+    }
+    assert!(!compare_transcripts(&base, &zero_epoch).is_empty());
+
+    // Episode frames: 0 or float 4.0 MUST be rejected vs positive integer 4.
+    let ep_ok = sample_transcript(vec![RecordedEvent::ServerFrame {
+        client: "c0".into(),
+        frame: json!({"type": "command_ack", "episode": {"id": "01K1", "frames": 4, "bytes": 120, "duration_s": 0.08}}),
+    }]);
+    let ep_zero = sample_transcript(vec![RecordedEvent::ServerFrame {
+        client: "c0".into(),
+        frame: json!({"type": "command_ack", "episode": {"id": "01K2", "frames": 0, "bytes": 120, "duration_s": 0.08}}),
+    }]);
+    let ep_float = sample_transcript(vec![RecordedEvent::ServerFrame {
+        client: "c0".into(),
+        frame: json!({"type": "command_ack", "episode": {"id": "01K3", "frames": 4.0, "bytes": 120, "duration_s": 0.08}}),
+    }]);
+    assert!(!compare_transcripts(&ep_ok, &ep_zero).is_empty());
+    assert!(!compare_transcripts(&ep_ok, &ep_float).is_empty());
 
     // Broken epoch equality -> diff.
     let mut bad_epoch_eq = shifted.clone();
@@ -250,12 +284,18 @@ fn comparator_accepts_bijective_nondeterministic_renumbering_and_rejects_every_s
     }
     assert!(!compare_transcripts(&base, &bad_dur).is_empty());
 
-    // Terminal message change MUST be caught.
+    // Terminal message and full ActionStatus field changes (e.g. gripper_gap_rad) MUST be caught.
     let mut bad_msg = shifted.clone();
-    if let RecordedEvent::ActionTerminal { message, .. } = &mut bad_msg.events[2] {
-        *message = Some("Different message".into());
+    if let RecordedEvent::ActionTerminal { action, .. } = &mut bad_msg.events[2] {
+        action["message"] = json!("Different message");
     }
     assert!(!compare_transcripts(&base, &bad_msg).is_empty());
+
+    let mut bad_gap = shifted.clone();
+    if let RecordedEvent::ActionTerminal { action, .. } = &mut bad_gap.events[2] {
+        action["gripper_gap_rad"] = json!(0.25);
+    }
+    assert!(!compare_transcripts(&base, &bad_gap).is_empty());
 
     // Frame kind, extra key, ordering swap -> all rejected.
     let mut bad_kind = shifted.clone();
@@ -354,6 +394,7 @@ fn comparator_accepts_bijective_nondeterministic_renumbering_and_rejects_every_s
         in_range: true,
         has_all_timestamps: true,
         monotonic: true,
+        all_samples_consistent: true,
         dof: 7,
         is_torqued: false,
         control_mode: "position".into(),
@@ -366,6 +407,7 @@ fn comparator_accepts_bijective_nondeterministic_renumbering_and_rejects_every_s
         in_range: true,
         has_all_timestamps: true,
         monotonic: true,
+        all_samples_consistent: true,
         dof: 7,
         is_torqued: false,
         control_mode: "position".into(),
@@ -462,33 +504,53 @@ async fn controlled_clock_and_injected_owner_event_replay_parity() {
 
         let mut ts_count = 0usize;
         let mut last_ts: Option<f64> = None;
-        let mut monotonic_ok = true;
+        let mut strictly_increasing = true;
+        let mut first_shape: Option<(usize, bool, String, Vec<i32>, Value, u64)> = None;
+        let mut all_samples_consistent = true;
         for s in &samples {
             if let Some(ts) = s.get("timestamp").and_then(Value::as_f64) {
                 ts_count += 1;
-                if last_ts.is_some_and(|p| ts < p) {
-                    monotonic_ok = false;
+                if last_ts.is_some_and(|p| ts <= p) {
+                    strictly_increasing = false;
                 }
                 last_ts = Some(ts);
             }
+            let qpos = quantize_positions_mrad(s);
+            let shape = (
+                qpos.len(),
+                s["is_torqued"].as_bool().unwrap(),
+                s["control_mode"].as_str().unwrap().to_string(),
+                qpos,
+                s["safety_state"].clone(),
+                s["epoch_id"].as_u64().unwrap(),
+            );
+            match &first_shape {
+                None => first_shape = Some(shape),
+                Some(exp) => {
+                    if *exp != shape {
+                        all_samples_consistent = false;
+                    }
+                }
+            }
         }
-        let last = samples.last().unwrap();
-        let positions_mrad = quantize_positions_mrad(last);
+        let (dof, is_torqued, control_mode, positions_mrad, safety_state, epoch_id) =
+            first_shape.unwrap();
         let has_all_timestamps = samples.len() == 3 && ts_count == samples.len();
-        assert!(has_all_timestamps && monotonic_ok);
-        assert_eq!(positions_mrad.len(), 7);
-        assert_eq!(last["safety_state"], "Idle");
+        assert!(has_all_timestamps && strictly_increasing && all_samples_consistent);
+        assert_eq!(dof, 7);
+        assert_eq!(safety_state, "Idle");
         events.push(RecordedEvent::TelemetrySummary {
             client: "c0".into(),
             in_range: true,
             has_all_timestamps,
-            monotonic: has_all_timestamps && monotonic_ok,
-            dof: positions_mrad.len(),
-            is_torqued: last["is_torqued"].as_bool().unwrap(),
-            control_mode: last["control_mode"].as_str().unwrap().to_string(),
+            monotonic: has_all_timestamps && strictly_increasing,
+            all_samples_consistent,
+            dof,
+            is_torqued,
+            control_mode,
             positions_mrad,
-            safety_state: last["safety_state"].clone(),
-            epoch_id: last["epoch_id"].as_u64().unwrap(),
+            safety_state,
+            epoch_id,
         });
 
         // Inject direct owner E-stop and verify BOTH post-EStop telemetry and heartbeat epoch_sync.
@@ -511,6 +573,7 @@ async fn controlled_clock_and_injected_owner_event_replay_parity() {
             in_range: true,
             has_all_timestamps: estop_obs.get("timestamp").and_then(Value::as_f64).is_some(),
             monotonic: true,
+            all_samples_consistent: true,
             dof: estop_pos.len(),
             is_torqued: estop_obs["is_torqued"].as_bool().unwrap(),
             control_mode: estop_obs["control_mode"].as_str().unwrap().to_string(),
@@ -578,38 +641,41 @@ async fn server_fatal_close_preserves_error_before_close_frame_order() {
         let ws_base = format!("ws://{addr}/api/v1/ws");
         let http = reqwest::Client::new();
 
-        // Snapshot existing connections so we identify the new connection ID deterministically.
-        let before: std::collections::HashSet<String> = {
-            let reg = armd::api::ws::connection_registry();
-            let g = reg.lock().unwrap_or_else(|e| e.into_inner());
-            g.keys().cloned().collect()
-        };
-
-        // Connect and acquire lease, then trigger deterministic WRITE_TIMEOUT fatal close.
+        // Connect and acquire lease on this test's own isolated `ArmSupervisor`, then read its
+        // exact server-side `connection:<id>` directly from `sup` (zero global registry race with
+        // parallel tests).
         let (mut ws, resp) = connect_async(&ws_base).await.unwrap();
         assert_eq!(resp.status().as_u16(), 101);
-        let conn_id = tokio::time::timeout(Duration::from_secs(2), async {
+        let acq = json!({"type": "acquire_lease", "client_id": "stall_client", "seq": 1});
+        ws.send(Message::Text(acq.to_string().into())).await.unwrap();
+        let granted: Value = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let found = {
-                    let reg = armd::api::ws::connection_registry();
-                    let g = reg.lock().unwrap_or_else(|e| e.into_inner());
-                    g.keys().find(|k| !before.contains(*k)).cloned()
-                };
-                if let Some(id) = found {
-                    return id;
+                let Message::Text(t) = ws.next().await.unwrap().unwrap() else { continue };
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v.get("type").is_some() {
+                    return v;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("new WS connection registered");
+        .expect("acquire_lease grant");
+        let gen = granted["generation"].as_u64().unwrap();
+        let conn_id = sup
+            .inner()
+            .read()
+            .await
+            .active_lease
+            .as_ref()
+            .map(|a| a.client_id.clone())
+            .expect("isolated supervisor must hold active_lease with connection:<id>");
+        assert!(conn_id.starts_with("connection:"), "unexpected conn_id {conn_id}");
 
         armd::api::ws::set_test_ws_write_timeout(&conn_id, Some(Duration::from_millis(60)));
         armd::api::ws::set_test_ws_write_stall_once(&conn_id, true);
 
-        // Send acquire_lease: its write stalls past 60 ms -> server triggers fatal WRITE_TIMEOUT.
-        let acq = json!({"type": "acquire_lease", "client_id": "stall_client", "seq": 1});
-        ws.send(Message::Text(acq.to_string().into())).await.unwrap();
+        // Send release_lease: its write stalls past 60 ms -> server triggers fatal WRITE_TIMEOUT.
+        let rel = json!({"type": "release_lease", "generation": gen});
+        ws.send(Message::Text(rel.to_string().into())).await.unwrap();
 
         let mut events = Vec::new();
         let close = tokio::time::timeout(Duration::from_secs(3), async {

@@ -174,24 +174,9 @@ fn record_unseen_terminals(
             if epoch_id > 0 {
                 vars.epoch = epoch_id;
             }
-            // Retain exact `progress` on `done` (deterministic 1.0); omit wall-clock partial
-            // progress on `cancelled`/`failed` where interruption timing varies.
-            let progress = if state == "done" {
-                la.get("progress").and_then(Value::as_f64).map(|p| p as f32)
-            } else {
-                None
-            };
             events.push(RecordedEvent::ActionTerminal {
                 client: client_name.to_string(),
-                action_id: id,
-                kind: la.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
-                state: state.to_string(),
-                code: la.get("code").and_then(Value::as_str).map(str::to_string),
-                message: la.get("message").and_then(Value::as_str).map(str::to_string),
-                tag: la.get("tag").and_then(Value::as_str).map(str::to_string),
-                settled: la.get("settled").and_then(Value::as_bool),
-                holding: la.get("holding").and_then(Value::as_bool),
-                progress,
+                action: la.clone(),
                 safety_state: v.get("safety_state").cloned().unwrap_or(Value::Null),
                 epoch_id,
                 is_torqued: v.get("is_torqued").and_then(Value::as_bool).unwrap_or(false),
@@ -617,10 +602,11 @@ pub async fn run_steps_against(
             }
             ScriptStep::CloseClient { client } => {
                 if let Some(mut cs) = clients.remove(client) {
-                    // Drain any already-buffered unread control frames before closing so
-                    // unexpected trailing server replies are recorded rather than silently dropped.
+                    // Drain any already-buffered unread control frames, unseen terminals, or
+                    // unexpected server Close frames before closing so nothing is silently dropped.
                     let drain_deadline =
                         tokio::time::Instant::now() + Duration::from_millis(25);
+                    let mut unexpected_close: Option<CloseOutcome> = None;
                     loop {
                         let rem = drain_deadline
                             .saturating_duration_since(tokio::time::Instant::now());
@@ -635,12 +621,41 @@ pub async fn run_steps_against(
                                             client: client.clone(),
                                             frame: v,
                                         });
+                                    } else {
+                                        record_unseen_terminals(
+                                            client,
+                                            &v,
+                                            &mut cs.recorded_terminals,
+                                            &mut vars,
+                                            &mut events,
+                                        );
                                     }
                                 }
                             }
+                            Ok(Some(Ok(Message::Close(cf)))) => {
+                                unexpected_close = Some(CloseOutcome::Frame {
+                                    code: cf.as_ref().map(|c| c.code.into()),
+                                    reason: cf.as_ref().map(|c| c.reason.to_string()),
+                                });
+                                break;
+                            }
                             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+                            Ok(None) => {
+                                unexpected_close = Some(CloseOutcome::Eof);
+                                break;
+                            }
+                            Ok(Some(Err(_))) => {
+                                unexpected_close = Some(CloseOutcome::TransportError);
+                                break;
+                            }
                             _ => break,
                         }
+                    }
+                    if let Some(close) = unexpected_close {
+                        events.push(RecordedEvent::ServerClose {
+                            client: client.clone(),
+                            close,
+                        });
                     }
                     let _ = cs.ws.close(None).await;
                     let _ = tokio::time::timeout(Duration::from_millis(200), async {
@@ -716,13 +731,9 @@ pub async fn run_steps_against(
                 let mut count = 0usize;
                 let mut ts_count = 0usize;
                 let mut last_ts: Option<f64> = None;
-                let mut monotonic_ok = true;
-                let mut dof = 0usize;
-                let mut is_torqued = false;
-                let mut control_mode = String::new();
-                let mut positions_mrad = Vec::new();
-                let mut safety_state = Value::Null;
-                let mut epoch_id = 0u64;
+                let mut strictly_increasing = true;
+                let mut first_shape: Option<(usize, bool, String, Vec<i32>, Value, u64)> = None;
+                let mut all_samples_consistent = true;
                 loop {
                     let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if rem.is_zero() {
@@ -740,25 +751,41 @@ pub async fn run_steps_against(
                                 });
                                 continue;
                             }
+                            record_unseen_terminals(
+                                client,
+                                &v,
+                                &mut cs.recorded_terminals,
+                                &mut vars,
+                                &mut events,
+                            );
                             count += 1;
                             if let Some(ts) = v.get("timestamp").and_then(Value::as_f64) {
                                 ts_count += 1;
-                                if last_ts.is_some_and(|prev| ts < prev) {
-                                    monotonic_ok = false;
+                                if last_ts.is_some_and(|prev| ts <= prev) {
+                                    strictly_increasing = false;
                                 }
                                 last_ts = Some(ts);
                             }
                             let qpos = quantize_positions_mrad(&v);
-                            dof = qpos.len();
-                            positions_mrad = qpos;
-                            is_torqued = v.get("is_torqued").and_then(Value::as_bool).unwrap_or(false);
-                            control_mode = v
-                                .get("control_mode")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            safety_state = v.get("safety_state").cloned().unwrap_or(Value::Null);
-                            epoch_id = v.get("epoch_id").and_then(Value::as_u64).unwrap_or(0);
+                            let sample_shape = (
+                                qpos.len(),
+                                v.get("is_torqued").and_then(Value::as_bool).unwrap_or(false),
+                                v.get("control_mode")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                qpos,
+                                v.get("safety_state").cloned().unwrap_or(Value::Null),
+                                v.get("epoch_id").and_then(Value::as_u64).unwrap_or(0),
+                            );
+                            match &first_shape {
+                                None => first_shape = Some(sample_shape),
+                                Some(expected_shape) => {
+                                    if *expected_shape != sample_shape {
+                                        all_samples_consistent = false;
+                                    }
+                                }
+                            }
                         }
                         Ok(Some(Ok(_))) => continue,
                         Ok(_) => break,
@@ -770,12 +797,15 @@ pub async fn run_steps_against(
                     "telemetry count {count} outside [{min_count}, {max_count}] on {client}"
                 );
                 let has_all_timestamps = count >= 2 && ts_count == count;
-                let monotonic = has_all_timestamps && monotonic_ok;
+                let monotonic = has_all_timestamps && strictly_increasing;
+                let (dof, is_torqued, control_mode, positions_mrad, safety_state, epoch_id) =
+                    first_shape.unwrap_or((0, false, String::new(), Vec::new(), Value::Null, 0));
                 events.push(RecordedEvent::TelemetrySummary {
                     client: client.clone(),
                     in_range,
                     has_all_timestamps,
                     monotonic,
+                    all_samples_consistent,
                     dof,
                     is_torqued,
                     control_mode,
@@ -786,6 +816,39 @@ pub async fn run_steps_against(
             }
             ScriptStep::SyncEpoch => {
                 vars.epoch = fetch_epoch(http, base_url).await;
+            }
+            ScriptStep::CheckState => {
+                let obs: Value = http
+                    .get(format!("{base_url}/api/v1/observation"))
+                    .send()
+                    .await
+                    .expect("GET /api/v1/observation")
+                    .json()
+                    .await
+                    .expect("parse observation JSON");
+                let epoch_id = obs["epoch_id"].as_u64().unwrap_or(0);
+                if epoch_id > 0 {
+                    vars.epoch = epoch_id;
+                }
+                let active_action = obs
+                    .get("action")
+                    .and_then(|a| a.get("state"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                events.push(RecordedEvent::StateSnapshot {
+                    safety_state: obs.get("safety_state").cloned().unwrap_or(Value::Null),
+                    is_torqued: obs
+                        .get("is_torqued")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    control_mode: obs
+                        .get("control_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    epoch_id,
+                    active_action,
+                });
             }
         }
     }

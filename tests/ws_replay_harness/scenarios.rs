@@ -548,10 +548,10 @@ pub fn all_scenarios() -> Vec<ScenarioSpec> {
                 cmd("c0", 4, "/api/v1/motion/stop", json!({})), expect("c0", 1),
                 send("c0", json!({"type":"command","request_id":5,"generation":"{{gen:c0}}","epoch_id":999999,"path":"/api/v1/motion/stop","body":{}})), expect("c0", 1),
                 cmd("c0", 6, "/api/v1/motion/stop", json!("not_an_object")), expect("c0", 1),
-                // Follow-up tick + command_ack verifies post-Stop steady-state safety_state == "Armed"
-                // verbatim (ensuring a persistent "Moving" regression cannot hide behind terminal normalization).
+                // Read-only observation probe verifies post-Stop steady-state safety_state == "Armed"
+                // and no lingering active action without sending a second mutating Stop command.
                 sleep(40),
-                cmd("c0", 7, "/api/v1/motion/stop", json!({})), expect("c0", 1),
+                ScriptStep::CheckState,
                 close_client("c0"),
             ],
         ].concat(),
@@ -696,8 +696,8 @@ pub fn all_scenarios() -> Vec<ScenarioSpec> {
             ],
             acquire("c1", "successor", 1),
             vec![
-                // Confirm steady-state Armed after c0 disconnect cancelled motion.
-                cmd("c1", 1, "/api/v1/motion/stop", json!({})), expect("c1", 1),
+                // Read-only probe confirms steady-state Armed and no active action after disconnect.
+                ScriptStep::CheckState,
                 close_client("c1"),
             ],
         ].concat(),

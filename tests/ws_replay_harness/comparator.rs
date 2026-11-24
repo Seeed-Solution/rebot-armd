@@ -135,6 +135,9 @@ pub enum ScriptStep {
     },
     /// Refresh `{{epoch}}` from `GET /api/v1/observation` without recording a REST event.
     SyncEpoch,
+    /// Read-only `GET /api/v1/observation` probe recording steady-state safety/action fields
+    /// without sending any mutating command.
+    CheckState,
 }
 
 fn one() -> usize {
@@ -182,24 +185,18 @@ pub enum RecordedEvent {
     },
     ActionTerminal {
         client: String,
-        action_id: u64,
-        kind: String,
-        state: String,
-        code: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tag: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        settled: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        holding: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        progress: Option<f32>,
+        action: Value,
         safety_state: Value,
         epoch_id: u64,
         is_torqued: bool,
         control_mode: String,
+    },
+    StateSnapshot {
+        safety_state: Value,
+        is_torqued: bool,
+        control_mode: String,
+        epoch_id: u64,
+        active_action: Option<String>,
     },
     NoReply {
         client: String,
@@ -222,6 +219,7 @@ pub enum RecordedEvent {
         in_range: bool,
         has_all_timestamps: bool,
         monotonic: bool,
+        all_samples_consistent: bool,
         dof: usize,
         is_torqued: bool,
         control_mode: String,
@@ -302,7 +300,8 @@ enum NormValue {
     NormTimingUs,
     NormPositiveF64,
     NormPositiveU64,
-    NormNonNegNum,
+    NormNonNegF64,
+    NormPartialProgress,
     NormOperationalState,
 }
 
@@ -330,7 +329,8 @@ impl NormValue {
             Self::NormTimingUs => "<timing:us>".into(),
             Self::NormPositiveF64 => "<pos:f64>".into(),
             Self::NormPositiveU64 => "<pos:u64>".into(),
-            Self::NormNonNegNum => "<nonneg:num>".into(),
+            Self::NormNonNegF64 => "<nonneg:f64>".into(),
+            Self::NormPartialProgress => "<progress:partial>".into(),
             Self::NormOperationalState => "<state:operational>".into(),
             Self::Array(a) => format!(
                 "[{}]",
@@ -419,7 +419,11 @@ impl ObjectContext {
 
 impl Normalizer {
     fn norm_epoch(&mut self, ep: u64) -> NormValue {
-        NormValue::NormEpoch(self.epochs.intern(ep))
+        if ep == 0 {
+            NormValue::U64(0)
+        } else {
+            NormValue::NormEpoch(self.epochs.intern(ep))
+        }
     }
 
     fn norm_gen(&mut self, g: u64) -> NormValue {
@@ -431,7 +435,11 @@ impl Normalizer {
     }
 
     fn norm_action_id(&mut self, id: u64) -> NormValue {
-        NormValue::NormActionId(self.action_ids.intern(id))
+        if id == 0 {
+            NormValue::U64(0)
+        } else {
+            NormValue::NormActionId(self.action_ids.intern(id))
+        }
     }
 
     fn norm_stop_gen(&mut self, sg: u64) -> NormValue {
@@ -514,10 +522,47 @@ impl Normalizer {
                         return self.norm_stop_gen(n);
                     }
                 }
-                "pose_id" | "recording_id" | "job_id" | "token" | "backup" | "content_sha256"
-                | "deleted" => {
+                "pose_id" | "sequence_id" | "recording_id" | "job_id" | "token" | "backup"
+                | "content_sha256" | "deleted" => {
                     if let Some(s) = val.as_str() {
                         return self.norm_opaque(s);
+                    }
+                }
+                "gripper_gap_rad" if parent_key == Some("action") => {
+                    // Mock gripper settling jitters by ~1e-6 rad; quantize to 1 mrad so real gap
+                    // changes (>= 0.001 rad) still fail.
+                    if let Some(n) = val.as_f64() {
+                        if n.is_finite() {
+                            return NormValue::from_f64((n * 1000.0).round() / 1000.0);
+                        }
+                    }
+                }
+                "phase_ms" if parent_key == Some("action") => {
+                    if let Some(obj) = val.as_object() {
+                        let mut out = BTreeMap::new();
+                        for (pk, pv) in obj {
+                            if pv.as_u64().is_some_and(|n| n > 0) {
+                                out.insert(pk.clone(), NormValue::NormPositiveU64);
+                            } else {
+                                out.insert(pk.clone(), self.normalize_plain_value(pv));
+                            }
+                        }
+                        return NormValue::Object(out);
+                    }
+                }
+                "infer_us" if parent_key == Some("policy_stats") => {
+                    if let Some(obj) = val.as_object() {
+                        let mut out = BTreeMap::new();
+                        for (wk, wv) in obj {
+                            if wk == "n" || wk == "samples" || wk == "count" {
+                                out.insert(wk.clone(), self.normalize_plain_value(wv));
+                            } else if wv.is_number() {
+                                out.insert(wk.clone(), NormValue::NormTimingUs);
+                            } else {
+                                out.insert(wk.clone(), self.normalize_plain_value(wv));
+                            }
+                        }
+                        return NormValue::Object(out);
                     }
                 }
                 "expected_duration_s" if parent_ctx.is_command_ack => {
@@ -568,12 +613,18 @@ impl Normalizer {
                         return NormValue::Object(out);
                     }
                 }
-                "duration_s" | "frames" | "bytes" if parent_key == Some("episode") => {
+                "duration_s" if parent_key == Some("episode") => {
                     if let Some(n) = val.as_f64() {
                         if n.is_finite() && n >= 0.0 {
-                            return NormValue::NormNonNegNum;
+                            return NormValue::NormNonNegF64;
                         }
                     }
+                }
+                "frames" | "bytes"
+                    if parent_key == Some("episode") && val.as_u64().is_some_and(|n| n > 0) =>
+                {
+                    // Preserve integer JSON type and reject zero counts on recorded episodes.
+                    return NormValue::NormPositiveU64;
                 }
                 _ => {}
             }
@@ -639,29 +690,23 @@ impl Normalizer {
             }
             RecordedEvent::ActionTerminal {
                 client,
-                action_id,
-                kind,
-                state,
-                code,
-                message,
-                tag,
-                settled,
-                holding,
-                progress,
+                action,
                 safety_state,
                 epoch_id,
                 is_torqued,
                 control_mode,
             } => {
+                let state = action.get("state").and_then(Value::as_str).unwrap_or("");
+                let code = action.get("code").and_then(Value::as_str);
                 // On completion or operational cancellation (`STOPPED`, `SUPERSEDED`, `LEASE_LOST`),
                 // `Moving` -> `Armed` can straddle a single 50 Hz tick boundary; normalize only
                 // those two operational states while keeping Fault/EStop/Idle and fault/ESTOP
                 // cancellations strict. Post-stop steady-state `Armed` is verified verbatim by
-                // follow-up command_ack steps.
+                // read-only `StateSnapshot` probes.
                 let operational_tick_boundary = state == "done"
                     || (state == "cancelled"
                         && matches!(
-                            code.as_deref(),
+                            code,
                             Some("STOPPED" | "SUPERSEDED" | "LEASE_LOST")
                         ));
                 let norm_safety = if operational_tick_boundary
@@ -671,43 +716,67 @@ impl Normalizer {
                 } else {
                     self.normalize_plain_value(safety_state)
                 };
+                let norm_action = match action {
+                    Value::Object(map) => {
+                        let sorted: BTreeMap<&String, &Value> = map.iter().collect();
+                        let mut out = BTreeMap::new();
+                        for (k, v) in sorted {
+                            let nv = match k.as_str() {
+                                "id" => match v.as_u64() {
+                                    Some(id) => self.norm_action_id(id),
+                                    None => self.normalize_plain_value(v),
+                                },
+                                // Partial progress on cancelled/failed actions varies with
+                                // interruption wall time; keep `done` progress exact (1.0).
+                                "progress" if state != "done" => {
+                                    if v.as_f64().is_some_and(|p| p.is_finite() && (0.0..=1.0).contains(&p)) {
+                                        NormValue::NormPartialProgress
+                                    } else {
+                                        self.normalize_plain_value(v)
+                                    }
+                                }
+                                _ => self.normalize_value(
+                                    Some(k.as_str()),
+                                    Some("action"),
+                                    ObjectContext::default(),
+                                    v,
+                                ),
+                            };
+                            out.insert(k.clone(), nv);
+                        }
+                        NormValue::Object(out)
+                    }
+                    other => self.normalize_plain_value(other),
+                };
                 m.insert("ev".into(), NormValue::Str("action_terminal".into()));
                 m.insert("client".into(), NormValue::Str(client.clone()));
-                m.insert("action_id".into(), self.norm_action_id(*action_id));
-                m.insert("kind".into(), NormValue::Str(kind.clone()));
-                m.insert("state".into(), NormValue::Str(state.clone()));
-                m.insert(
-                    "code".into(),
-                    code.as_ref()
-                        .map_or(NormValue::Null, |s| NormValue::Str(s.clone())),
-                );
-                m.insert(
-                    "message".into(),
-                    message
-                        .as_ref()
-                        .map_or(NormValue::Null, |s| NormValue::Str(s.clone())),
-                );
-                m.insert(
-                    "tag".into(),
-                    tag.as_ref()
-                        .map_or(NormValue::Null, |s| NormValue::Str(s.clone())),
-                );
-                m.insert(
-                    "settled".into(),
-                    settled.map_or(NormValue::Null, NormValue::Bool),
-                );
-                m.insert(
-                    "holding".into(),
-                    holding.map_or(NormValue::Null, NormValue::Bool),
-                );
-                m.insert(
-                    "progress".into(),
-                    progress.map_or(NormValue::Null, |p| NormValue::from_f64(f64::from(p))),
-                );
+                m.insert("action".into(), norm_action);
                 m.insert("safety_state".into(), norm_safety);
                 m.insert("epoch_id".into(), self.norm_epoch(*epoch_id));
                 m.insert("is_torqued".into(), NormValue::Bool(*is_torqued));
                 m.insert("control_mode".into(), NormValue::Str(control_mode.clone()));
+            }
+            RecordedEvent::StateSnapshot {
+                safety_state,
+                is_torqued,
+                control_mode,
+                epoch_id,
+                active_action,
+            } => {
+                m.insert("ev".into(), NormValue::Str("state_snapshot".into()));
+                m.insert(
+                    "safety_state".into(),
+                    self.normalize_plain_value(safety_state),
+                );
+                m.insert("is_torqued".into(), NormValue::Bool(*is_torqued));
+                m.insert("control_mode".into(), NormValue::Str(control_mode.clone()));
+                m.insert("epoch_id".into(), self.norm_epoch(*epoch_id));
+                m.insert(
+                    "active_action".into(),
+                    active_action
+                        .as_ref()
+                        .map_or(NormValue::Null, |s| NormValue::Str(s.clone())),
+                );
             }
             RecordedEvent::NoReply { client } => {
                 m.insert("ev".into(), NormValue::Str("no_reply".into()));
@@ -762,6 +831,7 @@ impl Normalizer {
                 in_range,
                 has_all_timestamps,
                 monotonic,
+                all_samples_consistent,
                 dof,
                 is_torqued,
                 control_mode,
@@ -777,6 +847,10 @@ impl Normalizer {
                     NormValue::Bool(*has_all_timestamps),
                 );
                 m.insert("monotonic".into(), NormValue::Bool(*monotonic));
+                m.insert(
+                    "all_samples_consistent".into(),
+                    NormValue::Bool(*all_samples_consistent),
+                );
                 m.insert("dof".into(), NormValue::U64(*dof as u64));
                 m.insert("is_torqued".into(), NormValue::Bool(*is_torqued));
                 m.insert("control_mode".into(), NormValue::Str(control_mode.clone()));
