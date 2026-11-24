@@ -302,28 +302,62 @@ async fn test_set_torque_false_safety_gates() {
         inner.measured_velocities = vec![0.0, 0.0];
     }
 
-    // 2. In E-Stop: set_torque(false) must be rejected with MotionForbiddenInFaultState
+    // 2. In E-Stop away from resting pose: set_torque(false) must be rejected with TorqueOffWouldDrop
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.5, -0.3];
+    }
     supervisor.trigger_e_stop().await;
-    let res_estop = supervisor.set_torque(false).await;
+    let res_estop_raised = supervisor.set_torque(false).await;
     assert!(matches!(
-        res_estop,
-        Err(ArmError::Safety(SafetyError::MotionForbiddenInFaultState(_)))
+        res_estop_raised,
+        Err(ArmError::Safety(SafetyError::TorqueOffWouldDrop { .. }))
     ));
+    assert!(supervisor.get_observation().await.is_torqued, "Torque must stay on away from rest in E-Stop");
 
-    // Clear fault
+    // In E-Stop at resting pose: set_torque(false) is allowed and keeps E-Stop latched
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.0, 0.0];
+        inner.measured_velocities = vec![0.0, 0.0];
+    }
+    let res_estop_rest = supervisor.set_torque(false).await;
+    assert_eq!(res_estop_rest.unwrap(), SafetyState::EStop);
+    let obs_estop = supervisor.get_observation().await;
+    assert_eq!(obs_estop.safety_state, SafetyState::EStop);
+    assert!(!obs_estop.is_torqued);
+
+    // Clear fault -> Idle
     supervisor.clear_fault().await.unwrap();
 
-    // 3. In Fault (e.g. BusLoss): set_torque(false) must be rejected with MotionForbiddenInFaultState
+    // 3. In Fault (e.g. BusLoss) away from rest: set_torque(false) rejected with TorqueOffWouldDrop
     supervisor.set_torque(true).await.unwrap();
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.5, -0.3];
+    }
     supervisor.apply_stop_policy(StopPolicy::BusLossFallback).await;
     assert!(matches!(supervisor.get_observation().await.safety_state, SafetyState::Fault(_)));
-    let res_fault = supervisor.set_torque(false).await;
+    let res_fault_raised = supervisor.set_torque(false).await;
     assert!(matches!(
-        res_fault,
-        Err(ArmError::Safety(SafetyError::MotionForbiddenInFaultState(_)))
+        res_fault_raised,
+        Err(ArmError::Safety(SafetyError::TorqueOffWouldDrop { .. }))
     ));
+    assert!(supervisor.get_observation().await.is_torqued);
 
-    // Clear fault, arm at resting pose: now set_torque(false) succeeds
+    // At resting pose in Fault: set_torque(false) is allowed and keeps Fault latched
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.0, 0.0];
+        inner.measured_velocities = vec![0.0, 0.0];
+    }
+    let res_fault_rest = supervisor.set_torque(false).await;
+    assert!(matches!(res_fault_rest, Ok(SafetyState::Fault(_))));
+    let obs_fault = supervisor.get_observation().await;
+    assert!(matches!(obs_fault.safety_state, SafetyState::Fault(_)));
+    assert!(!obs_fault.is_torqued);
+
+    // Clear fault, arm at resting pose: now Idle and set_torque(false) still succeeds
     supervisor.clear_fault().await.unwrap();
     let res_ok = supervisor.set_torque(false).await;
     assert!(res_ok.is_ok());

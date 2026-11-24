@@ -143,7 +143,24 @@ async fn test_rest_api_safety_estop_lifecycle() {
     let stopped: SafetyResponse = response.json().await.unwrap();
     assert_eq!(stopped.safety_state,SafetyState::EStop);
     assert_eq!(rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/motion/jog",serde_json::json!({"target_positions":[0.1,0.1]})).await["type"],"command_reject");
-    assert_eq!(rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/torque",serde_json::json!({"enable":false})).await["type"],"command_reject");
+    // Away from rest pose in E-Stop: torque off refused with TORQUE_OFF_WOULD_DROP
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.4, 0.0];
+    }
+    let drop_rej = rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/torque",serde_json::json!({"enable":false})).await;
+    assert_eq!(drop_rej["type"],"command_reject");
+    assert_eq!(drop_rej["code"],"TORQUE_OFF_WOULD_DROP");
+    assert!(supervisor.get_observation().await.is_torqued);
+    // At rest pose in E-Stop: torque off allowed, E-Stop latch kept
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.0, 0.0];
+    }
+    let rest_ack = rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/torque",serde_json::json!({"enable":false})).await;
+    assert_eq!(rest_ack["type"],"command_ack");
+    assert!(!supervisor.get_observation().await.is_torqued);
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
     let clear = rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/safety/clear_fault",serde_json::json!({})).await;
     assert_eq!(clear["type"],"command_ack");
     assert_eq!(clear["safety_state"],"Idle");
