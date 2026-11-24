@@ -557,6 +557,14 @@ pub trait ArmDriver: Send {
         self.write_estop_hold(targets).map(|()| TxBatchOutcome::Complete)
     }
 
+    /// Stopped-hold / freeze transmit strictly for the active position-force gripper joint
+    /// (zero MIT / arm frames). Used when MIT tracking is lost or refused so a tripped MIT
+    /// fence suppresses only MIT joints and never leaves J7 (`TIMEOUT=0`) executing an old
+    /// moving target across STOP, E-stop, or a J7-only feedback outage.
+    fn write_pos_force_stopped_hold_only(&mut self) -> Result<TxBatchOutcome, ArmDriverError> {
+        Ok(TxBatchOutcome::Complete)
+    }
+
     /// True if the most recent bounded stopped-hold pass submitted at least one frame to the bus.
     fn last_hold_tx_sent_any(&self) -> bool { true }
 
@@ -4468,6 +4476,141 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    /// Single shared unfenced stopped-hold / freeze emitter for the active `PosForce` joint
+    /// (`TIMEOUT=0`). Called BEFORE any MIT fence check or early-return on every fenced
+    /// stopped-hold / STOP / E-stop path, and by [`Self::write_pos_force_stopped_hold_only`]
+    /// when MIT ownership is lost or refused, so the MIT fence suppresses ONLY MIT joints.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when no active `PosForce` joint exists (complete no-op for MIT-only rigs).
+    /// - `Ok(Some((pf_j, true)))` when J7's `0x307` hold/freeze frame was transmitted (caller flushes).
+    /// - `Ok(Some((pf_j, false)))` when J7 was due but deferred/backpressured or unavailable.
+    /// - `Err(e)` on pending stop (`EstopInhibited`) or hard transport error.
+    fn emit_pos_force_stopped_hold_unfenced(
+        &mut self,
+        start_stamp: StopStamp,
+    ) -> Result<Option<(usize, bool)>, ArmDriverError> {
+        let Some(pf_j) = self.active_pos_force_joint() else {
+            return Ok(None);
+        };
+        let _ = self.check_pos_force_freshness_for_tx();
+        let mut retried_freeze = false;
+        loop {
+            match self.send(
+                TxKind::RollbackHold(pf_j),
+                Some(start_stamp),
+                None,
+                false,
+                |d| d.pos_force_frame_or_freeze_at(pf_j, None, d.now()),
+            ) {
+                Ok(sent_frame) => {
+                    if self.is_pos_force_freeze_frame(&sent_frame)
+                        && !matches!(self.last_tx_pf_status, PosForceTxStatus::Stale { .. })
+                    {
+                        let _ = self.check_pos_force_freshness_for_tx();
+                    }
+                    self.record_sent_target(pf_j, sent_frame, None);
+                    return Ok(Some((pf_j, true)));
+                }
+                Err(TxRefusal::PosForceFeedbackExpired(_)) => {
+                    let _ = self.check_pos_force_freshness_for_tx();
+                    if !retried_freeze {
+                        retried_freeze = true;
+                        continue;
+                    }
+                    return Ok(Some((pf_j, false)));
+                }
+                Err(TxRefusal::BuildRefused) => {
+                    let _ = self.check_pos_force_freshness_for_tx();
+                    if !retried_freeze {
+                        retried_freeze = true;
+                        continue;
+                    }
+                    return Ok(Some((pf_j, false)));
+                }
+                Err(TxRefusal::Deferred | TxRefusal::DeadlinePassed) => {
+                    return Ok(Some((pf_j, false)));
+                }
+                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                Err(TxRefusal::MitFenceTripped(reason)) => {
+                    return Err(ArmDriverError::MitFenceTripped(reason));
+                }
+                Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
+                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
+                    return Ok(Some((pf_j, false)));
+                }
+                Err(TxRefusal::Transport(e)) => {
+                    self.mark_tx_pass_backpressured();
+                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
+                    let pf_bit = pf_j.saturating_mul(2);
+                    self.last_hold_tx_sent_any = false;
+                    self.last_hold_tx_due_mask = if pf_bit < 64 { 1u64 << pf_bit } else { 0 };
+                    self.last_hold_tx_sent_mask = 0;
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    /// Flush a standalone J7 stopped-hold/freeze frame emitted by
+    /// [`Self::emit_pos_force_stopped_hold_unfenced`] and record J7-only progress masks.
+    fn flush_pos_force_stopped_hold_only(
+        &mut self,
+        pf_j: usize,
+        pf_sent: bool,
+        start_stamp: StopStamp,
+    ) -> Result<bool, ArmDriverError> {
+        let pf_bit = pf_j.saturating_mul(2);
+        let pf_mask = if pf_bit < 64 { 1u64 << pf_bit } else { 0 };
+        if !pf_sent {
+            self.last_hold_tx_sent_any = false;
+            self.last_hold_tx_due_mask = pf_mask;
+            self.last_hold_tx_sent_mask = 0;
+            return Ok(false);
+        }
+        if self.pending_stop_check(Some(start_stamp)).is_err() {
+            self.last_hold_tx_sent_any = self.can.flush_is_noop();
+            self.last_hold_tx_due_mask = 0;
+            self.last_hold_tx_sent_mask = 0;
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        if self.flush_cutoff_exceeded() {
+            self.mark_tx_pass_backpressured();
+            self.last_hold_tx_sent_any = false;
+            self.last_hold_tx_due_mask = pf_mask;
+            self.last_hold_tx_sent_mask = 0;
+            return Err(TransportError::Timeout.into());
+        }
+        if let Err(e) = self.can.flush() {
+            self.mark_tx_pass_backpressured();
+            self.last_hold_tx_sent_any = false;
+            if self.pending_stop_check(Some(start_stamp)).is_err() {
+                self.last_hold_tx_due_mask = 0;
+                self.last_hold_tx_sent_mask = 0;
+                return Err(ArmDriverError::EstopInhibited);
+            }
+            self.last_hold_tx_due_mask = pf_mask;
+            self.last_hold_tx_sent_mask = 0;
+            return Err(e.into());
+        }
+        if self.pending_stop_check(Some(start_stamp)).is_err() {
+            self.last_hold_tx_sent_any = true;
+            self.last_hold_tx_due_mask = 0;
+            self.last_hold_tx_sent_mask = 0;
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        self.last_hold_tx_sent_any = true;
+        self.last_hold_tx_due_mask = pf_mask;
+        self.last_hold_tx_sent_mask = pf_mask;
+        Ok(true)
+    }
+
     /// Single shared J7 position-force freshness gate used by BOTH motion
     /// (`write_joint_targets_bounded`, `drain_pending_tx`, `drain_pending_pass`) AND stopped-hold
     /// (`write_estop_hold_bounded`).
@@ -8271,27 +8414,62 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let total_joints = targets.len().min(u8::MAX as usize) as u8;
         if fenced {
             self.discard_pending_hold_tx();
-            self.fence_check()?;
             if let Err(e) = self.pending_stop_check(None) {
                 self.trip_fence(MitFenceTripReason::EstopBeforeBatch { total_joints });
                 return Err(e);
             }
             let start_stamp = self.current_stop_stamp();
+            // Emit the active PosForce J7 freeze/hold frame BEFORE any MIT fence check or early
+            // return so a tripped MIT fence suppresses ONLY the MIT joints and never leaves J7
+            // (`TIMEOUT=0`) running its previous moving target across STOP or E-stop.
+            let pf_emitted = self.emit_pos_force_stopped_hold_unfenced(start_stamp)?;
+            let flush_pf_before_abort = |d: &mut Self, pf: Option<(usize, bool)>| {
+                if let Some((pf_j, pf_sent)) = pf {
+                    let _ = d.flush_pos_force_stopped_hold_only(pf_j, pf_sent, start_stamp);
+                }
+            };
+            if let Err(e) = self.fence_check() {
+                flush_pf_before_abort(self, pf_emitted);
+                return Err(e);
+            }
             let pass = self.ensure_tx_pass();
             let mut started = [None::<Instant>; 16];
             if targets.len() > started.len() {
+                flush_pf_before_abort(self, pf_emitted);
                 self.reject_target_tx(MitFenceTripReason::PreflightRejected);
                 return Err(ArmDriverError::JointCountMismatch { expected: started.len(), actual: targets.len() });
             }
             let pre_now = self.now();
-            let _ = self.check_pos_force_freshness_for_tx_at(pre_now);
+            if pf_emitted.is_none() {
+                let _ = self.check_pos_force_freshness_for_tx_at(pre_now);
+            }
+            let pf_emitted_joint = pf_emitted.map(|(j, _)| j);
             let mut batch_frames = 0usize;
             let mut due_mask: u64 = 0;
+            let mut sent_any = false;
+            let mut sent_slot_mask: u64 = 0;
+            if let Some((pf_j, pf_sent)) = pf_emitted {
+                let bit = pf_j.saturating_mul(2);
+                if bit < 64 {
+                    due_mask |= 1u64 << bit;
+                    if pf_sent {
+                        sent_slot_mask |= 1u64 << bit;
+                    }
+                }
+                if pf_sent {
+                    sent_any = true;
+                    started[pf_j] = Some(pre_now);
+                }
+            }
             for (i, target) in targets.iter().enumerate() {
+                if pf_emitted_joint == Some(i) {
+                    continue;
+                }
                 let count = if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
                     if self.pos_force_frame_or_freeze_at(i, None, pre_now).is_some() {
                         1usize
                     } else {
+                        flush_pf_before_abort(self, pf_emitted);
                         self.trip_fence(MitFenceTripReason::TargetUnavailable {
                             joint: (i + 1) as u8,
                             completed_joints: 0,
@@ -8303,6 +8481,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     match self.target_frames_checked(i, target) {
                         Ok((frames, _)) => frames.into_iter().flatten().count(),
                         Err(e) => {
+                            flush_pf_before_abort(self, pf_emitted);
                             self.trip_fence(MitFenceTripReason::TargetUnavailable {
                                 joint: (i + 1) as u8,
                                 completed_joints: 0,
@@ -8321,11 +8500,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
             if pass.backpressured {
+                flush_pf_before_abort(self, pf_emitted);
                 let reason = MitFenceTripReason::TxBackpressuredBeforeBatch;
                 self.trip_fence(reason);
                 return Err(ArmDriverError::MitFenceTripped(reason));
             }
             if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
+                flush_pf_before_abort(self, pf_emitted);
                 let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
                 let reason = MitFenceTripReason::TxBudgetExceededPreflight {
                     needed: batch_frames.min(u16::MAX as usize) as u16,
@@ -8336,13 +8517,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 return Err(ArmDriverError::MitFenceTripped(reason));
             }
             if self.now() >= pass.deadline {
+                flush_pf_before_abort(self, pf_emitted);
                 let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                 self.trip_fence(reason);
                 return Err(ArmDriverError::MitFenceTripped(reason));
             }
-            let mut sent_any = false;
-            let mut sent_slot_mask: u64 = 0;
             for (i, target) in targets.iter().enumerate() {
+                if pf_emitted_joint == Some(i) {
+                    continue;
+                }
                 let is_pf = self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce);
                 let (slot_count, pf_joint) = if is_pf {
                     (1usize, Some(i))
@@ -8350,6 +8533,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     match self.target_frames_checked(i, target) {
                         Ok((frames, pf_joint)) => (frames.into_iter().flatten().count(), pf_joint),
                         Err(e) => {
+                            flush_pf_before_abort(self, pf_emitted);
                             self.trip_fence(MitFenceTripReason::TargetUnavailable {
                                 joint: (i + 1) as u8,
                                 completed_joints: i as u8,
@@ -8397,11 +8581,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 break;
                             }
                             Err(TxRefusal::PosForceFeedbackExpired(joint)) => {
-                                if is_pf && !retried_freeze && self.pf_last_fresh_position.is_some() {
+                                if is_pf && !retried_freeze {
                                     let _ = self.check_pos_force_freshness_for_tx();
                                     retried_freeze = true;
                                     continue;
                                 }
+                                flush_pf_before_abort(self, pf_emitted);
                                 self.trip_fence(MitFenceTripReason::TargetUnavailable {
                                     joint: (joint + 1) as u8,
                                     completed_joints: i as u8,
@@ -8410,6 +8595,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint });
                             }
                             Err(TxRefusal::Deferred) => {
+                                flush_pf_before_abort(self, pf_emitted);
                                 let reason = MitFenceTripReason::TxBudgetExhausted {
                                     completed_joints: i as u8,
                                     total_joints,
@@ -8418,6 +8604,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 return Err(ArmDriverError::MitFenceTripped(reason));
                             }
                             Err(TxRefusal::MitFenceTripped(reason)) => {
+                                flush_pf_before_abort(self, pf_emitted);
                                 return Err(ArmDriverError::MitFenceTripped(reason));
                             }
                             Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
@@ -8428,30 +8615,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 return Err(ArmDriverError::EstopInhibited);
                             }
                             Err(TxRefusal::BuildRefused) => {
-                                // Even if a non-PosForce joint's feedback is stale (> 100 ms),
-                                // active PosForce J7 (TIMEOUT=0) MUST still receive its freeze
-                                // frame before tripping the fence and returning the error.
-                                if let Some(pf_j) = self.active_pos_force_joint() {
-                                    let pf_bit = pf_j.saturating_mul(2);
-                                    let pf_already_sent = pf_bit < 64 && (sent_slot_mask & (1u64 << pf_bit)) != 0;
-                                    if pf_j != i && !pf_already_sent && self.pf_last_fresh_position.is_some() {
-                                        if let Ok(sent_frame) = self.send(
-                                            TxKind::RollbackHold(pf_j),
-                                            Some(start_stamp),
-                                            None,
-                                            false,
-                                            |d| d.pos_force_frame_or_freeze_at(pf_j, None, d.now()),
-                                        ) {
-                                            if self.is_pos_force_freeze_frame(&sent_frame)
-                                                && !matches!(self.last_tx_pf_status, PosForceTxStatus::Stale { .. })
-                                            {
-                                                let _ = self.check_pos_force_freshness_for_tx();
-                                            }
-                                            self.record_sent_target(pf_j, sent_frame, None);
-                                            let _ = self.can.flush();
-                                        }
-                                    }
-                                }
+                                flush_pf_before_abort(self, pf_emitted);
                                 let joint = pf_joint.unwrap_or(i);
                                 self.trip_fence(MitFenceTripReason::TargetUnavailable {
                                     joint: (joint + 1) as u8,
@@ -8473,6 +8637,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                     });
                                     return Err(ArmDriverError::EstopInhibited);
                                 }
+                                if let Some((pf_j, pf_sent)) = pf_emitted {
+                                    if pf_sent && !self.can.flush_is_noop() {
+                                        let _ = self.can.flush();
+                                    }
+                                    let _ = pf_j;
+                                }
                                 self.last_hold_tx_due_mask = due_mask;
                                 self.last_hold_tx_sent_mask = if self.can.flush_is_noop() { sent_slot_mask } else { 0 };
                                 self.trip_fence(MitFenceTripReason::TransmitFailed {
@@ -8484,6 +8654,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 return Err(e.into());
                             }
                             Err(TxRefusal::DeadlinePassed) => {
+                                flush_pf_before_abort(self, pf_emitted);
                                 let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                                 self.trip_fence(reason);
                                 return Err(ArmDriverError::MitFenceTripped(reason));
@@ -8905,6 +9076,30 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         } else {
             self.last_expired_oldest_age = None;
             Ok(TxBatchOutcome::Deferred { pending })
+        }
+    }
+
+    fn write_pos_force_stopped_hold_only(&mut self) -> Result<TxBatchOutcome, ArmDriverError> {
+        self.discard_pending_tx_stopped();
+        self.discard_pending_hold_tx();
+        self.last_hold_tx_sent_any = false;
+        self.last_hold_tx_due_mask = 0;
+        self.last_hold_tx_sent_mask = 0;
+        self.last_expired_oldest_age = None;
+        self.last_tx_pf_status = PosForceTxStatus::Unobserved;
+        if self.torque_hs.is_some() {
+            return Err(ArmDriverError::TorqueTransitionPending);
+        }
+        self.pending_stop_check(None)?;
+        let start_stamp = self.current_stop_stamp();
+        let Some((pf_j, pf_sent)) = self.emit_pos_force_stopped_hold_unfenced(start_stamp)? else {
+            return Ok(TxBatchOutcome::Complete);
+        };
+        let flushed = self.flush_pos_force_stopped_hold_only(pf_j, pf_sent, start_stamp)?;
+        if flushed {
+            Ok(TxBatchOutcome::Complete)
+        } else {
+            Ok(TxBatchOutcome::Deferred { pending: 1 })
         }
     }
 

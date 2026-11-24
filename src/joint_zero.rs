@@ -220,6 +220,9 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
+    fn write_pos_force_stopped_hold_only(&mut self) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+        self.inner.write_pos_force_stopped_hold_only()
+    }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
     fn last_hold_tx_due_mask(&self) -> u64 { self.inner.last_hold_tx_due_mask() }
     fn last_hold_tx_sent_mask(&self) -> u64 { self.inner.last_hold_tx_sent_mask() }

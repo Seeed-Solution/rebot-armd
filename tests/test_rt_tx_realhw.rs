@@ -4735,3 +4735,254 @@ fn dual_owner_stopped_hold_per_motor_lack_of_progress_hard_error_all_expired_and
         }
     }
 }
+
+/// Round 5 B1 regression:
+/// A J7-only feedback outage trips the 45 ms MIT deadline fence before the 100 ms J7 freeze
+/// threshold. Both driver-level fenced `write_estop_hold_bounded` AND supervisor-level STOP and
+/// E-stop (Legacy + RT Executor) MUST still emit J7's `0x307` freeze/hold frame BEFORE any MIT
+/// fence early-return, while suppressing ONLY the MIT/arm joints' output (ZERO MIT frames).
+#[test]
+fn dual_owner_tripped_mit_fence_j7_outage_stop_and_estop_still_send_freeze() {
+    use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DamiaoControlMode, JointMode, JointTarget};
+    use armd::mit::{MitOwner, MIT_DEADLINE};
+    use armd::safety::StopPolicy;
+    use armd::transport::CanFrame;
+
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+    let is_mit_or_arm_cmd = |f: &CanFrame| {
+        (1..=6).contains(&f.id) || (0x101..=0x106).contains(&f.id)
+    };
+
+    // --- (1) Driver-level fenced `write_estop_hold_bounded` after J7-only outage trips 45 ms fence ---
+    {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+            }
+            s.motors[6].q = -2.5;
+            s.motors[3].set_reg_u32(armd::protocol::damiao::RID_TIMEOUT, 2000);
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let pf_cfg = armd::driver::GripperPosForce {
+            joint: 6,
+            current_raw: pf_cur,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        };
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_gripper_pos_force(pf_cfg)
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).expect("enable");
+        let hold: Vec<JointTarget> = (0..7)
+            .map(|i| JointTarget::mit(if i == 6 { -2.5 } else { 0.1 * i as f32 }, 0.0, 12.0, 0.4, 0.0))
+            .collect();
+        let modes: Vec<JointMode> = (0..7)
+            .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
+            .collect();
+        d.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+        assert_eq!(d.joint_control_modes()[3], Some(DamiaoControlMode::Mit));
+        assert_eq!(d.joint_control_modes()[6], Some(DamiaoControlMode::PosForce));
+        d.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+        d.read_joint_states().unwrap();
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+
+        // J7-only outage -> advance 50 ms (>= 45 ms MIT fence, <= 100 ms J7 fresh) -> fence trips!
+        bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[6].mute_feedback = true;
+        });
+        clock.advance(ms(50));
+        bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        let _ = d.read_joint_states();
+        assert!(
+            d.mit_fence_trip().is_some(),
+            "50 ms J7 outage must trip 45 ms MIT deadline fence"
+        );
+
+        // At 50 ms (J7 still <= 100 ms fresh, MIT fence tripped): fenced `write_estop_hold_bounded`
+        // suppresses MIT/arm joints (returns `Err(MitFenceTripped)`) AND emits J7's 0x307 stop hold!
+        bus.clear_log();
+        d.begin_tx_tick();
+        let err_fresh = d.write_estop_hold_bounded(&hold).unwrap_err();
+        assert!(matches!(err_fresh, ArmDriverError::MitFenceTripped(_)), "{err_fresh:?}");
+        let log_50 = bus.tx_log();
+        assert!(
+            !log_50.iter().any(is_mit_or_arm_cmd),
+            "tripped MIT fence must suppress all MIT/arm frames at 50 ms: {log_50:?}"
+        );
+        let j7_50 = j7_pf_frames(&log_50);
+        assert_eq!(j7_50.len(), 1, "expected 1 J7 0x307 hold frame at 50 ms: {log_50:?}");
+        let p50 = f32::from_le_bytes(j7_50[0].data[0..4].try_into().unwrap());
+        assert!((p50 - (-2.5)).abs() < 1e-3, "expected J7 hold at -2.5, got {p50}");
+
+        // Advance to 120 ms (> 100 ms, J7 now stale): fenced `write_estop_hold_bounded` suppresses
+        // MIT/arm joints AND emits J7's exact 0x307 FREEZE frame (`vel_raw == 0`, pos -2.5)!
+        clock.advance(ms(70));
+        bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        let _ = d.read_joint_states();
+        bus.clear_log();
+        d.begin_tx_tick();
+        let err_stale = d.write_estop_hold_bounded(&hold).unwrap_err();
+        assert!(matches!(err_stale, ArmDriverError::MitFenceTripped(_)), "{err_stale:?}");
+        let log_120 = bus.tx_log();
+        assert!(
+            !log_120.iter().any(is_mit_or_arm_cmd),
+            "tripped MIT fence must suppress all MIT/arm frames at 120 ms: {log_120:?}"
+        );
+        assert_j7_freeze_frames(&j7_pf_frames(&log_120), -2.5, pf_cur, "fenced driver 120 ms");
+    }
+
+    // --- (2) Supervisor dual-owner (Legacy + RT Executor): J7 outage trips 45 ms MIT fence,
+    //         then STOP and E-stop both still send J7 freeze frames with ZERO MIT frames ---
+    let mut jt = armd::tracking::JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    for j in &mut jt.joints {
+        j.strategy = armd::tracking::TrackingStrategy::Position;
+    }
+    jt.joints[3].strategy = armd::tracking::TrackingStrategy::Mit;
+    jt.joints[3].kp = 10.0;
+    jt.joints[3].kd = 0.3;
+    jt.joints[3].hold_kp = Some(12.0);
+    jt.joints[3].hold_kd = Some(0.4);
+    jt.joints[3].effort_limit_nm = 3.0;
+    jt.joints[3].gravity_scale = 1.0;
+    for owner in [Owner::Legacy, Owner::Executor] {
+        for is_estop in [false, true] {
+            let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            rig.inner_mut().config.joint_tracking = Some(jt.clone());
+            if let RigOwner::Executor { fx, .. } = &mut rig.owner {
+                let stops = fx.stops().clone();
+                fx.core.attach_stop_requests(stops);
+                let gate = fx.core.estop_gate();
+                fx.core.driver.as_ref().unwrap().lock().unwrap().set_estop_gate(gate);
+            }
+            // Start J7 open at -3.0 rad, hand J4 over to MIT with 45 ms fence armed.
+            rig.bus.with(|s| {
+                s.motors[6].q = -3.0;
+                s.motors[3].set_reg_u32(armd::protocol::damiao::RID_TIMEOUT, 2000);
+                s.immediate_replies = true;
+                s.push_all_feedback();
+            });
+            rig.step();
+            rig.inner_mut().commanded_positions[6] = -3.0;
+            rig.inner_mut().target_positions[6] = -3.0;
+            {
+                let hold: Vec<JointTarget> = (0..7)
+                    .map(|i| JointTarget::mit(rig.inner().measured_positions[i], 0.0, 12.0, 0.4, 0.0))
+                    .collect();
+                let modes: Vec<JointMode> = (0..7)
+                    .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
+                    .collect();
+                let mut drv = rig.inner().driver.as_ref().unwrap().lock().unwrap();
+                drv.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+                drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+            }
+            rig.inner_mut().mit.owner = MitOwner::Active;
+            rig.inner_mut().mit.joints = vec![3];
+            rig.inner_mut().mit.last_output = Some(armd::transport::DriverClock::now(&rig.clock));
+            rig.bus.with(|s| {
+                s.immediate_replies = false;
+                s.rx.clear();
+                s.pending.clear();
+                s.push_all_feedback();
+            });
+            rig.step();
+
+            // Begin closing J7 so J7 has an active closing target when the outage hits.
+            let ep = rig.inner().safety.epoch_id();
+            {
+                let inner = rig.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).expect("admit gripper close");
+                SupervisorInner::start_gripper(
+                    admitted,
+                    GripperRequest {
+                        command: GripperCommand::Close,
+                        fraction: None,
+                        grasp: false,
+                        speed: 0.30,
+                        timeout_s: Some(15.0),
+                        tag: None,
+                    },
+                    ep,
+                )
+                .expect("start gripper close");
+            }
+            let last_fresh_pos = rig.inner().measured_positions[6];
+            assert!(last_fresh_pos < -2.0);
+
+            // J7-only outage -> advance 55 ms -> MIT fence trips BEFORE 100 ms!
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[6].mute_feedback = true;
+            });
+            rig.clock.advance(ms(55));
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            assert!(
+                rig.inner().driver.as_ref().unwrap().lock().unwrap().mit_fence_trip().is_some(),
+                "{owner:?} (estop={is_estop}): 55 ms J7 outage must trip 45 ms MIT fence"
+            );
+            assert_eq!(
+                rig.inner().mit.owner,
+                MitOwner::Lost,
+                "{owner:?} (estop={is_estop}): MIT tracking must transition to Lost"
+            );
+
+            // Advance past 100 ms (J7 now stale), then issue STOP or E-stop!
+            rig.clock.advance(ms(60));
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            match (&mut rig.owner, is_estop) {
+                (RigOwner::Legacy(inner), false) => {
+                    assert!(inner.authorized_stop());
+                }
+                (RigOwner::Executor { fx, .. }, false) => {
+                    fx.stops().request();
+                }
+                (RigOwner::Legacy(inner), true) => {
+                    inner.apply_stop_policy(StopPolicy::EStopLatch);
+                }
+                (RigOwner::Executor { fx, .. }, true) => {
+                    fx.core.e_stop_latched.store(true, Ordering::SeqCst);
+                    fx.core.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+
+            let log = rig.bus.tx_log();
+            assert!(
+                !log.iter().any(is_mit_or_arm_cmd),
+                "{owner:?} (estop={is_estop}): tripped MIT fence must suppress all MIT/arm frames: {log:?}"
+            );
+            assert_j7_freeze_frames(
+                &j7_pf_frames(&log),
+                last_fresh_pos,
+                pf_cur,
+                &format!("{owner:?} tripped MIT fence + {}", if is_estop { "E-stop" } else { "STOP" }),
+            );
+        }
+    }
+}

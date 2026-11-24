@@ -745,21 +745,78 @@ impl crate::supervisor::SupervisorInner {
         let is_hold = self.safety.state().is_stopped();
         let ff = match self.mit.owner {
             MitOwner::Off => None,
-            MitOwner::Lost => return TickOutput::None,
+            MitOwner::Lost => {
+                // A tripped MIT fence / cancelled MIT group suppresses ONLY the MIT joints; an
+                // active PosForce J7 (`TIMEOUT=0`) MUST still receive its freeze/hold frame via
+                // the shared unfenced J7 stopped-hold helper so STOP / E-stop / J7 outages never
+                // leave the jaw running its previous moving target.
+                if let Some(d) = self.driver.as_ref() {
+                    if let Ok(mut drv) = d.try_lock() {
+                        if drv.gripper_pos_force_info().is_some_and(|c| c.active) {
+                            let write_res = drv.write_pos_force_stopped_hold_only();
+                            return crate::supervisor::SupervisorInner::tick_output_from_driver_write(
+                                &mut **drv,
+                                true,
+                                write_res,
+                            );
+                        }
+                    }
+                }
+                return TickOutput::None;
+            }
             MitOwner::Active => match self.mit_prepare(targets, dt) {
                 Ok(ff) => Some(ff),
                 Err(e) => {
+                    // Emit J7's freeze/hold frame BEFORE returning the MIT preparation refusal
+                    // (e.g. a J7-only > 45 ms outage tripping the MIT deadline on a STOP/E-stop
+                    // or motion tick) so J7 stops immediately while MIT joints remain suppressed.
+                    let (now, max_age, sent_any, due_mask, sent_mask, pf_status) = self
+                        .driver
+                        .as_ref()
+                        .and_then(|d| d.try_lock().ok())
+                        .map(|mut drv| {
+                            if drv.gripper_pos_force_info().is_some_and(|c| c.active) {
+                                let _ = drv.write_pos_force_stopped_hold_only();
+                                (
+                                    drv.clock_now(),
+                                    drv.tx_frame_max_age(),
+                                    drv.last_hold_tx_sent_any(),
+                                    drv.last_hold_tx_due_mask(),
+                                    drv.last_hold_tx_sent_mask(),
+                                    drv.take_last_pos_force_tx_status(),
+                                )
+                            } else {
+                                (
+                                    drv.clock_now(),
+                                    drv.tx_frame_max_age(),
+                                    false,
+                                    0,
+                                    0,
+                                    crate::driver::PosForceTxStatus::Unobserved,
+                                )
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                self.mit_now(),
+                                crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
+                                false,
+                                0,
+                                0,
+                                crate::driver::PosForceTxStatus::Unobserved,
+                            )
+                        });
                     let mut buf = OutputErrorText::empty();
                     let _ = core::fmt::write(&mut buf, format_args!("MIT output refused: {e}"));
                     return TickOutput::Error {
                         message: buf,
-                        now: self.mit_now(),
-                        max_age: crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
+                        now,
+                        max_age,
                         is_hold,
-                        sent_any: false,
-                        due_mask: 0,
-                        sent_mask: 0,
-                        pf_status: crate::driver::PosForceTxStatus::Unobserved,
+                        sent_any,
+                        due_mask,
+                        sent_mask,
+                        pf_status,
                     };
                 }
             },
