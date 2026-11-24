@@ -69,8 +69,6 @@ fault_codes! {
         CanTxStalled,
         HardwareFault,
         EnableFailed,
-        /// Enable failed and rollback was refused to prevent dropping the arm; motors stay holding.
-        EnableRollbackHeld,
         ServoNoBrake,
         HandoverUnsettled,
         GravityCompFailed,
@@ -94,7 +92,6 @@ impl FaultCode {
             FaultCode::WatchdogTimeout
                 | FaultCode::ControlDeadline
                 | FaultCode::HandoverUnsettled
-                | FaultCode::EnableRollbackHeld
         )
     }
 

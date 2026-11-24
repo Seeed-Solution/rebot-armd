@@ -12040,7 +12040,9 @@ mod tx_chokepoint_tests {
     fn deferred_and_retried_enable_write_keeps_enable_state_unknown_until_post_write_off_feedback() {
         let limits = damiao::DamiaoLimits::default();
 
-        // Part 1: Deferred enable write (TX budget = 1 frame/tick) moves motor 2's write boundary.
+        // Part 1: Deferred enable write (TX budget = 1 frame/tick) leaves motor 3 OffConfirmed
+        // (write never reached transport), while motors 1 & 2 stay Unknown even if unsolicited 0x0
+        // frames arrive afterwards.
         let (bus, clock) = TestBus::new();
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3])
             .with_joint_limits(vec![limits; 3])
@@ -12056,46 +12058,68 @@ mod tx_chokepoint_tests {
         }
         drv.read_joint_states().unwrap();
         assert_eq!(drv.enable_state(), EnableState::Disabled);
-        assert!(drv.all_motors_confirmed_off_after_enable_writes());
+        let mut ev = [MotorTorqueEvidence::Unknown; 3];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::OffConfirmed; 3]);
 
-        // Tick 1: CMD_ENABLE sent to motor 1 only; motors 2 & 3 deferred.
+        // Tick 1: CMD_ENABLE sent to motor 1 only; motors 2 & 3 deferred (never reached transport).
         bus.clear_tx();
         assert!(matches!(drv.begin_torque(true).unwrap(), TorqueProgress::Pending { .. }));
         assert_eq!(bus.tx_len(), 1);
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev,
+            [
+                MotorTorqueEvidence::Unknown,
+                MotorTorqueEvidence::OffConfirmed,
+                MotorTorqueEvidence::OffConfirmed,
+            ],
+            "deferred writes that never reached transport must leave motor evidence intact"
+        );
 
-        // Fresh 0x0 feedback arrives for ALL 3 motors BEFORE motor 2's deferred enable write!
+        // Fresh 0x0 feedback arrives for ALL 3 motors BEFORE motor 2's deferred enable write.
         clock.advance(Duration::from_millis(5));
         for id in 1..=3 {
             bus.push_feedback(id, 0.50, 0x0, &limits);
         }
-        // Tick 2: poll_torque drains the 0x0 feedback for motors 1..3, THEN transmits the deferred
-        // CMD_ENABLE to motor 2 (updating last_enable_write_seq[1] right after transmit returns).
+        // Tick 2: poll_torque drains 0x0 feedback, then transmits deferred CMD_ENABLE to motor 2.
         bus.clear_tx();
         let dl = clock.now() + Duration::from_millis(5);
         assert!(matches!(drv.poll_torque(dl).unwrap(), TorqueProgress::Pending { .. }));
         assert_eq!(bus.tx_len(), 1, "deferred CMD_ENABLE sent to motor 2");
 
-        // Abort enable (as on E-stop/Fault): ALL 3 motors have fresh 0x0 after `send_enable()`,
-        // EXCEPT motor 2's 0x0 arrived BEFORE motor 2's deferred CMD_ENABLE -> MUST be Unknown!
+        // Abort enable: motors 1 & 2 had enable writes reach transport -> Unknown; motor 3 stayed OffConfirmed.
         drv.abort_enable();
+        assert_eq!(drv.enable_state(), EnableState::Unknown);
+        drv.motor_torque_evidence_into(&mut ev);
         assert_eq!(
-            drv.enable_state(),
-            EnableState::Unknown,
-            "pre-write 0x0 before deferred CMD_ENABLE must NOT prove Disabled"
-        );
-        assert!(
-            !drv.all_motors_confirmed_off_after_enable_writes(),
-            "shared reconciliation helper must return false while motor 2 lacks post-write 0x0"
+            ev,
+            [
+                MotorTorqueEvidence::Unknown,
+                MotorTorqueEvidence::Unknown,
+                MotorTorqueEvidence::OffConfirmed,
+            ]
         );
 
-        // Once motor 2 emits a NEW 0x0 strictly after its deferred CMD_ENABLE write, BOTH agree Disabled!
+        // Unsolicited 0x0 frames decoded AFTER an attempted enable NEVER confirm OffConfirmed on Damiao.
         clock.advance(Duration::from_millis(5));
-        bus.push_feedback(2, 0.50, 0x0, &limits);
+        for id in 1..=3 {
+            bus.push_feedback(id, 0.50, 0x0, &limits);
+        }
         drv.read_joint_states().unwrap();
-        assert!(drv.all_motors_confirmed_off_after_enable_writes());
-        assert_eq!(drv.enable_state(), EnableState::Disabled);
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev,
+            [
+                MotorTorqueEvidence::Unknown,
+                MotorTorqueEvidence::Unknown,
+                MotorTorqueEvidence::OffConfirmed,
+            ],
+            "unsolicited 0x0 must NEVER resolve an attempted Damiao enable to OffConfirmed"
+        );
+        assert_eq!(drv.enable_state(), EnableState::Unknown);
 
-        // Part 2: Retried enable write (`Service::Retry` at +25 ms) ALSO moves motor 2's boundary!
+        // Part 2: Retried enable write (`Service::Retry` at +25 ms) also keeps motors Unknown on unsolicited 0x0.
         let (bus_r, clock_r) = TestBus::new();
         let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2])
             .with_joint_limits(vec![limits; 2])
@@ -12105,13 +12129,11 @@ mod tx_chokepoint_tests {
         bus_r.push_feedback(2, 0.50, 0x0, &limits);
         drv_r.read_joint_states().unwrap();
         assert!(matches!(drv_r.begin_torque(true).unwrap(), TorqueProgress::Pending { .. }));
-        // Both motors reply 0x0 at +20 ms (after initial write, BEFORE the 25 ms retry).
         clock_r.advance(Duration::from_millis(20));
         bus_r.push_feedback(1, 0.50, 0x0, &limits);
         bus_r.push_feedback(2, 0.50, 0x0, &limits);
         let dl1 = clock_r.now() + Duration::from_millis(5);
         assert!(matches!(drv_r.poll_torque(dl1).unwrap(), TorqueProgress::Pending { .. }));
-        // At +30 ms, poll_torque retries CMD_ENABLE to motors 1 & 2, moving both write boundaries!
         clock_r.advance(Duration::from_millis(10));
         bus_r.clear_tx();
         let dl2 = clock_r.now() + Duration::from_millis(5);
@@ -12119,19 +12141,14 @@ mod tx_chokepoint_tests {
         assert_eq!(bus_r.tx_len(), 2, "retried CMD_ENABLE sent to both motors");
         drv_r.abort_enable();
 
-        // Even if motor 1 reports post-retry 0x0, motor 2 still has only pre-retry 0x0 -> Unknown!
         clock_r.advance(Duration::from_millis(5));
         bus_r.push_feedback(1, 0.50, 0x0, &limits);
-        drv_r.read_joint_states().unwrap();
-        assert_eq!(drv_r.enable_state(), EnableState::Unknown);
-        assert!(!drv_r.all_motors_confirmed_off_after_enable_writes());
-
-        // Once motor 2 ALSO reports post-retry 0x0 -> Disabled!
-        clock_r.advance(Duration::from_millis(5));
         bus_r.push_feedback(2, 0.50, 0x0, &limits);
         drv_r.read_joint_states().unwrap();
-        assert!(drv_r.all_motors_confirmed_off_after_enable_writes());
-        assert_eq!(drv_r.enable_state(), EnableState::Disabled);
+        let mut ev2 = [MotorTorqueEvidence::OffConfirmed; 2];
+        drv_r.motor_torque_evidence_into(&mut ev2);
+        assert_eq!(ev2, [MotorTorqueEvidence::Unknown, MotorTorqueEvidence::Unknown]);
+        assert_eq!(drv_r.enable_state(), EnableState::Unknown);
     }
 
     #[test]

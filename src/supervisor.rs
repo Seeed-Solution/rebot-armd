@@ -2167,7 +2167,7 @@ impl SupervisorInner {
         if req > self.applied_estop_count {
             let first_gen = self.applied_estop_count + 1;
             self.e_stop_latched.store(true, Ordering::SeqCst);
-            if matches!(self.torque_transition, Some(driver_transitions::TorqueTransition::Enable { .. })) {
+            if matches!(self.torque_transition, Some(driver_transitions::TorqueTransition::Enable(_))) {
                 if let Some(ref d) = self.driver {
                     if let Ok(mut drv) = d.lock() {
                         drv.abort_enable();
