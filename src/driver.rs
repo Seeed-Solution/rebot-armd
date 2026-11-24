@@ -2916,6 +2916,7 @@ pub struct FashionStarArmDriver<T: Transport> {
     feedback_seq: Vec<u64>,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
+    clock: Option<Arc<dyn crate::transport::DriverClock>>,
     abort_flag: Option<Arc<AtomicBool>>,
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     stopped_disable_gate: Option<StoppedDisableGate>,
@@ -2924,6 +2925,7 @@ pub struct FashionStarArmDriver<T: Transport> {
 impl<T: Transport> FashionStarArmDriver<T> {
     pub fn new(transport: T, servo_ids: Vec<u8>) -> Self {
         let dof = servo_ids.len();
+        let clock = transport.clock();
         Self {
             transport,
             servo_ids,
@@ -2933,10 +2935,65 @@ impl<T: Transport> FashionStarArmDriver<T> {
             feedback_seq: vec![0; dof],
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
+            clock,
             abort_flag: None,
             estop_gate: None,
             stopped_disable_gate: None,
         }
+    }
+
+    #[inline]
+    fn now(&self) -> Instant {
+        self.clock.as_ref().map_or_else(Instant::now, |c| c.now())
+    }
+
+    #[inline]
+    fn since(&self, earlier: Instant) -> Duration {
+        self.now().saturating_duration_since(earlier)
+    }
+
+    fn check_disable_requested(
+        &self,
+        started_at: Instant,
+        rollback: bool,
+    ) -> Result<(), ArmDriverError> {
+        let stopped = self
+            .stopped_disable_gate
+            .as_ref()
+            .is_some_and(StoppedDisableGate::is_safety_stopped)
+            || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
+            || self.estop_gate.as_ref().is_some_and(|g| g.pending());
+        if !rollback && !stopped {
+            return Ok(());
+        }
+        if self.since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        };
+        let arm_joints = gate.arm_joint_indices();
+        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        if !self.fresh_joint_positions_into(
+            arm_joints,
+            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+            &mut arm_positions[..arm_joints.len()],
+        ) || !gate.check_positions(&arm_positions[..arm_joints.len()])
+        {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        }
+        Ok(())
+    }
+
+    /// Per-write transmit choke point for FashionStar torque-off writes: re-evaluates stop state,
+    /// freshness, rest pose, and 1 s request lifetime immediately before each `transport.write_all`.
+    fn write_torque_off(&mut self, id: u8, kind: DisableKind) -> Result<(), ArmDriverError> {
+        let pkt = fashionstar::build_set_torque(id, false);
+        if let DisableKind::DisableRequested { started_at, rollback } = kind {
+            self.check_disable_requested(started_at, rollback)?;
+        }
+        self.transport.write_all(&pkt)?;
+        Ok(())
     }
 
     pub fn with_zero_offsets(mut self, offsets: Vec<u16>) -> Self {
@@ -2964,8 +3021,12 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
+    fn clock_now(&self) -> Instant {
+        self.now()
+    }
+
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
-        self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
+        self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
     }
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
@@ -2996,7 +3057,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                 .get(i)
                 .copied()
                 .flatten()
-                .is_some_and(|t| t.elapsed() <= max_age);
+                .is_some_and(|t| self.since(t) <= max_age);
             if !fresh {
                 return false;
             }
@@ -3018,7 +3079,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
         self.last_feedback_instant
             .iter()
-            .all(|opt| opt.is_some_and(|instant| instant.elapsed() <= FRESHNESS_LIMIT))
+            .all(|opt| opt.is_some_and(|instant| self.since(instant) <= FRESHNESS_LIMIT))
     }
 
     fn read_joint_states_budgeted(
@@ -3053,7 +3114,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         if !enabled {
             self.disable_torque(DisableKind::DisableRequested {
-                started_at: Instant::now(),
+                started_at: self.now(),
                 rollback: false,
             })
         } else {
@@ -3067,45 +3128,26 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
-        if let DisableKind::DisableRequested { started_at, rollback } = kind {
-            let stopped = self
-                .stopped_disable_gate
-                .as_ref()
-                .is_some_and(StoppedDisableGate::is_safety_stopped)
-                || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
-                || self.estop_gate.as_ref().is_some_and(|g| g.pending());
-            if rollback || stopped {
-                if Instant::now().saturating_duration_since(started_at)
-                    >= STOPPED_DISABLE_REQUEST_LIFETIME
-                {
-                    return Err(ArmDriverError::DisableRequestExpired);
+        let mut wrote_any = false;
+        let mut refused_err = None;
+        let mut last_err = None;
+        for idx in 0..self.servo_ids.len() {
+            let id = self.servo_ids[idx];
+            match self.write_torque_off(id, kind) {
+                Ok(()) => wrote_any = true,
+                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
+                    refused_err = Some(e);
+                    break;
                 }
-                let Some(ref gate) = self.stopped_disable_gate else {
-                    return Err(ArmDriverError::TorqueOffWouldDrop);
-                };
-                let arm_joints = gate.arm_joint_indices();
-                let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-                if !self.fresh_joint_positions_into(
-                    arm_joints,
-                    STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-                    &mut arm_positions[..arm_joints.len()],
-                ) || !gate.check_positions(&arm_positions[..arm_joints.len()])
-                {
-                    return Err(ArmDriverError::TorqueOffWouldDrop);
-                }
+                Err(e) => last_err = Some(e),
             }
         }
-        let mut last_err = None;
-        for &id in &self.servo_ids {
-            let pkt = fashionstar::build_set_torque(id, false);
-            if let Err(e) = self.transport.write_all(&pkt) {
+        if wrote_any {
+            if let Err(e) = self.transport.flush() {
                 last_err = Some(e.into());
             }
         }
-        if let Err(e) = self.transport.flush() {
-            last_err = Some(e.into());
-        }
-        if let Some(e) = last_err {
+        if let Some(e) = refused_err.or(last_err) {
             return Err(e);
         }
         Ok(())
@@ -3148,7 +3190,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         }
 
         let mut temp_chunk = [0u8; 1];
-        let start_time = Instant::now();
+        let start_time = self.now();
         const MAX_READ_DURATION: Duration = Duration::from_millis(3);
         const MAX_TOTAL_BYTES: usize = 256;
         let mut total_bytes_read = 0;
@@ -3158,7 +3200,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             let joint_idx = (start_cursor + offset) % dof;
             let id = self.servo_ids[joint_idx];
 
-            if start_time.elapsed() >= MAX_READ_DURATION || total_bytes_read >= MAX_TOTAL_BYTES {
+            if self.since(start_time) >= MAX_READ_DURATION || total_bytes_read >= MAX_TOTAL_BYTES {
                 self.poll_cursor = joint_idx;
                 break 'poll;
             }
@@ -3169,7 +3211,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
             let mut attempts = 0;
             while attempts < 10 {
-                if start_time.elapsed() >= MAX_READ_DURATION || total_bytes_read >= MAX_TOTAL_BYTES {
+                if self.since(start_time) >= MAX_READ_DURATION || total_bytes_read >= MAX_TOTAL_BYTES {
                     self.poll_cursor = (joint_idx + 1) % dof;
                     break 'poll;
                 }
@@ -3188,7 +3230,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                         {
                             let tenth_deg = i16::from_le_bytes([content[0], content[1]]);
                             self.cached_states[joint_idx].position = fashionstar::tenth_deg_to_rad(tenth_deg);
-                            self.last_feedback_instant[joint_idx] = Some(Instant::now());
+                            self.last_feedback_instant[joint_idx] = Some(self.now());
                             self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
                             break;
                         }
@@ -9782,6 +9824,7 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     /// `rx_empty_instant` when each joint's last sample was decoded.
     feedback_queue_bound: Vec<Option<Instant>>,
     fault_flags: Vec<u8>,
+    clock: Option<Arc<dyn crate::transport::DriverClock>>,
     abort_flag: Option<Arc<AtomicBool>>,
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     stopped_disable_gate: Option<StoppedDisableGate>,
@@ -9790,6 +9833,7 @@ pub struct RobStrideArmDriver<C: CanTransport> {
 impl<C: CanTransport> RobStrideArmDriver<C> {
     pub fn new(can: C, motor_ids: Vec<u8>) -> Self {
         let dof = motor_ids.len();
+        let clock = can.clock();
         Self {
             can,
             motor_ids,
@@ -9803,10 +9847,65 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             rx_empty_instant: None,
             feedback_queue_bound: vec![None; dof],
             fault_flags: vec![0; dof],
+            clock,
             abort_flag: None,
             estop_gate: None,
             stopped_disable_gate: None,
         }
+    }
+
+    #[inline]
+    fn now(&self) -> Instant {
+        self.clock.as_ref().map_or_else(Instant::now, |c| c.now())
+    }
+
+    #[inline]
+    fn since(&self, earlier: Instant) -> Duration {
+        self.now().saturating_duration_since(earlier)
+    }
+
+    fn check_disable_requested(
+        &self,
+        started_at: Instant,
+        rollback: bool,
+    ) -> Result<(), ArmDriverError> {
+        let stopped = self
+            .stopped_disable_gate
+            .as_ref()
+            .is_some_and(StoppedDisableGate::is_safety_stopped)
+            || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
+            || self.estop_gate.as_ref().is_some_and(|g| g.pending());
+        if !rollback && !stopped {
+            return Ok(());
+        }
+        if self.since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        let Some(ref gate) = self.stopped_disable_gate else {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        };
+        let arm_joints = gate.arm_joint_indices();
+        let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        if !self.fresh_joint_positions_into(
+            arm_joints,
+            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+            &mut arm_positions[..arm_joints.len()],
+        ) || !gate.check_positions(&arm_positions[..arm_joints.len()])
+        {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
+        }
+        Ok(())
+    }
+
+    /// Per-write transmit choke point for RobStride stop/disable CAN frames: re-evaluates stop
+    /// state, freshness, rest pose, and 1 s request lifetime immediately before each `can.transmit`.
+    fn send_stop_frame(&mut self, id: u8, kind: DisableKind) -> Result<(), ArmDriverError> {
+        let frame = robstride::build_stop_frame(id, self.master_id);
+        if let DisableKind::DisableRequested { started_at, rollback } = kind {
+            self.check_disable_requested(started_at, rollback)?;
+        }
+        self.can.transmit(&frame)?;
+        Ok(())
     }
 
     pub fn with_gains(mut self, kp: f32, kd: f32) -> Self {
@@ -9830,8 +9929,12 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false, load_feedback: false } }
 
+    fn clock_now(&self) -> Instant {
+        self.now()
+    }
+
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
-        self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
+        self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
     }
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
@@ -9856,13 +9959,13 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 .get(i)
                 .copied()
                 .flatten()
-                .is_some_and(|t| t.elapsed() <= max_age)
+                .is_some_and(|t| self.since(t) <= max_age)
                 && self
                     .feedback_queue_bound
                     .get(i)
                     .copied()
                     .flatten()
-                    .is_some_and(|b| b.elapsed() <= max_age)
+                    .is_some_and(|b| self.since(b) <= max_age)
         })
     }
 
@@ -9882,13 +9985,13 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 .get(i)
                 .copied()
                 .flatten()
-                .is_some_and(|t| t.elapsed() <= max_age)
+                .is_some_and(|t| self.since(t) <= max_age)
                 && self
                     .feedback_queue_bound
                     .get(i)
                     .copied()
                     .flatten()
-                    .is_some_and(|b| b.elapsed() <= max_age);
+                    .is_some_and(|b| self.since(b) <= max_age);
             if !fresh {
                 return false;
             }
@@ -9910,7 +10013,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
         self.last_feedback_instant
             .iter()
-            .all(|opt| opt.is_some_and(|instant| instant.elapsed() <= FRESHNESS_LIMIT))
+            .all(|opt| opt.is_some_and(|instant| self.since(instant) <= FRESHNESS_LIMIT))
     }
 
     fn read_joint_states_budgeted(
@@ -9920,12 +10023,12 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
         let max_frames = usize::from(max_rx_frames.min(64));
-        let t0 = Instant::now();
+        let t0 = self.now();
         let mut frames_processed = 0;
         let mut rx_drained = false;
         let mut hit_err = false;
-        while frames_processed < max_frames && Instant::now() < deadline && t0.elapsed() < Duration::from_micros(2000) {
-            let attempt = Instant::now();
+        while frames_processed < max_frames && self.now() < deadline && self.since(t0) < Duration::from_micros(2000) {
+            let attempt = self.now();
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
@@ -9937,7 +10040,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                                 torque: feedback.torque,
                                 temperature: feedback.mos_temperature,
                             };
-                            self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.last_feedback_instant[idx] = Some(self.now());
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
                             self.fault_flags[idx] = feedback.fault_flags;
@@ -10018,7 +10121,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         if !enabled {
             self.disable_torque(DisableKind::DisableRequested {
-                started_at: Instant::now(),
+                started_at: self.now(),
                 rollback: false,
             })
         } else {
@@ -10032,45 +10135,26 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
-        if let DisableKind::DisableRequested { started_at, rollback } = kind {
-            let stopped = self
-                .stopped_disable_gate
-                .as_ref()
-                .is_some_and(StoppedDisableGate::is_safety_stopped)
-                || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
-                || self.estop_gate.as_ref().is_some_and(|g| g.pending());
-            if rollback || stopped {
-                if Instant::now().saturating_duration_since(started_at)
-                    >= STOPPED_DISABLE_REQUEST_LIFETIME
-                {
-                    return Err(ArmDriverError::DisableRequestExpired);
+        let mut wrote_any = false;
+        let mut refused_err = None;
+        let mut last_err = None;
+        for idx in 0..self.motor_ids.len() {
+            let id = self.motor_ids[idx];
+            match self.send_stop_frame(id, kind) {
+                Ok(()) => wrote_any = true,
+                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
+                    refused_err = Some(e);
+                    break;
                 }
-                let Some(ref gate) = self.stopped_disable_gate else {
-                    return Err(ArmDriverError::TorqueOffWouldDrop);
-                };
-                let arm_joints = gate.arm_joint_indices();
-                let mut arm_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-                if !self.fresh_joint_positions_into(
-                    arm_joints,
-                    STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-                    &mut arm_positions[..arm_joints.len()],
-                ) || !gate.check_positions(&arm_positions[..arm_joints.len()])
-                {
-                    return Err(ArmDriverError::TorqueOffWouldDrop);
-                }
+                Err(e) => last_err = Some(e),
             }
         }
-        let mut last_err = None;
-        for &id in &self.motor_ids {
-            let frame = robstride::build_stop_frame(id, self.master_id);
-            if let Err(e) = self.can.transmit(&frame) {
+        if wrote_any {
+            if let Err(e) = self.can.flush() {
                 last_err = Some(e.into());
             }
         }
-        if let Err(e) = self.can.flush() {
-            last_err = Some(e.into());
-        }
-        if let Some(e) = last_err {
+        if let Some(e) = refused_err.or(last_err) {
             return Err(e);
         }
         Ok(())
@@ -10131,11 +10215,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-        let t0 = Instant::now();
+        let t0 = self.now();
         let mut frames_processed = 0;
         while frames_processed < 64 {
             // Taken before the receive: an empty result means the queue was empty after it.
-            let attempt = Instant::now();
+            let attempt = self.now();
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
@@ -10151,13 +10235,13 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                                 torque: feedback.torque,
                                 temperature: feedback.mos_temperature,
                             };
-                            self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.last_feedback_instant[idx] = Some(self.now());
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
                             self.fault_flags[idx] = feedback.fault_flags;
                         }
                     }
-                    if frames_processed >= 64 || t0.elapsed() >= Duration::from_micros(2000) {
+                    if frames_processed >= 64 || self.since(t0) >= Duration::from_micros(2000) {
                         break;
                     }
                 }
@@ -10211,6 +10295,10 @@ mod tx_chokepoint_tests {
 
         fn clear_tx(&self) {
             self.tx.lock().unwrap().clear();
+        }
+
+        fn set_on_tx(&self, cb: impl FnMut(&CanFrame) -> Result<(), TransportError> + Send + 'static) {
+            *self.on_tx.lock().unwrap() = Some(Box::new(cb));
         }
 
         fn push_feedback(&self, motor_id: u16, pos: f32, state: u8, limits: &DamiaoLimits) {
@@ -11010,5 +11098,265 @@ mod tx_chokepoint_tests {
             Err(TxRefusal::TorqueOffWouldDrop)
         ));
         assert_eq!(bus_r.tx_len(), 0, "zero disable frames to motor 2 after retried enable");
+    }
+
+    #[test]
+    fn fashionstar_and_robstride_gate_disable_per_write_across_estop_freshness_and_lifetime() {
+        // Hookable serial transport for FashionStar per-write gating tests.
+        #[derive(Clone)]
+        struct HookSerial {
+            clock: MockClock,
+            writes: Arc<Mutex<Vec<Vec<u8>>>>,
+            on_write: Arc<Mutex<Option<Box<dyn FnMut(usize) + Send>>>>,
+        }
+        impl HookSerial {
+            fn new(clock: MockClock) -> Self {
+                Self {
+                    clock,
+                    writes: Arc::new(Mutex::new(Vec::new())),
+                    on_write: Arc::new(Mutex::new(None)),
+                }
+            }
+            fn set_on_write(&self, cb: impl FnMut(usize) + Send + 'static) {
+                *self.on_write.lock().unwrap() = Some(Box::new(cb));
+            }
+            fn clear_writes(&self) {
+                self.writes.lock().unwrap().clear();
+            }
+            fn write_count(&self) -> usize {
+                self.writes.lock().unwrap().len()
+            }
+        }
+        impl Transport for HookSerial {
+            fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+                self.write_all(data)?;
+                Ok(data.len())
+            }
+            fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
+                let n = {
+                    let mut w = self.writes.lock().unwrap();
+                    w.push(data.to_vec());
+                    w.len()
+                };
+                if let Some(cb) = self.on_write.lock().unwrap().as_mut() {
+                    cb(n);
+                }
+                Ok(())
+            }
+            fn read(&mut self, _buf: &mut [u8]) -> Result<usize, TransportError> {
+                Err(TransportError::Timeout)
+            }
+            fn flush(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn clear_input_buffer(&mut self) {}
+            fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+                Some(Arc::new(self.clock.clone()))
+            }
+        }
+
+        let mut arm3 = [0usize; crate::rt_core::mailbox::MAX_DOF];
+        arm3[0] = 0;
+        arm3[1] = 1;
+        arm3[2] = 2;
+
+        // --- A. FashionStarArmDriver per-write gating ---
+        {
+            let clock = MockClock::new();
+            let serial = HookSerial::new(clock.clone());
+            let mut drv = FashionStarArmDriver::new(serial.clone(), vec![0, 1, 2]);
+            let stopped = Arc::new(AtomicBool::new(false));
+            drv.set_stopped_disable_gate(StoppedDisableGate {
+                safety_stopped: Arc::clone(&stopped),
+                has_resting_pose: true,
+                arm_joints: arm3,
+                arm_joints_len: 3,
+                rest_positions: [0.0; crate::rt_core::mailbox::MAX_DOF],
+                rest_pose_tolerance_rad: 0.05,
+            });
+            let t0 = clock.now();
+            // 1. Mid-batch E-stop arrives after write #1 on a raised arm -> writes #2,#3 refused!
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.50;
+                drv.last_feedback_instant[i] = Some(t0);
+            }
+            let stopped_cb = Arc::clone(&stopped);
+            serial.set_on_write(move |n| {
+                if n == 1 {
+                    stopped_cb.store(true, Ordering::SeqCst);
+                }
+            });
+            let res = drv.disable_torque(DisableKind::DisableRequested {
+                started_at: t0,
+                rollback: false,
+            });
+            assert!(
+                matches!(res, Err(ArmDriverError::TorqueOffWouldDrop)),
+                "FashionStar mid-batch E-stop must refuse write #2+, got {res:?}"
+            );
+            assert_eq!(serial.write_count(), 1, "FashionStar must stop after write #1 on mid-batch E-stop");
+
+            // 2. Mid-batch freshness cutoff (> 100 ms) while stopped at rest -> writes #2,#3 refused!
+            serial.clear_writes();
+            let t1 = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.0;
+                drv.last_feedback_instant[i] = Some(t1);
+            }
+            let clk_cb = clock.clone();
+            serial.set_on_write(move |n| {
+                if n == 1 {
+                    clk_cb.advance(Duration::from_millis(105));
+                }
+            });
+            let res = drv.disable_torque(DisableKind::DisableRequested {
+                started_at: t1,
+                rollback: false,
+            });
+            assert!(
+                matches!(res, Err(ArmDriverError::TorqueOffWouldDrop)),
+                "FashionStar mid-batch freshness cutoff must refuse write #2+, got {res:?}"
+            );
+            assert_eq!(serial.write_count(), 1);
+
+            // 3. Mid-batch 1 s lifetime cutoff while stopped at rest (feedback stays fresh!) -> DisableRequestExpired!
+            serial.clear_writes();
+            let t_req = clock.now();
+            clock.advance(Duration::from_millis(995));
+            let t_fb = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.0;
+                drv.last_feedback_instant[i] = Some(t_fb);
+            }
+            let clk_cb2 = clock.clone();
+            serial.set_on_write(move |n| {
+                if n == 1 {
+                    clk_cb2.advance(Duration::from_millis(10)); // past 1 s, feedback still only 10 ms old
+                }
+            });
+            let res = drv.disable_torque(DisableKind::DisableRequested {
+                started_at: t_req,
+                rollback: false,
+            });
+            assert!(
+                matches!(res, Err(ArmDriverError::DisableRequestExpired)),
+                "FashionStar mid-batch 1 s lifetime cutoff must refuse write #2+, got {res:?}"
+            );
+            assert_eq!(serial.write_count(), 1);
+
+            // 4. DisableProtective sends all 3 writes regardless of E-stop / staleness.
+            serial.clear_writes();
+            serial.set_on_write(|_| {});
+            drv.disable_torque(DisableKind::DisableProtective {
+                reason: DisableProtectiveReason::Thermal,
+            })
+            .unwrap();
+            assert_eq!(serial.write_count(), 3);
+        }
+
+        // --- B. RobStrideArmDriver per-write gating ---
+        {
+            let (bus, clock) = TestBus::new();
+            let mut drv = RobStrideArmDriver::new(bus.clone(), vec![1, 2, 3]);
+            let stopped = Arc::new(AtomicBool::new(false));
+            drv.set_stopped_disable_gate(StoppedDisableGate {
+                safety_stopped: Arc::clone(&stopped),
+                has_resting_pose: true,
+                arm_joints: arm3,
+                arm_joints_len: 3,
+                rest_positions: [0.0; crate::rt_core::mailbox::MAX_DOF],
+                rest_pose_tolerance_rad: 0.05,
+            });
+            let t0 = clock.now();
+            // 1. Mid-batch E-stop arrives after frame #1 on a raised arm -> frames #2,#3 refused!
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.50;
+                drv.last_feedback_instant[i] = Some(t0);
+                drv.feedback_queue_bound[i] = Some(t0);
+            }
+            let stopped_cb = Arc::clone(&stopped);
+            let mut count = 0usize;
+            bus.set_on_tx(move |_| {
+                count += 1;
+                if count == 1 {
+                    stopped_cb.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            let res = drv.disable_torque(DisableKind::DisableRequested {
+                started_at: t0,
+                rollback: false,
+            });
+            assert!(
+                matches!(res, Err(ArmDriverError::TorqueOffWouldDrop)),
+                "RobStride mid-batch E-stop must refuse frame #2+, got {res:?}"
+            );
+            assert_eq!(bus.tx_len(), 1, "RobStride must stop after frame #1 on mid-batch E-stop");
+
+            // 2. Mid-batch freshness cutoff (> 100 ms) while stopped at rest -> frames #2,#3 refused!
+            bus.clear_tx();
+            let t1 = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.0;
+                drv.last_feedback_instant[i] = Some(t1);
+                drv.feedback_queue_bound[i] = Some(t1);
+            }
+            let clk_cb = clock.clone();
+            let mut count2 = 0usize;
+            bus.set_on_tx(move |_| {
+                count2 += 1;
+                if count2 == 1 {
+                    clk_cb.advance(Duration::from_millis(105));
+                }
+                Ok(())
+            });
+            let res = drv.disable_torque(DisableKind::DisableRequested {
+                started_at: t1,
+                rollback: false,
+            });
+            assert!(
+                matches!(res, Err(ArmDriverError::TorqueOffWouldDrop)),
+                "RobStride mid-batch freshness cutoff must refuse frame #2+, got {res:?}"
+            );
+            assert_eq!(bus.tx_len(), 1);
+
+            // 3. Mid-batch 1 s lifetime cutoff while stopped at rest (feedback stays fresh!) -> DisableRequestExpired!
+            bus.clear_tx();
+            let t_req = clock.now();
+            clock.advance(Duration::from_millis(995));
+            let t_fb = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.0;
+                drv.last_feedback_instant[i] = Some(t_fb);
+                drv.feedback_queue_bound[i] = Some(t_fb);
+            }
+            let clk_cb2 = clock.clone();
+            let mut count3 = 0usize;
+            bus.set_on_tx(move |_| {
+                count3 += 1;
+                if count3 == 1 {
+                    clk_cb2.advance(Duration::from_millis(10));
+                }
+                Ok(())
+            });
+            let res = drv.disable_torque(DisableKind::DisableRequested {
+                started_at: t_req,
+                rollback: false,
+            });
+            assert!(
+                matches!(res, Err(ArmDriverError::DisableRequestExpired)),
+                "RobStride mid-batch 1 s lifetime cutoff must refuse frame #2+, got {res:?}"
+            );
+            assert_eq!(bus.tx_len(), 1);
+
+            // 4. DisableProtective sends all 3 frames regardless of E-stop / staleness.
+            bus.clear_tx();
+            bus.set_on_tx(|_| Ok(()));
+            drv.disable_torque(DisableKind::DisableProtective {
+                reason: DisableProtectiveReason::Thermal,
+            })
+            .unwrap();
+            assert_eq!(bus.tx_len(), 3);
+        }
     }
 }
