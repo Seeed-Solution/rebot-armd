@@ -1067,6 +1067,10 @@ impl CanTransport for TracingBus {
         self.inner.flush()
     }
 
+    fn flush_is_noop(&self) -> bool {
+        self.inner.flush_is_noop()
+    }
+
     fn clock(&self) -> Option<Arc<dyn DriverClock>> {
         self.inner.clock()
     }
