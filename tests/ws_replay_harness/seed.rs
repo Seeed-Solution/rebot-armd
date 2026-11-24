@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use axum::{routing::get, Json, Router};
-use serde_json::{json, Value};
+use serde_json::json;
 use tempfile::TempDir;
 
 use super::comparator::SessionSetup;
@@ -240,7 +240,7 @@ pub async fn materialize_seed(setup: &SessionSetup) -> MaterializedSeed {
             vec![0.0f32; dof],
         )];
         let rmlp = armd::policy_runtime::encode_rmlp_bytes(&layers).unwrap();
-        let manifest: Value = json!({
+        let manifest = json!({
             "format": "rebot-onnx-policy/v1",
             "name": "shadow_demo",
             "unit_mode": "rad",

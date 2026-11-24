@@ -1,14 +1,14 @@
 //! Transcript schema and equivalence-preserving comparator for WS replay parity.
 //!
-//! Normalizes ONLY genuinely nondeterministic values (wall timestamps, ephemeral durations,
-//! opaque generated IDs, epochs, lease generations, stop generations, action IDs) using
-//! bijective first-appearance tables so equality and ordering relationships are strictly
-//! preserved. Frame kinds, payload keys, status/error codes, messages, ordering, and close
-//! codes/reasons are compared verbatim.
+//! Normalizes ONLY genuinely nondeterministic values (wall timestamps, scoped ephemeral
+//! timings/cooldowns, opaque generated IDs, epochs, lease generations, stop generations,
+//! action IDs) into a type-safe [`NormValue`] domain so wire JSON strings can never collide
+//! with normalized numeric sentinels. Preserves bijective equality AND total relative order
+//! (`a < b <=> f(a) < f(b)`) across every numeric identifier domain.
 
 use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSetup {
@@ -73,6 +73,13 @@ pub enum ScriptStep {
         client: String,
         text: String,
     },
+    /// Send an explicit WebSocket Close control frame without tearing down the TCP socket yet.
+    SendCloseFrame {
+        client: String,
+        code: u16,
+        #[serde(default)]
+        reason: String,
+    },
     /// Wait for `count` control frames (messages with a `"type"` field) on `client`.
     ExpectControl {
         client: String,
@@ -93,11 +100,11 @@ pub enum ScriptStep {
         client: String,
         wait_ms: u64,
     },
-    /// Wait for server-initiated WS Close on `client`.
+    /// Wait for server-initiated WS Close (recording any preceding control frames in arrival order).
     ExpectClose {
         client: String,
     },
-    /// Client cleanly closes its WS connection.
+    /// Client drains any unexpected unread frames briefly and closes its WS connection.
     CloseClient {
         client: String,
     },
@@ -111,7 +118,7 @@ pub enum ScriptStep {
         auth_header: Option<String>,
         #[serde(default)]
         capture_token: bool,
-        /// Whether to record the full response body (default true; false records status + keys).
+        /// Whether to record the full response body (default true; false records status + presence).
         #[serde(default = "yes")]
         record_body: bool,
     },
@@ -119,7 +126,7 @@ pub enum ScriptStep {
     SleepMs {
         ms: u64,
     },
-    /// Collect telemetry observations for `duration_ms` and record rate/shape summary.
+    /// Collect telemetry observations for `duration_ms` and record rate/payload summary.
     CollectTelemetry {
         client: String,
         duration_ms: u64,
@@ -137,10 +144,16 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CloseInfo {
-    pub code: Option<u16>,
-    pub reason: Option<String>,
+/// Exact WebSocket close outcome distinguishing a Close handshake frame from bare EOF or reset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CloseOutcome {
+    Frame {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+    Eof,
+    TransportError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -158,6 +171,11 @@ pub enum RecordedEvent {
         client: String,
         text: String,
     },
+    ClientCloseFrame {
+        client: String,
+        code: u16,
+        reason: String,
+    },
     ServerFrame {
         client: String,
         frame: Value,
@@ -168,6 +186,16 @@ pub enum RecordedEvent {
         kind: String,
         state: String,
         code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holding: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<f32>,
         safety_state: Value,
         epoch_id: u64,
         is_torqued: bool,
@@ -178,7 +206,7 @@ pub enum RecordedEvent {
     },
     ServerClose {
         client: String,
-        close: CloseInfo,
+        close: CloseOutcome,
     },
     ClientClosed {
         client: String,
@@ -192,8 +220,12 @@ pub enum RecordedEvent {
     TelemetrySummary {
         client: String,
         in_range: bool,
+        has_all_timestamps: bool,
         monotonic: bool,
         dof: usize,
+        is_torqued: bool,
+        control_mode: String,
+        positions_mrad: Vec<i32>,
         safety_state: Value,
         epoch_id: u64,
     },
@@ -247,14 +279,112 @@ pub struct TranscriptDiff {
     pub actual: String,
 }
 
+/// Type-safe normalized comparison domain. Normalized sentinels live in distinct enum variants
+/// so no literal wire JSON string (e.g. `"$gen_1"`) can ever compare equal to a numeric token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormValue {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    /// Canonical finite f64 bits (`-0.0` canonicalized to `0.0`).
+    F64Bits(u64),
+    Str(String),
+    Array(Vec<NormValue>),
+    Object(BTreeMap<String, NormValue>),
+    NormEpoch(usize),
+    NormGen(usize),
+    NormActionId(usize),
+    NormStopGen(usize),
+    NormOpaqueId(usize),
+    NormTsNum,
+    NormTsStr,
+    NormTimingUs,
+    NormPositiveF64,
+    NormPositiveU64,
+    NormNonNegNum,
+    NormOperationalState,
+}
+
+impl NormValue {
+    fn from_f64(n: f64) -> Self {
+        let canon = if n == 0.0 { 0.0 } else { n };
+        Self::F64Bits(canon.to_bits())
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Null => "null".into(),
+            Self::Bool(b) => b.to_string(),
+            Self::I64(i) => i.to_string(),
+            Self::U64(u) => u.to_string(),
+            Self::F64Bits(bits) => format!("{}", f64::from_bits(*bits)),
+            Self::Str(s) => format!("{s:?}"),
+            Self::NormEpoch(n) => format!("<epoch#{n}>"),
+            Self::NormGen(n) => format!("<gen#{n}>"),
+            Self::NormActionId(n) => format!("<action#{n}>"),
+            Self::NormStopGen(n) => format!("<stop_gen#{n}>"),
+            Self::NormOpaqueId(n) => format!("<opaque#{n}>"),
+            Self::NormTsNum => "<ts:num>".into(),
+            Self::NormTsStr => "<ts:str>".into(),
+            Self::NormTimingUs => "<timing:us>".into(),
+            Self::NormPositiveF64 => "<pos:f64>".into(),
+            Self::NormPositiveU64 => "<pos:u64>".into(),
+            Self::NormNonNegNum => "<nonneg:num>".into(),
+            Self::NormOperationalState => "<state:operational>".into(),
+            Self::Array(a) => format!(
+                "[{}]",
+                a.iter().map(Self::describe).collect::<Vec<_>>().join(", ")
+            ),
+            Self::Object(m) => format!(
+                "{{{}}}",
+                m.iter()
+                    .map(|(k, v)| format!("{k}: {}", v.describe()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// First-appearance bijective table plus raw-value list for total relative-order checking.
+#[derive(Debug, Default)]
+struct NumericDomain {
+    by_value: HashMap<u64, usize>,
+    first_seen: Vec<u64>,
+}
+
+impl NumericDomain {
+    fn intern(&mut self, v: u64) -> usize {
+        if let Some(&id) = self.by_value.get(&v) {
+            return id;
+        }
+        let id = self.first_seen.len() + 1;
+        self.first_seen.push(v);
+        self.by_value.insert(v, id);
+        id
+    }
+
+    /// Returns the sorted rank (`0..k`) of each unique value in first-appearance order.
+    /// Two sequences have identical rank vectors iff the first-appearance bijection is strictly
+    /// order-preserving (`a < b <=> map(a) < map(b)` across ALL pairs, not just adjacent ones).
+    fn rank_signature(&self) -> Vec<usize> {
+        let mut sorted = self.first_seen.clone();
+        sorted.sort_unstable();
+        self.first_seen
+            .iter()
+            .map(|v| sorted.binary_search(v).unwrap())
+            .collect()
+    }
+}
+
 #[derive(Debug, Default)]
 struct Normalizer {
-    epochs: HashMap<u64, String>,
-    epoch_seq: Vec<u64>,
-    generations: HashMap<u64, String>,
-    action_ids: HashMap<u64, String>,
-    stop_gens: HashMap<u64, String>,
-    opaque_ids: HashMap<String, String>,
+    epochs: NumericDomain,
+    generations: NumericDomain,
+    action_ids: NumericDomain,
+    stop_gens: NumericDomain,
+    opaque_ids: HashMap<String, usize>,
 }
 
 const FIXED_SEED_IDS: &[&str] = &[
@@ -264,84 +394,109 @@ const FIXED_SEED_IDS: &[&str] = &[
     "shadow_demo",
 ];
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ObjectContext {
+    is_command_ack: bool,
+    is_policy_start_ack: bool,
+    is_preemption_cooldown: bool,
+}
+
+impl ObjectContext {
+    fn from_map(map: &serde_json::Map<String, Value>) -> Self {
+        let msg_type = map.get("type").and_then(Value::as_str);
+        let is_command_ack = msg_type == Some("command_ack");
+        let is_policy_start_ack =
+            is_command_ack && map.contains_key("policy_id") && map.contains_key("warmup_infer_us");
+        let is_preemption_cooldown = msg_type == Some("lease_rejected")
+            && map.get("error").and_then(Value::as_str) == Some("preemption_cooldown");
+        Self {
+            is_command_ack,
+            is_policy_start_ack,
+            is_preemption_cooldown,
+        }
+    }
+}
+
 impl Normalizer {
-    fn norm_epoch(&mut self, ep: u64) -> String {
-        if let Some(prev) = self.epoch_seq.last().copied() {
-            if prev != ep {
-                self.epoch_seq.push(ep);
-            }
-        } else {
-            self.epoch_seq.push(ep);
-        }
-        let next = self.epochs.len();
-        self.epochs
-            .entry(ep)
-            .or_insert_with(|| format!("$epoch_{next}"))
-            .clone()
+    fn norm_epoch(&mut self, ep: u64) -> NormValue {
+        NormValue::NormEpoch(self.epochs.intern(ep))
     }
 
-    fn norm_gen(&mut self, g: u64) -> Value {
+    fn norm_gen(&mut self, g: u64) -> NormValue {
         if g == 0 {
-            return Value::from(0u64);
+            NormValue::U64(0)
+        } else {
+            NormValue::NormGen(self.generations.intern(g))
         }
-        let next = self.generations.len() + 1;
-        Value::String(
-            self.generations
-                .entry(g)
-                .or_insert_with(|| format!("$gen_{next}"))
-                .clone(),
-        )
     }
 
-    fn norm_action_id(&mut self, id: u64) -> String {
-        let next = self.action_ids.len() + 1;
-        self.action_ids
-            .entry(id)
-            .or_insert_with(|| format!("$action_{next}"))
-            .clone()
+    fn norm_action_id(&mut self, id: u64) -> NormValue {
+        NormValue::NormActionId(self.action_ids.intern(id))
     }
 
-    fn norm_stop_gen(&mut self, sg: u64) -> Value {
+    fn norm_stop_gen(&mut self, sg: u64) -> NormValue {
         if sg == 0 {
-            return Value::from(0u64);
+            NormValue::U64(0)
+        } else {
+            NormValue::NormStopGen(self.stop_gens.intern(sg))
         }
-        let next = self.stop_gens.len() + 1;
-        Value::String(
-            self.stop_gens
-                .entry(sg)
-                .or_insert_with(|| format!("$stop_gen_{next}"))
-                .clone(),
-        )
     }
 
-    fn norm_opaque(&mut self, s: &str) -> String {
+    fn norm_opaque(&mut self, s: &str) -> NormValue {
         if FIXED_SEED_IDS.contains(&s) {
-            return s.to_string();
+            return NormValue::Str(s.to_string());
         }
         let next = self.opaque_ids.len() + 1;
-        self.opaque_ids
-            .entry(s.to_string())
-            .or_insert_with(|| format!("$id_{next}"))
-            .clone()
+        let id = *self.opaque_ids.entry(s.to_string()).or_insert(next);
+        NormValue::NormOpaqueId(id)
     }
 
-    fn epoch_order_signature(&self) -> Vec<i8> {
-        self.epoch_seq
-            .windows(2)
-            .map(|w| match w[1].cmp(&w[0]) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            })
-            .collect()
+    fn normalize_plain_value(&mut self, val: &Value) -> NormValue {
+        match val {
+            Value::Null => NormValue::Null,
+            Value::Bool(b) => NormValue::Bool(*b),
+            Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    NormValue::U64(u)
+                } else if let Some(i) = n.as_i64() {
+                    NormValue::I64(i)
+                } else if let Some(f) = n.as_f64() {
+                    NormValue::from_f64(f)
+                } else {
+                    NormValue::Str(n.to_string())
+                }
+            }
+            Value::String(s) => NormValue::Str(s.clone()),
+            Value::Array(arr) => NormValue::Array(
+                arr.iter()
+                    .map(|item| self.normalize_value(None, None, ObjectContext::default(), item))
+                    .collect(),
+            ),
+            Value::Object(map) => {
+                let ctx = ObjectContext::from_map(map);
+                let sorted: BTreeMap<&String, &Value> = map.iter().collect();
+                let mut out = BTreeMap::new();
+                for (k, v) in sorted {
+                    let nv = self.normalize_value(Some(k.as_str()), None, ctx, v);
+                    out.insert(k.clone(), nv);
+                }
+                NormValue::Object(out)
+            }
+        }
     }
 
-    fn normalize_value(&mut self, key: Option<&str>, parent_key: Option<&str>, val: &Value) -> Value {
+    fn normalize_value(
+        &mut self,
+        key: Option<&str>,
+        parent_key: Option<&str>,
+        parent_ctx: ObjectContext,
+        val: &Value,
+    ) -> NormValue {
         if let Some(k) = key {
             match k {
                 "epoch_id" => {
                     if let Some(n) = val.as_u64() {
-                        return Value::String(self.norm_epoch(n));
+                        return self.norm_epoch(n);
                     }
                 }
                 "generation" => {
@@ -351,7 +506,7 @@ impl Normalizer {
                 }
                 "action_id" => {
                     if let Some(n) = val.as_u64() {
-                        return Value::String(self.norm_action_id(n));
+                        return self.norm_action_id(n);
                     }
                 }
                 "stop_generation" => {
@@ -362,59 +517,61 @@ impl Normalizer {
                 "pose_id" | "recording_id" | "job_id" | "token" | "backup" | "content_sha256"
                 | "deleted" => {
                     if let Some(s) = val.as_str() {
-                        return Value::String(self.norm_opaque(s));
+                        return self.norm_opaque(s);
                     }
                 }
-                "expected_duration_s" => {
+                "expected_duration_s" if parent_ctx.is_command_ack => {
+                    // Mock joint settling varies by ~3 us on Cartesian planners; quantize to 1 ms
+                    // strictly on `command_ack` so any >= 1 ms drift fails.
                     if let Some(n) = val.as_f64() {
                         if n.is_finite() {
-                            return Value::from((n * 100.0).round() / 100.0);
+                            return NormValue::from_f64((n * 1000.0).round() / 1000.0);
                         }
                     }
                 }
                 "id" if matches!(parent_key, Some("pose" | "sequence" | "episode" | "body")) => {
                     if let Some(s) = val.as_str() {
-                        return Value::String(self.norm_opaque(s));
+                        return self.norm_opaque(s);
                     }
                 }
                 "timestamp" | "started_at" | "finished_at" | "recorded_at" | "created_at"
                 | "updated_at" | "saved_at_ms" | "ts" => {
                     if val.is_number() {
-                        return Value::String("$ts_num".into());
+                        return NormValue::NormTsNum;
                     }
                     if val.as_str().is_some_and(|s| !s.is_empty()) {
-                        return Value::String("$ts_str".into());
+                        return NormValue::NormTsStr;
                     }
                 }
-                "expires_in_s" | "max_fps" => {
+                "max_fps" if parent_ctx.is_policy_start_ack => {
                     if val.as_f64().is_some_and(|n| n.is_finite() && n > 0.0) {
-                        return Value::String("$positive_f64".into());
+                        return NormValue::NormPositiveF64;
                     }
                 }
-                "remaining_ms" => {
+                "remaining_ms" if parent_ctx.is_preemption_cooldown => {
                     if val.as_u64().is_some_and(|n| n > 0) {
-                        return Value::String("$positive_u64".into());
+                        return NormValue::NormPositiveU64;
                     }
                 }
-                "warmup_infer_us" => {
+                "warmup_infer_us" if parent_ctx.is_policy_start_ack => {
                     if let Some(obj) = val.as_object() {
-                        let mut out = Map::new();
+                        let mut out = BTreeMap::new();
                         for (wk, wv) in obj {
                             if wk == "n" || wk == "samples" || wk == "count" {
-                                out.insert(wk.clone(), wv.clone());
+                                out.insert(wk.clone(), self.normalize_plain_value(wv));
                             } else if wv.is_number() {
-                                out.insert(wk.clone(), Value::String("$timing_us".into()));
+                                out.insert(wk.clone(), NormValue::NormTimingUs);
                             } else {
-                                out.insert(wk.clone(), wv.clone());
+                                out.insert(wk.clone(), self.normalize_plain_value(wv));
                             }
                         }
-                        return Value::Object(out);
+                        return NormValue::Object(out);
                     }
                 }
                 "duration_s" | "frames" | "bytes" if parent_key == Some("episode") => {
                     if let Some(n) = val.as_f64() {
                         if n.is_finite() && n >= 0.0 {
-                            return Value::String("$nonneg_num".into());
+                            return NormValue::NormNonNegNum;
                         }
                     }
                 }
@@ -423,253 +580,347 @@ impl Normalizer {
         }
         match val {
             Value::Object(map) => {
-                // Use BTreeMap so key iteration order is deterministic when populating tables.
+                let ctx = ObjectContext::from_map(map);
                 let sorted: BTreeMap<&String, &Value> = map.iter().collect();
-                let mut out = Map::new();
+                let mut out = BTreeMap::new();
                 for (k, v) in sorted {
-                    let nv = self.normalize_value(Some(k.as_str()), key, v);
+                    let nv = self.normalize_value(Some(k.as_str()), key, ctx, v);
                     out.insert(k.clone(), nv);
                 }
-                Value::Object(out)
+                NormValue::Object(out)
             }
-            Value::Array(arr) => Value::Array(
+            Value::Array(arr) => NormValue::Array(
                 arr.iter()
-                    .map(|item| self.normalize_value(None, key, item))
+                    .map(|item| self.normalize_value(None, key, parent_ctx, item))
                     .collect(),
             ),
-            other => other.clone(),
+            other => self.normalize_plain_value(other),
         }
     }
 
-    fn normalize_event(&mut self, ev: &RecordedEvent) -> Value {
+    fn normalize_event(&mut self, ev: &RecordedEvent) -> NormValue {
+        let mut m = BTreeMap::new();
         match ev {
-            RecordedEvent::UpgradeStatus { client, status } => serde_json::json!({
-                "ev": "upgrade_status",
-                "client": client,
-                "status": status,
-            }),
-            RecordedEvent::ClientFrame { client, frame } => serde_json::json!({
-                "ev": "client_frame",
-                "client": client,
-                "frame": self.normalize_value(None, None, frame),
-            }),
-            RecordedEvent::ClientRaw { client, text } => serde_json::json!({
-                "ev": "client_raw",
-                "client": client,
-                "text": text,
-            }),
-            RecordedEvent::ServerFrame { client, frame } => serde_json::json!({
-                "ev": "server_frame",
-                "client": client,
-                "frame": self.normalize_value(None, None, frame),
-            }),
+            RecordedEvent::UpgradeStatus { client, status } => {
+                m.insert("ev".into(), NormValue::Str("upgrade_status".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                m.insert("status".into(), NormValue::U64(u64::from(*status)));
+            }
+            RecordedEvent::ClientFrame { client, frame } => {
+                m.insert("ev".into(), NormValue::Str("client_frame".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                m.insert(
+                    "frame".into(),
+                    self.normalize_value(None, None, ObjectContext::default(), frame),
+                );
+            }
+            RecordedEvent::ClientRaw { client, text } => {
+                m.insert("ev".into(), NormValue::Str("client_raw".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                m.insert("text".into(), NormValue::Str(text.clone()));
+            }
+            RecordedEvent::ClientCloseFrame {
+                client,
+                code,
+                reason,
+            } => {
+                m.insert("ev".into(), NormValue::Str("client_close_frame".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                m.insert("code".into(), NormValue::U64(u64::from(*code)));
+                m.insert("reason".into(), NormValue::Str(reason.clone()));
+            }
+            RecordedEvent::ServerFrame { client, frame } => {
+                m.insert("ev".into(), NormValue::Str("server_frame".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                m.insert(
+                    "frame".into(),
+                    self.normalize_value(None, None, ObjectContext::default(), frame),
+                );
+            }
             RecordedEvent::ActionTerminal {
                 client,
                 action_id,
                 kind,
                 state,
                 code,
+                message,
+                tag,
+                settled,
+                holding,
+                progress,
                 safety_state,
                 epoch_id,
                 is_torqued,
                 control_mode,
             } => {
-                // On completion or STOPPED cancellation tick, `Moving` -> `Armed` can straddle
-                // the terminal vs next 50 Hz tick; normalize only those two operational states
-                // while keeping Fault/EStop/Idle and non-STOPPED cancellations strict.
+                // On completion or operational cancellation (`STOPPED`, `SUPERSEDED`, `LEASE_LOST`),
+                // `Moving` -> `Armed` can straddle a single 50 Hz tick boundary; normalize only
+                // those two operational states while keeping Fault/EStop/Idle and fault/ESTOP
+                // cancellations strict. Post-stop steady-state `Armed` is verified verbatim by
+                // follow-up command_ack steps.
                 let operational_tick_boundary = state == "done"
-                    || (state == "cancelled" && code.as_deref() == Some("STOPPED"));
+                    || (state == "cancelled"
+                        && matches!(
+                            code.as_deref(),
+                            Some("STOPPED" | "SUPERSEDED" | "LEASE_LOST")
+                        ));
                 let norm_safety = if operational_tick_boundary
                     && matches!(safety_state.as_str(), Some("Moving" | "Armed"))
                 {
-                    Value::String("$operational".into())
+                    NormValue::NormOperationalState
                 } else {
-                    safety_state.clone()
+                    self.normalize_plain_value(safety_state)
                 };
-                serde_json::json!({
-                    "ev": "action_terminal",
-                    "client": client,
-                    "action_id": self.norm_action_id(*action_id),
-                    "kind": kind,
-                    "state": state,
-                    "code": code,
-                    "safety_state": norm_safety,
-                    "epoch_id": self.norm_epoch(*epoch_id),
-                    "is_torqued": is_torqued,
-                    "control_mode": control_mode,
-                })
+                m.insert("ev".into(), NormValue::Str("action_terminal".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                m.insert("action_id".into(), self.norm_action_id(*action_id));
+                m.insert("kind".into(), NormValue::Str(kind.clone()));
+                m.insert("state".into(), NormValue::Str(state.clone()));
+                m.insert(
+                    "code".into(),
+                    code.as_ref()
+                        .map_or(NormValue::Null, |s| NormValue::Str(s.clone())),
+                );
+                m.insert(
+                    "message".into(),
+                    message
+                        .as_ref()
+                        .map_or(NormValue::Null, |s| NormValue::Str(s.clone())),
+                );
+                m.insert(
+                    "tag".into(),
+                    tag.as_ref()
+                        .map_or(NormValue::Null, |s| NormValue::Str(s.clone())),
+                );
+                m.insert(
+                    "settled".into(),
+                    settled.map_or(NormValue::Null, NormValue::Bool),
+                );
+                m.insert(
+                    "holding".into(),
+                    holding.map_or(NormValue::Null, NormValue::Bool),
+                );
+                m.insert(
+                    "progress".into(),
+                    progress.map_or(NormValue::Null, |p| NormValue::from_f64(f64::from(p))),
+                );
+                m.insert("safety_state".into(), norm_safety);
+                m.insert("epoch_id".into(), self.norm_epoch(*epoch_id));
+                m.insert("is_torqued".into(), NormValue::Bool(*is_torqued));
+                m.insert("control_mode".into(), NormValue::Str(control_mode.clone()));
             }
-            RecordedEvent::NoReply { client } => serde_json::json!({
-                "ev": "no_reply",
-                "client": client,
-            }),
-            RecordedEvent::ServerClose { client, close } => serde_json::json!({
-                "ev": "server_close",
-                "client": client,
-                "code": close.code,
-                "reason": close.reason,
-            }),
-            RecordedEvent::ClientClosed { client } => serde_json::json!({
-                "ev": "client_closed",
-                "client": client,
-            }),
+            RecordedEvent::NoReply { client } => {
+                m.insert("ev".into(), NormValue::Str("no_reply".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+            }
+            RecordedEvent::ServerClose { client, close } => {
+                m.insert("ev".into(), NormValue::Str("server_close".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                match close {
+                    CloseOutcome::Frame { code, reason } => {
+                        m.insert("outcome".into(), NormValue::Str("frame".into()));
+                        m.insert(
+                            "code".into(),
+                            code.map_or(NormValue::Null, |c| NormValue::U64(u64::from(c))),
+                        );
+                        m.insert(
+                            "reason".into(),
+                            reason
+                                .as_ref()
+                                .map_or(NormValue::Null, |r| NormValue::Str(r.clone())),
+                        );
+                    }
+                    CloseOutcome::Eof => {
+                        m.insert("outcome".into(), NormValue::Str("eof".into()));
+                    }
+                    CloseOutcome::TransportError => {
+                        m.insert("outcome".into(), NormValue::Str("transport_error".into()));
+                    }
+                }
+            }
+            RecordedEvent::ClientClosed { client } => {
+                m.insert("ev".into(), NormValue::Str("client_closed".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+            }
             RecordedEvent::RestResponse {
                 method,
                 path,
                 status,
                 body,
-            } => serde_json::json!({
-                "ev": "rest_response",
-                "method": method,
-                "path": path,
-                "status": status,
-                "body": self.normalize_value(None, None, body),
-            }),
+            } => {
+                m.insert("ev".into(), NormValue::Str("rest_response".into()));
+                m.insert("method".into(), NormValue::Str(method.clone()));
+                m.insert("path".into(), NormValue::Str(path.clone()));
+                m.insert("status".into(), NormValue::U64(u64::from(*status)));
+                m.insert(
+                    "body".into(),
+                    self.normalize_value(None, None, ObjectContext::default(), body),
+                );
+            }
             RecordedEvent::TelemetrySummary {
                 client,
                 in_range,
+                has_all_timestamps,
                 monotonic,
                 dof,
+                is_torqued,
+                control_mode,
+                positions_mrad,
                 safety_state,
                 epoch_id,
-            } => serde_json::json!({
-                "ev": "telemetry_summary",
-                "client": client,
-                "in_range": in_range,
-                "monotonic": monotonic,
-                "dof": dof,
-                "safety_state": safety_state,
-                "epoch_id": self.norm_epoch(*epoch_id),
-            }),
-            RecordedEvent::OwnerEvent { label, detail } => serde_json::json!({
-                "ev": "owner_event",
-                "label": label,
-                "detail": self.normalize_value(None, None, detail),
-            }),
+            } => {
+                m.insert("ev".into(), NormValue::Str("telemetry_summary".into()));
+                m.insert("client".into(), NormValue::Str(client.clone()));
+                m.insert("in_range".into(), NormValue::Bool(*in_range));
+                m.insert(
+                    "has_all_timestamps".into(),
+                    NormValue::Bool(*has_all_timestamps),
+                );
+                m.insert("monotonic".into(), NormValue::Bool(*monotonic));
+                m.insert("dof".into(), NormValue::U64(*dof as u64));
+                m.insert("is_torqued".into(), NormValue::Bool(*is_torqued));
+                m.insert("control_mode".into(), NormValue::Str(control_mode.clone()));
+                m.insert(
+                    "positions_mrad".into(),
+                    NormValue::Array(
+                        positions_mrad
+                            .iter()
+                            .map(|&p| NormValue::I64(i64::from(p)))
+                            .collect(),
+                    ),
+                );
+                m.insert(
+                    "safety_state".into(),
+                    self.normalize_plain_value(safety_state),
+                );
+                m.insert("epoch_id".into(), self.norm_epoch(*epoch_id));
+            }
+            RecordedEvent::OwnerEvent { label, detail } => {
+                m.insert("ev".into(), NormValue::Str("owner_event".into()));
+                m.insert("label".into(), NormValue::Str(label.clone()));
+                m.insert(
+                    "detail".into(),
+                    self.normalize_value(None, None, ObjectContext::default(), detail),
+                );
+            }
         }
+        NormValue::Object(m)
     }
 }
 
 fn diff_values(
-    event_index: usize,
+    idx: usize,
     path: &str,
-    expected: &Value,
-    actual: &Value,
+    expected: &NormValue,
+    actual: &NormValue,
     out: &mut Vec<TranscriptDiff>,
 ) {
     if expected == actual {
         return;
     }
     match (expected, actual) {
-        (Value::Object(em), Value::Object(am)) => {
-            let mut keys: Vec<&String> = em.keys().chain(am.keys()).collect();
-            keys.sort();
-            keys.dedup();
-            for k in keys {
-                let child = if path.is_empty() {
+        (NormValue::Object(em), NormValue::Object(am)) => {
+            for (k, ev) in em {
+                let p = if path.is_empty() {
                     k.clone()
                 } else {
                     format!("{path}.{k}")
                 };
-                match (em.get(k), am.get(k)) {
-                    (Some(ev), Some(av)) => diff_values(event_index, &child, ev, av, out),
-                    (Some(ev), None) => out.push(TranscriptDiff {
-                        event_index,
-                        path: child,
-                        expected: ev.to_string(),
+                match am.get(k) {
+                    Some(av) => diff_values(idx, &p, ev, av, out),
+                    None => out.push(TranscriptDiff {
+                        event_index: idx,
+                        path: p,
+                        expected: ev.describe(),
                         actual: "<missing>".into(),
                     }),
-                    (None, Some(av)) => out.push(TranscriptDiff {
-                        event_index,
-                        path: child,
+                }
+            }
+            for (k, av) in am {
+                if !em.contains_key(k) {
+                    let p = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    out.push(TranscriptDiff {
+                        event_index: idx,
+                        path: p,
                         expected: "<missing>".into(),
-                        actual: av.to_string(),
-                    }),
-                    (None, None) => {}
+                        actual: av.describe(),
+                    });
                 }
             }
         }
-        (Value::Array(ea), Value::Array(aa)) => {
-            let max_len = ea.len().max(aa.len());
-            for i in 0..max_len {
-                let child = format!("{path}[{i}]");
-                match (ea.get(i), aa.get(i)) {
-                    (Some(ev), Some(av)) => diff_values(event_index, &child, ev, av, out),
-                    (Some(ev), None) => out.push(TranscriptDiff {
-                        event_index,
-                        path: child,
-                        expected: ev.to_string(),
-                        actual: "<missing>".into(),
-                    }),
-                    (None, Some(av)) => out.push(TranscriptDiff {
-                        event_index,
-                        path: child,
-                        expected: "<missing>".into(),
-                        actual: av.to_string(),
-                    }),
-                    (None, None) => {}
-                }
+        (NormValue::Array(ea), NormValue::Array(aa)) if ea.len() == aa.len() => {
+            for (i, (ev, av)) in ea.iter().zip(aa.iter()).enumerate() {
+                diff_values(idx, &format!("{path}[{i}]"), ev, av, out);
             }
         }
         _ => out.push(TranscriptDiff {
-            event_index,
+            event_index: idx,
             path: path.to_string(),
-            expected: expected.to_string(),
-            actual: actual.to_string(),
+            expected: expected.describe(),
+            actual: actual.describe(),
         }),
     }
 }
 
-/// Compare two recorded transcripts strictly after equivalence-preserving normalization.
-/// Returns an empty vector iff both transcripts are identical in normalized form and epoch order.
+/// Equivalence-preserving comparison of two transcripts.
+/// Returns an empty `Vec` iff every event kind, payload, error code, ordering, close outcome,
+/// bijective ID relation, and total numeric order relation across epochs/generations/actions/stops match.
 pub fn compare_transcripts(
     expected: &SessionTranscript,
     actual: &SessionTranscript,
 ) -> Vec<TranscriptDiff> {
-    let mut norm_exp = Normalizer::default();
-    let mut norm_act = Normalizer::default();
-    let exp_events: Vec<Value> = expected
-        .events
-        .iter()
-        .map(|ev| norm_exp.normalize_event(ev))
-        .collect();
-    let act_events: Vec<Value> = actual
-        .events
-        .iter()
-        .map(|ev| norm_act.normalize_event(ev))
-        .collect();
-
+    let mut norm_e = Normalizer::default();
+    let mut norm_a = Normalizer::default();
     let mut diffs = Vec::new();
-    let max_len = exp_events.len().max(act_events.len());
-    for i in 0..max_len {
-        match (exp_events.get(i), act_events.get(i)) {
-            (Some(e), Some(a)) => diff_values(i, "", e, a, &mut diffs),
-            (Some(e), None) => diffs.push(TranscriptDiff {
-                event_index: i,
-                path: "<event>".into(),
-                expected: e.to_string(),
-                actual: "<missing>".into(),
-            }),
-            (None, Some(a)) => diffs.push(TranscriptDiff {
-                event_index: i,
-                path: "<event>".into(),
-                expected: "<missing>".into(),
-                actual: a.to_string(),
-            }),
-            (None, None) => {}
-        }
-    }
 
-    let exp_order = norm_exp.epoch_order_signature();
-    let act_order = norm_act.epoch_order_signature();
-    if exp_order != act_order {
+    let common = expected.events.len().min(actual.events.len());
+    for i in 0..common {
+        let ve = norm_e.normalize_event(&expected.events[i]);
+        let va = norm_a.normalize_event(&actual.events[i]);
+        diff_values(i, "", &ve, &va, &mut diffs);
+    }
+    if expected.events.len() != actual.events.len() {
         diffs.push(TranscriptDiff {
-            event_index: max_len,
-            path: "<epoch_order>".into(),
-            expected: format!("{exp_order:?}"),
-            actual: format!("{act_order:?}"),
+            event_index: common,
+            path: "<events.len>".into(),
+            expected: expected.events.len().to_string(),
+            actual: actual.events.len().to_string(),
         });
     }
-
+    for (name, re, ra) in [
+        (
+            "<epoch_total_order>",
+            norm_e.epochs.rank_signature(),
+            norm_a.epochs.rank_signature(),
+        ),
+        (
+            "<generation_total_order>",
+            norm_e.generations.rank_signature(),
+            norm_a.generations.rank_signature(),
+        ),
+        (
+            "<action_id_total_order>",
+            norm_e.action_ids.rank_signature(),
+            norm_a.action_ids.rank_signature(),
+        ),
+        (
+            "<stop_generation_total_order>",
+            norm_e.stop_gens.rank_signature(),
+            norm_a.stop_gens.rank_signature(),
+        ),
+    ] {
+        if re != ra {
+            diffs.push(TranscriptDiff {
+                event_index: common,
+                path: name.into(),
+                expected: format!("{re:?}"),
+                actual: format!("{ra:?}"),
+            });
+        }
+    }
     diffs
 }

@@ -166,8 +166,9 @@ pub fn all_scenarios() -> Vec<ScenarioSpec> {
             vec![
                 send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"custom","positions":[0.05,0.0,0.0,0.0,0.0,0.0,0.0],"speed_scale":0.8})), expect_act("c0", "p1"), terminal("c0", Some("p1")),
                 send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"home"})), expect_act("c0", "p2"), terminal("c0", Some("p2")),
-                send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"park"})), expect("c0", 1),
+                send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"park"})), expect_act("c0", "p3"),
                 send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"unload"})), expect("c0", 1),
+                terminal("c0", Some("p3")),
                 send("c0", json!({"type":"preset","generation":"{{gen:c0}}","epoch_id":"{{epoch}}","name":"bad_custom"})), expect("c0", 1),
                 close_client("c0"),
             ],
@@ -547,6 +548,10 @@ pub fn all_scenarios() -> Vec<ScenarioSpec> {
                 cmd("c0", 4, "/api/v1/motion/stop", json!({})), expect("c0", 1),
                 send("c0", json!({"type":"command","request_id":5,"generation":"{{gen:c0}}","epoch_id":999999,"path":"/api/v1/motion/stop","body":{}})), expect("c0", 1),
                 cmd("c0", 6, "/api/v1/motion/stop", json!("not_an_object")), expect("c0", 1),
+                // Follow-up tick + command_ack verifies post-Stop steady-state safety_state == "Armed"
+                // verbatim (ensuring a persistent "Moving" regression cannot hide behind terminal normalization).
+                sleep(40),
+                cmd("c0", 7, "/api/v1/motion/stop", json!({})), expect("c0", 1),
                 close_client("c0"),
             ],
         ].concat(),
@@ -684,12 +689,17 @@ pub fn all_scenarios() -> Vec<ScenarioSpec> {
             acquire("c0", "transient", 1),
             torque_on("c0", 1),
             vec![
-                cmd("c0", 2, "/api/v1/motion/jog", json!({"target_positions":[0.4,0.0,0.0,0.0,0.0,0.0,0.0],"duration_secs":2.0})), expect("c0", 1),
+                cmd("c0", 2, "/api/v1/motion/jog", json!({"target_positions":[0.4,0.0,0.0,0.0,0.0,0.0,0.0],"duration_secs":2.0})), expect_act("c0", "disc_jog"),
                 close_client("c0"),
-                sleep(80),
+                terminal("c1", Some("disc_jog")),
+                sleep(40),
             ],
             acquire("c1", "successor", 1),
-            vec![close_client("c1")],
+            vec![
+                // Confirm steady-state Armed after c0 disconnect cancelled motion.
+                cmd("c1", 1, "/api/v1/motion/stop", json!({})), expect("c1", 1),
+                close_client("c1"),
+            ],
         ].concat(),
     });
 
@@ -719,15 +729,58 @@ pub fn all_scenarios() -> Vec<ScenarioSpec> {
     // 34: WS upgrade query parsing (?obs_hz=abc 400, ?obs_hz=5 telemetry pacing)
     out.push(ScenarioSpec {
         id: "34_ws_upgrade_query_and_obs_hz", family: "upgrade_telemetry",
-        description: "invalid obs_hz returns HTTP 400; obs_hz=5 streams bounded monotonic 7-DOF telemetry",
+        description: "invalid obs_hz returns HTTP 400; obs_hz=5 streams bounded monotonic 7-DOF telemetry with verified joint positions",
         setup: dm_setup(),
         steps: vec![
             conn_q("bad", "obs_hz=abc", Some(400)),
             conn_q("c0", "obs_hz=5", Some(101)),
-            ScriptStep::CollectTelemetry { client: "c0".into(), duration_ms: 650, min_count: 1, max_count: 8 },
+            ScriptStep::CollectTelemetry { client: "c0".into(), duration_ms: 650, min_count: 2, max_count: 5 },
             close_client("c0"),
         ],
     });
 
+    // 35: Explicit WS Close frame -> clean server EOF teardown + lease release
+    out.push(ScenarioSpec {
+        id: "35_server_close_and_teardown", family: "close",
+        description: "explicit WS Close frame drives clean server EOF teardown (distinct from Frame/TransportError) and releases lease",
+        setup: dm_setup(),
+        steps: [
+            vec![conn("c0"), conn("c1")],
+            acquire("c0", "closing_holder", 1),
+            vec![
+                ScriptStep::SendCloseFrame { client: "c0".into(), code: 1000, reason: "client_done".into() },
+                ScriptStep::ExpectClose { client: "c0".into() },
+                sleep(40),
+            ],
+            acquire("c1", "after_close", 1),
+            vec![close_client("c1")],
+        ].concat(),
+    });
+
     out
+}
+
+/// Companion session used when `policy-runtime` feature is disabled (`--no-default-features`),
+/// pinning exact legacy `Unknown action` rejection on policy endpoints.
+pub fn policy_disabled_scenario() -> ScenarioSpec {
+    ScenarioSpec {
+        id: "16_policy_disabled_reject",
+        family: "policy",
+        description: "without policy-runtime feature, policy/start and policy/stop return 400 INVALID_COMMAND Unknown action",
+        setup: dm_setup(),
+        steps: [
+            vec![conn("c0")],
+            acquire("c0", "ctrl", 1),
+            vec![
+                cmd("c0", 1, "/api/v1/action/policy/start", json!({"policy_id":"shadow_demo","mode":"shadow"})),
+                expect("c0", 1),
+                cmd("c0", 2, "/api/v1/action/policy/stop", json!({})),
+                expect("c0", 1),
+                cmd("c0", 3, "/api/v1/action/policy/start", json!("not_an_object")),
+                expect("c0", 1),
+                close_client("c0"),
+            ],
+        ]
+        .concat(),
+    }
 }

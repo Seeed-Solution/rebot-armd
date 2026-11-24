@@ -1,7 +1,11 @@
-//! WS replay session recorder/replayer against `armd --follower mock` binaries and
-//! in-process controlled-clock / injected owner-event harnesses.
+//! Live replay recorder & executor driving `armd --follower mock` (or an in-process router)
+//! against scripted WS + REST owner-event sessions.
+//!
+//! Records every inbound control frame and unseen action terminal at the exact point it arrives
+//! on the wire (never buffering/reordering terminals across ACKs and never discarding unexpected
+//! frames during waits or teardown).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -10,10 +14,12 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use super::comparator::{CloseInfo, RecordedEvent, ScriptStep, SessionSetup, SessionTranscript};
+use super::comparator::{CloseOutcome, RecordedEvent, ScriptStep, SessionSetup, SessionTranscript};
 use super::seed::{materialize_seed, reserve_mock_port};
 
 type WsConn = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -29,9 +35,12 @@ impl Drop for ChildGuard {
 
 struct ClientState {
     ws: WsConn,
-    buffered_terminals: HashMap<u64, RecordedEvent>,
+    /// Action IDs whose terminal observation has already been recorded in `events` (used only
+    /// to suppress duplicate `previous_action` snapshots repeated on subsequent 50 Hz ticks).
+    recorded_terminals: HashSet<u64>,
 }
 
+#[derive(Default)]
 struct RuntimeVars {
     gens: HashMap<String, u64>,
     epoch: u64,
@@ -44,52 +53,42 @@ struct RuntimeVars {
     last_action_id: Option<u64>,
 }
 
-impl Default for RuntimeVars {
-    fn default() -> Self {
-        Self {
-            gens: HashMap::new(),
-            epoch: 1,
-            token: None,
-            pose_id: None,
-            sequence_id: None,
-            recording_id: None,
-            episode_id: None,
-            actions: HashMap::new(),
-            last_action_id: None,
-        }
-    }
-}
-
 impl RuntimeVars {
-    fn update_from_frame(&mut self, client: &str, v: &Value, capture_action: Option<&str>) {
-        if let Some(ep) = v.get("epoch_id").and_then(Value::as_u64) {
-            self.epoch = ep;
-        }
-        if v.get("type").and_then(Value::as_str) == Some("lease_granted") {
-            if let Some(g) = v.get("generation").and_then(Value::as_u64) {
+    fn update_from_frame(&mut self, client: &str, frame: &Value, capture_action: Option<&str>) {
+        if frame.get("type").and_then(Value::as_str) == Some("lease_granted") {
+            if let Some(g) = frame.get("generation").and_then(Value::as_u64) {
                 self.gens.insert(client.to_string(), g);
             }
         }
-        if let Some(aid) = v.get("action_id").and_then(Value::as_u64) {
+        if let Some(ep) = frame.get("epoch_id").and_then(Value::as_u64) {
+            self.epoch = ep;
+        }
+        if let Some(aid) = frame.get("action_id").and_then(Value::as_u64) {
             self.last_action_id = Some(aid);
             if let Some(alias) = capture_action {
                 self.actions.insert(alias.to_string(), aid);
             }
         }
-        if let Some(pid) = v.get("pose_id").and_then(Value::as_str) {
+        if let Some(pid) = frame.get("pose_id").and_then(Value::as_str) {
+            self.pose_id = Some(pid.to_string());
+        } else if let Some(pid) = frame
+            .get("pose")
+            .and_then(|p| p.get("id"))
+            .and_then(Value::as_str)
+        {
             self.pose_id = Some(pid.to_string());
         }
-        if let Some(sid) = v
+        if let Some(sid) = frame
             .get("sequence")
             .and_then(|s| s.get("id"))
             .and_then(Value::as_str)
         {
             self.sequence_id = Some(sid.to_string());
         }
-        if let Some(rid) = v.get("recording_id").and_then(Value::as_str) {
+        if let Some(rid) = frame.get("recording_id").and_then(Value::as_str) {
             self.recording_id = Some(rid.to_string());
         }
-        if let Some(eid) = v
+        if let Some(eid) = frame
             .get("episode")
             .and_then(|e| e.get("id"))
             .and_then(Value::as_str)
@@ -100,33 +99,28 @@ impl RuntimeVars {
 
     fn resolve_str(&self, s: &str) -> Value {
         if s == "{{epoch}}" {
-            return json!(self.epoch);
+            return Value::from(self.epoch);
         }
-        if let Some(c) = s.strip_prefix("{{gen:").and_then(|r| r.strip_suffix("}}")) {
-            return json!(self.gens.get(c).copied().unwrap_or(0));
+        if let Some(client) = s.strip_prefix("{{gen:").and_then(|r| r.strip_suffix("}}")) {
+            return Value::from(self.gens.get(client).copied().unwrap_or(0));
         }
         if s == "{{token}}" {
-            return json!(self.token.as_deref().unwrap_or(""));
+            return Value::String(self.token.clone().unwrap_or_default());
         }
         if s == "{{pose_id}}" {
-            return json!(self.pose_id.as_deref().unwrap_or(""));
+            return Value::String(self.pose_id.clone().unwrap_or_default());
         }
         if s == "{{sequence_id}}" {
-            return json!(self.sequence_id.as_deref().unwrap_or(""));
+            return Value::String(self.sequence_id.clone().unwrap_or_default());
         }
         if s == "{{recording_id}}" {
-            return json!(self.recording_id.as_deref().unwrap_or(""));
+            return Value::String(self.recording_id.clone().unwrap_or_default());
         }
         if s == "{{episode_id}}" {
-            return json!(self.episode_id.as_deref().unwrap_or(""));
+            return Value::String(self.episode_id.clone().unwrap_or_default());
         }
         if s.contains("{{token}}") {
             return Value::String(s.replace("{{token}}", self.token.as_deref().unwrap_or("")));
-        }
-        if s.contains("{{episode_id}}") {
-            return Value::String(
-                s.replace("{{episode_id}}", self.episode_id.as_deref().unwrap_or("")),
-            );
         }
         Value::String(s.to_string())
     }
@@ -159,22 +153,47 @@ async fn fetch_epoch(http: &reqwest::Client, base_url: &str) -> u64 {
     obs["epoch_id"].as_u64().unwrap_or(1)
 }
 
-fn extract_terminals_from_obs(v: &Value, buf: &mut HashMap<u64, RecordedEvent>) {
+/// Extracts any unseen terminal action(s) from an observation frame and appends them directly
+/// into `events` in exact receive order.
+fn record_unseen_terminals(
+    client_name: &str,
+    v: &Value,
+    recorded_terminals: &mut HashSet<u64>,
+    vars: &mut RuntimeVars,
+    events: &mut Vec<RecordedEvent>,
+) {
     for key in ["action", "previous_action"] {
         let Some(la) = v.get(key).filter(|x| x.is_object()) else {
             continue;
         };
         let id = la.get("id").and_then(Value::as_u64).unwrap_or(0);
         let state = la.get("state").and_then(Value::as_str).unwrap_or("");
-        if id > 0 && matches!(state, "done" | "failed" | "cancelled") {
-            buf.entry(id).or_insert_with(|| RecordedEvent::ActionTerminal {
-                client: String::new(),
+        if id > 0 && matches!(state, "done" | "failed" | "cancelled") && recorded_terminals.insert(id)
+        {
+            let epoch_id = v.get("epoch_id").and_then(Value::as_u64).unwrap_or(0);
+            if epoch_id > 0 {
+                vars.epoch = epoch_id;
+            }
+            // Retain exact `progress` on `done` (deterministic 1.0); omit wall-clock partial
+            // progress on `cancelled`/`failed` where interruption timing varies.
+            let progress = if state == "done" {
+                la.get("progress").and_then(Value::as_f64).map(|p| p as f32)
+            } else {
+                None
+            };
+            events.push(RecordedEvent::ActionTerminal {
+                client: client_name.to_string(),
                 action_id: id,
                 kind: la.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
                 state: state.to_string(),
                 code: la.get("code").and_then(Value::as_str).map(str::to_string),
+                message: la.get("message").and_then(Value::as_str).map(str::to_string),
+                tag: la.get("tag").and_then(Value::as_str).map(str::to_string),
+                settled: la.get("settled").and_then(Value::as_bool),
+                holding: la.get("holding").and_then(Value::as_bool),
+                progress,
                 safety_state: v.get("safety_state").cloned().unwrap_or(Value::Null),
-                epoch_id: v.get("epoch_id").and_then(Value::as_u64).unwrap_or(0),
+                epoch_id,
                 is_torqued: v.get("is_torqued").and_then(Value::as_bool).unwrap_or(false),
                 control_mode: v
                     .get("control_mode")
@@ -186,7 +205,14 @@ fn extract_terminals_from_obs(v: &Value, buf: &mut HashMap<u64, RecordedEvent>) 
     }
 }
 
-async fn read_next_control(client: &mut ClientState) -> Value {
+/// Reads until the next control frame (`type.is_some()`), recording any unseen action terminals
+/// that arrive BEFORE the control frame immediately in wire receive order.
+async fn read_next_control(
+    client_name: &str,
+    client: &mut ClientState,
+    vars: &mut RuntimeVars,
+    events: &mut Vec<RecordedEvent>,
+) -> Value {
     tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             let msg = client
@@ -201,10 +227,18 @@ async fn read_next_control(client: &mut ClientState) -> Value {
                     if v.get("type").is_some() {
                         return v;
                     }
-                    extract_terminals_from_obs(&v, &mut client.buffered_terminals);
+                    record_unseen_terminals(
+                        client_name,
+                        &v,
+                        &mut client.recorded_terminals,
+                        vars,
+                        events,
+                    );
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(cf) => panic!("unexpected WS Close while waiting for control: {cf:?}"),
+                Message::Close(cf) => {
+                    panic!("unexpected WS Close while waiting for control: {cf:?}")
+                }
                 _ => continue,
             }
         }
@@ -213,9 +247,18 @@ async fn read_next_control(client: &mut ClientState) -> Value {
     .expect("timed out waiting for control frame")
 }
 
-async fn read_action_terminal(client: &mut ClientState, target_action_id: u64) -> RecordedEvent {
-    if let Some(ev) = client.buffered_terminals.remove(&target_action_id) {
-        return ev;
+/// Waits until `target_action_id` has been recorded as an `ActionTerminal`.
+/// Any control frames or other unseen terminals arriving in the meantime are recorded verbatim
+/// in wire receive order (never discarded).
+async fn wait_for_action_terminal(
+    client_name: &str,
+    client: &mut ClientState,
+    target_action_id: u64,
+    vars: &mut RuntimeVars,
+    events: &mut Vec<RecordedEvent>,
+) {
+    if client.recorded_terminals.contains(&target_action_id) {
+        return;
     }
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -225,19 +268,51 @@ async fn read_action_terminal(client: &mut ClientState, target_action_id: u64) -
                 .await
                 .expect("WS stream ended before action terminal")
                 .expect("WS read error");
-            let Message::Text(txt) = msg else { continue };
-            let v: Value = serde_json::from_str(&txt).expect("valid server JSON");
-            if v.get("type").is_some() {
-                continue;
-            }
-            extract_terminals_from_obs(&v, &mut client.buffered_terminals);
-            if let Some(ev) = client.buffered_terminals.remove(&target_action_id) {
-                return ev;
+            match msg {
+                Message::Text(txt) => {
+                    let v: Value = serde_json::from_str(&txt).expect("valid server JSON");
+                    if v.get("type").is_some() {
+                        vars.update_from_frame(client_name, &v, None);
+                        events.push(RecordedEvent::ServerFrame {
+                            client: client_name.to_string(),
+                            frame: v,
+                        });
+                        continue;
+                    }
+                    record_unseen_terminals(
+                        client_name,
+                        &v,
+                        &mut client.recorded_terminals,
+                        vars,
+                        events,
+                    );
+                    if client.recorded_terminals.contains(&target_action_id) {
+                        return;
+                    }
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                Message::Close(cf) => {
+                    panic!("unexpected WS Close while waiting for action {target_action_id}: {cf:?}")
+                }
+                _ => continue,
             }
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for terminal of action {target_action_id}"))
+    .unwrap_or_else(|_| panic!("timed out waiting for terminal of action {target_action_id}"));
+}
+
+/// Quantize a joint-position array from a telemetry frame to integer milliradians (`1e-3 rad`).
+pub fn quantize_positions_mrad(v: &Value) -> Vec<i32> {
+    v.get("positions")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_f64)
+                .map(|r| (r * 1000.0).round() as i32)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Run a replay session script against an `armd` binary spawned with `--follower mock` and
@@ -273,6 +348,7 @@ pub async fn execute_binary_session(
     if let Some(pin) = setup.operator_pin.as_deref() {
         cmd.args(["--operator-pin", pin]);
     }
+    cmd.env("ARMD_BIND_HOST", "127.0.0.1");
     cmd.env_remove("PORT");
     cmd.env_remove("ARMD_OPERATOR_PIN");
     cmd.env_remove("ARMD_TOOL");
@@ -361,7 +437,7 @@ pub async fn run_steps_against(
                             client.clone(),
                             ClientState {
                                 ws,
-                                buffered_terminals: HashMap::new(),
+                                recorded_terminals: HashSet::new(),
                             },
                         );
                     }
@@ -403,6 +479,25 @@ pub async fn run_steps_against(
                     text: text.clone(),
                 });
             }
+            ScriptStep::SendCloseFrame {
+                client,
+                code,
+                reason,
+            } => {
+                let cs = clients.get_mut(client).expect("unknown client");
+                cs.ws
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::from(*code),
+                        reason: reason.clone().into(),
+                    })))
+                    .await
+                    .expect("WS send close frame");
+                events.push(RecordedEvent::ClientCloseFrame {
+                    client: client.clone(),
+                    code: *code,
+                    reason: reason.clone(),
+                });
+            }
             ScriptStep::ExpectControl {
                 client,
                 count,
@@ -410,7 +505,7 @@ pub async fn run_steps_against(
             } => {
                 let cs = clients.get_mut(client).expect("unknown client");
                 for i in 0..*count {
-                    let frame = read_next_control(cs).await;
+                    let frame = read_next_control(client, cs, &mut vars, &mut events).await;
                     let alias = if i + 1 == *count {
                         capture_action.as_deref()
                     } else {
@@ -435,19 +530,7 @@ pub async fn run_steps_against(
                     None => vars.last_action_id.expect("no action_id captured yet"),
                 };
                 let cs = clients.get_mut(client).expect("unknown client");
-                let mut ev = read_action_terminal(cs, target_id).await;
-                if let RecordedEvent::ActionTerminal {
-                    client: ref mut c,
-                    epoch_id,
-                    ..
-                } = ev
-                {
-                    *c = client.clone();
-                    if epoch_id > 0 {
-                        vars.epoch = epoch_id;
-                    }
-                }
-                events.push(ev);
+                wait_for_action_terminal(client, cs, target_id, &mut vars, &mut events).await;
             }
             ScriptStep::ExpectNoControl { client, wait_ms } => {
                 let cs = clients.get_mut(client).expect("unknown client");
@@ -464,12 +547,21 @@ pub async fn run_steps_against(
                             if v.get("type").is_some() {
                                 panic!("expected no control frame on {client}, got: {v}");
                             }
+                            record_unseen_terminals(
+                                client,
+                                &v,
+                                &mut cs.recorded_terminals,
+                                &mut vars,
+                                &mut events,
+                            );
                         }
                         Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
                         Ok(Some(Ok(other))) => {
                             panic!("unexpected non-text frame on {client}: {other:?}");
                         }
-                        Ok(other) => panic!("WS closed unexpectedly during ExpectNoControl: {other:?}"),
+                        Ok(other) => {
+                            panic!("WS closed unexpectedly during ExpectNoControl: {other:?}")
+                        }
                     }
                 }
                 events.push(RecordedEvent::NoReply {
@@ -481,15 +573,37 @@ pub async fn run_steps_against(
                 let close = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         match cs.ws.next().await {
+                            Some(Ok(Message::Text(txt))) => {
+                                let v: Value =
+                                    serde_json::from_str(&txt).expect("valid server JSON");
+                                if v.get("type").is_some() {
+                                    vars.update_from_frame(client, &v, None);
+                                    events.push(RecordedEvent::ServerFrame {
+                                        client: client.clone(),
+                                        frame: v,
+                                    });
+                                } else {
+                                    record_unseen_terminals(
+                                        client,
+                                        &v,
+                                        &mut cs.recorded_terminals,
+                                        &mut vars,
+                                        &mut events,
+                                    );
+                                }
+                            }
                             Some(Ok(Message::Close(cf))) => {
-                                return CloseInfo {
+                                return CloseOutcome::Frame {
                                     code: cf.as_ref().map(|c| c.code.into()),
                                     reason: cf.as_ref().map(|c| c.reason.to_string()),
                                 };
                             }
-                            None => return CloseInfo { code: None, reason: None },
-                            Some(Ok(_)) => continue,
-                            Some(Err(_)) => return CloseInfo { code: None, reason: None },
+                            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => {
+                                continue
+                            }
+                            Some(Ok(Message::Frame(_))) => continue,
+                            None => return CloseOutcome::Eof,
+                            Some(Err(_)) => return CloseOutcome::TransportError,
                         }
                     }
                 })
@@ -503,6 +617,31 @@ pub async fn run_steps_against(
             }
             ScriptStep::CloseClient { client } => {
                 if let Some(mut cs) = clients.remove(client) {
+                    // Drain any already-buffered unread control frames before closing so
+                    // unexpected trailing server replies are recorded rather than silently dropped.
+                    let drain_deadline =
+                        tokio::time::Instant::now() + Duration::from_millis(25);
+                    loop {
+                        let rem = drain_deadline
+                            .saturating_duration_since(tokio::time::Instant::now());
+                        if rem.is_zero() {
+                            break;
+                        }
+                        match tokio::time::timeout(rem, cs.ws.next()).await {
+                            Ok(Some(Ok(Message::Text(txt)))) => {
+                                if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                                    if v.get("type").is_some() {
+                                        events.push(RecordedEvent::ServerFrame {
+                                            client: client.clone(),
+                                            frame: v,
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+                            _ => break,
+                        }
+                    }
                     let _ = cs.ws.close(None).await;
                     let _ = tokio::time::timeout(Duration::from_millis(200), async {
                         while cs.ws.next().await.is_some() {}
@@ -575,9 +714,13 @@ pub async fn run_steps_against(
                 let cs = clients.get_mut(client).expect("unknown client");
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(*duration_ms);
                 let mut count = 0usize;
+                let mut ts_count = 0usize;
                 let mut last_ts: Option<f64> = None;
-                let mut monotonic = true;
+                let mut monotonic_ok = true;
                 let mut dof = 0usize;
+                let mut is_torqued = false;
+                let mut control_mode = String::new();
+                let mut positions_mrad = Vec::new();
                 let mut safety_state = Value::Null;
                 let mut epoch_id = 0u64;
                 loop {
@@ -590,18 +733,30 @@ pub async fn run_steps_against(
                         Ok(Some(Ok(Message::Text(txt)))) => {
                             let v: Value = serde_json::from_str(&txt).expect("valid server JSON");
                             if v.get("type").is_some() {
+                                vars.update_from_frame(client, &v, None);
+                                events.push(RecordedEvent::ServerFrame {
+                                    client: client.clone(),
+                                    frame: v,
+                                });
                                 continue;
                             }
                             count += 1;
                             if let Some(ts) = v.get("timestamp").and_then(Value::as_f64) {
+                                ts_count += 1;
                                 if last_ts.is_some_and(|prev| ts < prev) {
-                                    monotonic = false;
+                                    monotonic_ok = false;
                                 }
                                 last_ts = Some(ts);
                             }
-                            if let Some(arr) = v.get("positions").and_then(Value::as_array) {
-                                dof = arr.len();
-                            }
+                            let qpos = quantize_positions_mrad(&v);
+                            dof = qpos.len();
+                            positions_mrad = qpos;
+                            is_torqued = v.get("is_torqued").and_then(Value::as_bool).unwrap_or(false);
+                            control_mode = v
+                                .get("control_mode")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
                             safety_state = v.get("safety_state").cloned().unwrap_or(Value::Null);
                             epoch_id = v.get("epoch_id").and_then(Value::as_u64).unwrap_or(0);
                         }
@@ -614,11 +769,17 @@ pub async fn run_steps_against(
                     in_range,
                     "telemetry count {count} outside [{min_count}, {max_count}] on {client}"
                 );
+                let has_all_timestamps = count >= 2 && ts_count == count;
+                let monotonic = has_all_timestamps && monotonic_ok;
                 events.push(RecordedEvent::TelemetrySummary {
                     client: client.clone(),
                     in_range,
+                    has_all_timestamps,
                     monotonic,
                     dof,
+                    is_torqued,
+                    control_mode,
+                    positions_mrad,
                     safety_state,
                     epoch_id,
                 });
