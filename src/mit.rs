@@ -1135,9 +1135,13 @@ impl crate::supervisor::SupervisorInner {
             }
             return Err(refusal.into_safety_error());
         }
-        let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-            Some(mut drv) => drv.mit_expiry_recover(),
-            None => Err("no driver".into()),
+        let (pre_recovery_seqs, res) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            Some(mut drv) => {
+                let pre = drv.feedback_seqs();
+                let r = drv.mit_expiry_recover();
+                (pre, r)
+            }
+            None => (Vec::new(), Err("no driver".into())),
         };
         if let Err(e) = res {
             let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
@@ -1150,28 +1154,34 @@ impl crate::supervisor::SupervisorInner {
         self.servo_stream_active = false;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
-        self.mit.owner = MitOwner::Off;
-        self.mit.joints.clear();
-        self.mit.last_ff.clear();
-        self.mit.last_output = None;
-        self.mit.armed_ok = false;
-        self.mit.revoke_pending = false;
         self.is_torqued = false;
         self.disable_pending = false;
         self.pending_rearm = false;
 
-        // Refresh supervisor feedback from samples received AFTER `drv.mit_expiry_recover()`
-        // confirmed every motor disabled — never evaluate final `clear_check` on pre-recovery
-        // positions or temperatures.
+        // Refresh supervisor feedback from samples received strictly AFTER the recovery request
+        // (verified by per-joint receive sequence advance AND driver post-recovery RX boundary) —
+        // never evaluate final `clear_check` on cached or pre-recovery feedback.
         let post_read = self.driver.as_ref().and_then(|d| {
             d.lock().ok().and_then(|mut drv| {
                 let states = drv.read_joint_states().ok()?;
+                let post_seqs = drv.feedback_seqs();
+                let seqs_after_recovery = pre_recovery_seqs.len() == self.config.dof
+                    && post_seqs.len() == self.config.dof
+                    && post_seqs
+                        .iter()
+                        .zip(&pre_recovery_seqs)
+                        .all(|(&post, &pre)| post > pre);
+                let rx_boundary_ok = drv.mit_feedback_after_recovery(self.config.dof);
                 let ages = drv.feedback_ages();
                 let loads = drv.joint_loads();
                 let caps = drv.capabilities();
-                let fb_fresh = drv.is_feedback_valid()
+                let fb_fresh = seqs_after_recovery
+                    && rx_boundary_ok
+                    && drv.is_feedback_valid()
                     && ages.len() == self.config.dof
-                    && ages.iter().all(|a| a.is_some_and(|t| t <= std::time::Duration::from_millis(250)))
+                    && ages
+                        .iter()
+                        .all(|a| a.is_some_and(|t| t <= crate::supervisor::THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                     && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
                 let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
                 let hw_fault = drv.has_hardware_fault();
@@ -1301,6 +1311,15 @@ impl crate::supervisor::SupervisorInner {
                 }
             }
             return Err(refusal.into_safety_error());
+        }
+        self.mit.owner = MitOwner::Off;
+        self.mit.joints.clear();
+        self.mit.last_ff.clear();
+        self.mit.last_output = None;
+        self.mit.armed_ok = false;
+        self.mit.revoke_pending = false;
+        if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            drv.acknowledge_mit_fence_trip();
         }
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {

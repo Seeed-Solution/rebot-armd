@@ -3102,3 +3102,335 @@ async fn executor_clear_fault_carries_epoch_and_refuses_after_newer_estop() {
     assert_eq!(alloc::take().calls, 0, "exact-epoch clear_fault_executor_bounded_for_epoch allocated");
     assert_eq!(cleared, SafetyState::Idle);
 }
+
+#[test]
+fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
+    use armd::mit::{self, MitJointQualification, MitQualificationFile};
+    use armd::protocol::damiao;
+    use armd::tracking::{JointTrackingConfig, TrackingStrategy};
+
+    const DT: f64 = 0.02;
+    let setup_mit_lost = |advance_past_quiet: bool| {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+
+        let mut jt = JointTrackingConfig::rebot_dm();
+        jt.enabled = true;
+        for j in &mut jt.joints { j.strategy = TrackingStrategy::Position; }
+        let j4 = &mut jt.joints[3];
+        j4.strategy = TrackingStrategy::Mit;
+        j4.kp = 10.0;
+        j4.kd = 0.3;
+        j4.hold_kp = Some(12.0);
+        j4.hold_kd = Some(0.4);
+        j4.effort_limit_nm = 3.0;
+        j4.gravity_scale = 1.0;
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 50,
+            workspace: None,
+            joint_tracking: Some(jt),
+            max_temperature: 75.0,
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.max_temperature = 75.0;
+        let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+        let l4 = limits[3];
+        let rec = MitQualificationFile {
+            version: mit::QUALIFICATION_VERSION,
+            joints: vec![MitJointQualification {
+                profile_id: "rebot_b601dm".into(),
+                joint: 4,
+                joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
+                zero_fingerprint: mit::zero_fingerprint(0.0),
+                motor_id: 4,
+                reply_id: 0x14,
+                esc_id: 4,
+                mst_id: 0x14,
+                sw_ver: mit_support::SW_VER,
+                pmax: l4.p_max,
+                vmax: l4.v_max,
+                tmax: l4.t_max,
+                timeout_raw: 2000,
+                timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
+                timeout_unit_verified: true,
+                tested_response: "disabled".into(),
+                measured_expiry_ms: 101.0,
+                worst_latency_ms: 8.0,
+                load_envelope: "unloaded, supported".into(),
+                max_kp: 15.0,
+                max_kd: 0.5,
+                effort_ceiling_nm: 4.0,
+                date: "2026-11-22T00:00:00Z".into(),
+                trace_id: "b3f-item3".into(),
+            }],
+            invalidated: None,
+        };
+        inner.set_calibration(Some(armd::calibration::CalibrationFile {
+            mit_qualification: serde_json::to_value(&rec).ok(),
+            ..Default::default()
+        }));
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        for _ in 0..3 { inner.tick(DT); }
+        assert!(inner.mit_active());
+        bus.with(|s| s.fail_tx_after = Some(3));
+        inner.tick(DT);
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        bus.with(|s| s.fail_tx_after = None);
+        if advance_past_quiet {
+            for _ in 0..8 {
+                clock.advance(Duration::from_millis(50));
+                inner.tick(DT);
+            }
+            assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled));
+        }
+        (inner, bus, clock)
+    };
+
+    // (a) Quiet-period refusal MUST NOT ack the fence: after holdoff elapses, background ticks
+    //     must still emit 0 autonomous 0xCC CAN refresh frames.
+    {
+        let (mut inner, bus, clock) = setup_mit_lost(false);
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(err.to_string().contains("quiet") || err.to_string().contains("MIT_QUIET_PERIOD") || err.to_string().contains("ms"), "{err}");
+        assert!(bus.tx_log().is_empty(), "quiet-period refusal sent frames: {:?}", bus.tx_log());
+        clock.advance(Duration::from_millis(350));
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(
+            bus.tx_log().is_empty(),
+            "failed quiet-period clear must NOT ack fence or unlock autonomous CAN refresh: {:?}",
+            bus.tx_log()
+        );
+    }
+
+    // (b) WatchdogTimeout with active lease + stale heartbeat MUST refuse in pre_ctx BEFORE
+    //     even polling 0xCC, leaving fence unacked and state unchanged.
+    {
+        let (mut inner, bus, clock) = setup_mit_lost(true);
+        inner.lease_enabled = true;
+        let _ = inner.acquire_lease("mit-wd").unwrap();
+        inner.last_heartbeat = Instant::now() - Duration::from_millis(80);
+        inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(err.to_string().contains("heartbeat"), "expected heartbeat refusal: {err}");
+        assert!(bus.tx_log().is_empty(), "stale heartbeat must refuse before any CAN poll: {:?}", bus.tx_log());
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(bus.tx_log().is_empty(), "fence must stay unacked after heartbeat refusal: {:?}", bus.tx_log());
+    }
+
+    // (c) Hot ThermalTrip during MIT recovery MUST refuse in full clear_check with ZERO fence ack
+    //     and ZERO supervisor state mutation (temperatures/positions/mit.owner unchanged).
+    {
+        let (mut inner, bus, clock) = setup_mit_lost(true);
+        inner.safety.latch(
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 82.0, limit: 75.0 },
+        );
+        let temps_before = inner.temperatures.clone();
+        let pos_before = inner.measured_positions.clone();
+        bus.with(|s| {
+            s.motors[0].temperature_c = 85;
+            s.motors[0].q = 0.25;
+        });
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(err.to_string().contains("Temperature must be confirmed below the reset threshold"), "{err}");
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mit.owner must not change before clear_check passes");
+        assert_eq!(inner.temperatures, temps_before, "temperatures must not mutate when clear_check refuses");
+        assert_eq!(inner.measured_positions, pos_before, "measured_positions must not mutate when clear_check refuses");
+        assert!(
+            bus.tx_log().iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "no recovery commands allowed when clear_check refuses: {:?}",
+            bus.tx_log()
+        );
+        // Subsequent ticks MUST send 0 autonomous CAN refresh frames (fence was NOT acked!).
+        bus.clear_log();
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(
+            bus.tx_log().is_empty(),
+            "autonomous CAN refresh must stay blocked after ThermalTrip refused MIT clear: {:?}",
+            bus.tx_log()
+        );
+
+        // (d) Cool motor 0 to 35 C and move J0 to 0.40 rad, but omit confirmation -> refused with
+        //     RECOVERY_CONFIRM_CODE, still ZERO fence ack and ZERO state mutation!
+        let pos_before_unconf = inner.measured_positions.clone();
+        let temps_before_unconf = inner.temperatures.clone();
+        bus.with(|s| {
+            s.motors[0].temperature_c = 35;
+            s.motors[0].q = 0.40;
+        });
+        let err_unconf = inner.clear_fault_confirmed(false).unwrap_err();
+        assert!(matches!(err_unconf, ArmError::Rejected { ref code, .. } if code == mit::RECOVERY_CONFIRM_CODE), "{err_unconf}");
+        assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+        assert_eq!(inner.measured_positions, pos_before_unconf);
+        assert_eq!(inner.temperatures, temps_before_unconf);
+        bus.clear_log();
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(120));
+            inner.tick(DT);
+        }
+        assert!(
+            bus.tx_log().is_empty(),
+            "autonomous CAN refresh must stay blocked when recovery confirmation is missing: {:?}",
+            bus.tx_log()
+        );
+
+        // (e) Now full clear_check passes + confirmed -> recovery succeeds, clears to Idle,
+        //     mit.owner becomes Off, and fence is now acknowledged so read-only polls may resume.
+        let cleared = inner.clear_fault_confirmed(true).unwrap();
+        assert_eq!(cleared, SafetyState::Idle);
+        assert_eq!(inner.mit.owner, mit::MitOwner::Off);
+        assert!(!inner.is_torqued);
+        bus.clear_log();
+        clock.advance(Duration::from_millis(150));
+        inner.tick(DT);
+        assert!(
+            bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "after full clear_check passes and recovery clears, read-only 0xCC polling resumes"
+        );
+    }
+}
+
+#[test]
+fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq() {
+    use armd::mit;
+
+    // 1. Driver whose `mit_expiry_recover()` returns Ok(()) without receiving any post-recovery
+    //    feedback frame (feedback_seqs stays unchanged, cached age is 5 ms <= 250 ms):
+    //    final MIT check MUST refuse with FreshFeedbackRequired and keep the fault latched!
+    struct CachedMitRecoveryDriver {
+        dof: usize,
+        seqs: Vec<u64>,
+        states: Vec<JointState>,
+        recovered_called: Arc<AtomicBool>,
+    }
+    impl ArmDriver for CachedMitRecoveryDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Disabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(5)); self.dof] }
+        fn feedback_seqs(&self) -> Vec<u64> { self.seqs.clone() }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            // Returns pre-recovery cached states without advancing `seqs`.
+            Ok(self.states.clone())
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
+            // Simulate J4 expired (0x0D), others enabled (1) -> triggers MIT expiry recovery path.
+            let mut st = vec![1u8; self.dof];
+            st[3] = 0x0D;
+            Ok(st)
+        }
+        fn mit_expiry_recover(&mut self) -> Result<(), String> {
+            self.recovered_called.store(true, Ordering::SeqCst);
+            // Intentionally does NOT advance `self.seqs` (simulates stale/cached readback).
+            Ok(())
+        }
+    }
+
+    let cfg = ArmConfig {
+        resting_pose: None,
+        workspace: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let recovered_called = Arc::new(AtomicBool::new(false));
+    let cached_states: Vec<JointState> = cfg
+        .home_positions
+        .iter()
+        .map(|&p| JointState {
+            position: p,
+            velocity: 0.0,
+            torque: 0.0,
+            temperature: 30.0,
+        })
+        .collect();
+    let drv = CachedMitRecoveryDriver {
+        dof: cfg.dof,
+        seqs: vec![7; cfg.dof],
+        states: cached_states,
+        recovered_called: Arc::clone(&recovered_called),
+    };
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.is_torqued = true;
+    inner.feedback_numeric_valid = true;
+    inner.mit.owner = mit::MitOwner::Lost;
+    inner.safety.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+
+    let err = inner.clear_fault_confirmed(true).unwrap_err();
+    assert!(recovered_called.load(Ordering::SeqCst), "mit_expiry_recover must have run");
+    assert!(
+        err.to_string().contains("Fresh feedback is required"),
+        "final MIT read must reject cached feedback whose receive sequence did not advance after recovery request: {err}"
+    );
+    assert!(inner.safety.state().is_stopped(), "fault must stay latched when post-recovery receive sequence did not advance");
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mit.owner must remain Lost when final clear_check fails");
+
+    // 2. Real DamiaoArmDriver: pre-recovery state-0 frame sitting unread in RX before recovery
+    //    cannot satisfy post-recovery feedback when motor 0 drops its disable reply!
+    let clock = MockClock::new();
+    let limits = dm_limits();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    dm.read_joint_states().unwrap();
+    dm.check_mapping_ranges();
+    dm.set_torque(true).unwrap();
+    // Queue a pre-recovery state-0 frame for motor 0 BEFORE mit_expiry_recover() is requested,
+    // and make motor 0 drop its disable command reply.
+    let stale_state0_j1 = bus.with(|s| {
+        let prev_en = s.motors[0].enabled;
+        s.motors[0].enabled = false;
+        let f = s.motors[0].feedback_frame();
+        s.motors[0].enabled = prev_en;
+        s.motors[0].no_feedback = true;
+        s.rx.push_back(f);
+        f
+    });
+    let _ = stale_state0_j1;
+    let err_dm = dm.mit_expiry_recover().unwrap_err();
+    assert!(err_dm.contains("J1"), "pre-recovery RX frame must not satisfy J1 post-recovery boundary: {err_dm}");
+    assert!(
+        !dm.mit_feedback_after_recovery(7),
+        "mit_feedback_after_recovery must be false when recovery did not receive post-request feedback for every joint"
+    );
+}
