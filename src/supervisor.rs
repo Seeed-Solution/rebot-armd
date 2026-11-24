@@ -3655,7 +3655,7 @@ impl SupervisorInner {
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
             if self.driver.is_none() {
                 tick_output_accepted = true;
-            } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
+            } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), self.driver.as_ref()) {
                 if let Ok(mut driver) = d.lock() {
                     if driver.enable_state() != EnableState::Disabled {
                         let write_res = if self.safety.state().is_stopped() {

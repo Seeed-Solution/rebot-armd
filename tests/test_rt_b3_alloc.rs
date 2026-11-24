@@ -3434,3 +3434,242 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
         "mit_feedback_after_recovery must be false when recovery did not receive post-request feedback for every joint"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collision_escalation_and_gravity_comp_output_zero_alloc_on_control_path() {
+    let log = global_log();
+    let _serial = log.guard.lock().await;
+    let _ = take_global_logs(log);
+
+    // 1. Collision trip, quiet release, and escalation (both operational and while E-stop latched)
+    //    must perform ZERO heap allocations on the control thread with tracing subscriber enabled.
+    struct CollisionAndGravityDriver {
+        dof: usize,
+        torques: Arc<Mutex<[f32; 7]>>,
+        positions: Arc<Mutex<[f32; 7]>>,
+        last_targets: Arc<Mutex<[JointTarget; 7]>>,
+        write_count: Arc<std::sync::atomic::AtomicUsize>,
+        estop_hold_count: Arc<std::sync::atomic::AtomicUsize>,
+        clock: MockClock,
+    }
+    impl ArmDriver for CollisionAndGravityDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: true,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn supports_mit_mode_switch(&self) -> bool { true }
+        fn set_joint_modes(&mut self, _: &[armd::driver::JointMode], _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); self.dof] }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
+        }
+        fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(0)); }
+        }
+        fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+            let now = self.clock.now();
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(now)); }
+        }
+        fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+            let now = self.clock.now();
+            out.clear();
+            for _ in 0..self.dof { out.push(Some(now)); }
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            let mut out = Vec::with_capacity(self.dof);
+            self.read_joint_states_into(&mut out)?;
+            Ok(out)
+        }
+        fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+            let qs = *self.positions.lock().unwrap();
+            let taus = *self.torques.lock().unwrap();
+            out.clear();
+            for i in 0..self.dof {
+                out.push(JointState {
+                    position: qs[i],
+                    velocity: 0.0,
+                    torque: taus[i],
+                    temperature: 30.0,
+                });
+            }
+            Ok(())
+        }
+        fn read_joint_states_budgeted(&mut self, out: &mut Vec<JointState>, _: Instant, _: u16) -> Result<(u16, bool), ArmDriverError> {
+            self.read_joint_states_into(out)?;
+            Ok((self.dof as u16, false))
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            let mut dst = self.last_targets.lock().unwrap();
+            for (d, s) in dst.iter_mut().zip(targets.iter()) { *d = s.clone(); }
+            self.write_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            let mut dst = self.last_targets.lock().unwrap();
+            for (d, s) in dst.iter_mut().zip(targets.iter()) { *d = s.clone(); }
+            self.estop_hold_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+        fn clock_now(&self) -> Instant { self.clock.now() }
+    }
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.joint_tracking = None;
+    cfg.resting_pose = None;
+    cfg.workspace = None;
+    if let Some(col) = cfg.collision.as_mut() {
+        col.enabled = true;
+        col.persist_ticks = 2;
+        col.resume_after_s = 0.04;
+        col.max_auto_resumes = 1;
+        col.escalate_window_s = 30.0;
+    }
+    if let Some(gc) = cfg.gravity_comp.as_mut() {
+        gc.ramp_in_s = 0.04;
+        gc.exit_hold_ms = 200;
+    }
+
+    let q_init = [0.0, -0.5, -0.5, 0.3, 0.0, 0.0, 0.0];
+    let g_model = cfg.arm_model.gravity_torques(&q_init[..6]).unwrap();
+    let mut tau_init = [0.0f32; 7];
+    tau_init[..6].copy_from_slice(&g_model[..6]);
+
+    let torques = Arc::new(Mutex::new(tau_init));
+    let positions = Arc::new(Mutex::new(q_init));
+    let last_targets = Arc::new(Mutex::new(std::array::from_fn(|_| JointTarget::position(0.0))));
+    let write_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let estop_hold_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drv = CollisionAndGravityDriver {
+        dof: cfg.dof,
+        torques: Arc::clone(&torques),
+        positions: Arc::clone(&positions),
+        last_targets: Arc::clone(&last_targets),
+        write_count: Arc::clone(&write_count),
+        estop_hold_count: Arc::clone(&estop_hold_count),
+        clock: MockClock::new(),
+    };
+
+    let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.gravity_compensated = true;
+    inner.collision.enabled = true;
+    inner.collision.torque_feedback = true;
+    inner.measured_positions = q_init.to_vec();
+    inner.commanded_positions = q_init.to_vec();
+    inner.target_positions = q_init.to_vec();
+    inner.set_torque(true).unwrap();
+    inner.safety.set_off_thread_reclaim(true);
+    // Warm up per-tick scratch buffers.
+    for _ in 0..3 {
+        let _ = inner.tick_control(0.02);
+    }
+
+    alloc::time_this_thread();
+
+    // (a) First collision trip -> protective hold (0 allocs).
+    torques.lock().unwrap()[0] = g_model[0] + 15.0;
+    let _ = alloc::take();
+    let _ = inner.tick_control(0.02);
+    let _ = inner.tick_control(0.02);
+    let trip1_allocs = alloc::take();
+    assert_eq!(trip1_allocs.calls, 0, "collision protective-stop trip allocated: {trip1_allocs:?}");
+    assert!(inner.collision.hold.is_some(), "expected protective hold on first collision trip");
+
+    // (b) Quiet period -> collision hold release (0 allocs).
+    torques.lock().unwrap()[0] = g_model[0];
+    let _ = alloc::take();
+    for _ in 0..3 {
+        let _ = inner.tick_control(0.02);
+    }
+    let rel_allocs = alloc::take();
+    assert_eq!(rel_allocs.calls, 0, "collision hold release allocated: {rel_allocs:?}");
+    assert!(inner.collision.hold.is_none(), "expected collision hold to release after quiet period");
+
+    // (c) Second collision trip in window -> escalation latches FaultKind::CollisionLatched (0 allocs!).
+    torques.lock().unwrap()[0] = g_model[0] + 15.0;
+    let _ = alloc::take();
+    let _ = inner.tick_control(0.02);
+    let _ = inner.tick_control(0.02);
+    let esc_allocs = alloc::take();
+    assert_eq!(esc_allocs.calls, 0, "collision escalation allocated: {esc_allocs:?}");
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::CollisionLatched));
+    let fi = inner.safety.fault().expect("collision fault info");
+    assert_eq!(fi.code, FaultCode::Collision);
+    assert!(
+        fi.message.as_str().contains("COLLISION: Collision on joint 1:") && fi.message.as_str().contains("2 trips within 30 s"),
+        "unexpected collision fault message: {}",
+        fi.message
+    );
+    // Off-thread deferred logs emit exact collision lines.
+    inner.safety.drain_log_events_off_thread();
+    inner.safety.drain_retired_state_arcs_off_thread();
+    let col_logs = take_global_logs(log);
+    assert!(
+        col_logs.contains("Collision hold ended after quiet period")
+            && col_logs.contains("Collision on joint 1:")
+            && col_logs.contains("latching Fault COLLISION"),
+        "missing deferred collision logs:\n{col_logs}"
+    );
+
+    // 2. Gravity-comp tick + Step-5 inline output (RampIn, RampIn -> Active, steady Active,
+    //    and E-stop Exiting hold): ZERO heap allocations across every control tick!
+    torques.lock().unwrap()[0] = g_model[0];
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+    inner.set_torque(true).unwrap();
+    let _ = inner.tick_control(0.02);
+    inner.enter_gravity_comp(armd::gravity_comp::GravityCompRequest::default()).unwrap();
+    // Warm up one tick after entering gravity_comp (not strictly required, keeps measurement focused on steady/ramp RT path).
+    let before_writes = write_count.load(Ordering::Relaxed);
+    let _ = alloc::take();
+    let direct_targets = inner.gravity_comp_targets().expect("gravity_comp_targets inline");
+    assert_eq!(alloc::take().calls, 0, "gravity_comp_targets() must be bounded/inline with 0 heap allocs");
+    assert!(direct_targets[0].kp.is_some() && direct_targets[6].kp.is_none());
+
+    // Measure RampIn, RampIn -> Active transition, and steady Active ticks (5 ticks = 0.10 s > 0.04 s ramp).
+    let _ = alloc::take();
+    for _ in 0..5 {
+        let _ = inner.tick_control(0.02);
+    }
+    let gc_allocs = alloc::take();
+    assert_eq!(gc_allocs.calls, 0, "gravity_comp tick + Step-5 output allocated: {gc_allocs:?}");
+    assert!(
+        write_count.load(Ordering::Relaxed) >= before_writes + 5,
+        "gravity_comp Step-5 must deliver MIT targets to driver"
+    );
+    let sent = last_targets.lock().unwrap().clone();
+    assert!(sent[1].kp == Some(0.0) && sent[1].torque.is_some_and(f32::is_finite), "expected Active MIT target: {:?}", sent[1]);
+
+    // Trigger E-stop during gravity comp -> Exiting phase Step-5 `write_estop_hold` must also do 0 heap allocs!
+    let before_holds = estop_hold_count.load(Ordering::Relaxed);
+    let _ = alloc::take();
+    inner.apply_stop_policy(StopPolicy::EStopLatch);
+    let _ = inner.tick_control(0.02);
+    let gc_estop_allocs = alloc::take();
+    assert_eq!(gc_estop_allocs.calls, 0, "gravity_comp E-stop exit + hold output allocated: {gc_estop_allocs:?}");
+    assert!(
+        estop_hold_count.load(Ordering::Relaxed) >= before_holds + 2,
+        "expected immediate + Step-5 write_estop_hold calls"
+    );
+    inner.safety.drain_log_events_off_thread();
+    inner.safety.drain_retired_state_arcs_off_thread();
+    let gc_logs = take_global_logs(log);
+    assert!(
+        gc_logs.contains("Gravity compensation ramp complete")
+            && gc_logs.contains("Gravity compensation exit: ESTOP E-stop"),
+        "missing deferred gravity_comp logs:\n{gc_logs}"
+    );
+}
