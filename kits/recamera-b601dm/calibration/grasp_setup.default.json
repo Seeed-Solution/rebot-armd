@@ -30,6 +30,6 @@
   "align_j6": true,
   "approach_speed_mps": 0.05,
   "descend_speed_mps": 0.03,
-  "phase_timeout_s": 25.0,
+  "phase_timeout_s": 30.0,
   "timeout_s": 120.0
 }

@@ -23,7 +23,7 @@ use crate::motion::MotionError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::persist::{self, Loaded, PendingWrite};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::safety::{FaultCode, FaultReason, SafetyError};
+use crate::safety::{FaultCode, SafetyError};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
@@ -212,12 +212,29 @@ impl CollisionGuard {
     }
 
     /// Deterministic collision transition used by simulation and WASM. Returns the
-    /// tripped joint (zero based) when a new hold is entered, or `None` otherwise.
+    /// tripped joint (zero based) when a new hold or escalation occurs, or `None` otherwise.
     pub fn step(&mut self, residuals: Option<&[f32; 6]>, dt_s: f64, now_s: f64,
         policy: &CollisionPolicy, operational: bool, supported: &[bool; 6]) -> CollisionStep {
+        self.step_guard(residuals, dt_s, now_s, policy, operational, operational, supported)
+    }
+
+    /// Collision transition separating recoverable protective holds (`hold_allowed`, operational
+    /// states only) from collision escalation detection (`detect_active`, also active while
+    /// torqued in Fault/EStop so escalation routes through `SafetyManager::latch`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_guard(
+        &mut self,
+        residuals: Option<&[f32; 6]>,
+        dt_s: f64,
+        now_s: f64,
+        policy: &CollisionPolicy,
+        hold_allowed: bool,
+        detect_active: bool,
+        supported: &[bool; 6],
+    ) -> CollisionStep {
         let mut out = CollisionStep::default();
         if let Some(mut hold) = self.hold {
-            if !self.enabled || !operational { self.hold = None; self.over = [0; 6]; out.released = true; return out; }
+            if !self.enabled || !hold_allowed { self.hold = None; self.over = [0; 6]; out.released = true; return out; }
             let thresholds: [f32; 6] = std::array::from_fn(|j| policy.thresholds_nm[j] * self.sensitivity.factor());
             let quiet = residuals.is_some_and(|r| (0..6).all(|j| supported[j] || r[j].abs() < policy.clear_ratio * thresholds[j]));
             hold.quiet_s = if quiet { hold.quiet_s + dt_s } else { 0.0 };
@@ -225,7 +242,7 @@ impl CollisionGuard {
             else { self.hold = Some(hold); }
             return out;
         }
-        if !self.enabled || !operational { self.over = [0; 6]; return out; }
+        if !self.enabled || !detect_active { self.over = [0; 6]; return out; }
         let Some(residuals) = residuals else { self.over = [0; 6]; return out; };
         let thresholds: [f32; 6] = std::array::from_fn(|j| policy.thresholds_nm[j] * self.sensitivity.factor());
         let mut worst = None;
@@ -241,7 +258,7 @@ impl CollisionGuard {
             self.over = [0; 6];
             let trips = self.trips_in_window(now_s, policy.escalate_window_s);
             out.escalated = trips > policy.max_auto_resumes;
-            if !out.escalated {
+            if !out.escalated && hold_allowed {
                 self.hold = Some(CollisionHold { joint: j, residual_nm: residuals[j], threshold_nm: thresholds[j], since_s: now_s, quiet_s: 0.0 });
             }
             out.trip = Some((j, residuals[j], thresholds[j]));
@@ -370,9 +387,23 @@ impl SupervisorInner {
 
     pub(crate) fn collision_tick(&mut self, dt: f64) {
         let p = self.collision_policy();
-        let operational = self.is_torqued && self.safety.state().is_operational() && self.gravity_comp.is_none()
-            && !self.disable_pending && !self.pending_rearm;
-        let watching = self.collision.enabled && self.collision_available() && operational && self.unload_settle.is_none();
+        let active_arm = self.is_torqued
+            && self.gravity_comp.is_none()
+            && !self.disable_pending
+            && !self.pending_rearm;
+        let hold_allowed = active_arm && self.safety.state().is_operational();
+        // Detection and escalation remain active while torqued even when another fault or E-stop
+        // is already latched, routing escalation through `SafetyManager::latch`.
+        let detect_active = active_arm
+            && !matches!(
+                self.safety.state(),
+                crate::safety::SafetyState::Booting | crate::safety::SafetyState::Idle
+            )
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::CollisionLatched);
+        let watching = self.collision.enabled
+            && self.collision_available()
+            && detect_active
+            && self.unload_settle.is_none();
         let supported = self.collision_supported_joints();
         let now = self.start_time.elapsed().as_secs_f64();
         let residuals = if self.collision.hold.is_some() {
@@ -380,9 +411,17 @@ impl SupervisorInner {
         } else {
             self.residual_torques.as_ref().filter(|_| watching)
         };
-        let result = self.collision.step(residuals, dt, now, &p, operational, &supported);
+        let result = self.collision.step_guard(
+            residuals,
+            dt,
+            now,
+            &p,
+            hold_allowed,
+            watching,
+            &supported,
+        );
         if result.released {
-            tracing::info!("Collision hold ended after quiet period");
+            self.safety.log_collision_hold_released();
         }
         if let Some((j, residual, threshold)) = result.trip {
             self.collision_trip(j, residual, threshold, &p, now, result.escalated);
@@ -393,10 +432,14 @@ impl SupervisorInner {
     /// and latch Fault `COLLISION` when this trip exceeds `max_auto_resumes` in the window.
     fn collision_trip(&mut self, j: usize, residual: f32, threshold: f32, p: &CollisionPolicy, now: f64, escalated: bool) {
         let trips = self.collision.trips_in_window(now, p.escalate_window_s);
-        let message = format!("Collision on joint {}: residual {residual:.2} N·m above threshold {threshold:.2} N·m", j + 1);
-        tracing::warn!("{message} (trip {trips} within {:.0} s); protective stop", p.escalate_window_s);
+        let mut message = crate::safety::BoundedText::<160>::empty();
+        let _ = core::fmt::write(
+            &mut message,
+            format_args!("Collision on joint {}: residual {residual:.2} N·m above threshold {threshold:.2} N·m", j + 1),
+        );
+        self.safety.log_collision_trip(j as u8, residual, threshold, trips, p.escalate_window_s);
         if let Some(id) = self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id) {
-            self.finish_action(id, "failed", Some("COLLISION"), Some(message.clone()), None, None, None);
+            self.finish_action(id, "failed", Some("COLLISION"), Some(message.as_str().to_owned()), None, None, None);
         }
         self.drop_macro_run("failed", Some("COLLISION"));
         // Hold commanded = measured; the gripper keeps its command so a held object stays held.
@@ -412,16 +455,23 @@ impl SupervisorInner {
             }
         }
         if let (Some(g), Some(c)) = (gripper_idx, grip_cmd) { self.commanded_positions[g] = c; }
-        self.target_positions.clone_from(&self.commanded_positions);
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
         self.servo_lead_stall.fill(None);
         self.safety.mark_motion_finished();
         if escalated {
-            tracing::error!("Collision guard: {trips} trips within {:.0} s; latching Fault COLLISION", p.escalate_window_s);
-            self.safety.trigger_fault_coded(FaultCode::Collision, FaultReason::Other(format!(
-                "COLLISION: {message}; {trips} trips within {:.0} s", p.escalate_window_s)));
+            self.safety.log_collision_escalated(trips, p.escalate_window_s);
+            self.safety.latch(
+                crate::safety::FaultKind::CollisionLatched,
+                crate::safety::FaultDetail::formatted(FaultCode::Collision, |buf| {
+                    let _ = core::fmt::write(
+                        buf,
+                        format_args!("COLLISION: {message}; {trips} trips within {:.0} s", p.escalate_window_s),
+                    );
+                }),
+            );
         }
         // Pure step has already installed the hold state.
     }

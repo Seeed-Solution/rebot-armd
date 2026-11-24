@@ -249,6 +249,10 @@ pub const PLANE_MAX_TILT_DEG: f64 = 5.0;
 pub const PLANE_MAX_OFFSET_M: f64 = 0.01;
 /// Object threshold: this many times the MAD of the table residuals (at least `object_min_h_m`).
 pub const PLANE_MAD_K: f64 = 3.0;
+/// The inliers surround the object when the largest angular gap between them, seen from the box
+/// centre, is below this (deg); else the tilt is not constrained at the object and only the
+/// offset is fitted (horizontal plane at the inliers' median height).
+pub const PLANE_MAX_GAP_DEG: f64 = 150.0;
 
 /// A fitted table plane.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -265,6 +269,20 @@ pub struct TablePlane {
     pub mad_mm: f64,
     /// The object threshold max(`object_min_h_m`, [`PLANE_MAD_K`] x MAD) (mm).
     pub threshold_mm: f64,
+    /// `fit` (tilted plane through the inliers) or `offset_only` (the inliers do not surround the
+    /// object: horizontal plane at their median height).
+    pub mode: &'static str,
+    /// Largest angular gap between the inliers seen from the box centre (deg; 360 with one).
+    pub max_gap_deg: f64,
+}
+
+/// Largest angular gap (deg) between the directions of `pts` seen from `centre_xy`.
+pub fn max_angular_gap_deg(pts: &[Vec3], centre_xy: [f64; 2]) -> f64 {
+    let mut a: Vec<f64> = pts.iter().map(|x| (x[1] - centre_xy[1]).atan2(x[0] - centre_xy[0]).to_degrees()).collect();
+    if a.len() < 2 { return 360.0; }
+    a.sort_by(f64::total_cmp);
+    let wrap = a[0] + 360.0 - a[a.len() - 1];
+    a.windows(2).map(|w| w[1] - w[0]).fold(wrap, f64::max)
 }
 
 /// Least-squares plane z = a x + b y + c through `pts`.
@@ -288,6 +306,8 @@ fn lsq_plane(pts: &[Vec3]) -> Option<[f64; 3]> {
 /// within 20 deg of vertical), then least squares on the inliers. None with fewer than
 /// [`PLANE_MIN_POINTS`] candidates or inliers, or a plane tilted more than
 /// [`PLANE_MAX_TILT_DEG`] or more than [`PLANE_MAX_OFFSET_M`] off `table_z_m` at `centre_xy`.
+/// When the inliers leave an angular gap of [`PLANE_MAX_GAP_DEG`] or more around `centre_xy`
+/// (they lie on one side of the object) only the offset is fitted: `mode` `offset_only`.
 pub fn fit_table_plane(points: &[Point], p: &Params, centre_xy: [f64; 2]) -> Option<TablePlane> {
     let cand: Vec<Vec3> = points.iter().filter(|q| !q.in_box && (q.x[2] - p.table_z_m).abs() <= PLANE_BAND_M).map(|q| q.x).collect();
     if cand.len() < PLANE_MIN_POINTS { return None; }
@@ -309,7 +329,15 @@ pub fn fit_table_plane(points: &[Point], p: &Params, centre_xy: [f64; 2]) -> Opt
     }
     if best_n < PLANE_MIN_POINTS { return None; }
     let inl: Vec<Vec3> = cand.iter().zip(&best).filter(|(_, b)| **b).map(|(x, _)| *x).collect();
-    let [a, b, c] = lsq_plane(&inl)?;
+    let max_gap_deg = max_angular_gap_deg(&inl, centre_xy);
+    let ([a, b, c], mode) = if max_gap_deg < PLANE_MAX_GAP_DEG {
+        (lsq_plane(&inl)?, "fit")
+    } else {
+        // one-sided support: a fitted tilt would be extrapolated to the object
+        let mut z: Vec<f64> = inl.iter().map(|x| x[2]).collect();
+        z.sort_by(f64::total_cmp);
+        ([0.0, 0.0, quantile(&z, 0.5)], "offset_only")
+    };
     let l = (a * a + b * b + 1.0).sqrt();
     let plane = [-a / l, -b / l, 1.0 / l, -c / l];
     let tilt_deg = (1.0 / l).acos().to_degrees();
@@ -324,6 +352,7 @@ pub fn fit_table_plane(points: &[Point], p: &Params, centre_xy: [f64; 2]) -> Opt
     Some(TablePlane {
         plane, n_points: cand.len(), n_inliers: inl.len(), offset_mm: offset * 1000.0, tilt_deg, mad_mm: mad * 1000.0,
         threshold_mm: p.object_min_h_m.max(PLANE_MAD_K * mad) * 1000.0,
+        mode, max_gap_deg,
     })
 }
 
@@ -1789,6 +1818,19 @@ mod tests {
         // too few points, or a plane far from the calibrated table: no fit
         assert!(fit_table_plane(&pts[..9], &Params::new(0.01), [0.3, 0.0]).is_none());
         assert!(fit_table_plane(&pts, &Params::new(-0.002), [0.3, 0.0]).is_none());
+        assert_eq!(t.mode, "fit");
+        assert!(t.max_gap_deg < PLANE_MAX_GAP_DEG, "{t:?}");
+        // the same table seen on one side of the object only (y < -0.05): offset only, horizontal,
+        // at the inliers' median height
+        let one: Vec<Point> = (0..60).map(|i| {
+            let (x, y) = (0.2 + 0.004 * f64::from(i % 20) * 2.5, -0.06 - 0.01 * f64::from(i / 20) * 2.0);
+            pt(x, y, z(x) + if i % 2 == 0 { 0.0005 } else { -0.0005 }, false)
+        }).collect();
+        let o = fit_table_plane(&one, &Params::new(0.01), [0.3, 0.0]).unwrap();
+        assert_eq!(o.mode, "offset_only");
+        assert!(o.max_gap_deg >= 180.0 && o.tilt_deg.abs() < 1e-9 && (o.offset_mm - 3.0).abs() < 0.6, "{o:?}");
+        assert_eq!(max_angular_gap_deg(&[[1.0, 0.0, 0.0]], [0.0, 0.0]), 360.0);
+        assert!((max_angular_gap_deg(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], [0.0, 0.0]) - 90.0).abs() < 1e-9);
     }
 
     #[test]

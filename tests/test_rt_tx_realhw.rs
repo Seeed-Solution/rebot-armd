@@ -1226,3 +1226,86 @@ fn profile_tx_budget_and_stall_ticks_validation() {
     cfg2.control_frequency_hz = 25; // period 40 ms -> ceil(45/40) = 2
     assert_eq!(cfg2.resolved_tx_stall_ticks(), 2);
 }
+
+/// B3 + TX-realhw integration: `FaultKind::CanTxStalled` latched via `SafetyManager::latch`
+/// enforces its `clear_check` rule on both Legacy and RT Executor owners — refusing while the
+/// driver's TX queue has pending frames or feedback is stale, and clearing once drained + fresh.
+#[test]
+fn dual_owner_can_tx_stalled_clear_check_requires_drained_tx_queue_and_fresh_feedback() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new(owner, base_cfg(), None);
+        rig.bus.with(|s| s.tx_enobufs = true);
+        // Drive 4 stalled ticks (80 ms > 45 ms) to latch FaultKind::CanTxStalled via SafetyManager::latch.
+        for _ in 0..4 {
+            rig.step();
+        }
+        assert!(rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled));
+        assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::CanTxStalled));
+        // Run one stopped tick while still backpressured so pending_hold_tx is non-empty.
+        rig.step();
+        assert!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_tx_len_total() > 0,
+            "{owner:?}: expected pending hold TX frames while bus is backpressured"
+        );
+
+        // 1. Fresh feedback, but TX queue NOT drained -> MUST refuse with TxQueueNotDrained!
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(
+                    err.contains("CAN TX queue still has pending frames"),
+                    "{owner:?}: expected TxQueueNotDrained refusal, got: {err}"
+                );
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert_eq!(
+                    err,
+                    armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::TxQueueNotDrained),
+                    "{owner:?}: expected bounded TxQueueNotDrained refusal"
+                );
+            }
+        }
+        assert!(rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled));
+
+        // 2. Bus recovers and drains pending hold TX on next tick, then advance clock past 250 ms
+        //    without new feedback -> drained queue, stale feedback -> MUST refuse with FreshFeedbackRequired!
+        rig.bus.with(|s| s.tx_enobufs = false);
+        rig.step();
+        assert_eq!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_tx_len_total(),
+            0,
+            "{owner:?}: expected TX queue drained after bus recovery step"
+        );
+        rig.bus.with(|s| {
+            s.immediate_replies = false;
+            s.rx.clear();
+        });
+        rig.clock.advance(ms(400));
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(
+                    err.contains("Fresh feedback is required"),
+                    "{owner:?}: expected FreshFeedbackRequired refusal, got: {err}"
+                );
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert_eq!(
+                    err,
+                    armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::FreshFeedbackRequired),
+                    "{owner:?}: expected bounded FreshFeedbackRequired refusal"
+                );
+            }
+        }
+
+        // 3. Push fresh feedback + drained TX queue -> clear_fault succeeds and resets latched kinds!
+        rig.bus.with(|s| s.immediate_replies = true);
+        rig.step();
+        rig.clear_fault_and_enable();
+        assert_eq!(rig.inner().safety.latched_fault_kinds(), 0);
+    }
+}

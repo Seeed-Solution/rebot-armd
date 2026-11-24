@@ -84,21 +84,16 @@ fn copy_into<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
     dst.extend_from_slice(src);
 }
 
-/// Preallocated per-slot string buffers reused across `None <-> Some(String)` and
-/// `SafetyState::Fault(Other(_)) <-> Fault(CanTxStalled)` transitions so RT publication
-/// never allocates or drops heap strings.
+/// Preallocated per-slot string spare reused across `None <-> Some(String)` action message
+/// transitions so RT publication never allocates or drops heap strings.
 #[derive(Debug, Default)]
 pub struct ObservationSpares {
-    pub fault_msg: String,
-    pub safety_reason: String,
     pub action_msg: String,
 }
 
 impl ObservationSpares {
     pub fn preallocated() -> Self {
         Self {
-            fault_msg: String::with_capacity(256),
-            safety_reason: String::with_capacity(256),
             action_msg: String::with_capacity(256),
         }
     }
@@ -225,12 +220,6 @@ impl StatePublisher {
     /// Returns the string spares to the back slot before publishing (0 alloc, 0 drop).
     pub fn restore_back_spares(&mut self, spares: ObservationSpares) {
         let slot = self.producer.back_mut();
-        if spares.fault_msg.capacity() > slot.spares.fault_msg.capacity() {
-            slot.spares.fault_msg = spares.fault_msg;
-        }
-        if spares.safety_reason.capacity() > slot.spares.safety_reason.capacity() {
-            slot.spares.safety_reason = spares.safety_reason;
-        }
         if spares.action_msg.capacity() > slot.spares.action_msg.capacity() {
             slot.spares.action_msg = spares.action_msg;
         }

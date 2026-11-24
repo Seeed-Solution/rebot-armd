@@ -609,7 +609,7 @@ pub fn expected_duration(inner: &SupervisorInner, steps: &[(usize, PinnedStep)],
                 PinnedStep::Gripper { action, fraction } => {
                     once += 1.0 + match (gripper_idx, inner.config.gripper_policy.clone()) {
                         (Some(g), Some(policy)) => {
-                            let request = gripper_request(*action, *fraction);
+                            let request = gripper_request(*action, *fraction, policy.close_speed());
                             let start = q.as_ref().map_or(inner.commanded_positions[g], |q| q[g]);
                             match crate::motion::GripperMotion::try_with_close_speed_limit(
                                 request, policy, inner.config.limits[g].clone(), start, g, inner.gripper_close_speed_limit(),
@@ -647,10 +647,13 @@ pub fn expected_duration(inner: &SupervisorInner, steps: &[(usize, PinnedStep)],
     first + next * f64::from(repeats.saturating_sub(1)) + 1.0
 }
 
-fn gripper_request(action: GripperAction, fraction: Option<f64>) -> crate::motion::GripperRequest {
+/// The request a sequence gripper step runs (as `macro_action::MacroCtx::gripper` /
+/// `gripper_move` build it): closes and moves at `close_speed` with the derived deadline.
+fn gripper_request(action: GripperAction, fraction: Option<f64>, close_speed: f64) -> crate::motion::GripperRequest {
     use crate::motion::GripperCommand as C;
     let command = match action { GripperAction::Open => C::Open, GripperAction::Close => C::Close, GripperAction::Move => C::Move };
-    crate::motion::GripperRequest { command, fraction, grasp: command == C::Close, speed: 1.0, timeout_s: Some(8.0), tag: None }
+    let (speed, timeout_s) = if command == C::Open { (1.0, Some(8.0)) } else { (close_speed, None) };
+    crate::motion::GripperRequest { command, fraction, grasp: command == C::Close, speed, timeout_s, tag: None }
 }
 
 /// Begin the parent action and spawn its orchestrator. Returns (action id, expected duration).

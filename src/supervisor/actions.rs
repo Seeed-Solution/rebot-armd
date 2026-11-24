@@ -855,9 +855,97 @@ impl SupervisorInner {
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
+    /// Effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`, `sequence`,
+    /// `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
+    /// damiao_gripper.close_speed_rad_s when pos_force)`, quantized downward to `0.01 rad/s`
+    /// when `pos_force` is active.
+    pub fn effective_planned_close_speed(&self) -> f64 {
+        let mut v = self.config.gripper_policy.as_ref()
+            .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
+        if let Some(max_v) = self.config.gripper_index()
+            .and_then(|g| self.config.limits.get(g))
+            .map(|l| f64::from(l.max_velocity))
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            v = v.min(max_v);
+        }
+        if let Some(cap) = self.gripper_close_speed_limit() {
+            v = v.min(f64::from(cap));
+            let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(v);
+            if raw > 0 {
+                v = f64::from(raw) / 100.0;
+            }
+        }
+        v
+    }
+
+    /// Snapshot of the active tool's free-motion torque baseline for a new gripper motion. A
+    /// baseline of another tool (id or config digest) or follower is replaced by an empty one.
+    pub fn gripper_baseline_for_motion(&mut self) -> Option<crate::gripper_baseline::FreeTorqueBaseline> {
+        let policy = self.config.gripper_policy.as_ref()?;
+        let tool = &self.config.active_tool;
+        let follower = self.follower.as_deref();
+        let lo = policy.closed_rad.min(policy.open_rad);
+        let hi = policy.closed_rad.max(policy.open_rad);
+        // same tool and follower, and the same stroke (a gripper calibration offset moves it)
+        let matches = self.gripper_baseline.as_ref().is_some_and(|b| b.belongs_to(&tool.id, &tool.config_digest, follower)
+            && (b.lo_rad - lo).abs() < 1e-3 && (b.hi_rad - hi).abs() < 1e-3);
+        if !matches {
+            if self.gripper_baseline.is_some() {
+                tracing::info!("Gripper baseline belongs to another tool; starting unlearned for {}", tool.id);
+                self.gripper_baseline_dirty = true;
+            }
+            self.gripper_baseline = Some(crate::gripper_baseline::FreeTorqueBaseline::new(
+                policy.closed_rad, policy.open_rad, Some(tool.id.clone()), Some(tool.config_digest.clone()), self.follower.clone()));
+        }
+        self.gripper_baseline.clone()
+    }
+
+    /// Forget the learned free-motion torque (`/api/v1/action/gripper` `"baseline": "reset"`);
+    /// the next unloaded moves learn it again.
+    pub fn reset_gripper_baseline(&mut self) {
+        self.gripper_baseline = None;
+        self.gripper_last_contact = None;
+        self.gripper_baseline_pending.clear();
+        self.gripper_baseline_generation += 1;
+        self.gripper_baseline_for_motion();
+        self.gripper_baseline_dirty = true;
+        tracing::info!("Gripper baseline reset");
+    }
+
+    /// Contact threshold of the learned baseline at jaw `q` moving toward `closing` (the closing
+    /// sign of the policy or its opposite) at |v| `speed`; None when not learned there.
+    pub fn gripper_baseline_threshold(&self, q: f32, closing: bool, speed: f32) -> Option<f32> {
+        let b = self.gripper_baseline.as_ref()?;
+        let cap = self.config.gripper_policy.as_ref().and_then(|p| p.max_close_torque_nm);
+        let dir = if closing { crate::gripper_baseline::Direction::Close } else { crate::gripper_baseline::Direction::Open };
+        b.estimate(q, dir, speed).map(|e| e.threshold_nm(cap))
+    }
+
+    /// `observation.gripper.baseline` (zero-allocation inline [`crate::model::HolderLabel`]).
+    pub fn gripper_baseline_observation(&self) -> crate::model::GripperBaselineObs {
+        let tool = &self.config.active_tool;
+        let b = self.gripper_baseline.as_ref().filter(|b| b.belongs_to(&tool.id, &tool.config_digest, self.follower.as_deref()));
+        crate::model::GripperBaselineObs {
+            state: crate::model::HolderLabel::new(b.map_or("unlearned", |b| b.state())),
+            close_moves: b.map_or(0, |b| b.close_moves),
+            open_moves: b.map_or(0, |b| b.open_moves),
+            rejected_moves: b.map_or(0, |b| b.rejected_moves),
+            last_contact: self.gripper_last_contact,
+        }
+    }
+
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
-        self.start_macro_gripper_within(id, request, None, false).map(|(dur, _, _)| dur)
+        self.start_macro_gripper_learning_within(id, request, crate::motion::LearnMode::Opening, None, false)
+            .map(|(dur, _, _)| dur)
+    }
+
+    /// [`Self::start_macro_gripper`] recording the move for the baseline as `learn` allows
+    /// (`gripper_calibrate` strokes: `LearnMode::Calibration`).
+    pub fn start_macro_gripper_learning(&mut self, id: u64, request: GripperRequest, learn: crate::motion::LearnMode) -> Result<f64, ArmError> {
+        self.start_macro_gripper_learning_within(id, request, learn, None, false)
+            .map(|(dur, _, _)| dur)
     }
 
     /// Start a gripper sub-motion of macro action `id`, verifying before installation that
@@ -868,6 +956,25 @@ impl SupervisorInner {
         &mut self,
         id: u64,
         request: GripperRequest,
+        max_budget_s: Option<f64>,
+        extend_pos_force_close_timeout: bool,
+    ) -> Result<(f64, f64, bool), ArmError> {
+        self.start_macro_gripper_learning_within(
+            id,
+            request,
+            crate::motion::LearnMode::Opening,
+            max_budget_s,
+            extend_pos_force_close_timeout,
+        )
+    }
+
+    /// [`Self::start_macro_gripper_within`] with an explicit baseline [`crate::motion::LearnMode`].
+    #[doc(hidden)]
+    pub fn start_macro_gripper_learning_within(
+        &mut self,
+        id: u64,
+        request: GripperRequest,
+        learn: crate::motion::LearnMode,
         max_budget_s: Option<f64>,
         extend_pos_force_close_timeout: bool,
     ) -> Result<(f64, f64, bool), ArmError> {
@@ -888,9 +995,8 @@ impl SupervisorInner {
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
         )?.with_ceiling_torque_estimate(ceiling_est);
         let is_pos_force_close = close_cap.is_some() && motion.is_closing();
-        if is_pos_force_close && extend_pos_force_close_timeout {
-            motion.request.timeout_s = None;
-            motion.timeout_s = motion.default_timeout_s();
+        if is_pos_force_close && extend_pos_force_close_timeout && motion.request.timeout_s.is_some() {
+            motion.use_default_timeout();
         }
         let duration = motion.expected_duration();
         let timeout_s = motion.timeout_s;
@@ -906,6 +1012,9 @@ impl SupervisorInner {
                 )).into());
             }
         }
+        self.safety.mark_motion_started()?;
+        let baseline = self.gripper_baseline_for_motion();
+        let motion = motion.with_baseline(baseline, learn);
         self.releasing = matches!(motion.request.command, GripperCommand::Open);
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
@@ -914,7 +1023,6 @@ impl SupervisorInner {
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
-        self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         self.set_macro_sub_running(id);
@@ -989,6 +1097,12 @@ impl SupervisorInner {
 
     /// Start a gripper action. Returns (action id, expected duration).
     pub fn start_gripper(&mut self, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
+        self.start_gripper_with_baseline(request, epoch, GripperBaselineCmd::None)
+    }
+
+    /// [`Self::start_gripper`] with a baseline command; a reset happens only once the action is
+    /// admitted (a refused action leaves the learned baseline as it was).
+    pub fn start_gripper_with_baseline(&mut self, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
         })?;
@@ -1012,17 +1126,20 @@ impl SupervisorInner {
             request, policy, self.config.limits[gripper_idx].clone(),
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
         )?.with_ceiling_torque_estimate(ceiling_est);
-        self.releasing = matches!(motion.request.command, GripperCommand::Open);
-        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();
+        self.safety.mark_motion_started()?;
+        self.releasing = matches!(motion.request.command, GripperCommand::Open);
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
+        if baseline_cmd == GripperBaselineCmd::Reset { self.reset_gripper_baseline(); }
+        let learn = if baseline_cmd == GripperBaselineCmd::None { crate::motion::LearnMode::Opening } else { crate::motion::LearnMode::Calibration };
+        let motion = motion.with_baseline(self.gripper_baseline_for_motion(), learn);
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
-        self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         let id = self.begin_action("gripper", tag);
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
@@ -1204,7 +1321,10 @@ impl SupervisorInner {
             match cause {
                 ReconcileCause::Static(_, _, text) => message.push_str(text),
                 ReconcileCause::SafetyMessage(_, _) => {
-                    if self.safety.write_fault_message(&mut message).is_none() {
+                    if let Some(info) = self.safety.fault() {
+                        use std::fmt::Write;
+                        let _ = write!(message, "{}", info.message);
+                    } else {
                         message.push_str("CAN TX stalled");
                     }
                 }

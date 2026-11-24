@@ -175,7 +175,7 @@ impl ArmCore {
     /// one, allocated, only before the slot held one: the first ticks).
     pub fn take_observation_buffer(&mut self) -> ObservationBuffer {
         self.buffer_out = true;
-        let obs = self.publisher.take_back_observation().unwrap_or_else(ArmObservation::blank);
+        let obs = self.publisher.take_back_observation().unwrap_or_else(ArmObservation::blank_rt);
         let spares = self.publisher.take_back_spares();
         ObservationBuffer(obs, spares)
     }

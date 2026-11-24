@@ -339,11 +339,23 @@ pub struct MockCanTransport {
     error_on_next_tx: Option<String>,
     error_on_next_rx: Option<String>,
     transmit_responses: Vec<(CanFrame, CanFrame)>,
+    clock: Option<MockClock>,
 }
 
 impl MockCanTransport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach a deterministic virtual clock so drivers using this mock transport
+    /// are completely independent of host wall-clock scheduling.
+    pub fn with_clock(mut self, clock: MockClock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    pub fn mock_clock(&self) -> Option<&MockClock> {
+        self.clock.as_ref()
     }
 
     /// Opt-in response generated after a matching transmit, never before it.
@@ -439,5 +451,9 @@ impl CanTransport for MockCanTransport {
 
     fn supports_nonblocking_rt(&self) -> bool {
         true
+    }
+
+    fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+        self.clock.clone().map(|c| Arc::new(c) as Arc<dyn DriverClock>)
     }
 }

@@ -1027,12 +1027,18 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     assert!(matches!(inner.safety.state(), SafetyState::Fault(FaultReason::CanTxStalled)));
     assert_eq!((a, f), (0, 0), "subsequent stalled hold tick_publish touched allocator");
 
-    // (d) Off-thread reclamation saturation refusal: fill RETIRED_STATE_CAPACITY (16) retired
-    // fault transitions without draining, then try_trigger_can_tx_stalled inside counted.
+    // (d) Off-thread reclamation saturation: fill RETIRED_STATE_CAPACITY (16) retired
+    // fault transitions without draining, leave a non-cached Fault(Other) active, then latch
+    // CanTxStalled via SafetyManager::latch inside counted -> records kind & detail and advances
+    // epoch with 0 allocs / 0 frees without overflowing or dropping the retired fault ring.
+    inner.safety.clear_fault_bounded().expect("clear before filling retired ring");
     for _ in 0..RETIRED_STATE_CAPACITY {
         inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fill".into()));
+        inner.safety.clear_fault_bounded().expect("retire fault arc");
     }
+    inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("active-full".into()));
     assert!(inner.safety.retired_state_arcs_full());
+    assert!(!inner.safety.can_accept_fault_transition());
     let stall_detail = TxStallDetail {
         queued: 5,
         dropped: 0,
@@ -1041,9 +1047,18 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
         consecutive_ticks: 3,
         is_hold: false,
     };
-    let (res, a, f) = counted(|| inner.safety.try_trigger_can_tx_stalled(stall_detail));
-    assert!(res.is_err(), "saturated retired fault ring must refuse CAN_TX_STALLED transition");
-    assert_eq!((a, f), (0, 0), "saturated try_trigger_can_tx_stalled touched allocator");
+    let ep_before = inner.safety.epoch_id();
+    let (ep_after, a, f) = counted(|| {
+        inner.safety.latch(
+            armd::safety::FaultKind::CanTxStalled,
+            armd::safety::FaultDetail::CanTxStalled(Some(stall_detail)),
+        )
+    });
+    assert_eq!(ep_after, ep_before + 1, "CanTxStalled latch must advance epoch_id");
+    assert!(inner.safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled));
+    assert_eq!(inner.safety.fault_code(), Some(FaultCode::CanTxStalled));
+    assert_eq!(inner.safety.tx_stall_detail(), Some(stall_detail));
+    assert_eq!((a, f), (0, 0), "saturated SafetyManager::latch(CanTxStalled) touched allocator");
 
     // (e) Active gravity-comp tick on a fresh warmed-up SupervisorInner with DamiaoArmDriver<SharedNoAllocBus>.
     let (mut gc_inner, _gc_bus) = mk_rt_supervisor();

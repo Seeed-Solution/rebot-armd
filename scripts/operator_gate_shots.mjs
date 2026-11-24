@@ -18,6 +18,8 @@
 //  7. the enable switch label in the E-stop state fits the switch and breaks only between words;
 //  0. (tablet context) the header at 360-1440 px, simple and expert: no overlap, nothing off screen, title not clipped;
 //  the unlock after an expired session removes the "expired" and Unlock toasts.
+//  9. calibration wizard open: renewal offered 3 min before the session ends, Renew asks for the PIN while unlocked and
+//     starts a new session; a refused session upload is queued and stored after the next unlock.
 // The PIN dialog, the calibration drawer and the failure box are checked after their animations ended: the element
 // at their centre and four inner points belongs to them.
 // PNGs to OUT. Exits non-zero if a check fails.
@@ -236,6 +238,19 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   ok(!cover.length, `${name} fine calibration failure box on top of the page ${JSON.stringify(cover)}`);
   await page.screenshot({ path: path.join(out, `${name}_7_fine_fail.png`) });
   ok(fine.items === 2 && fine.msgs.some((x) => x.includes(fine.same) && x.includes('RMS') && x.includes('B → A')), `${name} failed fine calibration: one line per failed cause ${JSON.stringify(fine)}`);
+  // the same failure explained by a bent board (calib_wizard.js boardFlatness; values of the real session 2026-11-23):
+  // the image-noise hint becomes the board message with bow, largest corner and marker
+  const flatMsg = await page.evaluate(() => {
+    CWZ.solve.flatness = { explains: true, rms0: 0.591, rms1: 0.316, gain: 0.47, rangeMm: 2.8, bowMm: 1.57, worst: { id: 11, mm: -1.98 } };
+    cwRender();
+    const li = document.querySelector('#cwiz-body .cwiz-fail li.cwiz-flat');
+    if (li) li.scrollIntoView({ block: 'center' });
+    return { flat: li ? li.innerText : null, all: $('cwiz-body').querySelector('.cwiz-fail').innerText };
+  });
+  ok(!!flatMsg.flat && (lang === 'zh' ? /标定板不平.*1\.6 mm.*2\.0 mm.*11 号标记/ : /not flat.*1\.6 mm.*2\.0 mm.*marker 11/).test(flatMsg.flat)
+    && !(lang === 'zh' ? /图像噪声偏大/ : /image noise too high/).test(flatMsg.all), `${name} bent board named instead of image noise ${JSON.stringify(flatMsg)}`);
+  await settle(page);
+  await page.screenshot({ path: path.join(out, `${name}_7b_fine_fail_board.png`) });
   await page.evaluate(() => { cwOpen(false); CWZ.solve = null; CWZ.step = 'board'; });
   // 7. E-stop latched: the enable switch label is not cut off
   await page.click('#btn-estop');
@@ -256,6 +271,49 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   // reset (the session is unlocked here) so the next viewport starts without a latched E-stop
   await page.evaluate(() => clearFault());
   ok(await waitFor(page, () => S.state !== 'EStop'), name + ' E-stop reset');
+  // 9. long flow (calibration wizard open): 3 min before the session ends a toast offers the renewal; Renew asks for the
+  // PIN while the session still runs and starts a new one. A session upload refused after the session ended waits and
+  // is stored again after the next unlock (from the badge), without a new capture.
+  {
+    let sessPosts = 0, sessOk = 0;
+    await page.route((u) => u.pathname === '/api/v1/calibration/sessions', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      sessPosts++;
+      const r = await route.fetch().catch(() => null);
+      if (r && r.status() === 403) return route.fulfill({ response: r });
+      sessOk++;
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'S' + sessOk }) });
+    });
+    if (!(await page.evaluate(() => S.auth.role === 'operator'))) { await page.click('#btn-op'); await enterPin(page); }
+    await page.evaluate(() => { CWZ.views = [{ markers: [], q: [0, 0, 0, 0, 0, 0], ds: 0 }]; cwOpen(true); });
+    await clearToasts(page);
+    const exp0 = await page.evaluate(() => { S.auth.expiresAt = Date.now() + 2 * 60000; opCheckExpiry(); return S.auth.expiresAt; });
+    const warn = await toasts(page);
+    ok(warn.some((x) => x.act && (lang === 'zh' ? /到期/ : /ends in/).test(x.text)), `${name} renewal offered before the session ends ${JSON.stringify(warn)}`);
+    await settle(page);
+    await page.screenshot({ path: path.join(out, `${name}_9a_renew_warn.png`) });
+    await page.click('#toasts .toast-act');
+    ok(await waitFor(page, () => !$('op-modal').hidden && !$('op-pin-field').hidden), name + ' Renew asks for the PIN while unlocked');
+    await settle(page);
+    await page.screenshot({ path: path.join(out, `${name}_9b_renew_pin.png`) });
+    await page.fill('#op-pin', PIN); await page.press('#op-pin', 'Enter');
+    ok(await waitFor(page, (e) => $('op-modal').hidden && S.auth.role === 'operator' && S.auth.expiresAt > e + 20 * 60000, exp0), name + ' new session, later expiry');
+    ok(await page.evaluate(() => CWZ.open && CWZ.views.length === 1), name + ' the wizard and its views stay');
+    // the session ends (cookie gone): the upload is refused, waits, and goes out after the unlock from the badge
+    await ctx.clearCookies();
+    await clearToasts(page);
+    await page.evaluate(() => cwSessionUpload());
+    ok(await waitFor(page, () => OP.queue.size === 1, null, 4000), `${name} refused session upload queued (posts ${sessPosts})`);
+    const q = await page.evaluate(() => CWZ.sessionWarn);
+    ok((lang === 'zh' ? /自动重新保存/ : /saved again by itself/).test(q), `${name} wizard says the data is stored after the unlock ${JSON.stringify(q)}`);
+    await page.evaluate(() => { if (!$('op-modal').hidden) closeOperatorModal(false); });
+    // the badge's handler (on phones the wizard sheet covers the header)
+    await page.evaluate(() => openOperatorModal()); await page.fill('#op-pin', PIN); await page.press('#op-pin', 'Enter');
+    ok(await waitFor(page, () => S.auth.role === 'operator' && OP.queue.size === 0, null, 6000) && await waitFor(page, () => CWZ.sessionId === 'S1' && !CWZ.sessionWarn, null, 6000),
+      `${name} queued upload stored after the unlock (posts ${sessPosts}, ok ${sessOk})`);
+    await page.evaluate(() => { cwOpen(false); CWZ.views = []; CWZ.sessionId = null; });
+    await page.unroute((u) => u.pathname === '/api/v1/calibration/sessions');
+  }
   console.log(`${name}: done`);
   await ctx.close();
 }
