@@ -1052,6 +1052,8 @@ pub struct SupervisorInner {
     pub zero_check_persisting: Option<u64>,
     /// Pending disk persist + commit payload produced by finish_action during ArmSupervisor::tick.
     pub pending_zero_check_persist: Option<PendingZeroCheckPersist>,
+    /// Retired `ZeroCheckPersistContext` payloads waiting for off-thread drop (never dropped on RT).
+    pub(crate) retired_zero_check_ctx: std::collections::VecDeque<Box<ZeroCheckPersistContext>>,
     /// Whether operator auth is enforced (exposed in GET /api/v1/safety/describe).
     pub operator_auth_enforced: bool,
     /// Path to persisted tool commissioning confirmations (`tool_commissioning.json`).
@@ -1326,6 +1328,75 @@ pub struct GripperCalibrationCandidate {
     driver_config_error: Option<String>,
 }
 
+/// Pre-captured heap context for `gripper_zero_check(store_offset=true)` persistence,
+/// allocated once at action start so `finish_action` on `armd-control` performs zero heap
+/// allocations and zero frees.
+#[derive(Clone)]
+pub struct ZeroCheckPersistContext {
+    pub path: PathBuf,
+    pub jaw_opening: Option<crate::model::JawOpening>,
+    pub stale: Option<crate::calibration::CalibrationStale>,
+    pub tool_id: String,
+    pub tool_config_digest: String,
+    pub active_tool_is_stock: bool,
+    pub base_gripper_policy: Option<crate::model::GripperPolicy>,
+    pub gripper_limit: Option<crate::model::JointLimit>,
+    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    /// Pre-allocated scratch buffer reused on saturation failure without allocating on RT.
+    pub sat_msg_buf: String,
+}
+
+impl ZeroCheckPersistContext {
+    /// Captures all heap-backed calibration persistence inputs off the RT completion path.
+    pub fn from_inner(
+        inner: &SupervisorInner,
+        operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    ) -> Self {
+        let path = inner
+            .gripper_calib_path
+            .clone()
+            .unwrap_or_else(crate::gripper_calib::path_from_env);
+        let gripper_limit = inner
+            .config
+            .gripper_index()
+            .and_then(|idx| inner.config.limits.get(idx))
+            .cloned();
+        Self {
+            path,
+            jaw_opening: inner.gripper_calib_jaw_opening.clone(),
+            stale: inner.gripper_calib_stale.clone(),
+            tool_id: inner.config.active_tool.id.clone(),
+            tool_config_digest: inner.config.active_tool.config_digest.clone(),
+            active_tool_is_stock: inner.config.active_tool.is_stock,
+            base_gripper_policy: inner
+                .base_gripper_policy
+                .clone()
+                .or_else(|| inner.config.gripper_policy.clone()),
+            gripper_limit,
+            operator_auth,
+            sat_msg_buf: String::with_capacity(64),
+        }
+    }
+
+    /// Serializes `GripperCalibFile` off the control thread into a [`crate::persist::PendingWrite`].
+    pub fn serialize_write(&self, offset_rad: f32) -> crate::persist::PendingWrite {
+        let file = crate::gripper_calib::GripperCalibFile {
+            offset_rad: Some(offset_rad),
+            jaw_opening: self.jaw_opening.clone(),
+            ts: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+            stale: self.stale.clone(),
+            tool_id: Some(self.tool_id.clone()),
+            tool_config_digest: Some(self.tool_config_digest.clone()),
+        };
+        let text = serde_json::to_string_pretty(&file).unwrap_or_default();
+        crate::persist::PendingWrite::new(self.path.clone(), text)
+    }
+}
+
 /// Parameters of a running gripper zero check action.
 #[derive(Clone)]
 pub struct ZeroCheckParams {
@@ -1333,7 +1404,7 @@ pub struct ZeroCheckParams {
     pub store_offset: bool,
     pub threshold_rad: f32,
     pub base_closed_rad: f32,
-    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    pub persist_ctx: Option<Box<ZeroCheckPersistContext>>,
 }
 
 /// Deferred atomic persist-before-commit job for `gripper_zero_check(store_offset=true)`.
@@ -1341,15 +1412,9 @@ pub struct ZeroCheckParams {
 pub struct PendingZeroCheckPersist {
     pub action_id: u64,
     pub offset_rad: f32,
-    pub jaw_opening: Option<crate::model::JawOpening>,
     pub base_revision: u64,
-    pub lease_owner: Option<(String, u64)>,
-    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
-    pub write: crate::persist::PendingWrite,
-    pub base_gripper_policy: Option<crate::model::GripperPolicy>,
-    pub current_calib_jaw: Option<crate::model::JawOpening>,
-    pub gripper_limit: Option<crate::model::JointLimit>,
-    pub active_tool_is_stock: bool,
+    pub lease_owner: Option<(crate::model::HolderLabel, u64)>,
+    pub ctx: Box<ZeroCheckPersistContext>,
 }
 
 /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`).
@@ -1720,6 +1785,7 @@ impl SupervisorInner {
             tick_phases_us: [0; 5],
             zero_check_persisting: None,
             pending_zero_check_persist: None,
+            retired_zero_check_ctx: std::collections::VecDeque::with_capacity(4),
             operator_auth_enforced: false,
             tool_commissioning_path: None,
             tool_commissioning_confirmed_at: None,
@@ -8002,8 +8068,32 @@ impl ArmSupervisor {
             let cw_lock = Arc::clone(&self.config_write_mutex);
             tokio::spawn(async move {
                 let _cw = cw_lock.lock().await;
-                let path = job.write.path.clone();
-                let text = job.write.text.clone();
+                if let Err(e) = SupervisorInner::validate_gripper_calibration_off_thread(
+                    job.ctx.base_gripper_policy.as_ref(),
+                    job.ctx.jaw_opening.as_ref(),
+                    job.ctx.gripper_limit.as_ref(),
+                    job.ctx.active_tool_is_stock,
+                    Some(job.offset_rad),
+                    job.ctx.jaw_opening.as_ref(),
+                ) {
+                    tracing::warn!("Failed to validate gripper calibration after zero_check: {e}");
+                    let mut inner = sup_inner.write().await;
+                    if inner.zero_check_persisting == Some(job.action_id) {
+                        inner.zero_check_persisting = None;
+                    }
+                    let now = inner.now_s();
+                    if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                        a.state = "failed".into();
+                        a.code = Some("INVALID_CALIBRATION".into());
+                        a.message = Some(format!("Gripper calibration rejected: {e}"));
+                        a.finished_at = Some(now);
+                    }
+                    inner.record_finished_action_by_id(job.action_id);
+                    return;
+                }
+                let write = job.ctx.serialize_write(job.offset_rad);
+                let path = write.path;
+                let text = write.text;
                 let staged_res = tokio::task::spawn_blocking(move || {
                     crate::persist::StagedWrite::stage(path, text)
                 }).await;
@@ -8047,11 +8137,13 @@ impl ArmSupervisor {
                     let mut inner = sup_inner.write().await;
                     let still_persisting = inner.zero_check_persisting == Some(job.action_id);
                     let action_running = inner.last_action.as_ref().is_some_and(|a| a.id == job.action_id && a.is_running());
-                    let auth_ok = job.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
+                    let auth_ok = job.ctx.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
                     let lease_ok = match &job.lease_owner {
                         None => true,
                         Some((c, g)) => inner.active_lease.as_ref().is_some_and(|l| {
-                            l.acquired_at.elapsed() < inner.lease_timeout && l.client_id == *c && l.generation == *g
+                            l.acquired_at.elapsed() < inner.lease_timeout
+                                && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
+                                && l.generation == *g
                         }),
                     };
                     let rev_ok = inner.gripper_calib_revision == job.base_revision;
@@ -8111,7 +8203,7 @@ impl ArmSupervisor {
                     }
 
                     // Build complete validated candidate BEFORE atomic rename so memory commit is infallible.
-                    let cand = match inner.build_gripper_calibration_candidate(Some(job.offset_rad), job.jaw_opening.clone()) {
+                    let cand = match inner.build_gripper_calibration_candidate(Some(job.offset_rad), job.ctx.jaw_opening.clone()) {
                         Ok((cand, _)) => cand,
                         Err(e) => {
                             staged.abort();
@@ -8132,11 +8224,13 @@ impl ArmSupervisor {
 
                     // Re-verify operator session & lease (not expired) immediately before atomic rename
                     // because OperatorAuth or lease timeout can expire during driver limit validation.
-                    let auth_still_ok = job.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
+                    let auth_still_ok = job.ctx.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
                     let lease_still_ok = match &job.lease_owner {
                         None => true,
                         Some((c, g)) => inner.active_lease.as_ref().is_some_and(|l| {
-                            l.acquired_at.elapsed() < inner.lease_timeout && l.client_id == *c && l.generation == *g
+                            l.acquired_at.elapsed() < inner.lease_timeout
+                                && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
+                                && l.generation == *g
                         }),
                     };
                     if !lease_still_ok {

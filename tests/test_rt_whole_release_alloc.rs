@@ -387,18 +387,20 @@ fn sample_persist_job(action_id: u64, dir: &std::path::Path) -> PendingZeroCheck
     PendingZeroCheckPersist {
         action_id,
         offset_rad: 0.01,
-        jaw_opening: None,
         base_revision: 1,
         lease_owner: None,
-        operator_auth: None,
-        write: armd::persist::PendingWrite::new(
-            dir.join(format!("gripper_calib_{action_id}.json")),
-            format!("{{\"offset_rad\":0.01,\"action\":{action_id}}}\n"),
-        ),
-        base_gripper_policy: Some(armd::model::GripperPolicy::rebot_dm()),
-        current_calib_jaw: None,
-        gripper_limit: None,
-        active_tool_is_stock: true,
+        ctx: Box::new(armd::supervisor::ZeroCheckPersistContext {
+            path: dir.join(format!("gripper_calib_{action_id}.json")),
+            jaw_opening: None,
+            stale: None,
+            tool_id: "stock".into(),
+            tool_config_digest: String::new(),
+            active_tool_is_stock: true,
+            base_gripper_policy: Some(armd::model::GripperPolicy::rebot_dm()),
+            gripper_limit: None,
+            operator_auth: None,
+            sat_msg_buf: String::with_capacity(64),
+        }),
     }
 }
 
@@ -1211,33 +1213,48 @@ async fn b3_blocked_torque_transition_failure_zero_alloc() {
 }
 
 #[test]
-#[ignore = "blocked on A8/C: gripper zero_check(store_offset=true) builds candidate and serializes JSON at src/supervisor/actions.rs:197-216 plus saturation error Strings at :222-223 (and PendingZeroCheckPersist at :233-246 when capacity is available); config commits remain gated until A8/A9"]
 fn a8_blocked_zero_check_store_offset_serialization_zero_alloc() {
-    thread::spawn(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let mut inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
-        inner.lease_enabled = false;
-        inner.gripper_calib_path = Some(dir.path().join("calib.json"));
-        inner.defer_zero_check_persist = true;
-        inner.persist_capacity_available = false;
-        let stamp = inner.current_admission_stamp();
-        let admitted = inner.check_admission(stamp).unwrap();
-        armd::SupervisorInner::enable_torque(admitted).unwrap();
-        let epoch = inner.safety.epoch_id();
-        let stamp = inner.current_admission_stamp();
-        let admitted = inner.check_admission(stamp).unwrap();
-        let (id, _) = armd::SupervisorInner::start_gripper_zero_check(
-            admitted,
-            &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}),
-            epoch,
-        )
+    for capacity_available in [false, true] {
+        thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let mut inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
+            inner.lease_enabled = false;
+            inner.gripper_calib_path = Some(dir.path().join("calib.json"));
+            inner.defer_zero_check_persist = true;
+            inner.persist_capacity_available = capacity_available;
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            armd::SupervisorInner::enable_torque(admitted).unwrap();
+            let epoch = inner.safety.epoch_id();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let (id, _) = armd::SupervisorInner::start_gripper_zero_check(
+                admitted,
+                &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}),
+                epoch,
+            )
+            .unwrap();
+            alloc::time_this_thread();
+            let before = alloc::snapshot_counts();
+            inner.finish_action(id, "done", None, None, None, None, None);
+            let delta = alloc::snapshot_counts().delta_since(before);
+            assert_eq!(
+                delta,
+                AllocCounts::ZERO,
+                "zero_check(store_offset=true, capacity={capacity_available}) allocated on RT: {delta:?}"
+            );
+            if capacity_available {
+                assert!(inner.pending_zero_check_persist.is_some());
+                assert_eq!(inner.zero_check_persisting, Some(id));
+            } else {
+                assert!(inner.pending_zero_check_persist.is_none());
+                assert_eq!(
+                    inner.last_action.as_ref().and_then(|a| a.code.as_deref()),
+                    Some("PERSIST_FAILED")
+                );
+            }
+        })
+        .join()
         .unwrap();
-        alloc::time_this_thread();
-        let before = alloc::snapshot_counts();
-        inner.finish_action(id, "done", None, None, None, None, None);
-        let delta = alloc::snapshot_counts().delta_since(before);
-        assert_eq!(delta, AllocCounts::ZERO, "zero_check(store_offset=true) allocated on RT: {delta:?}");
-    })
-    .join()
-    .unwrap();
+    }
 }

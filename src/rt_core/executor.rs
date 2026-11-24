@@ -61,7 +61,7 @@ pub const RECLAIM_TRAJ_CAPACITY: usize = 8;
 pub const PERSIST_REP_CAPACITY: usize = 8;
 /// Lock-free SPSC capacity for off-thread reclamation (runtime rejected persistence jobs,
 /// deferred `legacy_j6` warnings, and clean-exit overflow payloads when consumer rings stay full).
-/// Sized strictly >= `17 maint + 6 persist + 12 runtime jobs/logs + 64 pending_estop_acks + 64 retired states + 64 retired stops + 8 retired trajectories`.
+/// Sized strictly >= `17 maint + 6 persist + 12 runtime jobs/logs + 64 pending_estop_acks + 64 retired states + 64 retired stops + 8 retired trajectories + 4 retired zero-check contexts`.
 const OFFLOAD_RECLAIM_CAPACITY: usize = MAINT_QUEUE_CAPACITY
     + 1
     + 6
@@ -69,7 +69,8 @@ const OFFLOAD_RECLAIM_CAPACITY: usize = MAINT_QUEUE_CAPACITY
     + ESTOP_ACK_CAPACITY
     + RECLAIM_STATE_CAPACITY
     + URGENT_STOP_CAPACITY
-    + RECLAIM_TRAJ_CAPACITY;
+    + RECLAIM_TRAJ_CAPACITY
+    + 4;
 
 /// Startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1510,6 +1511,7 @@ enum OffloadReclaim {
     MaintReply(MaintReply),
     PersistReply(PersistReply),
     PersistJob(PendingZeroCheckPersist, Option<Box<dyn Any + Send>>),
+    ZeroCheckCtx(Box<crate::supervisor::ZeroCheckPersistContext>),
     Probe(Box<dyn Any + Send>),
     SafetyState(Arc<SafetyState>),
     RetiredStop(RetiredStopPayloads),
@@ -2434,6 +2436,9 @@ impl ControlState {
                 let _ = self.offload_reclaim_tx.push(OffloadReclaim::ActiveTrajectory(traj));
             }
         }
+        while let Some(ctx) = core.pop_retired_zero_check_ctx() {
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
+        }
     }
 
     /// Moves retired fault `Arc<SafetyState>` snapshots, retired heap motion payloads, retired
@@ -2474,6 +2479,13 @@ impl ControlState {
                 break;
             };
             let _ = self.reclaim_traj_tx.push(traj);
+            drained = true;
+        }
+        while !self.offload_reclaim_tx.is_full() {
+            let Some(ctx) = core.pop_retired_zero_check_ctx() else {
+                break;
+            };
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
             drained = true;
         }
         let lost_inline = core.safety.advance_log_dropped_forwarded();
@@ -3462,6 +3474,7 @@ fn spawn_persist_worker(
                 }
             };
             let auth_ok = job
+                .ctx
                 .operator_auth
                 .as_ref()
                 .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
@@ -3473,7 +3486,7 @@ fn spawn_persist_worker(
                         code: "OPERATOR_REQUIRED".into(),
                         message: "Operator session expired or locked before gripper calibration persisted".into(),
                         unused_policy: None,
-                        unused_jaw: job.jaw_opening,
+                        unused_jaw: job.ctx.jaw_opening,
                     },
                     &persist_stop,
                     &control_exited,
@@ -3481,14 +3494,14 @@ fn spawn_persist_worker(
                 let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
                 continue;
             }
-            // Validate & build candidate GripperPolicy completely off `armd-control`.
+            // Validate, build candidate GripperPolicy, and serialize JSON completely off `armd-control`.
             let candidate_policy = match SupervisorInner::validate_gripper_calibration_off_thread(
-                job.base_gripper_policy.as_ref(),
-                job.current_calib_jaw.as_ref(),
-                job.gripper_limit.as_ref(),
-                job.active_tool_is_stock,
+                job.ctx.base_gripper_policy.as_ref(),
+                job.ctx.jaw_opening.as_ref(),
+                job.ctx.gripper_limit.as_ref(),
+                job.ctx.active_tool_is_stock,
                 Some(job.offset_rad),
-                job.jaw_opening.as_ref(),
+                job.ctx.jaw_opening.as_ref(),
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -3499,7 +3512,7 @@ fn spawn_persist_worker(
                             code: "INVALID_CALIBRATION".into(),
                             message: e,
                             unused_policy: None,
-                            unused_jaw: job.jaw_opening,
+                            unused_jaw: job.ctx.jaw_opening,
                         },
                         &persist_stop,
                         &control_exited,
@@ -3509,7 +3522,8 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
-            let staged = match StagedWrite::stage(job.write.path.clone(), job.write.text.clone()) {
+            let write = job.ctx.serialize_write(job.offset_rad);
+            let staged = match StagedWrite::stage(write.path, write.text) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = push_cmd(
@@ -3519,7 +3533,7 @@ fn spawn_persist_worker(
                             code: "PERSIST_FAILED".into(),
                             message: format!("Failed to stage gripper calibration: {e}"),
                             unused_policy: Some(candidate_policy),
-                            unused_jaw: job.jaw_opening,
+                            unused_jaw: job.ctx.jaw_opening,
                         },
                         &persist_stop,
                         &control_exited,
@@ -3528,10 +3542,7 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
-            let lease_owner_inline = job
-                .lease_owner
-                .as_ref()
-                .map(|(c, g)| (crate::model::HolderLabel::new(c), *g));
+            let lease_owner_inline = job.lease_owner;
             let payload_probe = hooks
                 .payload_drop_probe
                 .as_ref()
@@ -3543,7 +3554,7 @@ fn spawn_persist_worker(
                     base_revision: job.base_revision,
                     lease_owner: lease_owner_inline,
                     new_policy: candidate_policy,
-                    jaw_opening: job.jaw_opening,
+                    jaw_opening: job.ctx.jaw_opening,
                     probe: payload_probe,
                     code_buf: String::with_capacity(64),
                     msg_buf: String::with_capacity(160),
@@ -3587,6 +3598,7 @@ fn spawn_persist_worker(
             // Re-verify operator authorization immediately before rename (operator session may
             // have expired or locked during staging or reservation wait).
             let auth_still_ok = job
+                .ctx
                 .operator_auth
                 .as_ref()
                 .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
@@ -5643,18 +5655,20 @@ mod tests {
         let sample_job = PendingZeroCheckPersist {
             action_id: 7,
             offset_rad: 0.01,
-            jaw_opening: None,
             base_revision: 0,
             lease_owner: None,
-            operator_auth: None,
-            write: crate::persist::PendingWrite::new(
-                std::path::PathBuf::from("/tmp/armd-unused-test.json"),
-                "{}".to_string(),
-            ),
-            base_gripper_policy: Some(crate::model::GripperPolicy::rebot_dm()),
-            current_calib_jaw: None,
-            gripper_limit: None,
-            active_tool_is_stock: true,
+            ctx: Box::new(crate::supervisor::ZeroCheckPersistContext {
+                path: std::path::PathBuf::from("/tmp/armd-unused-test.json"),
+                jaw_opening: None,
+                stale: None,
+                tool_id: "stock".into(),
+                tool_config_digest: String::new(),
+                active_tool_is_stock: true,
+                base_gripper_policy: Some(crate::model::GripperPolicy::rebot_dm()),
+                gripper_limit: None,
+                operator_auth: None,
+                sat_msg_buf: String::with_capacity(64),
+            }),
         };
         state.reject_saturated_persist_job(
             &mut core,
