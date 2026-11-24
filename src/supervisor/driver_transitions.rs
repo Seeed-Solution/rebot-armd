@@ -1386,6 +1386,16 @@ impl SupervisorInner {
         Ok(self.safety.state().clone())
     }
 
+    /// True when E-stop, a Fault state, any latched fault kind bit, or a pending E-stop
+    /// keeps the arm stopped: torque-off must apply Rule A′ and must never clear or mutate
+    /// the fault record or epoch.
+    #[inline]
+    fn torque_off_stopped(&self) -> bool {
+        self.safety.state().is_stopped()
+            || self.safety.has_latched_fault()
+            || self.estop_pending()
+    }
+
     pub(crate) fn torque_off_rt_immediate(&mut self) -> Result<(), &'static str> {
         if self.torque_transition.is_some() {
             return Err("TRANSITION_BUSY");
@@ -1396,7 +1406,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            if !self.safety.state().is_stopped() && !self.estop_pending() {
+            if !self.torque_off_stopped() {
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
@@ -1415,7 +1425,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            if !self.safety.state().is_stopped() && !self.estop_pending() {
+            if !self.torque_off_stopped() {
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
@@ -1432,7 +1442,7 @@ impl SupervisorInner {
     /// [`Self::may_disable_torque_while_stopped`] once); non-stopped paths fall through to
     /// [`Self::torque_off_check`].
     fn torque_off_check_rt(&mut self) -> Result<(), &'static str> {
-        if self.safety.state().is_stopped() || self.estop_pending() {
+        if self.torque_off_stopped() {
             return self
                 .eval_stopped_torque_off()
                 .map_err(|_| "TORQUE_OFF_WOULD_DROP");
@@ -1443,7 +1453,7 @@ impl SupervisorInner {
 
     /// The refusals of a torque off: E-stop / fault (rest-pose gated), not at the resting pose.
     fn torque_off_check(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
-        if self.safety.state().is_stopped() || self.estop_pending() {
+        if self.torque_off_stopped() {
             return self
                 .eval_stopped_torque_off()
                 .map_err(|r| r.into_safety_error(&self.config.joint_names));
@@ -1463,7 +1473,7 @@ impl SupervisorInner {
 
     /// Torque off after the confirmed disable without cloning `SafetyState` (zero-alloc on RT).
     fn torque_off_finish_in_place(&mut self) -> Result<(), SafetyError> {
-        if !self.safety.state().is_stopped() && !self.estop_pending() {
+        if !self.torque_off_stopped() {
             let _ = self.safety.set_torque(false)?;
         }
         self.reset_gripper_stall();
@@ -1563,7 +1573,7 @@ impl SupervisorInner {
     /// A disable step failed: `disable_pending` stays set and `DRIVER_WRITE_FAILED` latches
     /// (as in `torque_off`).
     fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
-        let already_stopped = self.safety.state().is_stopped() || self.estop_pending();
+        let already_stopped = self.torque_off_stopped();
         let detail = (!already_stopped).then(|| {
             crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
                 buf.push_str("Torque disable transmission failed: ");
@@ -1698,7 +1708,7 @@ impl SupervisorInner {
                         self.torque_off_finish_in_place().map(|()| Rt::Done).map_err(|e| torque_error_code(&e))
                     }
                     Some(false) => {
-                        if !self.safety.state().is_stopped() && !self.estop_pending() {
+                        if !self.torque_off_stopped() {
                             self.safety.latch(
                                 crate::safety::FaultKind::Other,
                                 crate::safety::FaultDetail::Static(crate::safety::StaticFault::DisableUnconfirmed),

@@ -189,7 +189,7 @@ impl CanTransport for ZeroAllocBus {
 const BOOT: BootId = BootId(77);
 const RELEASE: Duration = Duration::from_millis(20);
 
-fn build_armed_faulted_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, Broker<PlanSlot>, ZeroAllocBus, Arc<MockClock>) {
+fn build_armed_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, Broker<PlanSlot>, ZeroAllocBus, Arc<MockClock>) {
     let clock = Arc::new(MockClock::new());
     let bus = ZeroAllocBus::new(clock.clone());
     let limits: Vec<DamiaoLimits> = ArmConfig::rebot_dm()
@@ -233,6 +233,11 @@ fn build_armed_faulted_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, B
     }
     assert!(fx.core.is_torqued);
 
+    (fx, b, bus, clock)
+}
+
+fn build_armed_faulted_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, Broker<PlanSlot>, ZeroAllocBus, Arc<MockClock>) {
+    let (mut fx, b, bus, clock) = build_armed_fixture(q_j2);
     // Latch Fault and warm up all triple-buffer slots so steady-state publish buffers are settled.
     fx.core.safety.trigger_fault_coded(
         FaultCode::DriverWriteFailed,
@@ -248,7 +253,7 @@ fn build_armed_faulted_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, B
 }
 
 fn build_armed_estopped_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, Broker<PlanSlot>, ZeroAllocBus, Arc<MockClock>) {
-    let (mut fx, b, bus, clock) = build_armed_faulted_fixture(q_j2);
+    let (mut fx, b, bus, clock) = build_armed_fixture(q_j2);
     fx.core.apply_stop_policy(armd::safety::StopPolicy::EStopLatch);
     for _ in 0..5 {
         bus.with(|s| s.push_all_feedback());
@@ -273,16 +278,26 @@ fn submit_torque_off(fx: &ReleaseFixture<SupervisorInner>, b: &mut Broker<PlanSl
 #[test]
 fn stopped_torque_off_refused_zero_alloc() {
     let (mut fx, mut b, bus, clock) = build_armed_estopped_fixture(0.35);
+    let epoch_before = fx.core.safety.epoch_id();
+    let kinds_before = fx.core.safety.latched_fault_kinds();
+    let fault_before = fx.core.safety.fault();
     bus.with(|s| s.push_all_feedback());
     submit_torque_off(&fx, &mut b, 2);
 
     let (rep, allocs, frees) = counted(|| fx.step());
     clock.advance(RELEASE);
     assert_eq!(rep.command.unwrap().1, Err("TORQUE_OFF_WOULD_DROP"));
+    assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before);
+    assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(fx.core.safety.fault(), fault_before);
     assert_eq!((allocs, frees), (0, 0), "refused stopped TorqueOff must allocate 0");
 
     // Also verify zero-alloc direct CoreOps::commit_transition while in Fault(Other(String)).
     let (mut fx_f, _b_f, _bus_f, _clock_f) = build_armed_faulted_fixture(0.35);
+    let f_epoch_before = fx_f.core.safety.epoch_id();
+    let f_kinds_before = fx_f.core.safety.latched_fault_kinds();
+    let f_fault_before = fx_f.core.safety.fault();
     let ctx = fx_f.ctx(fx_f.now());
     let d = armd::rt_core::broker::Descriptor {
         stamp: armd::rt_core::broker::Stamp {
@@ -298,12 +313,18 @@ fn stopped_torque_off_refused_zero_alloc() {
     };
     let (res, a, f) = counted(|| fx_f.core.commit_transition(&d, TransitionOp::TorqueOff, &ctx));
     assert_eq!(res.err(), Some("TORQUE_OFF_WOULD_DROP"));
+    assert_eq!(fx_f.core.safety.epoch_id(), f_epoch_before);
+    assert_eq!(fx_f.core.safety.latched_fault_kinds(), f_kinds_before);
+    assert_eq!(fx_f.core.safety.fault(), f_fault_before);
     assert_eq!((a, f), (0, 0), "refused commit_transition in Fault(Other) must allocate 0");
 }
 
 #[test]
 fn stopped_torque_off_confirmed_zero_alloc() {
     let (mut fx, mut b, bus, clock) = build_armed_estopped_fixture(0.0);
+    let epoch_before = fx.core.safety.epoch_id();
+    let kinds_before = fx.core.safety.latched_fault_kinds();
+    let fault_before = fx.core.safety.fault();
     bus.with(|s| s.push_all_feedback());
     submit_torque_off(&fx, &mut b, 2);
 
@@ -324,12 +345,18 @@ fn stopped_torque_off_confirmed_zero_alloc() {
     assert_eq!(ended, Some(Outcome::Completed));
     assert!(!fx.core.is_torqued);
     assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before);
+    assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(fx.core.safety.fault(), fault_before);
     assert_eq!((total_allocs, total_frees), (0, 0), "confirmed stopped TorqueOff must allocate 0");
 }
 
 #[test]
 fn stopped_torque_off_tx_failure_zero_alloc() {
     let (mut fx, mut b, bus, clock) = build_armed_estopped_fixture(0.0);
+    let epoch_before = fx.core.safety.epoch_id();
+    let kinds_before = fx.core.safety.latched_fault_kinds();
+    let fault_before = fx.core.safety.fault();
     bus.with(|s| {
         s.push_all_feedback();
         s.tx_would_block = true;
@@ -344,6 +371,9 @@ fn stopped_torque_off_tx_failure_zero_alloc() {
     clock.advance(RELEASE);
     assert!(matches!(rep2.transition_ended, Some((_, Outcome::Failed(_)))), "{rep2:?}");
     assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before);
+    assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(fx.core.safety.fault(), fault_before);
     assert_eq!(
         (a1 + a2, f1 + f2),
         (0, 0),
@@ -354,6 +384,9 @@ fn stopped_torque_off_tx_failure_zero_alloc() {
 #[test]
 fn stopped_torque_off_confirm_timeout_zero_alloc() {
     let (mut fx, mut b, bus, clock) = build_armed_estopped_fixture(0.0);
+    let epoch_before = fx.core.safety.epoch_id();
+    let kinds_before = fx.core.safety.latched_fault_kinds();
+    let fault_before = fx.core.safety.fault();
     bus.with(|s| {
         s.push_all_feedback();
         s.silent_disable = true;
@@ -375,6 +408,9 @@ fn stopped_torque_off_confirm_timeout_zero_alloc() {
     }
     assert_eq!(ended, Some(Outcome::Failed("FEEDBACK_UNCONFIRMED")));
     assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before);
+    assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(fx.core.safety.fault(), fault_before);
     assert_eq!(
         (total_allocs, total_frees),
         (0, 0),

@@ -222,18 +222,26 @@ fn legacy_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
     );
     assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
     assert!(inner.is_torqued);
+    let epoch_before = inner.safety.epoch_id();
+    let kinds_before = inner.safety.latched_fault_kinds();
+    let fault_before = inner.safety.fault();
 
     let state = inner.set_torque(false).expect("disable at rest in Fault must succeed");
     assert!(matches!(state, SafetyState::Fault(_)), "Fault latch must stay active");
     assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
+    assert_eq!(inner.safety.epoch_id(), epoch_before, "torque-off must not advance epoch");
+    assert_eq!(inner.safety.latched_fault_kinds(), kinds_before, "torque-off must not mutate fault record");
+    assert_eq!(inner.safety.fault(), fault_before, "torque-off must not mutate fault detail");
     assert!(!inner.is_torqued, "is_torqued must become false");
     assert!(!inner.disable_pending, "disable must be confirmed");
     assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)), "all motors disabled on wire");
 
-    // Later clear_fault follows the normal rules and transitions to Idle with torque off.
+    // Later exact-epoch clear_fault follows the normal rules and transitions to Idle with torque off.
     clock.advance(Duration::from_millis(10));
     bus.with(|s| s.push_all_feedback());
-    let cleared = inner.clear_fault().expect("clear_fault after torque-off must succeed");
+    let cleared = inner
+        .clear_fault_for_epoch(Some(epoch_before))
+        .expect("exact-epoch clear_fault after torque-off must succeed");
     assert_eq!(cleared, SafetyState::Idle);
     assert!(!inner.is_torqued);
 }
@@ -264,6 +272,9 @@ fn executor_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
     );
     assert!(matches!(r.fx.core.safety.state(), SafetyState::Fault(_)));
     assert!(r.fx.core.is_torqued);
+    let epoch_before = r.fx.core.safety.epoch_id();
+    let kinds_before = r.fx.core.safety.latched_fault_kinds();
+    let fault_before = r.fx.core.safety.fault();
 
     r.bus.with(|s| s.push_all_feedback());
     r.submit_transition(TransitionOp::TorqueOff);
@@ -273,6 +284,9 @@ fn executor_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
     assert_eq!(outcome, Outcome::Completed);
 
     assert!(matches!(r.fx.core.safety.state(), SafetyState::Fault(_)), "Fault latch must stay active");
+    assert_eq!(r.fx.core.safety.epoch_id(), epoch_before, "torque-off must not advance epoch");
+    assert_eq!(r.fx.core.safety.latched_fault_kinds(), kinds_before, "torque-off must not mutate fault record");
+    assert_eq!(r.fx.core.safety.fault(), fault_before, "torque-off must not mutate fault detail");
     assert!(!r.fx.core.is_torqued);
     assert!(!r.fx.core.disable_pending);
     assert!(r.bus.with(|s| s.motors.iter().all(|m| !m.enabled)));
@@ -550,44 +564,75 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     inner.apply_stop_policy(StopPolicy::EStopLatch);
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert!(inner.e_stop_latched.load(Ordering::SeqCst));
+    let epoch_before = inner.safety.epoch_id();
+    let kinds_before = inner.safety.latched_fault_kinds();
+    let fault_before = inner.safety.fault();
     assert!(matches!(
         inner.set_torque(false),
         Err(SafetyError::TorqueOffWouldDrop { ref joint, .. }) if joint.as_deref() == Some("joint_1")
     ));
     assert!(inner.is_torqued);
+    assert_eq!(inner.safety.epoch_id(), epoch_before);
+    assert_eq!(inner.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(inner.safety.fault(), fault_before);
 
-    // At rest -> stale feedback -> refused
+    // At rest + fresh feedback in pure E-Stop:
+    // First inject a disable TX failure while in EStop: sticky disable stays pending and
+    // SafetyState::EStop, fault record, and epoch must NOT be mutated.
     bus.with(|s| {
         s.motors[0].q = 0.0;
         s.push_all_feedback();
     });
     inner.tick(0.02);
+    assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert_eq!(inner.safety.epoch_id(), epoch_before);
+    bus.with(|s| s.tx_error = true);
+    assert!(inner.set_torque(false).is_err());
+    assert_eq!(*inner.safety.state(), SafetyState::EStop, "failed disable must not overwrite E-Stop latch");
+    assert_eq!(inner.safety.epoch_id(), epoch_before, "failed disable must not advance epoch");
+    assert_eq!(inner.safety.latched_fault_kinds(), kinds_before, "failed disable must not mutate fault record");
+    assert_eq!(inner.safety.fault(), fault_before, "failed disable must not mutate fault detail");
+    assert!(inner.disable_pending, "sticky disable_pending must stay set on failure");
+
+    // At rest -> stale feedback -> refused without mutating EStop latch, fault record, or epoch.
+    bus.with(|s| s.tx_error = false);
     clock.advance(Duration::from_millis(150));
     assert!(matches!(
         inner.set_torque(false),
         Err(SafetyError::TorqueOffWouldDrop { joint: None, .. })
     ));
+    assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert_eq!(inner.safety.epoch_id(), epoch_before);
+    assert_eq!(inner.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(inner.safety.fault(), fault_before);
 
-    // At rest + fresh post-drain feedback -> allowed; TxKind::Disable bypasses stop gate; EStop latch kept.
-    inner.tick(0.02); // observe empty RX queue after 150 ms stall
+    // Refresh driver RX queue bound without triggering a stale hold-output transmit, then confirm
+    // TxKind::Disable bypasses stop gate and keeps the exact EStop latch and epoch.
+    {
+        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let _ = drv.read_joint_states(); // observe empty RX queue after 150 ms stall
+    }
     bus.with(|s| s.push_all_feedback());
     inner.tick(0.02);
-    // First inject a disable TX failure while in EStop: sticky disable stays pending and
-    // SafetyState::EStop must NOT be overwritten to Fault(DriverWriteFailed).
-    bus.with(|s| s.tx_error = true);
-    assert!(inner.set_torque(false).is_err());
-    assert_eq!(*inner.safety.state(), SafetyState::EStop, "failed disable must not overwrite E-Stop latch");
-    assert!(inner.disable_pending, "sticky disable_pending must stay set on failure");
-    bus.with(|s| {
-        s.tx_error = false;
-        s.push_all_feedback();
-    });
+    assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert_eq!(inner.safety.epoch_id(), epoch_before);
     let st = inner.set_torque(false).expect("disable at rest in E-Stop must succeed");
     assert_eq!(st, SafetyState::EStop);
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert_eq!(inner.safety.epoch_id(), epoch_before, "confirmed disable must not advance epoch");
+    assert_eq!(inner.safety.latched_fault_kinds(), kinds_before, "confirmed disable must not mutate fault record");
+    assert_eq!(inner.safety.fault(), fault_before, "confirmed disable must not mutate fault detail");
     assert!(inner.e_stop_latched.load(Ordering::SeqCst), "e_stop_latched must remain set");
     assert!(!inner.is_torqued);
     assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)));
+
+    // Exact-epoch clear still works after stopped torque-off (confirming epoch did not advance).
+    inner.e_stop_latched.store(false, Ordering::SeqCst);
+    bus.with(|s| s.push_all_feedback());
+    assert_eq!(
+        inner.clear_fault_for_epoch(Some(epoch_before)).expect("exact-epoch clear after E-Stop disable must succeed"),
+        SafetyState::Idle
+    );
 
     // 2. Executor owner in E-Stop
     let mut r = ExecRig::new();
@@ -608,14 +653,20 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
     assert_eq!(*r.fx.core.safety.state(), SafetyState::EStop);
     assert!(r.fx.core.e_stop_latched.load(Ordering::SeqCst));
+    let exec_epoch_before = r.fx.core.safety.epoch_id();
+    let exec_kinds_before = r.fx.core.safety.latched_fault_kinds();
+    let exec_fault_before = r.fx.core.safety.fault();
 
     // Raised in E-Stop -> refused
     r.bus.with(|s| s.push_all_feedback());
     r.submit_transition(TransitionOp::TorqueOff);
     assert_eq!(r.step().command.unwrap().1, Err("TORQUE_OFF_WOULD_DROP"));
     assert!(r.fx.core.is_torqued);
+    assert_eq!(r.fx.core.safety.epoch_id(), exec_epoch_before);
+    assert_eq!(r.fx.core.safety.latched_fault_kinds(), exec_kinds_before);
+    assert_eq!(r.fx.core.safety.fault(), exec_fault_before);
 
-    // Move to rest with fresh feedback -> allowed; EStop latch kept.
+    // Move to rest with fresh feedback -> allowed; EStop latch, fault record, and epoch kept.
     r.bus.with(|s| {
         s.motors[1].q = 0.0;
         s.push_all_feedback();
@@ -626,6 +677,9 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     assert!(r.step().command.unwrap().1.is_ok());
     assert_eq!(r.run_transition_to_end(20), Outcome::Completed);
     assert_eq!(*r.fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(r.fx.core.safety.epoch_id(), exec_epoch_before);
+    assert_eq!(r.fx.core.safety.latched_fault_kinds(), exec_kinds_before);
+    assert_eq!(r.fx.core.safety.fault(), exec_fault_before);
     assert!(r.fx.core.e_stop_latched.load(Ordering::SeqCst));
     assert!(!r.fx.core.is_torqued);
     assert!(r.bus.with(|s| s.motors.iter().all(|m| !m.enabled)));

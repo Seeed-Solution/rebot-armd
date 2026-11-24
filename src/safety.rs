@@ -2207,10 +2207,11 @@ impl SafetyManager {
 
     /// Set torque enabled/disabled
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
-        if self.state_arc.is_stopped() {
+        if self.state_arc.is_stopped() || self.has_latched_fault() {
             if !enable {
-                // Disabling torque while stopped keeps the E-stop / Fault latch intact;
-                // rest-pose gating is enforced by the supervisor before reaching here.
+                // Disabling torque while stopped keeps the E-stop / Fault latch intact
+                // without mutating the fault record or epoch; rest-pose gating is enforced
+                // by the supervisor before reaching here.
                 return Ok((*self.state_arc).clone());
             }
             if let SafetyState::Fault(ref reason) = *self.state_arc {
