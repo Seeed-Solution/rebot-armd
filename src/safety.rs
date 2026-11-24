@@ -902,6 +902,12 @@ pub enum SafetyLogEvent {
         message: BoundedText<160>,
         logged_at: std::time::Instant,
     },
+    MitTrackingCancelled(BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
+    MitDeadlineNearMiss {
+        count: u64,
+        worst: std::time::Duration,
+        deadline: std::time::Duration,
+    },
 }
 
 impl SafetyLogEvent {
@@ -955,6 +961,15 @@ impl SafetyLogEvent {
             ),
             Self::StoppedHoldOutputFailed { partial, suppressed, message, .. } => {
                 Self::emit_stopped_hold_output_failed(*partial, *suppressed, message.as_str());
+            }
+            Self::MitTrackingCancelled(reason) => {
+                tracing::error!(target: "armd::mit", "MIT tracking cancelled: {reason}");
+            }
+            Self::MitDeadlineNearMiss { count, worst, deadline } => {
+                tracing::warn!(
+                    target: "armd::mit",
+                    "MIT deadline near miss #{count}: {worst:?} of {deadline:?} (feedback age or output gap)"
+                );
             }
         }
     }
@@ -1766,6 +1781,32 @@ impl SafetyManager {
             tracing::warn!(
                 target: "armd::supervisor",
                 "Watchdog: lease expired while torqued, not parking ({reason}); holding torque and latching WatchdogTimeout"
+            );
+        }
+    }
+
+    /// Emits or defers an MIT tracking cancellation error without RT heap allocation.
+    pub fn log_mit_tracking_cancelled(&mut self, reason: BoundedText<SAFETY_LOG_TEXT_CAPACITY>) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::MitTrackingCancelled(reason));
+        } else {
+            tracing::error!(target: "armd::mit", "MIT tracking cancelled: {reason}");
+        }
+    }
+
+    /// Emits or defers an MIT deadline near-miss warning without RT heap allocation.
+    pub fn log_mit_deadline_near_miss(
+        &mut self,
+        count: u64,
+        worst: std::time::Duration,
+        deadline: std::time::Duration,
+    ) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::MitDeadlineNearMiss { count, worst, deadline });
+        } else {
+            tracing::warn!(
+                target: "armd::mit",
+                "MIT deadline near miss #{count}: {worst:?} of {deadline:?} (feedback age or output gap)"
             );
         }
     }

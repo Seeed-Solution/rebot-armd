@@ -358,6 +358,11 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
+    fn mit_fence_trip_bounded(
+        &self,
+    ) -> Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>> {
+        self.inner.mit_fence_trip_bounded()
+    }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
     fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
         self.inner.driver_clock()

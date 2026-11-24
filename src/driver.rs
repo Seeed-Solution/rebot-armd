@@ -1088,6 +1088,13 @@ pub trait ArmDriver: Send {
     /// Why the MIT deadline fence tripped (None = not tripped).
     fn mit_fence_trip(&self) -> Option<String> { None }
 
+    /// Zero-allocation bounded version of [`Self::mit_fence_trip`] for RT paths (`armd-control`).
+    fn mit_fence_trip_bounded(
+        &self,
+    ) -> Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>> {
+        None
+    }
+
     /// Explicit operator clearance of a tripped MIT fence: read-only status polls may resume
     /// (after the hold-off) so fresh feedback can return; target writes stay refused until the
     /// next confirmed enable.
@@ -4904,6 +4911,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if pf_j < 64 {
             self.last_target_tx_sent_mask |= 1u64 << pf_j;
         }
+        if self.mit_fence.is_some() && self.mit_fence_trip.is_none() {
+            self.mit_fence_last_cmd[pf_j] = Some(entry_now);
+        }
         let pf_status = self.take_last_pos_force_tx_status();
         Ok(PosForceEmitOutcome::Sent { joint: pf_j, freeze: is_freeze, pf_status })
     }
@@ -8030,6 +8040,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.to_string()) }
+
+    fn mit_fence_trip_bounded(
+        &self,
+    ) -> Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>> {
+        self.mit_fence_trip.as_ref().map(|(r, _)| {
+            let mut buf = crate::safety::BoundedText::empty();
+            let _ = core::fmt::write(&mut buf, format_args!("{r}"));
+            buf
+        })
+    }
 
     fn clock_now(&self) -> Instant { self.now() }
 

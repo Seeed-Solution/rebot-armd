@@ -83,6 +83,7 @@ struct NoAllocDamiaoBus {
     flush_err: Option<Mode>,
     on_tx_stop: Option<(usize, StopRequests)>,
     on_flush_stop: Option<StopRequests>,
+    pf_tx_count: u64,
 }
 
 impl NoAllocDamiaoBus {
@@ -104,6 +105,7 @@ impl NoAllocDamiaoBus {
             flush_err: None,
             on_tx_stop: None,
             on_flush_stop: None,
+            pf_tx_count: 0,
         }
     }
 
@@ -194,6 +196,10 @@ impl CanTransport for NoAllocDamiaoBus {
                             damiao::RID_PMAX => l.p_max.to_le_bytes(),
                             damiao::RID_VMAX => l.v_max.to_le_bytes(),
                             damiao::RID_TMAX => l.t_max.to_le_bytes(),
+                            damiao::RID_MST_ID => (0x10u32 + u32::from(mid)).to_le_bytes(),
+                            damiao::RID_ESC_ID => u32::from(mid).to_le_bytes(),
+                            damiao::RID_TIMEOUT => 2000u32.to_le_bytes(),
+                            damiao::RID_SW_VER => 0x0001_0000u32.to_le_bytes(),
                             _ => 0u32.to_le_bytes(),
                         };
                         let [lo, hi] = mid.to_le_bytes();
@@ -237,6 +243,9 @@ impl CanTransport for NoAllocDamiaoBus {
         } else if let Some(k) =
             find(&self.motors, id.wrapping_sub(0x100)).or_else(|| find(&self.motors, id.wrapping_sub(0x300)))
         {
+            if id == 0x307 {
+                self.pf_tx_count += 1;
+            }
             self.motors[k].2 = f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
             self.reply(k);
         }
@@ -2545,5 +2554,454 @@ fn rt_r2_stale_j7_refusals_and_r1_epilogue_zero_alloc_and_zero_free() {
         assert!(inner.policy_run.is_none());
         assert_eq!(inner.retired_policy_runs_len(), 1);
         assert!(inner.pop_retired_policy_run().is_some());
+    }
+}
+
+/// Round-7 M3 zero-allocation proof on `armd-control`:
+/// MIT steady-state ticks, MIT batch write failures (`Error`, `MitFenceTripped`, `EstopInhibited`,
+/// `Deferred`, `Expired`), `mit_prepare_inline` refusal, `mit_supervise` deadline loss, and
+/// post-loss `MitOwner::Lost` ticks all perform strictly 0 allocations and 0 frees while
+/// recording bounded `mit.lost_reason`, latching `BusLoss`, queuing deferred `SafetyLogEvent`,
+/// and still emitting J7 hold/freeze through the tick epilogue.
+#[test]
+fn rt_m3_mit_batch_error_and_mit_lose_zero_alloc_and_zero_free() {
+    use armd::driver::{
+        gripper_drive_from_profile, DriverCapabilities, EnableState, GripperPosForceInfo,
+        PosForceEmitOutcome, PosForceIntent, PosForceIntentStamp, PosForceTxStatus,
+    };
+    use armd::mit::{self, MitJointQualification, MitOwner, MitQualificationFile};
+    use armd::model::JointState;
+    use armd::safety::FaultCode;
+    use armd::tracking::{JointTrackingConfig, TrackingStrategy};
+
+    let limits = b601_limits();
+
+    let mit_cfg = || {
+        let mut jt = JointTrackingConfig::rebot_dm();
+        jt.enabled = true;
+        for j in &mut jt.joints {
+            j.strategy = TrackingStrategy::Position;
+        }
+        let j4 = &mut jt.joints[3];
+        j4.strategy = TrackingStrategy::Mit;
+        j4.kp = 10.0;
+        j4.kd = 0.3;
+        j4.hold_kp = Some(12.0);
+        j4.hold_kd = Some(0.4);
+        j4.effort_limit_nm = 3.0;
+        j4.gravity_scale = 1.0;
+        ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(jt),
+            ..ArmConfig::rebot_dm()
+        }
+    };
+
+    let mk_qualified_active_mit = || {
+        let cfg = mit_cfg();
+        let l4 = limits[3];
+        let rec = MitQualificationFile {
+            version: mit::QUALIFICATION_VERSION,
+            joints: vec![MitJointQualification {
+                profile_id: "rebot_b601dm".into(),
+                joint: 4,
+                joint_name: cfg.joint_names[3].clone(),
+                zero_fingerprint: mit::zero_fingerprint(0.0),
+                motor_id: 4,
+                reply_id: 0x14,
+                esc_id: 4,
+                mst_id: 0x14,
+                sw_ver: 0x0001_0000,
+                pmax: l4.p_max,
+                vmax: l4.v_max,
+                tmax: l4.t_max,
+                timeout_raw: 2000,
+                timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
+                timeout_unit_verified: true,
+                tested_response: "disabled".into(),
+                measured_expiry_ms: 101.0,
+                worst_latency_ms: 8.0,
+                load_envelope: "unloaded, supported".into(),
+                max_kp: 15.0,
+                max_kd: 0.5,
+                effort_ceiling_nm: 4.0,
+                date: "2026-11-24T00:00:00Z".into(),
+                trace_id: "m3-zero-alloc".into(),
+            }],
+            invalidated: None,
+        };
+        let bus = SharedNoAllocBus::new(&limits);
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+            g.push_all_feedback();
+        }
+        let grip = gripper_drive_from_profile(&cfg).expect("pos-force drive");
+        let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap()
+            .with_gripper_drive(grip)
+            .unwrap();
+        driver.read_joint_states().unwrap();
+        driver.check_mapping_ranges();
+        driver.set_rt_mode(true);
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
+        inner.lease_enabled = false;
+        inner.set_calibration(Some(armd::calibration::CalibrationFile {
+            mit_qualification: serde_json::to_value(&rec).ok(),
+            ..Default::default()
+        }));
+        inner.tick(0.02);
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).expect("arm with MIT qualification");
+        inner.rt_executor_owned = true;
+        inner.safety.set_off_thread_reclaim(true);
+        // Step stationary ticks until MIT handover completes and triple-buffer slots warm up.
+        for _ in 0..25 {
+            {
+                let mut g = bus.0.lock().unwrap();
+                g.clock.advance(Duration::from_millis(20));
+                g.push_all_feedback();
+            }
+            let _ = inner.tick_publish(0.02, 1, false);
+            let _ = inner.core.hub().latest();
+        }
+        assert_eq!(
+            inner.mit.owner,
+            MitOwner::Active,
+            "MIT must be active after handover (handover_error={:?}, lost_reason={:?})",
+            inner.mit.handover_error,
+            inner.mit.lost_reason
+        );
+        // Disable Phase-1 position-lead tracking (`src/tracking.rs`, out of scope for M3) after
+        // real MIT handover completes so `tick_publish` exercises the full MIT `mit_supervise` ->
+        // `write_output_scratch` -> `mit_prepare_inline` -> `write_joint_targets_bounded` ->
+        // `mit_lose_bounded` -> J7 epilogue -> `publish_at` path with strictly (0, 0) alloc/free.
+        if let Some(jt) = inner.config.joint_tracking.as_mut() {
+            jt.enabled = false;
+        }
+        // Warm up one post-handover tick across triple-buffer slots before counting.
+        for _ in 0..4 {
+            {
+                let mut g = bus.0.lock().unwrap();
+                g.clock.advance(Duration::from_millis(20));
+                g.push_all_feedback();
+            }
+            let _ = inner.tick_publish(0.02, 1, false);
+            let _ = inner.core.hub().latest();
+        }
+        inner.safety.drain_log_events_off_thread();
+        reset_tx_metrics();
+        (inner, bus)
+    };
+
+    // 1. Steady-state Active MIT tick + HardError (TickOutput::Error -> mit_lose_bounded)
+    //    + subsequent MitOwner::Lost tick (mit_supervise with tripped fence + J7 hold epilogue).
+    {
+        let (mut inner, bus) = mk_qualified_active_mit();
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        let _ = inner.core.hub().latest();
+        assert_eq!(inner.mit.owner, MitOwner::Active);
+        assert_eq!((a, f), (0, 0), "steady-state Active MIT tick_publish touched allocator");
+
+        // Trigger TickOutput::Error via Mode::HardError during MIT batch write.
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+            g.mode = Mode::HardError;
+            g.tx_count = 0;
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "MIT HardError batch failure + mit_lose touched allocator");
+        assert_eq!(inner.mit.owner, MitOwner::Lost);
+        assert_eq!(inner.safety.fault_code(), Some(FaultCode::BusLoss));
+        let reason = inner.mit.lost_reason.expect("lost_reason must be recorded");
+        assert!(
+            reason.as_str().contains("MIT batch write failed"),
+            "unexpected lost_reason: {reason}"
+        );
+        assert!(
+            inner.safety.log_events_len() >= 1,
+            "deferred MitTrackingCancelled safety log must be queued"
+        );
+        let _ = inner.core.hub().latest();
+
+        // Recover bus and run one post-loss tick: MitOwner::Lost + tripped fence + J7 hold epilogue.
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.mode = Mode::Ok;
+            g.tx_count = 0;
+            g.pf_tx_count = 0;
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "post-loss MitOwner::Lost tick_publish touched allocator");
+        assert_eq!(
+            bus.0.lock().unwrap().pf_tx_count,
+            1,
+            "J7 hold/freeze 0x307 must still emit on post-loss fenced tick"
+        );
+    }
+
+    // 2. MIT fence trip on WouldBlock during batch write (MitFenceTripped -> TickOutput::Error).
+    {
+        let (mut inner, bus) = mk_qualified_active_mit();
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+            g.mode = Mode::WouldBlockAfter(0);
+            g.tx_count = 0;
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "MIT WouldBlock/MitFenceTripped batch failure touched allocator");
+        assert_eq!(inner.mit.owner, MitOwner::Lost);
+        assert_eq!(inner.safety.fault_code(), Some(FaultCode::BusLoss));
+        assert!(inner
+            .mit
+            .lost_reason
+            .is_some_and(|r| r.as_str().contains("MIT batch write failed")));
+    }
+
+    // 3. Pending STOP arriving mid-batch (TickOutput::EstopInhibited -> mit_lose_bounded).
+    {
+        let (mut inner, bus) = mk_qualified_active_mit();
+        let stops = StopRequests::new();
+        inner.attach_stop_requests(stops.clone());
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+            g.tx_count = 0;
+            g.pf_tx_count = 0;
+            g.on_tx_stop = Some((1, stops));
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "MIT mid-batch STOP EstopInhibited + mit_lose touched allocator");
+        assert_eq!(inner.mit.owner, MitOwner::Lost);
+        assert_eq!(inner.safety.fault_code(), Some(FaultCode::BusLoss));
+        assert!(inner
+            .mit
+            .lost_reason
+            .is_some_and(|r| r.as_str().contains("MIT batch write failed")));
+        assert_eq!(
+            bus.0.lock().unwrap().pf_tx_count,
+            1,
+            "J7 stop/hold 0x307 must still emit after mid-batch STOP"
+        );
+    }
+
+    // 4. Stale feedback >= 45 ms hitting mit_supervise -> mit_lose_bounded (0 alloc, 0 free).
+    {
+        let (mut inner, bus) = mk_qualified_active_mit();
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.rx.clear();
+            g.pending_rx.clear();
+            g.clock.advance(Duration::from_millis(50));
+            g.pf_tx_count = 0;
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "mit_supervise stale-feedback mit_lose touched allocator");
+        assert_eq!(inner.mit.owner, MitOwner::Lost);
+        assert_eq!(inner.safety.fault_code(), Some(FaultCode::BusLoss));
+        assert!(
+            inner.mit.lost_reason.is_some_and(|r| r.as_str().contains("feedback age")),
+            "expected 'feedback age' in {:?}",
+            inner.mit.lost_reason
+        );
+        assert_eq!(bus.0.lock().unwrap().pf_tx_count, 1);
+    }
+
+    // 5. mit_prepare_inline refusal (missing gravity model while gravity_scale > 0): 0 alloc, 0 free.
+    {
+        let (mut inner, bus) = mk_qualified_active_mit();
+        inner.config.gravity_model = None;
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+            g.pf_tx_count = 0;
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "mit_prepare_inline refusal tick_publish touched allocator");
+        assert_eq!(inner.safety.fault_code(), Some(FaultCode::DriverWriteFailed));
+        assert_eq!(
+            bus.0.lock().unwrap().pf_tx_count,
+            1,
+            "J7 hold/freeze 0x307 must still emit when mit_prepare_inline refuses"
+        );
+    }
+
+    // 6. Direct coverage of TickOutput::Deferred, TickOutput::Expired, and TickOutput::EstopInhibited
+    //    arms inside write_output_slice (`mit.rs`) through full `tick_publish`: strictly (0, 0).
+    #[derive(Clone, Copy)]
+    enum StubOutcome {
+        Ok,
+        Deferred(usize),
+        Expired(usize),
+        EstopInhibited,
+    }
+    struct StubMitBatchDriver {
+        outcome: StubOutcome,
+        pf_emits: u64,
+        clock: std::sync::Arc<MockClock>,
+        states: [JointState; 7],
+    }
+    impl StubMitBatchDriver {
+        fn new() -> Self {
+            Self {
+                outcome: StubOutcome::Ok,
+                pf_emits: 0,
+                clock: std::sync::Arc::new(MockClock::new()),
+                states: std::array::from_fn(|_| JointState {
+                    position: 0.0,
+                    velocity: 0.0,
+                    torque: 0.0,
+                    temperature: 30.0,
+                }),
+            }
+        }
+    }
+    impl ArmDriver for StubMitBatchDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                temperature_feedback: true,
+                torque_feedback: true,
+                ..DriverCapabilities::default()
+            }
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(self.states.to_vec())
+        }
+        fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+            out.clear();
+            out.extend_from_slice(&self.states);
+            Ok(())
+        }
+        fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn write_joint_targets_bounded(
+            &mut self,
+            _targets: &[JointTarget],
+        ) -> Result<TxBatchOutcome, ArmDriverError> {
+            match self.outcome {
+                StubOutcome::Ok => Ok(TxBatchOutcome::Complete),
+                StubOutcome::Deferred(pending) => Ok(TxBatchOutcome::Deferred { pending }),
+                StubOutcome::Expired(dropped) => Ok(TxBatchOutcome::Expired { dropped, pending: 0 }),
+                StubOutcome::EstopInhibited => Err(ArmDriverError::EstopInhibited),
+            }
+        }
+        fn write_estop_hold_bounded(
+            &mut self,
+            _targets: &[JointTarget],
+        ) -> Result<TxBatchOutcome, ArmDriverError> {
+            Ok(TxBatchOutcome::Complete)
+        }
+        fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            out.clear();
+            out.extend([Some(Duration::from_millis(5)); 7]);
+        }
+        fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+            dof == 7 && Duration::from_millis(5) <= max_age
+        }
+        fn clock_now(&self) -> std::time::Instant { self.clock.now() }
+        fn gripper_pos_force_info(&self) -> Option<GripperPosForceInfo> {
+            Some(GripperPosForceInfo {
+                joint: 6,
+                active: true,
+                close_speed_rad_s: 0.3,
+                ceiling_torque_estimate_nm: None,
+            })
+        }
+        fn emit_pos_force_j7(
+            &mut self,
+            _intent: PosForceIntent,
+            _current: PosForceIntentStamp,
+        ) -> Result<PosForceEmitOutcome, ArmDriverError> {
+            self.pf_emits += 1;
+            Ok(PosForceEmitOutcome::Sent {
+                joint: 6,
+                freeze: false,
+                pf_status: PosForceTxStatus::Fresh,
+            })
+        }
+    }
+
+    for (outcome, expected_substr) in [
+        (StubOutcome::Deferred(2), "MIT batch write deferred (2 frames queued)"),
+        (StubOutcome::Expired(3), "MIT batch write expired (3 frames dropped)"),
+        (StubOutcome::EstopInhibited, "MIT batch write failed:"),
+    ] {
+        let mut cfg = mit_cfg();
+        cfg.joint_tracking.as_mut().unwrap().enabled = false;
+        let mut drv = StubMitBatchDriver::new();
+        drv.outcome = StubOutcome::Ok;
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        inner.is_torqued = true;
+        inner.safety.set_torque(true).expect("armed");
+        inner.mit.owner = MitOwner::Active;
+        inner.mit.joints = vec![3];
+        inner.mit.last_ff = vec![0.0; 7];
+        inner.mit.last_output = Some(inner.driver.as_ref().unwrap().lock().unwrap().clock_now());
+        inner.rt_executor_owned = true;
+        inner.safety.set_off_thread_reclaim(true);
+        // Warm up steady-state MIT ticks across triple-buffer slots.
+        for _ in 0..5 {
+            let _ = inner.tick_publish(0.02, 1, false);
+            let _ = inner.core.hub().latest();
+        }
+        inner.safety.drain_log_events_off_thread();
+
+        // Inject the specific batch outcome by swapping the stub driver's mode.
+        let mut failing = StubMitBatchDriver::new();
+        failing.outcome = outcome;
+        inner.driver = Some(std::sync::Mutex::new(Box::new(failing)));
+        inner.mit.last_output = Some(inner.driver.as_ref().unwrap().lock().unwrap().clock_now());
+
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "MIT batch outcome '{expected_substr}' touched allocator"
+        );
+        assert_eq!(inner.mit.owner, MitOwner::Lost);
+        assert_eq!(inner.safety.fault_code(), Some(FaultCode::BusLoss));
+        let reason = inner.mit.lost_reason.expect("lost_reason recorded");
+        assert!(
+            reason.as_str().contains(expected_substr),
+            "expected '{expected_substr}' in '{reason}'"
+        );
     }
 }
