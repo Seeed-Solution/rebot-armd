@@ -4397,3 +4397,241 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
         "expected exactly 1 owner-side emit_pos_force_j7 call site across src/"
     );
 }
+
+/// Round 7 M2 regression: under tight per-tick budgets (`max_frames = 1, 2, 3`), J1–J6 stopped
+/// hold frames ALWAYS take strict priority over J7 `0xCC` refresh and J7 `0x307` freeze/hold; J7
+/// is served only after all due J1–J6 holds have been queued/sent and remaining capacity allows.
+#[test]
+fn j1_j6_stopped_holds_prioritized_over_j7_under_tight_budget_1_2_3() {
+    let pf_cfg = armd::driver::GripperPosForce {
+        joint: 6,
+        current_raw: 460,
+        close_speed_rad_s: 0.30,
+        closed_rad: 0.0,
+        open_rad: -5.7,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    };
+
+    // Part A: 7-motor arm (6 arm joints + PosForce J7), J7 stale (> 100 ms, refresh pending) while
+    // J1–J6 stay fresh. Under max_frames = 1, 2, 3 across 12 consecutive stopped-hold ticks:
+    // - EVERY tick transmits exact `max_frames` J1–J6 arm holds (0 starvation ticks!);
+    // - Round-robin services all 6 arm joints J1–J6;
+    // - Neither J7 0xCC refresh nor J7 0x307 freeze steals a slot while J1–J6 holds remain due.
+    for max_frames in [1usize, 2, 3] {
+        let (bus, clock) = VirtualBus::new(&b601_limits());
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits())
+            .unwrap()
+            .with_gripper_pos_force(pf_cfg.clone())
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).unwrap();
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+
+        // Make J7 stale (> 100 ms) so both J7 freeze AND 0xCC refresh want slots.
+        clock.advance(ms(115));
+        bus.with(|s| {
+            s.rx.clear();
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+        });
+        d.read_joint_states().unwrap();
+        assert!(!d.pos_force_feedback_fresh(), "J7 must be stale");
+
+        d.set_tx_budget(TxBudget {
+            max_frames,
+            max_duration: ms(10),
+            frame_max_age: ms(45),
+        });
+
+        let mut seen_arm_ids = std::collections::BTreeSet::new();
+        for tick in 0..12 {
+            clock.advance(ms(20));
+            bus.with(|s| {
+                s.rx.clear();
+                for i in 0..6 {
+                    s.push_feedback(i);
+                }
+                s.tx_log.clear();
+                s.tx_accepted.clear();
+            });
+            d.read_joint_states().unwrap();
+            let out = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap();
+            assert!(
+                matches!(out, TxBatchOutcome::Deferred { .. } | TxBatchOutcome::Expired { .. }),
+                "max_frames={max_frames} tick={tick}: 6 due arm holds + J7 cannot complete in {max_frames} frames: {out:?}"
+            );
+            let tx = bus.with(|s| s.tx_accepted.clone());
+            let arm_holds: Vec<u32> = tx
+                .iter()
+                .filter(|f| (0x101..=0x106).contains(&f.id))
+                .map(|f| f.id)
+                .collect();
+            let j7_frames: Vec<_> = tx.iter().filter(|f| f.id == 0x307).collect();
+            let j7_refresh: Vec<_> = tx
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC)
+                .collect();
+            assert_eq!(
+                arm_holds.len(),
+                max_frames,
+                "max_frames={max_frames} tick={tick}: J1-J6 holds must get EVERY slot (0 starvation): tx={tx:?}"
+            );
+            assert!(
+                j7_frames.is_empty(),
+                "max_frames={max_frames} tick={tick}: J7 freeze must not steal slot while J1-J6 holds remain due: tx={tx:?}"
+            );
+            assert!(
+                j7_refresh.is_empty(),
+                "max_frames={max_frames} tick={tick}: J7 0xCC refresh must not steal slot while J1-J6 holds remain due: tx={tx:?}"
+            );
+            for id in arm_holds {
+                seen_arm_ids.insert(id);
+            }
+        }
+        assert_eq!(
+            seen_arm_ids,
+            (0x101u32..=0x106).collect(),
+            "max_frames={max_frames}: all 6 arm joints J1-J6 must receive holds via round-robin"
+        );
+
+        // Part B1: Once capacity allows on the same driver (max_frames = 7 -> 6 arm holds + 1 J7 freeze;
+        // max_frames = 8 -> 6 arm holds + 1 J7 freeze + 1 J7 0xCC refresh), all 6 arm holds transmit
+        // FIRST, then J7 freeze, then 0xCC refresh!
+        for (budget, expect_refresh) in [(7usize, false), (8usize, true)] {
+            d.set_tx_budget(TxBudget {
+                max_frames: budget,
+                max_duration: ms(10),
+                frame_max_age: ms(45),
+            });
+            clock.advance(ms(20));
+            bus.with(|s| {
+                s.rx.clear();
+                for i in 0..6 {
+                    s.push_feedback(i);
+                }
+                s.tx_log.clear();
+                s.tx_accepted.clear();
+            });
+            d.read_joint_states().unwrap();
+            let out = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap();
+            assert!(
+                matches!(out, TxBatchOutcome::Complete | TxBatchOutcome::Expired { pending: 0, .. }),
+                "budget={budget}: all 6 arm holds + J7 freeze must drain with pending=0, got {out:?}"
+            );
+            let tx = bus.with(|s| s.tx_accepted.clone());
+            let arm_indices: Vec<usize> = tx
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| (0x101..=0x106).contains(&f.id))
+                .map(|(idx, _)| idx)
+                .collect();
+            let j7_idx = tx
+                .iter()
+                .position(|f| f.id == 0x307)
+                .unwrap_or_else(|| panic!("budget={budget}: expected J7 freeze once capacity allows: {tx:?}"));
+            assert_eq!(arm_indices.len(), 6, "budget={budget}: all 6 arm holds must send: {tx:?}");
+            assert!(
+                arm_indices.iter().all(|&i| i < j7_idx),
+                "budget={budget}: all 6 arm holds must precede J7 freeze: {tx:?}"
+            );
+            assert_eq!(u16::from_le_bytes([tx[j7_idx].data[4], tx[j7_idx].data[5]]), 0);
+            let refresh_idx = tx
+                .iter()
+                .position(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC);
+            if expect_refresh {
+                let r_idx = refresh_idx.unwrap_or_else(|| panic!("budget={budget}: expected 0xCC refresh after J7 freeze: {tx:?}"));
+                assert!(r_idx > j7_idx, "budget={budget}: 0xCC refresh must follow J7 freeze: {tx:?}");
+            } else {
+                assert!(refresh_idx.is_none(), "budget={budget}: 0xCC must not steal slot from 6 arm holds + J7 freeze: {tx:?}");
+            }
+        }
+    }
+
+    // Part B2: With max_frames = 2 on a 1-arm + J7 bus (or max_frames = 3 on a 2-arm + J7 bus),
+    // all due arm holds transmit FIRST and J7 freeze takes the remaining slot (0xCC does not steal
+    // J7's freeze slot)!
+    for (max_frames, arm_count) in [(2usize, 1usize), (3usize, 2usize)] {
+        let mut motor_ids: Vec<u16> = (1..=arm_count as u16).collect();
+        motor_ids.push(7);
+        let mut lims: Vec<DamiaoLimits> = b601_limits()[..arm_count].to_vec();
+        lims.push(b601_limits()[6]);
+        let mut sub_pf = pf_cfg.clone();
+        sub_pf.joint = arm_count;
+
+        let (bus, clock) = VirtualBus::new(&lims);
+        // Set the gripper motor's ID in VirtualBus to 7 so 0x307 matches cleanly.
+        bus.with(|s| {
+            s.motors[arm_count].0 = 7;
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), motor_ids)
+            .with_joint_limits(lims)
+            .unwrap()
+            .with_gripper_pos_force(sub_pf)
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).unwrap();
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+
+        // Age J7 past 100 ms while keeping all arm joints fresh (with fresh empty-queue bound).
+        clock.advance(ms(115));
+        bus.with(|s| s.rx.clear());
+        d.read_joint_states().unwrap();
+        bus.with(|s| {
+            for i in 0..arm_count {
+                s.push_feedback(i);
+            }
+        });
+        d.set_tx_budget(TxBudget {
+            max_frames,
+            max_duration: ms(10),
+            frame_max_age: ms(45),
+        });
+        bus.with(|s| {
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+        });
+        d.read_joint_states().unwrap();
+        let hold_tgts = vec![JointTarget::position(0.0); arm_count + 1];
+        let out = d.write_estop_hold_bounded(&hold_tgts).unwrap();
+        assert_eq!(out, TxBatchOutcome::Complete);
+        let tx = bus.with(|s| s.tx_accepted.clone());
+        let arm_indices: Vec<usize> = tx
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| (0x101..=0x106).contains(&f.id))
+            .map(|(idx, _)| idx)
+            .collect();
+        let j7_idx = tx
+            .iter()
+            .position(|f| f.id == 0x307)
+            .unwrap_or_else(|| panic!("max_frames={max_frames}: expected J7 freeze in spare slot: {tx:?}"));
+        assert_eq!(arm_indices.len(), arm_count, "expected {arm_count} arm holds: {tx:?}");
+        assert!(
+            arm_indices.iter().all(|&i| i < j7_idx),
+            "due arm holds must precede J7 freeze in spare slot: {tx:?}"
+        );
+        assert_eq!(u16::from_le_bytes([tx[j7_idx].data[4], tx[j7_idx].data[5]]), 0);
+        assert!(
+            !tx.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+            "0xCC refresh must not steal the J7 freeze slot when budget equals arm_count + 1: {tx:?}"
+        );
+    }
+}

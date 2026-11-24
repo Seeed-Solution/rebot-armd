@@ -3251,6 +3251,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pf_refresh_attempted_this_tick: bool,
     /// True when an output pass ran since the previous `receive_feedback()` pass.
     output_ran_since_rx: bool,
+    /// True when the most recent bounded output pass was a stopped hold (`write_estop_hold_bounded`),
+    /// so `receive_feedback()` yields the shared TX budget to due J1–J6 stopped holds instead of
+    /// preempting them with a J7 `0xCC` refresh.
+    last_output_was_hold: bool,
     /// Bitmask of `(joint, slot)` stopped-hold frames (`1u64 << (joint * 2 + slot)`) that were
     /// due in the most recent `write_estop_hold_bounded` pass (`0` when nothing was due or
     /// stop-inhibited).
@@ -3757,6 +3761,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_refresh_deferred_ticks: 0,
             pf_refresh_attempted_this_tick: false,
             output_ran_since_rx: false,
+            last_output_was_hold: false,
             last_hold_tx_due_mask: 0,
             last_hold_tx_sent_mask: 0,
             external_pos_force_emitter: false,
@@ -3974,12 +3979,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.now() < effective_deadline
     }
 
-    /// Per-tick TX frame slots reserved for the J7 `PosForce` tick-epilogue emitter when J7 (or
-    /// its stale `0xCC` refresh) was deferred on the previous tick, guaranteeing J7 never starves
-    /// under tight budgets (e.g. `max_frames = 6` on a 7-motor arm).
+    /// Per-tick TX frame slots reserved for the J7 `PosForce` tick-epilogue emitter during normal
+    /// motion passes when J7 (or its stale `0xCC` refresh) was deferred on the previous tick
+    /// (e.g. `max_frames = 6` on a 7-motor arm).
+    ///
+    /// Never reserves slots when due J1–J6 stopped holds are queued or in stopped-hold mode, and
+    /// always leaves at least 1 slot for J1–J6 so J7 can never starve arm output under tight
+    /// budgets (`max_frames = 1, 2, 3`).
     #[inline]
     fn pos_force_reserved_slots(&self) -> usize {
-        if !self.is_enabled || self.active_pos_force_joint().is_none() {
+        if !self.is_enabled
+            || self.active_pos_force_joint().is_none()
+            || self.last_output_was_hold
+            || self.pending_hold_tx.len() > 0
+            || self.tx_budget.max_frames <= 1
+        {
             return 0;
         }
         let j7_frame = usize::from(self.pf_deferred_ticks >= 1);
@@ -3989,7 +4003,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 && !self.pf_refresh_attempted_this_tick
                 && self.poll_tx_allowed(),
         );
-        (j7_frame + refresh).min(self.tx_budget.max_frames)
+        (j7_frame + refresh).min(self.tx_budget.max_frames.saturating_sub(1))
     }
 
     /// True when an arm joint (J1–J6) may start one more frame transmit in the current tick pass
@@ -4745,13 +4759,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let entry_now = self.now();
         let _ = self.check_pos_force_freshness_for_tx_at(entry_now);
 
-        let mut pf_refresh_sent = false;
-        if self.pf_refresh_pending
-            && self.pf_refresh_deferred_ticks >= 1
-            && !self.pf_refresh_attempted_this_tick
-            && self.poll_tx_allowed()
-        {
-            pf_refresh_sent |= self.try_send_pf_refresh(start_stamp)?;
+        // Strict stopped-hold priority: J1–J6 hold and stop frames take priority over both the
+        // J7 freeze/hold frame and the J7 `0xCC` refresh. J7 may consume a TX slot ONLY after all
+        // due J1–J6 stopped holds have been queued and drained (`pending_hold_tx.is_empty()`).
+        if self.pending_hold_tx.len() > 0 {
+            if self.pf_refresh_pending && !self.pf_refresh_attempted_this_tick && self.poll_tx_allowed() {
+                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
+            }
+            self.pf_deferred_ticks = self.pf_deferred_ticks.saturating_add(1);
+            let pf_status = self.take_last_pos_force_tx_status();
+            return Ok(PosForceEmitOutcome::Deferred { joint: pf_j, pf_status });
         }
 
         let mut active_kind = effective_kind;
@@ -4825,24 +4842,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         };
 
         let Some(sent_frame) = sent_frame else {
-            if pf_refresh_sent {
-                let stop_res = if is_target_intent {
-                    self.strict_stop_check(Some(start_stamp))
-                } else {
-                    self.pending_stop_check(Some(start_stamp))
-                };
-                if stop_res.is_err() {
-                    return Err(ArmDriverError::EstopInhibited);
-                }
-                if self.flush_cutoff_exceeded() {
-                    self.mark_tx_pass_backpressured();
-                    return Err(TransportError::Timeout.into());
-                }
-                if let Err(e) = self.can.flush() {
-                    self.mark_tx_pass_backpressured();
-                    return Err(e.into());
-                }
-            }
             if self.pf_refresh_pending && !self.pf_refresh_attempted_this_tick && self.poll_tx_allowed() {
                 self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
             }
@@ -4862,13 +4861,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.record_sent_target(pf_j, sent_frame, None);
 
-        if self.pf_refresh_pending
+        // J7 `0xCC` refresh runs strictly AFTER all due J1–J6 holds and the J7 hold/freeze frame,
+        // consuming a slot only if TX budget capacity still allows.
+        if self.pending_hold_tx.len() == 0
+            && self.pf_refresh_pending
             && !self.pf_refresh_attempted_this_tick
             && self.poll_tx_allowed()
+            && self.can_start_tick_tx()
         {
-            pf_refresh_sent |= self.try_send_pf_refresh(start_stamp)?;
+            let _ = self.try_send_pf_refresh(start_stamp)?;
         }
-        let _ = pf_refresh_sent;
 
         let stop_check = |d: &Self| {
             if is_target_intent {
@@ -6155,6 +6157,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(e);
         }
         self.output_ran_since_rx = true;
+        self.last_output_was_hold = false;
         let current_stamp = self.current_stop_stamp();
         if self.pending_tx.has_stopped_entry(current_stamp) {
             self.discard_pending_tx_stopped();
@@ -8878,6 +8881,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 return Err(e);
             }
             self.output_ran_since_rx = true;
+            self.last_output_was_hold = true;
             let start_stamp = self.current_stop_stamp();
             let _ = self.drop_stopped_hold_tx(start_stamp);
             let cleanup_now = self.now();
@@ -8961,7 +8965,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let mut dropped_stale_in_pass = 0usize;
             (|| -> Result<TxBatchOutcome, ArmDriverError> {
                 while let Some(entry) = self.pending_hold_tx.front() {
-                    if !self.can_start_arm_tx() {
+                    if !self.can_start_tick_tx() {
                         break;
                     }
                     let i = entry.joint;
@@ -9280,6 +9284,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
         self.last_target_tx_sent_mask = 0;
         self.last_tx_pf_status = PosForceTxStatus::Unobserved;
+        self.last_output_was_hold = false;
         self.discard_pending_hold_tx();
         if targets.len() != self.motor_ids.len() {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
@@ -10020,6 +10025,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.pf_refresh_deferred_ticks = 0;
                 } else {
                     if self.pf_refresh_pending
+                        && self.pending_hold_tx.len() == 0
+                        && !self.last_output_was_hold
+                        && self.tx_budget.max_frames > self.motor_ids.len()
                         && (self.pf_refresh_deferred_ticks >= 1 || !self.output_ran_since_rx)
                     {
                         if let Ok(true) = self.try_send_pf_refresh(rx_stop_stamp) {

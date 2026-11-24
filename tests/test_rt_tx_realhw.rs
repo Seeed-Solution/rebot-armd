@@ -2718,37 +2718,62 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
             "{owner:?}: J7 did not resume moving/fresh 0x307 after recovery"
         );
 
-        // Same full 6-frame budget priority refresh + freeze check under stopped-hold.
-        let hold_last_fresh_j7 = rig_full.inner().measured_positions[6];
+        // Stopped-hold priority check (M2): under a 6-frame budget on a 7-motor arm, all 6 due
+        // J1–J6 stopped holds take strict priority every tick (0 starvation by J7 freeze/0xCC);
+        // once capacity allows (max_frames = 8), all 6 J1–J6 holds go first, then J7 freeze + 0xCC.
         rig_full.inner_mut()
             .safety
             .trigger_fault_coded(FaultCode::Other, FaultReason::Other("6-frame hold test".into()));
-        let hold_ep = rig_full.inner().safety.epoch_id();
         rig_full.bus.with(|s| s.motors[6].mute_feedback = true);
         for _ in 0..6 {
             rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
             rig_full.step_dt(DT, false);
         }
         rig_full.bus.clear_log();
-        for _ in 0..2 {
-            rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
-            rig_full.step_dt(DT, false);
-        }
-        let h_all = rig_full.bus.tx_log();
-        assert_j7_freeze_frames(
-            &j7_pf_frames(&h_all),
-            hold_last_fresh_j7,
-            pf_cur,
-            &format!("{owner:?} 6-frame stopped-hold"),
-        );
+        rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_full.step_dt(DT, false);
+        let h6 = rig_full.bus.tx_log();
         for id in 1u32..=6 {
-            assert!(h_all.iter().any(|f| f.id == 0x100 + id), "{owner:?}: 6-frame hold missed J{id}: {h_all:?}");
+            assert!(h6.iter().any(|f| f.id == 0x100 + id), "{owner:?}: 6-frame hold missed J{id}: {h6:?}");
         }
-        assert!(
-            !j7_refresh_frames(&h_all).is_empty(),
-            "{owner:?}: 6-frame hold must send priority J7 0xCC refresh: {h_all:?}"
+        assert!(j7_pf_frames(&h6).is_empty(), "{owner:?}: 6-frame hold must prioritize J1-J6 over J7 freeze: {h6:?}");
+        assert!(j7_refresh_frames(&h6).is_empty(), "{owner:?}: 6-frame hold must prioritize J1-J6 over J7 0xCC: {h6:?}");
+
+        // With 8-frame capacity (6 arm holds + J7 freeze + J7 0xCC), all 6 arm holds go first,
+        // followed by J7 freeze AND J7 0xCC refresh with no false CAN_TX_STALLED!
+        let mut rig_h8 = DualRig::new_pos_force(
+            owner,
+            base_cfg(),
+            Some(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) }),
         );
-        assert_eq!(rig_full.inner().safety.epoch_id(), hold_ep, "{owner:?}: no false CAN_TX_STALLED in 6-frame hold");
+        let h8_last_fresh_j7 = rig_h8.inner().measured_positions[6];
+        rig_h8.inner_mut()
+            .safety
+            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("8-frame hold test".into()));
+        let h8_ep = rig_h8.inner().safety.epoch_id();
+        rig_h8.bus.with(|s| s.motors[6].mute_feedback = true);
+        for _ in 0..6 {
+            rig_h8.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig_h8.step_dt(DT, false);
+        }
+        rig_h8.bus.clear_log();
+        rig_h8.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_h8.step_dt(DT, false);
+        let h8 = rig_h8.bus.tx_log();
+        for id in 1u32..=6 {
+            assert!(h8.iter().any(|f| f.id == 0x100 + id), "{owner:?}: 8-frame hold missed J{id}: {h8:?}");
+        }
+        assert_j7_freeze_frames(
+            &j7_pf_frames(&h8),
+            h8_last_fresh_j7,
+            pf_cur,
+            &format!("{owner:?} 8-frame stopped-hold"),
+        );
+        assert!(
+            !j7_refresh_frames(&h8).is_empty(),
+            "{owner:?}: 8-frame hold must send J7 0xCC refresh once capacity allows: {h8:?}"
+        );
+        assert_eq!(rig_h8.inner().safety.epoch_id(), h8_ep, "{owner:?}: no false CAN_TX_STALLED in 8-frame hold");
     }
 }
 
