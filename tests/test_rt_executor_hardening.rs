@@ -2832,7 +2832,7 @@ async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and
     drv_rt.check_mapping_ranges();
     let sup_rt = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_rt)));
     sup_rt.set_lease_enabled(false).await;
-    sup_rt.set_torque(true).await.unwrap();
+    sup_rt.enable_torque(sup_rt.capture_admission_stamp()).await.unwrap();
     inner_rt.with(|s| s.tx_log.clear());
 
     let timeout_fired = Arc::new(AtomicBool::new(false));
