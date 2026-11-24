@@ -1,0 +1,30 @@
+{
+  "id": "22_calibration_and_misc_actions",
+  "family": "calibration",
+  "description": "calib_hover, gripper_calibrate, measure_multiview validation & mock responses",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":true,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"resume":"nonexistent"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/calib_hover","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/gripper_calibrate","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/measure_multiview","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"resume":"nonexistent"},"epoch_id":1,"generation":1,"path":"/api/v1/action/calib_hover","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"JOB_NOT_FOUND","epoch_id":1,"error":"JOB_NOT_FOUND","message":"no hover job nonexistent (GET /api/v1/calibration/hover)","request_id":1,"safety_state":null,"status":404,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/action/gripper_calibrate","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"NOT_ARMED","epoch_id":1,"error":"NOT_ARMED","message":"Arm is not armed/torqued (current state: Idle)","request_id":2,"safety_state":null,"status":412,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/action/measure_multiview","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"NOT_ARMED","epoch_id":1,"error":"NOT_ARMED","message":"Arm is not armed/torqued (current state: Idle)","request_id":3,"safety_state":null,"status":412,"type":"command_reject"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

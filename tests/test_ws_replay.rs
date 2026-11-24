@@ -355,9 +355,11 @@ async fn replay_corpus_matches_baseline_zero_diff() {
     }
 
     let manifest_path = dir.join("manifest.json");
-    if !manifest_path.exists() {
-        return;
-    }
+    assert!(
+        manifest_path.exists(),
+        "missing WS replay corpus manifest at {}",
+        manifest_path.display()
+    );
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     let files = manifest["sessions"]

@@ -1,0 +1,36 @@
+{
+  "id": "28_auth_clear_fault_after_estop",
+  "family": "auth",
+  "description": "viewer cannot clear_fault latched EStop; succeeds after REST unlock + WS auth",
+  "setup": {"profile":"rebot_dm","operator_pin":"246810","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0","query":"auth=explicit"},
+    {"op":"send","client":"c0","frame":{"client_id":"op","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"type":"estop"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/safety/clear_fault","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"rest","method":"POST","path":"/api/v1/auth/unlock","body":{"pin":"246810"},"capture_token":true,"record_body":true},
+    {"op":"send","client":"c0","frame":{"seq":1,"token":"{{token}}","type":"auth"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/safety/clear_fault","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"op","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"op","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"type":"estop"}},
+    {"ev":"server_frame","client":"c0","frame":{"epoch_id":2,"safety_state":"EStop","type":"epoch_sync"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":2,"generation":1,"path":"/api/v1/safety/clear_fault","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"OPERATOR_REQUIRED","epoch_id":2,"error":"operator_required","message":"Operator unlock is required for clear_fault (EStop latched)","request_id":1,"safety_state":null,"status":403,"type":"command_reject"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/auth/unlock","status":200,"body":{"expires_in_s":1800,"role":"operator","token":"88e6e0bc0b4dfe965959945a3aba14a8633afaa9c6522d2ad5c319c1079b05d1"}},
+    {"ev":"client_frame","client":"c0","frame":{"seq":1,"token":"88e6e0bc0b4dfe965959945a3aba14a8633afaa9c6522d2ad5c319c1079b05d1","type":"auth"}},
+    {"ev":"server_frame","client":"c0","frame":{"auth_enforced":true,"expires_in_s":1800,"role":"operator","seq":1,"type":"auth_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":2,"generation":1,"path":"/api/v1/safety/clear_fault","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":3,"is_torqued":false,"request_id":2,"safety_state":"Idle","status":"accepted","type":"command_ack"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

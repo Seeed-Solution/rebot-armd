@@ -1,0 +1,30 @@
+{
+  "id": "02_lease_validation",
+  "family": "lease",
+  "description": "invalid_client_id (empty & >128), non-boolean force, non-command without lease -> lease_lost gen 0",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"client_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":2,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","force":"yes","seq":3,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"epoch_id":"{{epoch}}","generation":0,"name":"home","type":"preset"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"error":"invalid_client_id","seq":1,"type":"lease_rejected"}},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":2,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"error":"invalid_client_id","seq":2,"type":"lease_rejected"}},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","force":"yes","seq":3,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"error":"invalid_argument","message":"force must be a boolean","seq":3,"status":400,"type":"lease_rejected"}},
+    {"ev":"client_frame","client":"c0","frame":{"epoch_id":1,"generation":0,"name":"home","type":"preset"}},
+    {"ev":"server_frame","client":"c0","frame":{"generation":0,"type":"lease_lost"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

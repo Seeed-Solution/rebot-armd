@@ -1,0 +1,32 @@
+{
+  "id": "12_replay_episode",
+  "family": "replay",
+  "description": "replay seeded parquet episode + terminal, plus missing episode rejection",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":true,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"episode":"01J00000000000000000000001","speed":1.0},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/replay","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1,"capture_action":"rp"},
+    {"op":"expect_terminal","client":"c0","action_alias":"rp"},
+    {"op":"send","client":"c0","frame":{"body":{"episode":"01ARZ3NDEKTSV4RRFFQ69G5FAV"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/replay","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":1,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"episode":"01J00000000000000000000001","speed":1.0},"epoch_id":1,"generation":1,"path":"/api/v1/action/replay","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"action_id":1,"control_mode":"position","epoch_id":1,"expected_duration_s":0.72,"is_torqued":true,"request_id":2,"safety_state":"Moving","status":"accepted","type":"command_ack"}},
+    {"ev":"action_terminal","client":"c0","action_id":1,"kind":"replay","state":"done","code":null,"safety_state":"Moving","epoch_id":1,"is_torqued":true,"control_mode":"position"},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"episode":"01ARZ3NDEKTSV4RRFFQ69G5FAV"},"epoch_id":1,"generation":1,"path":"/api/v1/action/replay","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"EPISODE_NOT_FOUND","epoch_id":1,"error":"EPISODE_NOT_FOUND","message":"Episode '01ARZ3NDEKTSV4RRFFQ69G5FAV' not found","request_id":3,"safety_state":null,"status":404,"type":"command_reject"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

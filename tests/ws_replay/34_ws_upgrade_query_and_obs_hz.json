@@ -1,0 +1,18 @@
+{
+  "id": "34_ws_upgrade_query_and_obs_hz",
+  "family": "upgrade_telemetry",
+  "description": "invalid obs_hz returns HTTP 400; obs_hz=5 streams bounded monotonic 7-DOF telemetry",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"bad","query":"obs_hz=abc","expect_http_status":400},
+    {"op":"connect","client":"c0","query":"obs_hz=5","expect_http_status":101},
+    {"op":"collect_telemetry","client":"c0","duration_ms":650,"min_count":1,"max_count":8},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"bad","status":400},
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"telemetry_summary","client":"c0","in_range":true,"monotonic":true,"dof":7,"safety_state":"Idle","epoch_id":1},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "id": "30_preemption_eviction_and_cooldown",
+  "family": "preemption",
+  "description": "c0 holds lease, c1 non-force controller_busy, c1 force preempts (c0 gets lease_lost preempted), c0 re-preempt hits cooldown",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"connect","client":"c1"},
+    {"op":"send","client":"c0","frame":{"client_id":"holder_a","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c1","frame":{"client_id":"holder_b","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c1","count":1},
+    {"op":"send","client":"c1","frame":{"client_id":"holder_b","force":true,"seq":2,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c1","count":1},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"client_id":"holder_a","force":true,"seq":2,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"},
+    {"op":"close_client","client":"c1"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"upgrade_status","client":"c1","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"holder_a","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"holder_a","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c1","frame":{"client_id":"holder_b","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c1","frame":{"error":"controller_busy","seq":1,"type":"lease_rejected"}},
+    {"ev":"client_frame","client":"c1","frame":{"client_id":"holder_b","force":true,"seq":2,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c1","frame":{"client_id":"holder_b","generation":2,"seq":2,"type":"lease_granted"}},
+    {"ev":"server_frame","client":"c0","frame":{"generation":1,"reason":"preempted","type":"lease_lost"}},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"holder_a","force":true,"seq":2,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"error":"preemption_cooldown","remaining_ms":2999,"seq":2,"type":"lease_rejected"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"LEASE_LOST","epoch_id":1,"error":"LEASE_LOST","message":"This connection does not own an active lease","request_id":1,"status":409,"type":"command_reject"}},
+    {"ev":"client_closed","client":"c0"},
+    {"ev":"client_closed","client":"c1"}
+  ]
+}

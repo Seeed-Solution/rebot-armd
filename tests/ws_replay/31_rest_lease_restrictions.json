@@ -1,0 +1,32 @@
+{
+  "id": "31_rest_lease_restrictions",
+  "family": "preemption",
+  "description": "REST mutating endpoints rejected with connection-lease requirement while WS holds lease",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ws_holder","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"rest","method":"POST","path":"/api/v1/torque","body":{"enable":true},"capture_token":false,"record_body":true},
+    {"op":"rest","method":"POST","path":"/api/v1/motion/jog","body":{"target_positions":[0.0,0.0,0.0,0.0,0.0,0.0,0.0]},"capture_token":false,"record_body":true},
+    {"op":"rest","method":"POST","path":"/api/v1/motion/home","body":{},"capture_token":false,"record_body":true},
+    {"op":"rest","method":"POST","path":"/api/v1/action/move_to","body":{"position":[0.2,0.0,0.2]},"capture_token":false,"record_body":true},
+    {"op":"rest","method":"POST","path":"/api/v1/mode/gravity_comp","body":{"enable":true},"capture_token":false,"record_body":true},
+    {"op":"send","client":"c0","frame":{"generation":"{{gen:c0}}","type":"release_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ws_holder","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ws_holder","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/torque","status":409,"body":{"code":"LEASE_ACTIVE","error":"LEASE_ACTIVE","message":"Use actuator commands on the WebSocket connection holding the control lease"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/motion/jog","status":409,"body":{"code":"LEASE_ACTIVE","error":"LEASE_ACTIVE","message":"Use actuator commands on the WebSocket connection holding the control lease"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/motion/home","status":409,"body":{"code":"LEASE_ACTIVE","error":"LEASE_ACTIVE","message":"Use actuator commands on the WebSocket connection holding the control lease"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/action/move_to","status":409,"body":{"code":"LEASE_ACTIVE","error":"LEASE_ACTIVE","message":"Use actuator commands on the WebSocket connection holding the control lease"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/mode/gravity_comp","status":409,"body":{"code":"LEASE_ACTIVE","error":"LEASE_ACTIVE","message":"Use actuator commands on the WebSocket connection holding the control lease"}},
+    {"ev":"client_frame","client":"c0","frame":{"generation":1,"type":"release_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"success":true,"type":"lease_released"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}
