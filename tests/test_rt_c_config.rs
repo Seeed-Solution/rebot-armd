@@ -2196,3 +2196,238 @@ async fn codex_review_regression_invariants_executor() {
         .await
         .unwrap();
 }
+
+// ============================================================================
+// 10. B1: Software joint zero + stale poses/gripper atomic commit (both owners)
+// ============================================================================
+
+async fn run_joint_zero_calib_is_dir_test(owner: RtOwner) {
+    let dir = tempfile::tempdir().unwrap();
+    let calib_path = dir.path().join("calibration.json");
+    let poses_path = dir.path().join("poses.json");
+    let gripper_path = dir.path().join("gripper_calib.json");
+    let backup_dir = dir.path().join("backups");
+
+    // Pre-create calibration.json as a DIRECTORY so atomic rename_only() MUST fail.
+    std::fs::create_dir(&calib_path).unwrap();
+
+    // Seed valid poses.json and gripper_calib.json on disk.
+    let pose_seed = json!({
+        "joint_names": ["joint_1","joint_2","joint_3","joint_4","joint_5","joint_6","gripper"],
+        "poses": [{
+            "id": "01J00000000000000000000001",
+            "name": "p_zero_test",
+            "positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "saved_at_ms": 1_700_000_000_000u64,
+            "profile_id": "rebot_b601dm",
+            "arm_dof": 6,
+            "gripper_joint": 6,
+            "stale": null
+        }]
+    });
+    let poses_before = serde_json::to_string_pretty(&pose_seed).unwrap();
+    std::fs::write(&poses_path, &poses_before).unwrap();
+
+    let grip_seed = json!({
+        "offset_rad": 0.02,
+        "ts": 1_700_000_000u64,
+        "stale": null
+    });
+    let grip_before = serde_json::to_string_pretty(&grip_seed).unwrap();
+    std::fs::write(&gripper_path, &grip_before).unwrap();
+
+    // Build supervisor shifted on J2 and gripper J7 by > STALE_THRESHOLD_RAD so software zero
+    // will compute non-zero offsets and mark BOTH poses and gripper calibration stale.
+    let shifted: [f32; 7] = [0.0, 0.15, 0.0, 0.0, 0.0, 0.0, -0.15];
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    armd::poses::load_into(&sup, &poses_path).await;
+    armd::gripper_calib::load_into(&sup, &gripper_path).await;
+    let lease_conn = "b1-zero-conn";
+    let (lease_gen, epoch) = {
+        let mut inner = sup.inner().write().await;
+        inner.measured_positions = shifted.to_vec();
+        inner.commanded_positions = shifted.to_vec();
+        inner.target_positions = shifted.to_vec();
+        inner.is_torqued = false;
+        let lgen = inner.acquire_lease(lease_conn).unwrap();
+        let ep = inner.safety.epoch_id();
+        (lgen, ep)
+    };
+    let handle = if owner == RtOwner::Executor {
+        let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
+        ecfg.alloc_timing = true;
+        let h = sup.start_executor(ecfg).await.unwrap();
+        let dl = Instant::now() + Duration::from_secs(3);
+        while sup.hub().latest().is_none() {
+            assert!(Instant::now() < dl);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Some(h)
+    } else {
+        sup.tick(0.02).await;
+        None
+    };
+
+    let _detached = if owner == RtOwner::Executor {
+        Some(sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let mut deps = armd::calibration::CalibrationDeps::new(calib_path.clone(), None, up);
+    deps.backup_dir = backup_dir;
+
+    let job_token = armd::rt_core::requests::config::next_calib_job_token();
+    let busy_res = sup
+        .dispatch_config_request(ConfigRequest::SetCalibrationBusy {
+            busy: true,
+            motor_zero: true,
+            job_token,
+            check_begin: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(busy_res, ConfigReply::CalibrationBusySet(Ok(_))));
+
+    let adm = capture_config_admission(&sup, 501, lease_gen, Some(epoch));
+    let auth = armd::calibration::CalibCommitAuth {
+        admission: adm,
+        lease_holder: Some((HolderLabel::new(lease_conn), lease_gen)),
+        off_thread_check: Arc::new(|| Ok(())),
+        job_token: Some(job_token),
+        deadline: Instant::now() + Duration::from_secs(10),
+    };
+    let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+    let req = armd::motor_zero::MotorZeroRequest {
+        joints: vec![1, 6], // 0-based J2 and J7 (gripper)
+        force: true,
+        dry_run: false,
+        method: Some("software".into()),
+    };
+
+    // 1. Rename of calibration.json fails because target is a directory:
+    //    live offsets MUST stay unchanged and poses.json / gripper_calib.json MUST be untouched.
+    let err = armd::motor_zero::run_with_auth(&sup, &deps, req.clone(), &check, &auth)
+        .await
+        .expect_err("software zero must fail when calibration.json is a directory");
+    assert_eq!(err.code, "PERSIST_FAILED", "{err:?}");
+
+    let pub_after_fail = sup.published_config().await.unwrap();
+    assert_eq!(
+        pub_after_fail.joint_zero_offsets,
+        vec![0.0; 7],
+        "live joint_zero_offsets must be unchanged after calibration.json rename failure"
+    );
+    assert!(
+        pub_after_fail.poses.list.poses[0].stale.is_none(),
+        "live pose stale flag must stay None after rename failure"
+    );
+    assert!(
+        pub_after_fail.gripper_calib_stale.is_none(),
+        "live gripper_calib_stale must stay None after rename failure"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&poses_path).unwrap(),
+        poses_before,
+        "poses.json on disk must be completely untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&gripper_path).unwrap(),
+        grip_before,
+        "gripper_calib.json on disk must be completely untouched"
+    );
+    assert!(calib_path.is_dir(), "calibration.json directory must remain intact");
+    // Verify no leftover temp files remain in the directory.
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "aborted temp files leaked: {leftovers:?}");
+
+    // Hold must be Cleared (NOT Reconciling), and live positions unchanged.
+    let held = sup
+        .dispatch_config_request(ConfigRequest::InspectHold(ConfigDomain::Calibration))
+        .await
+        .unwrap();
+    match held {
+        ConfigReply::HoldInspected { config_inhibited, state } => {
+            assert!(!config_inhibited, "pre-rename failure must not inhibit motion");
+            assert_eq!(state, None, "pre-rename failure must release hold Cleared");
+        }
+        _ => panic!("unexpected InspectHold reply"),
+    }
+    if owner == RtOwner::Legacy {
+        let inner = sup.inner().read().await;
+        assert_eq!(inner.joint_zero_offsets, vec![0.0; 7]);
+        assert!(inner.poses.list.poses[0].stale.is_none());
+        assert!(inner.gripper_calib_stale.is_none());
+    } else {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let obs = sup.hub().latest().unwrap().obs.clone();
+        assert!((obs.positions[1] - 0.15).abs() < 1e-4, "live J2 reading changed before persist: {:?}", obs.positions);
+        assert!((obs.positions[6] - (-0.15)).abs() < 1e-4, "live J7 reading changed before persist: {:?}", obs.positions);
+    }
+
+    // 2. Remove the blocking directory and retry: software zero commits calibration.json,
+    //    poses.json, gripper_calib.json, and live offsets atomically inside one reservation.
+    std::fs::remove_dir(&calib_path).unwrap();
+    let adm2 = capture_config_admission(&sup, 502, lease_gen, Some(epoch));
+    let auth2 = armd::calibration::CalibCommitAuth {
+        admission: adm2,
+        lease_holder: Some((HolderLabel::new(lease_conn), lease_gen)),
+        off_thread_check: Arc::new(|| Ok(())),
+        job_token: Some(job_token),
+        deadline: Instant::now() + Duration::from_secs(10),
+    };
+    let ok = armd::motor_zero::run_with_auth(&sup, &deps, req, &check, &auth2)
+        .await
+        .expect("software zero should succeed once calibration.json path is writable");
+    assert_eq!(ok["persist_verified"], json!(true), "{ok}");
+    assert_eq!(ok["invalidated"]["gripper_calibration_stale"], json!(true), "{ok}");
+    assert_eq!(ok["invalidated"]["poses_stale"], json!(["p_zero_test"]), "{ok}");
+    assert!(calib_path.is_file(), "calibration.json must be persisted");
+    let poses_disk: Value = serde_json::from_str(&std::fs::read_to_string(&poses_path).unwrap()).unwrap();
+    assert!(poses_disk["poses"][0]["stale"].is_object(), "poses.json must be marked stale on disk");
+    let grip_disk: Value = serde_json::from_str(&std::fs::read_to_string(&gripper_path).unwrap()).unwrap();
+    assert!(grip_disk["stale"].is_object(), "gripper_calib.json must be marked stale on disk");
+    let pub_ok = sup.published_config().await.unwrap();
+    assert!(pub_ok.joint_zero_offsets[1].abs() > 0.05, "J2 offset must now be active: {:?}", pub_ok.joint_zero_offsets);
+    assert!(pub_ok.poses.list.poses[0].stale.is_some());
+    assert!(pub_ok.gripper_calib_stale.is_some());
+
+    let _ = sup
+        .dispatch_config_request(ConfigRequest::SetCalibrationBusy {
+            busy: false,
+            motor_zero: false,
+            job_token,
+            check_begin: None,
+        })
+        .await;
+
+    if let Some(h) = handle {
+        assert_eq!(
+            h.stats().total_allocs(),
+            AllocCounts::ZERO,
+            "B1 software zero fail+success allocated on armd-control: {:?}",
+            h.stats().total_allocs()
+        );
+        assert_eq!(sup.inner().control_thread_attempts(), 0);
+        drop(_detached);
+        tokio::task::spawn_blocking(move || h.stop_and_join())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joint_zero_rename_failure_leaves_offsets_poses_and_gripper_untouched_legacy() {
+    run_joint_zero_calib_is_dir_test(RtOwner::Legacy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joint_zero_rename_failure_leaves_offsets_poses_and_gripper_untouched_executor() {
+    run_joint_zero_calib_is_dir_test(RtOwner::Executor).await;
+}

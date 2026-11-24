@@ -1581,118 +1581,205 @@ fn clear_busy(inner: &mut SupervisorInner, job_token: u64) -> bool {
     }
 }
 
-/// After a zero (motor or software) of `joints` (1-based) whose readings moved by `changes`
-/// (rad, same order): remove the kinematic correction (live, and from `calibration.json`), mark
-/// the camera calibration stale, write `joint_zero` (`new_zero`: None = unchanged, Some(None) =
-/// removed), and, for joints that moved by more than [`crate::joint_zero::STALE_THRESHOLD_RAD`],
-/// mark the saved poses stale and, for the gripper joint, the gripper calibration (nothing is
-/// deleted). The caller holds `calibration_busy` and torque is off. Returns `{kinematics_removed,
-/// camera_stale, poses_stale, gripper_calibration_stale, removed_kinematics, at, error?}`; a
-/// failed file write leaves the live state changed and reports `error`.
-pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, joints: &[usize], changes: &[f32],
-    method: &str, new_zero: Option<Option<crate::joint_zero::JointZero>>) -> Value {
-    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let moved: Vec<usize> = joints.iter().zip(changes).filter(|(_, d)| f64::from(d.abs()) > crate::joint_zero::STALE_THRESHOLD_RAD)
-        .map(|(j, _)| *j).collect();
-    let Ok(pub_cfg) = sup.published_config().await else {
-        return json!({"kinematics_removed": false, "camera_stale": false, "poses_stale": [],
-            "gripper_calibration_stale": false, "removed_kinematics": null, "at": at, "error": "published configuration unavailable"});
+/// Atomically persists and activates a joint-zero change (optional new software/restore offsets)
+/// together with all dependent invalidations (`calibration.json`, stale `poses.json`, stale
+/// `gripper_calib.json`, uncorrected kinematics, floor, and gripper baseline) inside ONE
+/// `ConfigDomain::Calibration` reservation through the single common commit worker:
+/// `reserve -> stage + file fsync -> authority recheck -> rename (calibration.json first) ->
+/// parent-directory fsync -> authority recheck -> activate/publish`.
+///
+/// Used identically on both `RtOwner::Legacy` and `RtOwner::Executor`:
+/// - Software/restore offsets are installed ONLY at activation (after rename + parent-dir fsync).
+/// - A failure before the first rename (e.g. `calibration.json` is a directory) aborts all
+///   remaining temp files, releases the hold (`Cleared`), and leaves live offsets, `poses.json`,
+///   and `gripper_calib.json` untouched.
+/// - A failure at or after the first rename (including parent-dir fsync failure) keeps old live
+///   state active and enters `HoldState::Reconciling` (motion stays inhibited).
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_joint_zero_and_invalidation(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    joints: &[usize],
+    changes: &[f32],
+    method: &str,
+    new_zero: Option<Option<crate::joint_zero::JointZero>>,
+    new_offsets: Option<Vec<f32>>,
+    auth: Option<&CalibCommitAuth>,
+    require_zero_idle: bool,
+) -> Result<Value, CalibError> {
+    use crate::rt_core::config_iface::ConfigDomain;
+    use crate::rt_core::requests::config::{
+        build_config_proposal_with_deadline, capture_config_admission, prepare_eval_bufs_off_thread,
+        run_config_commit_detailed, ConfigAuthContext, ConfigCandidate, ConfigCommitPlan,
+        ConfigWriteOp, FileWriteOp, JointZeroCommitCandidate, ReservePrecheck,
     };
+
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let moved: Vec<usize> = joints
+        .iter()
+        .zip(changes)
+        .filter(|(_, d)| f64::from(d.abs()) > crate::joint_zero::STALE_THRESHOLD_RAD)
+        .map(|(j, _)| *j)
+        .collect();
+    let pub_cfg = sup
+        .published_config()
+        .await
+        .map_err(|e| CalibError::new(503, "CONFIG_UNAVAILABLE", e.to_string()))?;
+
     let mut file = pub_cfg.calibration.clone();
     let removed = file.as_mut().and_then(|c| c.kinematics.take());
     let camera_stale = file.as_ref().is_some_and(CalibrationFile::has_camera);
     if let Some(c) = file.as_mut().filter(|c| c.has_camera()) {
-        c.stale = Some(CalibrationStale { reason: format!("{method} zero of joints {joints:?}; the camera calibration was measured with the old zero"), at: at.clone() });
+        c.stale = Some(CalibrationStale {
+            reason: format!(
+                "{method} zero of joints {joints:?}; the camera calibration was measured with the old zero"
+            ),
+            at: at.clone(),
+        });
         if let Some(a) = c.acceptance.as_mut() {
-            a.invalidated = Some(CalibrationStale { reason: format!("{method} zero of joints {joints:?}; the acceptance was measured with the old zero"), at: at.clone() });
+            a.invalidated = Some(CalibrationStale {
+                reason: format!(
+                    "{method} zero of joints {joints:?}; the acceptance was measured with the old zero"
+                ),
+                at: at.clone(),
+            });
         }
     }
     let mut file_changes = removed.is_some() || camera_stale;
     if let Some(c) = file.as_mut() {
-        if crate::mit::invalidate_record(c, joints, &format!("{method} zero of joints {joints:?}; the MIT qualification was measured with the old zero"), &at) {
+        if crate::mit::invalidate_record(
+            c,
+            joints,
+            &format!(
+                "{method} zero of joints {joints:?}; the MIT qualification was measured with the old zero"
+            ),
+            &at,
+        ) {
             file_changes = true;
         }
     }
     if let Some(z) = new_zero {
-        if file.as_ref().and_then(|c| c.joint_zero.as_ref()) != z.as_ref() { file_changes = true; }
+        if file.as_ref().and_then(|c| c.joint_zero.as_ref()) != z.as_ref() {
+            file_changes = true;
+        }
         match file.as_mut() {
             Some(c) => c.joint_zero = z,
             None if z.is_some() => file = Some(CalibrationFile { joint_zero: z, ..Default::default() }),
             None => {}
         }
     }
-    if file.as_ref().is_some_and(|c| !c.has_camera() && c.joint_zero.is_none() && c.kinematics.is_none() && c.mit_qualification.is_none()) {
+    if file.as_ref().is_some_and(|c| {
+        !c.has_camera() && c.joint_zero.is_none() && c.kinematics.is_none() && c.mit_qualification.is_none()
+    }) {
         file = None;
     }
     let had_live = pub_cfg.config.arm_model.correction().is_some();
 
-    let mut error = None;
-    if file_changes {
-        if let Err(e) = put_file(deps.path.clone(), file.as_ref().map(|c| serde_json::to_string_pretty(c).unwrap_or_default())).await {
-            error = Some(format!("calibration file {}: {e}", deps.path.display()));
-        }
-    }
+    let uncorrected_model = pub_cfg
+        .config
+        .arm_model
+        .with_correction(None)
+        .map_err(|e| CalibError::new(500, "INTERNAL", format!("kinematic correction not removed: {e}")))?;
+    let kin_removed_live = uncorrected_model.correction() != pub_cfg.config.arm_model.correction();
 
-    let uncorrected_model = match pub_cfg.config.arm_model.with_correction(None) {
-        Ok(m) => Some(m),
-        Err(e) => {
-            error.get_or_insert(format!("kinematic correction not removed: {e}"));
-            None
-        }
-    };
-    let effective_model = uncorrected_model
-        .as_ref()
-        .unwrap_or(&pub_cfg.config.arm_model);
     let reason = format!("{method} zero of joints {moved:?}; taught with the old zero");
     let mut poses_stale = Vec::new();
     let mut next_poses_list = pub_cfg.poses.list.clone();
     if !moved.is_empty() {
         for p in next_poses_list.poses.iter_mut() {
-            p.stale = Some(CalibrationStale { reason: reason.clone(), at: at.clone() });
+            p.stale = Some(CalibrationStale {
+                reason: reason.clone(),
+                at: at.clone(),
+            });
             poses_stale.push(p.name.clone());
         }
     }
-    if uncorrected_model.as_ref().is_some_and(|m| m.correction() != pub_cfg.config.arm_model.correction()) {
+    if kin_removed_live {
         for p in next_poses_list.poses.iter_mut() {
-            p.tcp = pub_cfg.recompute_pose_tcp_for(effective_model, p);
+            p.tcp = pub_cfg.recompute_pose_tcp_for(&uncorrected_model, p);
         }
     }
     let poses_changed = !poses_stale.is_empty();
-    let poses_write = poses_changed
-        .then(|| pub_cfg.poses.path.clone())
-        .flatten()
-        .map(|path| crate::persist::PendingWrite::new(path, serde_json::to_string_pretty(&next_poses_list).unwrap_or_default()));
 
     let grip = pub_cfg.config.gripper_index().map(|g| g + 1);
     let has_grip_calib = pub_cfg.gripper_calib_offset.is_some() || pub_cfg.gripper_calib_jaw_opening.is_some();
     let gripper_moved = grip.is_some_and(|g| moved.contains(&g));
     let gripper_stale = gripper_moved && has_grip_calib;
-    let gripper_stale_obj = gripper_stale.then(|| CalibrationStale { reason: reason.clone(), at: at.clone() });
-    let gripper_write = gripper_stale_obj.as_ref().map(|st| {
+    let gripper_stale_obj = gripper_stale.then(|| CalibrationStale {
+        reason: reason.clone(),
+        at: at.clone(),
+    });
+
+    // Build atomic file batch inside the SAME reservation: calibration.json FIRST so a failure
+    // renaming calibration.json (e.g. directory at target path) leaves poses.json and
+    // gripper_calib.json untouched on disk.
+    let mut file_ops: Vec<FileWriteOp> = Vec::new();
+    if file_changes {
+        match file.as_ref() {
+            Some(c) => {
+                let text = serde_json::to_string_pretty(c)
+                    .map_err(|e| CalibError::new(500, "INTERNAL", format!("serialize calibration.json: {e}")))?;
+                file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(
+                    deps.path.clone(),
+                    text,
+                )));
+            }
+            None => file_ops.push(FileWriteOp::Remove(deps.path.clone())),
+        }
+    }
+    if poses_changed {
+        if let Some(path) = pub_cfg.poses.path.clone() {
+            let text = serde_json::to_string_pretty(&next_poses_list)
+                .map_err(|e| CalibError::new(500, "INTERNAL", format!("serialize poses.json: {e}")))?;
+            file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(path, text)));
+        }
+    }
+    if let Some(st) = gripper_stale_obj.as_ref() {
         let f = crate::gripper_calib::GripperCalibFile {
             offset_rad: pub_cfg.gripper_calib_offset,
             jaw_opening: pub_cfg.gripper_calib_jaw_opening.clone(),
-            ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+            ts: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
             stale: Some(st.clone()),
             tool_id: Some(pub_cfg.config.active_tool.id.clone()),
             tool_config_digest: Some(pub_cfg.config.active_tool.config_digest.clone()),
         };
-        let path = pub_cfg.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
-        crate::persist::PendingWrite::new(path, serde_json::to_string_pretty(&f).unwrap_or_default())
-    });
+        let path = pub_cfg
+            .gripper_calib_path
+            .clone()
+            .unwrap_or_else(crate::gripper_calib::path_from_env);
+        let text = serde_json::to_string_pretty(&f)
+            .map_err(|e| CalibError::new(500, "INTERNAL", format!("serialize gripper_calib.json: {e}")))?;
+        file_ops.push(FileWriteOp::Replace(crate::persist::PendingWrite::new(path, text)));
+    }
+    let write_op = if file_ops.is_empty() {
+        ConfigWriteOp::Volatile
+    } else {
+        ConfigWriteOp::Batch(file_ops)
+    };
 
-    let effective_calib_for_floor = if file_changes { file.as_ref() } else { pub_cfg.calibration.as_ref() };
+    let effective_offsets: &[f32] = new_offsets
+        .as_deref()
+        .unwrap_or(&pub_cfg.joint_zero_offsets);
+    let effective_calib_for_floor = if file_changes {
+        file.as_ref()
+    } else {
+        pub_cfg.calibration.as_ref()
+    };
     let effective_floor = pub_cfg.profile_floor_z_m.map(|profile| {
         let (_, fp) = file_fingerprints(
             effective_calib_for_floor,
             &pub_cfg.config.camera_mount,
-            &pub_cfg.joint_zero_offsets,
+            effective_offsets,
             Some(&pub_cfg.config.active_tool.config_digest),
         );
         let legacy_fp = legacy_file_fingerprint(
             effective_calib_for_floor,
             &pub_cfg.config.camera_mount,
-            &pub_cfg.joint_zero_offsets,
+            effective_offsets,
         );
         let (floor, source, _) = effective_floor_for_with_legacy(
             profile,
@@ -1709,37 +1796,58 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
         if let Some((floor, _)) = effective_floor {
             ws_next.floor_z_m = floor;
         }
-        Some(crate::rt_core::requests::config::prepare_eval_bufs_off_thread(
-            effective_model,
+        Some(prepare_eval_bufs_off_thread(
+            &uncorrected_model,
             &ws_next,
             &pub_cfg.config.camera_mount,
             pub_cfg.config.tcp_offset,
         ))
     });
-    let pose_tcps = uncorrected_model
-        .as_ref()
-        .filter(|m| m.correction() != pub_cfg.config.arm_model.correction())
-        .map(|m| {
-            pub_cfg
-                .poses
-                .list
-                .poses
-                .iter()
-                .map(|p| (p.id.clone(), pub_cfg.recompute_pose_tcp_for(m, p)))
-                .collect()
-        });
+    let pose_tcps = kin_removed_live.then(|| {
+        pub_cfg
+            .poses
+            .list
+            .poses
+            .iter()
+            .map(|p| (p.id.clone(), pub_cfg.recompute_pose_tcp_for(&uncorrected_model, p)))
+            .collect()
+    });
     #[cfg(feature = "policy-runtime")]
     let calibration_digest = file_changes.then(|| SupervisorInner::calibration_digest_of(file.as_ref()));
 
+    let (admission, lease_holder, deadline, job_token) = match auth {
+        Some(a) => (a.step_admission(sup), a.lease_holder, a.deadline, a.job_token),
+        None => (
+            capture_config_admission(sup, 0, 0, None),
+            None,
+            std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
+            None,
+        ),
+    };
+    let lease_gen = lease_holder.map_or(0, |(_, g)| g);
+    let proposal = build_config_proposal_with_deadline(
+        sup,
+        ConfigDomain::Calibration,
+        pub_cfg.calibration_revision,
+        admission,
+        lease_gen,
+        pub_cfg.workspace_revision,
+        deadline,
+    );
+    let expected_poses = (poses_changed || pose_tcps.is_some()).then_some(pub_cfg.poses.revision);
+    let expected_gripper = gripper_stale.then_some(pub_cfg.gripper_calib_revision);
+
+    let pub_offsets = new_offsets.clone();
     let pub_file = file.clone();
     let pub_model = uncorrected_model.clone();
     let pub_poses = poses_changed.then(|| next_poses_list.clone());
     let pub_grip_stale = gripper_stale_obj.clone();
 
-    let inv_cand = Box::new(crate::rt_core::requests::config::ZeroInvalidationCandidate {
+    let cand = Box::new(JointZeroCommitCandidate {
+        new_offsets,
         file_changes,
         calibration: file,
-        arm_model_uncorrected: uncorrected_model,
+        arm_model_uncorrected: Some(uncorrected_model),
         pose_tcps,
         effective_floor,
         ws_eval_bufs,
@@ -1748,112 +1856,171 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
         next_poses: poses_changed.then_some(next_poses_list),
         gripper_stale: gripper_stale_obj,
         reset_gripper_baseline: gripper_moved,
+        require_zero_idle,
+        job_token,
+        expected_gripper_calib_revision: expected_gripper,
     });
-    let owner_ok = match sup
-        .dispatch_config_request_owned_reliable(
-            crate::rt_core::requests::config::ConfigRequest::InvalidateAfterZero(inv_cand),
-        )
-        .await
-    {
-        Ok(crate::rt_core::requests::config::ConfigReply::ZeroInvalidated(rep)) => {
-            sup.published_config_hub().update(|cfg| {
-                if let Some(m) = pub_model {
-                    cfg.config.arm_model = m;
-                }
-                if file_changes {
-                    cfg.calibration = pub_file;
-                }
-                if let Some((floor, source)) = effective_floor {
-                    cfg.floor_source = source;
-                    if let Some(ws) = cfg.config.workspace.as_mut() {
-                        ws.floor_z_m = floor;
-                    }
-                }
-                if let Some(pl) = pub_poses {
-                    cfg.poses.list = pl;
-                }
-                if let Some(st) = pub_grip_stale {
-                    cfg.gripper_calib_stale = Some(st);
-                }
-                cfg.poses.revision = rep.poses_revision;
-                cfg.gripper_calib_revision = rep.gripper_calib_revision;
-                cfg.calibration_revision = rep.calibration_revision;
-                cfg.workspace_revision = rep.workspace_revision;
-            });
-            true
-        }
-        Err(e) => {
-            error.get_or_insert(format!("owner invalidation failed: {e:?}"));
-            if file_changes {
-                let _ = sup
-                    .dispatch_config_request_reliable(|| {
-                        crate::rt_core::requests::config::ConfigRequest::ForceReconcile(
-                            crate::rt_core::config_iface::ConfigDomain::Calibration,
-                        )
-                    })
-                    .await;
-            }
-            false
-        }
-        _ => {
-            error.get_or_insert("unexpected owner invalidation reply".into());
-            if file_changes {
-                let _ = sup
-                    .dispatch_config_request_reliable(|| {
-                        crate::rt_core::requests::config::ConfigRequest::ForceReconcile(
-                            crate::rt_core::config_iface::ConfigDomain::Calibration,
-                        )
-                    })
-                    .await;
-            }
-            false
-        }
+    let plan = ConfigCommitPlan {
+        proposal,
+        auth: ConfigAuthContext {
+            admission,
+            lease_holder,
+        },
+        precheck: ReservePrecheck::JointZeroCommit {
+            require_zero_idle,
+            job_token,
+            expected_gripper_calib_revision: expected_gripper,
+        },
+        candidate: ConfigCandidate::JointZeroCommit(cand),
+        write: write_op,
+        expected_workspace_revision: Some(pub_cfg.workspace_revision),
+        expected_poses_revision: expected_poses,
     };
 
-    if owner_ok {
-        for (what, w) in [("poses file", poses_write), ("gripper calibration file", gripper_write)] {
-            if let Some(w) = w {
-                if let Err(e) = w.run().await { error.get_or_insert(format!("{what}: {e}")); }
+    let off_check = auth.map(|a| Arc::clone(&a.off_thread_check));
+    let commit_res = run_config_commit_detailed(
+        sup,
+        plan,
+        move || match off_check.as_ref() {
+            Some(f) => (f)().map_err(|(code, err)| {
+                (
+                    code,
+                    crate::supervisor::ArmError::Rejected {
+                        status: err.status,
+                        code: err.code,
+                        message: err.message,
+                    },
+                )
+            }),
+            None => Ok(()),
+        },
+        move |cfg, act| {
+            if let Some(off) = pub_offsets {
+                cfg.joint_zero_offsets = off;
             }
+            cfg.config.arm_model = pub_model;
+            if file_changes {
+                cfg.calibration = pub_file;
+            }
+            if let Some((floor, source)) = effective_floor {
+                cfg.floor_source = source;
+                if let Some(ws) = cfg.config.workspace.as_mut() {
+                    ws.floor_z_m = floor;
+                }
+            }
+            if let Some(pl) = pub_poses {
+                cfg.poses.list = pl;
+            }
+            if let Some(st) = pub_grip_stale {
+                cfg.gripper_calib_stale = Some(st);
+            }
+            cfg.poses.revision = act.poses_revision;
+            cfg.gripper_calib_revision = act.gripper_calib_revision;
+            cfg.calibration_revision = act.revision;
+            cfg.workspace_revision = act.workspace_revision;
+        },
+    )
+    .await;
+
+    match commit_res {
+        Ok(_outcome) => {
+            tracing::warn!(
+                "{method} zero of joints {joints:?}: kinematic correction {}, camera calibration {}, {} poses and gripper calibration {} marked stale",
+                if removed.is_some() || had_live { "removed" } else { "none" },
+                if camera_stale { "marked stale" } else { "none" },
+                poses_stale.len(),
+                if gripper_stale { "" } else { "not" }
+            );
+            Ok(json!({
+                "kinematics_removed": removed.is_some() || had_live,
+                "camera_stale": camera_stale,
+                "poses_stale": poses_stale,
+                "gripper_calibration_stale": gripper_stale,
+                "removed_kinematics": removed,
+                "at": at,
+                "error": Value::Null,
+            }))
+        }
+        Err(e) => {
+            let mut ce = arm_err_to_calib(e.error);
+            if !e.disk_published && !ce.message.contains("nothing was changed") {
+                ce.message.push_str("; nothing was changed");
+            }
+            tracing::error!("joint zero commit/invalidation failed: {}", ce.message);
+            Err(ce)
         }
     }
-    if let Some(e) = &error { tracing::error!("zero invalidation: {e}"); }
-    tracing::warn!("{method} zero of joints {joints:?}: kinematic correction {}, camera calibration {}, {} poses and gripper calibration {} marked stale",
-        if removed.is_some() || had_live { "removed" } else { "none" }, if camera_stale { "marked stale" } else { "none" },
-        poses_stale.len(), if gripper_stale { "" } else { "not" });
-    json!({"kinematics_removed": removed.is_some() || had_live, "camera_stale": camera_stale, "poses_stale": poses_stale,
-        "gripper_calibration_stale": gripper_stale, "removed_kinematics": removed, "at": at, "error": error})
 }
 
-/// Strict post-zero invalidation for Executor motor-zero / restore flows: if file persistence
-/// or owner live invalidation fails, forces `Reconciling` on `Calibration` (inhibiting motion)
-/// and returns `Err(CalibError)` so the command never reports `persist_verified: true` on error.
+/// After a zero (motor or software) of `joints` (1-based) whose readings moved by `changes`
+/// (rad, same order): remove the kinematic correction, mark camera/poses/gripper stale, and
+/// store `joint_zero` inside ONE common-path `Calibration` reservation. Returns the summary JSON
+/// (carrying `"error"` on failure for callers that report partial hardware-motor-zero results).
+pub async fn invalidate_after_zero(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    joints: &[usize],
+    changes: &[f32],
+    method: &str,
+    new_zero: Option<Option<crate::joint_zero::JointZero>>,
+) -> Value {
+    invalidate_after_zero_with_auth(sup, deps, joints, changes, method, new_zero, None).await
+}
+
+pub async fn invalidate_after_zero_with_auth(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    joints: &[usize],
+    changes: &[f32],
+    method: &str,
+    new_zero: Option<Option<crate::joint_zero::JointZero>>,
+    auth: Option<&CalibCommitAuth>,
+) -> Value {
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    match commit_joint_zero_and_invalidation(
+        sup, deps, joints, changes, method, new_zero, None, auth, false,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => json!({
+            "kinematics_removed": false,
+            "camera_stale": false,
+            "poses_stale": [],
+            "gripper_calibration_stale": false,
+            "removed_kinematics": null,
+            "at": at,
+            "error": e.message,
+        }),
+    }
+}
+
+/// Strict post-zero invalidation returning `Err(CalibError)` on persistence/commit failure so
+/// callers never report `persist_verified: true` on error.
 pub async fn invalidate_after_zero_strict(
-    sup: &ArmSupervisor,
+    sup: &Arc<ArmSupervisor>,
     deps: &CalibrationDeps,
     joints: &[usize],
     changes: &[f32],
     method: &str,
     new_zero: Option<Option<crate::joint_zero::JointZero>>,
 ) -> Result<Value, CalibError> {
-    let inv = invalidate_after_zero(sup, deps, joints, changes, method, new_zero).await;
-    if let Some(err_msg) = inv.get("error").and_then(Value::as_str) {
-        let _ = sup
-            .dispatch_config_request_reliable(|| {
-                crate::rt_core::requests::config::ConfigRequest::ForceReconcile(
-                    crate::rt_core::config_iface::ConfigDomain::Calibration,
-                )
-            })
-            .await;
-        let mut e = CalibError::new(
-            500,
-            "PERSIST_FAILED",
-            format!("joint zero invalidation failed ({err_msg}); reconciliation required"),
-        );
-        e.extra.insert("invalidated".into(), inv);
-        return Err(e);
-    }
-    Ok(inv)
+    invalidate_after_zero_strict_with_auth(sup, deps, joints, changes, method, new_zero, None).await
+}
+
+pub async fn invalidate_after_zero_strict_with_auth(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    joints: &[usize],
+    changes: &[f32],
+    method: &str,
+    new_zero: Option<Option<crate::joint_zero::JointZero>>,
+    auth: Option<&CalibCommitAuth>,
+) -> Result<Value, CalibError> {
+    commit_joint_zero_and_invalidation(
+        sup, deps, joints, changes, method, new_zero, None, auth, false,
+    )
+    .await
 }
 
 /// Everything marked stale by a zero: `[{item: camera | poses | gripper_calibration, reason, at, names?}]`.
@@ -2715,26 +2882,72 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
     }
 }
 
-/// Before a zero of `joints` (1-based) is written: mark an MIT qualification record that holds
-/// one of them invalidated and persist that first (atomic write), then publish it live. A failed
-/// write refuses the zero (nothing changed), so a crash or write error never leaves a valid
-/// record next to a changed physical zero. Nothing to do without such a record.
-pub async fn invalidate_mit_before_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, joints: &[usize], method: &str) -> Result<(), CalibError> {
+/// Before a physical/mock motor zero of `joints` (1-based) is sent: mark an MIT qualification
+/// record that holds one of them invalidated and commit it through the unified common commit path
+/// (`reserve -> stage + fsync -> authority recheck -> rename -> dir-sync -> authority recheck ->
+/// activate/publish`). A failed write refuses the zero (nothing changed). Nothing to do without
+/// such a record.
+pub async fn invalidate_mit_before_zero(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    joints: &[usize],
+    method: &str,
+) -> Result<(), CalibError> {
+    invalidate_mit_before_zero_with_auth(sup, deps, joints, method, None).await
+}
+
+pub async fn invalidate_mit_before_zero_with_auth(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    joints: &[usize],
+    method: &str,
+    auth: Option<&CalibCommitAuth>,
+) -> Result<(), CalibError> {
+    use crate::rt_core::config_iface::ConfigDomain;
+    use crate::rt_core::requests::config::{
+        build_config_proposal_with_deadline, capture_config_admission, run_config_commit_detailed,
+        ConfigAuthContext, ConfigCandidate, ConfigCommitPlan, ConfigWriteOp,
+        JointZeroCommitCandidate, ReservePrecheck,
+    };
+
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let pub_cfg = sup
         .published_config()
         .await
         .map_err(|e| CalibError::new(503, "CONFIG_UNAVAILABLE", e.to_string()))?;
     let Some(mut file) = pub_cfg.calibration.clone() else { return Ok(()) };
-    let reason = format!("{method} zero of joints {joints:?}; the MIT qualification was measured with the old zero");
-    if !crate::mit::invalidate_record(&mut file, joints, &reason, &at) { return Ok(()); }
-    let text = serde_json::to_string_pretty(&file).map_err(|e| CalibError::new(500, "INTERNAL", e.to_string()))?;
-    put_file(deps.path.clone(), Some(text)).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED",
-        format!("the MIT qualification could not be invalidated in {} ({e}); the zero was refused, nothing was changed", deps.path.display())))?;
+    let reason = format!(
+        "{method} zero of joints {joints:?}; the MIT qualification was measured with the old zero"
+    );
+    if !crate::mit::invalidate_record(&mut file, joints, &reason, &at) {
+        return Ok(());
+    }
+    let text = serde_json::to_string_pretty(&file)
+        .map_err(|e| CalibError::new(500, "INTERNAL", e.to_string()))?;
     let pub_file = file.clone();
     #[cfg(feature = "policy-runtime")]
     let calibration_digest = Some(SupervisorInner::calibration_digest_of(Some(&file)));
-    let inv_cand = Box::new(crate::rt_core::requests::config::ZeroInvalidationCandidate {
+    let (admission, lease_holder, deadline, job_token) = match auth {
+        Some(a) => (a.step_admission(sup), a.lease_holder, a.deadline, a.job_token),
+        None => (
+            capture_config_admission(sup, 0, 0, None),
+            None,
+            std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
+            None,
+        ),
+    };
+    let lease_gen = lease_holder.map_or(0, |(_, g)| g);
+    let proposal = build_config_proposal_with_deadline(
+        sup,
+        ConfigDomain::Calibration,
+        pub_cfg.calibration_revision,
+        admission,
+        lease_gen,
+        pub_cfg.workspace_revision,
+        deadline,
+    );
+    let cand = Box::new(JointZeroCommitCandidate {
+        new_offsets: None,
         file_changes: true,
         calibration: Some(file),
         arm_model_uncorrected: None,
@@ -2746,14 +2959,63 @@ pub async fn invalidate_mit_before_zero(sup: &ArmSupervisor, deps: &CalibrationD
         next_poses: None,
         gripper_stale: None,
         reset_gripper_baseline: false,
+        require_zero_idle: false,
+        job_token,
+        expected_gripper_calib_revision: None,
     });
-    let _ = sup
-        .dispatch_config_request(
-            crate::rt_core::requests::config::ConfigRequest::InvalidateAfterZero(inv_cand),
+    let plan = ConfigCommitPlan {
+        proposal,
+        auth: ConfigAuthContext {
+            admission,
+            lease_holder,
+        },
+        precheck: ReservePrecheck::JointZeroCommit {
+            require_zero_idle: false,
+            job_token,
+            expected_gripper_calib_revision: None,
+        },
+        candidate: ConfigCandidate::JointZeroCommit(cand),
+        write: ConfigWriteOp::StageAndReplace(crate::persist::PendingWrite::new(
+            deps.path.clone(),
+            text,
+        )),
+        expected_workspace_revision: None,
+        expected_poses_revision: None,
+    };
+    let off_check = auth.map(|a| Arc::clone(&a.off_thread_check));
+    run_config_commit_detailed(
+        sup,
+        plan,
+        move || match off_check.as_ref() {
+            Some(f) => (f)().map_err(|(code, err)| {
+                (
+                    code,
+                    crate::supervisor::ArmError::Rejected {
+                        status: err.status,
+                        code: err.code,
+                        message: err.message,
+                    },
+                )
+            }),
+            None => Ok(()),
+        },
+        move |cfg, act| {
+            cfg.calibration = Some(pub_file);
+            cfg.calibration_revision = act.revision;
+        },
+    )
+    .await
+    .map_err(|e| {
+        CalibError::new(
+            500,
+            "PERSIST_FAILED",
+            format!(
+                "the MIT qualification could not be invalidated in {} ({}); the zero was refused, nothing was changed",
+                deps.path.display(),
+                e.error
+            ),
         )
-        .await;
-    sup.published_config_hub()
-        .update(|cfg| cfg.calibration = Some(pub_file));
+    })?;
     Ok(())
 }
 

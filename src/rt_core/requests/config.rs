@@ -1024,6 +1024,11 @@ pub enum ReservePrecheck {
         kin_changes: bool,
         allow_during_calibration_busy: bool,
     },
+    JointZeroCommit {
+        require_zero_idle: bool,
+        job_token: Option<u64>,
+        expected_gripper_calib_revision: Option<u64>,
+    },
 }
 
 /// Pre-built candidate payload swapped into `SupervisorInner` in-place during [`ActivateConfig`].
@@ -1060,6 +1065,7 @@ pub enum ConfigCandidate {
         confirmed_at: String,
     },
     Calibration(Box<CalibrationCandidate>),
+    JointZeroCommit(Box<JointZeroCommitCandidate>),
 }
 
 /// Pre-built calibration live-state payload (zero heap alloc/free on RT swap).
@@ -1076,8 +1082,12 @@ pub struct CalibrationCandidate {
     pub require_kinematics_disarmed: bool,
 }
 
-/// Pre-built zero-invalidation live payload (swapped in-place on RT).
-pub struct ZeroInvalidationCandidate {
+/// Pre-built atomic joint-zero + invalidation live payload (swapped in-place on RT with
+/// zero heap allocation and zero heap free).
+pub struct JointZeroCommitCandidate {
+    /// Software/restore zero offsets installed strictly at activation (after rename + dir-sync).
+    /// `None` for post-motor-zero or pre-motor-zero MIT invalidations that do not change offsets.
+    pub new_offsets: Option<Vec<f32>>,
     pub file_changes: bool,
     pub calibration: Option<CalibrationFile>,
     pub arm_model_uncorrected: Option<ArmModel>,
@@ -1089,6 +1099,9 @@ pub struct ZeroInvalidationCandidate {
     pub next_poses: Option<PoseList>,
     pub gripper_stale: Option<CalibrationStale>,
     pub reset_gripper_baseline: bool,
+    pub require_zero_idle: bool,
+    pub job_token: Option<u64>,
+    pub expected_gripper_calib_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1101,14 +1114,6 @@ pub struct CalibBeginCheck {
 pub struct CalibBeginSnapshot {
     pub is_torqued: bool,
     pub epoch_id: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ZeroInvalidatedReply {
-    pub poses_revision: u64,
-    pub gripper_calib_revision: u64,
-    pub calibration_revision: u64,
-    pub workspace_revision: u64,
 }
 
 /// Reserve `proposal.domain` at `proposal.expected_revision` after authority + domain prechecks.
@@ -1218,6 +1223,8 @@ pub struct ConfigActivated {
     pub revision: u64,
     pub durability: Durability,
     pub workspace_revision: u64,
+    pub poses_revision: u64,
+    pub gripper_calib_revision: u64,
     pub epoch_id: u64,
     pub is_torqued: bool,
     pub safety_state: SafetyStateTag,
@@ -1251,7 +1258,6 @@ pub enum ConfigRequest {
     },
     CalibrationClearLoadError,
     ForceReconcile(ConfigDomain),
-    InvalidateAfterZero(Box<ZeroInvalidationCandidate>),
     SetJointZeroOffsets {
         offsets: Vec<f32>,
         precomputed_floor: Option<(f32, &'static str)>,
@@ -1286,7 +1292,6 @@ pub enum ConfigReply {
     },
     CalibrationLoadErrorCleared,
     ReconcilingForced,
-    ZeroInvalidated(ZeroInvalidatedReply),
     JointZeroOffsetsSet(Result<(), ConfigError>),
     MotorZeroSet(Result<(), ConfigError>),
     TableCaptureSampled(Result<([f32; 8], usize), ConfigError>),
@@ -1318,7 +1323,7 @@ pub struct ConfigRetiredPayloads {
     pub arm_model: Option<ArmModel>,
     pub pose_tcps: Option<Vec<(String, Option<PoseTcp>)>>,
     pub calib_candidate: Option<Box<CalibrationCandidate>>,
-    pub zero_inv_candidate: Option<Box<ZeroInvalidationCandidate>>,
+    pub joint_zero_commit_candidate: Option<Box<JointZeroCommitCandidate>>,
     pub gravity_comp_policy: Option<crate::model::GravityCompPolicy>,
     pub unused_candidate: Option<ConfigCandidate>,
     pub gripper_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
@@ -1407,9 +1412,6 @@ pub(crate) fn handle_config_exchange(
             let active_rev = ConfigAuthority::revision(core, domain);
             core.core.config_mut().force_reconcile(domain, active_rev);
             ConfigReply::ReconcilingForced
-        }
-        ConfigRequest::InvalidateAfterZero(cand) => {
-            ConfigReply::ZeroInvalidated(install_invalidate_after_zero(core, cand, &mut ex.retired))
         }
         ConfigRequest::SetJointZeroOffsets {
             offsets,
@@ -1617,6 +1619,45 @@ fn run_reserve_precheck(
             }
             Ok(())
         }
+        ReservePrecheck::JointZeroCommit {
+            require_zero_idle,
+            job_token,
+            expected_gripper_calib_revision,
+        } => {
+            if let Some(tok) = job_token {
+                if !core.calibration_busy || core.calibration_busy_token != Some(tok) {
+                    return Err(ConfigError::Busy(
+                        "motor zero job no longer holds calibration lock",
+                    ));
+                }
+            }
+            if let Some(exp_grip) = expected_gripper_calib_revision {
+                if core.gripper_calib_revision != exp_grip {
+                    return Err(ConfigError::PlanStale(
+                        "gripper calibration changed while preparing joint zero commit",
+                    ));
+                }
+            }
+            if require_zero_idle {
+                if core.rt_executor_owned && core.driver.is_some() {
+                    return Err(ConfigError::ExecutorCapabilityUnsupported(
+                        "software joint zero with attached hardware driver is unsupported on the RT executor",
+                    ));
+                }
+                if *core.safety.state() != crate::safety::SafetyState::Idle
+                    || core.is_torqued
+                    || core.disable_pending
+                    || core.active_trajectory.is_some()
+                {
+                    return Err(ConfigError::CalibPrecondition {
+                        status: 409,
+                        code: "MOTOR_ZERO_FAILED",
+                        message: "Arm must be Idle with torque off and no active trajectory to set joint zero offsets",
+                    });
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1788,6 +1829,14 @@ fn fail_activation(
                     code: "KINEMATICS_ARMED",
                     message: "the kinematic correction can change only with torque off and no action running",
                 },
+                "MOTOR_ZERO_FAILED" => ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "MOTOR_ZERO_FAILED",
+                    message: "Arm must be Idle with torque off and no active trajectory to set joint zero offsets",
+                },
+                "EXECUTOR_CAPABILITY_UNSUPPORTED" => ConfigError::ExecutorCapabilityUnsupported(
+                    "software joint zero with attached hardware driver is unsupported on the RT executor",
+                ),
                 other => ConfigError::Busy(other),
             }
         }
@@ -1924,6 +1973,36 @@ fn install_activate_config(
                 Ok(())
             }
         }
+        ConfigCandidate::JointZeroCommit(cand) => {
+            if let Some(tok) = cand.job_token {
+                if !core.calibration_busy || core.calibration_busy_token != Some(tok) {
+                    return Err(fail_activation(core, reservation, "CONFIG_BUSY", candidate, retired));
+                }
+            }
+            if let Some(exp_grip) = cand.expected_gripper_calib_revision {
+                if core.gripper_calib_revision != exp_grip {
+                    return Err(fail_activation(core, reservation, "PLAN_STALE", candidate, retired));
+                }
+            }
+            if cand.new_offsets.is_some() && core.rt_executor_owned && core.driver.is_some() {
+                Err("EXECUTOR_CAPABILITY_UNSUPPORTED")
+            } else if cand.require_zero_idle
+                && (*core.safety.state() != crate::safety::SafetyState::Idle
+                    || core.is_torqued
+                    || core.disable_pending
+                    || core.active_trajectory.is_some())
+            {
+                Err("MOTOR_ZERO_FAILED")
+            } else if cand
+                .new_offsets
+                .as_ref()
+                .is_some_and(|o| o.len() != core.config.dof || o.iter().any(|v| !v.is_finite()))
+            {
+                Err("MOTOR_ZERO_FAILED")
+            } else {
+                Ok(())
+            }
+        }
         ConfigCandidate::Poses { .. } | ConfigCandidate::Sequences { .. } => Ok(()),
     };
     if let Err(code) = domain_ok {
@@ -2015,6 +2094,9 @@ fn install_activate_config(
         ConfigCandidate::Calibration(cand) => {
             apply_calibration_candidate_in_place(core, cand, true, retired);
         }
+        ConfigCandidate::JointZeroCommit(cand) => {
+            apply_joint_zero_commit_in_place(core, cand, retired);
+        }
     }
 
     if durability == Durability::Durable {
@@ -2026,6 +2108,8 @@ fn install_activate_config(
             revision,
             durability,
             workspace_revision: core.workspace_revision,
+            poses_revision: core.poses.revision,
+            gripper_calib_revision: core.gripper_calib_revision,
             epoch_id: core.safety.epoch_id(),
             is_torqued: core.is_torqued,
             safety_state: SafetyStateTag::from_state(core.safety.state()),
@@ -2276,16 +2360,25 @@ fn install_set_motor_zero(
     })
 }
 
-fn install_invalidate_after_zero(
+fn apply_joint_zero_commit_in_place(
     core: &mut SupervisorInner,
-    mut cand: Box<ZeroInvalidationCandidate>,
+    mut cand: Box<JointZeroCommitCandidate>,
     retired: &mut ConfigRetiredPayloads,
-) -> ZeroInvalidatedReply {
+) {
+    let start_calib_rev = core.calibration_revision;
     let mut workspace_bumped = false;
+    if let Some(mut new_offsets) = cand.new_offsets.take() {
+        // Offsets length and finiteness were validated in install_activate_config before swapping.
+        if let Ok(retired_base) = core.set_joint_zero_offsets_in_place(&mut new_offsets, cand.effective_floor) {
+            if let Some(gb) = retired_base {
+                retired.gripper_baseline = Some(gb);
+            }
+        }
+        retired.offsets = Some(new_offsets);
+    }
     if let Some(uncorrected) = cand.arm_model_uncorrected.take() {
         if uncorrected.correction() != core.config.arm_model.correction() {
             retired.arm_model = Some(std::mem::replace(&mut core.config.arm_model, uncorrected));
-            core.calibration_revision += 1;
             workspace_bumped = true;
             if let Some(tcps) = cand.pose_tcps.take() {
                 for (pose, (id, tcp)) in core.poses.list.poses.iter_mut().zip(tcps.iter()) {
@@ -2327,7 +2420,9 @@ fn install_invalidate_after_zero(
         core.poses.revision += 1;
     }
     if cand.reset_gripper_baseline {
-        retired.gripper_baseline = core.gripper_baseline.take();
+        if let Some(gb) = core.gripper_baseline.take() {
+            retired.gripper_baseline = Some(gb);
+        }
         core.gripper_baseline_pending.clear();
         core.gripper_baseline_dirty = false;
         core.gripper_baseline_generation += 1;
@@ -2336,13 +2431,8 @@ fn install_invalidate_after_zero(
         retired.gripper_stale = core.gripper_calib_stale.replace(stale);
         core.gripper_calib_revision += 1;
     }
-    retired.zero_inv_candidate = Some(cand);
-    ZeroInvalidatedReply {
-        poses_revision: core.poses.revision,
-        gripper_calib_revision: core.gripper_calib_revision,
-        calibration_revision: core.calibration_revision,
-        workspace_revision: core.workspace_revision,
-    }
+    core.calibration_revision = start_calib_rev + 1;
+    retired.joint_zero_commit_candidate = Some(cand);
 }
 
 fn install_sample_table_capture(core: &SupervisorInner) -> Result<([f32; 8], usize), ConfigError> {
