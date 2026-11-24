@@ -2049,17 +2049,15 @@ fn install_activate_config(
             }
             if cand.new_offsets.is_some() && core.rt_executor_owned && core.driver.is_some() {
                 Err("EXECUTOR_CAPABILITY_UNSUPPORTED")
-            } else if cand.require_zero_idle
+            } else if (cand.require_zero_idle
                 && (*core.safety.state() != crate::safety::SafetyState::Idle
                     || core.is_torqued
                     || core.disable_pending
-                    || core.active_trajectory.is_some())
-            {
-                Err("MOTOR_ZERO_FAILED")
-            } else if cand
-                .new_offsets
-                .as_ref()
-                .is_some_and(|o| o.len() != core.config.dof || o.iter().any(|v| !v.is_finite()))
+                    || core.active_trajectory.is_some()))
+                || cand
+                    .new_offsets
+                    .as_ref()
+                    .is_some_and(|o| o.len() != core.config.dof || o.iter().any(|v| !v.is_finite()))
             {
                 Err("MOTOR_ZERO_FAILED")
             } else {
@@ -2433,10 +2431,8 @@ fn apply_joint_zero_commit_in_place(
     let mut workspace_bumped = false;
     if let Some(mut new_offsets) = cand.new_offsets.take() {
         // Offsets length and finiteness were validated in install_activate_config before swapping.
-        if let Ok(retired_base) = core.set_joint_zero_offsets_in_place(&mut new_offsets, cand.effective_floor) {
-            if let Some(gb) = retired_base {
-                retired.gripper_baseline = Some(gb);
-            }
+        if let Ok(Some(gb)) = core.set_joint_zero_offsets_in_place(&mut new_offsets, cand.effective_floor) {
+            retired.gripper_baseline = Some(gb);
         }
         retired.offsets = Some(new_offsets);
     }
@@ -3910,48 +3906,50 @@ pub(crate) fn zero_check_owner_activate(
     } else {
         check_zero_check_authority(core, ctx, proposal, auth, action_id, base_revision, None)
     };
-    if auth_res.is_ok() {
-        let (old_policy, old_jaw) =
-            core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
-        let _ = core.core.config_mut().confirm_durable(&reservation);
-        if !matches!(
-            ConfigAuthority::activate(core, reservation),
-            Activated::Active { .. }
-        ) {
-            let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-            core.core
-                .config_mut()
-                .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+    match auth_res {
+        Ok(()) => {
+            let (old_policy, old_jaw) =
+                core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
+            let _ = core.core.config_mut().confirm_durable(&reservation);
+            if !matches!(
+                ConfigAuthority::activate(core, reservation),
+                Activated::Active { .. }
+            ) {
+                let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                core.core
+                    .config_mut()
+                    .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+            }
+            if core.zero_check_persisting == Some(action_id) {
+                core.zero_check_persisting = None;
+            }
+            let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
+            Ok((old_policy, old_jaw, code_buf, msg_buf))
         }
-        if core.zero_check_persisting == Some(action_id) {
-            core.zero_check_persisting = None;
+        Err((state, code, msg)) => {
+            if !matches!(
+                core.core.config_mut().activation_failed(reservation, code),
+                Activated::Reconciling { .. }
+            ) {
+                let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                core.core
+                    .config_mut()
+                    .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+            }
+            if core.zero_check_persisting == Some(action_id) {
+                core.zero_check_persisting = None;
+            }
+            let (old_code, old_msg) = if core
+                .last_action
+                .as_ref()
+                .is_some_and(|a| a.id == action_id && a.is_running())
+            {
+                core.finish_zero_check_action_in_place(action_id, state, code, msg, code_buf, msg_buf)
+            } else {
+                (code_buf, msg_buf)
+            };
+            Err((Some(new_policy), new_jaw, old_code, old_msg))
         }
-        let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
-        Ok((old_policy, old_jaw, code_buf, msg_buf))
-    } else {
-        let (state, code, msg) = auth_res.unwrap_err();
-        if !matches!(
-            core.core.config_mut().activation_failed(reservation, code),
-            Activated::Reconciling { .. }
-        ) {
-            let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-            core.core
-                .config_mut()
-                .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-        }
-        if core.zero_check_persisting == Some(action_id) {
-            core.zero_check_persisting = None;
-        }
-        let (old_code, old_msg) = if core
-            .last_action
-            .as_ref()
-            .is_some_and(|a| a.id == action_id && a.is_running())
-        {
-            core.finish_zero_check_action_in_place(action_id, state, code, msg, code_buf, msg_buf)
-        } else {
-            (code_buf, msg_buf)
-        };
-        Err((Some(new_policy), new_jaw, old_code, old_msg))
     }
 }
 

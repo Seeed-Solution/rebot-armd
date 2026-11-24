@@ -1550,6 +1550,8 @@ enum PersistCmd {
     },
 }
 
+// Zero-allocation RT reply enum; boxing `Reserved` would heap-allocate on `armd-control`.
+#[allow(clippy::large_enum_variant)]
 enum PersistReply {
     Reserved {
         reservation: Option<(
