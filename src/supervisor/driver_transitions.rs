@@ -2493,7 +2493,6 @@ impl SupervisorInner {
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
         self.reset_tx_joint_progress();
-        self.hold_tx_unsent_since = None;
         self.hold_tx_stalled_latched = false;
         self.j7_stale_since = None;
         // Preserve `self.last_hold_tx_error_log` across fault clears so rapid clear/re-fault

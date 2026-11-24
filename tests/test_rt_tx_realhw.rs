@@ -796,10 +796,10 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
         }
         rig_stall.clear_fault_and_enable();
 
-        // (c2) Major 5: Hard transport errors (`tx_error = true`) while stopped with fresh RX:
-        //      - Zero progress (`sent_any == false`) >= 45 ms escalates ONCE to CAN_TX_STALLED.
-        //      - Partial submission (`fail_tx_after = Some(2)` on no-op flush bus, `sent_any == true`)
-        //        resets the no-progress timer and does NOT escalate.
+        // (c2) Hard transport errors (`tx_error = true`) discard the hold queue (`0 frames queued`)
+        //      while stopped with fresh RX:
+        //      - Neither partial submission (`fail_tx_after = Some(2)`) nor hard TX errors (`tx_error = true`,
+        //        0 frames queued) may ever falsely latch `CAN_TX_STALLED` ("0 frames queued" is NOT a TX stall).
         {
             let mut rig_err = DualRig::new(owner, base_cfg(), None);
             rig_err.inner_mut()
@@ -807,33 +807,35 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
                 .trigger_fault_coded(FaultCode::Other, FaultReason::Other("hard-error hold test".into()));
             let e0 = rig_err.inner().safety.epoch_id();
             // Partial submission: 2 frames accepted then hard error on frame 3 across 6 ticks (120 ms) ->
-            // must NOT escalate to CAN_TX_STALLED because sent_any == true every tick!
+            // must NOT escalate to CAN_TX_STALLED.
             for _ in 0..6 {
                 rig_err.bus.with(|s| s.fail_tx_after = Some(2));
                 rig_err.step();
                 assert_eq!(rig_err.inner().safety.epoch_id(), e0, "{owner:?}: partial hard-error submission must not escalate");
                 assert_eq!(rig_err.inner().safety.fault().map(|f| f.code), Some(FaultCode::Other));
             }
-            // Zero progress: every transmit returns hard error -> escalates ONCE after >= 45 ms!
+            // Hard error on frame 0 (`tx_error = true`): driver discards hold queue (0 frames queued) ->
+            // must NEVER latch CAN_TX_STALLED across >= 160 ms; recovers cleanly when bus clears.
             rig_err.bus.with(|s| {
                 s.fail_tx_after = None;
                 s.tx_error = true;
             });
-            for _ in 0..3 {
-                rig_err.step(); // t = 0, 20, 40 ms -> < 45 ms
-                assert_eq!(rig_err.inner().safety.epoch_id(), e0);
-            }
-            rig_err.step(); // t = 60 ms >= 45 ms -> escalates ONCE!
-            assert_eq!(
-                rig_err.inner().safety.fault().map(|f| f.code),
-                Some(FaultCode::CanTxStalled),
-                "{owner:?}: persistent hard TX errors with 0 progress >= 45 ms must escalate once to CAN_TX_STALLED"
-            );
-            let e1 = rig_err.inner().safety.epoch_id();
-            assert_eq!(e1, e0 + 1);
-            for _ in 0..5 {
+            for _ in 0..8 {
                 rig_err.step();
-                assert_eq!(rig_err.inner().safety.epoch_id(), e1, "{owner:?}: hard-error escalation must latch only once");
+                assert_eq!(
+                    rig_err.inner().safety.epoch_id(),
+                    e0,
+                    "{owner:?}: 0-queued hard TX error must not latch CAN_TX_STALLED"
+                );
+                assert_eq!(rig_err.inner().safety.fault().map(|f| f.code), Some(FaultCode::Other));
+            }
+            rig_err.bus.with(|s| s.tx_error = false);
+            rig_err.bus.clear_log();
+            rig_err.step();
+            let resumed: std::collections::HashSet<u32> =
+                rig_err.bus.tx_log().into_iter().map(|f| f.id).collect();
+            for j in 1u32..=7 {
+                assert!(resumed.contains(&(0x100 + j)), "{owner:?}: joint {j} did not resume hold after tx_error cleared");
             }
         }
 

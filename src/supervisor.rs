@@ -374,6 +374,7 @@ pub(crate) enum TickOutput {
         now: Instant,
         max_age: Duration,
         oldest_age: Option<Duration>,
+        hold_stall_age: Option<Duration>,
         is_hold: bool,
         sent_any: bool,
         sent_mask: u64,
@@ -385,6 +386,7 @@ pub(crate) enum TickOutput {
         now: Instant,
         max_age: Duration,
         oldest_age: Option<Duration>,
+        hold_stall_age: Option<Duration>,
         is_hold: bool,
         sent_any: bool,
         pf_status: crate::driver::PosForceTxStatus,
@@ -787,8 +789,6 @@ pub struct SupervisorInner {
     /// Driver-clock instant of the first missed tick in each joint's current no-progress run
     /// (preallocated once at `SupervisorInner::new`; mutated strictly in place -> 0 RT allocs/frees).
     pub(crate) tx_joint_no_progress_since: Vec<Option<Instant>>,
-    /// Driver-clock instant when stopped-hold TX first failed to submit any frame at all.
-    pub(crate) hold_tx_unsent_since: Option<Instant>,
     /// True once `CAN_TX_STALLED` has been installed for the current stopped/fault session
     /// (prevents repeated fault re-latching; cleared in `clear_fault_finish`).
     pub(crate) hold_tx_stalled_latched: bool,
@@ -1235,7 +1235,6 @@ impl SupervisorInner {
             before_publish_hook: None,
             tx_joint_no_progress_ticks: vec![0; dof],
             tx_joint_no_progress_since: vec![None; dof],
-            hold_tx_unsent_since: None,
             hold_tx_stalled_latched: false,
             last_hold_tx_error_log: None,
             j7_stale_since: None,
@@ -2787,7 +2786,6 @@ impl SupervisorInner {
     /// Zero-allocation motion stall latch (`CAN_TX_STALLED`) routed through `SafetyManager::latch`.
     fn latch_can_tx_stalled_motion(&mut self, detail: crate::safety::TxStallDetail, now: Instant) {
         self.reset_tx_joint_progress();
-        self.hold_tx_unsent_since = None;
         if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.try_lock() {
                 drv.discard_pending_tx();
@@ -2811,91 +2809,66 @@ impl SupervisorInner {
         }
     }
 
-    /// Unified stopped-hold TX progress & escalation accounting across `Deferred`, `Expired`,
-    /// and hard `Error` outcomes:
-    /// - Any submitted frame (`sent_any == true`) resets the no-progress timer (distinguishing
-    ///   partial submission from zero progress).
-    /// - Zero progress (`sent_any == false`) reaching `>= max_age` escalates ONCE to
-    ///   `CAN_TX_STALLED` via `SafetyManager::latch` (never overwriting stronger faults or
-    ///   overflowing off-thread reclaim) and emits a single log record on transition, then
-    ///   rate-limits further logs to <= 1/s.
-    #[allow(clippy::too_many_arguments)]
+    /// Real-backlog-only stopped-hold TX stall accounting across `Deferred` and `Expired`:
+    /// - `CAN_TX_STALLED` latches ONLY when hold frames are actually queued (`queued > 0`) AND
+    ///   the driver's per-`(joint, frame_id)` continuity age reaches `>= max_age`.
+    /// - Zero queued frames (`queued == 0`, including freshness-refused holds and hard-error
+    ///   queue discards) can NEVER latch `CAN_TX_STALLED`.
     fn account_stopped_hold_progress(
         &mut self,
         now: Instant,
         max_age: Duration,
-        sent_any: bool,
         queued: usize,
         dropped: usize,
-        oldest_age: Option<Duration>,
-        force_aged: bool,
-        err_msg: Option<&str>,
+        hold_stall_age: Option<Duration>,
     ) {
         self.reset_tx_joint_progress();
-        if sent_any {
-            self.hold_tx_unsent_since = None;
-            if let Some(msg) = err_msg {
-                if self.should_log_hold_tx_error(now) && !self.safety.deferred_logging() {
-                    tracing::error!("Stopped hold output partially failed: {msg}");
-                }
-            }
+        if queued == 0 {
             return;
         }
-        let since = *self.hold_tx_unsent_since.get_or_insert(now);
-        let unsent_age = now.saturating_duration_since(since);
-        let mut observed_age = oldest_age.map_or(unsent_age, |a| a.max(unsent_age));
-        if force_aged {
-            observed_age = observed_age.max(max_age);
+        let Some(observed_age) = hold_stall_age else {
+            return;
+        };
+        if observed_age < max_age {
+            return;
         }
-        if observed_age >= max_age {
-            let mut escalated_now = false;
-            if self.can_escalate_to_can_tx_stalled() {
-                let detail = crate::safety::TxStallDetail {
-                    queued,
+        let mut escalated_now = false;
+        if self.can_escalate_to_can_tx_stalled() {
+            let detail = crate::safety::TxStallDetail {
+                queued,
+                dropped,
+                age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                consecutive_ticks: 0,
+                is_hold: true,
+            };
+            self.safety.latch(
+                crate::safety::FaultKind::CanTxStalled,
+                crate::safety::FaultDetail::CanTxStalled(Some(detail)),
+            );
+            self.hold_tx_stalled_latched = true;
+            // Single log event on the transition (emitted or deferred by `SafetyManager::latch`).
+            self.last_hold_tx_error_log = Some(now);
+            escalated_now = true;
+        }
+        if !escalated_now && self.should_log_hold_tx_error(now) && !self.safety.deferred_logging() {
+            let age_ms = observed_age.as_millis().min(u128::from(u64::MAX)) as u64;
+            let limit_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
+            if dropped > 0 {
+                tracing::error!(
                     dropped,
-                    age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
-                    limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
-                    consecutive_ticks: 0,
-                    is_hold: true,
-                };
-                self.safety.latch(
-                    crate::safety::FaultKind::CanTxStalled,
-                    crate::safety::FaultDetail::CanTxStalled(Some(detail)),
+                    queued,
+                    age_ms,
+                    limit_ms,
+                    "Stopped hold CAN TX expired without sending any frame"
                 );
-                self.hold_tx_stalled_latched = true;
-                // Single log event on the transition (emitted or deferred by `SafetyManager::latch`).
-                self.last_hold_tx_error_log = Some(now);
-                escalated_now = true;
-            }
-            if !escalated_now && self.should_log_hold_tx_error(now) && !self.safety.deferred_logging() {
-                let age_ms = observed_age.as_millis().min(u128::from(u64::MAX)) as u64;
-                let limit_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
-                if let Some(msg) = err_msg {
-                    tracing::error!(
-                        age_ms,
-                        limit_ms,
-                        "Stopped hold output failed with no frames sent within age limit: {msg}"
-                    );
-                } else if dropped > 0 {
-                    tracing::error!(
-                        dropped,
-                        queued,
-                        age_ms,
-                        limit_ms,
-                        "Stopped hold CAN TX expired without sending any frame"
-                    );
-                } else {
-                    tracing::error!(
-                        queued,
-                        age_ms,
-                        limit_ms,
-                        "Stopped hold CAN TX stalled with no frames sent within age limit"
-                    );
-                }
-            }
-        } else if let Some(msg) = err_msg {
-            if self.should_log_hold_tx_error(now) && !self.safety.deferred_logging() {
-                tracing::error!("Stopped hold output failed: {msg}");
+            } else {
+                tracing::error!(
+                    queued,
+                    age_ms,
+                    limit_ms,
+                    "Stopped hold CAN TX stalled with no frames sent within age limit"
+                );
             }
         }
     }
@@ -2911,6 +2884,7 @@ impl SupervisorInner {
         let now = drv.clock_now();
         let max_age = drv.tx_frame_max_age();
         let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
+        let hold_stall_age = if is_hold { drv.last_hold_stall_age() } else { None };
         let pf_status = drv.take_last_pos_force_tx_status();
         match write_res {
             Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold, now, pf_status },
@@ -2919,6 +2893,7 @@ impl SupervisorInner {
                 now,
                 max_age,
                 oldest_age: drv.oldest_pending_tx_age(),
+                hold_stall_age,
                 is_hold,
                 sent_any: hold_sent_any,
                 sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
@@ -2930,6 +2905,7 @@ impl SupervisorInner {
                 now,
                 max_age,
                 oldest_age: drv.last_tx_expired_age(),
+                hold_stall_age,
                 is_hold,
                 sent_any: hold_sent_any,
                 pf_status,
@@ -3053,7 +3029,6 @@ impl SupervisorInner {
             TickOutput::None => {
                 if !self.is_torqued || self.disable_pending || self.shutdown_committed {
                     self.reset_tx_joint_progress();
-                    self.hold_tx_unsent_since = None;
                     self.j7_stale_since = None;
                 } else if count_release_streak && !has_pending_motion {
                     self.reset_tx_joint_progress();
@@ -3094,22 +3069,30 @@ impl SupervisorInner {
             }
             TickOutput::Complete { now, pf_status, .. } => {
                 self.reset_tx_joint_progress();
-                self.hold_tx_unsent_since = None;
                 self.handle_j7_feedback_staleness(pf_status, now);
                 true
             }
-            TickOutput::Deferred { pending, now, max_age, oldest_age, is_hold, sent_any, sent_mask, pf_status } => {
+            TickOutput::Deferred {
+                pending,
+                now,
+                max_age,
+                oldest_age,
+                hold_stall_age,
+                is_hold,
+                sent_mask,
+                pf_status,
+                ..
+            } => {
                 // Classify using the pass's original motion vs stopped-hold context BEFORE
                 // `handle_j7_feedback_staleness` so a same-release J7 threshold crossing can never
                 // mask a motion TX stall; both conditions record through `SafetyManager::latch`.
                 let treat_as_hold = is_hold || self.safety.state().is_stopped();
                 if treat_as_hold {
-                    self.account_stopped_hold_progress(now, max_age, sent_any, pending, 0, oldest_age, false, None);
+                    self.account_stopped_hold_progress(now, max_age, pending, 0, hold_stall_age);
                     self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
 
-                self.hold_tx_unsent_since = None;
                 if count_release_streak {
                     // Track per-motor lack of progress: joints that completed a target TX in this pass
                     // reset their streak, while unsent joints advance their own streak & age. Healthy
@@ -3161,13 +3144,23 @@ impl SupervisorInner {
                 self.handle_j7_feedback_staleness(pf_status, now);
                 false
             }
-            TickOutput::Expired { dropped, pending, now, max_age, oldest_age, is_hold, sent_any, pf_status } => {
+            TickOutput::Expired {
+                dropped,
+                pending,
+                now,
+                max_age,
+                oldest_age,
+                hold_stall_age,
+                is_hold,
+                pf_status,
+                ..
+            } => {
                 // Classify using the pass's original motion vs stopped-hold context BEFORE
                 // `handle_j7_feedback_staleness` so a same-release J7 threshold crossing can never
                 // mask a non-recoverable motion `CAN_TX_STALLED` latch.
                 let treat_as_hold = is_hold || self.safety.state().is_stopped();
                 if treat_as_hold {
-                    self.account_stopped_hold_progress(now, max_age, sent_any, pending, dropped, oldest_age, true, None);
+                    self.account_stopped_hold_progress(now, max_age, pending, dropped, hold_stall_age);
                     self.handle_j7_feedback_staleness(pf_status, now);
                     return false;
                 }
@@ -3188,28 +3181,28 @@ impl SupervisorInner {
                 self.handle_j7_feedback_staleness(pf_status, now);
                 false
             }
-            TickOutput::Error { message, now, max_age, is_hold, sent_any, pf_status } => {
+            TickOutput::Error { message, now, is_hold, sent_any, pf_status, .. } => {
                 // Classify using the pass's original motion vs stopped-hold context BEFORE
                 // `handle_j7_feedback_staleness` so recoverable J7 staleness can never mask a
                 // non-recoverable motion `DRIVER_WRITE_FAILED` latch.
                 let treat_as_hold = is_hold || self.safety.state().is_stopped();
                 if treat_as_hold {
+                    self.reset_tx_joint_progress();
                     self.tracking.invalidate();
                     self.commanded_velocities.fill(0.0);
                     if self.measured_positions.iter().all(|q| q.is_finite()) {
                         copy_into(&mut self.commanded_positions, &self.measured_positions);
                         copy_into(&mut self.target_positions, &self.measured_positions);
                     }
-                    self.account_stopped_hold_progress(
-                        now,
-                        max_age,
-                        sent_any,
-                        0,
-                        0,
-                        None,
-                        false,
-                        Some(message.as_str()),
-                    );
+                    // Hard error discarded the hold queue (0 frames queued): NEVER latches
+                    // `CAN_TX_STALLED`; rate-limit the error log on driver clock (<= 1/s).
+                    if self.should_log_hold_tx_error(now) && !self.safety.deferred_logging() {
+                        if sent_any {
+                            tracing::error!("Stopped hold output partially failed: {message}");
+                        } else {
+                            tracing::error!("Stopped hold output failed: {message}");
+                        }
+                    }
                 } else {
                     self.reset_tx_joint_progress();
                     self.stop_motion();

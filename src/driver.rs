@@ -558,6 +558,10 @@ pub trait ArmDriver: Send {
     /// True if the most recent bounded stopped-hold pass submitted at least one frame to the bus.
     fn last_hold_tx_sent_any(&self) -> bool { true }
 
+    /// Age of the longest-blocked currently queued stopped-hold frame key (`None` when 0 hold
+    /// frames are queued). Only a real queued hold backlog (`queued > 0`) may report `Some`.
+    fn last_hold_stall_age(&self) -> Option<Duration> { None }
+
     /// Bitmask of 0-based joint indices (`1u64 << i`) that completed a motion target transmit
     /// (and flush) with no unsent target remaining in the carry-over queue during the most recent
     /// [`Self::write_joint_targets_bounded`] pass. Non-CAN/sim drivers default to `u64::MAX`.
@@ -3051,6 +3055,25 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pf_refresh_attempted_this_tick: bool,
     /// True when an output pass ran since the previous `receive_feedback()` pass.
     output_ran_since_rx: bool,
+    /// Per-`(joint, frame_id)` continuity tracker for currently queued stopped-hold frames.
+    hold_key_ages: [Option<HoldKeyAge>; DAMIAO_PENDING_TX_CAPACITY],
+    /// Stop generation (`StopStamp`) that owns the current `hold_key_ages` records; any stop
+    /// generation change immediately invalidates carried hold ages at the single stop-drop gate.
+    hold_key_ages_stop_stamp: StopStamp,
+    /// True when the previous bounded stopped-hold pass finished with `pending > 0` and sent 0 frames.
+    last_hold_pass_zero_progress: bool,
+    /// Longest blocked age among currently queued stopped-hold frame keys (`None` when `pending == 0`).
+    last_hold_stall_age: Option<Duration>,
+}
+
+/// Per-`(joint, frame_id)` stopped-hold stall continuity record (zero allocation).
+#[derive(Clone, Copy, Debug)]
+struct HoldKeyAge {
+    joint: usize,
+    frame_id: u32,
+    unsent_since: Instant,
+    unsent_passes: u32,
+    hit_backpressure: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3366,6 +3389,10 @@ impl PendingTxQueue {
         }
         newly
     }
+
+    fn iter(&self) -> impl Iterator<Item = &PendingTxFrame> {
+        self.buf[..self.len].iter().flatten()
+    }
 }
 
 /// Phase of a pending Damiao torque transition.
@@ -3554,6 +3581,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_refresh_deferred_ticks: 0,
             pf_refresh_attempted_this_tick: false,
             output_ran_since_rx: false,
+            hold_key_ages: [None; DAMIAO_PENDING_TX_CAPACITY],
+            hold_key_ages_stop_stamp: StopStamp { estop_gen: 0, stop_gen: 0 },
+            last_hold_pass_zero_progress: false,
+            last_hold_stall_age: None,
         }
     }
 
@@ -3613,11 +3644,55 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         n
     }
 
+    /// Clear all per-`(joint, frame_id)` stopped-hold stall continuity records.
+    fn reset_hold_key_ages(&mut self) {
+        self.hold_key_ages = [None; DAMIAO_PENDING_TX_CAPACITY];
+        self.last_hold_pass_zero_progress = false;
+        self.last_hold_stall_age = None;
+    }
+
+    /// Remove the hold stall continuity record for a single `(joint, frame_id)` key once sent.
+    fn take_hold_key_age(&mut self, joint: usize, frame_id: u32) -> Option<HoldKeyAge> {
+        for slot in &mut self.hold_key_ages {
+            if slot.is_some_and(|k| k.joint == joint && k.frame_id == frame_id) {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    /// Drop hold stall continuity records for a joint skipped by freshness policy (e.g. stale J7).
+    fn drop_hold_key_ages_for_joint(&mut self, joint: usize) {
+        for slot in &mut self.hold_key_ages {
+            if slot.is_some_and(|k| k.joint == joint) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Single choke point for stop-generation cleanup on `pending_hold_tx`: drops any carried hold
+    /// frames from an older stop generation AND invalidates `hold_key_ages` whenever frames were
+    /// dropped OR `stamp` advanced (so RX-path drops can never leak prior-generation ages into the
+    /// next hold pass).
+    fn drop_stopped_hold_tx(&mut self, stamp: StopStamp) -> usize {
+        let dropped = self.pending_hold_tx.drop_stopped(stamp);
+        if dropped > 0 || self.hold_key_ages_stop_stamp != stamp {
+            self.reset_hold_key_ages();
+            self.hold_key_ages_stop_stamp = stamp;
+        }
+        if dropped > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+        }
+        dropped
+    }
+
     /// Drop all queued stopped-hold frames and reset the round-robin hold cursor.
     fn discard_pending_hold_tx(&mut self) {
         self.tx_probe = None;
         let n = self.pending_hold_tx.clear();
         self.hold_cursor = 0;
+        self.reset_hold_key_ages();
+        self.hold_key_ages_stop_stamp = self.current_stop_stamp();
         if n > 0 {
             crate::diagnostics::tick::record_tx_dropped_stopped(n as u32);
         }
@@ -8200,27 +8275,35 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // partial passes never starve an unconfirmed joint's second (MIT) slot, rebuilding every
         // frame fresh at send time from `fresh_measured_position(<= 100 ms)`.
         self.last_hold_tx_sent_any = false;
+        self.last_hold_stall_age = None;
         if let Err(e) = self.pending_stop_check(None) {
             self.discard_pending_hold_tx();
             return Err(e);
         }
         self.output_ran_since_rx = true;
         let start_stamp = self.current_stop_stamp();
-        let stopped_carry = self.pending_hold_tx.drop_stopped(start_stamp);
-        if stopped_carry > 0 {
-            crate::diagnostics::tick::record_tx_dropped_stopped(stopped_carry as u32);
-        }
+        let _ = self.drop_stopped_hold_tx(start_stamp);
         // Single shared J7 pos-force staleness gate runs BEFORE `drop_stale` using ONE shared
         // clock sample so stale J7 is dropped and refreshed (never counted as FIFO expiry) while
         // J1–J6 continue holding.
         let cleanup_now = self.now();
         let skip_pf_joint = self.check_pos_force_freshness_for_tx_at(cleanup_now);
+        if let Some(j) = skip_pf_joint {
+            self.drop_hold_key_ages_for_joint(j);
+        }
+        let prev_zero_progress = self.last_hold_pass_zero_progress;
+        let prev_ages = self.hold_key_ages;
         // Drop stale carried-over holds without resetting `hold_cursor`, then still stage fresh
         // holds so a slow cadence (e.g. 100 ms) rotates across all frame keys instead of stalling.
         let (pre_dropped_stale, mut oldest_expired) =
             self.pending_hold_tx.drop_stale(cleanup_now, self.tx_budget.frame_max_age);
         if pre_dropped_stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(pre_dropped_stale as u32);
+        }
+        let mut retained_before_stage: [Option<(usize, u32)>; DAMIAO_PENDING_TX_CAPACITY] =
+            [None; DAMIAO_PENDING_TX_CAPACITY];
+        for (slot, entry) in retained_before_stage.iter_mut().zip(self.pending_hold_tx.iter()) {
+            *slot = Some((entry.joint, entry.frame_id));
         }
 
         let n = targets.len();
@@ -8291,12 +8374,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         let mut sent_any = false;
         let mut dropped_stale_in_pass = 0usize;
+        let mut bp_key: Option<(usize, u32)> = None;
         while let Some(entry) = self.pending_hold_tx.front() {
             let i = entry.joint;
+            let frame_id = entry.frame_id;
             if self.active_pos_force_joint() == Some(i)
                 && !self.pos_force_feedback_valid(i, self.now())
             {
                 let _ = self.check_pos_force_freshness_for_tx();
+                self.drop_hold_key_ages_for_joint(i);
                 continue;
             }
             let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
@@ -8332,6 +8418,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             ) {
                 Ok(sent_frame) => {
                     let _ = self.pending_hold_tx.pop_front();
+                    let _ = self.take_hold_key_age(i, frame_id);
                     let mit_params = (
                         kp.filter(|k| k.is_finite()).unwrap_or(self.default_kp),
                         kd.filter(|k| k.is_finite()).unwrap_or(self.default_kd),
@@ -8345,6 +8432,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::PosForceFeedbackExpired(_)) => {
                     let _ = self.check_pos_force_freshness_for_tx();
+                    self.drop_hold_key_ages_for_joint(i);
                     continue;
                 }
                 Err(TxRefusal::DeadlinePassed) => {
@@ -8373,6 +8461,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         && !self.pos_force_feedback_valid(i, self.now())
                     {
                         let _ = self.check_pos_force_freshness_for_tx();
+                        self.drop_hold_key_ages_for_joint(i);
                         continue;
                     }
                     self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
@@ -8397,6 +8486,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         && !self.pos_force_feedback_valid(i, self.now())
                     {
                         let _ = self.check_pos_force_freshness_for_tx();
+                        self.drop_hold_key_ages_for_joint(i);
+                    } else {
+                        bp_key = Some((i, frame_id));
                     }
                     break;
                 }
@@ -8460,6 +8552,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 && !self.pos_force_feedback_valid(pf_joint, post_now)
             {
                 let _ = self.check_pos_force_freshness_for_tx_at(post_now);
+                self.drop_hold_key_ages_for_joint(pf_joint);
             }
         }
         let (late_stale, late_oldest) =
@@ -8475,6 +8568,60 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.last_hold_tx_sent_any = sent_any;
         let newly_deferred = self.pending_hold_tx.mark_newly_deferred();
         let pending = self.pending_hold_tx.len();
+        if pending == 0 {
+            self.reset_hold_key_ages();
+        } else {
+            let pass_now = self.now();
+            let mut next_ages = [None; DAMIAO_PENDING_TX_CAPACITY];
+            let mut next_len = 0usize;
+            let mut max_stall_age: Option<Duration> = None;
+            for entry in self.pending_hold_tx.iter() {
+                let prev = prev_ages
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .find(|k| k.joint == entry.joint && k.frame_id == entry.frame_id);
+                let retained = retained_before_stage
+                    .iter()
+                    .flatten()
+                    .any(|&(j, fid)| j == entry.joint && fid == entry.frame_id);
+                let key_hit_bp = bp_key == Some((entry.joint, entry.frame_id));
+                let (unsent_since, unsent_passes, hit_backpressure) = if retained {
+                    (
+                        prev.map_or(entry.queued_at, |p| p.unsent_since.min(entry.queued_at)),
+                        prev.map_or(1, |p| p.unsent_passes.saturating_add(1)),
+                        key_hit_bp || prev.is_some_and(|p| p.hit_backpressure),
+                    )
+                } else if let Some(p) = prev.filter(|p| {
+                    (!sent_any && prev_zero_progress) || (p.hit_backpressure && key_hit_bp)
+                }) {
+                    (
+                        p.unsent_since,
+                        p.unsent_passes.saturating_add(1),
+                        key_hit_bp || p.hit_backpressure,
+                    )
+                } else {
+                    (entry.queued_at, 1, key_hit_bp)
+                };
+                if next_len < DAMIAO_PENDING_TX_CAPACITY {
+                    next_ages[next_len] = Some(HoldKeyAge {
+                        joint: entry.joint,
+                        frame_id: entry.frame_id,
+                        unsent_since,
+                        unsent_passes,
+                        hit_backpressure,
+                    });
+                    next_len += 1;
+                }
+                if !sent_any || hit_backpressure {
+                    let age = pass_now.saturating_duration_since(unsent_since);
+                    max_stall_age = Some(max_stall_age.map_or(age, |m| m.max(age)));
+                }
+            }
+            self.hold_key_ages = next_ages;
+            self.last_hold_pass_zero_progress = !sent_any;
+            self.last_hold_stall_age = max_stall_age;
+        }
         crate::diagnostics::tick::record_tx_deferred(newly_deferred as u32, self.total_pending_tx_len());
         let total_dropped_stale = pre_dropped_stale.saturating_add(dropped_stale_in_pass);
         if total_dropped_stale > 0 {
@@ -8491,6 +8638,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn last_hold_tx_sent_any(&self) -> bool {
         self.last_hold_tx_sent_any
+    }
+
+    fn last_hold_stall_age(&self) -> Option<Duration> {
+        if self.pending_hold_tx.len() == 0 {
+            None
+        } else {
+            self.last_hold_stall_age
+        }
     }
 
     fn last_target_tx_sent_mask(&self) -> u64 {
@@ -9142,10 +9297,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.pending_stop_check(None).is_err() {
             self.discard_pending_hold_tx();
         } else {
-            let stopped_hold = self.pending_hold_tx.drop_stopped(rx_stop_stamp);
-            if stopped_hold > 0 {
-                crate::diagnostics::tick::record_tx_dropped_stopped(stopped_hold as u32);
-            }
+            let _ = self.drop_stopped_hold_tx(rx_stop_stamp);
         }
         // Priority J7 0xCC refresh when enabled: if a needed refresh was previously deferred by
         // full-budget contention (`pf_refresh_deferred_ticks >= 1`) OR no output pass ran since the

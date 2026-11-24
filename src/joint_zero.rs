@@ -221,6 +221,7 @@ impl ArmDriver for ZeroOffsetDriver {
         r
     }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
+    fn last_hold_stall_age(&self) -> Option<Duration> { self.inner.last_hold_stall_age() }
     fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
     fn take_last_pos_force_tx_status(&mut self) -> crate::driver::PosForceTxStatus {
         self.inner.take_last_pos_force_tx_status()
