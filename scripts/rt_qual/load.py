@@ -29,10 +29,21 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from rebot import Arm
-from rebot import _ws as rebot_ws
-from rebot.client import ArmdClient
-from rebot.errors import RebotError
+try:
+    from rebot import Arm
+    from rebot import _ws as rebot_ws
+    from rebot.client import ArmdClient
+    from rebot.errors import RebotError
+    HAS_REBOT_SDK = True
+except ImportError:
+    Arm = None  # type: ignore[assignment]
+    rebot_ws = None  # type: ignore[assignment]
+    ArmdClient = None  # type: ignore[assignment]
+
+    class RebotError(Exception):  # type: ignore[no-redef]
+        pass
+
+    HAS_REBOT_SDK = False
 
 MAX_SPEED_SCALE = 0.3
 
@@ -399,10 +410,11 @@ def run_tick_sampler(
     enabled_loads: dict[str, bool],
     fh: Any,
     write_lock: threading.Lock,
+    skip_initial: bool = False,
 ) -> None:
-    # Take an initial sample immediately, then every interval_s.
-    rec = sample_tick_once(base_url, run_id, t0, state, enabled_loads)
-    write_jsonl_line(fh, write_lock, rec)
+    if not skip_initial:
+        rec = sample_tick_once(base_url, run_id, t0, state, enabled_loads)
+        write_jsonl_line(fh, write_lock, rec)
     next_t = time.monotonic() + interval_s
     while not state.stop_event.is_set() and time.monotonic() < deadline:
         wait_s = min(max(0.0, next_t - time.monotonic()), max(0.0, deadline - time.monotonic()))
@@ -415,6 +427,35 @@ def run_tick_sampler(
         next_t += interval_s
         if next_t < time.monotonic():
             next_t = time.monotonic() + interval_s
+
+
+def capture_settled_final_sample(
+    base_url: str,
+    run_id: str,
+    t0: float,
+    state: SharedState,
+    enabled_loads: dict[str, bool],
+    max_attempts: int = 6,
+    settle_sleep_s: float = 0.005,
+) -> dict[str, Any]:
+    """Capture the terminal `final` diagnostics sample, briefly settling if an ordinary
+    in-flight release (< 20 ms) happens to be executing when the poll fires so `releases_total`
+    covers `releases_started`. Immediately returns if a release is already stalled >= 20 ms."""
+    sample = sample_tick_once(base_url, run_id, t0, state, enabled_loads, phase_override="final")
+    for _ in range(max_attempts - 1):
+        tick = sample.get("tick")
+        if not isinstance(tick, dict) or sample.get("tick_error"):
+            break
+        started = tick.get("releases_started")
+        total = tick.get("releases_total")
+        in_flight = tick.get("in_flight_release_us")
+        if not (isinstance(started, int) and isinstance(total, int) and started > total):
+            break
+        if isinstance(in_flight, int) and in_flight >= 20_000:
+            break
+        time.sleep(settle_sleep_s)
+        sample = sample_tick_once(base_url, run_id, t0, state, enabled_loads, phase_override="final")
+    return sample
 
 
 def check_arm_state(arm: Arm, state: SharedState) -> bool:
@@ -565,6 +606,10 @@ def fetch_boot_meta(base_url: str) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if not HAS_REBOT_SDK and (args.motion or args.record or args.ws_stream or args.measure):
+        raise RuntimeError(
+            "rebot SDK is required when --motion, --record, --ws-stream, or --measure is enabled"
+        )
     http_base, ws_base = build_base_urls(args.host, args.port)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -629,15 +674,35 @@ def main(argv: list[str] | None = None) -> int:
             }
             write_jsonl_line(fh, write_lock, meta_record)
 
-            # Start tick sampler first so baseline + load + cooldown are all captured.
-            state.set_phase("baseline" if args.baseline_s > 0 else "full_load")
-            sampler_thread = threading.Thread(
-                target=run_tick_sampler,
-                args=(http_base, args.run_id, t0, args.sample_interval, deadline, state, enabled_loads, fh, write_lock),
-                name="tick-sampler",
-                daemon=True,
-            )
-            sampler_thread.start()
+            # Capture a synchronous baseline sample BEFORE starting any load workers (even when
+            # --baseline-s=0) so early workload spikes cannot be absorbed into samples[0].
+            state.set_phase("baseline")
+            baseline_sample = sample_tick_once(http_base, args.run_id, t0, state, enabled_loads, phase_override="baseline")
+            write_jsonl_line(fh, write_lock, baseline_sample)
+            baseline_ok = isinstance(baseline_sample.get("tick"), dict) and not baseline_sample.get("tick_error")
+            if not baseline_ok:
+                state.stop_reason = f"baseline_poll_failed:{baseline_sample.get('tick_error') or 'no_tick'}"
+                state.stop_event.set()
+            else:
+                state.set_phase("baseline" if args.baseline_s > 0 else "full_load")
+                sampler_thread = threading.Thread(
+                    target=run_tick_sampler,
+                    args=(
+                        http_base,
+                        args.run_id,
+                        t0,
+                        args.sample_interval,
+                        deadline,
+                        state,
+                        enabled_loads,
+                        fh,
+                        write_lock,
+                        True,
+                    ),
+                    name="tick-sampler",
+                    daemon=True,
+                )
+                sampler_thread.start()
 
             if args.baseline_s > 0 and not state.stop_event.is_set():
                 state.stop_event.wait(min(args.baseline_s, max(0.0, deadline - time.monotonic())))
@@ -787,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
             if sampler_thread is not None:
                 sampler_thread.join(timeout=3.0)
 
-            final_sample = sample_tick_once(http_base, args.run_id, t0, state, enabled_loads, phase_override="final")
+            final_sample = capture_settled_final_sample(http_base, args.run_id, t0, state, enabled_loads)
             write_jsonl_line(fh, write_lock, final_sample)
 
             blackbox_tail = None
@@ -818,7 +883,11 @@ def main(argv: list[str] | None = None) -> int:
         f"rt_qual load finished: run_id={args.run_id} elapsed={time.monotonic() - t0:.1f}s "
         f"stop_reason={state.stop_reason} fault={state.fault} output={out_path}"
     )
-    return 2 if state.has_fault() else 0
+    if state.has_fault():
+        return 2
+    if state.stop_reason.startswith("baseline_poll_failed"):
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

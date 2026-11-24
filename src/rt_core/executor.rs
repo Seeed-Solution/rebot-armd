@@ -248,7 +248,9 @@ impl AtomicAllocCounters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonotonicStatsSnapshot {
     pub coherent: bool,
+    pub releases_started: u64,
     pub releases_total: u64,
+    pub in_flight_release_us: u64,
     pub release_us_max_ever: u64,
     pub releases_over_10ms: u64,
     pub releases_over_15ms: u64,
@@ -263,6 +265,13 @@ pub struct MonotonicStatsSnapshot {
 }
 
 const MAX_MONOTONIC_SEQLOCK_RETRIES: usize = 64;
+const TAIL_AMEND_SLOTS: usize = 16;
+
+#[derive(Debug, Default)]
+struct AtomicTailAmend {
+    release_seq: AtomicU64,
+    release_us: std::sync::atomic::AtomicU32,
+}
 
 /// Counters the executor / periodic control thread updates with plain atomic stores.
 #[derive(Debug, Default)]
@@ -271,8 +280,12 @@ pub struct ExecutorStats {
     pub steps: AtomicU64,
     /// Whole releases completed (Release-incremented strictly AFTER `release_allocs` is updated).
     pub completed_releases: AtomicU64,
+    /// Monotonic releases started since process start (control-thread incremented at wake).
+    pub releases_started: AtomicU64,
     /// Monotonic completed releases since process start (control-thread written only).
     pub releases_total: AtomicU64,
+    /// Monotonic start timestamp (`mono_now_ns().max(1)`) of an in-flight release, or `0` when idle.
+    in_flight_start_mono_ns: AtomicU64,
     /// Monotonic all-time maximum full `release_us` since process start, µs (control-thread written only).
     pub release_us_max_ever: AtomicU64,
     /// Monotonic releases since process start with full duration `>= 10 ms` / `>= 15 ms` / `>= 20 ms`.
@@ -336,6 +349,13 @@ pub struct ExecutorStats {
     pub last_clear_release_seq: AtomicU64,
     /// Release sequence (`TickSample::release_seq`) of the most recent injected test allocation on `armd-control`.
     pub last_inject_alloc_release_seq: AtomicU64,
+    /// Optional one-shot test delay (ns) injected strictly AFTER stats publication & counter commit,
+    /// right before the next `sleep_until`, to prove tail-stall coverage on both owners (0 in production).
+    #[doc(hidden)]
+    pub post_stats_delay_once_ns: AtomicU64,
+    /// Fixed-size lock-free tail-amendment table written by the executor control thread and applied
+    /// off-thread by `drain_diag` so post-`diag_tx.push` stalls update the rolling window too.
+    tail_amend_slots: [AtomicTailAmend; TAIL_AMEND_SLOTS],
     /// Optional lock-free tick ring attached in legacy mode (`attach_legacy_loop_stats`) so
     /// `run_periodic_with_clock` publishes each legacy sample once at release completion.
     legacy_tick_ring: std::sync::OnceLock<Arc<crate::diagnostics::tick::LockFreeTickStats>>,
@@ -362,6 +382,77 @@ impl ExecutorStats {
     /// Writes ONLY `marker_requested_gen`; never touches any control-thread counter/peak atomic.
     pub fn request_marker(&self) -> u64 {
         self.marker_requested_gen.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    }
+
+    /// Marks the start of one control release right after wake lateness sampling (zero allocation).
+    #[inline]
+    pub fn mark_release_started(&self) {
+        let start_mono = mono_now_ns().max(1);
+        let s0 = self.stats_seq.load(Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        let started = self.releases_started.load(Ordering::Relaxed).saturating_add(1);
+        self.releases_started.store(started, Ordering::Relaxed);
+        self.in_flight_start_mono_ns.store(start_mono, Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Clears the in-flight release watermark strictly after all post-commit tail work finishes
+    /// (right before sleeping until the next release, or on loop exit).
+    #[inline]
+    pub fn clear_in_flight(&self) {
+        self.in_flight_start_mono_ns.store(0, Ordering::Release);
+    }
+
+    /// Records a post-`diag_tx.push` tail `release_us` amendment for executor `release_seq`
+    /// (zero allocation, wait-free; applied off-thread by `drain_diag`).
+    #[inline]
+    pub fn record_sample_release_us_amendment(&self, release_seq: u64, release_us: u32) {
+        if release_seq == 0 {
+            return;
+        }
+        let slot = &self.tail_amend_slots[(release_seq as usize) & (TAIL_AMEND_SLOTS - 1)];
+        slot.release_seq.store(0, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        slot.release_us.store(release_us, Ordering::Relaxed);
+        slot.release_seq.store(release_seq, Ordering::Release);
+    }
+
+    /// Applies any pending tail `release_us` amendment to a freshly popped executor `TickSample`.
+    pub(crate) fn apply_tail_amend_to_sample(&self, sample: &mut TickSample) {
+        if sample.release_seq == 0 {
+            return;
+        }
+        let slot = &self.tail_amend_slots[(sample.release_seq as usize) & (TAIL_AMEND_SLOTS - 1)];
+        let s1 = slot.release_seq.load(Ordering::Acquire);
+        if s1 != sample.release_seq {
+            return;
+        }
+        let us = slot.release_us.load(Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Acquire);
+        let s2 = slot.release_seq.load(Ordering::Relaxed);
+        if s1 == s2 && sample.release_us < us {
+            sample.release_us = us;
+        }
+    }
+
+    /// Flushes any recorded tail `release_us` amendments into already-drained `LockFreeTickStats` slots.
+    pub(crate) fn flush_tail_amendments_to_ring(
+        &self,
+        tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    ) {
+        for slot in &self.tail_amend_slots {
+            let s1 = slot.release_seq.load(Ordering::Acquire);
+            if s1 == 0 {
+                continue;
+            }
+            let us = slot.release_us.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let s2 = slot.release_seq.load(Ordering::Relaxed);
+            if s1 == s2 {
+                tick_stats.amend_release_us_by_release_seq(s1, us);
+            }
+        }
     }
 
     /// Classifies raw wakeup lateness (`actual_release_start - scheduled_release`, ns), updates
@@ -470,17 +561,61 @@ impl ExecutorStats {
         self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
     }
 
-    /// Accounts remaining shutdown/panic-exit overrun skips inside the control-thread seqlock.
+    /// Amends the just-committed release's monotonic duration, threshold crossings, and overrun
+    /// skips if post-publication/post-commit tail work extended the release before the next sleep.
+    /// Never double-counts already-counted thresholds, and never misattributes pre-marker tail
+    /// debt to a newly acknowledged zero-release marker interval.
     #[inline]
-    pub fn record_exit_skips(&self, skipped_delta: u64) {
-        if skipped_delta == 0 {
+    pub fn amend_last_release_tail(
+        &self,
+        committed_release_ns: u64,
+        tail_release_ns: u64,
+        extra_skips: u64,
+    ) {
+        let (_, p10, p15, p20) = crate::diagnostics::tick::classify_release_duration_ns(committed_release_ns);
+        let (tail_us, t10, t15, t20) = crate::diagnostics::tick::classify_release_duration_ns(tail_release_ns);
+        let d10 = u64::from(t10 && !p10);
+        let d15 = u64::from(t15 && !p15);
+        let d20 = u64::from(t20 && !p20);
+        if tail_release_ns <= committed_release_ns && d10 == 0 && d15 == 0 && d20 == 0 && extra_skips == 0 {
             return;
         }
+
         let s0 = self.stats_seq.load(Ordering::Relaxed);
         self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
-        let skips = self.skipped_releases.load(Ordering::Relaxed).saturating_add(skipped_delta);
+
+        let prev_max = self.release_us_max_ever.load(Ordering::Relaxed);
+        if u64::from(tail_us) > prev_max {
+            self.release_us_max_ever.store(u64::from(tail_us), Ordering::Relaxed);
+        }
+        let r10 = self.releases_over_10ms.load(Ordering::Relaxed).saturating_add(d10);
+        self.releases_over_10ms.store(r10, Ordering::Relaxed);
+        let r15 = self.releases_over_15ms.load(Ordering::Relaxed).saturating_add(d15);
+        self.releases_over_15ms.store(r15, Ordering::Relaxed);
+        let r20 = self.releases_over_20ms.load(Ordering::Relaxed).saturating_add(d20);
+        self.releases_over_20ms.store(r20, Ordering::Relaxed);
+        let skips = self.skipped_releases.load(Ordering::Relaxed).saturating_add(extra_skips);
         self.skipped_releases.store(skips, Ordering::Relaxed);
+
+        let ack = self.marker_ack_gen.load(Ordering::Relaxed);
+        if ack > 0 {
+            let rel_total = self.releases_total.load(Ordering::Relaxed);
+            let base_rel = self.base_releases_total.load(Ordering::Relaxed);
+            if rel_total == base_rel {
+                // This release acknowledged the marker; its tail debt belongs to the pre-marker side.
+                self.base_releases_over_10ms.store(r10, Ordering::Relaxed);
+                self.base_releases_over_15ms.store(r15, Ordering::Relaxed);
+                self.base_releases_over_20ms.store(r20, Ordering::Relaxed);
+                self.base_skipped_releases.store(skips, Ordering::Relaxed);
+            } else {
+                let sr = self.since_release_us_max.load(Ordering::Relaxed);
+                if u64::from(tail_us) > sr {
+                    self.since_release_us_max.store(u64::from(tail_us), Ordering::Relaxed);
+                }
+            }
+        }
+
         self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
     }
 
@@ -493,7 +628,9 @@ impl ExecutorStats {
                 std::hint::spin_loop();
                 continue;
             }
+            let releases_started = self.releases_started.load(Ordering::Relaxed);
             let releases_total = self.releases_total.load(Ordering::Relaxed);
+            let in_flight_start = self.in_flight_start_mono_ns.load(Ordering::Relaxed);
             let release_us_max_ever = self.release_us_max_ever.load(Ordering::Relaxed);
             let releases_over_10ms = self.releases_over_10ms.load(Ordering::Relaxed);
             let releases_over_15ms = self.releases_over_15ms.load(Ordering::Relaxed);
@@ -519,6 +656,13 @@ impl ExecutorStats {
             std::sync::atomic::fence(Ordering::Acquire);
             let s2 = self.stats_seq.load(Ordering::Relaxed);
             if s1 == s2 {
+                let active = self.loop_active.load(Ordering::Acquire);
+                let live_in_flight = self.in_flight_start_mono_ns.load(Ordering::Acquire);
+                let in_flight_release_us = if active && in_flight_start != 0 && live_in_flight == in_flight_start {
+                    mono_now_ns().saturating_sub(in_flight_start) / 1_000
+                } else {
+                    0
+                };
                 let req = self.marker_requested_gen.load(Ordering::Acquire);
                 let since_marker = if req == 0 {
                     None
@@ -541,7 +685,7 @@ impl ExecutorStats {
                 } else {
                     Some(crate::diagnostics::tick::TickSinceMarker {
                         marker_id: req,
-                        status: "pending",
+                        status: if active { "pending" } else { "inactive" },
                         releases_total_delta: None,
                         releases_over_10ms_delta: None,
                         releases_over_15ms_delta: None,
@@ -557,7 +701,9 @@ impl ExecutorStats {
                 };
                 return MonotonicStatsSnapshot {
                     coherent: true,
+                    releases_started,
                     releases_total,
+                    in_flight_release_us,
                     release_us_max_ever,
                     releases_over_10ms,
                     releases_over_15ms,
@@ -575,7 +721,9 @@ impl ExecutorStats {
         }
         MonotonicStatsSnapshot {
             coherent: false,
+            releases_started: self.releases_started.load(Ordering::Relaxed),
             releases_total: self.releases_total.load(Ordering::Relaxed),
+            in_flight_release_us: 0,
             release_us_max_ever: self.release_us_max_ever.load(Ordering::Relaxed),
             releases_over_10ms: self.releases_over_10ms.load(Ordering::Relaxed),
             releases_over_15ms: self.releases_over_15ms.load(Ordering::Relaxed),
@@ -1227,9 +1375,11 @@ impl OffThreadSinks {
 
     pub(crate) fn drain_diag(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
         let mut rx = self.diag_rx.lock().unwrap_or_else(|e| e.into_inner());
-        while let Ok(sample) = rx.pop() {
+        while let Ok(mut sample) = rx.pop() {
+            self.stats.apply_tail_amend_to_sample(&mut sample);
             let _ = tick_stats.record(&sample);
         }
+        self.stats.flush_tail_amendments_to_ring(tick_stats);
     }
 
     pub(crate) fn drain_all(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
@@ -3239,18 +3389,18 @@ fn control_thread_main(
         }
     };
 
-    struct LoopActiveGuard<'a>(&'a AtomicBool);
+    struct LoopActiveGuard<'a>(&'a ExecutorStats);
     impl Drop for LoopActiveGuard<'_> {
         fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
+            self.0.clear_in_flight();
+            self.0.loop_active.store(false, Ordering::Release);
         }
     }
     stats.loop_active.store(true, Ordering::Release);
-    let _loop_active = LoopActiveGuard(&stats.loop_active);
+    let _loop_active = LoopActiveGuard(&stats);
 
     let mut releases = Releases::start_at(now_ns_fn(), cfg.period);
     let mut last_release_start = now_inst();
-    let mut last_release_end_ns: Option<u64> = None;
     let mut publish_gen = initial_generation;
     let mut panicked = false;
 
@@ -3275,6 +3425,7 @@ fn control_thread_main(
         let release_start = now_inst();
         let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
         let wake_lateness_us = crate::diagnostics::tick::ns_to_us_u32(wake_lateness_ns);
+        stats.mark_release_started();
         let wake_skipped;
         let step_num;
 
@@ -3496,7 +3647,6 @@ fn control_thread_main(
         };
 
         // ---- Window 2: Disjoint sub-release transition wakes before `next_release_ns` ----
-        let mut wake_sleep_ns: u64 = 0;
         let mut step_sample: Option<TickSample> = None;
         let step_res: Result<(), Box<dyn Any + Send>> = match release_res {
             Err(err) => Err(err),
@@ -3516,20 +3666,12 @@ fn control_thread_main(
                     }
                     let now = now_inst();
                     if wake > now {
-                        let sleep_start = now_ns_fn();
-                        let wake_ns = sleep_start.saturating_add(
+                        let wake_ns = now_ns_fn().saturating_add(
                             wake.saturating_duration_since(now)
                                 .as_nanos()
                                 .min(u128::from(u64::MAX)) as u64,
                         );
-                        let target_wake_ns = wake_ns.min(next_release_ns);
-                        sleep_until(target_wake_ns);
-                        let sleep_end = now_ns_fn();
-                        // Subtract only intended scheduled wait; any OS wake jitter/overrun stays in `release_us`.
-                        let scheduled_wait = target_wake_ns
-                            .saturating_sub(sleep_start)
-                            .min(sleep_end.saturating_sub(sleep_start));
-                        wake_sleep_ns = wake_sleep_ns.saturating_add(scheduled_wait);
+                        sleep_until(wake_ns.min(next_release_ns));
                     }
                     if control_stop.load(Ordering::Acquire) {
                         break;
@@ -3588,7 +3730,7 @@ fn control_thread_main(
             }
         };
 
-        // ---- Single release-completion point (covers Window 1 + Window 2 + post-publish tail) ----
+        // ---- Single release-completion point (full wall time from wake through all release work) ----
         let tail_alloc_start = crate::diagnostics::alloc::snapshot_counts();
         if let Some(delay) = state
             .hooks
@@ -3599,20 +3741,20 @@ fn control_thread_main(
             sleep_dur(delay);
         }
         let pre_diag_end_ns = now_ns_fn();
-        let pre_diag_release_ns = pre_diag_end_ns
-            .saturating_sub(actual_ns)
-            .saturating_sub(wake_sleep_ns);
+        let pre_diag_release_ns = pre_diag_end_ns.saturating_sub(actual_ns);
+        let stamped_release_us = crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns);
         let mut diag_dropped_delta: u64 = 0;
-        if step_sample.is_some() || step_res.is_err() {
+        let pushed_sample = step_sample.is_some() || step_res.is_err();
+        if pushed_sample {
             let mut sample = step_sample.unwrap_or(TickSample {
-                tick_us: crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns),
+                tick_us: stamped_release_us,
                 release_us: 0,
                 wake_lateness_us,
                 release_seq: step_num,
                 safety_epoch: core.safety.epoch_id(),
                 ..Default::default()
             });
-            sample.release_us = crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns);
+            sample.release_us = stamped_release_us;
             if diag_tx.push(sample).is_err() {
                 diag_dropped_delta = 1;
             }
@@ -3623,10 +3765,13 @@ fn control_thread_main(
         {
             let _tail_local = state.run_tail_alloc_probe(&state.hooks.inject_release_tail_once);
         }
+        let tail_alloc_delta = crate::diagnostics::alloc::snapshot_counts().delta_since(tail_alloc_start);
+        if tail_alloc_delta.total() > 0 {
+            stats.release_allocs.record(tail_alloc_delta);
+        }
         let release_end_ns = now_ns_fn();
-        let final_release_ns = release_end_ns
-            .saturating_sub(actual_ns)
-            .saturating_sub(wake_sleep_ns);
+        let final_release_ns = release_end_ns.saturating_sub(actual_ns);
+        let final_release_us = crate::diagnostics::tick::ns_to_us_u32(final_release_ns);
         let overrun_skipped = releases.advance_overrun(release_end_ns);
         stats.commit_release_outcome(
             wake_lateness_ns,
@@ -3634,17 +3779,31 @@ fn control_thread_main(
             wake_skipped.saturating_add(overrun_skipped),
             diag_dropped_delta,
         );
-        last_release_end_ns = Some(release_end_ns);
-        let tail_alloc_delta = crate::diagnostics::alloc::snapshot_counts().delta_since(tail_alloc_start);
-        if tail_alloc_delta.total() > 0 {
-            stats.release_allocs.record(tail_alloc_delta);
+        if pushed_sample && diag_dropped_delta == 0 && final_release_us > stamped_release_us {
+            stats.record_sample_release_us_amendment(step_num, final_release_us);
+            hub.wake();
         }
         stats.completed_releases.fetch_add(1, Ordering::Release);
 
-        if let Err(err) = step_res {
-            if let Some(end_ns) = last_release_end_ns.take() {
-                stats.record_exit_skips(releases.missed_at_exit(end_ns));
+        // Explicit post-commit instrumentation tail check right before next `sleep_until`.
+        let post_stats_delay_ns = stats.post_stats_delay_once_ns.swap(0, Ordering::AcqRel);
+        if post_stats_delay_ns > 0 {
+            sleep_dur(Duration::from_nanos(post_stats_delay_ns));
+        }
+        let loop_end_ns = now_ns_fn();
+        let tail_release_ns = loop_end_ns.saturating_sub(actual_ns);
+        if tail_release_ns > final_release_ns || loop_end_ns >= releases.next_ns() {
+            let extra_skips = releases.advance_overrun(loop_end_ns);
+            stats.amend_last_release_tail(final_release_ns, tail_release_ns, extra_skips);
+            let tail_us = crate::diagnostics::tick::ns_to_us_u32(tail_release_ns);
+            if pushed_sample && diag_dropped_delta == 0 && tail_us > final_release_us.max(stamped_release_us) {
+                stats.record_sample_release_us_amendment(step_num, tail_us);
+                hub.wake();
             }
+        }
+        stats.clear_in_flight();
+
+        if let Err(err) = step_res {
             panicked = true;
             e_stop_latched.store(true, Ordering::SeqCst);
             tracing::error!("RT executor thread panicked during release: {:?}", err);
@@ -3707,11 +3866,6 @@ fn control_thread_main(
                 break;
             }
         }
-    }
-
-    // Account any final release overrun that elapsed past `releases.next_ns()` right before loop exit.
-    if let Some(end_ns) = last_release_end_ns.take() {
-        stats.record_exit_skips(releases.missed_at_exit(end_ns));
     }
 
     if !panicked && teardown_disable.requested.load(Ordering::Acquire) {
@@ -3839,18 +3993,19 @@ impl Releases {
         skipped
     }
 
-    /// Accounts intermediate deadlines strictly missed by an overrun during the release that
-    /// finished at `end_ns`, advancing `next_ns` while keeping `next_ns <= end_ns` so an immediate
-    /// catch-up release still runs if the loop continues without double-counting skips.
+    /// Accounts all scheduled deadlines at or before `end_ns` crossed during an overrunning
+    /// release and advances `next_ns` to the earliest grid point strictly after `end_ns`.
+    /// Because every crossed deadline is committed at release completion (whether the loop
+    /// continues or exits), overrun skips are never lost on shutdown or catch-up and never
+    /// misattributed to a newly acknowledged baseline marker.
     pub fn advance_overrun(&mut self, end_ns: u64) -> u64 {
-        let second_missed = self.next_ns.saturating_add(self.period_ns);
-        let skipped = Self::missed_since(second_missed, end_ns, self.period_ns);
+        let skipped = Self::missed_since(self.next_ns, end_ns, self.period_ns);
         self.next_ns = self.next_ns.saturating_add(skipped.saturating_mul(self.period_ns));
         skipped
     }
 
-    /// Accounts all remaining scheduled deadlines at or before `end_ns` when the control loop
-    /// exits after a release ending at `end_ns` (returns `0` when `end_ns < self.next_ns`).
+    /// Accounts all remaining scheduled deadlines at or before `end_ns` when a release aborts
+    /// mid-body (e.g. panic unwind / panic-exit).
     pub fn missed_at_exit(&self, end_ns: u64) -> u64 {
         Self::missed_since(self.next_ns, end_ns, self.period_ns)
     }
@@ -3883,6 +4038,7 @@ pub fn account_periodic_overrun_on_panic_exit(stats: &ExecutorStats) {
             wake_skipped.saturating_add(exit_skips),
             0,
         );
+        stats.clear_in_flight();
     }
 }
 
@@ -3900,20 +4056,20 @@ pub fn run_periodic_with_clock(
     clock: Option<&dyn ExecutorClock>,
     mut step: impl FnMut(f64),
 ) {
-    struct LoopActiveGuard<'a>(&'a AtomicBool);
+    struct LoopActiveGuard<'a>(&'a ExecutorStats);
     impl Drop for LoopActiveGuard<'_> {
         fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
+            self.0.clear_in_flight();
+            self.0.loop_active.store(false, Ordering::Release);
         }
     }
     stats.loop_active.store(true, Ordering::Release);
-    let _loop_active = LoopActiveGuard(&stats.loop_active);
+    let _loop_active = LoopActiveGuard(stats);
 
     let now_inst = || clock.map_or_else(Instant::now, ExecutorClock::now);
     let now_ns = || clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
     let mut releases = Releases::start_at(now_ns(), period);
     let mut last = now_inst();
-    let mut last_release_end_ns: Option<u64> = None;
     while !stop.load(Ordering::Acquire) {
         let scheduled_ns = releases.next_ns();
         if let Some(c) = clock {
@@ -3927,6 +4083,7 @@ pub fn run_periodic_with_clock(
         let actual_ns = now_ns();
         let woke = now_inst();
         let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
+        stats.mark_release_started();
         let wake_skipped = releases.advance(actual_ns);
         let elapsed = woke.saturating_duration_since(last);
         last = woke;
@@ -3935,80 +4092,113 @@ pub fn run_periodic_with_clock(
             stats.late.fetch_add(1, Ordering::Release);
         }
         stats.steps.fetch_add(1, Ordering::Relaxed);
-        let _lateness_guard = crate::diagnostics::tick::WakeLatenessGuard::enter_periodic(
-            wake_lateness_ns,
-            stats.has_legacy_tick_ring(),
-        );
-        let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| {
-            c.set(Some((
-                actual_ns,
+        let stashed_sample = {
+            let _lateness_guard = crate::diagnostics::tick::WakeLatenessGuard::enter_periodic(
                 wake_lateness_ns,
-                wake_skipped,
-                releases.next_ns,
-                releases.period_ns,
-            )))
-        });
-        struct PeriodicUnwindGridGuard<'a> {
-            stats: &'a ExecutorStats,
-            clock: Option<&'a dyn ExecutorClock>,
-        }
-        impl Drop for PeriodicUnwindGridGuard<'_> {
-            fn drop(&mut self) {
-                if let Some((actual_ns, wake_lateness_ns, wake_skipped, next_ns, period_ns)) =
-                    ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
-                {
-                    if std::thread::panicking() {
-                        let pre_pub_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
-                        if let Some(mut sample) = crate::diagnostics::tick::take_periodic_sample() {
-                            sample.release_us = crate::diagnostics::tick::ns_to_us_u32(
-                                pre_pub_ns.saturating_sub(actual_ns),
-                            );
-                            if let Some(ring) = self.stats.legacy_tick_ring.get() {
-                                let _ = ring.record(&sample);
+                stats.has_legacy_tick_ring(),
+            );
+            let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| {
+                c.set(Some((
+                    actual_ns,
+                    wake_lateness_ns,
+                    wake_skipped,
+                    releases.next_ns,
+                    releases.period_ns,
+                )))
+            });
+            struct PeriodicUnwindGridGuard<'a> {
+                stats: &'a ExecutorStats,
+                clock: Option<&'a dyn ExecutorClock>,
+            }
+            impl Drop for PeriodicUnwindGridGuard<'_> {
+                fn drop(&mut self) {
+                    if let Some((actual_ns, wake_lateness_ns, wake_skipped, next_ns, period_ns)) =
+                        ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
+                    {
+                        if std::thread::panicking() {
+                            let sample = crate::diagnostics::tick::take_periodic_sample();
+                            let commit = || -> u32 {
+                                let end_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
+                                let release_ns = end_ns.saturating_sub(actual_ns);
+                                let exit_skips = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
+                                self.stats.commit_release_outcome(
+                                    wake_lateness_ns,
+                                    release_ns,
+                                    wake_skipped.saturating_add(exit_skips),
+                                    0,
+                                );
+                                crate::diagnostics::tick::ns_to_us_u32(release_ns)
+                            };
+                            let staged = match (sample, self.stats.legacy_tick_ring.get()) {
+                                (Some(sample), Some(ring)) => ring.record_staged(&sample, commit).is_some(),
+                                _ => false,
+                            };
+                            if !staged {
+                                let _ = commit();
                             }
+                            self.stats.clear_in_flight();
                         }
-                        let end_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
-                        let release_ns = end_ns.saturating_sub(actual_ns);
-                        let exit_skips = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
-                        self.stats.commit_release_outcome(
-                            wake_lateness_ns,
-                            release_ns,
-                            wake_skipped.saturating_add(exit_skips),
-                            0,
-                        );
                     }
                 }
             }
-        }
-        let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
-        step(elapsed.as_secs_f64());
-        let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take());
-        drop(_unwind_grid);
-        // Single legacy release-completion point: stamp full `release_us` and publish the prepared
-        // sample once into `LockFreeTickStats`, then measure `end_ns` (strictly after ring publication)
-        // and commit all monotonic counters and overrun skips in one coherent seqlock transaction.
-        if let Some(mut sample) = crate::diagnostics::tick::take_periodic_sample() {
-            let pre_pub_ns = now_ns();
-            sample.release_us = crate::diagnostics::tick::ns_to_us_u32(
-                pre_pub_ns.saturating_sub(actual_ns),
+            let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
+            step(elapsed.as_secs_f64());
+            let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take());
+            let sample = crate::diagnostics::tick::take_periodic_sample();
+            drop(_unwind_grid);
+            sample
+            // `_lateness_guard` drops here, strictly BEFORE final timing & ring publication.
+        };
+
+        // Single legacy release-completion point: stage sample payload into the lock-free ring
+        // first, then measure one authoritative `end_ns` for both rolling `release_us` and
+        // monotonic counters/skips inside `record_staged`.
+        let mut committed_release_ns: u64 = 0;
+        let mut committed_release_us: u32 = 0;
+        let mut commit_once = || -> u32 {
+            let end_ns = now_ns();
+            let final_ns = end_ns.saturating_sub(actual_ns);
+            let overrun_skipped = releases.advance_overrun(end_ns);
+            stats.commit_release_outcome(
+                wake_lateness_ns,
+                final_ns,
+                wake_skipped.saturating_add(overrun_skipped),
+                0,
             );
-            if let Some(ring) = stats.legacy_tick_ring.get() {
-                let _ = ring.record(&sample);
+            committed_release_ns = final_ns;
+            committed_release_us = crate::diagnostics::tick::ns_to_us_u32(final_ns);
+            committed_release_us
+        };
+        let recorded_seq = match (stashed_sample, stats.legacy_tick_ring.get()) {
+            (Some(sample), Some(ring)) => ring.record_staged(&sample, &mut commit_once),
+            _ => None,
+        };
+        if recorded_seq.is_none() {
+            let _ = commit_once();
+        }
+
+        // Explicit post-publication instrumentation tail check right before next `sleep_until`.
+        let post_stats_delay_ns = stats.post_stats_delay_once_ns.swap(0, Ordering::AcqRel);
+        if post_stats_delay_ns > 0 {
+            if let Some(c) = clock {
+                c.sleep(Duration::from_nanos(post_stats_delay_ns), stop);
+            } else {
+                thread::sleep(Duration::from_nanos(post_stats_delay_ns));
             }
         }
-        let end_ns = now_ns();
-        let final_release_ns = end_ns.saturating_sub(actual_ns);
-        let overrun_skipped = releases.advance_overrun(end_ns);
-        stats.commit_release_outcome(
-            wake_lateness_ns,
-            final_release_ns,
-            wake_skipped.saturating_add(overrun_skipped),
-            0,
-        );
-        last_release_end_ns = Some(end_ns);
-    }
-    if let Some(end_ns) = last_release_end_ns.take() {
-        stats.record_exit_skips(releases.missed_at_exit(end_ns));
+        let loop_end_ns = now_ns();
+        let tail_release_ns = loop_end_ns.saturating_sub(actual_ns);
+        if tail_release_ns > committed_release_ns || loop_end_ns >= releases.next_ns() {
+            let extra_skips = releases.advance_overrun(loop_end_ns);
+            stats.amend_last_release_tail(committed_release_ns, tail_release_ns, extra_skips);
+            let tail_us = crate::diagnostics::tick::ns_to_us_u32(tail_release_ns);
+            if tail_us > committed_release_us {
+                if let (Some(seq), Some(ring)) = (recorded_seq, stats.legacy_tick_ring.get()) {
+                    ring.amend_slot_release_us(seq, tail_us);
+                }
+            }
+        }
+        stats.clear_in_flight();
     }
 }
 
@@ -4035,38 +4225,43 @@ mod tests {
         let mut r = Releases { period_ns: 20, next_ns: 20 };
         assert_eq!(r.advance(20), 0); // next_ns = 40
         assert_eq!(r.advance_overrun(25), 0);
+        assert_eq!(r.next_ns(), 40);
         assert_eq!(r.missed_at_exit(25), 0);
 
-        // Case 2: 25ms release on 20ms grid (starts at 20, ends at 45) -> 0 intermediate, 1 at exit.
+        // Case 2: 25ms release on 20ms grid (starts at 20, ends at 45) -> 1 skip immediately,
+        // next_ns advances past end_ns to 60 so continuing OR exiting yields 1 (never 0, never 2).
         let mut r = Releases { period_ns: 20, next_ns: 20 };
         assert_eq!(r.advance(20), 0); // next_ns = 40
-        assert_eq!(r.advance_overrun(45), 0);
-        assert_eq!(r.next_ns(), 40);
-        assert_eq!(r.missed_at_exit(45), 1);
-        // Exact boundary end_ns == next_ns also counts 1 at exit.
-        assert_eq!(r.missed_at_exit(40), 1);
-        assert_eq!(r.missed_at_exit(39), 0);
+        assert_eq!(r.advance_overrun(45), 1);
+        assert_eq!(r.next_ns(), 60);
+        assert_eq!(r.missed_at_exit(45), 0);
+        assert_eq!(r.advance(60), 0); // next on-grid release at 60 adds 0
+        assert_eq!(r.next_ns(), 80);
 
-        // Case 3: 12ms release on 5ms grid (starts at 5, ends at 17):
-        // intermediate skip (1) committed immediately at release end, +1 at exit (= 2 total: 10, 15).
+        // Exact boundary end_ns == next_ns also counts 1 immediately.
+        let mut r = Releases { period_ns: 20, next_ns: 20 };
+        assert_eq!(r.advance(20), 0); // next_ns = 40
+        assert_eq!(r.advance_overrun(39), 0);
+        assert_eq!(r.advance_overrun(40), 1);
+        assert_eq!(r.next_ns(), 60);
+
+        // Case 3: 12ms release on 5ms grid (starts at 5, ends at 17): skips 10 & 15 (2 total).
         let mut r = Releases { period_ns: 5, next_ns: 5 };
         assert_eq!(r.advance(5), 0); // next_ns = 10
-        assert_eq!(r.advance_overrun(17), 1); // 10 left for catch-up? next_ns advances to 15 <= 17
-        assert_eq!(r.next_ns(), 15);
-        assert_eq!(r.missed_at_exit(17), 1); // total 1 + 1 = 2 (10 & 15 both missed on exit)
-        // If loop instead continues immediately at 17: advance(17) adds 0 (no double count!).
-        assert_eq!(r.advance(17), 0);
+        assert_eq!(r.advance_overrun(17), 2);
         assert_eq!(r.next_ns(), 20);
+        assert_eq!(r.missed_at_exit(17), 0);
+        assert_eq!(r.advance(20), 0);
+        assert_eq!(r.next_ns(), 25);
 
-        // Case 4: 45ms release on 10ms grid (starts at 30, ends at 75):
-        // intermediate skip (3: 50/60/70) committed at release end; continuing adds 0; exit adds 1 (= 4 total).
+        // Case 4: 45ms release on 10ms grid (starts at 30, ends at 75): skips 40, 50, 60, 70 (4 total).
         let mut r = Releases { period_ns: 10, next_ns: 30 };
         assert_eq!(r.advance(30), 0); // next_ns = 40
-        assert_eq!(r.advance_overrun(75), 3);
-        assert_eq!(r.next_ns(), 70);
-        assert_eq!(r.missed_at_exit(75), 1);
-        assert_eq!(r.advance(75), 0);
+        assert_eq!(r.advance_overrun(75), 4);
         assert_eq!(r.next_ns(), 80);
+        assert_eq!(r.missed_at_exit(75), 0);
+        assert_eq!(r.advance(80), 0);
+        assert_eq!(r.next_ns(), 90);
     }
 
     #[test]

@@ -69,10 +69,20 @@ PCT_MAX_REQUIRED_KEYS = (
 )
 
 
+RECOGNIZED_OWNER_MODES = ("legacy", "executor")
+
+
 def get_nonneg_int(d: dict[str, Any], key: str) -> int | None:
     v = d.get(key)
     if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
         return int(v)
+    return None
+
+
+def get_strict_bool(d: dict[str, Any], key: str) -> bool | None:
+    v = d.get(key)
+    if isinstance(v, bool):
+        return v
     return None
 
 
@@ -231,6 +241,7 @@ class LoadRun:
     summary: dict[str, Any]
     samples: list[LoadSample]
     failed_polls: list[dict[str, Any]] = field(default_factory=list)
+    has_summary: bool = False
 
 
 def load_input(path: Path) -> LoadRun:
@@ -275,6 +286,7 @@ def load_input(path: Path) -> LoadRun:
 
     meta = {}
     summary = {}
+    has_summary = False
     samples = []
     failed_polls = []
     idx = 0
@@ -290,6 +302,7 @@ def load_input(path: Path) -> LoadRun:
             meta = rec
         elif rtype == "summary":
             summary = rec
+            has_summary = True
         else:
             tick_err = rec.get("tick_error")
             poll_failed = bool(rec.get("poll_failed")) or (tick_err is not None and str(tick_err).strip() != "")
@@ -327,7 +340,7 @@ def load_input(path: Path) -> LoadRun:
             idx += 1
     if not samples and not failed_polls:
         raise ValueError(f"No tick samples found in {path}")
-    return LoadRun("jsonl", meta, summary, samples, failed_polls=failed_polls)
+    return LoadRun("jsonl", meta, summary, samples, failed_polls=failed_polls, has_summary=has_summary)
 
 
 # ---- devstat.txt parsing ----------------------------------------------------
@@ -840,6 +853,7 @@ def analyze(
 
     # ---- Monotonic counter series ----
     since_boot_series = analyze_counter_series(samples, "since_boot_ticks")
+    releases_started_series = analyze_counter_series(samples, "releases_started")
     releases_total_series = analyze_counter_series(samples, "releases_total")
     release_max_ever_series = analyze_counter_series(samples, "release_us_max_ever")
     rel_over_10ms = analyze_counter_series(samples, "releases_over_10ms")
@@ -852,6 +866,11 @@ def analyze(
     wake_over_1ms = analyze_counter_series(samples, "wake_lateness_over_1ms")
     wake_over_5ms = analyze_counter_series(samples, "wake_lateness_over_5ms")
     wake_over_10ms = analyze_counter_series(samples, "wake_lateness_over_10ms")
+    alloc_ops_series = analyze_counter_series(samples, "control_thread_alloc_ops")
+
+    in_flight_raw = [get_nonneg_int(s.tick, "in_flight_release_us") for s in samples]
+    in_flight_miss = sum(1 for v in in_flight_raw if v is None)
+    in_flight_max_us = max_int_or_none([v for v in in_flight_raw if v is not None])
 
     first_ticks = since_boot_series.start
     last_ticks = since_boot_series.end
@@ -903,6 +922,7 @@ def analyze(
     instance_id_latest = distinct_instance_ids[-1] if distinct_instance_ids else None
 
     owner_modes = [get_nonempty_str(s.tick, "owner_mode") for s in samples]
+    owner_invalid_count = sum(1 for m in owner_modes if m not in RECOGNIZED_OWNER_MODES)
     distinct_owner_modes = sorted({m for m in owner_modes if m is not None})
     owner_mode_changed = len(distinct_owner_modes) > 1
     owner_mode: str | None = None
@@ -911,10 +931,13 @@ def analyze(
             owner_mode = m
             break
 
-    snapshot_lapped_any = any(s.tick.get("stats_snapshot_lapped") is True for s in samples)
-    writer_drops_max = max_int_or_none(
-        [v for s in samples if (v := get_nonneg_int(s.tick, "stats_writer_drops")) is not None]
-    )
+    lapped_flags = [get_strict_bool(s.tick, "stats_snapshot_lapped") for s in samples]
+    lapped_missing_count = sum(1 for v in lapped_flags if v is None)
+    snapshot_lapped_any = any(v is True for v in lapped_flags)
+
+    writer_drop_vals = [get_nonneg_int(s.tick, "stats_writer_drops") for s in samples]
+    writer_drops_missing_count = sum(1 for v in writer_drop_vals if v is None)
+    writer_drops_max = max_int_or_none([v for v in writer_drop_vals if v is not None])
 
     latest_since_marker: dict[str, Any] | None = None
     for s in reversed(samples):
@@ -930,6 +953,13 @@ def analyze(
         invalid_reasons.append(f"failed poll(s): {len(load_run.failed_polls)} poll failure(s) (first: {first_err})")
     if n_samples < 2:
         invalid_reasons.append(f"fewer than 2 tick samples ({n_samples}); cannot compute run delta")
+    if load_run.source_format == "jsonl":
+        if not load_run.has_summary:
+            invalid_reasons.append("incomplete capture: missing terminal summary record")
+        if samples[-1].phase != "final":
+            invalid_reasons.append(
+                f"incomplete capture: last sample phase is '{samples[-1].phase}' (expected 'final')"
+            )
     if instance_changed:
         invalid_reasons.append(f"daemon restart: instance_id changed ({' -> '.join(distinct_instance_ids)})")
     if owner_mode_changed:
@@ -941,6 +971,7 @@ def analyze(
 
     # Check every monotonic counter for decreases (daemon restart / counter reset).
     monotonic_checks: list[tuple[str, CounterSeries]] = [
+        ("releases_started", releases_started_series),
         ("releases_total", releases_total_series),
         ("since_boot_ticks", since_boot_series),
         ("release_us_max_ever", release_max_ever_series),
@@ -954,10 +985,30 @@ def analyze(
         ("wake_lateness_over_5ms", wake_over_5ms),
         ("wake_lateness_over_10ms", wake_over_10ms),
         ("late_count", late_series),
+        ("control_thread_alloc_ops", alloc_ops_series),
     ]
     for name, series in monotonic_checks:
         if series.reset_detected:
             invalid_reasons.append(f"counter decreased mid-run (restart/reset): {name}")
+
+    # Release-start watermark consistency (all samples) & terminal completion coverage.
+    terminal_in_flight_incomplete = False
+    for s in samples:
+        s_started = get_nonneg_int(s.tick, "releases_started")
+        s_total = get_nonneg_int(s.tick, "releases_total")
+        if s_started is not None and s_total is not None and s_total > s_started:
+            terminal_in_flight_incomplete = True
+            invalid_reasons.append(
+                f"inconsistent release counters on sample {s.index}: releases_total ({s_total}) > releases_started ({s_started})"
+            )
+            break
+    last_started = get_nonneg_int(samples[-1].tick, "releases_started")
+    last_total = get_nonneg_int(samples[-1].tick, "releases_total")
+    if last_started is not None and last_total is not None and last_started > last_total:
+        terminal_in_flight_incomplete = True
+        invalid_reasons.append(
+            f"uncompleted in-flight release at final capture (releases_started={last_started} > releases_total={last_total})"
+        )
 
     # Require positive release progress between first and last sample.
     if n_samples >= 2:
@@ -972,6 +1023,7 @@ def analyze(
     all_monotonic_present = all(
         s.present_all
         for s in (
+            releases_started_series,
             releases_total_series,
             release_max_ever_series,
             rel_over_10ms,
@@ -987,6 +1039,10 @@ def analyze(
         t1 = get_nonneg_int(samples[i].tick, "since_boot_ticks")
         if t0 is not None and t1 is not None and t1 >= t0:
             max_adjacent_gap_ticks = max(max_adjacent_gap_ticks, float(t1 - t0))
+        r0 = get_nonneg_int(samples[i - 1].tick, "releases_total")
+        r1 = get_nonneg_int(samples[i].tick, "releases_total")
+        if r0 is not None and r1 is not None and r1 >= r0:
+            max_adjacent_gap_ticks = max(max_adjacent_gap_ticks, float(r1 - r0))
         dt_s: float | None = None
         if samples[i - 1].elapsed_s is not None and samples[i].elapsed_s is not None:
             dt_s = samples[i].elapsed_s - samples[i - 1].elapsed_s
@@ -1002,11 +1058,20 @@ def analyze(
             "with missing monotonic counters"
         )
 
-    # Check every required field (strictly validating nested percentile keys).
+    # Check every required field (strictly validating nested percentile keys and coherence metadata).
     missing_required_fields: list[str] = []
     if instance_missing_count > 0:
         missing_required_fields.append(f"instance_id ({instance_missing_count}/{n_samples})")
+    if owner_invalid_count > 0:
+        missing_required_fields.append(f"owner_mode ({owner_invalid_count}/{n_samples})")
+    if lapped_missing_count > 0:
+        missing_required_fields.append(f"stats_snapshot_lapped ({lapped_missing_count}/{n_samples})")
+    if writer_drops_missing_count > 0:
+        missing_required_fields.append(f"stats_writer_drops ({writer_drops_missing_count}/{n_samples})")
+    if in_flight_miss > 0:
+        missing_required_fields.append(f"in_flight_release_us ({in_flight_miss}/{n_samples})")
     for key, series in (
+        ("releases_started", releases_started_series),
         ("releases_total", releases_total_series),
         ("release_us_max_ever", release_max_ever_series),
         ("releases_over_10ms", rel_over_10ms),
@@ -1039,6 +1104,28 @@ def analyze(
     if missing_required_fields:
         invalid_reasons.append("missing/malformed required field(s): " + ", ".join(missing_required_fields))
 
+    # Detect contradictory release telemetry (e.g. >= 20 ms peak while releases_over_20ms == 0).
+    contradiction_seen = False
+    for s in samples:
+        c20 = get_nonneg_int(s.tick, "releases_over_20ms")
+        rmax = get_pct(s.tick, "release_us", "max")
+        rever = get_nonneg_int(s.tick, "release_us_max_ever")
+        if c20 == 0 and (
+            (rmax is not None and rmax >= RELEASE_BUDGET_US)
+            or (rever is not None and rever >= RELEASE_BUDGET_US)
+        ):
+            if not contradiction_seen:
+                invalid_reasons.append(
+                    "contradictory telemetry: release_us >= 20 ms observed while releases_over_20ms == 0"
+                )
+                contradiction_seen = True
+        if rever is not None and rmax is not None and rever < rmax:
+            if not contradiction_seen:
+                invalid_reasons.append(
+                    f"contradictory telemetry: release_us_max_ever ({rever}) < release_us.max ({rmax})"
+                )
+                contradiction_seen = True
+
     # Optional external telemetry fields (never default missing to 0).
     enq_vals: list[int] = []
     for s in samples:
@@ -1057,17 +1144,18 @@ def analyze(
     has_lock_attempts = len(lock_attempt_vals) == n_samples
     lock_attempts_max = max_int_or_none(lock_attempt_vals)
 
-    # Lock holders observed on max_release / max_tick / max_lock.
+    # Lock holders & allocation counts observed on max_release / max_tick / max_lock (never default missing to 0).
     breakdowns = collect_unique_breakdowns(samples)
     lock_wait_holders = [
         bd["waited_for"]
         for _, _, _, bd in breakdowns
         if isinstance(bd.get("waited_for"), dict)
     ]
-    alloc_calls_max = max(
-        (get_nonneg_int(bd, "lock_alloc_calls") or 0 for _, _, _, bd in breakdowns),
-        default=0,
-    )
+    bd_alloc_vals = [
+        v for _, _, _, bd in breakdowns if (v := get_nonneg_int(bd, "lock_alloc_calls")) is not None
+    ]
+    bd_alloc_malformed = len(breakdowns) - len(bd_alloc_vals)
+    alloc_calls_max = max_int_or_none(bd_alloc_vals)
 
     # RX age observed via load.py polling / WS.
     rx_age_max_ms = max_or_none(
@@ -1104,10 +1192,50 @@ def analyze(
             "max_ms": us_to_ms(max_or_none(maxs)),
         }
 
-    # Wake lateness (real Q1 field when present; legacy period_us proxy otherwise) & MIT budget.
-    if has_wake_lateness and wake_lateness_max_us is not None:
-        wake_extra_ms: float | None = wake_lateness_max_us / 1000.0
-        wake_extra_label = "wake lateness"
+    # Same-instance high-water-mark increases prove an in-run peak even after 1000-tick rollover.
+    in_run_release_ever_us: int | None = None
+    in_run_wake_ever_us: int | None = None
+    prev_inst_hwm: str | None = None
+    prev_rel_ever: int | None = None
+    prev_wake_ever: int | None = None
+    for s in samples:
+        cur_inst = get_nonempty_str(s.tick, "instance_id")
+        same_inst = (prev_inst_hwm is None) or (cur_inst is None) or (cur_inst == prev_inst_hwm)
+        cur_rel_ever = get_nonneg_int(s.tick, "release_us_max_ever")
+        cur_wake_ever = get_nonneg_int(s.tick, "wake_late_max_ever")
+        if same_inst and prev_rel_ever is not None and cur_rel_ever is not None and cur_rel_ever > prev_rel_ever:
+            in_run_release_ever_us = max(in_run_release_ever_us or 0, cur_rel_ever)
+        if same_inst and prev_wake_ever is not None and cur_wake_ever is not None and cur_wake_ever > prev_wake_ever:
+            in_run_wake_ever_us = max(in_run_wake_ever_us or 0, cur_wake_ever)
+        if cur_rel_ever is not None:
+            prev_rel_ever = cur_rel_ever
+        if cur_wake_ever is not None:
+            prev_wake_ever = cur_wake_ever
+        if cur_inst is not None:
+            prev_inst_hwm = cur_inst
+
+    marker_wake_max_us: int | None = None
+    if isinstance(latest_since_marker, dict) and latest_since_marker.get("status") == "active":
+        marker_wake_max_us = get_nonneg_int(latest_since_marker, "wake_late_max")
+
+    effective_wake_max_us = max_int_or_none(
+        [v for v in (wake_lateness_max_us, in_run_wake_ever_us, marker_wake_max_us) if v is not None]
+    )
+    wake_rollover_masked = (
+        max_adjacent_gap_ticks > TICK_WINDOW_CAPACITY
+        and wake_late_max_ever_series.start is not None
+        and (effective_wake_max_us is None or wake_late_max_ever_series.start > effective_wake_max_us)
+        and marker_wake_max_us is None
+    )
+
+    # Wake lateness (real Q1 field + in-run monotonic HWM/marker peak; legacy period_us proxy otherwise) & MIT budget.
+    if effective_wake_max_us is not None:
+        wake_extra_ms: float | None = effective_wake_max_us / 1000.0
+        wake_extra_label = (
+            "wake lateness (in-run HWM)"
+            if (in_run_wake_ever_us is not None and (wake_lateness_max_us is None or in_run_wake_ever_us > wake_lateness_max_us))
+            else "wake lateness"
+        )
     elif period_max_us is not None:
         wake_extra_ms = max(0.0, (period_max_us - nom_period_us) / 1000.0)
         wake_extra_label = "sched overrun proxy"
@@ -1126,10 +1254,11 @@ def analyze(
         / 1000.0
         for _, _, _, bd in breakdowns
     ]
+    fallback_rel_us = max_int_or_none([v for v in (release_us_max_us, in_run_release_ever_us) if v is not None])
     start_to_tx_ms: float | None = (
         max(bd_start_to_tx_vals)
         if bd_start_to_tx_vals
-        else (us_to_ms(release_us_max_us) if release_us_max_us is not None else us_to_ms(tick_max_us))
+        else (us_to_ms(fallback_rel_us) if fallback_rel_us is not None else us_to_ms(tick_max_us))
     )
     enq_ms = (enqueue_to_wire_max_us / 1000.0) if enqueue_to_wire_max_us is not None else 0.0
     if wake_extra_ms is not None and start_to_tx_ms is not None:
@@ -1151,18 +1280,21 @@ def analyze(
         faults_seen.append(str(load_run.summary["fault"]))
 
     # ---- Gate Evaluation ----
-    # 1. Release latency (< 20 ms): gated strictly on `release_us` + monotonic `releases_over_20ms` delta.
-    #    Scoped to the run so pre-run spikes sitting in samples[0]'s window do not trigger false FAIL
-    #    when `releases_over_20ms` delta == 0, while in-run spikes that rolled past 1000 ticks DO FAIL.
+    # 1. Release latency (< 20 ms): gated on `release_us`, monotonic `releases_over_20ms` delta,
+    #    in-run `release_us_max_ever` increases, attributable window `release_us.max`, and live
+    #    `in_flight_release_us` (always checked even when `releases_over_20ms` is present).
     release_over_20_delta = rel_over_20ms.verified_in_run_delta
     release_over_15_delta = rel_over_15ms.verified_in_run_delta
     release_over_10_delta = rel_over_10ms.verified_in_run_delta
+    in_flight_breach = in_flight_max_us is not None and in_flight_max_us >= RELEASE_BUDGET_US
     release_in_run_breach = False
     if release_over_20_delta is not None and release_over_20_delta > 0:
         release_in_run_breach = True
-    elif not rel_over_20ms.present_any and has_release_us and n_samples >= 2:
-        # Fallback when `releases_over_20ms` is absent: only flag hard FAIL if an in-run sample
-        # provably introduced a >= 20 ms `release_us` peak.
+    if in_flight_breach:
+        release_in_run_breach = True
+    if in_run_release_ever_us is not None and in_run_release_ever_us >= RELEASE_BUDGET_US:
+        release_in_run_breach = True
+    if has_release_us and n_samples >= 2:
         first_rel = get_pct(samples[0].tick, "release_us", "max")
         first_t = get_nonneg_int(samples[0].tick, "since_boot_ticks")
         first_inst = get_nonempty_str(samples[0].tick, "instance_id")
@@ -1197,15 +1329,25 @@ def analyze(
         and rel_over_15ms.present_all
         and rel_over_10ms.present_all
         and release_max_ever_series.present_all
+        and releases_started_series.present_all
         and releases_total_series.present_all
+        and in_flight_miss == 0
         and not rel_over_20ms.reset_detected
+        and not releases_started_series.reset_detected
         and not releases_total_series.reset_detected
         and not release_max_ever_series.reset_detected
         and not instance_changed
+        and instance_missing_count == 0
         and not owner_mode_changed
+        and owner_invalid_count == 0
         and not load_run.failed_polls
+        and lapped_missing_count == 0
         and not snapshot_lapped_any
-        and (writer_drops_max is None or writer_drops_max == 0)
+        and writer_drops_missing_count == 0
+        and (writer_drops_max is not None and writer_drops_max == 0)
+        and not terminal_in_flight_incomplete
+        and not contradiction_seen
+        and (load_run.source_format != "jsonl" or (load_run.has_summary and samples[-1].phase == "final"))
         and n_samples >= 2
         and release_over_20_delta is not None
         and (releases_total_series.verified_in_run_delta or 0) > 0
@@ -1225,6 +1367,7 @@ def analyze(
             f"`release_us_max_ever`={fmt_ms(us_to_ms(release_max_ever_series.end))} ms, "
             f"`releases_over_20ms` Δ={fmt_int(release_over_20_delta)} "
             f"(`>=15ms` Δ={fmt_int(release_over_15_delta)}, `>=10ms` Δ={fmt_int(release_over_10_delta)})"
+            + (f", `in_flight_release_us` max={fmt_ms(us_to_ms(in_flight_max_us))} ms" if in_flight_breach else "")
         )
     else:
         release_detail = (
@@ -1239,7 +1382,13 @@ def analyze(
             skipped_series.present_all
             and not skipped_series.reset_detected
             and not instance_changed
+            and instance_missing_count == 0
             and not owner_mode_changed
+            and owner_invalid_count == 0
+            and lapped_missing_count == 0
+            and not snapshot_lapped_any
+            and writer_drops_missing_count == 0
+            and (writer_drops_max is not None and writer_drops_max == 0)
             and not load_run.failed_polls
             and n_samples >= 2
             and skipped_delta is not None
@@ -1327,17 +1476,51 @@ def analyze(
     alloc_timing_confirmed = False
     if devstat is not None:
         alloc_timing_confirmed = any("ARMD_ALLOC_TIMING=1" in l for l in devstat.armd_version)
-    if alloc_calls_max > 0:
+    alloc_ops_delta = alloc_ops_series.verified_in_run_delta
+    has_authoritative_alloc = (
+        alloc_ops_series.present_all
+        and not alloc_ops_series.reset_detected
+        and alloc_ops_delta is not None
+        and alloc_timing_confirmed
+    )
+    alloc_breach = (
+        (alloc_ops_delta is not None and alloc_ops_delta > 0)
+        or (alloc_calls_max is not None and alloc_calls_max > 0)
+    )
+    if alloc_breach:
         alloc_pass = False
+        alloc_evidence_complete = True
         alloc_status = "FAIL"
-        alloc_detail = f"lock_alloc_calls max={alloc_calls_max} on max_release/max_tick/max_lock"
-    else:
+        alloc_detail = (
+            f"control_thread_alloc_ops Δ={fmt_int(alloc_ops_delta)}, "
+            f"lock_alloc_calls max={fmt_int(alloc_calls_max)} on max_release/max_tick/max_lock"
+        )
+    elif has_authoritative_alloc:
         alloc_pass = True
+        alloc_evidence_complete = True
+        alloc_status = "PASS"
+        alloc_detail = (
+            f"control_thread_alloc_ops Δ=0 (ARMD_ALLOC_TIMING=1 confirmed=True"
+            + (f", breakdown lock_alloc_calls max={alloc_calls_max}" if alloc_calls_max is not None else "")
+            + ")"
+        )
+    elif bd_alloc_vals and bd_alloc_malformed == 0:
+        alloc_pass = True
+        alloc_evidence_complete = False
         alloc_status = "PASS (proxy)"
         alloc_detail = (
-            f"lock_alloc_calls=0 on max_release/max_tick/max_lock "
-            f"(gap: only reported on breakdowns and zero unless ARMD_ALLOC_TIMING=1; "
+            f"lock_alloc_calls=0 on peak breakdown(s) only "
+            f"(gap: run-scoped control_thread_alloc_ops not exposed; "
             f"ARMD_ALLOC_TIMING=1 confirmed={alloc_timing_confirmed})"
+        )
+    else:
+        alloc_pass = True
+        alloc_evidence_complete = False
+        alloc_status = "INCOMPLETE (missing/malformed allocation evidence)"
+        alloc_detail = (
+            f"no authoritative run-scoped allocation counter and "
+            f"{'no breakdowns present' if not breakdowns else f'{bd_alloc_malformed}/{len(breakdowns)} malformed lock_alloc_calls'} "
+            f"(ARMD_ALLOC_TIMING=1 confirmed={alloc_timing_confirmed})"
         )
 
     mit_observable_pass = True if mit_total_ms is None else (mit_total_ms < MIT_WATCHDOG_MS)
@@ -1354,6 +1537,10 @@ def analyze(
         mit_gaps.append("wake_lateness_us not exposed (using period proxy)")
     elif wake_lateness_partial:
         mit_gaps.append("wake_lateness_us missing on some samples")
+    if wake_rollover_masked:
+        mit_gaps.append(
+            "pre-run wake_late_max_ever masks in-run wake peak across >1000-tick sample gap without active since_marker"
+        )
     if not has_enqueue_to_wire:
         mit_gaps.append("enqueue-to-wire CAN latency not exposed")
     if not mit_observable_pass:
@@ -1389,7 +1576,8 @@ def analyze(
         diag_samples_lost
         or (not has_lock_attempts)
         or (not has_enqueue_to_wire)
-        or (not alloc_timing_confirmed)
+        or (not alloc_evidence_complete)
+        or bool(mit_gaps)
     )
     if hard_fail:
         overall_verdict = "FAIL"

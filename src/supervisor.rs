@@ -5984,6 +5984,12 @@ impl ArmSupervisor {
         obs
     }
 
+    /// Exposes the lock-free tick ring for deterministic paused-reader contention tests.
+    #[doc(hidden)]
+    pub fn tick_stats_ring_for_test(&self) -> &Arc<crate::diagnostics::tick::LockFreeTickStats> {
+        &self.tick_stats
+    }
+
     /// The raw samples of the last ticks, oldest first (tests, diagnostics).
     pub fn tick_samples(&self) -> Vec<crate::diagnostics::tick::TickSample> {
         self.drain_diag();
@@ -6053,7 +6059,9 @@ impl ArmSupervisor {
             if !mono.coherent {
                 snap.stats_snapshot_lapped = true;
             }
+            snap.releases_started = mono.releases_started;
             snap.releases_total = mono.releases_total;
+            snap.in_flight_release_us = mono.in_flight_release_us;
             snap.release_us_max_ever = mono.release_us_max_ever;
             snap.releases_over_10ms = mono.releases_over_10ms;
             snap.releases_over_15ms = mono.releases_over_15ms;

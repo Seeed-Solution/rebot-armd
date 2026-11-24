@@ -499,7 +499,11 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let mut q0 = base_tick_json(26_000, 1_500);
     q0["instance_id"] = serde_json::json!("armd-test-1");
     q0["owner_mode"] = serde_json::json!("executor");
+    q0["stats_snapshot_lapped"] = serde_json::json!(false);
+    q0["stats_writer_drops"] = serde_json::json!(0);
+    q0["in_flight_release_us"] = serde_json::json!(0);
     q0["release_us"] = serde_json::json!({ "p50": 600, "p99": 1000, "max": 1600 });
+    q0["releases_started"] = serde_json::json!(100);
     q0["releases_total"] = serde_json::json!(100);
     q0["release_us_max_ever"] = serde_json::json!(1600);
     q0["releases_over_10ms"] = serde_json::json!(0);
@@ -515,15 +519,17 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
 
     let mut q1 = q0.clone();
     q1["since_boot_ticks"] = serde_json::json!(300);
+    q1["releases_started"] = serde_json::json!(300);
     q1["releases_total"] = serde_json::json!(300);
     q1["wake_lateness_us"] = serde_json::json!({ "p50": 150, "p99": 500, "max": 800 });
     q1["wake_late_max_ever"] = serde_json::json!(800);
 
     let q1_lines = format!(
-        "{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n",
         serde_json::json!({ "type": "meta", "run_id": "q1-clean" }),
         serde_json::json!({ "type": "sample", "phase": "baseline", "tick": q0 }),
-        serde_json::json!({ "type": "sample", "phase": "full_load", "tick": q1 }),
+        serde_json::json!({ "type": "sample", "phase": "final", "tick": q1 }),
+        serde_json::json!({ "type": "summary", "run_id": "q1-clean", "stop_reason": "completed", "fault": null }),
     );
     std::fs::write(&q1_path, q1_lines).unwrap();
     let q1_rep = run_analyze(&q1_path, None);
@@ -547,16 +553,19 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let drop_path = dir.path().join("q1_drop.jsonl");
     let mut d0 = q0.clone();
     d0["control_thread_lock_attempts"] = serde_json::json!(0);
+    d0["control_thread_alloc_ops"] = serde_json::json!(0);
     d0["enqueue_to_wire_us"] = serde_json::json!({ "p50": 100, "p99": 200, "max": 250 });
     let mut d1 = d0.clone();
     d1["since_boot_ticks"] = serde_json::json!(300);
+    d1["releases_started"] = serde_json::json!(300);
     d1["releases_total"] = serde_json::json!(300);
     d1["diag_dropped"] = serde_json::json!(5);
     let drop_lines = format!(
-        "{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n",
         serde_json::json!({ "type": "meta", "run_id": "q1-drop" }),
         serde_json::json!({ "type": "sample", "phase": "baseline", "tick": d0 }),
-        serde_json::json!({ "type": "sample", "phase": "full_load", "tick": d1 }),
+        serde_json::json!({ "type": "sample", "phase": "final", "tick": d1 }),
+        serde_json::json!({ "type": "summary", "run_id": "q1-drop", "stop_reason": "completed", "fault": null }),
     );
     std::fs::write(&drop_path, drop_lines).unwrap();
     let drop_rep = run_analyze(&drop_path, Some(&devstat_path));
@@ -575,10 +584,11 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     b1["tick_us"]["max"] = serde_json::json!(25_000);
     b1["max_tick"]["tick_us"] = serde_json::json!(25_000);
     let breach_lines = format!(
-        "{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n",
         serde_json::json!({ "type": "meta", "run_id": "q1-drop-breach" }),
         serde_json::json!({ "type": "sample", "phase": "baseline", "tick": d0 }),
-        serde_json::json!({ "type": "sample", "phase": "full_load", "tick": b1 }),
+        serde_json::json!({ "type": "sample", "phase": "final", "tick": b1 }),
+        serde_json::json!({ "type": "summary", "run_id": "q1-drop-breach", "stop_reason": "completed", "fault": null }),
     );
     std::fs::write(&breach_path, breach_lines).unwrap();
     let breach_rep = run_analyze(&breach_path, Some(&devstat_path));
@@ -590,14 +600,16 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     m0.as_object_mut().unwrap().remove("diag_dropped");
     let mut m1 = m0.clone();
     m1["since_boot_ticks"] = serde_json::json!(300);
+    m1["releases_started"] = serde_json::json!(300);
     m1["releases_total"] = serde_json::json!(300);
     std::fs::write(
         &missing_dd_path,
         format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-missing-dd" }),
             serde_json::json!({ "type": "sample", "phase": "baseline", "tick": m0 }),
-            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": m1 }),
+            serde_json::json!({ "type": "sample", "phase": "final", "tick": m1 }),
+            serde_json::json!({ "type": "summary", "run_id": "q1-missing-dd", "stop_reason": "completed", "fault": null }),
         ),
     )
     .unwrap();
@@ -611,20 +623,23 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     r0["diag_dropped"] = serde_json::json!(0);
     let mut r1 = d0.clone();
     r1["since_boot_ticks"] = serde_json::json!(200);
+    r1["releases_started"] = serde_json::json!(200);
     r1["releases_total"] = serde_json::json!(200);
     r1["diag_dropped"] = serde_json::json!(7);
     let mut r2 = d0.clone();
     r2["since_boot_ticks"] = serde_json::json!(50);
+    r2["releases_started"] = serde_json::json!(50);
     r2["releases_total"] = serde_json::json!(50);
     r2["diag_dropped"] = serde_json::json!(0);
     std::fs::write(
         &reset_dd_path,
         format!(
-            "{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-reset-dd" }),
             serde_json::json!({ "type": "sample", "phase": "baseline", "tick": r0 }),
             serde_json::json!({ "type": "sample", "phase": "full_load", "tick": r1 }),
-            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": r2 }),
+            serde_json::json!({ "type": "sample", "phase": "final", "tick": r2 }),
+            serde_json::json!({ "type": "summary", "run_id": "q1-reset-dd", "stop_reason": "completed", "fault": null }),
         ),
     )
     .unwrap();
@@ -638,20 +653,23 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     s0["skipped_releases"] = serde_json::json!(0);
     let mut s1 = d0.clone();
     s1["since_boot_ticks"] = serde_json::json!(200);
+    s1["releases_started"] = serde_json::json!(200);
     s1["releases_total"] = serde_json::json!(200);
     s1["skipped_releases"] = serde_json::json!(7);
     let mut s2 = d0.clone();
     s2["since_boot_ticks"] = serde_json::json!(50);
+    s2["releases_started"] = serde_json::json!(50);
     s2["releases_total"] = serde_json::json!(50);
     s2["skipped_releases"] = serde_json::json!(0);
     std::fs::write(
         &reset_skip_path,
         format!(
-            "{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-reset-skip" }),
             serde_json::json!({ "type": "sample", "phase": "baseline", "tick": s0 }),
             serde_json::json!({ "type": "sample", "phase": "full_load", "tick": s1 }),
-            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": s2 }),
+            serde_json::json!({ "type": "sample", "phase": "final", "tick": s2 }),
+            serde_json::json!({ "type": "summary", "run_id": "q1-reset-skip", "stop_reason": "completed", "fault": null }),
         ),
     )
     .unwrap();
@@ -663,19 +681,22 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let partial_dd_path = dir.path().join("q1_partial_dd.jsonl");
     let mut p1 = d0.clone();
     p1["since_boot_ticks"] = serde_json::json!(200);
+    p1["releases_started"] = serde_json::json!(200);
     p1["releases_total"] = serde_json::json!(200);
     p1.as_object_mut().unwrap().remove("diag_dropped");
     let mut p2 = d0.clone();
     p2["since_boot_ticks"] = serde_json::json!(300);
+    p2["releases_started"] = serde_json::json!(300);
     p2["releases_total"] = serde_json::json!(300);
     std::fs::write(
         &partial_dd_path,
         format!(
-            "{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-partial-dd" }),
             serde_json::json!({ "type": "sample", "phase": "baseline", "tick": d0 }),
             serde_json::json!({ "type": "sample", "phase": "full_load", "tick": p1 }),
-            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": p2 }),
+            serde_json::json!({ "type": "sample", "phase": "final", "tick": p2 }),
+            serde_json::json!({ "type": "summary", "run_id": "q1-partial-dd", "stop_reason": "completed", "fault": null }),
         ),
     )
     .unwrap();
@@ -690,20 +711,23 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     f0["skipped_releases"] = serde_json::json!(0);
     let mut c1 = q0.clone();
     c1["since_boot_ticks"] = serde_json::json!(200);
+    c1["releases_started"] = serde_json::json!(200);
     c1["releases_total"] = serde_json::json!(200);
     c1["skipped_releases"] = serde_json::json!(2);
     let mut f2 = q0.clone();
     f2["since_boot_ticks"] = serde_json::json!(300);
+    f2["releases_started"] = serde_json::json!(300);
     f2["releases_total"] = serde_json::json!(300);
     f2["skipped_releases"] = serde_json::json!(2);
     std::fs::write(
         &recur_path,
         format!(
-            "{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({ "type": "meta", "run_id": "q1-recur" }),
             serde_json::json!({ "type": "sample", "phase": "full_load", "tick": f0 }),
             serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": c1 }),
             serde_json::json!({ "type": "sample", "phase": "full_load", "tick": f2 }),
+            serde_json::json!({ "type": "summary", "run_id": "q1-recur", "stop_reason": "completed", "fault": null }),
         ),
     )
     .unwrap();
@@ -1252,6 +1276,27 @@ async fn shutdown_overrun_skips_clean_exit_and_panic_accounting_both_owners() {
         assert!(snap.stats_snapshot_lapped);
     }
 
+    // (d2) Executor: clean release followed by late stop wake past next_ns -> 0 false-positive skips!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        clock.run_schedule(&[0]);
+        clock.advance_ns(30_000_000);
+        handle.stop_and_join();
+        assert_eq!(handle.stats().skipped_releases.load(Ordering::Acquire), 0);
+        assert_eq!(handle.stats().releases_total.load(Ordering::Acquire), 1);
+    }
+
     // (e) Executor: first-release panic with 25 ms overrun accounts skips & duration before StopExecutor exit.
     {
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
@@ -1284,10 +1329,129 @@ async fn shutdown_overrun_skips_clean_exit_and_panic_accounting_both_owners() {
         assert_eq!(handle.stats().releases_total.load(Ordering::Acquire), 1);
         handle.stop_and_join();
     }
+
+    // (f) Mark requested DURING a 25 ms final release (20 ms period), then stop (BOTH owners):
+    // final overrun skip must be attributed to the pre-marker release, NEVER to the 0-release marker!
+    // Plus (g) stop-vs-mark overlap exposes terminal `"inactive"` instead of hanging `"pending"`.
+    {
+        // Legacy owner:
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+                clock_t.advance_ns(25_000_000);
+                let _ = entered_tx.send(());
+                let _ = resume_rx.recv();
+            });
+        });
+        {
+            let mut s = clock.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.cv.notify_all();
+        }
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Request marker WHILE this final 25 ms release is in flight, then arm post-stats tail too.
+        let marker_id = sup.mark_tick_baseline().unwrap();
+        assert_eq!(marker_id, 1);
+        loop_stats.post_stats_delay_once_ns.store(2_000_000, Ordering::Release);
+        resume_tx.send(()).unwrap();
+        // Wait for loop to park after release #1, then stop cleanly.
+        {
+            let mut s = clock.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while s.waiting_for_ns.is_none() && Instant::now() < deadline {
+                let (next, _) = clock.cv.wait_timeout(s, Duration::from_millis(20)).unwrap();
+                s = next;
+            }
+            assert!(s.waiting_for_ns.is_some());
+        }
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+
+        let snap = sup.tick_stats();
+        assert_eq!(snap.releases_total, 1);
+        assert_eq!(snap.skipped_releases, 1);
+        assert_eq!(snap.releases_over_20ms, 1);
+        let sm = snap.since_marker.expect("active marker");
+        assert_eq!(sm.status, "active");
+        assert_eq!(sm.releases_total_delta, Some(0));
+        assert_eq!(sm.skipped_releases_delta, Some(0));
+        assert_eq!(sm.releases_over_20ms_delta, Some(0));
+        assert_eq!(sm.release_us_max, Some(0));
+
+        // Stop-vs-mark overlap: a request published right as loop exits exposes terminal `"inactive"`.
+        let pending_after_stop = loop_stats.request_marker();
+        let snap_inactive = sup.tick_stats();
+        let sm_inactive = snap_inactive.since_marker.expect("inactive marker");
+        assert_eq!(sm_inactive.marker_id, pending_after_stop);
+        assert_eq!(sm_inactive.status, "inactive");
+    }
+
+    {
+        // Executor owner: request marker before/during a 25 ms final release, then stop.
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    post_publish_delay_once: Some(Arc::new(Mutex::new(Some(Duration::from_millis(25))))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Wait until executor is parked before release #1, then issue mark + run 1 overrunning release + stop.
+        {
+            let mut s = clock.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while s.waiting_for_ns.is_none() && Instant::now() < deadline {
+                let (next, _) = clock.cv.wait_timeout(s, Duration::from_millis(20)).unwrap();
+                s = next;
+            }
+            assert!(s.waiting_for_ns.is_some());
+        }
+        assert_eq!(sup.mark_tick_baseline().unwrap(), 1);
+        handle.stats().post_stats_delay_once_ns.store(2_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+        handle.stop_and_join();
+
+        let snap = sup.tick_stats();
+        assert_eq!(snap.releases_total, 1);
+        assert_eq!(snap.skipped_releases, 1);
+        assert_eq!(snap.releases_over_20ms, 1);
+        let sm = snap.since_marker.expect("active marker");
+        assert_eq!(sm.status, "active");
+        assert_eq!(sm.releases_total_delta, Some(0));
+        assert_eq!(sm.skipped_releases_delta, Some(0));
+        assert_eq!(sm.releases_over_20ms_delta, Some(0));
+        assert_eq!(sm.release_us_max, Some(0));
+
+        // Stop-vs-mark overlap on executor exposes terminal `"inactive"`.
+        let pending_after_stop = handle.stats().request_marker();
+        let snap_inactive = sup.tick_stats();
+        let sm_inactive = snap_inactive.since_marker.expect("inactive marker");
+        assert_eq!(sm_inactive.marker_id, pending_after_stop);
+        assert_eq!(sm_inactive.status, "inactive");
+    }
 }
 
 // ============================================================================
-// 8. Legacy lock-free `tick_stats` under concurrent HTTP reader flood (zero control blocking)
+// 8. Legacy lock-free `tick_stats` under concurrent HTTP reader flood & paused reader
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1315,6 +1479,42 @@ async fn legacy_lock_free_stats_under_concurrent_http_readers_never_blocks_contr
             );
         })
         .unwrap();
+
+    // Causal non-blocking proof: freeze a reader thread mid-snapshot inside `window_with_hook`
+    // and assert the live legacy control thread publishes >= 20 additional releases BEFORE
+    // the paused reader is allowed to resume!
+    let wait_initial = Instant::now() + Duration::from_secs(2);
+    while loop_stats.releases_total.load(Ordering::Acquire) < 10 && Instant::now() < wait_initial {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let ring = Arc::clone(sup.tick_stats_ring_for_test());
+    let paused_reader_jh = thread::spawn(move || {
+        let mut paused_once = false;
+        let _ = ring.window_with_hook(|slot_i| {
+            if slot_i == 1 && !paused_once {
+                paused_once = true;
+                let _ = paused_tx.send(());
+                let _ = resume_rx.recv();
+            }
+        });
+    });
+    paused_rx.recv_timeout(Duration::from_secs(2)).expect("reader paused mid-snapshot");
+    let before_while_paused = loop_stats.releases_total.load(Ordering::Acquire);
+    let pause_deadline = Instant::now() + Duration::from_secs(2);
+    while loop_stats.releases_total.load(Ordering::Acquire) < before_while_paused + 20
+        && Instant::now() < pause_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let after_while_paused = loop_stats.releases_total.load(Ordering::Acquire);
+    assert!(
+        after_while_paused >= before_while_paused + 20,
+        "legacy control thread must keep publishing while reader is frozen mid-snapshot ({before_while_paused} -> {after_while_paused})"
+    );
+    resume_tx.send(()).unwrap();
+    paused_reader_jh.join().unwrap();
 
     let addr = serve(sup.clone()).await;
     let url = format!("http://{addr}/api/v1/diagnostics/tick");
@@ -1368,7 +1568,7 @@ async fn legacy_lock_free_stats_under_concurrent_http_readers_never_blocks_contr
 }
 
 // ============================================================================
-// 9. `analyze.py`: INVALID rules (counter reset, failed poll, missing field, gap, restart) & rollover FAIL
+// 9. `analyze.py`: INVALID rules, contradiction/rollover/MIT/alloc checks, & `load.py` boundaries
 // ============================================================================
 
 #[test]
@@ -1385,8 +1585,12 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
         let mut t = base_tick_json(20_100, 1_200);
         t["instance_id"] = serde_json::json!("armd-inst-1");
         t["owner_mode"] = serde_json::json!("executor");
+        t["stats_snapshot_lapped"] = serde_json::json!(false);
+        t["stats_writer_drops"] = serde_json::json!(0);
+        t["in_flight_release_us"] = serde_json::json!(0);
         t["since_boot_ticks"] = serde_json::json!(ticks);
         t["release_us"] = serde_json::json!({ "p50": 550, "p99": 950, "max": 1_400 });
+        t["releases_started"] = serde_json::json!(ticks);
         t["releases_total"] = serde_json::json!(ticks);
         t["release_us_max_ever"] = serde_json::json!(1_400);
         t["releases_over_10ms"] = serde_json::json!(0);
@@ -1400,18 +1604,37 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
         t["wake_lateness_over_5ms"] = serde_json::json!(0);
         t["wake_lateness_over_10ms"] = serde_json::json!(0);
         t["control_thread_lock_attempts"] = serde_json::json!(0);
+        t["control_thread_alloc_ops"] = serde_json::json!(0);
         t["enqueue_to_wire_us"] = serde_json::json!({ "p50": 80, "p99": 150, "max": 200 });
-        serde_json::json!({ "type": "sample", "phase": "full_load", "elapsed_s": elapsed_s, "tick": t })
+        serde_json::json!({ "type": "sample", "phase": "baseline", "elapsed_s": elapsed_s, "tick": t })
     };
 
-    let write_and_run = |name: &str, lines: &[serde_json::Value]| -> String {
+    let write_and_run_raw = |name: &str, lines: &[serde_json::Value], include_summary: bool| -> String {
         let p = dir.path().join(name);
         let mut buf = format!("{}\n", serde_json::json!({ "type": "meta", "run_id": name }));
         for l in lines {
             buf.push_str(&format!("{l}\n"));
         }
+        if include_summary {
+            buf.push_str(&format!(
+                "{}\n",
+                serde_json::json!({ "type": "summary", "run_id": name, "stop_reason": "completed", "fault": null })
+            ));
+        }
         std::fs::write(&p, buf).unwrap();
         run_analyze(&p, Some(&devstat_path))
+    };
+
+    let write_and_run = |name: &str, lines: &[serde_json::Value]| -> String {
+        let mut owned: Vec<serde_json::Value> = lines.to_vec();
+        if let Some(last) = owned.last_mut() {
+            if last.get("type").and_then(|v| v.as_str()) == Some("sample")
+                && last.get("tick").is_some_and(|v| v.is_object())
+            {
+                last["phase"] = serde_json::json!("final");
+            }
+        }
+        write_and_run_raw(name, &owned, true)
     };
 
     // 1. Clean full-coverage run -> PASS
@@ -1473,6 +1696,7 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
     let mut gap0 = make_clean(100, 0.0);
     let mut gap1 = make_clean(2500, 48.0);
     for key in [
+        "releases_started",
         "releases_total",
         "release_us_max_ever",
         "releases_over_10ms",
@@ -1520,4 +1744,503 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
     roll1["tick"]["releases_over_20ms"] = serde_json::json!(1);
     let roll_rep = write_and_run("rollover_breach.jsonl", &[make_clean(100, 0.0), roll1]);
     assert!(roll_rep.contains("**Overall Verdict: FAIL**"), "{roll_rep}");
+
+    // 14. Blocker #3: direct 25 ms in-run evidence (HWM 1_400 -> 25_000 + ticks_ago=0) with
+    //     releases_over_20ms 0->0 MUST FAIL (never PASS)!
+    let mut contra1 = make_clean(300, 4.0);
+    contra1["tick"]["release_us"]["max"] = serde_json::json!(25_000);
+    contra1["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
+    contra1["tick"]["max_release"] = serde_json::json!({ "release_us": 25_000, "ticks_ago": 0 });
+    let contra_rep = write_and_run("contra_breach.jsonl", &[make_clean(100, 0.0), contra1]);
+    assert!(contra_rep.contains("**Overall Verdict: FAIL**"), "{contra_rep}");
+
+    // 15. Blocker #3: ambiguous contradiction (both samples report 25 ms max with releases_over_20ms=0) -> INVALID!
+    let mut amb0 = make_clean(100, 0.0);
+    amb0["tick"]["release_us"]["max"] = serde_json::json!(25_000);
+    amb0["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
+    let mut amb1 = make_clean(300, 4.0);
+    amb1["tick"]["release_us"]["max"] = serde_json::json!(25_000);
+    amb1["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
+    let amb_rep = write_and_run("contra_ambig.jsonl", &[amb0, amb1]);
+    assert!(amb_rep.contains("**Overall Verdict: INVALID"), "{amb_rep}");
+    assert!(amb_rep.contains("contradictory telemetry"), "{amb_rep}");
+
+    // 16. Blocker #4: truncated JSONL (no summary or non-final tail), terminal uncompleted release,
+    //     and live in-flight stall >= 20 ms!
+    let mut fin_ok = make_clean(300, 4.0);
+    fin_ok["phase"] = serde_json::json!("final");
+    let no_sum_rep = write_and_run_raw("no_summary.jsonl", &[make_clean(100, 0.0), fin_ok], false);
+    assert!(no_sum_rep.contains("**Overall Verdict: INVALID"), "{no_sum_rep}");
+    assert!(no_sum_rep.contains("missing terminal summary record"), "{no_sum_rep}");
+
+    let non_final_rep = write_and_run_raw("non_final.jsonl", &[make_clean(100, 0.0), make_clean(300, 4.0)], true);
+    assert!(non_final_rep.contains("**Overall Verdict: INVALID"), "{non_final_rep}");
+    assert!(non_final_rep.contains("expected 'final'"), "{non_final_rep}");
+
+    let mut uncomp1 = make_clean(300, 4.0);
+    uncomp1["tick"]["releases_started"] = serde_json::json!(301);
+    let uncomp_rep = write_and_run("uncompleted_inflight.jsonl", &[make_clean(100, 0.0), uncomp1]);
+    assert!(uncomp_rep.contains("**Overall Verdict: INVALID"), "{uncomp_rep}");
+    assert!(uncomp_rep.contains("uncompleted in-flight release"), "{uncomp_rep}");
+
+    let mut stall1 = make_clean(300, 4.0);
+    stall1["tick"]["releases_started"] = serde_json::json!(301);
+    stall1["tick"]["in_flight_release_us"] = serde_json::json!(25_000);
+    let stall_rep = write_and_run("stalled_inflight.jsonl", &[make_clean(100, 0.0), stall1]);
+    assert!(stall_rep.contains("**Overall Verdict: FAIL**"), "{stall_rep}");
+
+    // 17. Major #1: malformed coherence metadata ("true" string, missing stats_writer_drops, unknown owner) -> INVALID!
+    let mut str_lap = make_clean(300, 4.0);
+    str_lap["tick"]["stats_snapshot_lapped"] = serde_json::json!("true");
+    let str_lap_rep = write_and_run("str_lapped.jsonl", &[make_clean(100, 0.0), str_lap]);
+    assert!(str_lap_rep.contains("**Overall Verdict: INVALID"), "{str_lap_rep}");
+    assert!(str_lap_rep.contains("stats_snapshot_lapped (1/2)"), "{str_lap_rep}");
+
+    let mut no_wd = make_clean(300, 4.0);
+    no_wd["tick"].as_object_mut().unwrap().remove("stats_writer_drops");
+    let no_wd_rep = write_and_run("no_writer_drops.jsonl", &[make_clean(100, 0.0), no_wd]);
+    assert!(no_wd_rep.contains("**Overall Verdict: INVALID"), "{no_wd_rep}");
+    assert!(no_wd_rep.contains("stats_writer_drops (1/2)"), "{no_wd_rep}");
+
+    let mut bad_owner = make_clean(300, 4.0);
+    bad_owner["tick"]["owner_mode"] = serde_json::json!("transferring");
+    let bad_owner_rep = write_and_run("bad_owner.jsonl", &[make_clean(100, 0.0), bad_owner]);
+    assert!(bad_owner_rep.contains("**Overall Verdict: INVALID"), "{bad_owner_rep}");
+    assert!(bad_owner_rep.contains("owner_mode (1/2)"), "{bad_owner_rep}");
+
+    // 18. Major #2: rolled wake peak (100 -> 25_000 on wake_late_max_ever with 100 us windows) -> MIT FAIL!
+    //     And pre-run high wake_late_max_ever across >1000-tick gap without since_marker -> INCOMPLETE!
+    let mut wake_roll0 = make_clean(100, 0.0);
+    wake_roll0["tick"]["wake_lateness_us"] = serde_json::json!({ "p50": 50, "p99": 80, "max": 100 });
+    wake_roll0["tick"]["wake_late_max_ever"] = serde_json::json!(100);
+    let mut wake_roll1 = make_clean(1600, 30.0);
+    wake_roll1["tick"]["wake_lateness_us"] = serde_json::json!({ "p50": 50, "p99": 80, "max": 100 });
+    wake_roll1["tick"]["wake_late_max_ever"] = serde_json::json!(25_000);
+    let wake_roll_rep = write_and_run("rolled_wake.jsonl", &[wake_roll0, wake_roll1]);
+    assert!(wake_roll_rep.contains("**Overall Verdict: FAIL**"), "{wake_roll_rep}");
+
+    let mut wake_mask0 = make_clean(100, 0.0);
+    wake_mask0["tick"]["wake_late_max_ever"] = serde_json::json!(15_000);
+    let mut wake_mask1 = make_clean(1600, 30.0);
+    wake_mask1["tick"]["wake_late_max_ever"] = serde_json::json!(15_000);
+    let wake_mask_rep = write_and_run("masked_wake.jsonl", &[wake_mask0, wake_mask1]);
+    assert!(wake_mask_rep.contains("**Overall Verdict: INCOMPLETE"), "{wake_mask_rep}");
+    assert!(wake_mask_rep.contains("masks in-run wake peak"), "{wake_mask_rep}");
+
+    // 19. Major #4: missing/proxy-only allocation evidence MUST NEVER produce PASS!
+    let mut no_alloc0 = make_clean(100, 0.0);
+    let mut no_alloc1 = make_clean(300, 4.0);
+    for sample in [&mut no_alloc0, &mut no_alloc1] {
+        let obj = sample["tick"].as_object_mut().unwrap();
+        obj.remove("control_thread_alloc_ops");
+        obj.remove("max_tick");
+        obj.remove("max_lock");
+        obj.remove("max_release");
+    }
+    let no_alloc_rep = write_and_run("no_alloc_evidence.jsonl", &[no_alloc0, no_alloc1]);
+    assert!(no_alloc_rep.contains("**Overall Verdict: INCOMPLETE"), "{no_alloc_rep}");
+    assert!(no_alloc_rep.contains("INCOMPLETE (missing/malformed allocation evidence)"), "{no_alloc_rep}");
+
+    let mut proxy_alloc0 = make_clean(100, 0.0);
+    let mut proxy_alloc1 = make_clean(300, 4.0);
+    proxy_alloc0["tick"].as_object_mut().unwrap().remove("control_thread_alloc_ops");
+    proxy_alloc1["tick"].as_object_mut().unwrap().remove("control_thread_alloc_ops");
+    let proxy_alloc_rep = write_and_run("proxy_alloc_only.jsonl", &[proxy_alloc0, proxy_alloc1]);
+    assert!(proxy_alloc_rep.contains("**Overall Verdict: INCOMPLETE"), "{proxy_alloc_rep}");
+    assert!(proxy_alloc_rep.contains("PASS (proxy)"), "{proxy_alloc_rep}");
+
+    let mut alloc_breach1 = make_clean(300, 4.0);
+    alloc_breach1["tick"]["control_thread_alloc_ops"] = serde_json::json!(2);
+    let alloc_breach_rep = write_and_run("alloc_breach.jsonl", &[make_clean(100, 0.0), alloc_breach1]);
+    assert!(alloc_breach_rep.contains("**Overall Verdict: FAIL**"), "{alloc_breach_rep}");
+}
+
+// ============================================================================
+// 10. Post-stats tail stalls, executor sub-release overrun catch-up, in-flight stall, & load.py boundaries
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tail_stall_sub_release_overrun_in_flight_stall_and_load_py_boundaries() {
+    // (a) Legacy: 25 ms stall STRICTLY AFTER ring.record_staged & commit_release_outcome (right before sleep)
+    //     MUST still appear in rolling `release_us.max`, `release_us_max_ever`, `releases_over_20ms`, and `skipped_releases`!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+            });
+        });
+        loop_stats.post_stats_delay_once_ns.store(25_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+        let snap = sup.tick_stats();
+        assert!(snap.release_us.max >= 25_000, "rolling release_us missed post-stats tail: {snap:?}");
+        assert!(snap.release_us_max_ever >= 25_000);
+        assert_eq!(snap.releases_over_20ms, 1);
+        assert_eq!(snap.skipped_releases, 1);
+        assert_eq!(snap.releases_started, 1);
+        assert_eq!(snap.releases_total, 1);
+
+        // Continuing clean release must NOT double-count skips or thresholds.
+        clock.run_schedule(&[0]);
+        let snap2 = sup.tick_stats();
+        assert_eq!(snap2.releases_over_20ms, 1);
+        assert_eq!(snap2.skipped_releases, 1);
+        assert_eq!(snap2.releases_total, 2);
+
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+    }
+
+    // (b) Executor: 25 ms stall STRICTLY AFTER diag_tx.push + hub.wake + commit_release_outcome + completed_releases
+    //     MUST update rolling `release_us.max`, `release_us_max_ever`, `releases_over_20ms`, `skipped_releases`, with 0 allocs!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(20));
+        cfg.alloc_timing = true;
+        let handle = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        handle.stats().post_stats_delay_once_ns.store(25_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+        let snap = sup.tick_stats();
+        assert!(snap.release_us.max >= 25_000, "executor rolling release_us missed post-stats tail: {snap:?}");
+        assert!(snap.release_us_max_ever >= 25_000);
+        assert_eq!(snap.releases_over_20ms, 1);
+        assert_eq!(snap.skipped_releases, 1);
+        assert_eq!(snap.releases_started, 1);
+        assert_eq!(snap.releases_total, 1);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+        // Continuing loop preserves exact skip count (no catch-up skip loss, no double count).
+        clock.run_schedule(&[0]);
+        let snap2 = sup.tick_stats();
+        assert_eq!(snap2.releases_over_20ms, 1);
+        assert_eq!(snap2.skipped_releases, 1);
+        assert_eq!(snap2.releases_total, 2);
+        handle.stop_and_join();
+    }
+
+    // (c) Blocker #2: Executor release with 10 ms scheduled sub-release sleep + 15 ms wake work
+    //     (= 25 ms wall span on a 20 ms period) followed by continuing releases -> MUST record
+    //     `release_us >= 25 ms` (no sub-release wait subtraction), `releases_over_20ms == 1`, AND
+    //     `skipped_releases == 1` even while the loop continues!
+    {
+        use armd::driver::{
+            ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, TorqueOutcome,
+            TorqueProgress,
+        };
+        use armd::model::JointState;
+        use armd::rt_core::broker::{Authority, ClientId, Submit, TransitionOp};
+
+        struct SubReleaseOverrunDriver {
+            dof: usize,
+            q: Vec<f32>,
+            enabled: bool,
+            rx_at: Vec<Option<Instant>>,
+            seqs: Vec<u64>,
+            pending_target: Option<(bool, Instant)>,
+            clock: Arc<LatenessClock>,
+            wake_delay: Duration,
+            wake_work_ns: u64,
+        }
+        impl ArmDriver for SubReleaseOverrunDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    velocity_feedback: true,
+                    torque_feedback: true,
+                    temperature_feedback: true,
+                    torque_feedforward: false,
+                    enable_feedback: true,
+                    load_feedback: false,
+                }
+            }
+            fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+            fn clock_now(&self) -> Instant { self.clock.now() }
+            fn enable_state(&self) -> EnableState {
+                if self.enabled { EnableState::Enabled } else { EnableState::Disabled }
+            }
+            fn is_feedback_valid(&self) -> bool { true }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> {
+                let now = self.clock.now();
+                self.rx_at.iter().map(|t| t.map(|t| now.saturating_duration_since(t))).collect()
+            }
+            fn feedback_instants(&self) -> Vec<Option<Instant>> { self.rx_at.clone() }
+            fn feedback_seqs(&self) -> Vec<u64> { self.seqs.clone() }
+            fn feedback_receive_instants(&self) -> Vec<Option<Instant>> { self.rx_at.clone() }
+            fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+                let now = self.clock.now();
+                out.clear();
+                out.extend(self.rx_at.iter().map(|t| t.map(|t| now.saturating_duration_since(t))));
+            }
+            fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+                let now = self.clock.now();
+                self.rx_at.len() == dof
+                    && self.rx_at.iter().all(|t| t.is_some_and(|t| now.saturating_duration_since(t) <= max_age))
+            }
+            fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+                let now = self.clock.now();
+                out.clear();
+                out.extend(self.rx_at.iter().map(|t| t.map(|t| now.saturating_duration_since(t).as_millis() as u64)));
+            }
+            fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+                out.clear();
+                out.extend_from_slice(&self.rx_at);
+            }
+            fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+                out.clear();
+                out.extend_from_slice(&self.seqs);
+            }
+            fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+                out.clear();
+                out.extend_from_slice(&self.rx_at);
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                let mut out = Vec::with_capacity(self.dof);
+                self.read_joint_states_into(&mut out)?;
+                Ok(out)
+            }
+            fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+                let now = self.clock.now();
+                out.clear();
+                for i in 0..self.dof {
+                    out.push(JointState { position: self.q[i], velocity: 0.0, torque: 0.0, temperature: 30.0 });
+                    self.rx_at[i] = Some(now);
+                    self.seqs[i] += 1;
+                }
+                Ok(())
+            }
+            fn read_joint_states_budgeted(
+                &mut self,
+                out: &mut Vec<JointState>,
+                _deadline: Instant,
+                _max_frames: u16,
+            ) -> Result<(u16, bool), ArmDriverError> {
+                self.read_joint_states_into(out)?;
+                Ok((self.dof as u16, false))
+            }
+            fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                for (i, t) in targets.iter().enumerate().take(self.dof) {
+                    self.q[i] = t.position;
+                }
+                Ok(())
+            }
+            fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+                self.enabled = enable;
+                Ok(())
+            }
+            fn begin_torque_budgeted(&mut self, enable: bool, _max_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+                let wake = self.clock.now() + self.wake_delay;
+                self.pending_target = Some((enable, wake));
+                Ok(TorqueProgress::Pending { wake })
+            }
+            fn poll_torque_budgeted(&mut self, _deadline: Instant, _max_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+                let Some((target, wake)) = self.pending_target else {
+                    return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+                };
+                if self.clock.now() < wake {
+                    return Ok(TorqueProgress::Pending { wake });
+                }
+                self.pending_target = None;
+                // Simulate 15 ms work inside the sub-release wake after 10 ms scheduled sub-release wait -> 25 ms total!
+                self.clock.advance_ns(self.wake_work_ns);
+                self.enabled = target;
+                Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+            }
+            fn abort_enable(&mut self) {
+                if matches!(self.pending_target, Some((true, _))) {
+                    self.pending_target = None;
+                }
+            }
+            fn torque_transition_pending(&self) -> bool {
+                self.pending_target.is_some()
+            }
+        }
+
+        let clock = LatenessClock::new();
+        let now = clock.now();
+        let drv = SubReleaseOverrunDriver {
+            dof: 7,
+            q: vec![0.0; 7],
+            enabled: false,
+            rx_at: vec![Some(now); 7],
+            seqs: vec![1; 7],
+            pending_target: None,
+            clock: clock.clone(),
+            // 30 ms confirm delay on a 20 ms period: release #2 starts TorqueOn at T+40ms (wake=T+70ms),
+            // release #3 wakes at T+60ms, sleeps 10 ms to sub-release wake T+70ms, then does 15 ms work -> 25 ms!
+            wake_delay: Duration::from_millis(30),
+            wake_work_ns: 15_000_000,
+        };
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Run 1 clean baseline release so epoch is published, then submit TorqueOn to trigger
+        // a 10 ms scheduled sub-release wait + 15 ms wake work (= 25 ms) followed by 2 continuing releases.
+        clock.run_schedule(&[0]);
+        let auth = Authority {
+            lease_generation: 0,
+            epoch: sup.hub().latest().map_or(1, |s| s.obs.epoch_id),
+            stop_generation: handle.stop_requests().current(),
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(1),
+                1,
+                auth,
+                clock.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        // 4 sleep_until_ns calls: release #2 periodic wake, release #2 sub-release wake (10 ms),
+        // release #3 periodic wake, release #4 periodic wake.
+        clock.run_schedule(&[0, 0, 0, 0]);
+        let snap = sup.tick_stats();
+        assert_eq!(handle.stats().wakes.load(Ordering::Acquire), 1, "must exercise real Window-2 sub-release wake");
+        assert!(snap.release_us.max >= 25_000, "sub-release wait must NOT be subtracted from release_us: {snap:?}");
+        assert!(snap.release_us_max_ever >= 25_000);
+        assert_eq!(snap.releases_over_20ms, 1);
+        assert_eq!(snap.skipped_releases, 1, "continuing loop must account 25 ms overrun skip immediately");
+        assert_eq!(snap.releases_total, 4);
+        handle.stop_and_join();
+    }
+
+    // (d) Blocker #4: Live in-flight release stall (> 20 ms) is immediately visible via `releases_started > releases_total`
+    //     and `in_flight_release_us >= 20_000`, AND `load.py` captures baseline strictly BEFORE workers start
+    //     even with `--baseline-s 0` and writes settled `final` + `summary`!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let stall_armed = Arc::new(AtomicBool::new(true));
+        let (stalled_tx, stalled_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let armed_t = stall_armed.clone();
+        let jh = thread::spawn(move || {
+            armd::rt_core::executor::run_periodic(Duration::from_millis(5), &stop_t, &stats_t, |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+                if armed_t.swap(false, Ordering::AcqRel) {
+                    let _ = stalled_tx.send(());
+                    let _ = release_rx.recv();
+                }
+            });
+        });
+
+        stalled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let live = sup.tick_stats();
+        assert!(live.releases_started > live.releases_total, "expected in-flight release: {live:?}");
+        assert!(
+            live.in_flight_release_us >= 20_000,
+            "expected live in_flight_release_us >= 20_000, got {}",
+            live.in_flight_release_us
+        );
+        release_tx.send(()).unwrap();
+
+        // Run real `scripts/rt_qual/load.py` with `--baseline-s 0` against live HTTP router.
+        let addr = serve(sup.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let out_jsonl = dir.path().join("load.jsonl");
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/rt_qual/load.py");
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new("python3")
+                .arg(&script)
+                .args([
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &addr.port().to_string(),
+                    "--duration",
+                    "0.4",
+                    "--baseline-s",
+                    "0",
+                    "--cooldown-s",
+                    "0",
+                    "--sample-interval",
+                    "0.2",
+                    "--no-motion",
+                    "--no-record",
+                    "--no-measure",
+                    "--no-ws-stream",
+                    "--no-blackbox-log",
+                    "--no-bulk-http",
+                    "--obs-poll",
+                    "--output",
+                ])
+                .arg(&out_jsonl)
+                .output()
+                .expect("run load.py")
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "load.py failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let raw = std::fs::read_to_string(dir.path().join("load.jsonl")).unwrap();
+        let recs: Vec<serde_json::Value> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let sample_recs: Vec<&serde_json::Value> = recs
+            .iter()
+            .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("sample"))
+            .collect();
+        assert!(sample_recs.len() >= 2, "expected >= 2 samples: {raw}");
+        assert_eq!(sample_recs[0]["phase"], "baseline");
+        assert_eq!(
+            sample_recs[0]["counters"]["obs_ok"], 0,
+            "baseline sample MUST complete before any load worker fires even with --baseline-s 0"
+        );
+        let last_sample = *sample_recs.last().unwrap();
+        assert_eq!(last_sample["phase"], "final");
+        assert_eq!(
+            last_sample["tick"]["releases_started"],
+            last_sample["tick"]["releases_total"],
+            "settled final sample must cover all started releases: {last_sample}"
+        );
+        assert_eq!(recs.last().unwrap()["type"], "summary");
+
+        stop.store(true, Ordering::Release);
+        jh.join().unwrap();
+    }
 }

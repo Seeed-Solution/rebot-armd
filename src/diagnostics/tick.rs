@@ -620,8 +620,12 @@ pub struct TickSnapshot {
     pub tick_us: Percentiles,
     /// Full release duration on the control thread from wake through all release work, µs.
     pub release_us: Percentiles,
+    /// Monotonic releases started since process start (control-thread incremented at wake).
+    pub releases_started: u64,
     /// Monotonic completed releases since process start (control-thread written only).
     pub releases_total: u64,
+    /// Elapsed wall duration (µs) of a currently in-flight control release, or 0 when idle.
+    pub in_flight_release_us: u64,
     /// Monotonic all-time maximum full `release_us` since process start, µs (never ages out).
     pub release_us_max_ever: u64,
     /// Monotonic releases since process start with full duration `>= 10 ms` / `>= 15 ms` / `>= 20 ms`.
@@ -1225,13 +1229,24 @@ impl LockFreeTickStats {
     /// Returns `false` and increments `writer_contention_drops` only if two writers call
     /// `record` concurrently.
     pub fn record(&self, s: &TickSample) -> bool {
+        self.record_staged(s, || s.release_us).is_some()
+    }
+
+    /// Wait-free staged publication: writes all sample payload fields into the next unpublished
+    /// slot BEFORE invoking `finalize()` (which measures the final release completion timestamp
+    /// and commits monotonic counters), stamps the authoritative `release_us` returned by
+    /// `finalize()`, and publishes both the slot and metadata seqlocks.
+    ///
+    /// Returns `Some(sample_seq)` on success, or `None` (incrementing `writer_contention_drops`)
+    /// if two writers contend concurrently.
+    pub fn record_staged(&self, s: &TickSample, finalize: impl FnOnce() -> u32) -> Option<u64> {
         if self
             .writer_busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return None;
         }
         struct BusyGuard<'a>(&'a AtomicBool);
         impl Drop for BusyGuard<'_> {
@@ -1246,11 +1261,14 @@ impl LockFreeTickStats {
         let sample_seq = prev_seq.wrapping_add(1);
         let slot = &self.slots[(prev_seq as usize) & (LOCK_FREE_RING_CAPACITY - 1)];
 
-        // Per-slot seqlock write: odd -> Release fence -> Relaxed payload -> even (Release).
+        // Per-slot seqlock write on the unpublished slot (readers do not read this slot until
+        // `write_seq` advances in `meta_seq` below).
         let s0 = slot.seq.load(Ordering::Relaxed);
         slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
         fence(Ordering::Release);
         slot.store_relaxed(sample_seq, s);
+        let final_release_us = finalize();
+        slot.release_us.store(final_release_us, Ordering::Relaxed);
         slot.seq.store(s0.wrapping_add(2), Ordering::Release);
 
         // Coherent metadata seqlock write: odd -> Release fence -> totals + write_seq -> even (Release).
@@ -1275,7 +1293,86 @@ impl LockFreeTickStats {
         add_tx(&self.tx_dropped_stale, s.usage.tx_dropped_stale);
         add_tx(&self.tx_dropped_stopped, s.usage.tx_dropped_stopped);
         self.meta_seq.store(m0.wrapping_add(2), Ordering::Release);
-        true
+        Some(sample_seq)
+    }
+
+    /// Wait-free single-writer tail amendment of `slot.release_us` for a specific `sample_seq`
+    /// if a post-publication instrumentation tail extended the release duration.
+    pub fn amend_slot_release_us(&self, sample_seq: u64, release_us: u32) {
+        if sample_seq == 0 {
+            return;
+        }
+        if self
+            .writer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        struct BusyGuard<'a>(&'a AtomicBool);
+        impl Drop for BusyGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(&self.writer_busy);
+
+        let slot_idx = ((sample_seq.wrapping_sub(1)) as usize) & (LOCK_FREE_RING_CAPACITY - 1);
+        let slot = &self.slots[slot_idx];
+        if slot.sample_seq.load(Ordering::Relaxed) == sample_seq
+            && slot.release_us.load(Ordering::Relaxed) < release_us
+        {
+            let s0 = slot.seq.load(Ordering::Relaxed);
+            slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+            fence(Ordering::Release);
+            slot.release_us.store(release_us, Ordering::Relaxed);
+            slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+        }
+    }
+
+    /// Wait-free single-writer tail amendment by executor `release_seq` (called only by off-thread
+    /// `drain_diag` under the `diag_rx` consumer mutex so `LockFreeTickStats` stays single-writer).
+    pub fn amend_release_us_by_release_seq(&self, release_seq: u64, release_us: u32) {
+        if release_seq == 0 {
+            return;
+        }
+        if self
+            .writer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        struct BusyGuard<'a>(&'a AtomicBool);
+        impl Drop for BusyGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(&self.writer_busy);
+
+        let end_seq = self.write_seq.load(Ordering::Relaxed);
+        let scan = (end_seq as usize).min(16);
+        for back in 0..scan {
+            let seq = end_seq - back as u64;
+            let slot = &self.slots[((seq - 1) as usize) & (LOCK_FREE_RING_CAPACITY - 1)];
+            if slot.sample_seq.load(Ordering::Relaxed) == seq
+                && slot.release_seq.load(Ordering::Relaxed) == release_seq
+            {
+                if slot.release_us.load(Ordering::Relaxed) < release_us {
+                    let s0 = slot.seq.load(Ordering::Relaxed);
+                    slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+                    fence(Ordering::Release);
+                    slot.release_us.store(release_us, Ordering::Relaxed);
+                    slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+                }
+                break;
+            }
+        }
     }
 
     fn read_meta_seqlock(&self) -> Option<(u64, u64, TxTotals)> {
@@ -1444,7 +1541,9 @@ impl TickWindow {
             window: self.rows.len(),
             tick_us: self.col(|r| r.tick_us),
             release_us: self.col(|r| r.release_us),
+            releases_started: 0,
             releases_total: 0,
+            in_flight_release_us: 0,
             release_us_max_ever: 0,
             releases_over_10ms: 0,
             releases_over_15ms: 0,
@@ -1795,5 +1894,42 @@ mod tests {
         lf.set_odd_slot_seq_for_test(first_slot, false);
         assert!(odd_slot.snapshot_lapped);
         assert!(lf.reader_retries() >= retries_before_slot + MAX_SEQLOCK_RETRIES as u64);
+    }
+
+    #[test]
+    fn lock_free_tick_stats_record_staged_and_tail_amendments_are_exact() {
+        let lf = LockFreeTickStats::new();
+        let seq1 = lf
+            .record_staged(
+                &TickSample {
+                    tick_us: 1_200,
+                    release_us: 0,
+                    release_seq: 101,
+                    ..Default::default()
+                },
+                || 4_500,
+            )
+            .expect("staged record");
+        assert_eq!(seq1, 1);
+        assert_eq!(lf.window().samples()[0].release_us, 4_500);
+
+        // Amend downward is ignored; amend upward updates cleanly.
+        lf.amend_slot_release_us(seq1, 3_000);
+        assert_eq!(lf.window().samples()[0].release_us, 4_500);
+        lf.amend_slot_release_us(seq1, 25_200);
+        assert_eq!(lf.window().samples()[0].release_us, 25_200);
+
+        // Executor release_seq-based amendment updates the recorded slot monotonically.
+        let _ = lf.record(&TickSample {
+            tick_us: 900,
+            release_us: 1_100,
+            release_seq: 202,
+            ..Default::default()
+        });
+        lf.amend_release_us_by_release_seq(202, 26_700);
+        let samples = lf.window().samples().to_vec();
+        assert_eq!(samples[1].release_seq, 202);
+        assert_eq!(samples[1].release_us, 26_700);
+        assert_eq!(lf.writer_contention_drops(), 0);
     }
 }
