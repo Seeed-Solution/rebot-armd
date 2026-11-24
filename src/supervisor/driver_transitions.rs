@@ -1169,6 +1169,10 @@ impl SupervisorInner {
 
     /// The driver's enable failed with `e`: an arm that was not torqued is disabled again
     /// (confirmed or left `disable_pending`), and the fault `ENABLE_FAILED` latches.
+    ///
+    /// Exception (third exception alongside thermal trip and forced exit/panic): rollback only
+    /// runs when `!was_torqued`, returning motors to their prior torque-off state; it never
+    /// disables motors that were already enabled and holding before the enable request.
     fn enable_failed(&mut self, was_torqued: bool, e: &dyn std::fmt::Display) -> SafetyError {
         if !was_torqued {
             if let Some(ref d) = self.driver {
@@ -1194,6 +1198,7 @@ impl SupervisorInner {
 
     /// Non-blocking enable failure handler for RT transitions: sends disable frames with zero RX
     /// and zero sleep when the arm was not previously torqued, leaving confirmation to Step 2.
+    /// Guarded by `!was_torqued`: never disables motors that were already enabled and holding.
     fn enable_failed_budgeted(&mut self, was_torqued: bool, e: &dyn std::fmt::Display) -> SafetyError {
         if !was_torqued {
             let disable_outcome = self.driver.as_ref().and_then(|d| {
