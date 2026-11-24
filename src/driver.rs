@@ -3326,6 +3326,7 @@ pub struct DamiaoArmDriver<C: CanTransport> {
 /// 1. Transition from motion to stop / hold / freeze for ANY joint (including J7).
 /// 2. Motion targets.
 /// 3. Re-sends of an unchanged hold / freeze.
+///
 /// (Class 4: J7 `0xCC` refresh and other reads — sent only when Classes 1–3 have no pending work
 /// and spare TX budget remains.)
 const TX_CLASS_STOP_TRANSITION: u8 = 1;
@@ -10580,25 +10581,24 @@ mod pos_force_emitter {
                         && !driver.pf_refresh_attempted_this_tick
                         && driver.poll_tx_allowed()
                         && driver.can_start_tick_tx()
+                        && driver.try_send_pf_refresh(start_stamp)?
                     {
-                        if driver.try_send_pf_refresh(start_stamp)? {
+                        if stop_check(driver).is_err() {
+                            return Err(ArmDriverError::EstopInhibited);
+                        }
+                        if driver.flush_cutoff_exceeded() {
+                            driver.mark_tx_pass_backpressured();
+                            return Err(TransportError::Timeout.into());
+                        }
+                        if let Err(e) = driver.can.flush() {
+                            driver.mark_tx_pass_backpressured();
                             if stop_check(driver).is_err() {
                                 return Err(ArmDriverError::EstopInhibited);
                             }
-                            if driver.flush_cutoff_exceeded() {
-                                driver.mark_tx_pass_backpressured();
-                                return Err(TransportError::Timeout.into());
-                            }
-                            if let Err(e) = driver.can.flush() {
-                                driver.mark_tx_pass_backpressured();
-                                if stop_check(driver).is_err() {
-                                    return Err(ArmDriverError::EstopInhibited);
-                                }
-                                return Err(e.into());
-                            }
-                            if stop_check(driver).is_err() {
-                                return Err(ArmDriverError::EstopInhibited);
-                            }
+                            return Err(e.into());
+                        }
+                        if stop_check(driver).is_err() {
+                            return Err(ArmDriverError::EstopInhibited);
                         }
                     }
                     let pf_status = driver.take_last_pos_force_tx_status();
