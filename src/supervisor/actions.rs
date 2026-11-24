@@ -120,14 +120,27 @@ impl SupervisorInner {
             }
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
-                    if msg.capacity() > self.action_msg_spare.capacity() {
-                        self.action_msg_spare = msg;
-                    }
+                    self.recycle_action_msg_spare(msg);
                 }
             }
         }
-        if format_superseded_msg && self.action_msg_spare.capacity() < 256 {
-            self.action_msg_spare = String::with_capacity(256);
+        if format_superseded_msg {
+            // Off-RT start: ensure two 256-byte spares exist (matching `last_action` and
+            // `previous_action`) so back-to-back RT failures never allocate or free.
+            let ready = self
+                .action_msg_spares
+                .iter()
+                .filter(|s| s.as_ref().is_some_and(|b| b.capacity() >= 256))
+                .count();
+            for _ in ready..2 {
+                if let Some(slot) = self
+                    .action_msg_spares
+                    .iter_mut()
+                    .find(|s| s.as_ref().is_none_or(|b| b.capacity() < 256))
+                {
+                    *slot = Some(String::with_capacity(256));
+                }
+            }
         }
         self.next_action_id += 1;
         let id = self.next_action_id;
@@ -153,14 +166,73 @@ impl SupervisorInner {
         id
     }
 
+    /// Take a preallocated message buffer (`capacity >= min_cap` when available) for RT action
+    /// termination without allocating or freeing on `armd-control`. If the target action already
+    /// holds a smaller buffer, it is recycled into `action_msg_spares` before taking a spare.
+    pub(crate) fn take_action_msg_buf(&mut self, action_id: u64, min_cap: usize) -> String {
+        if let Some(existing) = self
+            .last_action
+            .as_mut()
+            .filter(|a| a.id == action_id)
+            .and_then(|a| a.message.take())
+        {
+            if existing.capacity() >= min_cap {
+                return existing;
+            }
+            self.recycle_action_msg_spare(existing);
+        }
+        if let Some(slot) = self
+            .action_msg_spares
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|b| b.capacity() >= min_cap))
+        {
+            return slot.take().unwrap_or_default();
+        }
+        let mut best_idx = None;
+        let mut best_cap = 0usize;
+        for (i, s) in self.action_msg_spares.iter().enumerate() {
+            if let Some(b) = s {
+                if b.capacity() > best_cap {
+                    best_cap = b.capacity();
+                    best_idx = Some(i);
+                }
+            }
+        }
+        best_idx.and_then(|i| self.action_msg_spares[i].take()).unwrap_or_default()
+    }
+
+    /// Return a `String` message buffer to `action_msg_spares` without freeing on `armd-control`
+    /// whenever a spare slot is free.
+    pub(crate) fn recycle_action_msg_spare(&mut self, mut msg: String) {
+        if msg.capacity() == 0 {
+            return;
+        }
+        msg.clear();
+        if let Some(slot) = self.action_msg_spares.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(msg);
+            return;
+        }
+        if let Some(min_slot) = self
+            .action_msg_spares
+            .iter_mut()
+            .min_by_key(|s| s.as_ref().map_or(0, String::capacity))
+        {
+            if min_slot.as_ref().is_none_or(|b| msg.capacity() > b.capacity()) {
+                *min_slot = Some(msg);
+            }
+        }
+    }
+
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
         let mut store_offset_req: Option<(f32, Option<(crate::auth::OperatorAuth, Option<String>)>)> = None;
+        let mut incoming_message = message;
+        let mut displaced_message: Option<String> = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.state = state.into();
             a.code = code.map(Into::into);
-            a.message = message;
+            displaced_message = std::mem::replace(&mut a.message, incoming_message.take());
             a.finished_at = Some(now);
             if state != "failed" || code != Some("WORKSPACE_VIOLATION") {
                 a.constraint_id = None;
@@ -201,6 +273,9 @@ impl SupervisorInner {
                 if code.is_some() { " " } else { "" },
                 code.unwrap_or(""),
             );
+        }
+        if let Some(unused_msg) = displaced_message.or(incoming_message) {
+            self.recycle_action_msg_spare(unused_msg);
         }
         if let Some((offset_rad, operator_auth)) = store_offset_req {
             let candidate_jaw = self.gripper_calib_jaw_opening.clone();
@@ -549,9 +624,24 @@ impl SupervisorInner {
     /// Arms the RT deadline of the current child of macro `id` (the tick fails it with `code` /
     /// `message` when it still runs after `deadline`). Returns its ticket.
     pub fn arm_macro_child(&mut self, id: u64, deadline: Instant, code: &str, message: String) -> Option<ChildTicket> {
+        self.arm_macro_child_bounded(
+            id,
+            deadline,
+            crate::safety::BoundedText::new(code),
+            crate::motion::StepErrorText::new(&message),
+        )
+    }
+
+    pub(crate) fn arm_macro_child_bounded(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        code: crate::safety::BoundedText<48>,
+        message: crate::motion::StepErrorText,
+    ) -> Option<ChildTicket> {
         let m = self.macro_run.as_mut().filter(|m| m.id == id && m.children > 0)?;
         m.child.deadline = Some(deadline);
-        m.child.timeout = Some((code.to_string(), message));
+        m.child.timeout = Some((code, message));
         m.ticket()
     }
 
@@ -578,7 +668,10 @@ impl SupervisorInner {
         if self.macro_child_active_or_pending(id) { self.stop_motion(); }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
-        let (code, message) = m.child.timeout.take().unwrap_or_else(|| ("TIMEOUT".into(), "Sub-motion did not finish in time".into()));
+        let (code, message) = m.child.timeout.take().unwrap_or_else(|| (
+            crate::safety::BoundedText::new("TIMEOUT"),
+            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+        ));
         m.child.deadline = None;
         m.sub = SubState::Failed { code, message };
         true
@@ -615,7 +708,10 @@ impl SupervisorInner {
             m.child.watch.contact_tcp_z_m = z;
             if let Some(code) = guard.stop_code {
                 self.safety.mark_motion_finished();
-                m.sub = SubState::Failed { code: code.into(), message: format!("contact on J{}", joint + 1) };
+                m.sub = SubState::Failed {
+                    code: crate::safety::BoundedText::new(code),
+                    message: crate::motion::format_step_error(format_args!("contact on J{}", joint + 1)),
+                };
             } else if let Some(ticket) = ticket {
                 // Success-on-contact: motion is stopped and locked to measured immediately,
                 // while `SubState::Done` commits strictly through the shared post-output
@@ -725,7 +821,12 @@ impl SupervisorInner {
             return Err(code(e));
         }
         let deadline = now + Duration::from_secs_f64(if spec.timeout_s.is_finite() { spec.timeout_s.clamp(0.0, 1e6) } else { 1e6 });
-        self.arm_macro_child(id, deadline, spec.timeout_code, "Sub-motion did not finish in time".into());
+        self.arm_macro_child_bounded(
+            id,
+            deadline,
+            crate::safety::BoundedText::new(spec.timeout_code),
+            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+        );
         Ok(crate::rt_core::broker::ActionId(id))
     }
 
@@ -831,35 +932,31 @@ impl SupervisorInner {
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.motor_current_cap())
-            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
-            .and_then(|cap| cap.close_speed_rad_s)
+            .and_then(|drv| drv.gripper_pos_force_info())
+            .filter(|info| info.joint == gripper_idx)
+            .map(|info| info.close_speed_rad_s)
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
     /// Estimated motor ceiling torque (N·m) of the attached position-force gripper: calibrated
     /// `ceiling_torque_nm` when available, else the feedback-equivalent estimate from
-    /// `current_raw * 0.0019 N·m/raw`.
+    /// `current_raw * 0.0019 N·m/raw`. Allocation-free on `armd-control`.
     pub(crate) fn gripper_ceiling_torque_estimate(&self) -> Option<f32> {
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.motor_current_cap())
-            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
-            .and_then(|cap| {
-                cap.ceiling_torque_nm.or_else(|| {
-                    cap.current_raw
-                        .map(|raw| f32::from(raw) * crate::model::DamiaoGripperDrive::FEEDBACK_EQUIVALENT_NM_PER_RAW)
-                })
-            })
+            .and_then(|drv| drv.gripper_pos_force_info())
+            .filter(|info| info.joint == gripper_idx)
+            .and_then(|info| info.ceiling_torque_estimate_nm)
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
-    /// Effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`, `sequence`,
-    /// `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
-    /// damiao_gripper.close_speed_rad_s when pos_force)`, quantized downward to `0.01 rad/s`
-    /// when `pos_force` is active.
-    pub fn effective_planned_close_speed(&self) -> f64 {
+    /// Unquantized effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`,
+    /// `sequence`, `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
+    /// damiao_gripper.close_speed_rad_s when pos_force)`. Feed this into `GripperRequest` so
+    /// [`crate::motion::GripperMotion::try_with_close_speed_limit`] is the single wire-speed
+    /// quantization point (avoiding `raw 29 -> 0.29_f64 -> raw 28` double flooring).
+    pub(crate) fn unquantized_planned_close_speed(&self) -> f64 {
         let mut v = self.config.gripper_policy.as_ref()
             .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
         if let Some(max_v) = self.config.gripper_index()
@@ -871,9 +968,21 @@ impl SupervisorInner {
         }
         if let Some(cap) = self.gripper_close_speed_limit() {
             v = v.min(f64::from(cap));
+        }
+        v
+    }
+
+    /// Effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`, `sequence`,
+    /// `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
+    /// damiao_gripper.close_speed_rad_s when pos_force)`, quantized once downward to `0.01 rad/s`
+    /// when `pos_force` is active (for reporting and duration estimates; never feed back into
+    /// `GripperRequest`).
+    pub fn effective_planned_close_speed(&self) -> f64 {
+        let v = self.unquantized_planned_close_speed();
+        if self.gripper_close_speed_limit().is_some() {
             let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(v);
             if raw > 0 {
-                v = f64::from(raw) / 100.0;
+                return f64::from(raw) / 100.0;
             }
         }
         v
@@ -1218,6 +1327,7 @@ impl SupervisorInner {
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_window.reset();
         self.zero_check_params = Some(ZeroCheckParams {
             action_id: id,
             store_offset,
@@ -1311,12 +1421,7 @@ impl SupervisorInner {
             if (is_macro || is_replay) && carried { self.stop_motion(); }
             self.pending_deferred_done = None;
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
-            let mut message = self
-                .last_action
-                .as_mut()
-                .filter(|a| a.id == id)
-                .and_then(|a| a.message.take())
-                .unwrap_or_else(|| std::mem::take(&mut self.action_msg_spare));
+            let mut message = self.take_action_msg_buf(id, 256);
             message.clear();
             match cause {
                 ReconcileCause::Static(_, _, text) => message.push_str(text),
@@ -1443,6 +1548,7 @@ impl SupervisorInner {
             self.gripper_stalled = false;
             self.gripper_high_torque_ticks = 0;
             self.gripper_low_torque_ticks = 0;
+            self.gripper_stall_window.reset();
         }
         let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
         if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
@@ -1469,7 +1575,9 @@ impl SupervisorInner {
                 } else {
                     DeferredCompletionTarget::Anonymous
                 };
-                self.active_trajectory = None;
+                if let Some(old_traj) = self.active_trajectory.take() {
+                    self.retire_active_trajectory(old_traj);
+                }
                 self.commanded_velocities.fill(0.0);
                 crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 Some(DeferredActionDone {
@@ -1487,11 +1595,11 @@ impl SupervisorInner {
                     self.stop_motion();
                     self.tracking.invalidate();
                     if self.measured_positions.iter().all(|q| q.is_finite()) {
-                        self.commanded_positions = self.measured_positions.clone();
+                        crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
                     }
                     self.commanded_accelerations.fill(0.0);
-                } else {
-                    self.active_trajectory = None;
+                } else if let Some(old_traj) = self.active_trajectory.take() {
+                    self.retire_active_trajectory(old_traj);
                 }
                 if action_id.is_none() && self.park_release == Some(ParkRelease::Opening) {
                     tracing::warn!("Park release opening failed ({code}: {message}); skipping re-close and keeping held state");
@@ -1500,11 +1608,21 @@ impl SupervisorInner {
                     self.releasing = false;
                 }
                 self.commanded_velocities.fill(0.0);
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
                 if macro_sub {
-                    if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
-                } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
+                    if let Some(m) = self.macro_run.as_mut() {
+                        m.sub = SubState::Failed {
+                            code: crate::safety::BoundedText::new(code),
+                            message,
+                        };
+                    }
+                } else if let Some(id) = action_id {
+                    let mut msg = self.take_action_msg_buf(id, message.as_str().len().max(160));
+                    msg.clear();
+                    msg.push_str(message.as_str());
+                    self.finish_action(id, "failed", Some(code), Some(msg), None, None, None);
+                }
                 None
             }
         }

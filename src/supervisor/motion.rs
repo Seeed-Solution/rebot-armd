@@ -113,6 +113,7 @@ impl SupervisorInner {
         self.release_servo_target();
         self.gripper_stream_target = None;
         self.gripper_stream_contact = None;
+        self.gripper_stream_contact_detector.reset();
         self.gripper_stream_lease = None;
 
         // Lock onto measured_positions only when finite and the supervisor's own coherent
@@ -457,6 +458,7 @@ impl SupervisorInner {
                 self.release_servo_target();
                 self.gripper_stream_target = None;
                 self.gripper_stream_contact = None;
+                self.gripper_stream_contact_detector.reset();
                 self.gripper_stream_lease = None;
                 if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
@@ -716,6 +718,7 @@ impl SupervisorInner {
             self.release_servo_target();
             self.gripper_stream_target = None;
             self.gripper_stream_contact = None;
+            self.gripper_stream_contact_detector.reset();
             self.gripper_stream_lease = None;
             self.servo_settled_ticks.fill(0);
             self.servo_ws_min_depths = None;
@@ -966,6 +969,7 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }
@@ -1143,6 +1147,7 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }

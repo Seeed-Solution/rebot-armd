@@ -794,7 +794,30 @@ impl From<OwnerError> for ArmError {
     }
 }
 
+/// Immutable tool/follower/path identity for gripper baseline persistence, captured once before
+/// transferring `SupervisorInner` onto `armd-control` so baseline maintenance never clones strings
+/// or paths on the control thread.
+#[derive(Debug, Clone)]
+pub struct BaselineIdentity {
+    pub tool_id: String,
+    pub tool_config_digest: String,
+    pub follower: Option<String>,
+    pub path: Option<std::path::PathBuf>,
+}
+
+/// Payload returned by [`MaintenanceOp::TakeBaselinePending`] without allocating or freeing on
+/// `armd-control`.
+pub struct BaselineTakeReply {
+    pub moves: Vec<crate::gripper_baseline::MoveRecord>,
+    pub current: Option<crate::gripper_baseline::BaselineData>,
+    /// `(closed_rad, open_rad, initial_max_nm, calibration_initial_max_nm)` when a gripper policy exists.
+    pub policy: Option<(f32, f32, f32, f32)>,
+    pub generation: u64,
+    pub dirty: bool,
+}
+
 /// Bounded maintenance and shutdown operations routed through the single RT owner.
+#[allow(clippy::large_enum_variant)] // inline FreeTorqueBaseline keeps RT baseline store zero-alloc
 pub enum MaintenanceOp {
     RequestShutdown,
     CommitShutdown,
@@ -804,12 +827,22 @@ pub enum MaintenanceOp {
     ClearFault { expected_epoch: Option<u64> },
     SetJointZeroOffsets { offsets: Vec<f32> },
     SetMotorZero { joint: usize },
+    TakeBaselinePending {
+        fresh_pending: Vec<crate::gripper_baseline::MoveRecord>,
+        clear_dirty: bool,
+    },
+    StoreBaseline {
+        baseline: crate::gripper_baseline::FreeTorqueBaseline,
+        expected_generation: u64,
+        mark_dirty: bool,
+    },
+    MarkBaselineDirty,
     #[doc(hidden)]
     ProbeOwnedPayload { payload: Box<dyn Any + Send> },
 }
 
 /// Reply payload of one [`MaintenanceOp`].
-#[allow(clippy::large_enum_variant)] // bounded stack refusal keeps RT ClearFault zero-alloc
+#[allow(clippy::large_enum_variant)] // bounded stack refusal keeps RT ClearFault and baseline zero-alloc
 pub enum MaintenanceResult {
     ShutdownRequested(bool),
     ShutdownCommitted(bool),
@@ -819,6 +852,9 @@ pub enum MaintenanceResult {
     FaultCleared(Result<SafetyState, ClearFaultError>),
     JointZeroOffsetsSet(Result<(), String>),
     MotorZeroSet(Result<(), String>),
+    BaselineTaken(BaselineTakeReply),
+    BaselineStored(bool),
+    BaselineDirtyMarked,
     ProbeReturned,
     Stopped,
 }
@@ -834,6 +870,8 @@ struct MaintReply {
     returned_offsets: Option<Vec<f32>>,
     returned_probe: Option<Box<dyn Any + Send>>,
     returned_driver_config_error: Option<String>,
+    returned_pending: Option<Vec<crate::gripper_baseline::MoveRecord>>,
+    returned_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
 }
 
 enum MaintWaiter {
@@ -867,6 +905,9 @@ impl MaintClientInner {
             // Explicitly drop returned payloads here on the off-RT caller/dispatcher thread.
             drop(reply.returned_offsets);
             drop(reply.returned_probe);
+            drop(reply.returned_driver_config_error);
+            drop(reply.returned_pending);
+            drop(reply.returned_baseline);
             if let Some(waiter) = self.waiters.remove(&reply.id) {
                 let res = match reply.result {
                     MaintenanceResult::Stopped => Err(OwnerError::Stopped),
@@ -1553,6 +1594,7 @@ struct RtExecutorShared {
     monitor_thread: Mutex<Option<JoinHandle<()>>>,
     persist_park_thread: Thread,
     clock: Option<Arc<dyn ExecutorClock>>,
+    baseline_identity: BaselineIdentity,
 }
 
 impl RtExecutorShared {
@@ -1682,6 +1724,7 @@ impl RtExecutorHandle {
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
     pub fn executor_thread_id(&self) -> ThreadId { self.shared.executor_thread_id }
     pub fn is_exited(&self) -> bool { self.shared.exited.load(Ordering::Acquire) }
+    pub fn baseline_identity(&self) -> &BaselineIdentity { &self.shared.baseline_identity }
     #[doc(hidden)]
     pub fn persist_worker_exited(&self) -> bool { self.shared.persist_worker_exited.load(Ordering::Acquire) }
 
@@ -1787,6 +1830,49 @@ impl RtExecutorHandle {
         }
     }
 
+    pub async fn take_baseline_pending_async(
+        &self,
+        clear_dirty: bool,
+    ) -> Result<BaselineTakeReply, OwnerError> {
+        let fresh_pending = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
+        match self
+            .call_maintenance_async(MaintenanceOp::TakeBaselinePending {
+                fresh_pending,
+                clear_dirty,
+            })
+            .await?
+        {
+            MaintenanceResult::BaselineTaken(reply) => Ok(reply),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn store_baseline_async(
+        &self,
+        baseline: crate::gripper_baseline::FreeTorqueBaseline,
+        expected_generation: u64,
+        mark_dirty: bool,
+    ) -> Result<bool, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::StoreBaseline {
+                baseline,
+                expected_generation,
+                mark_dirty,
+            })
+            .await?
+        {
+            MaintenanceResult::BaselineStored(stored) => Ok(stored),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn mark_baseline_dirty_async(&self) -> Result<(), OwnerError> {
+        match self.call_maintenance_async(MaintenanceOp::MarkBaselineDirty).await? {
+            MaintenanceResult::BaselineDirtyMarked => Ok(()),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
     #[doc(hidden)]
     pub fn probe_owned_payload(&self, payload: Box<dyn Any + Send>) -> Result<(), OwnerError> {
         match self.call_maintenance(MaintenanceOp::ProbeOwnedPayload { payload })? {
@@ -1852,6 +1938,12 @@ pub(crate) fn spawn_executor(
 ) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), (Option<Box<SupervisorInner>>, String)> {
     let hub = core.core.hub().clone();
     let e_stop_latched = core.e_stop_latched.clone();
+    let baseline_identity = BaselineIdentity {
+        tool_id: core.config.active_tool.id.clone(),
+        tool_config_digest: core.config.active_tool.config_digest.clone(),
+        follower: core.follower.clone(),
+        path: core.gripper_baseline_path.clone(),
+    };
     let (engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
     core.attach_stop_requests(stop_requests.clone());
 
@@ -2026,6 +2118,7 @@ pub(crate) fn spawn_executor(
         monitor_thread: Mutex::new(monitor_thread),
         persist_park_thread,
         clock: hooks.clock.clone(),
+        baseline_identity,
     });
     Ok((RtExecutorHandle { shared }, sinks))
 }
@@ -2200,6 +2293,8 @@ impl ControlState {
         *maint_req_id = req.id;
         let mut returned_offsets = None;
         let mut returned_probe = None;
+        let mut returned_pending = None;
+        let mut returned_baseline = None;
         let result = match req.op {
             MaintenanceOp::RequestShutdown => {
                 let confirmed = core.request_shutdown();
@@ -2264,6 +2359,67 @@ impl ControlState {
                 };
                 MaintenanceResult::MotorZeroSet(res)
             }
+            MaintenanceOp::TakeBaselinePending { fresh_pending, clear_dirty } => {
+                let moves = if core.gripper_baseline_pending.is_empty() {
+                    returned_pending = Some(fresh_pending);
+                    Vec::new()
+                } else {
+                    std::mem::replace(&mut core.gripper_baseline_pending, fresh_pending)
+                };
+                let tool = &core.config.active_tool;
+                let stroke = core
+                    .config
+                    .gripper_policy
+                    .as_ref()
+                    .map(|p| (p.closed_rad.min(p.open_rad), p.closed_rad.max(p.open_rad)));
+                let current = core
+                    .gripper_baseline
+                    .as_ref()
+                    .filter(|b| {
+                        b.belongs_to(&tool.id, &tool.config_digest, core.follower.as_deref())
+                            && stroke.is_some_and(|(lo, hi)| {
+                                (b.lo_rad - lo).abs() < 1e-3 && (b.hi_rad - hi).abs() < 1e-3
+                            })
+                    })
+                    .map(crate::gripper_baseline::FreeTorqueBaseline::data_snapshot);
+                let dirty = core.gripper_baseline_dirty;
+                // Only clear `dirty` here when draining an idle dirty flush (`moves.is_empty()`)
+                // with a matching baseline to persist; non-empty `moves` clear `dirty` atomically
+                // in `StoreBaseline` so transient maintenance/policy errors never drop dirty state.
+                if moves.is_empty() && dirty && clear_dirty && current.is_some() {
+                    core.gripper_baseline_dirty = false;
+                }
+                let policy = core.config.gripper_policy.as_ref().map(|p| {
+                    (
+                        p.closed_rad,
+                        p.open_rad,
+                        crate::gripper_calib::initial_max_nm(core),
+                        crate::gripper_calib::calibration_initial_max_nm(core),
+                    )
+                });
+                MaintenanceResult::BaselineTaken(BaselineTakeReply {
+                    moves,
+                    current,
+                    policy,
+                    generation: core.gripper_baseline_generation,
+                    dirty,
+                })
+            }
+            MaintenanceOp::StoreBaseline { baseline, expected_generation, mark_dirty } => {
+                if core.gripper_baseline_generation == expected_generation {
+                    returned_baseline = core.gripper_baseline.replace(baseline);
+                    core.gripper_baseline_generation += 1;
+                    core.gripper_baseline_dirty = mark_dirty;
+                    MaintenanceResult::BaselineStored(true)
+                } else {
+                    returned_baseline = Some(baseline);
+                    MaintenanceResult::BaselineStored(false)
+                }
+            }
+            MaintenanceOp::MarkBaselineDirty => {
+                core.gripper_baseline_dirty = true;
+                MaintenanceResult::BaselineDirtyMarked
+            }
             MaintenanceOp::ProbeOwnedPayload { payload } => {
                 returned_probe = Some(payload);
                 MaintenanceResult::ProbeReturned
@@ -2276,6 +2432,8 @@ impl ControlState {
             returned_offsets,
             returned_probe,
             returned_driver_config_error,
+            returned_pending,
+            returned_baseline,
         });
     }
 
@@ -2298,19 +2456,27 @@ impl ControlState {
 
     fn drain_maintenance_stopped(&mut self) {
         if let Some(reply) = self.pending_maint_reply.take() {
+            let returned_pending = match reply.result {
+                MaintenanceResult::BaselineTaken(taken) if !taken.moves.is_empty() => Some(taken.moves),
+                _ => reply.returned_pending,
+            };
             self.push_maint_reply_or_offload(MaintReply {
                 id: reply.id,
                 result: MaintenanceResult::Stopped,
                 returned_offsets: reply.returned_offsets,
                 returned_probe: reply.returned_probe,
                 returned_driver_config_error: reply.returned_driver_config_error,
+                returned_pending,
+                returned_baseline: reply.returned_baseline,
             });
         }
         while let Ok(req) = self.maint_req_rx.pop() {
-            let (returned_offsets, returned_probe) = match req.op {
-                MaintenanceOp::SetJointZeroOffsets { offsets } => (Some(offsets), None),
-                MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload)),
-                _ => (None, None),
+            let (returned_offsets, returned_probe, returned_pending, returned_baseline) = match req.op {
+                MaintenanceOp::SetJointZeroOffsets { offsets } => (Some(offsets), None, None, None),
+                MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload), None, None),
+                MaintenanceOp::TakeBaselinePending { fresh_pending, .. } => (None, None, Some(fresh_pending), None),
+                MaintenanceOp::StoreBaseline { baseline, .. } => (None, None, None, Some(baseline)),
+                _ => (None, None, None, None),
             };
             self.push_maint_reply_or_offload(MaintReply {
                 id: req.id,
@@ -2318,6 +2484,8 @@ impl ControlState {
                 returned_offsets,
                 returned_probe,
                 returned_driver_config_error: None,
+                returned_pending,
+                returned_baseline,
             });
         }
     }
@@ -4738,6 +4906,8 @@ mod tests {
                     returned_offsets: None,
                     returned_probe: None,
                     returned_driver_config_error: None,
+                    returned_pending: None,
+                    returned_baseline: None,
                 })
                 .unwrap();
             exited.store(true, Ordering::Release);
@@ -5034,7 +5204,17 @@ mod tests {
         // Fill `maint_rep_tx` to full (2/2), `persist_rep_tx` to slots() == 1 (7/8),
         // and `offload_reclaim_tx` to full (2/2) to exercise retained-job fallback.
         for id in 1..=2 {
-            maint_rep_tx.push(MaintReply { id, result: MaintenanceResult::ProbeReturned, returned_offsets: None, returned_probe: None, returned_driver_config_error: None }).unwrap();
+            maint_rep_tx
+                .push(MaintReply {
+                    id,
+                    result: MaintenanceResult::ProbeReturned,
+                    returned_offsets: None,
+                    returned_probe: None,
+                    returned_driver_config_error: None,
+                    returned_pending: None,
+                    returned_baseline: None,
+                })
+                .unwrap();
         }
         for _ in 0..(PERSIST_REP_CAPACITY - 1) {
             persist_rep_tx.push(PersistReply::Done {
