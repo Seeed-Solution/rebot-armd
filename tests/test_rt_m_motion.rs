@@ -106,6 +106,8 @@ struct DriverKnobs {
     estop_inhibit_disable: Arc<AtomicBool>,
     disable_started: Arc<AtomicBool>,
     nudge_q0_on_enable: Arc<Mutex<Option<f32>>>,
+    reported_vel_j0_bits: Arc<std::sync::atomic::AtomicU32>,
+    override_q0_bits: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DriverKnobs {
@@ -116,6 +118,8 @@ impl DriverKnobs {
             estop_inhibit_disable: Arc::new(AtomicBool::new(false)),
             disable_started: Arc::new(AtomicBool::new(false)),
             nudge_q0_on_enable: Arc::new(Mutex::new(None)),
+            reported_vel_j0_bits: Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits())),
+            override_q0_bits: Arc::new(std::sync::atomic::AtomicU32::new(f32::NAN.to_bits())),
         }
     }
 }
@@ -186,9 +190,13 @@ impl ArmDriver for MotionTestDriver {
     }
     fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         let now = self.now();
+        let vel0 = f32::from_bits(self.knobs.reported_vel_j0_bits.load(Ordering::Relaxed));
+        let ov_q0 = f32::from_bits(self.knobs.override_q0_bits.load(Ordering::Relaxed));
         out.clear();
         for i in 0..self.dof {
-            out.push(JointState { position: self.q[i], velocity: 0.0, torque: 0.0, temperature: 30.0 });
+            let position = if i == 0 && ov_q0.is_finite() { ov_q0 } else { self.q[i] };
+            let velocity = if i == 0 { vel0 } else { 0.0 };
+            out.push(JointState { position, velocity, torque: 0.0, temperature: 30.0 });
             self.rx_at[i] = Some(now);
             self.seqs[i] += 1;
         }
@@ -1576,6 +1584,100 @@ async fn m2_off_thread_watchdog_park_bare_quintic_refusal_mit_handback_and_zero_
         let cont_plan = req::prepare_motion(&MotionPlanSnapshot::from_supervisor(&inner), &MotionRequest::park()).unwrap();
         req::install_park_continuation(&mut inner, park_id, &cont_plan.slot, None, Some(ep), false).unwrap();
         assert!(inner.park_continuation().is_none() && inner.pending_normal_unload);
+    }
+
+    // 9e. Round 3 Item 3: RT watchdog park settle-timeout branches (`at_pose` grace extension +
+    //     grace expiry `WatchdogTimeout`, AND `!at_pose` immediate `WatchdogTimeout`) must execute
+    //     on `armd-control` with strictly `AllocCounts::ZERO` (no diagnostic `String` allocations).
+    for test_at_pose_grace in [true, false] {
+        let step_period = Duration::from_millis(20);
+        let step_period_ns = step_period.as_nanos() as u64;
+        let mut cfg = parkable_2dof_config();
+        cfg.lease_timeout_ms = 60;
+        let clock = ScriptedClock::new();
+        let (drv, knobs) = MotionTestDriver::new(vec![0.12, 0.05], Duration::from_millis(4), Duration::from_millis(4), Some(clock.clone()));
+        if test_at_pose_grace {
+            // Reach resting pose [0.0, 0.0] (`at_pose == true`), but report velocity > max_velocity
+            // (0.015 rad/s) so the stationary settle window never completes -> exercises grace grant
+            // AND post-grace WatchdogTimeout latch.
+            knobs.reported_vel_j0_bits.store(0.05f32.to_bits(), Ordering::Relaxed);
+        } else {
+            // Keep measured joint 0 outside resting_pose tolerance (0.08 rad) yet well below
+            // following_error bound so `at_pose == false` -> immediate WatchdogTimeout without grace.
+            knobs.override_q0_bits.store(0.12f32.to_bits(), Ordering::Relaxed);
+        }
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        {
+            let mut inner = sup.inner().write().await;
+            inner.lease_enabled = true;
+            let _ = inner.acquire_lease("client-wd-settle-timeout").unwrap();
+            let s = inner.current_admission_stamp();
+            SupervisorInner::enable_torque(inner.check_admission(s).unwrap()).unwrap();
+            inner.commanded_positions = vec![0.12, 0.05];
+            inner.measured_positions = vec![0.12, 0.05];
+            inner.target_positions = vec![0.12, 0.05];
+            inner.last_heartbeat = std::time::Instant::now() - Duration::from_millis(200);
+        }
+        let mut exec_cfg = ExecutorConfig::for_tests(step_period);
+        exec_cfg.alloc_timing = true;
+        let mut hooks = PersistTestHooks::default();
+        hooks.clock = Some(clock.clone());
+        let handle = sup.start_executor_with_hooks(exec_cfg, hooks).await.unwrap();
+
+        // Step 1 triggers lease expiry and defers watchdog park planning off-thread.
+        clock.run_steps(step_period_ns, 1);
+        assert_ne!(sup.hub().latest().unwrap().rt.watchdog_park_pending_gen, 0);
+
+        // Wait for off-thread watchdog park to be planned and installed by armd-persist.
+        let mut installed = false;
+        for _ in 0..80 {
+            clock.run_steps(step_period_ns, 1);
+            let s = sup.hub().latest().unwrap();
+            if s.rt.watchdog_park_pending_gen == 0 && s.obs.safety_state.is_operational() {
+                installed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(installed, "off-thread watchdog park must install before settle-timeout check");
+
+        // Advance past WATCHDOG_PARK_TIMEOUT (10 s) + WATCHDOG_PARK_SETTLE_GRACE (5 s) = ~16 s.
+        let mut saw_grace_still_operational = false;
+        let mut latched_watchdog_fault = false;
+        let mut fault_step = 0usize;
+        for step in 1..=950 {
+            clock.run_steps(step_period_ns, 1);
+            let s = sup.hub().latest().unwrap();
+            if test_at_pose_grace && step == 560 {
+                // ~11.2 s: initial 10 s budget expired, 5 s grace must keep the arm operational.
+                assert!(
+                    s.obs.safety_state.is_operational(),
+                    "grace window must keep arm operational past initial 10 s budget; got {:?}",
+                    s.obs.safety_state
+                );
+                saw_grace_still_operational = true;
+            }
+            if matches!(s.obs.safety_state, SafetyState::Fault(armd::safety::FaultReason::WatchdogTimeout)) {
+                assert!(s.obs.is_torqued, "torque must remain held on WatchdogTimeout");
+                latched_watchdog_fault = true;
+                fault_step = step;
+                break;
+            }
+        }
+        if test_at_pose_grace {
+            assert!(saw_grace_still_operational, "at-pose settle timeout must grant grace window first");
+            assert!(fault_step > 560, "at-pose fault must occur only after 5 s grace expires (step={fault_step})");
+        } else {
+            assert!(fault_step < 560, "off-pose timeout must latch immediately without 5 s grace (step={fault_step})");
+        }
+        assert!(latched_watchdog_fault, "settle timeout (test_at_pose_grace={test_at_pose_grace}) must latch WatchdogTimeout");
+        assert!(!knobs.disable_started.load(Ordering::Acquire), "must not cut torque when settle timed out");
+        assert_eq!(
+            handle.stats().total_allocs(),
+            AllocCounts::ZERO,
+            "RT settle-timeout branch (test_at_pose_grace={test_at_pose_grace}) must perform zero heap alloc/free on armd-control"
+        );
+        drop(handle);
     }
 }
 

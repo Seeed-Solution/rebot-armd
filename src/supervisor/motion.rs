@@ -738,22 +738,42 @@ impl SupervisorInner {
             self.latch_watchdog_fault();
             return;
         }
+        if self.rt_executor_owned {
+            let at_pose = self.active_trajectory.is_none() && self.is_resting_pose_static_ok();
+            if at_pose && !park.grace_granted {
+                park.budget_s += WATCHDOG_PARK_SETTLE_GRACE.as_secs_f64();
+                park.grace_granted = true;
+                self.watchdog_park = Some(park);
+                return;
+            }
+            let reason = self.unload_settle_blocker_static();
+            self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new(reason));
+            self.latch_watchdog_fault();
+            return;
+        }
         let blocker = self.unload_settle_blocker().unwrap_or_else(|| "settle pending".into());
         let at_pose = self.active_trajectory.is_none() && self.resting_pose_static_violation().is_none();
         if at_pose && !park.grace_granted {
-            if !self.rt_executor_owned {
-                tracing::warn!("Watchdog park at the resting pose after {:.2} s but not settled ({blocker}); waiting up to {:?} more",
-                    park.elapsed_s, WATCHDOG_PARK_SETTLE_GRACE);
-            }
+            tracing::warn!("Watchdog park at the resting pose after {:.2} s but not settled ({blocker}); waiting up to {:?} more",
+                park.elapsed_s, WATCHDOG_PARK_SETTLE_GRACE);
             park.budget_s += WATCHDOG_PARK_SETTLE_GRACE.as_secs_f64();
             park.grace_granted = true;
             self.watchdog_park = Some(park);
             return;
         }
-        if !self.rt_executor_owned {
-            tracing::warn!("Watchdog park did not finish within {:.2} s ({blocker}); holding torque and latching WatchdogTimeout", park.budget_s);
-        }
+        tracing::warn!("Watchdog park did not finish within {:.2} s ({blocker}); holding torque and latching WatchdogTimeout", park.budget_s);
         self.latch_watchdog_fault();
+    }
+
+    /// Allocation-free static reason code for a pending unload settle on `armd-control`.
+    fn unload_settle_blocker_static(&mut self) -> &'static str {
+        if self.active_trajectory.is_some() {
+            "park trajectory still running"
+        } else if !self.is_resting_pose_static_ok() {
+            "resting pose static check failed"
+        } else {
+            "settle stationary check pending"
+        }
     }
 
     /// Zero-allocation bounded check of conditions for parking automatically when the lease
