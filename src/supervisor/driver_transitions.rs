@@ -2221,6 +2221,14 @@ impl SupervisorInner {
         self.e_stop_latched.store(false, Ordering::SeqCst);
         self.shutdown_refused_unknown = false;
         if self.consume_pending_estop() {
+            if let Some(received) = ctx.expected_epoch {
+                if received != self.safety.epoch_id() {
+                    return Err(ClearFaultError::EpochMismatch {
+                        expected: self.safety.epoch_id(),
+                        received,
+                    });
+                }
+            }
             return Err(ClearFaultError::EStopActive);
         }
         self.last_heartbeat = Instant::now();
@@ -2368,8 +2376,34 @@ impl SupervisorInner {
     /// `SafetyManager::clear_check` runs FIRST before any concurrent-E-stop mutation, driver limit
     /// commit, motor reset, or other side effect.
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
-    pub fn clear_fault_executor_bounded(&mut self, deadline: Instant) -> Result<SafetyState, crate::safety::ClearFaultError> {
+    pub fn clear_fault_executor_bounded(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        self.clear_fault_executor_bounded_for_epoch(deadline, None)
+    }
+
+    /// Bounded, allocation-free fault clearing for the RT executor enforcing exact `expected_epoch`
+    /// parity with [`Self::clear_fault_for_epoch`].
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    pub fn clear_fault_executor_bounded_for_epoch(
+        &mut self,
+        deadline: Instant,
+        expected_epoch: Option<u64>,
+    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
         use crate::safety::{ClearFaultError as E, ClearRefusal as R};
+        let apply_estop_refusal = |this: &mut Self| -> E {
+            this.consume_pending_estop();
+            if let Some(received) = expected_epoch {
+                if received != this.safety.epoch_id() {
+                    return E::EpochMismatch {
+                        expected: this.safety.epoch_id(),
+                        received,
+                    };
+                }
+            }
+            E::EStopActive
+        };
         let had_driver_config_error = self.driver_config_error.is_some();
         let (candidate_limits, driver_err_override) = if had_driver_config_error {
             match self.probe_driver_limits_bounded() {
@@ -2386,12 +2420,12 @@ impl SupervisorInner {
             if candidate_limits.is_some() {
                 ctx.driver_config_error = None;
             }
+            ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == R::EStopActive {
-                    self.consume_pending_estop();
-                    return Err(E::EStopActive);
+                    return Err(apply_estop_refusal(self));
                 }
                 return Err(E::from(refusal));
             }
@@ -2473,6 +2507,7 @@ impl SupervisorInner {
             if candidate_limits.is_some() {
                 ctx.driver_config_error = None;
             }
+            ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
             ctx.feedback_fresh = fb_fresh;
@@ -2489,10 +2524,7 @@ impl SupervisorInner {
             // concurrent E-stop / config mutation.
             match self.safety.clear_check(&ctx) {
                 Ok(()) => {}
-                Err(R::EStopActive) => {
-                    self.consume_pending_estop();
-                    return Err(E::EStopActive);
-                }
+                Err(R::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(R::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
                     // so a budgeted motor reset is now permitted; re-evaluate `clear_check` after.
@@ -2513,8 +2545,7 @@ impl SupervisorInner {
                     }
                     let post_refusal = self.safety.clear_check(&ctx).unwrap_err();
                     if post_refusal == R::EStopActive {
-                        self.consume_pending_estop();
-                        return Err(E::EStopActive);
+                        return Err(apply_estop_refusal(self));
                     }
                     return Err(E::from(post_refusal));
                 }
@@ -2531,14 +2562,14 @@ impl SupervisorInner {
             if candidate_limits.is_some() {
                 ctx.driver_config_error = None;
             }
+            ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
             ctx.joint_limit_violation =
                 self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == R::EStopActive {
-                    self.consume_pending_estop();
-                    return Err(E::EStopActive);
+                    return Err(apply_estop_refusal(self));
                 }
                 return Err(E::from(refusal));
             }
@@ -2551,7 +2582,17 @@ impl SupervisorInner {
 
     /// Bounded fault clearing for the RT executor rendered into [`SafetyError`] for direct callers.
     pub fn clear_fault_executor(&mut self, deadline: Instant) -> Result<SafetyState, SafetyError> {
-        self.clear_fault_executor_bounded(deadline).map_err(SafetyError::from)
+        self.clear_fault_executor_for_epoch(deadline, None)
+    }
+
+    /// Bounded fault clearing for the RT executor with exact epoch check rendered into [`SafetyError`].
+    pub fn clear_fault_executor_for_epoch(
+        &mut self,
+        deadline: Instant,
+        expected_epoch: Option<u64>,
+    ) -> Result<SafetyState, SafetyError> {
+        self.clear_fault_executor_bounded_for_epoch(deadline, expected_epoch)
+            .map_err(SafetyError::from)
     }
 
     /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.

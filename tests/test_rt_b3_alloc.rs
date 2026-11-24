@@ -2913,3 +2913,192 @@ fn thermal_cooldown_restarts_across_unobserved_stale_gap_without_tick() {
         "per-joint >250ms gap must restart dwell to 0 ms: {err_restart}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_clear_fault_carries_epoch_and_refuses_after_newer_estop() {
+    use armd::rt_core::executor::ExecutorClock;
+
+    struct StepClock {
+        origin: Instant,
+        state: Mutex<(u64, u64)>, // (now_ns, sleeping_waiters)
+        cv: Condvar,
+    }
+    impl StepClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                origin: Instant::now(),
+                state: Mutex::new((0, 0)),
+                cv: Condvar::new(),
+            })
+        }
+        fn wait_until_parked(&self) {
+            let mut g = self.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while g.1 == 0 {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                assert!(!rem.is_zero(), "timed out waiting for armd-control to park on StepClock");
+                g = self.cv.wait_timeout(g, rem).unwrap().0;
+            }
+        }
+        fn advance(&self, dur: Duration) {
+            let mut g = self.state.lock().unwrap();
+            g.0 = g.0.saturating_add(dur.as_nanos() as u64);
+            self.cv.notify_all();
+        }
+    }
+    impl ExecutorClock for StepClock {
+        fn now(&self) -> Instant {
+            let ns = self.state.lock().unwrap().0;
+            self.origin + Duration::from_nanos(ns)
+        }
+        fn now_ns(&self) -> u64 {
+            self.state.lock().unwrap().0
+        }
+        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+            let mut g = self.state.lock().unwrap();
+            g.1 += 1;
+            self.cv.notify_all();
+            while !stop.load(Ordering::Acquire) && g.0 < target_ns {
+                g = self.cv.wait_timeout(g, Duration::from_millis(5)).unwrap().0;
+            }
+            g.1 -= 1;
+        }
+        fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+            let target = self.now_ns().saturating_add(dur.as_nanos() as u64);
+            self.sleep_until_ns(target, stop);
+        }
+        fn wake(&self) {
+            self.cv.notify_all();
+        }
+    }
+
+    // 1. Live RtExecutor: queue ClearFault(Some(e)), latch a newer E-stop B before the release runs,
+    //    then step armd-control -> refused with EpochMismatch, latch kept, 0 heap allocs.
+    let period = Duration::from_millis(20);
+    let step_clock = StepClock::new();
+    let cfg = ArmConfig::rebot_dm();
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    {
+        let mut g = sup.inner().write().await;
+        g.lease_enabled = false;
+    }
+    let mut exec_cfg = ExecutorConfig::for_tests(period);
+    exec_cfg.alloc_timing = true;
+    let hooks = PersistTestHooks {
+        clock: Some(step_clock.clone()),
+        ..Default::default()
+    };
+    let handle = sup.start_executor_with_hooks(exec_cfg, hooks).await.unwrap();
+    let step_one = |target_steps: u64| {
+        step_clock.wait_until_parked();
+        step_clock.advance(period);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.stats().steps.load(Ordering::Acquire) < target_steps {
+            assert!(Instant::now() < deadline, "timed out waiting for step {target_steps}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // Warm up every StateHub slot and per-tick scratch buffer before measuring release allocations.
+    let mut expected_steps = handle.stats().steps.load(Ordering::Acquire);
+    for _ in 0..8 {
+        expected_steps += 1;
+        step_one(expected_steps);
+    }
+    step_clock.wait_until_parked();
+
+    // Latch E-stop A and observe epoch e.
+    let estop_a = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.trigger_e_stop_checked().await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    expected_steps += 1;
+    step_one(expected_steps);
+    let (state_a, epoch_a) = estop_a.await.unwrap().unwrap();
+    assert_eq!(state_a, SafetyState::EStop);
+    step_clock.wait_until_parked();
+
+    // While armd-control is parked between releases:
+    // (a) Queue ClearFault carrying client-observed epoch_a.
+    let clear_stale = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.clear_fault_for_epoch(Some(epoch_a)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    // (b) Latch a newer E-stop B before the queued clear is applied.
+    let estop_b = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.trigger_e_stop_checked().await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Step one release: Step 1 applies E-stop B (epoch_a + 1), Step 2b evaluates queued ClearFault(epoch_a).
+    expected_steps += 1;
+    step_one(expected_steps);
+    let (state_b, epoch_b) = estop_b.await.unwrap().unwrap();
+    assert_eq!(state_b, SafetyState::EStop);
+    assert_eq!(epoch_b, epoch_a + 1);
+
+    let clear_res = clear_stale.await.unwrap();
+    assert!(
+        matches!(
+            clear_res,
+            Err(ArmError::Safety(SafetyError::EpochMismatch { expected, received }))
+                if expected == epoch_b && received == epoch_a
+        ),
+        "queued ClearFault with stale epoch_a must be refused after newer E-stop B: {clear_res:?}"
+    );
+    let obs_after_refuse = sup.hub().latest().expect("published observation");
+    assert_eq!(obs_after_refuse.obs.safety_state, SafetyState::EStop, "latch must stay active");
+    assert_eq!(obs_after_refuse.obs.epoch_id, epoch_b);
+
+    let refuse_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
+    let refuse_sample = expect_release_sample(&sup, refuse_seq, "executor stale-epoch clear refusal").await;
+    assert_ne!(refuse_sample.release_flags & RELEASE_FLAG_CLEAR_REFUSED, 0);
+    assert_eq!(refuse_sample.usage.lock_alloc_calls, 0, "stale-epoch clear refusal allocated: {refuse_sample:?}");
+
+    // Queuing ClearFault with the exact current epoch_b clears cleanly with 0 allocs.
+    step_clock.wait_until_parked();
+    let clear_exact = tokio::spawn({
+        let sup = Arc::clone(&sup);
+        async move { sup.clear_fault_for_epoch(Some(epoch_b)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    expected_steps += 1;
+    step_one(expected_steps);
+    assert_eq!(clear_exact.await.unwrap().unwrap(), SafetyState::Idle);
+    let ok_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
+    assert!(ok_seq > refuse_seq);
+    let ok_sample = expect_release_sample(&sup, ok_seq, "executor exact-epoch clear ok").await;
+    assert_ne!(ok_sample.release_flags & RELEASE_FLAG_CLEAR_OK, 0);
+    assert_eq!(ok_sample.usage.lock_alloc_calls, 0, "exact-epoch clear allocated: {ok_sample:?}");
+
+    step_clock.advance(period);
+    handle.stop_and_join();
+
+    // 2. Owner-level direct check: pending unconsumed E-stop B arriving right before
+    //    clear_fault_executor_bounded_for_epoch(Some(e)) -> EpochMismatch (0 heap allocs).
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+    inner.lease_enabled = false;
+    inner.safety.set_off_thread_reclaim(true);
+    inner.apply_stop_policy(StopPolicy::EStopLatch);
+    let e = inner.safety.epoch_id();
+    // Simulate a newer E-stop B queued before clear_fault runs on owner.
+    inner.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+    alloc::time_this_thread();
+    let _ = alloc::take();
+    let err = inner
+        .clear_fault_executor_bounded_for_epoch(Instant::now() + Duration::from_millis(50), Some(e))
+        .unwrap_err();
+    assert_eq!(alloc::take().calls, 0, "pending-estop EpochMismatch on executor path allocated");
+    assert_eq!(err, ClearFaultError::EpochMismatch { expected: e + 1, received: e });
+    assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert_eq!(inner.safety.epoch_id(), e + 1);
+    // Exact epoch clears cleanly with 0 heap allocs.
+    let _ = alloc::take();
+    let cleared = inner
+        .clear_fault_executor_bounded_for_epoch(Instant::now() + Duration::from_millis(50), Some(e + 1))
+        .unwrap();
+    assert_eq!(alloc::take().calls, 0, "exact-epoch clear_fault_executor_bounded_for_epoch allocated");
+    assert_eq!(cleared, SafetyState::Idle);
+}

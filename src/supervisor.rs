@@ -5267,10 +5267,14 @@ impl ArmSupervisor {
     }
 
     pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
+        self.clear_fault_for_epoch(None).await
+    }
+
+    pub async fn clear_fault_for_epoch(&self, expected_epoch: Option<u64>) -> Result<SafetyState, ArmError> {
         match self.owner_mode() {
             OWNER_EXECUTOR => {
                 let h = self.executor_handle().ok_or_else(executor_unavailable)?;
-                let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                let res = h.clear_fault_for_epoch_async(expected_epoch).await.map_err(ArmError::from)?;
                 res.map_err(ArmError::Safety)
             }
             OWNER_LEGACY => {
@@ -5279,14 +5283,14 @@ impl ArmSupervisor {
                     drop(inner);
                     if self.owner_mode() == OWNER_EXECUTOR {
                         let h = self.executor_handle().ok_or_else(executor_unavailable)?;
-                        let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                        let res = h.clear_fault_for_epoch_async(expected_epoch).await.map_err(ArmError::from)?;
                         return res.map_err(ArmError::Safety);
                     }
                     return Err(executor_unavailable());
                 }
                 let estop_reg = Arc::clone(&self.estop_reg);
                 let res = tokio::task::spawn_blocking(move || {
-                    let r = inner.clear_fault();
+                    let r = inner.clear_fault_for_epoch(expected_epoch);
                     inner.safety.drain_retired_state_arcs_off_thread();
                     ArmSupervisor::flush_legacy_estop_acks_into(&estop_reg, &mut inner);
                     r
