@@ -24,6 +24,17 @@ pub(crate) struct CandidateDriverLimits {
     min: [f32; crate::rt_core::mailbox::MAX_DOF],
     max: [f32; crate::rt_core::mailbox::MAX_DOF],
     vel: [f32; crate::rt_core::mailbox::MAX_DOF],
+    raw_pos: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
+}
+
+/// Side effects staged during `clear_fault` preflight and applied ONLY AFTER
+/// `SafetyManager::clear_with_check` commits (zero state mutations on refusal).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ClearFaultCommit {
+    pub(crate) candidate_limits: Option<CandidateDriverLimits>,
+    pub(crate) reapply_legacy_limits: bool,
+    pub(crate) is_torqued: Option<bool>,
+    pub(crate) thermal_cooldown: Option<ThermalCooldown>,
 }
 
 /// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
@@ -586,7 +597,7 @@ impl SupervisorInner {
         }
         let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &self.joint_zero_offsets));
         self.apply_driver_limits(driver.as_ref());
-        self.driver = Some(std::sync::Mutex::new(driver));
+        self.install_driver(driver);
         self.refresh_schema_cache();
         self
     }
@@ -652,6 +663,9 @@ impl SupervisorInner {
         trigger_fault: bool,
     ) {
         self.driver_config_error = None;
+        for (i, slot) in self.cached_driver_pos_limits.iter_mut().enumerate() {
+            *slot = pos_limits.get(i).copied().flatten();
+        }
         let mut candidate = self.config.clone();
 
         for (i, limit) in candidate.limits.iter_mut().enumerate() {
@@ -802,6 +816,61 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation check whether a candidate `GripperPolicy` satisfies both profile and
+    /// driver hardware position limits without mutating `self`.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_gripper_policy_against_driver_bounded(
+        &self,
+        gp: &crate::model::GripperPolicy,
+    ) -> Result<(), crate::safety::BoundedText<256>> {
+        use crate::safety::BoundedText;
+        let Some(g_idx) = self.config.gripper_index() else {
+            return Err(BoundedText::new("Gripper calibration requires a gripper joint"));
+        };
+        let Some(lim) = self.config.limits.get(g_idx) else {
+            return Err(BoundedText::new("Gripper calibration requires gripper joint limits"));
+        };
+        let mut lo = lim.min_position;
+        let mut hi = lim.max_position;
+        if self.rt_executor_owned {
+            if let Some((d_min, d_max)) = self.cached_driver_pos_limits.get(g_idx).copied().flatten() {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        } else if let Some(d) = self.driver.as_ref() {
+            let drv = d
+                .lock()
+                .map_err(|_| BoundedText::new("driver unavailable while validating gripper calibration"))?;
+            if let Some((d_min, d_max)) = drv.position_limits(g_idx) {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        }
+        if self.driver_config_error.is_some() && self.driver.is_none() {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("Driver limit configuration error prevents gripper calibration")));
+        }
+        let in_lim = |v: f32| v.is_finite() && v >= lo && v <= hi;
+        if !(in_lim(gp.closed_rad)
+            && in_lim(gp.open_rad)
+            && gp.jaw_opening.as_ref().is_none_or(|jo| jo.points.iter().all(|&[q, _]| in_lim(q))))
+        {
+            return Err(BoundedText::new(
+                "Driver limits violated config invariants: Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)",
+            ));
+        }
+        Ok(())
+    }
+
     /// Pure read-only validation of driver position/velocity limits into bounded stack storage
     /// (zero allocations, zero mutations to `self`).
     #[allow(clippy::result_large_err)] // inline bounded text avoids RT heap allocation
@@ -940,6 +1009,7 @@ impl SupervisorInner {
             min: cand_min,
             max: cand_max,
             vel: cand_vel,
+            raw_pos: pos_limits,
         })
     }
 
@@ -950,6 +1020,7 @@ impl SupervisorInner {
             self.config.limits[i].min_position = cand.min[i];
             self.config.limits[i].max_position = cand.max[i];
             self.config.limits[i].max_velocity = cand.vel[i];
+            self.cached_driver_pos_limits[i] = cand.raw_pos[i];
         }
         if let Some(prev) = self.driver_config_error.take() {
             if self.retired_driver_config_error.is_none() {
@@ -962,7 +1033,7 @@ impl SupervisorInner {
 
     /// Pure read-only check of `positions` against either validated candidate limits (if
     /// `driver_config_error` just resolved) or current `self.config.limits` (zero heap allocations).
-    fn joint_limit_clear_violation_for_positions(
+    pub(crate) fn joint_limit_clear_violation_for_positions(
         &self,
         positions: &[f32],
         cand: Option<&CandidateDriverLimits>,
@@ -1005,7 +1076,7 @@ impl SupervisorInner {
 
     /// Pure read-only check of measured positions against either validated candidate limits (if
     /// `driver_config_error` just resolved) or current `self.config.limits` (zero heap allocations).
-    fn joint_limit_clear_violation_with_candidates(
+    pub(crate) fn joint_limit_clear_violation_with_candidates(
         &self,
         cand: Option<&CandidateDriverLimits>,
     ) -> Option<crate::safety::JointLimitClearViolation> {
@@ -1061,6 +1132,19 @@ impl SupervisorInner {
         // Ages alone decide: drivers' is_feedback_valid() hard-codes 250 ms,
         // which would silently cap callers asking for a longer bound.
         self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_all_within(self.config.dof, max_age)))
+    }
+
+    /// True when every arm joint (excluding a `PosForce` Damiao gripper) has valid numeric
+    /// feedback within `max_age`. Used by gravity compensation so transient J7 pos-force
+    /// staleness does not prematurely abort or wedge arm-only handback before
+    /// `feedback_stale_fault_ms` latches `J7_FEEDBACK_STALE`.
+    pub fn hardware_arm_feedback_fresh(&self, max_age: Duration) -> bool {
+        if !self.feedback_numeric_valid { return false; }
+        if !self.config.damiao_gripper.as_ref().is_some_and(|g| g.mode == crate::model::DamiaoGripperMode::PosForce) {
+            return self.hardware_feedback_fresh(max_age);
+        }
+        let arm = self.config.arm_joints();
+        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_joints_within(&arm, max_age)))
     }
 
     /// Per arm joint, an instant before which its last sample cannot have been enqueued: the
@@ -1312,7 +1396,7 @@ impl SupervisorInner {
             && (self.gravity_comp.is_some()
                 || self.mit_active()
                 || self.mit.revoke_pending
-                || crate::mit::has_mit_joints(&self.config))
+                || crate::mit::mit_joint_mask(&self.config) != 0)
         {
             return Err(SafetyError::ClearFaultRejected(
                 "UNSUPPORTED: MIT mode qualification/handover and gravity compensation are not supported under synchronous RT executor step 1".into(),
@@ -2554,10 +2638,13 @@ impl SupervisorInner {
             shutdown_committed: self.shutdown_committed,
             driver_config_error: driver_config_error_override
                 .or_else(|| self.driver_config_error.as_deref().map(BoundedText::new)),
+            config_reconcile_fault: self.config_reconcile_fault,
             gravity_comp_unconfirmed: self.gravity_comp_blocks_clear(),
             disable_pending: self.disable_pending,
             has_driver: self.driver.is_some(),
             feedback_fresh: self.driver.is_none(),
+            j7_feedback_fresh: self.driver.is_none()
+                && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale),
             tx_queue_drained: self.driver.is_none(),
             tx_probe_confirmed: self.driver.is_none(),
             tx_probe_sent: false,
@@ -2591,6 +2678,7 @@ impl SupervisorInner {
                 ctx.feedback_fresh = self.feedback_numeric_valid
                     && drv.is_feedback_valid()
                     && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
+                ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
                 ctx.tx_queue_drained = drv.pending_tx_len_total() == 0;
                 ctx.tx_probe_confirmed = drv.tx_probe_confirmed();
                 ctx.tx_probe_sent = drv.tx_probe_pending();
@@ -2725,6 +2813,7 @@ impl SupervisorInner {
         // telemetry; universal blockers and supervisor-known checks (including `has_active_lease`
         // / `lease_heartbeat_fresh`) run FIRST here before any bus poll or state change.
         pre_ctx.feedback_fresh = true;
+        pre_ctx.j7_feedback_fresh = true;
         pre_ctx.tx_queue_drained = true;
         pre_ctx.tx_probe_confirmed = true;
         pre_ctx.thermal_sensor_available = true;
@@ -2771,6 +2860,7 @@ impl SupervisorInner {
                             && ages.len() == self.config.dof
                             && ages.iter().all(|a| a.is_some_and(|t| t <= THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                             && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                        let j7_fb_fresh = drv.pos_force_feedback_fresh();
                         let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
                         let thermal_below = fb_fresh
                             && caps.temperature_feedback
@@ -2785,9 +2875,9 @@ impl SupervisorInner {
                         );
                         Some((
                             states,
-                            loads,
                             caps.temperature_feedback,
                             fb_fresh,
+                            j7_fb_fresh,
                             tx_queue_drained,
                             tx_probe_confirmed,
                             tx_probe_sent,
@@ -2803,10 +2893,11 @@ impl SupervisorInner {
                 }
                 mit_ctx.expected_epoch = expected_epoch;
                 mit_ctx.pending_estop = self.estop_request_unapplied();
-                if let Some((ref states, _, temp_fb, fb_fresh, tx_queue_drained, tx_probe_confirmed, tx_probe_sent, thermal_below, next_cd, modes_uncertain)) = snapshot {
+                if let Some((ref states, temp_fb, fb_fresh, j7_fb_fresh, tx_queue_drained, tx_probe_confirmed, tx_probe_sent, thermal_below, next_cd, modes_uncertain)) = snapshot {
                     mit_ctx.mit_modes_uncertain = modes_uncertain;
                     mit_ctx.thermal_sensor_available = temp_fb;
                     mit_ctx.feedback_fresh = fb_fresh;
+                    mit_ctx.j7_feedback_fresh = j7_fb_fresh;
                     mit_ctx.tx_queue_drained = tx_queue_drained;
                     mit_ctx.tx_probe_confirmed = tx_probe_confirmed;
                     mit_ctx.tx_probe_sent = tx_probe_sent;
@@ -2822,6 +2913,7 @@ impl SupervisorInner {
                         self.joint_limit_clear_violation_for_positions(&positions, candidate_limits.as_ref());
                 } else {
                     mit_ctx.feedback_fresh = false;
+                    mit_ctx.j7_feedback_fresh = false;
                     mit_ctx.tx_queue_drained = false;
                     mit_ctx.tx_probe_confirmed = false;
                     mit_ctx.tx_probe_sent = false;
@@ -2845,30 +2937,32 @@ impl SupervisorInner {
                         crate::mit::RECOVERY_WARNING
                     )));
                 }
-                // Full `clear_check` and operator confirmation passed: commit synced state now.
-                self.mit.recovery_confirmed = false;
-                if let Some((states, loads, _, fb_fresh, _, _, _, _, next_cd, _)) = snapshot {
-                    if fb_fresh {
-                        self.feedback_numeric_valid = true;
-                        Self::apply_feedback(
-                            &mut self.measured_positions,
-                            &mut self.measured_velocities,
-                            &mut self.torques,
-                            &mut self.temperatures,
-                            &mut self.loads,
-                            self.config.dof,
-                            &states,
-                            loads.as_deref(),
-                        );
-                        self.thermal_cooldown = next_cd;
-                    }
-                }
-                commit_probed_limits(self);
-                return self.mit_expiry_recovery_for_epoch(expected_epoch);
+                // Keep operator confirmation, feedback, cooldown, and probed limits staged through
+                // `mit_expiry_recovery_for_epoch`'s final `clear_with_check` decision (fail-closed:
+                // zero premature commits if pre- or post-recovery clear_check refuses).
+                let mit_commit = ClearFaultCommit {
+                    candidate_limits,
+                    reapply_legacy_limits: clear_driver_err_field && candidate_limits.is_none(),
+                    is_torqued: None,
+                    thermal_cooldown: None,
+                };
+                return self.mit_expiry_recovery_for_epoch(
+                    expected_epoch,
+                    mit_ctx,
+                    mit_commit,
+                    driver_err_override,
+                );
             }
         }
 
         let mut ctx;
+        let mut commit = ClearFaultCommit {
+            candidate_limits,
+            reapply_legacy_limits: clear_driver_err_field && candidate_limits.is_none(),
+            is_torqued: None,
+            thermal_cooldown: None,
+        };
+        let mut staged_feedback = None;
         if let Some(ref d) = self.driver {
             let mut ws_bufs = std::mem::take(&mut self.ws_eval_bufs);
             let mut drv = match d.lock() {
@@ -2896,6 +2990,7 @@ impl SupervisorInner {
             let mut partial = drv.has_known_partial_enable();
             let mut any_enabled = drv.has_any_joint_enabled();
             let fb_valid = drv.is_feedback_valid();
+            let mut j7_fb_fresh = drv.pos_force_feedback_fresh();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
             let tx_probe_confirmed = drv.tx_probe_confirmed();
             let tx_probe_sent = drv.tx_probe_pending();
@@ -2915,31 +3010,16 @@ impl SupervisorInner {
                 && ages.iter().all(|a| a.is_some_and(|t| t <= max_rest_age))
                 && states_ok;
 
-            let defer_mit_commit = self.mit.owner == crate::mit::MitOwner::Lost;
-            if fb_fresh && !defer_mit_commit {
-                self.feedback_numeric_valid = true;
-                self.last_can_feedback_instant = ages
-                    .iter()
-                    .copied()
-                    .try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t)))
-                    .and_then(|age| Instant::now().checked_sub(age));
-                self.core.poll_feedback(
-                    &mut self.joint_feedback_queue_bounds,
-                    self.config.dof,
-                    drv.as_ref(),
-                    &mut self.scratch.fb,
-                );
-                Self::apply_feedback(
-                    &mut self.measured_positions,
-                    &mut self.measured_velocities,
-                    &mut self.torques,
-                    &mut self.temperatures,
-                    &mut self.loads,
-                    self.config.dof,
-                    &states,
-                    loads.as_deref(),
-                );
-            }
+            // Stage sampled feedback and thermal cooldown WITHOUT mutating supervisor state
+            // before `clear_check` / `clear_with_check` succeeds.
+            let dof = self.config.dof;
+            let staged_positions: Vec<f32> = states.iter().take(dof).map(|s| s.position).collect();
+            let staged_velocities: Vec<f32> = states.iter().take(dof).map(|s| s.velocity).collect();
+            let staged_torques: Vec<f32> = states.iter().take(dof).map(|s| s.torque).collect();
+            let staged_loads_vec: Vec<f32> = match loads.as_deref() {
+                Some(ls) => ls.iter().take(dof).copied().collect(),
+                None => self.loads.clone(),
+            };
             let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
             let thermal_below = fb_fresh
                 && caps.temperature_feedback
@@ -2953,9 +3033,6 @@ impl SupervisorInner {
                 thermal_below,
                 &mut rx_buf,
             );
-            if !defer_mit_commit {
-                self.thermal_cooldown = next_cd;
-            }
 
             let mut resting_feedback_missing = false;
             let mut resting_pose_violation = None;
@@ -2963,8 +3040,16 @@ impl SupervisorInner {
                 if !resting_fb_ok {
                     resting_feedback_missing = true;
                 } else {
-                    resting_pose_violation =
-                        self.resting_pose_support_violation_bounded(Some(drv.as_ref()), &ages, &mut ws_bufs);
+                    resting_pose_violation = self.resting_pose_support_violation_for_feedback(
+                        Some(drv.as_ref()),
+                        &ages,
+                        &staged_positions,
+                        &staged_velocities,
+                        &staged_torques,
+                        &staged_loads_vec,
+                        true,
+                        &mut ws_bufs,
+                    );
                 }
             }
             let enable_known = state != EnableState::Unknown || partial;
@@ -2978,23 +3063,18 @@ impl SupervisorInner {
             ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.feedback_fresh = fb_fresh;
+            ctx.j7_feedback_fresh = j7_fb_fresh;
             ctx.tx_queue_drained = tx_queue_drained;
             ctx.tx_probe_confirmed = tx_probe_confirmed;
             ctx.tx_probe_sent = tx_probe_sent;
             ctx.thermal_sensor_available = caps.temperature_feedback;
             ctx.thermal_below_threshold = thermal_below;
-            if defer_mit_commit {
-                ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
-                let positions: Vec<f32> = states.iter().take(self.config.dof).map(|s| s.position).collect();
-                ctx.joint_limit_violation = if fb_fresh {
-                    self.joint_limit_clear_violation_for_positions(&positions, candidate_limits.as_ref())
-                } else {
-                    self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref())
-                };
+            ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
+            ctx.joint_limit_violation = if fb_fresh {
+                self.joint_limit_clear_violation_for_positions(&staged_positions, candidate_limits.as_ref())
             } else {
-                ctx.joint_limit_violation =
-                    self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
-            }
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref())
+            };
             ctx.resting_feedback_missing = resting_feedback_missing;
             ctx.resting_pose_violation = resting_pose_violation;
             ctx.hardware_reset_required = hw_fault;
@@ -3006,7 +3086,7 @@ impl SupervisorInner {
             if clear_res == Err(ClearRefusal::TxProbeRequired) {
                 // Every OTHER recorded kind's condition passed and the software TX queue is empty:
                 // run one read-only refresh/status TX probe and verify fresh post-probe feedback.
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, ages_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_after) = {
                     let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
                     let res = drv.probe_tx_ready();
                     (
@@ -3019,15 +3099,18 @@ impl SupervisorInner {
                         drv.has_known_partial_enable(),
                         drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
+                        drv.pos_force_feedback_fresh(),
                         drv.feedback_ages(),
                     )
                 };
                 state = st_after;
                 partial = partial_after;
                 any_enabled = any_en_after;
+                j7_fb_fresh = j7_fresh_after;
                 ctx.tx_queue_drained = drained_after;
                 ctx.enable_state_known = state != EnableState::Unknown || partial;
                 ctx.hardware_reset_required = hw_fault_after;
+                ctx.j7_feedback_fresh = j7_fb_fresh;
                 ctx.pending_estop = self.estop_request_unapplied();
                 match probe_res {
                     Ok(confirmed) => {
@@ -3051,10 +3134,23 @@ impl SupervisorInner {
                 Err(ClearRefusal::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(ClearRefusal::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so transmitting the motor fault reset is now permitted; re-evaluate
-                    // `clear_check` immediately after the reset.
+                    // so transmitting the motor fault reset is now permitted. Recheck live J7
+                    // freshness and pending E-stop under the SAME driver lock guard before sending
+                    // the reset so there is zero check-to-command gap.
                     let reset_res = {
                         let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                        ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                        ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
+                        ctx.pending_estop = self.estop_request_unapplied();
+                        if let Err(refusal) = self.safety.clear_check(&ctx) {
+                            if refusal != ClearRefusal::HardwareResetRequired {
+                                drop(drv);
+                                if refusal == ClearRefusal::EStopActive {
+                                    return Err(apply_estop_refusal(self));
+                                }
+                                return Err(refusal.into_safety_error());
+                            }
+                        }
                         drv.clear_fault()
                     };
                     ctx.hardware_reset_required = false;
@@ -3077,8 +3173,10 @@ impl SupervisorInner {
                         state = drv.enable_state();
                         partial = drv.has_known_partial_enable();
                         any_enabled = drv.has_any_joint_enabled();
+                        j7_fb_fresh = drv.pos_force_feedback_fresh();
                     }
                     ctx.enable_state_known = state != EnableState::Unknown || partial;
+                    ctx.j7_feedback_fresh = j7_fb_fresh;
                     ctx.pending_estop = self.estop_request_unapplied();
                     if let Err(refusal) = self.safety.clear_check(&ctx) {
                         if refusal == ClearRefusal::EStopActive {
@@ -3087,73 +3185,195 @@ impl SupervisorInner {
                         return Err(refusal.into_safety_error());
                     }
                 }
-                Err(refusal) => return Err(refusal.into_safety_error()),
-            }
-            if defer_mit_commit && fb_fresh {
-                self.feedback_numeric_valid = true;
-                self.last_can_feedback_instant = ages
-                    .iter()
-                    .copied()
-                    .try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t)))
-                    .and_then(|age| Instant::now().checked_sub(age));
-                if let Ok(drv) = d.lock() {
-                    self.core.poll_feedback(
-                        &mut self.joint_feedback_queue_bounds,
-                        self.config.dof,
-                        drv.as_ref(),
-                        &mut self.scratch.fb,
-                    );
+                Err(refusal) => {
+                    if matches!(refusal, ClearRefusal::ThermalCooldownNotElapsed { .. })
+                        && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                            || ctx.j7_feedback_fresh)
+                    {
+                        self.thermal_cooldown = next_cd;
+                    }
+                    return Err(refusal.into_safety_error());
                 }
-                Self::apply_feedback(
-                    &mut self.measured_positions,
-                    &mut self.measured_velocities,
-                    &mut self.torques,
-                    &mut self.temperatures,
-                    &mut self.loads,
-                    self.config.dof,
-                    &states,
-                    loads.as_deref(),
-                );
-                self.thermal_cooldown = next_cd;
             }
-            commit_probed_limits(self);
-            self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
+            if fb_fresh {
+                staged_feedback = Some((states, loads, ages));
+            }
+            commit.is_torqued = Some(state == EnableState::Enabled || partial || any_enabled);
+            commit.thermal_cooldown = Some(next_cd);
         } else {
-            self.update_thermal_cooldown_driverless(Instant::now());
+            let next_cd = self.evaluate_thermal_cooldown_driverless(Instant::now());
             ctx = self.build_clear_context_base(driver_err_override);
             if clear_driver_err_field && driver_err_override.is_none() {
                 ctx.driver_config_error = None;
             }
             ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
+            ctx.thermal_cooldown_elapsed_ms = if ctx.thermal_below_threshold {
+                next_cd.elapsed_ms()
+            } else {
+                0
+            };
             ctx.joint_limit_violation =
                 self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == ClearRefusal::EStopActive {
                     return Err(apply_estop_refusal(self));
                 }
+                if matches!(refusal, ClearRefusal::ThermalCooldownNotElapsed { .. })
+                    && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                        || ctx.j7_feedback_fresh)
+                {
+                    self.thermal_cooldown = next_cd;
+                }
                 return Err(refusal.into_safety_error());
             }
-            commit_probed_limits(self);
+            commit.thermal_cooldown = Some(next_cd);
         }
-        self.clear_fault_finish(&ctx)
-    }
-
-    fn clear_fault_finish(&mut self, ctx: &crate::safety::ClearContext) -> Result<SafetyState, SafetyError> {
-        self.clear_fault_finish_bounded(ctx).map_err(SafetyError::from)
+        self.clear_fault_finish_bounded(&ctx, commit, move |this| {
+            if let Some((states, loads, ages)) = staged_feedback {
+                this.feedback_numeric_valid = true;
+                this.last_can_feedback_instant = ages
+                    .iter()
+                    .copied()
+                    .try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t)))
+                    .and_then(|age| Instant::now().checked_sub(age));
+                if let Some(ref d) = this.driver {
+                    if let Ok(drv) = d.lock() {
+                        this.core.poll_feedback(
+                            &mut this.joint_feedback_queue_bounds,
+                            this.config.dof,
+                            drv.as_ref(),
+                            &mut this.scratch.fb,
+                        );
+                    }
+                }
+                Self::apply_feedback(
+                    &mut this.measured_positions,
+                    &mut this.measured_velocities,
+                    &mut this.torques,
+                    &mut this.temperatures,
+                    &mut this.loads,
+                    this.config.dof,
+                    &states,
+                    loads.as_deref(),
+                );
+            }
+        })
+        .map_err(SafetyError::from)
     }
 
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     fn clear_fault_finish_bounded(
         &mut self,
         ctx: &crate::safety::ClearContext,
+        commit: ClearFaultCommit,
+        on_committed: impl FnOnce(&mut Self),
     ) -> Result<SafetyState, crate::safety::ClearFaultError> {
-        use crate::safety::{ClearFaultError, ClearRefusal};
+        use crate::safety::{ClearFaultError, ClearRefusal, FaultKind};
         if self.shutdown_committed {
             return Err(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted));
         }
-        // Single authoritative clear_check FIRST before mutating/resetting state.
-        self.safety.clear_check(ctx).map_err(ClearFaultError::Rejected)?;
+        // Build live pre-commit ClearContext right before committing so any concurrent E-stop or
+        // J7 freshness expiry between preflight/probe and commit fails closed with ZERO mutations.
+        let mut final_ctx = *ctx;
+        let was_estop = *self.safety.state() == SafetyState::EStop;
+        let state = if let Some(ref d) = self.driver {
+            let drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    final_ctx.j7_feedback_fresh = false;
+                    final_ctx.feedback_fresh = false;
+                    final_ctx.pending_estop = self.estop_request_unapplied();
+                    return Err(self
+                        .safety
+                        .clear_check(&final_ctx)
+                        .err()
+                        .map_or(ClearFaultError::FeedbackUnavailable, ClearFaultError::from));
+                }
+            };
+            final_ctx.pending_estop = self.estop_request_unapplied();
+            if self.safety.has_latched_fault_kind(FaultKind::J7FeedbackStale) {
+                final_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                final_ctx.feedback_fresh = final_ctx.feedback_fresh && drv.is_feedback_valid();
+            }
+            if let Err(refusal) = self.safety.clear_check(&final_ctx) {
+                drop(drv);
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = final_ctx.expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(ClearFaultError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            });
+                        }
+                    }
+                    return Err(ClearFaultError::EStopActive);
+                }
+                return Err(ClearFaultError::from(refusal));
+            }
+            if self.estop_request_unapplied() {
+                drop(drv);
+                self.consume_pending_estop();
+                if let Some(received) = final_ctx.expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(ClearFaultError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        });
+                    }
+                }
+                return Err(ClearFaultError::EStopActive);
+            }
+            // Commit the safety clear under the SAME driver lock guard before applying staged
+            // limits, torque flag, or cleanup (zero check-to-commit gap).
+            self.safety.clear_with_check(&final_ctx).map_err(ClearFaultError::from)?
+        } else {
+            final_ctx.pending_estop = self.estop_request_unapplied();
+            if self.safety.has_latched_fault_kind(FaultKind::J7FeedbackStale) {
+                final_ctx.j7_feedback_fresh = false;
+            }
+            if let Err(refusal) = self.safety.clear_check(&final_ctx) {
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = final_ctx.expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(ClearFaultError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            });
+                        }
+                    }
+                    return Err(ClearFaultError::EStopActive);
+                }
+                return Err(ClearFaultError::from(refusal));
+            }
+            if self.consume_pending_estop() {
+                if let Some(received) = final_ctx.expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(ClearFaultError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        });
+                    }
+                }
+                return Err(ClearFaultError::EStopActive);
+            }
+            self.safety.clear_with_check(&final_ctx).map_err(ClearFaultError::from)?
+        };
+
+        on_committed(self);
+        if let Some(ref cand) = commit.candidate_limits {
+            self.commit_driver_limits_bounded(cand);
+        } else if commit.reapply_legacy_limits {
+            self.reapply_driver_limits();
+        }
+        if let Some(is_torqued) = commit.is_torqued {
+            self.is_torqued = is_torqued;
+        }
+        if let Some(cd) = commit.thermal_cooldown {
+            self.thermal_cooldown = cd;
+        }
         let was_mit_lost = self.mit.owner == crate::mit::MitOwner::Lost;
         self.pending_rearm = true;
         self.stop_motion();
@@ -3161,9 +3381,12 @@ impl SupervisorInner {
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
         self.reset_tx_joint_progress();
-        self.hold_tx_unsent_since = None;
+        self.reset_hold_tx_joint_progress();
         self.hold_tx_stalled_latched = false;
-        self.last_hold_tx_error_log = None;
+        self.last_hold_tx_stall_log = None;
+        self.j7_stale_since = None;
+        // Preserve `self.last_hold_tx_error_log` across fault clears so rapid clear/re-fault
+        // cycles cannot bypass the 1/s stopped-hold error log rate limit.
         self.pending_deferred_done = None;
         if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.lock() {
@@ -3178,21 +3401,9 @@ impl SupervisorInner {
         self.last_commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
+        self.watchdog_park_blocked_reason = None;
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
-        if self.consume_pending_estop() {
-            if let Some(received) = ctx.expected_epoch {
-                if received != self.safety.epoch_id() {
-                    return Err(ClearFaultError::EpochMismatch {
-                        expected: self.safety.epoch_id(),
-                        received,
-                    });
-                }
-            }
-            return Err(ClearFaultError::EStopActive);
-        }
-        let was_estop = *self.safety.state() == SafetyState::EStop;
-        let state = self.safety.clear_with_check(ctx).map_err(ClearFaultError::from)?;
         self.handover_settling_since = None;
         if !was_estop && self.e_stop_latched.load(Ordering::SeqCst) {
             self.apply_stop_policy(StopPolicy::EStopLatch);
@@ -3203,15 +3414,11 @@ impl SupervisorInner {
         self.e_stop_latched.store(false, Ordering::SeqCst);
         self.shutdown_refused_unknown = false;
         if self.consume_pending_estop() {
-            if let Some(received) = ctx.expected_epoch {
-                if received != self.safety.epoch_id() {
-                    return Err(ClearFaultError::EpochMismatch {
-                        expected: self.safety.epoch_id(),
-                        received,
-                    });
-                }
-            }
-            return Err(ClearFaultError::EStopActive);
+            // A concurrent E-stop arrived strictly AFTER `clear_with_check` already committed;
+            // keep the newly applied E-stop state and return Ok(EStop) rather than Err after commit.
+            self.last_heartbeat = Instant::now();
+            self.last_motion_frame = Instant::now();
+            return Ok(self.safety.state().clone());
         }
         if was_mit_lost {
             // Only after full clear passed: release MIT lost ownership and allow read-only polls.
@@ -3227,13 +3434,14 @@ impl SupervisorInner {
         Ok(state)
     }
 
-    pub(super) fn measured_workspace_violation_bounded(
+    pub(super) fn workspace_violation_for_positions_bounded(
         &self,
+        positions: &[f32],
         bufs: &mut crate::chain::EvalBufs,
     ) -> Option<crate::safety::WorkspaceSupportViolation> {
         use crate::safety::{BoundedText, WorkspaceSupportViolation};
         let (ws, cam) = self.workspace_policy()?;
-        if self.config.arm_model.frames_f32(&self.measured_positions).is_none() {
+        if self.config.arm_model.frames_f32(positions).is_none() {
             return Some(WorkspaceSupportViolation::EvalFailed {
                 limit: BoundedText::new("invalid"),
                 reason: BoundedText::new("non-finite or incomplete joint positions"),
@@ -3259,7 +3467,7 @@ impl SupervisorInner {
             &self.config.arm_model, ws, cam, self.config.tcp_offset, bufs,
         );
         let mut buf = eval.alloc_buf_in(bufs);
-        let violation = match eval.eval_into_in(&self.measured_positions, &mut buf, &mut bufs.world_caps, "clear_fault") {
+        let violation = match eval.eval_into_in(positions, &mut buf, &mut bufs.world_caps, "clear_fault") {
             Err(f) => Some(WorkspaceSupportViolation::EvalFailed {
                 limit: BoundedText::new(&f.limit),
                 reason: BoundedText::new(f.detail.reason.as_deref().unwrap_or("invalid joint positions")),
@@ -3280,9 +3488,33 @@ impl SupervisorInner {
         ages: &[Option<Duration>],
         bufs: &mut crate::chain::EvalBufs,
     ) -> Option<crate::safety::RestingSupportViolation> {
+        self.resting_pose_support_violation_for_feedback(
+            drv,
+            ages,
+            &self.measured_positions,
+            &self.measured_velocities,
+            &self.torques,
+            &self.loads,
+            self.feedback_numeric_valid,
+            bufs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resting_pose_support_violation_for_feedback(
+        &self,
+        drv: Option<&dyn ArmDriver>,
+        ages: &[Option<Duration>],
+        positions: &[f32],
+        velocities: &[f32],
+        torques: &[f32],
+        loads: &[f32],
+        feedback_numeric_valid: bool,
+        bufs: &mut crate::chain::EvalBufs,
+    ) -> Option<crate::safety::RestingSupportViolation> {
         use crate::safety::{RestingSupportJointItem as Item, RestingSupportViolation as V, MAX_RESTING_SUPPORT_ITEMS};
         let dof = self.config.dof;
-        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
+        if positions.len() != dof || velocities.len() != dof {
             return Some(V::FeedbackLengthMismatch);
         }
         let Some(policy) = self.config.resting_pose.as_ref() else { return Some(V::NoRestingPoseConfigured); };
@@ -3293,14 +3525,14 @@ impl SupervisorInner {
             if !policy.support_torque_limits.is_empty() && !caps.torque_feedback { return Some(V::DriverLacksTorqueFeedback); }
             if !policy.support_load_limits.is_empty() && !caps.load_feedback { return Some(V::DriverLacksLoadFeedback); }
             let max_age = Duration::from_millis(policy.feedback_max_age_ms);
-            if !self.feedback_numeric_valid || ages.len() != dof || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age)) {
+            if !feedback_numeric_valid || ages.len() != dof || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age)) {
                 return Some(V::FeedbackTooOld { max_age_ms: policy.feedback_max_age_ms });
             }
         }
         let mut items = [None; MAX_RESTING_SUPPORT_ITEMS];
         let mut len = 0usize;
         let mut overflowed = 0u16;
-        for (i, &v) in self.measured_velocities.iter().enumerate().take(dof) {
+        for (i, &v) in velocities.iter().enumerate().take(dof) {
             let limit = policy.max_velocity_of(i);
             if !v.is_finite() || v.abs() > limit {
                 if len < MAX_RESTING_SUPPORT_ITEMS {
@@ -3314,7 +3546,7 @@ impl SupervisorInner {
         let mut total = 0.0;
         let rest = self.config.resting_positions();
         for (i, &tol) in policy.position_tolerances.iter().enumerate().take(dof) {
-            let dev = (self.measured_positions[i] - rest[i]).abs();
+            let dev = (positions[i] - rest[i]).abs();
             if !dev.is_finite() || dev > tol {
                 if len < MAX_RESTING_SUPPORT_ITEMS {
                     items[len] = Some(Item::JointOffHome { joint: i as u16, deviation: dev, limit: tol });
@@ -3332,7 +3564,7 @@ impl SupervisorInner {
         if self.driver.is_some() {
             for &(i, max_tau) in &policy.support_torque_limits {
                 if i >= dof { return Some(V::SupportTorqueIndexOutOfRange { index: i }); }
-                let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
+                let tau = torques.get(i).copied().unwrap_or(f32::NAN);
                 if !tau.is_finite() || tau.abs() > max_tau {
                     if len < MAX_RESTING_SUPPORT_ITEMS {
                         items[len] = Some(Item::JointTorque { joint: i as u16, torque: tau, limit: max_tau });
@@ -3344,7 +3576,7 @@ impl SupervisorInner {
             }
             for &(i, max_load) in &policy.support_load_limits {
                 if i >= dof { return Some(V::SupportLoadIndexOutOfRange { index: i }); }
-                let load = self.loads.get(i).copied().unwrap_or(f32::NAN);
+                let load = loads.get(i).copied().unwrap_or(f32::NAN);
                 if !load.is_finite() || load.abs() > max_load {
                     if len < MAX_RESTING_SUPPORT_ITEMS {
                         items[len] = Some(Item::JointLoad { joint: i as u16, load, limit: max_load });
@@ -3355,7 +3587,7 @@ impl SupervisorInner {
                 }
             }
         }
-        let mut workspace = self.measured_workspace_violation_bounded(bufs);
+        let mut workspace = self.workspace_violation_for_positions_bounded(positions, bufs);
         if workspace.is_some() && len >= MAX_RESTING_SUPPORT_ITEMS {
             workspace = None;
             overflowed = overflowed.saturating_add(1);
@@ -3452,6 +3684,12 @@ impl SupervisorInner {
         }
 
         let mut ctx;
+        let mut commit = ClearFaultCommit {
+            candidate_limits,
+            reapply_legacy_limits: false,
+            is_torqued: None,
+            thermal_cooldown: None,
+        };
         if let Some(ref d) = self.driver {
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
             let mut scratch_rx = std::mem::take(&mut self.scratch.rx);
@@ -3470,6 +3708,7 @@ impl SupervisorInner {
             let ages_valid = scratch_ages.len() == self.config.dof
                 && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > THERMAL_FEEDBACK_FRESHNESS_LIMIT));
             let fb_valid = drv.is_feedback_valid();
+            let j7_fb_fresh = drv.pos_force_feedback_fresh();
             let tx_queue_drained = drv.pending_tx_len_total() == 0;
             let tx_probe_confirmed = drv.tx_probe_confirmed();
             let tx_probe_sent = drv.tx_probe_pending();
@@ -3504,7 +3743,8 @@ impl SupervisorInner {
                 }
             }
             let fb_fresh = self.feedback_numeric_valid && fb_valid && ages_valid;
-            // Cooldown accrues ONLY across consecutive fresh cool samples; stale/unavailable/gapped temp resets it.
+            // Cooldown accrues ONLY across consecutive fresh cool samples; evaluate without
+            // mutating `self.thermal_cooldown` until clear commits (or ThermalCooldownNotElapsed).
             let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
             let thermal_below = fb_fresh
                 && temp_fb
@@ -3520,7 +3760,6 @@ impl SupervisorInner {
             self.scratch.ages = scratch_ages;
             self.scratch.rx = scratch_rx;
             self.ws_eval_bufs = ws_bufs;
-            self.thermal_cooldown = next_cd;
 
             ctx = self.build_clear_context_base(driver_err_override);
             if candidate_limits.is_some() {
@@ -3530,11 +3769,13 @@ impl SupervisorInner {
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
             ctx.feedback_fresh = fb_fresh;
+            ctx.j7_feedback_fresh = j7_fb_fresh;
             ctx.tx_queue_drained = tx_queue_drained;
             ctx.tx_probe_confirmed = tx_probe_confirmed;
             ctx.tx_probe_sent = tx_probe_sent;
             ctx.thermal_sensor_available = temp_fb;
             ctx.thermal_below_threshold = thermal_below;
+            ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
             ctx.joint_limit_violation =
                 self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             ctx.resting_feedback_missing = resting_feedback_missing;
@@ -3551,7 +3792,7 @@ impl SupervisorInner {
                     return Err(E::Rejected(R::BudgetExpired));
                 }
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
-                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, ages_valid_after) = {
+                let (probe_res, drained_after, probe_ok, probe_pending, hw_fault_after, st_after, partial_after, any_en_after, fb_valid_after, j7_fresh_after, ages_valid_after) = {
                     let mut drv = match d.lock() {
                         Ok(g) => g,
                         Err(_) => {
@@ -3576,6 +3817,7 @@ impl SupervisorInner {
                         drv.has_known_partial_enable(),
                         drv.has_any_joint_enabled(),
                         drv.is_feedback_valid(),
+                        drv.pos_force_feedback_fresh(),
                         ages_ok,
                     )
                 };
@@ -3586,6 +3828,7 @@ impl SupervisorInner {
                 ctx.tx_queue_drained = drained_after;
                 ctx.enable_state_known = state != EnableState::Unknown || partial;
                 ctx.hardware_reset_required = hw_fault_after;
+                ctx.j7_feedback_fresh = j7_fresh_after;
                 ctx.pending_estop = self.estop_request_unapplied();
                 match probe_res {
                     Ok(confirmed) => {
@@ -3606,13 +3849,27 @@ impl SupervisorInner {
                 Err(R::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(R::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so a budgeted motor reset is now permitted; re-evaluate `clear_check` after.
+                    // so a budgeted motor reset is now permitted. Recheck live J7 freshness and
+                    // pending E-stop under the SAME driver lock guard before sending the reset so
+                    // there is zero check-to-command gap.
                     let now = now_override.unwrap_or_else(Instant::now);
                     if now >= deadline {
                         return Err(E::Rejected(R::BudgetExpired));
                     }
                     let reset_res = {
                         let mut drv = d.lock().map_err(|_| E::FeedbackUnavailable)?;
+                        ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+                        ctx.feedback_fresh = ctx.feedback_fresh && drv.is_feedback_valid();
+                        ctx.pending_estop = self.estop_request_unapplied();
+                        if let Err(refusal) = self.safety.clear_check(&ctx) {
+                            if refusal != R::HardwareResetRequired {
+                                drop(drv);
+                                if refusal == R::EStopActive {
+                                    return Err(apply_estop_refusal(self));
+                                }
+                                return Err(E::from(refusal));
+                            }
+                        }
                         let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
                         drv.set_tx_release_deadline(Some(drv_deadline));
                         let res = drv.clear_fault_budgeted(drv_deadline);
@@ -3631,15 +3888,21 @@ impl SupervisorInner {
                     }
                     return Err(E::from(post_refusal));
                 }
-                Err(refusal) => return Err(E::from(refusal)),
+                Err(refusal) => {
+                    if matches!(refusal, R::ThermalCooldownNotElapsed { .. })
+                        && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                            || ctx.j7_feedback_fresh)
+                    {
+                        self.thermal_cooldown = next_cd;
+                    }
+                    return Err(E::from(refusal));
+                }
             }
-            if let Some(ref cand) = candidate_limits {
-                self.commit_driver_limits_bounded(cand);
-            }
-            self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
+            commit.is_torqued = Some(state == EnableState::Enabled || partial || any_enabled);
+            commit.thermal_cooldown = Some(next_cd);
         } else {
-            // Driverless simulation mode: update cooldown clock in place (0 alloc).
-            self.update_thermal_cooldown_driverless(Instant::now());
+            // Driverless simulation mode: evaluate cooldown without pre-committing (0 alloc).
+            let next_cd = self.evaluate_thermal_cooldown_driverless(Instant::now());
             ctx = self.build_clear_context_base(driver_err_override);
             if candidate_limits.is_some() {
                 ctx.driver_config_error = None;
@@ -3647,19 +3910,28 @@ impl SupervisorInner {
             ctx.expected_epoch = expected_epoch;
             ctx.pending_estop = self.estop_request_unapplied();
             ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
+            ctx.thermal_cooldown_elapsed_ms = if ctx.thermal_below_threshold {
+                next_cd.elapsed_ms()
+            } else {
+                0
+            };
             ctx.joint_limit_violation =
                 self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
             if let Err(refusal) = self.safety.clear_check(&ctx) {
                 if refusal == R::EStopActive {
                     return Err(apply_estop_refusal(self));
                 }
+                if matches!(refusal, R::ThermalCooldownNotElapsed { .. })
+                    && (!self.safety.has_latched_fault_kind(crate::safety::FaultKind::J7FeedbackStale)
+                        || ctx.j7_feedback_fresh)
+                {
+                    self.thermal_cooldown = next_cd;
+                }
                 return Err(E::from(refusal));
             }
-            if let Some(ref cand) = candidate_limits {
-                self.commit_driver_limits_bounded(cand);
-            }
+            commit.thermal_cooldown = Some(next_cd);
         }
-        self.clear_fault_finish_bounded(&ctx)
+        self.clear_fault_finish_bounded(&ctx, commit, |_| {})
     }
 
     /// Bounded fault clearing for the RT executor rendered into [`SafetyError`] for direct callers.

@@ -1,9 +1,13 @@
 //! Scheduling of the RT executor (design section 5): the platform profile of the control
 //! thread and the process-wide memory lock.
 //!
-//! - Priority: SCHED_FIFO 45 by default, below the SPI / CAN interrupt threads of the SG2002
-//!   (`irq/51-spi0.0`, `spi0` at FIFO 50), so bus interrupts keep running while the executor
-//!   computes. `ARMD_RT_PRIORITY` (1..=99) sets another value for other platforms.
+//! - Priority: SCHED_FIFO 79 by default on SG2002. The vendor kernel
+//!   (`linux_5.10/kernel/sched/cvi_sched.h`) caps non-`cvitask` tasks at 80 and pins
+//!   `cvitask_isp_pre`, `cvitask_vpss_0/1` (90) and `cvitask_tpu_wor` (85). The kit init script
+//!   raises `spi0` and SPI/CAN IRQ threads to SCHED_FIFO 80 and lowers the 4 unpinned `cvitask`
+//!   threads and `rebot-vision`'s RT SDK threads to 70, placing `armd-control` at FIFO 79:
+//!   strictly below SPI/CAN bus interrupts and strictly above vision/unpinned `cvitask` threads.
+//!   `ARMD_RT_PRIORITY` (1..=99) overrides the default for other platforms or A/B tests.
 //! - CPU: `ARMD_RT_CPU` pins the executor to one CPU (an isolated core on multi-core
 //!   boards); unset, the thread keeps the inherited affinity.
 //! - Memory: `mlockall(MCL_CURRENT | MCL_FUTURE)` at startup, so no page fault of armd's
@@ -17,8 +21,11 @@
 
 use crate::diagnostics::tick::ControlThreadSched;
 
-/// The executor priority on the SG2002 (below its SPI / CAN interrupt threads at 50).
-pub const DEFAULT_PRIORITY: i32 = 45;
+/// Default executor priority on SG2002 (`SCHED_FIFO 79`): strictly below the SPI / CAN interrupt
+/// threads raised to FIFO 80 (the vendor `cvi_sched.h` cap for non-`cvitask` tasks), and strictly
+/// above `rebot-vision` RT SDK threads and the 4 unpinned `cvitask_*` threads lowered to 70 by the
+/// kit init script. Overridable via `ARMD_RT_PRIORITY`.
+pub const DEFAULT_PRIORITY: i32 = 79;
 
 /// Scheduling request of the executor thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,7 +278,7 @@ mod tests {
 
     #[test]
     fn config_defaults_and_env() {
-        assert_eq!(RtSchedConfig::from_vars(vars(&[])).unwrap(), RtSchedConfig { priority: 45, cpu: None, lock_memory: true });
+        assert_eq!(RtSchedConfig::from_vars(vars(&[])).unwrap(), RtSchedConfig { priority: 79, cpu: None, lock_memory: true });
         let c = RtSchedConfig::from_vars(vars(&[("ARMD_RT_PRIORITY", "60"), ("ARMD_RT_CPU", "3"), ("ARMD_MLOCKALL", "0")])).unwrap();
         assert_eq!(c, RtSchedConfig { priority: 60, cpu: Some(3), lock_memory: false });
         assert!(RtSchedConfig::from_vars(vars(&[("ARMD_RT_PRIORITY", "0")])).is_err());
@@ -284,7 +291,7 @@ mod tests {
     #[test]
     fn readiness_is_fail_closed() {
         let mut s = ControlThreadSched {
-            policy: "fifo".into(), priority: 45, realtime: true, requested_priority: Some(45), cpu: None,
+            policy: "fifo".into(), priority: 79, realtime: true, requested_priority: Some(79), cpu: None,
             memory_locked: Some(true), memory_lock: Some("locked".into()), errors: vec![],
         };
         assert!(RtReadiness::from_sched(&s).refusal().is_none());

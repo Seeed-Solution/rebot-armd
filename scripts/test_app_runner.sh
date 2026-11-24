@@ -280,7 +280,7 @@ sys.exit(5)"
 }
 
 echo "== sh -n"
-for f in "$RUNNER" "$K92" "$KIT/../debian/postinst" "$KIT/../debian/prerm"; do
+for f in "$RUNNER" "$KIT/usr/share/rebot-teleop/rebot-vision-run" "$K92" "$KIT/../debian/postinst" "$KIT/../debian/prerm"; do
     check "sh -n $(basename "$f")" sh -n "$f"
     if command -v busybox >/dev/null 2>&1 && busybox sh -c : 2>/dev/null; then
         check "busybox sh -n $(basename "$f")" busybox sh -n "$f"
@@ -304,6 +304,152 @@ c" ]
 check "config: app name" [ "$APP_NAME" = demo ]
 check "config: nothing was executed" sh -c "[ ! -e '$CT/pwned1' ] && [ ! -e '$CT/pwned2' ]"
 rm -rf "$CT"
+
+# K92 SG2002 RT thread priority layout (tested under /bin/sh and busybox sh)
+run_rt_prio_suite() {
+    RTSH=$1
+    echo "== K92 apply_rt_priorities ($RTSH)"
+    RT=$(mktemp -d) || exit 1
+    cat > "$RT/make_proc.py" <<'PYEOF'
+import os, sys
+
+def stat_line(tid, comm, pol, rtprio):
+    # Fields after ')': 1=state(S), ..., 38=rt_priority, 39=policy (49 fields total after comm)
+    f = ["0"] * 49
+    f[0] = "S"
+    f[37] = str(rtprio)
+    f[38] = str(pol)
+    return f"{tid} ({comm}) " + " ".join(f) + "\n"
+
+def add_proc(root, pid, comm, pol, rtprio, cmdline=b"", tasks=None):
+    pdir = os.path.join(root, str(pid))
+    os.makedirs(pdir, exist_ok=True)
+    with open(os.path.join(pdir, "comm"), "w") as fp: fp.write(comm + "\n")
+    with open(os.path.join(pdir, "cmdline"), "wb") as fp: fp.write(cmdline)
+    with open(os.path.join(pdir, "stat"), "w") as fp: fp.write(stat_line(pid, comm, pol, rtprio))
+    for tid, tcomm, tpol, trt in (tasks or [(pid, comm, pol, rtprio)]):
+        tdir = os.path.join(pdir, "task", str(tid))
+        os.makedirs(tdir, exist_ok=True)
+        with open(os.path.join(tdir, "comm"), "w") as fp: fp.write(tcomm + "\n")
+        with open(os.path.join(tdir, "stat"), "w") as fp: fp.write(stat_line(tid, tcomm, tpol, trt))
+
+root = sys.argv[1]
+mode = sys.argv[2]
+if mode == "full":
+    add_proc(root, 44, "spi0", 1, 50)
+    add_proc(root, 51, "irq/51-spi0.0", 1, 50)
+    add_proc(root, 52, "irq/52-mcp251xfd", 1, 50)
+    add_proc(root, 79, "irq/48-cviusb-o", 1, 50)
+    add_proc(root, 81, "irq/22-mmc0", 1, 50)
+    # Pinned cvitask threads (must NEVER be touched)
+    add_proc(root, 321, "cvitask_isp_pre", 1, 90)
+    add_proc(root, 326, "cvitask_vpss_0", 1, 90)
+    add_proc(root, 327, "cvitask_vpss_1", 1, 90)
+    add_proc(root, 334, "cvitask_tpu_wor", 2, 85)
+    # Unpinned cvitask threads (must be lowered to 70, preserving policy)
+    add_proc(root, 322, "cvitask_isp_bla", 1, 90)
+    add_proc(root, 323, "cvitask_isp_err", 1, 90)
+    add_proc(root, 2221, "cvitask_vc_wt2", 1, 95)
+    add_proc(root, 2222, "cvitask_vc_bh2", 2, 95)
+    # rebot-vision process with mixed OTHER / RR / FIFO threads
+    add_proc(root, 1855, "rebot-vision", 0, 0, cmdline=b"/usr/bin/rebot-vision\x00", tasks=[
+        (1855, "rebot-vision", 0, 0),
+        (2410, "tz_event_handle", 2, 80),
+        (2422, "ISP0_RUN", 2, 80),
+        (2423, "vi_dbg_handler", 2, 80),
+        (2427, "DataConsume", 0, 0),
+        (2434, "Thread_Venc0_Pr", 2, 80),
+        (2447, "Thread_Venc2_Pr", 2, 80),
+        (2499, "ExtraFifoSdk", 1, 80),
+    ])
+elif mode == "vision-restarted":
+    # New rebot-vision process after restart with fresh RR 80 threads
+    add_proc(root, 3100, "rebot-vision", 0, 0, cmdline=b"/usr/bin/rebot-vision\x00", tasks=[
+        (3100, "rebot-vision", 0, 0),
+        (3110, "ISP0_RUN", 2, 80),
+        (3111, "Thread_Venc0_Pr", 2, 80),
+    ])
+PYEOF
+    cat > "$RT/fake_chrt" <<'CHEOF'
+#!/bin/sh
+echo "$*" >> "$RT_CHRT_LOG"
+pol=2
+case "$1" in
+    -f) pol=1; shift ;;
+    -r) pol=2; shift ;;
+esac
+[ "$1" = "-p" ] && shift
+prio=$1
+tid=$2
+python3 -c '
+import glob, sys
+root, tid, pol, prio = sys.argv[1:]
+for path in glob.glob(f"{root}/{tid}/stat") + glob.glob(f"{root}/*/task/{tid}/stat"):
+    txt = open(path).read()
+    r = txt.rfind(")")
+    head, rest = txt[:r + 2], txt[r + 2:].split()
+    rest[37] = prio
+    rest[38] = pol
+    open(path, "w").write(head + " ".join(rest) + "\n")
+' "$RT_PROC_ROOT" "$tid" "$pol" "$prio"
+CHEOF
+    chmod +x "$RT/fake_chrt"
+    sed -n '/^is_sg2002() {/,/^# Poll briefly after vision starts/p' "$K92" | sed '$d' > "$RT/rt_funcs.sh"
+
+    mkdir -p "$RT/proc"
+    python3 "$RT/make_proc.py" "$RT/proc" full
+    printf 'raspberrypi,5-model-b\0' > "$RT/compat_other"
+    printf 'cvitek,cv181x\0' > "$RT/compat_sg2002"
+
+    # Non-SG2002: no-op
+    : > "$RT/chrt.log"
+    out=$(RT_PROC_ROOT="$RT/proc" RT_DT_COMPAT="$RT/compat_other" RT_CHRT_BIN="$RT/fake_chrt" RT_CHRT_LOG="$RT/chrt.log" NAME=rebot-teleop \
+        $RTSH -c '. "$1"; apply_rt_priorities' _ "$RT/rt_funcs.sh")
+    check "rt-prio ($RTSH): non-SG2002 makes 0 chrt calls and logs nothing" sh -c "[ ! -s '$RT/chrt.log' ] && [ -z '$out' ]"
+
+    # SG2002: applies layout
+    : > "$RT/chrt.log"
+    out=$(RT_PROC_ROOT="$RT/proc" RT_DT_COMPAT="$RT/compat_sg2002" RT_CHRT_BIN="$RT/fake_chrt" RT_CHRT_LOG="$RT/chrt.log" NAME=rebot-teleop \
+        $RTSH -c '. "$1"; apply_rt_priorities' _ "$RT/rt_funcs.sh")
+    check "rt-prio ($RTSH): spi0 and SPI/CAN IRQs raised to FIFO 80" sh -c "grep -qx -- '-f -p 80 44' '$RT/chrt.log' && grep -qx -- '-f -p 80 51' '$RT/chrt.log' && grep -qx -- '-f -p 80 52' '$RT/chrt.log'"
+    check "rt-prio ($RTSH): non-SPI IRQs (mmc0, cviusb) untouched" sh -c "! grep -Eq ' (79|81)\$' '$RT/chrt.log'"
+    check "rt-prio ($RTSH): 4 unpinned cvitask lowered to 70 preserving policy" sh -c "grep -qx -- '-f -p 70 322' '$RT/chrt.log' && grep -qx -- '-f -p 70 323' '$RT/chrt.log' && grep -qx -- '-f -p 70 2221' '$RT/chrt.log' && grep -qx -- '-r -p 70 2222' '$RT/chrt.log'"
+    check "rt-prio ($RTSH): pinned cvitask (isp_pre, vpss_0/1, tpu_wor) untouched" sh -c "! grep -Eq ' (321|326|327|334)\$' '$RT/chrt.log'"
+    check "rt-prio ($RTSH): rebot-vision RT threads lowered to RR 70" sh -c "grep -qx -- '-r -p 70 2410' '$RT/chrt.log' && grep -qx -- '-r -p 70 2422' '$RT/chrt.log' && grep -qx -- '-r -p 70 2423' '$RT/chrt.log' && grep -qx -- '-r -p 70 2434' '$RT/chrt.log' && grep -qx -- '-r -p 70 2447' '$RT/chrt.log' && grep -qx -- '-r -p 70 2499' '$RT/chrt.log'"
+    check "rt-prio ($RTSH): rebot-vision SCHED_OTHER threads untouched" sh -c "! grep -Eq ' (1855|2427)\$' '$RT/chrt.log'"
+    check "rt-prio ($RTSH): changes logged" sh -c 'printf "%s" "$1" | grep -q "\[rebot-teleop\] RT priorities:"' _ "$out"
+
+    # Idempotency: second run changes nothing
+    : > "$RT/chrt.log"
+    out2=$(RT_PROC_ROOT="$RT/proc" RT_DT_COMPAT="$RT/compat_sg2002" RT_CHRT_BIN="$RT/fake_chrt" RT_CHRT_LOG="$RT/chrt.log" NAME=rebot-teleop \
+        $RTSH -c '. "$1"; apply_rt_priorities' _ "$RT/rt_funcs.sh")
+    check "rt-prio ($RTSH): second run is idempotent (0 chrt calls, no log)" sh -c "[ ! -s '$RT/chrt.log' ] && [ -z '$out2' ]"
+
+    # Vision restart: only new rebot-vision RT threads are lowered
+    rm -rf "$RT/proc/1855"
+    python3 "$RT/make_proc.py" "$RT/proc" vision-restarted
+    : > "$RT/chrt.log"
+    out3=$(RT_PROC_ROOT="$RT/proc" RT_DT_COMPAT="$RT/compat_sg2002" RT_CHRT_BIN="$RT/fake_chrt" RT_CHRT_LOG="$RT/chrt.log" NAME=rebot-teleop \
+        $RTSH -c '. "$1"; apply_rt_priorities' _ "$RT/rt_funcs.sh")
+    check "rt-prio ($RTSH): vision restart re-applies only new vision RT threads" sh -c "[ \$(wc -l < '$RT/chrt.log') -eq 2 ] && grep -qx -- '-r -p 70 3110' '$RT/chrt.log' && grep -qx -- '-r -p 70 3111' '$RT/chrt.log' && printf '%s' \"\$1\" | grep -q 'ISP0_RUN(3110)'" _ "$out3"
+
+    # Regression: never rely on `[ -s "$pdir/cmdline" ]` (procfs virtual files report st_size==0)
+    check "rt-prio ($RTSH): does not use stat-size -s on procfs cmdline" sh -c "! grep -q -- '-s .*cmdline' '$RT/rt_funcs.sh'"
+
+    # Missing threads: exits 0 cleanly
+    mkdir -p "$RT/empty_proc"
+    : > "$RT/chrt.log"
+    RT_PROC_ROOT="$RT/empty_proc" RT_DT_COMPAT="$RT/compat_sg2002" RT_CHRT_BIN="$RT/fake_chrt" RT_CHRT_LOG="$RT/chrt.log" NAME=rebot-teleop \
+        $RTSH -c '. "$1"; apply_rt_priorities' _ "$RT/rt_funcs.sh"
+    mrc=$?
+    check "rt-prio ($RTSH): missing threads never fail (exit 0, 0 chrt calls)" sh -c "[ $mrc -eq 0 ] && [ ! -s '$RT/chrt.log' ]"
+    rm -rf "$RT"
+}
+
+run_rt_prio_suite /bin/sh
+if command -v busybox >/dev/null 2>&1 && busybox sh -c : 2>/dev/null; then
+    run_rt_prio_suite "busybox sh"
+fi
 
 # leftover sweep helper ($SWEEP, pidfds) on explicit candidate pids of the current user
 echo "== rebot-app-run pidfd sweep"

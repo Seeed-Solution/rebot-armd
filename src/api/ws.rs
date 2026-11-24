@@ -74,6 +74,13 @@ pub static TEST_ACK_STAMP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 /// `lease_granted` onto `ordinary_out_tx`, allowing heartbeat-triggered `lease_lost` to race ahead.
 pub static TEST_LEASE_GRANTED_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test hook: pause (ms) after a deferred action install (`complete_pending_plan` /
+/// `complete_pending_replay` / `complete_macro_check`) releases the owner lock and before
+/// enqueueing its `command_ack` onto `ordinary_out_tx`, allowing a concurrent Stop/terminal to
+/// race against the ACK gate. 0 (no pause) outside tests.
+#[doc(hidden)]
+pub static TEST_DEFERRED_ACK_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 static TEST_WS_WRITE_HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TEST_WS_WRITE_PAUSED_CONNS: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -721,6 +728,33 @@ impl WsWriterHandle {
 
     fn try_send_stop_best_effort(&self, reply: Value) -> bool {
         self.stop_tx.try_send(reply).is_ok()
+    }
+}
+
+/// Per-connection RAII gate pausing `subscribe_action_terminals` delivery for this connection
+/// while `worker_task` executes an immediate owner command and enqueues its reply on `ordinary_tx`.
+/// Returning `false` from the subscriber callback keeps pending terminals at the head of
+/// `TerminalBroadcaster`'s bounded FIFO (preserving capacity accounting and holding back newer
+/// telemetry broadcasts) until this guard drops and wakes `armd-dispatch`.
+pub(super) struct CommandReplyGateGuard {
+    active: Arc<AtomicBool>,
+    hub: Arc<crate::rt_core::publish::StateHub>,
+}
+
+impl CommandReplyGateGuard {
+    pub(super) fn enter(active: &Arc<AtomicBool>, hub: &Arc<crate::rt_core::publish::StateHub>) -> Self {
+        active.store(true, Ordering::Release);
+        Self {
+            active: Arc::clone(active),
+            hub: Arc::clone(hub),
+        }
+    }
+}
+
+impl Drop for CommandReplyGateGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        self.hub.wake();
     }
 }
 
@@ -1942,8 +1976,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Route unseen action terminals into this connection's lossless ordinary control queue
     // (never dropped by telemetry broadcast lag; overflow closes the connection with an error).
+    // Returning `false` while `command_reply_pending` is set keeps terminals at the head of
+    // `TerminalBroadcaster`'s bounded FIFO (and gates telemetry broadcast) until the in-flight
+    // command's own reply is enqueued on `ordinary_tx`.
+    let command_reply_pending = Arc::new(AtomicBool::new(false));
     let term_writer = writer.clone();
+    let term_pending = Arc::clone(&command_reply_pending);
     let _terminal_sub = supervisor.subscribe_action_terminals(move |obs| {
+        if term_pending.load(Ordering::Acquire) {
+            return false;
+        }
         let Ok(val) = serde_json::to_value(obs) else { return true; };
         term_writer.try_send_ordinary_control(val)
     });
@@ -2409,6 +2451,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let recv_client_label = client_label.clone();
     let worker_ordinary_queue = ordinary_queue.clone();
     let worker_writer = writer.clone();
+    let worker_command_reply_pending = Arc::clone(&command_reply_pending);
     let worker_tasks = tasks.clone();
     let worker_closing = connection_closing.clone();
     let recv_deps = deps;
@@ -2467,7 +2510,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
                     let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
-                    let Some(reply) = actions::complete_macro_check(
+                    let Some((reply, macro_gate)) = actions::complete_macro_check(
                         request_id,
                         generation,
                         stamp,
@@ -2477,8 +2520,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_generation,
                         &recv_deps,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
+                    if reply.get("type").and_then(Value::as_str) == Some("command_ack") {
+                        let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                    let sent = worker_writer.send_ordinary_control(reply).await;
+                    drop(macro_gate);
+                    if !sent { break; }
                     continue;
                 }
                 item = worker_ordinary_queue.pop(macro_active) => match item {
@@ -2585,6 +2637,34 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // Fail closed before any legacy lock/reader path (including depth/teach) whenever
             // `ArmCore` is not owned by the legacy supervisor lock.
             if owner_mode != crate::supervisor::OWNER_LEGACY {
+                if owner_mode == crate::supervisor::OWNER_EXECUTOR {
+                    if let Some(opt_reply) = config::handle_executor_ws_command(
+                        frame_kind,
+                        entry,
+                        &value,
+                        stamp,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &mut last_ordinary_request,
+                        &ws_auth,
+                        &recv_supervisor,
+                        &recv_deps,
+                        &recv_calib,
+                        &ack_tx,
+                        &worker_tasks,
+                    )
+                    .await
+                    {
+                        if let Some(reply) = opt_reply {
+                            if !worker_writer.send_ordinary_control(reply).await {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if let Some(reply) = executor_routing_reject(&value, owner_mode) {
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                 }
@@ -2632,6 +2712,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 continue;
             }
             let mut response: Option<Value>;
+            let mut response_sent = false;
+            let evicted_notify: Option<(String, u64)> = None;
             let mut action_pending = actions::ActionPending {
                 plan: None,
                 macro_action: None,
@@ -2640,9 +2722,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 policy: None,
                 dry_run_grasp: None,
             };
-            let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
+            let mut pending_config_write: Option<config::PendingConfigJob> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
+            let mut reply_gate_guard;
             {
                 let mut inner = recv_supervisor.inner().write().await;
                 if inner.detached {
@@ -2652,6 +2735,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                     continue;
                 }
+                reply_gate_guard = Some(CommandReplyGateGuard::enter(
+                    &worker_command_reply_pending,
+                    recv_supervisor.hub(),
+                ));
                 macro_rules! call_owner {
                     ($handler:expr, $path:expr, $epoch:expr, $gen:expr) => {{
                         let mut ctx = OwnerDispatchCtx {
@@ -2740,12 +2827,40 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                     }
                 }
+                // Enqueue immediate control replies before dropping `inner` and before releasing
+                // `reply_gate_guard` so any terminal caused by this command (either via
+                // `record_finished_action` inside `inner` or via a subsequent tick's telemetry)
+                // cannot overtake this command's ack on the wire.
+                if evicted_notify.is_none()
+                    && response
+                        .as_ref()
+                        .is_some_and(|r| r.get("type").and_then(Value::as_str) != Some("lease_granted"))
+                    && !worker_writer.is_fatal()
+                {
+                    if let Some(reply) = response.take() {
+                        match worker_writer.ordinary_tx.try_send(reply) {
+                            Ok(()) => {
+                                response_sent = true;
+                            }
+                            Err(mpsc::error::TrySendError::Full(reply)) => {
+                                response = Some(reply);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                drop(reply_gate_guard.take());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if response.is_none() {
+                drop(reply_gate_guard.take());
             }
 
             let allows_deferred = entry.is_some_and(|e| e.reply == ReplyPolicy::CommandDeferred);
             if allows_deferred {
                 if let Some((plan, generation)) = action_pending.plan.take() {
-                    let Some(next) = actions::complete_pending_plan(
+                    let Some((next, gate)) = actions::complete_pending_plan(
                         plan,
                         generation,
                         stamp,
@@ -2753,7 +2868,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_connection,
                         &recv_generation,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
+                    reply_gate_guard = gate;
                     response = next;
                 }
 
@@ -2771,7 +2888,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
 
                 if let Some((request_id, input, generation)) = action_pending.replay.take() {
-                    let Some(next) = actions::complete_pending_replay(
+                    let Some((next, gate)) = actions::complete_pending_replay(
                         request_id,
                         input,
                         generation,
@@ -2780,7 +2897,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_connection,
                         &recv_generation,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
+                    reply_gate_guard = gate;
                     response = next;
                 }
                 #[cfg(feature = "policy-runtime")]
@@ -2824,20 +2943,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &worker_tasks,
                     );
                 }
-                // Atomic two-phase persist-before-commit config writes (track B, `config::persist_and_activate`).
-                if let Some((request_id, prepared, generation, epoch)) = pending_config_write.take() {
-                    config::spawn_config_write(
-                        request_id,
-                        prepared,
-                        generation,
-                        epoch,
+                // Atomic two-phase persist-before-commit config writes (PR C / A8, off-lock prepare + requests::config).
+                if let Some(job) = pending_config_write.take() {
+                    response = config::complete_or_spawn_config_write(
+                        job,
+                        recv_conn_id,
                         &recv_supervisor,
+                        &recv_deps,
                         &ack_tx,
                         &ws_auth,
                         &recv_connection,
                         &recv_generation,
                         &worker_tasks,
-                    );
+                    )
+                    .await;
                 }
             } else {
                 #[cfg(feature = "policy-runtime")]
@@ -2857,7 +2976,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 );
                 if unexpected_deferred
                     || (entry.is_some_and(|e| e.reply == ReplyPolicy::CommandImmediate)
-                        && response.is_none())
+                        && response.is_none()
+                        && !response_sent)
                 {
                     tracing::error!(
                         "WS dispatch contract violation: immediate entry {:?} produced no immediate reply or populated deferred slot",
@@ -2875,8 +2995,25 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
             // Control replies are never silently dropped: saturation closes the connection with an error.
             if let Some(response) = response {
-                if !worker_writer.send_ordinary_control(response).await { break; }
+                if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                    let delay_ms = TEST_LEASE_GRANTED_DELAY_MS.load(Ordering::Relaxed);
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                } else if reply_gate_guard.is_some()
+                    && response.get("type").and_then(Value::as_str) == Some("command_ack")
+                {
+                    let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
+                if !worker_writer.send_ordinary_control(response).await {
+                    drop(reply_gate_guard.take());
+                    break;
+                }
             }
+            drop(reply_gate_guard.take());
         }
     });
     // Only the writer (fatal close after urgent flush, or socket error) and reader (client

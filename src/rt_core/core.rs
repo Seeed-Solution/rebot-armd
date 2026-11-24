@@ -8,7 +8,7 @@ use super::config_iface::{ConfigDomain, ConfigHold, HeldConfig};
 use super::mailbox::TargetAuthority;
 use super::ops::TorqueProgress;
 use super::ids::{ArmId, BusId};
-use super::publish::{state_channel, ObservationSpares, OwnerStateSnapshot, RtInputs, StateHub, StatePublisher};
+use super::publish::{state_channel, ObservationSpares, OwnerStateSnapshot, PublishedOwnerMeta, RtInputs, StateHub, StatePublisher};
 use super::record_ring::{Fence, Finished, RecordProducer, RecordRing};
 use crate::driver::ArmDriver;
 use crate::model::ArmObservation;
@@ -189,20 +189,52 @@ impl ArmCore {
     /// Publishes one tick's observation, filled in place, back into the slot it came from:
     /// nothing is displaced, so the tick never frees an observation (whatever the readers
     /// and the retire ring do).
-    pub fn publish(
+    pub fn publish(&mut self, buffer: ObservationBuffer, generation: u64, sampled_at: Instant, valid_until: Instant, positions: &[f32], velocities: &[f32]) {
+        self.publish_with_rt_meta(
+            buffer,
+            generation,
+            sampled_at,
+            valid_until,
+            OwnerStateSnapshot::default(),
+            positions,
+            velocities,
+            positions,
+            &[],
+            &[],
+            PublishedOwnerMeta::default(),
+        );
+    }
+
+    /// In-place zero-alloc publication carrying [`OwnerStateSnapshot`], commanded joints, driver
+    /// RX queue bounds, and live `Copy` [`PublishedOwnerMeta`] alongside the observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_with_rt_meta(
         &mut self,
         buffer: ObservationBuffer,
         generation: u64,
         sampled_at: Instant,
         valid_until: Instant,
-        owner: OwnerStateSnapshot,
+        owner_state: OwnerStateSnapshot,
         positions: &[f32],
         velocities: &[f32],
+        commanded_positions: &[f32],
+        commanded_velocities: &[f32],
+        feedback_queue_bounds: &[Option<Instant>],
+        owner: PublishedOwnerMeta,
     ) {
         self.buffer_out = false;
         self.publisher.restore_back_spares(buffer.1);
-        let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
-        let displaced = self.publisher.publish_with_owner(generation, sampled_at, valid_until, buffer.0, owner, rt);
+        let rt = RtInputs {
+            positions,
+            velocities,
+            commanded_positions,
+            commanded_velocities,
+            feedback_instants: &self.feedback.instants,
+            feedback_seqs: &self.feedback.seqs,
+            feedback_queue_bounds,
+            owner,
+        };
+        let displaced = self.publisher.publish_with_owner(generation, sampled_at, valid_until, buffer.0, owner_state, rt);
         // the slot was emptied by take_observation_buffer and nothing wrote it since
         debug_assert!(displaced.is_none(), "an in-place publication displaced an observation");
         if let Some(d) = displaced { self.publisher.restore_back_observation(d); }
@@ -216,7 +248,16 @@ impl ArmCore {
     #[allow(clippy::result_large_err)]
     pub fn publish_displacing(&mut self, generation: u64, sampled_at: Instant, valid_until: Instant, obs: ArmObservation, positions: &[f32], velocities: &[f32]) -> Result<Option<ArmObservation>, ArmObservation> {
         if self.buffer_out { return Err(obs); }
-        let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
+        let rt = RtInputs {
+            positions,
+            velocities,
+            commanded_positions: positions,
+            commanded_velocities: &[],
+            feedback_instants: &self.feedback.instants,
+            feedback_seqs: &self.feedback.seqs,
+            feedback_queue_bounds: &[],
+            owner: PublishedOwnerMeta::default(),
+        };
         Ok(self.publisher.publish(generation, sampled_at, valid_until, obs, rt))
     }
 

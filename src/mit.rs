@@ -219,11 +219,33 @@ impl MitQualificationFile {
     }
 }
 
+/// Zero-allocation bitmask of 0-based arm joint indices selected for MIT
+/// (0 when MIT is not requested; supports up to 64 joints without heap allocation).
+pub fn mit_joint_mask(cfg: &ArmConfig) -> u64 {
+    let Some(jt) = cfg.joint_tracking.as_ref().filter(|jt| jt.mit_requested()) else {
+        return 0;
+    };
+    let arm = cfg.arm_joints();
+    let mut mask = 0u64;
+    for (k, j) in jt.joints.iter().enumerate() {
+        if j.strategy == crate::tracking::TrackingStrategy::Mit {
+            if let Some(&idx) = arm.get(k) {
+                if idx < 64 {
+                    mask |= 1u64 << idx;
+                }
+            }
+        }
+    }
+    mask
+}
+
 /// 0-based arm joint indices selected for MIT (empty when MIT is not requested).
 pub fn mit_joints(cfg: &ArmConfig) -> Vec<usize> {
-    let Some(jt) = cfg.joint_tracking.as_ref().filter(|jt| jt.mit_requested()) else { return Vec::new() };
-    let arm = cfg.arm_joint_indices();
-    jt.mit_joint_slots().into_iter().filter_map(|k| arm.get(k).copied()).collect()
+    let mask = mit_joint_mask(cfg);
+    if mask == 0 {
+        return Vec::new();
+    }
+    (0..cfg.dof.min(64)).filter(|&i| (mask & (1u64 << i)) != 0).collect()
 }
 
 /// Zero-allocation equivalent of `!mit_joints(cfg).is_empty()` for RT control paths.
@@ -468,6 +490,13 @@ impl crate::supervisor::SupervisorInner {
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn store_qualification(sup: &crate::supervisor::ArmSupervisor, deps: &crate::calibration::CalibrationDeps,
     file: crate::calibration::CalibrationFile, check: &crate::calibration::LeaseCheck) -> Result<Value, CalibError> {
+    if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            format!("{QUALIFICATION_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+        ));
+    }
     {
         let mut inner = sup.inner().write().await;
         check(&mut inner)?;
@@ -520,8 +549,8 @@ pub struct MitRuntime {
     pub armed_ok: bool,
     /// Why the last handover (or hand back) failed.
     pub handover_error: Option<String>,
-    /// Why the group was cancelled.
-    pub lost_reason: Option<String>,
+    /// Why the group was cancelled (bounded stack text — zero allocation on `armd-control`).
+    pub lost_reason: Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>>,
     /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
     pub park_after_hand_back: bool,
     /// Action id of that deferred park (its outcome is reported on it).
@@ -554,15 +583,26 @@ fn quantize_into(tau: f32, lo: f32, hi: f32, l: &damiao::DamiaoLimits) -> Option
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::supervisor::SupervisorInner {
     fn mit_slot(&self, j: usize) -> Option<&crate::tracking::JointTrackingJoint> {
-        let k = self.config.arm_joint_indices().iter().position(|&a| a == j)?;
+        let k = self.config.arm_joints().iter().position(|&a| a == j)?;
         self.config.joint_tracking.as_ref()?.joints.get(k)
     }
 
     pub fn mit_active(&self) -> bool { self.mit.owner == MitOwner::Active }
 
+    /// Zero-allocation MIT motion blocker check (fixed `u64` bitmask, no `Vec`, no `String`):
+    /// true when MIT is requested on an armed arm but does not currently own its joints.
+    pub fn mit_motion_blocked(&self) -> bool {
+        if !self.is_torqued || mit_joint_mask(&self.config) == 0 {
+            return false;
+        }
+        self.mit.park_after_hand_back
+            || self.mit.revoke_pending
+            || self.mit.owner != MitOwner::Active
+    }
+
     /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
     pub fn mit_motion_blocker(&self) -> Option<String> {
-        if !self.is_torqued || mit_joints(&self.config).is_empty() { return None; }
+        if !self.mit_motion_blocked() { return None; }
         if self.mit.park_after_hand_back { return Some("a park waits for the MIT hand back at rest".into()); }
         if self.mit.revoke_pending { return Some("MIT authorization revoked: braking to rest and handing back".into()); }
         match self.mit.owner {
@@ -573,28 +613,67 @@ impl crate::supervisor::SupervisorInner {
         }
     }
 
-    /// Gravity torque per joint from the fresh measured posture, when a selected joint uses it.
-    fn mit_gravity(&self) -> Result<Vec<f32>, String> {
-        let dof = self.config.dof;
+    /// Zero-allocation gravity torque per joint from the fresh measured posture, when a selected
+    /// joint uses it.
+    #[allow(clippy::result_large_err)] // inline stack text avoids RT heap allocation
+    fn mit_gravity_inline(&self) -> Result<[f32; crate::rt_core::mailbox::MAX_DOF], OutputErrorText> {
         let arm_dof = self.config.arm_dof();
-        let needed = self.mit.joints.iter().chain(mit_joints(&self.config).iter())
-            .any(|&j| self.mit_slot(j).is_some_and(|c| c.gravity_scale > 0.0));
-        if !needed { return Ok(vec![0.0; dof]); }
-        if self.config.gravity_model.is_none() || self.measured_positions.len() < arm_dof {
-            return Err("gravity model unavailable".into());
+        let arm = self.config.arm_joints();
+        let needed = self
+            .mit
+            .joints
+            .iter()
+            .copied()
+            .any(|j| self.mit_slot(j).is_some_and(|c| c.gravity_scale > 0.0))
+            || self
+                .config
+                .joint_tracking
+                .as_ref()
+                .filter(|jt| jt.mit_requested())
+                .is_some_and(|jt| {
+                    jt.joints
+                        .iter()
+                        .take(arm.len())
+                        .any(|c| c.strategy == TrackingStrategy::Mit && c.gravity_scale > 0.0)
+                });
+        let mut g = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        if !needed {
+            return Ok(g);
         }
-        let tau = self.config.arm_model.gravity_torques(&self.measured_positions[..arm_dof]).map_err(|e| format!("gravity: {e:?}"))?;
-        if !tau[..arm_dof].iter().all(|t| t.is_finite()) { return Err("gravity torque not finite".into()); }
-        let mut g = vec![0.0; dof];
+        if self.config.gravity_model.is_none()
+            || self.measured_positions.len() < arm_dof
+            || arm_dof > crate::rt_core::mailbox::MAX_DOF
+        {
+            return Err(OutputErrorText::new("gravity model unavailable"));
+        }
+        let tau = self
+            .config
+            .arm_model
+            .gravity_torques(&self.measured_positions[..arm_dof])
+            .map_err(|e| {
+                let mut buf = OutputErrorText::empty();
+                let _ = core::fmt::write(&mut buf, format_args!("gravity: {e:?}"));
+                buf
+            })?;
+        if !tau[..arm_dof].iter().all(|t| t.is_finite()) {
+            return Err(OutputErrorText::new("gravity torque not finite"));
+        }
         g[..arm_dof].copy_from_slice(&tau[..arm_dof]);
         Ok(g)
+    }
+
+    /// Gravity torque per joint from the fresh measured posture, when a selected joint uses it.
+    fn mit_gravity(&self) -> Result<Vec<f32>, String> {
+        let g = self.mit_gravity_inline().map_err(|e| e.to_string())?;
+        Ok(g[..self.config.dof.min(g.len())].to_vec())
     }
 
     /// Fresh feedback of every joint: no age past the deadline ([`past_deadline`]).
     fn mit_feedback_fresh(&self) -> bool {
         if !self.feedback_numeric_valid { return false; }
-        let ages = match self.driver.as_ref().and_then(|d| d.lock().ok()) { Some(drv) => drv.feedback_ages(), None => return true };
-        ages.len() == self.config.dof && ages.iter().all(|a| a.is_some_and(|a| !past_deadline(a)))
+        let Some(d) = self.driver.as_ref() else { return true };
+        let Ok(drv) = d.try_lock() else { return false };
+        drv.feedback_all_within(self.config.dof, MIT_DEADLINE.saturating_sub(Duration::from_nanos(1)))
     }
 
     /// A stationary MIT hold: the reference is at rest (fixed nominal, zero velocity and
@@ -620,39 +699,78 @@ impl crate::supervisor::SupervisorInner {
     /// relieving half-space `sign·(pd + tau_ff) <= 0`, rounded to the wire grid inside `I`.
     /// Refuses (nothing is written) for stale feedback, missing gravity, values outside the
     /// wire ranges or an empty interval.
-    pub fn mit_prepare(&self, targets: &mut [JointTarget], dt: f64) -> Result<Vec<f32>, String> {
-        if !self.mit_feedback_fresh() { return Err("feedback older than the MIT deadline".into()); }
-        let g = self.mit_gravity()?;
+    /// Zero-allocation RT core of [`Self::mit_prepare`].
+    #[allow(clippy::result_large_err)] // inline stack text avoids RT heap allocation
+    fn mit_prepare_inline(
+        &self,
+        targets: &mut [JointTarget],
+        dt: f64,
+    ) -> Result<([f32; crate::rt_core::mailbox::MAX_DOF], usize), OutputErrorText> {
+        if !self.mit_feedback_fresh() {
+            return Err(OutputErrorText::new("feedback older than the MIT deadline"));
+        }
+        let g = self.mit_gravity_inline()?;
+        let dof = self.config.dof;
+        if dof > crate::rt_core::mailbox::MAX_DOF {
+            return Err(OutputErrorText::new("dof exceeds MAX_DOF"));
+        }
         let dt = (dt as f32).clamp(0.001, 0.1);
-        let mut ff = self.mit.last_ff.clone();
-        ff.resize(self.config.dof, 0.0);
+        let mut ff = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let copy_len = self.mit.last_ff.len().min(dof);
+        ff[..copy_len].copy_from_slice(&self.mit.last_ff[..copy_len]);
         for &j in &self.mit.joints {
-            let t = targets.get_mut(j).ok_or("target vector too short")?;
+            let t = targets
+                .get_mut(j)
+                .ok_or_else(|| OutputErrorText::new("target vector too short"))?;
             let (q_d, v_d) = (t.position, t.velocity.unwrap_or(0.0));
             let a_d = self.commanded_accelerations.get(j).copied().unwrap_or(0.0);
             let hold = self.mit_in_hold(v_d, a_d);
             let last = self.mit.last_ff.get(j).copied().unwrap_or(0.0);
-            let (frame, tau) = self.mit_frame(j, q_d, v_d, a_d, hold, g[j], Some((last, dt)))?;
+            let (frame, tau) = self.mit_frame_bounded(j, q_d, v_d, a_d, hold, g[j], Some((last, dt)))?;
             *t = frame;
             ff[j] = tau;
         }
-        Ok(ff)
+        Ok((ff, dof))
     }
 
-    /// One MIT frame for joint `j` on the decoded wire grid and its tau_ff (see
-    /// [`Self::mit_prepare`]); `slew` = (last tau_ff, dt) limits the change, None (the handover's
-    /// first frame) does not. Every bound is checked on the fields the motor decodes.
-    #[allow(clippy::too_many_arguments)]
-    fn mit_frame(&self, j: usize, q_d: f32, v_d: f32, a_d: f32, hold: bool, g_j: f32, slew: Option<(f32, f32)>)
-        -> Result<(JointTarget, f32), String> {
-        let c = self.mit_slot(j).ok_or_else(|| format!("J{}: no tracking entry", j + 1))?;
+    pub fn mit_prepare(&self, targets: &mut [JointTarget], dt: f64) -> Result<Vec<f32>, String> {
+        let (ff, dof) = self.mit_prepare_inline(targets, dt).map_err(|e| e.to_string())?;
+        Ok(ff[..dof].to_vec())
+    }
+
+    /// Zero-allocation RT core of [`Self::mit_frame`].
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)] // inline stack text avoids RT heap allocation
+    fn mit_frame_bounded(
+        &self,
+        j: usize,
+        q_d: f32,
+        v_d: f32,
+        a_d: f32,
+        hold: bool,
+        g_j: f32,
+        slew: Option<(f32, f32)>,
+    ) -> Result<(JointTarget, f32), OutputErrorText> {
+        let fmt_err = |args: core::fmt::Arguments<'_>| {
+            let mut buf = OutputErrorText::empty();
+            let _ = core::fmt::write(&mut buf, args);
+            buf
+        };
+        let c = self
+            .mit_slot(j)
+            .ok_or_else(|| fmt_err(format_args!("J{}: no tracking entry", j + 1)))?;
         let (q_m, v_m) = (self.measured_positions[j], self.measured_velocities[j]);
-        if ![q_d, v_d, a_d, q_m, v_m].iter().all(|x| x.is_finite()) { return Err(format!("J{}: non-finite reference or feedback", j + 1)); }
+        if ![q_d, v_d, a_d, q_m, v_m].iter().all(|x| x.is_finite()) {
+            return Err(fmt_err(format_args!("J{}: non-finite reference or feedback", j + 1)));
+        }
         let (kp, kd) = if hold { (c.hold_kp.unwrap_or(0.0), c.hold_kd.unwrap_or(0.0)) } else { (c.kp, c.kd) };
         let wl = wire_limits(&self.config, j);
         let off = self.joint_zero_offsets.get(j).copied().unwrap_or(0.0);
         if (q_d + off).abs() > wl.p_max || v_d.abs() > wl.v_max || kp > wl.kp_max || kd > wl.kd_max || kp <= 0.0 || kd <= 0.0 {
-            return Err(format!("J{}: MIT frame outside the wire ranges (q {:.3}, v {v_d:.3}, kp {kp}, kd {kd})", j + 1, q_d + off));
+            return Err(fmt_err(format_args!(
+                "J{}: MIT frame outside the wire ranges (q {:.3}, v {v_d:.3}, kp {kp}, kd {kd})",
+                j + 1,
+                q_d + off
+            )));
         }
         // every field as the motor decodes it (position in the motor frame, after the zero offset)
         let grid = |x: f32, lo: f32, hi: f32, bits: u32| damiao::uint_to_float(damiao::float_to_uint(x, lo, hi, bits), lo, hi, bits);
@@ -677,15 +795,31 @@ impl crate::supervisor::SupervisorInner {
             if h.sign > 0.0 { hi = hi.min(-pd); } else { lo = lo.max(-pd); }
         }
         if lo.is_nan() || hi.is_nan() || lo > hi {
-            return Err(format!("J{}: empty effort interval [{lo:.3}, {hi:.3}] N·m (pd {pd:.3}, L {l})", j + 1));
+            return Err(fmt_err(format_args!(
+                "J{}: empty effort interval [{lo:.3}, {hi:.3}] N·m (pd {pd:.3}, L {l})",
+                j + 1
+            )));
         }
-        let tau = quantize_into(raw.clamp(lo, hi), lo, hi, &wl)
-            .ok_or_else(|| format!("J{}: no wire torque value inside [{lo:.4}, {hi:.4}]", j + 1))?;
+        let tau = quantize_into(raw.clamp(lo, hi), lo, hi, &wl).ok_or_else(|| {
+            fmt_err(format_args!("J{}: no wire torque value inside [{lo:.4}, {hi:.4}]", j + 1))
+        })?;
         let total = pd + tau;
         if total.abs() > l + 1e-6 || guard.is_some_and(|h| h.sign * total > 1e-6) {
-            return Err(format!("J{}: decoded effort {total:.4} N·m outside the limit {l} or the relieving side", j + 1));
+            return Err(fmt_err(format_args!(
+                "J{}: decoded effort {total:.4} N·m outside the limit {l} or the relieving side",
+                j + 1
+            )));
         }
         Ok((JointTarget::mit(q_w, v_w, kp_w, kd_w, tau), tau))
+    }
+
+    /// One MIT frame for joint `j` on the decoded wire grid and its tau_ff (see
+    /// [`Self::mit_prepare`]); `slew` = (last tau_ff, dt) limits the change, None (the handover's
+    /// first frame) does not. Every bound is checked on the fields the motor decodes.
+    #[allow(clippy::too_many_arguments)]
+    fn mit_frame(&self, j: usize, q_d: f32, v_d: f32, a_d: f32, hold: bool, g_j: f32, slew: Option<(f32, f32)>)
+        -> Result<(JointTarget, f32), String> {
+        self.mit_frame_bounded(j, q_d, v_d, a_d, hold, g_j, slew).map_err(|e| e.to_string())
     }
 
     /// Write one output batch (every ordinary output path). Without MIT: the bounded driver write
@@ -750,26 +884,61 @@ impl crate::supervisor::SupervisorInner {
         dt: f64,
         override_limits: Option<&[crate::model::JointLimit]>,
     ) -> crate::supervisor::TickOutput {
-        use crate::driver::TxBatchOutcome;
+        use crate::driver::PosForceIntent;
         use crate::supervisor::TickOutput;
         // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
         // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
         if self.urgent_stop_unapplied() { return TickOutput::None; }
+        if let Some(ref hook) = self.post_stop_check_hook {
+            hook();
+        }
         let is_hold = self.safety.state().is_stopped();
+        // Every J7 `Target` carries the `(stop_gen, estop_epoch)` from the A1 `AdmissionStamp` of
+        // the command that produced it (`self.j7_admitted_stamp`). It is NEVER re-stamped later
+        // and NEVER stamped with `max(local, requested)`, so any STOP accepted after admission —
+        // even right between the `urgent_stop_unapplied()` check above and intent creation — turns
+        // the intent into `Hold` in the tick epilogue's single J7 emitter.
+        let admitted_target_stamp = self.j7_admitted_stamp;
+        let non_target_stamp = self.current_j7_intent_stamp();
         let ff = match self.mit.owner {
             MitOwner::Off => None,
-            MitOwner::Lost => return TickOutput::None,
-            MitOwner::Active => match self.mit_prepare(targets, dt) {
+            MitOwner::Lost => {
+                // A tripped MIT fence / cancelled MIT group suppresses ONLY the MIT joints; set
+                // the J7 intent so the tick epilogue's ONE J7 emitter writes the hold/freeze frame.
+                self.j7_intent = Some(if is_hold {
+                    PosForceIntent::stop(non_target_stamp)
+                } else {
+                    PosForceIntent::hold(non_target_stamp)
+                });
+                return TickOutput::None;
+            }
+            MitOwner::Active => match self.mit_prepare_inline(targets, dt) {
                 Ok(ff) => Some(ff),
                 Err(e) => {
+                    // Record J7 Hold/Stop intent so the tick epilogue's ONE J7 emitter still writes
+                    // J7's freeze/hold frame while MIT joints remain suppressed.
+                    self.j7_intent = Some(if is_hold {
+                        PosForceIntent::stop(non_target_stamp)
+                    } else {
+                        PosForceIntent::hold(non_target_stamp)
+                    });
+                    let (now, max_age) = self
+                        .driver
+                        .as_ref()
+                        .and_then(|d| d.try_lock().ok())
+                        .map(|drv| (drv.clock_now(), drv.tx_frame_max_age()))
+                        .unwrap_or_else(|| (self.mit_now(), crate::driver::DAMIAO_TX_FRAME_MAX_AGE));
                     let mut buf = OutputErrorText::empty();
                     let _ = core::fmt::write(&mut buf, format_args!("MIT output refused: {e}"));
                     return TickOutput::Error {
                         message: buf,
-                        now: self.mit_now(),
-                        max_age: crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
+                        now,
+                        max_age,
                         is_hold,
                         sent_any: false,
+                        due_mask: 0,
+                        sent_mask: 0,
+                        pf_status: crate::driver::PosForceTxStatus::Unobserved,
                     };
                 }
             },
@@ -780,20 +949,21 @@ impl crate::supervisor::SupervisorInner {
                 .map(|c| self.gripper_hold_vel_ceiling.map_or(c, |h| c.min(h)))
                 .or_else(|| self.active_joint_velocity_ceiling(g))
         });
+        let mut computed_j7_intent: Option<PosForceIntent> = None;
+        let cutoff = self.active_tx_cutoff;
         let res = self.driver.as_ref().and_then(|d| d.lock().ok())
             .map(|mut drv| {
-                // Enforce the active authorized velocity ceiling across both moving ticks and
-                // zero-velocity position targets (e.g. grasp squeeze, settle, hold) on an active
-                // pos-force gripper joint:
-                // - When the authorized ceiling quantizes to raw >= 1, bound zero-velocity targets
-                //   and any over-ceiling velocity to `wire_speed_f32(ceiling_raw)`, and floor
-                //   transient sub-quantum accel/braking velocities (0 < |v| < 0.01) to raw 1
-                //   (always <= authorized ceiling and <= close_speed_rad_s).
-                // - When the authorized ceiling itself encodes to 0 (unrepresentable), never fall
-                //   back to vlim()/close_speed_rad_s or bump up to raw 1: forward the
-                //   unrepresentable ceiling/velocity so DamiaoArmDriver fails closed with 0 frames.
+                // Resolve the J7 PosForce intent (never writing a 0x307 frame here: the tick
+                // epilogue's ONE J7 emitter writes every 0x307 frame after arm output finishes).
+                // - In stopped hold (`is_hold`), caller's J7 target is ignored and intent is `Stop`.
+                // - In motion (`!is_hold`), enforce the active authorized velocity ceiling and
+                //   validate the caller's J7 target BEFORE writing arm frames: an invalid caller
+                //   J7 target (non-finite or unrepresentable sub-quantum speed) refuses arm motion
+                //   and degrades J7 intent to `Stop` so the epilogue still emits a hold/freeze.
                 if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
-                    if let Some(t) = targets.get_mut(cap.joint) {
+                    if is_hold {
+                        computed_j7_intent = Some(PosForceIntent::stop(non_target_stamp));
+                    } else if let Some(t) = targets.get_mut(cap.joint) {
                         if !t.velocity.is_some_and(|v| !v.is_finite()) {
                             let ceiling_raw = active_pf_ceiling
                                 .filter(|c| c.is_finite() && *c > 0.0)
@@ -817,6 +987,47 @@ impl crate::supervisor::SupervisorInner {
                                 }
                             }
                         }
+                        if let Err(err) = drv.validate_pos_force_intent_target(t.position, t.velocity, None) {
+                            computed_j7_intent = Some(PosForceIntent::stop(non_target_stamp));
+                            return crate::supervisor::SupervisorInner::tick_output_from_driver_write(
+                                &mut **drv,
+                                false,
+                                Err(err),
+                            );
+                        }
+                        computed_j7_intent = Some(match admitted_target_stamp {
+                            Some(stamp) => PosForceIntent::target(t.position, t.velocity, None, stamp),
+                            None => PosForceIntent::hold(non_target_stamp),
+                        });
+                    }
+                }
+                let j7_hold_hint = is_hold
+                    || computed_j7_intent.is_some_and(|intent| {
+                        !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
+                            || intent.stamp != non_target_stamp
+                    });
+                drv.set_pending_pos_force_hold_hint(j7_hold_hint);
+                // Single TX cutoff choke point under the driver lock:
+                // - Safety/stopped holds restore the unclipped release cap so an action deadline
+                //   never blocks a safety hold.
+                // - Motion targets check the action cutoff right before calling the driver (guarding
+                //   non-CAN/sim/mock drivers and any wait on `d.lock()`), while `DamiaoArmDriver`
+                //   additionally enforces the exact same `tx_release_deadline` per-frame inside `send()`.
+                let action_cap = cutoff.and_then(|c| c.drv_action_cutoff);
+                if is_hold {
+                    if let Some(c) = cutoff {
+                        if c.drv_action_cutoff.is_some() {
+                            drv.set_tx_release_deadline(Some(c.drv_release_cap));
+                        }
+                    }
+                } else if let Some(cap) = action_cap {
+                    let pre_now = drv.clock_now();
+                    if pre_now >= cap {
+                        drv.discard_pending_tx();
+                        return TickOutput::ActionDeadlineRefused {
+                            drv_now: pre_now,
+                            pf_status: crate::driver::PosForceTxStatus::Unobserved,
+                        };
                     }
                 }
                 let write_res = if is_hold {
@@ -825,77 +1036,83 @@ impl crate::supervisor::SupervisorInner {
                     drv.write_joint_targets_bounded(targets)
                 };
                 let now = drv.clock_now();
-                let max_age = drv.tx_frame_max_age();
-                let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
-                match write_res {
-                    Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold },
-                    Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
-                        pending,
-                        now,
-                        max_age,
-                        oldest_age: drv.oldest_pending_tx_age(),
-                        is_hold,
-                        sent_any: hold_sent_any,
-                        sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
-                    },
-                    Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
-                        dropped,
-                        pending,
-                        now,
-                        max_age,
-                        oldest_age: drv.last_tx_expired_age(),
-                        is_hold,
-                        sent_any: hold_sent_any,
-                    },
-                    Err(crate::driver::ArmDriverError::EstopInhibited) => {
-                        TickOutput::EstopInhibited { is_hold }
-                    }
-                    Err(e) => {
-                        let mut buf = OutputErrorText::empty();
-                        e.write_bounded(&mut buf);
-                        TickOutput::Error {
-                            message: buf,
-                            now,
-                            max_age,
-                            is_hold,
-                            sent_any: hold_sent_any,
-                        }
-                    }
+                if !is_hold
+                    && matches!(
+                        write_res,
+                        Ok(crate::driver::TxBatchOutcome::Deferred { .. })
+                            | Err(crate::driver::ArmDriverError::Transport(
+                                crate::transport::TransportError::Timeout
+                            ))
+                    )
+                    && action_cap.is_some_and(|cap| now >= cap)
+                {
+                    drv.discard_pending_tx();
+                    return TickOutput::ActionDeadlineRefused {
+                        drv_now: now,
+                        pf_status: drv.take_last_pos_force_tx_status(),
+                    };
                 }
+                crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res)
             })
             .unwrap_or(TickOutput::None);
-        if let Some(ff) = ff {
+        if let Some(intent) = computed_j7_intent {
+            self.j7_intent = Some(intent);
+        }
+        if let Some((ff, dof)) = ff {
             match &res {
                 TickOutput::Complete { .. } => {
-                    self.mit.last_ff = ff;
+                    crate::rt_core::scratch::copy_into(&mut self.mit.last_ff, &ff[..dof]);
                     self.mit.last_output = Some(self.mit_now());
                 }
                 TickOutput::EstopInhibited { .. } => {
-                    self.mit_lose(
-                        format!("MIT batch write failed: {}", crate::driver::ESTOP_INHIBITED),
-                        crate::safety::FaultCode::BusLoss,
+                    self.j7_intent = Some(PosForceIntent::stop(self.current_j7_intent_stamp()));
+                    let mut reason = OutputErrorText::empty();
+                    let _ = core::fmt::write(
+                        &mut reason,
+                        format_args!("MIT batch write failed: {}", crate::driver::ESTOP_INHIBITED),
                     );
+                    self.mit_lose_bounded(reason, crate::safety::FaultCode::BusLoss);
                 }
                 TickOutput::Error { message, .. } => {
-                    self.mit_lose(format!("MIT batch write failed: {message}"), crate::safety::FaultCode::BusLoss);
+                    self.j7_intent = Some(PosForceIntent::stop(self.current_j7_intent_stamp()));
+                    let mut reason = OutputErrorText::empty();
+                    let _ = core::fmt::write(&mut reason, format_args!("MIT batch write failed: {message}"));
+                    self.mit_lose_bounded(reason, crate::safety::FaultCode::BusLoss);
                 }
                 TickOutput::Deferred { pending, .. } => {
-                    self.mit_lose(format!("MIT batch write deferred ({pending} frames queued)"), crate::safety::FaultCode::BusLoss);
+                    self.j7_intent = Some(PosForceIntent::stop(self.current_j7_intent_stamp()));
+                    let mut reason = OutputErrorText::empty();
+                    let _ = core::fmt::write(
+                        &mut reason,
+                        format_args!("MIT batch write deferred ({pending} frames queued)"),
+                    );
+                    self.mit_lose_bounded(reason, crate::safety::FaultCode::BusLoss);
                 }
                 TickOutput::Expired { dropped, .. } => {
-                    self.mit_lose(format!("MIT batch write expired ({dropped} frames dropped)"), crate::safety::FaultCode::BusLoss);
+                    self.j7_intent = Some(PosForceIntent::stop(self.current_j7_intent_stamp()));
+                    let mut reason = OutputErrorText::empty();
+                    let _ = core::fmt::write(
+                        &mut reason,
+                        format_args!("MIT batch write expired ({dropped} frames dropped)"),
+                    );
+                    self.mit_lose_bounded(reason, crate::safety::FaultCode::BusLoss);
                 }
-                TickOutput::None => {}
+                TickOutput::ActionDeadlineRefused { .. } | TickOutput::None => {}
             }
         }
         res
     }
 
-    /// Cancel the group: no further output, latched fault, history and caches dropped.
-    pub(crate) fn mit_lose(&mut self, reason: String, code: crate::safety::FaultCode) {
-        tracing::error!("MIT tracking cancelled: {reason}");
+    /// Cancel the group without heap allocation on `armd-control`: no further output, latched
+    /// fault, history and caches dropped, and deferred log event when RT deferred logging is on.
+    pub(crate) fn mit_lose_bounded(
+        &mut self,
+        reason: OutputErrorText,
+        code: crate::safety::FaultCode,
+    ) {
+        self.safety.log_mit_tracking_cancelled(reason);
         self.mit.owner = MitOwner::Lost;
-        self.mit.lost_reason = Some(reason.clone());
+        self.mit.lost_reason = Some(reason);
         self.mit.last_output = None;
         self.stop_motion();
         self.servo_stream_active = false;
@@ -919,25 +1136,41 @@ impl crate::supervisor::SupervisorInner {
         );
     }
 
+    /// Cancel the group: no further output, latched fault, history and caches dropped.
+    pub(crate) fn mit_lose(&mut self, reason: String, code: crate::safety::FaultCode) {
+        self.mit_lose_bounded(OutputErrorText::new(&reason), code);
+    }
+
     /// Deadline supervision while MIT owns joints: the driver fence, every joint's feedback age
     /// and the gap since the last flushed dynamic batch, each against [`MIT_DEADLINE`].
     /// Time of the MIT deadline bookkeeping: the driver's clock (the transport's deterministic
     /// clock in tests, the system clock otherwise), the same one that dates the feedback ages.
     fn mit_now(&self) -> std::time::Instant {
-        self.driver.as_ref().and_then(|d| d.lock().ok()).map_or_else(std::time::Instant::now, |drv| drv.clock_now())
+        self.driver
+            .as_ref()
+            .and_then(|d| d.try_lock().ok())
+            .map_or_else(std::time::Instant::now, |drv| drv.clock_now())
     }
 
     /// Fault code of a cancelled group: BUS_LOSS when the driver's deadline fence tripped (a
     /// transport loss, wherever it was detected), otherwise a hardware fault (mode uncertain).
     fn mit_loss_code(&self) -> crate::safety::FaultCode {
-        let tripped = self.driver.as_ref().and_then(|d| d.lock().ok()).is_some_and(|drv| drv.mit_fence_trip().is_some());
+        let tripped = self
+            .driver
+            .as_ref()
+            .and_then(|d| d.try_lock().ok())
+            .is_some_and(|drv| drv.mit_fence_trip_bounded().is_some());
         if tripped { crate::safety::FaultCode::BusLoss } else { crate::safety::FaultCode::HardwareFault }
     }
 
     pub(crate) fn mit_supervise(&mut self) {
         if self.mit.owner == MitOwner::Lost {
             // a trip seen after the group was cancelled for another reason is still a loss
-            let tripped = self.driver.as_ref().and_then(|d| d.lock().ok()).and_then(|drv| drv.mit_fence_trip());
+            let tripped = self
+                .driver
+                .as_ref()
+                .and_then(|d| d.try_lock().ok())
+                .and_then(|drv| drv.mit_fence_trip_bounded());
             if let Some(t) = tripped {
                 self.safety.latch(
                     crate::safety::FaultKind::BusLoss,
@@ -954,23 +1187,48 @@ impl crate::supervisor::SupervisorInner {
             return;
         }
         if self.mit.owner != MitOwner::Active { return; }
-        let (trip, ages) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-            Some(drv) => (drv.mit_fence_trip(), drv.feedback_ages()),
-            None => (None, Vec::new()),
+        let mut ages = std::mem::take(&mut self.scratch.ages);
+        ages.clear();
+        let (trip, now) = match self.driver.as_ref().and_then(|d| d.try_lock().ok()) {
+            Some(drv) => {
+                drv.feedback_ages_into(&mut ages);
+                (drv.mit_fence_trip_bounded(), drv.clock_now())
+            }
+            None => (None, std::time::Instant::now()),
         };
-        let now = self.mit_now();
         let gap = self.mit.last_output.map(|t| now.saturating_duration_since(t));
-        let reason = if let Some(t) = trip { Some(format!("driver deadline fence: {t}")) }
-            else if let Some((i, a)) = ages.iter().enumerate().find(|(_, a)| a.is_none_or(past_deadline)) {
-                Some(format!("joint {} feedback age {a:?} reached {MIT_DEADLINE:?}", i + 1))
-            } else if ages.len() != self.config.dof { Some("feedback ages unavailable".into()) }
-            else { gap.filter(|g| past_deadline(*g)).map(|g| format!("gap between dynamic outputs {g:?} reached {MIT_DEADLINE:?}")) };
-        if let Some(r) = reason { self.mit_lose(r, crate::safety::FaultCode::BusLoss); return; }
+        let mut reason: Option<OutputErrorText> = None;
+        if let Some(t) = trip {
+            let mut buf = OutputErrorText::empty();
+            let _ = core::fmt::write(&mut buf, format_args!("driver deadline fence: {t}"));
+            reason = Some(buf);
+        } else if let Some((i, a)) = ages.iter().enumerate().find(|(_, a)| a.is_none_or(past_deadline)) {
+            let mut buf = OutputErrorText::empty();
+            let _ = core::fmt::write(
+                &mut buf,
+                format_args!("joint {} feedback age {a:?} reached {MIT_DEADLINE:?}", i + 1),
+            );
+            reason = Some(buf);
+        } else if ages.len() != self.config.dof {
+            reason = Some(OutputErrorText::new("feedback ages unavailable"));
+        } else if let Some(g) = gap.filter(|g| past_deadline(*g)) {
+            let mut buf = OutputErrorText::empty();
+            let _ = core::fmt::write(
+                &mut buf,
+                format_args!("gap between dynamic outputs {g:?} reached {MIT_DEADLINE:?}"),
+            );
+            reason = Some(buf);
+        }
         let worst = ages.iter().flatten().copied().chain(gap).max().unwrap_or_default();
+        self.scratch.ages = ages;
+        if let Some(r) = reason {
+            self.mit_lose_bounded(r, crate::safety::FaultCode::BusLoss);
+            return;
+        }
         if worst >= MIT_NEAR_MISS {
             self.mit.near_misses += 1;
             if self.mit.near_misses.is_power_of_two() {
-                tracing::warn!("MIT deadline near miss #{}: {worst:?} of {MIT_DEADLINE:?} (feedback age or output gap)", self.mit.near_misses);
+                self.safety.log_mit_deadline_near_miss(self.mit.near_misses, worst, MIT_DEADLINE);
             }
         }
     }
@@ -994,8 +1252,7 @@ impl crate::supervisor::SupervisorInner {
     /// control of an armed arm whose qualification passed at this arm, with nothing else owning
     /// the output (no motion, park, gravity compensation, hold or fault).
     pub(crate) fn mit_maybe_activate(&mut self) {
-        let joints = mit_joints(&self.config);
-        if joints.is_empty() || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
+        if mit_joint_mask(&self.config) == 0 || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
             || self.disable_pending || self.pending_rearm || self.pending_normal_unload || self.gravity_comp.is_some()
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
             || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
@@ -1004,6 +1261,7 @@ impl crate::supervisor::SupervisorInner {
             || !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() {
             return;
         }
+        let joints = mit_joints(&self.config);
         let g = match self.mit_gravity() {
             Ok(g) => g,
             Err(e) => { self.mit.handover_error = Some(e); self.mit.armed_ok = false; return; }
@@ -1178,34 +1436,68 @@ impl crate::supervisor::SupervisorInner {
     pub(crate) fn mit_expiry_recovery_for_epoch(
         &mut self,
         expected_epoch: Option<u64>,
+        mut pre_ctx: crate::safety::ClearContext,
+        commit: crate::supervisor::ClearFaultCommit,
+        driver_err_override: Option<crate::safety::BoundedText<256>>,
     ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
         use crate::driver::EnableState;
         use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
-        // Single authoritative clear_check FIRST before issuing any recovery disable/reset commands.
-        let mut pre_ctx = self.build_mit_recovery_clear_context();
+        // Recheck live J7 freshness, feedback validity, E-stop, and epoch under the SAME driver
+        // lock guard that issues `drv.mit_expiry_recover()` so there is zero check-to-command gap
+        // if J7 crosses 100 ms before the physical disable runs (ZERO commits & ZERO bus commands).
         pre_ctx.expected_epoch = expected_epoch;
-        pre_ctx.pending_estop = self.estop_request_unapplied();
-        if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
-            if refusal == ClearRefusal::EStopActive {
-                self.consume_pending_estop();
-                if let Some(received) = expected_epoch {
-                    if received != self.safety.epoch_id() {
-                        return Err(SafetyError::EpochMismatch {
-                            expected: self.safety.epoch_id(),
-                            received,
-                        });
+        let (pre_recovery_seqs, res) = if let Some(ref d) = self.driver {
+            let mut drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    pre_ctx.j7_feedback_fresh = false;
+                    pre_ctx.feedback_fresh = false;
+                    pre_ctx.pending_estop = self.estop_request_unapplied();
+                    return Err(self
+                        .safety
+                        .clear_check(&pre_ctx)
+                        .err()
+                        .map_or(SafetyError::FeedbackUnavailable, ClearRefusal::into_safety_error));
+                }
+            };
+            pre_ctx.j7_feedback_fresh = drv.pos_force_feedback_fresh();
+            pre_ctx.feedback_fresh = pre_ctx.feedback_fresh && drv.is_feedback_valid();
+            pre_ctx.pending_estop = self.estop_request_unapplied();
+            if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+                drop(drv);
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(SafetyError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            });
+                        }
                     }
                 }
+                return Err(refusal.into_safety_error());
             }
-            return Err(refusal.into_safety_error());
-        }
-        let (pre_recovery_seqs, res) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-            Some(mut drv) => {
-                let pre = drv.feedback_seqs();
-                let r = drv.mit_expiry_recover();
-                (pre, r)
+            let pre = drv.feedback_seqs();
+            let r = drv.mit_expiry_recover();
+            (pre, r)
+        } else {
+            pre_ctx.pending_estop = self.estop_request_unapplied();
+            if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+                if refusal == ClearRefusal::EStopActive {
+                    self.consume_pending_estop();
+                    if let Some(received) = expected_epoch {
+                        if received != self.safety.epoch_id() {
+                            return Err(SafetyError::EpochMismatch {
+                                expected: self.safety.epoch_id(),
+                                received,
+                            });
+                        }
+                    }
+                }
+                return Err(refusal.into_safety_error());
             }
-            None => (Vec::new(), Err("no driver".into())),
+            (Vec::new(), Err("no driver".into()))
         };
         if let Err(e) = res {
             let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
@@ -1222,9 +1514,9 @@ impl crate::supervisor::SupervisorInner {
         self.disable_pending = false;
         self.pending_rearm = false;
 
-        // Refresh supervisor feedback from samples received strictly AFTER the recovery request
-        // (verified by per-joint receive sequence advance AND driver post-recovery RX boundary) —
-        // never evaluate final `clear_check` on cached or pre-recovery feedback.
+        // Read post-recovery feedback strictly AFTER the recovery disable (verified by per-joint
+        // receive sequence advance AND driver post-recovery RX boundary), keeping telemetry,
+        // cooldown, confirmation, and limits STAGED until `clear_with_check(&post_ctx)` commits.
         let post_read = self.driver.as_ref().and_then(|d| {
             d.lock().ok().and_then(|mut drv| {
                 let states = drv.read_joint_states().ok()?;
@@ -1247,6 +1539,7 @@ impl crate::supervisor::SupervisorInner {
                         .iter()
                         .all(|a| a.is_some_and(|t| t <= crate::supervisor::THERMAL_FEEDBACK_FRESHNESS_LIMIT))
                     && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                let j7_fresh = drv.pos_force_feedback_fresh();
                 let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
                 let hw_fault = drv.has_hardware_fault();
                 let state = drv.enable_state();
@@ -1273,6 +1566,8 @@ impl crate::supervisor::SupervisorInner {
                     loads,
                     caps.temperature_feedback,
                     fb_fresh,
+                    j7_fresh,
+                    thermal_below,
                     hw_err,
                     hw_fault,
                     enable_known,
@@ -1281,74 +1576,62 @@ impl crate::supervisor::SupervisorInner {
                 ))
             })
         });
-        let (post_fb_fresh, post_temp_fb, post_hw_err, post_hw_fault, post_enable_known) =
-            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age, next_cd)) = post_read {
-                self.feedback_numeric_valid = fb_fresh;
-                if fb_fresh {
-                    self.last_can_feedback_instant =
-                        oldest_age.and_then(|age| std::time::Instant::now().checked_sub(age));
-                    Self::apply_feedback(
-                        &mut self.measured_positions,
-                        &mut self.measured_velocities,
-                        &mut self.torques,
-                        &mut self.temperatures,
-                        &mut self.loads,
-                        self.config.dof,
-                        &states,
-                        loads.as_deref(),
-                    );
-                    if temp_fb {
-                        self.thermal_cooldown = next_cd;
-                        let temps_copy = self.temperatures.clone();
-                        if let Some((joint_idx, temperature)) = temps_copy
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
-                            .max_by(|a, b| a.1.total_cmp(&b.1))
-                        {
-                            self.thermal_cooldown.reset();
-                            self.safety.latch(
-                                FaultKind::ThermalTrip,
-                                FaultDetail::ThermalTrip {
-                                    joint_idx,
-                                    temperature,
-                                    limit: self.config.max_temperature,
-                                },
-                            );
-                        }
-                    } else {
-                        self.thermal_cooldown.reset();
-                    }
-                } else {
-                    self.last_can_feedback_instant = None;
-                    self.thermal_cooldown.reset();
-                }
-                (fb_fresh, temp_fb, hw_err, hw_fault, enable_known)
-            } else {
-                self.feedback_numeric_valid = false;
-                self.last_can_feedback_instant = None;
-                self.thermal_cooldown.reset();
-                (false, false, None, false, false)
-            };
 
-        if post_fb_fresh && self.measured_positions.iter().all(|q| q.is_finite()) {
-            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
-            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
+        let mut post_ctx = self.build_mit_recovery_clear_context();
+        post_ctx.driver_config_error = if commit.candidate_limits.is_some() || commit.reapply_legacy_limits {
+            None
+        } else {
+            driver_err_override.or(post_ctx.driver_config_error)
+        };
+        if let Some((ref states, _, temp_fb, fb_fresh, j7_fresh, thermal_below, hw_err, hw_fault, enable_known, _, next_cd)) = post_read {
+            if fb_fresh && temp_fb {
+                if let Some((joint_idx, temperature)) = states
+                    .iter()
+                    .take(self.config.dof)
+                    .map(|s| s.temperature)
+                    .enumerate()
+                    .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                {
+                    self.safety.latch(
+                        FaultKind::ThermalTrip,
+                        FaultDetail::ThermalTrip {
+                            joint_idx,
+                            temperature,
+                            limit: self.config.max_temperature,
+                        },
+                    );
+                }
+            }
+            let positions: Vec<f32> = states.iter().take(self.config.dof).map(|s| s.position).collect();
+            post_ctx.feedback_fresh = fb_fresh;
+            post_ctx.j7_feedback_fresh = post_ctx.j7_feedback_fresh && j7_fresh;
+            post_ctx.thermal_sensor_available = temp_fb;
+            post_ctx.thermal_below_threshold = thermal_below;
+            post_ctx.thermal_cooldown_elapsed_ms = if thermal_below { next_cd.elapsed_ms() } else { 0 };
+            post_ctx.joint_limit_violation = if fb_fresh {
+                self.joint_limit_clear_violation_for_positions(&positions, commit.candidate_limits.as_ref())
+            } else {
+                self.joint_limit_clear_violation_with_candidates(commit.candidate_limits.as_ref())
+            };
+            post_ctx.hardware_error = hw_err;
+            post_ctx.hardware_reset_required = hw_fault;
+            post_ctx.enable_state_known = enable_known;
+        } else {
+            post_ctx.feedback_fresh = false;
+            post_ctx.j7_feedback_fresh = false;
+            post_ctx.thermal_sensor_available = false;
+            post_ctx.thermal_below_threshold = false;
+            post_ctx.thermal_cooldown_elapsed_ms = 0;
+            post_ctx.hardware_error = None;
+            post_ctx.hardware_reset_required = false;
+            post_ctx.enable_state_known = false;
         }
-        self.commanded_velocities.fill(0.0);
-        self.commanded_accelerations.fill(0.0);
 
         // An E-stop that arrived while the disables were confirmed wins: never end in Idle.
         self.consume_pending_estop();
-        let mut post_ctx = self.build_mit_recovery_clear_context();
         post_ctx.expected_epoch = expected_epoch;
         post_ctx.pending_estop = self.estop_request_unapplied();
-        post_ctx.feedback_fresh = post_fb_fresh;
-        post_ctx.thermal_sensor_available = post_temp_fb;
-        post_ctx.hardware_error = post_hw_err;
-        post_ctx.hardware_reset_required = post_hw_fault;
-        post_ctx.enable_state_known = post_enable_known;
         if let Some(received) = expected_epoch {
             if received != self.safety.epoch_id() {
                 return Err(SafetyError::EpochMismatch {
@@ -1362,7 +1645,30 @@ impl crate::supervisor::SupervisorInner {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
             return Err(SafetyError::EStopActive);
         }
-        if let Err(refusal) = self.safety.clear_with_check(&post_ctx) {
+        // Single authoritative clear commit FIRST — recheck live J7 freshness and feedback
+        // validity under the driver lock guard across `clear_with_check(&post_ctx)` so an earlier
+        // read can never clear a now-stale J7 fault (ZERO feedback/cooldown/limit/confirmation
+        // commits on refusal).
+        let clear_res = if let Some(ref d) = self.driver {
+            match d.lock() {
+                Ok(drv) => {
+                    post_ctx.j7_feedback_fresh =
+                        post_ctx.j7_feedback_fresh && drv.pos_force_feedback_fresh();
+                    post_ctx.feedback_fresh = post_ctx.feedback_fresh && drv.is_feedback_valid();
+                    post_ctx.pending_estop = self.estop_request_unapplied();
+                    self.safety.clear_with_check(&post_ctx)
+                }
+                Err(_) => {
+                    post_ctx.j7_feedback_fresh = false;
+                    post_ctx.feedback_fresh = false;
+                    post_ctx.pending_estop = self.estop_request_unapplied();
+                    self.safety.clear_with_check(&post_ctx)
+                }
+            }
+        } else {
+            self.safety.clear_with_check(&post_ctx)
+        };
+        if let Err(refusal) = clear_res {
             if refusal == ClearRefusal::EStopActive {
                 self.consume_pending_estop();
                 if let Some(received) = expected_epoch {
@@ -1375,6 +1681,45 @@ impl crate::supervisor::SupervisorInner {
                 }
             }
             return Err(refusal.into_safety_error());
+        }
+
+        // Clear committed: apply staged post-recovery feedback, cooldown, limits, and confirmation.
+        self.mit.recovery_confirmed = false;
+        if let Some((states, loads, temp_fb, fb_fresh, _, _, _, _, _, oldest_age, next_cd)) = post_read {
+            self.feedback_numeric_valid = fb_fresh;
+            if fb_fresh {
+                self.last_can_feedback_instant =
+                    oldest_age.and_then(|age| std::time::Instant::now().checked_sub(age));
+                Self::apply_feedback(
+                    &mut self.measured_positions,
+                    &mut self.measured_velocities,
+                    &mut self.torques,
+                    &mut self.temperatures,
+                    &mut self.loads,
+                    self.config.dof,
+                    &states,
+                    loads.as_deref(),
+                );
+                if self.measured_positions.iter().all(|q| q.is_finite()) {
+                    crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+                    crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
+                }
+                if temp_fb {
+                    self.thermal_cooldown = next_cd;
+                } else {
+                    self.thermal_cooldown.reset();
+                }
+            } else {
+                self.last_can_feedback_instant = None;
+                self.thermal_cooldown.reset();
+            }
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        if let Some(ref cand) = commit.candidate_limits {
+            self.commit_driver_limits_bounded(cand);
+        } else if commit.reapply_legacy_limits {
+            self.reapply_driver_limits();
         }
         self.mit.owner = MitOwner::Off;
         self.mit.joints.clear();

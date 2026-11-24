@@ -1007,7 +1007,7 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
                     assert!(!inner.gripper_stalled, "{label} learned={learned}: false stall at {}", inner.measured_positions[6]);
                     assert!(inner.gripper_last_contact.is_none(), "{label} learned={learned}: false contact {:?}", inner.gripper_last_contact);
                 }
-                let sub = inner.macro_run.as_ref().unwrap().sub.clone();
+                let sub = inner.macro_run.as_ref().unwrap().sub;
                 match sub {
                     armd::macro_action::SubState::Done(d) => {
                         if grasp { assert_eq!(d.holding, Some(false), "{label} learned={learned}: {d:?}"); }

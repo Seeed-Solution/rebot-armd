@@ -189,6 +189,8 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
+    fn set_tx_budget(&mut self, budget: crate::driver::TxBudget) { self.inner.set_tx_budget(budget); }
+    fn reset_pos_force_boot_state(&mut self) { self.inner.reset_pos_force_boot_state(); }
     fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
     fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
     fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }
@@ -220,10 +222,60 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
+    fn set_external_pos_force_emitter(&mut self, enabled: bool) {
+        self.inner.set_external_pos_force_emitter(enabled);
+    }
+    fn validate_pos_force_intent_target(
+        &self,
+        position: f32,
+        velocity: Option<f32>,
+        current_raw: Option<u16>,
+    ) -> Result<(), ArmDriverError> {
+        let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+        self.inner.validate_pos_force_intent_target(position + offset, velocity, current_raw)
+    }
+    fn set_pending_pos_force_hold_hint(&mut self, is_hold: bool) {
+        self.inner.set_pending_pos_force_hold_hint(is_hold);
+    }
+    fn emit_pos_force_j7(
+        &mut self,
+        intent: crate::driver::PosForceIntent,
+        current: crate::driver::PosForceIntentStamp,
+    ) -> Result<crate::driver::PosForceEmitOutcome, ArmDriverError> {
+        let mapped = match intent.kind {
+            crate::driver::PosForceIntentKind::Target { position, velocity, current_raw } => {
+                let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+                crate::driver::PosForceIntent {
+                    kind: crate::driver::PosForceIntentKind::Target {
+                        position: position + offset,
+                        velocity,
+                        current_raw,
+                    },
+                    stamp: intent.stamp,
+                }
+            }
+            _ => intent,
+        };
+        self.inner.emit_pos_force_j7(mapped, current)
+    }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
+    fn last_hold_tx_due_mask(&self) -> u64 { self.inner.last_hold_tx_due_mask() }
+    fn last_hold_tx_sent_mask(&self) -> u64 { self.inner.last_hold_tx_sent_mask() }
     fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
+    fn take_last_pos_force_tx_status(&mut self) -> crate::driver::PosForceTxStatus {
+        self.inner.take_last_pos_force_tx_status()
+    }
+    fn pos_force_feedback_fresh(&self) -> bool { self.inner.pos_force_feedback_fresh() }
+    fn pos_force_last_fresh_position(&self) -> Option<f32> {
+        let pos = self.inner.pos_force_last_fresh_position()?;
+        let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+        Some(pos - offset)
+    }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        self.inner.feedback_joints_within(joints, max_age)
+    }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { self.inner.with_range_check(f) }
     fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_instants_into(out) }
@@ -311,7 +363,15 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
+    fn mit_fence_trip_bounded(
+        &self,
+    ) -> Option<crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>> {
+        self.inner.mit_fence_trip_bounded()
+    }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
+    fn driver_clock(&self) -> Option<std::sync::Arc<dyn crate::transport::DriverClock>> {
+        self.inner.driver_clock()
+    }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
