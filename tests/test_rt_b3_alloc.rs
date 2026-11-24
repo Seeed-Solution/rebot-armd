@@ -391,6 +391,7 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
     *temp_ctl.lock().unwrap() = 85.0;
     wait_until_async(Duration::from_secs(2), || {
         sup.hub().latest().is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })))
+            && handle.stats().last_fault_latch_release_seq.load(Ordering::Acquire) > 0
     }).await;
     let thermal_seq = handle.stats().last_fault_latch_release_seq.load(Ordering::Acquire);
     let thermal_sample = expect_release_sample(&sup, thermal_seq, "ThermalTrip latch").await;
@@ -1851,6 +1852,7 @@ async fn watchdog_latch_and_executor_clear_retry_zero_alloc_on_tagged_live_relea
     let handle_wd = sup_wd.start_executor(exec_cfg.clone()).await.unwrap();
     wait_until_async(Duration::from_secs(2), || {
         sup_wd.hub().latest().is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Fault(FaultReason::WatchdogTimeout)))
+            && handle_wd.stats().last_fault_latch_release_seq.load(Ordering::Acquire) > 0
     }).await;
     let wd_seq = handle_wd.stats().last_fault_latch_release_seq.load(Ordering::Acquire);
     let wd_sample = expect_release_sample(&sup_wd, wd_seq, "watchdog latch").await;
@@ -3023,11 +3025,14 @@ async fn executor_clear_fault_carries_epoch_and_refuses_after_newer_estop() {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
-    // Warm up every StateHub slot and per-tick scratch buffer before measuring release allocations.
+    // Warm up every StateHub triple-buffer slot (including the reader front slot via `latest()`)
+    // and per-tick scratch buffer before measuring release allocations.
+    step_clock.wait_until_parked();
     let mut expected_steps = handle.stats().steps.load(Ordering::Acquire);
     for _ in 0..8 {
         expected_steps += 1;
         step_one(expected_steps);
+        let _ = sup.hub().latest();
     }
     step_clock.wait_until_parked();
 

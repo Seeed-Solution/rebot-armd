@@ -2565,19 +2565,9 @@ fn control_thread_main(
                     state.persist_wake.unpark();
                 }
             }
-            // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
-            // drain any E-stop acks / retired states produced during Steps 3-7.
-            state.flush_pending_maint_reply(&core);
-            state.emit_estop_ack_if_advanced(&mut core);
-            state.drain_retired_states(&mut core);
-            if let Some((armed, slot)) = state.hooks.inject_release_alloc_once.as_deref() {
-                if armed.swap(false, Ordering::AcqRel) {
-                    let ptr = Box::into_raw(Box::new(0xB3_u64));
-                    slot.store(ptr, Ordering::Release);
-                    release_flags |= RELEASE_FLAG_INJECT_ALLOC;
-                    stats.last_inject_alloc_release_seq.store(step_num, Ordering::Release);
-                }
-            }
+            // Publish safety/E-stop release_seq markers BEFORE waking maintenance or E-stop
+            // callers so Acquire loads after `trigger_e_stop_checked` / `clear_fault` always
+            // observe the tagged release sequence without racing `armd-control`.
             let kinds_after = core.safety.latched_fault_kinds();
             let newly_set_kinds = kinds_after & !kinds_before;
             if core.safety.latch_count() != latch_count_before || newly_set_kinds != 0 {
@@ -2594,6 +2584,20 @@ fn control_thread_main(
                 release_flags |= RELEASE_FLAG_ESTOP_APPLIED;
                 stats.last_estop_release_seq.store(step_num, Ordering::Release);
             }
+            if let Some((armed, slot)) = state.hooks.inject_release_alloc_once.as_deref() {
+                if armed.load(Ordering::Acquire) {
+                    let ptr = Box::into_raw(Box::new(0xB3_u64));
+                    slot.store(ptr, Ordering::Release);
+                    release_flags |= RELEASE_FLAG_INJECT_ALLOC;
+                    stats.last_inject_alloc_release_seq.store(step_num, Ordering::Release);
+                    armed.store(false, Ordering::Release);
+                }
+            }
+            // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
+            // drain any E-stop acks / retired states produced during Steps 3-7.
+            state.flush_pending_maint_reply(&core);
+            state.emit_estop_ack_if_advanced(&mut core);
+            state.drain_retired_states(&mut core);
             let control_hz = core.config.control_frequency_hz;
             let done = now_inst();
             let allocs = crate::diagnostics::alloc::take();
