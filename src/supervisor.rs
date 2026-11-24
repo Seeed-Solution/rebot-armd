@@ -1723,6 +1723,7 @@ impl SupervisorInner {
         }
         if (self.is_torqued || self.disable_pending || was_active)
             && temperature_available
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip)
             && self
                 .temperatures
                 .iter()
@@ -2249,13 +2250,12 @@ impl SupervisorInner {
     /// [`Self::fill_observation`] at this timestamp.
     pub fn tick_control(&mut self, dt: f64) -> f64 {
         self.consume_pending_estop();
-        // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst) {
-            if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Estop) {
-                self.apply_stop_policy(StopPolicy::EStopLatch);
-            } else {
-                self.safety.latch(crate::safety::FaultKind::Estop, crate::safety::FaultDetail::Estop);
-            }
+        // Immediate atomic e-stop latch check before any processing (only latches once when not yet recorded;
+        // every new E-stop request arrives via `consume_pending_estop` above and advances the epoch).
+        if self.e_stop_latched.load(Ordering::SeqCst)
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Estop)
+        {
+            self.apply_stop_policy(StopPolicy::EStopLatch);
         }
 
         // Reuse Step 2's single budgeted hardware poll when present; legacy callers without
@@ -2324,10 +2324,12 @@ impl SupervisorInner {
             self.stop_motion();
             self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
-            self.safety.latch(
-                crate::safety::FaultKind::Other,
-                crate::safety::FaultDetail::Static(crate::safety::StaticFault::InvalidTelemetry),
-            );
+            if !self.safety.has_latched_fault_code(FaultCode::InvalidTelemetry) {
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::Static(crate::safety::StaticFault::InvalidTelemetry),
+                );
+            }
         }
         if driver_torque_lost && self.is_torqued && !self.disable_pending {
             self.stop_motion();
@@ -2790,6 +2792,7 @@ impl SupervisorInner {
         if self.is_torqued
             && self.driver.is_some()
             && !(self.feedback_numeric_valid && bus_feedback_fresh)
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::BusLoss)
         {
             self.execute_stop(StopPolicy::BusLossFallback);
         }
@@ -2820,12 +2823,14 @@ impl SupervisorInner {
                         self.tracking.invalidate();
                         copy_into(&mut self.target_positions, &self.commanded_positions);
                         self.commanded_velocities.fill(0.0);
-                        self.safety.latch(
-                            crate::safety::FaultKind::Other,
-                            crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
-                                let _ = core::fmt::write(buf, format_args!("{e}"));
-                            }),
-                        );
+                        if !self.safety.has_latched_fault_code(FaultCode::HardwareFault) {
+                            self.safety.latch(
+                                crate::safety::FaultKind::Other,
+                                crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                                    let _ = core::fmt::write(buf, format_args!("{e}"));
+                                }),
+                            );
+                        }
                     }
                 }
             }
@@ -2841,6 +2846,7 @@ impl SupervisorInner {
             && self.is_torqued
             && !matches!(self.safety.state(), SafetyState::Booting | SafetyState::Idle)
             && !self.pending_normal_unload
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::WatchdogTimeout)
             && self.last_heartbeat.elapsed() > self.lease_timeout
         {
             #[cfg(feature = "policy-runtime")]
@@ -3699,12 +3705,14 @@ impl SupervisorInner {
                 copy_into(&mut self.commanded_positions, &self.measured_positions);
                 copy_into(&mut self.target_positions, &self.measured_positions);
             }
-            self.safety.latch(
-                crate::safety::FaultKind::Other,
-                crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
-                    let _ = core::fmt::write(buf, format_args!("Control output failed: {error}"));
-                }),
-            );
+            if !self.safety.has_latched_fault_code(FaultCode::DriverWriteFailed) {
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+                        let _ = core::fmt::write(buf, format_args!("Control output failed: {error}"));
+                    }),
+                );
+            }
             tracing::error!("Control output failed: {error}");
         }
 

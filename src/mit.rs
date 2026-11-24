@@ -1098,13 +1098,17 @@ impl crate::supervisor::SupervisorInner {
     /// motors, a disable of every motor confirmed per motor, then Idle with torque off and the
     /// MIT group reset (fence disarmed, history cleared; the qualification record is untouched
     /// and the next arm reads the TIMEOUT again). A motor that does not confirm keeps the fault.
-    pub(crate) fn mit_expiry_recovery(&mut self) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
+    pub(crate) fn mit_expiry_recovery_for_epoch(
+        &mut self,
+        expected_epoch: Option<u64>,
+    ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
         use crate::safety::SafetyError;
         // Single authoritative clear_check FIRST before issuing any recovery disable/reset commands.
-        let pre_ctx = self.build_mit_recovery_clear_context();
+        let mut pre_ctx = self.build_mit_recovery_clear_context();
+        pre_ctx.expected_epoch = expected_epoch;
         self.safety
             .clear_check(&pre_ctx)
-            .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))?;
+            .map_err(|r| r.into_safety_error())?;
         let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
             Some(mut drv) => drv.mit_expiry_recover(),
             None => Err("no driver".into()),
@@ -1138,7 +1142,16 @@ impl crate::supervisor::SupervisorInner {
         // an E-stop that arrived while the disables were confirmed wins: never end in Idle.
         // Clear the resolved MIT fault once clear_check passes, then latch EStop.
         self.consume_pending_estop();
-        let post_ctx = self.build_mit_recovery_clear_context();
+        let mut post_ctx = self.build_mit_recovery_clear_context();
+        post_ctx.expected_epoch = expected_epoch;
+        if let Some(received) = expected_epoch {
+            if received != self.safety.epoch_id() {
+                return Err(SafetyError::EpochMismatch {
+                    expected: self.safety.epoch_id(),
+                    received,
+                });
+            }
+        }
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = self.safety.clear_with_check(&post_ctx);
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
@@ -1147,7 +1160,7 @@ impl crate::supervisor::SupervisorInner {
         crate::supervisor::SupervisorInner::check_concurrent_estop(self)?;
         self.safety
             .clear_with_check(&post_ctx)
-            .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))?;
+            .map_err(|r| r.into_safety_error())?;
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
@@ -1163,8 +1176,16 @@ impl crate::supervisor::SupervisorInner {
     /// (`{"mit_recovery": "torque_off_all"}`). Without it, the recovery state is refused with
     /// [`RECOVERY_CONFIRM_CODE`]; every other state clears as `clear_fault`.
     pub fn clear_fault_confirmed(&mut self, mit_recovery: bool) -> Result<crate::safety::SafetyState, crate::supervisor::ArmError> {
+        self.clear_fault_confirmed_for_epoch(mit_recovery, None)
+    }
+
+    pub fn clear_fault_confirmed_for_epoch(
+        &mut self,
+        mit_recovery: bool,
+        expected_epoch: Option<u64>,
+    ) -> Result<crate::safety::SafetyState, crate::supervisor::ArmError> {
         self.mit.recovery_confirmed = mit_recovery;
-        let res = self.clear_fault();
+        let res = self.clear_fault_for_epoch(expected_epoch);
         self.mit.recovery_confirmed = false;
         res.map_err(|e| match e {
             crate::safety::SafetyError::ClearFaultRejected(m) if m.starts_with(RECOVERY_CONFIRM_CODE) =>

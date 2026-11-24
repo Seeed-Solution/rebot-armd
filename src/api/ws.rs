@@ -403,6 +403,15 @@ fn check_operator_privilege(
     body: &Value,
     epoch: u64,
 ) -> Option<ApiError> {
+    if path == "/api/v1/safety/clear_fault"
+        && inner.consume_pending_estop()
+        && inner.safety.epoch_id() != epoch
+    {
+        return Some(ArmError::Safety(SafetyError::EpochMismatch {
+            expected: inner.safety.epoch_id(),
+            received: epoch,
+        }).into());
+    }
     if ws_auth.is_operator() {
         return None;
     }
@@ -845,6 +854,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             inner.stop_motion();
                             response = Some(json!({"type":"lease_released", "success":released}));
                         } else {
+                            inner.consume_pending_estop();
                             let epoch = inner.safety.epoch_id();
                             if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
                                 response = Some(if kind == "command" {

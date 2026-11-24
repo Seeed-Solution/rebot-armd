@@ -684,10 +684,15 @@ async fn exhausted_pool_still_latches_thermal_trip_during_bus_loss_and_watchdog_
             assert!(!inner.safety.recoverable());
             assert!(!inner.safety.fault().unwrap().recoverable);
 
-            // A second thermal trip does not churn epoch_id once ThermalTrip is already recorded.
+            // Every explicit latch (including a second ThermalTrip) advances epoch_id with 0 heap ops.
             let ep_after_trip = inner.safety.epoch_id();
+            let _ = alloc::take();
             inner.apply_stop_policy(StopPolicy::ThermalTrip);
-            assert_eq!(inner.safety.epoch_id(), ep_after_trip);
+            let repeat_allocs = alloc::take();
+            if use_rt {
+                assert_eq!(repeat_allocs.calls, 0, "repeat ThermalTrip latch must do 0 heap ops: {repeat_allocs:?}");
+            }
+            assert_eq!(inner.safety.epoch_id(), ep_after_trip + 1);
 
             // clear_fault MUST check EVERY recorded kind: stale bus feedback fails first,
             // then fresh feedback with hot temperature STILL fails thermal cooldown.
@@ -1986,4 +1991,146 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             format!("Transport error: SocketCAN send failed: {}", std::io::Error::from_raw_os_error(libc::ENETDOWN))
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_latch_advances_epoch_and_stale_clear_refuses_newer_estop_with_epoch_mismatch() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // 1. Unit invariant: EVERY latch (new kind, E-stop over existing fault, or repeat of same kind
+    // including repeat E-stop) advances epoch_id with 0 heap allocations.
+    let mut sm = SafetyManager::new();
+    alloc::time_this_thread();
+    let e0 = sm.epoch_id();
+    let _ = alloc::take();
+    let e1 = sm.latch(FaultKind::Estop, FaultDetail::Estop);
+    let e2 = sm.latch(FaultKind::Estop, FaultDetail::Estop);
+    let e3 = sm.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+    let e4 = sm.latch(FaultKind::Estop, FaultDetail::Estop);
+    let e5 = sm.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+    let latch_allocs = alloc::take();
+    assert_eq!((e1, e2, e3, e4, e5), (e0 + 1, e0 + 2, e0 + 3, e0 + 4, e0 + 5));
+    assert_eq!(latch_allocs.calls, 0, "repeated/stacked latches must do 0 heap ops: {latch_allocs:?}");
+    assert_eq!(
+        sm.clear_check(&ClearContext { expected_epoch: Some(e4), ..ClearContext::all_conditions_met() }),
+        Err(ClearRefusal::EpochMismatch { expected: e5, received: e4 })
+    );
+    assert!(sm.has_latched_fault_kind(FaultKind::Estop));
+    assert!(sm.has_latched_fault_kind(FaultKind::BusLoss));
+
+    // 2. Live WebSocket operator session: E-stop A -> read epoch e -> E-stop B -> clear with e ->
+    // refused with EPOCH_MISMATCH and latch kept (both applied and pending E-stop B, and E-stop over fault).
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let router = armd::api::create_router(sup.clone(), OperatorAuth::enforced("123456", 1800));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+
+    let http = reqwest::Client::new();
+    let unlock: serde_json::Value = http
+        .post(format!("http://{addr}/api/v1/auth/unlock"))
+        .json(&serde_json::json!({"pin": "123456"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let op_token = unlock["token"].as_str().unwrap().to_string();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    ws.send(Message::Text(serde_json::json!({"type": "auth", "token": op_token}).to_string().into())).await.unwrap();
+    loop {
+        let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        if v["type"] == "auth_ack" {
+            assert_eq!(v["role"], "operator", "{v}");
+            break;
+        }
+    }
+    ws.send(Message::Text(serde_json::json!({"type":"acquire_lease","seq":1,"client_id":"op"}).to_string().into())).await.unwrap();
+    let lease_gen = loop {
+        let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        if v["type"] == "lease_granted" { break v["generation"].as_u64().unwrap(); }
+    };
+
+    async fn send_clear(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        req_id: u64,
+        lease_gen: u64,
+        epoch_id: u64,
+    ) -> serde_json::Value {
+        let cmd = serde_json::json!({
+            "type": "command",
+            "request_id": req_id,
+            "path": "/api/v1/safety/clear_fault",
+            "body": {},
+            "generation": lease_gen,
+            "epoch_id": epoch_id,
+            "client_id": "op"
+        });
+        ws.send(Message::Text(cmd.to_string().into())).await.unwrap();
+        loop {
+            let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+            if v["type"] == "command_reject" || v["type"] == "command_ack" {
+                return v;
+            }
+        }
+    }
+
+    // (a) E-stop A -> client reads epoch e -> second E-stop B -> clear with e -> EPOCH_MISMATCH, latch kept.
+    let (st_a, ep_a) = sup.trigger_e_stop().await;
+    assert_eq!(st_a, SafetyState::EStop);
+    assert_eq!(sup.get_observation().await.epoch_id, ep_a);
+
+    let (st_b, ep_b) = sup.trigger_e_stop().await;
+    assert_eq!(st_b, SafetyState::EStop);
+    assert_eq!(ep_b, ep_a + 1, "second E-stop B must advance epoch");
+
+    let rej_stale = send_clear(&mut ws, 10, lease_gen, ep_a).await;
+    assert_eq!(rej_stale["type"], "command_reject", "{rej_stale}");
+    assert_eq!(rej_stale["code"], "EPOCH_MISMATCH", "{rej_stale}");
+    assert_eq!(rej_stale["epoch_id"], ep_b, "{rej_stale}");
+    assert_eq!(sup.get_observation().await.safety_state, SafetyState::EStop);
+    assert!(sup.e_stop_latched.load(Ordering::SeqCst), "stale clear must keep E-stop latch");
+
+    // (b) Pending (unconsumed) E-stop C arrives before operator WS clear carrying ep_b ->
+    // WS consumes pending E-stop before reading epoch -> refused with EPOCH_MISMATCH, latch kept!
+    {
+        let inner = sup.inner().read().await;
+        inner.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+    }
+    let rej_pending = send_clear(&mut ws, 11, lease_gen, ep_b).await;
+    assert_eq!(rej_pending["type"], "command_reject", "{rej_pending}");
+    assert_eq!(rej_pending["code"], "EPOCH_MISMATCH", "{rej_pending}");
+    let ep_c = ep_b + 1;
+    assert_eq!(rej_pending["epoch_id"], ep_c, "{rej_pending}");
+    assert_eq!(sup.get_observation().await.safety_state, SafetyState::EStop);
+    assert!(sup.e_stop_latched.load(Ordering::SeqCst), "pending E-stop C must stay latched");
+
+    // Clear with exact latest epoch ep_c succeeds.
+    let ok_c = send_clear(&mut ws, 12, lease_gen, ep_c).await;
+    assert_eq!(ok_c["type"], "command_ack", "{ok_c}");
+    assert_eq!(sup.get_observation().await.safety_state, SafetyState::Idle);
+    assert!(!sup.e_stop_latched.load(Ordering::SeqCst));
+
+    // (c) E-stop over existing fault (BusLoss) advances epoch -> clear with pre-E-stop fault epoch is refused!
+    {
+        let mut inner = sup.inner().write().await;
+        inner.safety.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+    }
+    let ep_fault = sup.get_observation().await.epoch_id;
+    let (st_es_over_fault, ep_es_over_fault) = sup.trigger_e_stop().await;
+    assert_eq!(st_es_over_fault, SafetyState::Fault(FaultReason::BusLoss));
+    assert_eq!(ep_es_over_fault, ep_fault + 1, "E-stop over existing fault must advance epoch");
+
+    let rej_over_fault = send_clear(&mut ws, 13, lease_gen, ep_fault).await;
+    assert_eq!(rej_over_fault["type"], "command_reject", "{rej_over_fault}");
+    assert_eq!(rej_over_fault["code"], "EPOCH_MISMATCH", "{rej_over_fault}");
+    assert_eq!(rej_over_fault["epoch_id"], ep_es_over_fault, "{rej_over_fault}");
+    assert_eq!(sup.get_observation().await.safety_state, SafetyState::Fault(FaultReason::BusLoss));
+    assert!(sup.e_stop_latched.load(Ordering::SeqCst));
 }

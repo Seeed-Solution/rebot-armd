@@ -75,6 +75,12 @@ fault_codes! {
 }
 
 impl FaultCode {
+    /// Bitmask bit for this fault code (fits in `u32`).
+    #[inline]
+    pub const fn bit(self) -> u32 {
+        1u32 << (self as u8)
+    }
+
     /// Hint for client recovery policies; armd never clears a fault by itself.
     pub fn recoverable(self) -> bool {
         matches!(self, FaultCode::WatchdogTimeout | FaultCode::ControlDeadline | FaultCode::HandoverUnsettled)
@@ -915,6 +921,7 @@ impl std::fmt::Display for ClearFaultDriverError {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub enum ClearRefusal {
+    EpochMismatch { expected: u64, received: u64 },
     ShutdownCommitted,
     DriverConfigError(BoundedText<256>),
     GravityCompUnconfirmed,
@@ -943,11 +950,21 @@ pub type ClearFaultRefusal = ClearRefusal;
 impl ClearRefusal {
     /// Renders the exact API error text off the RT control thread.
     pub fn render_message(&self) -> String { self.to_string() }
+
+    /// Converts this refusal into the corresponding [`SafetyError`] off-thread.
+    pub fn into_safety_error(self) -> SafetyError {
+        match self {
+            Self::EpochMismatch { expected, received } => SafetyError::EpochMismatch { expected, received },
+            other => SafetyError::ClearFaultRejected(other.render_message()),
+        }
+    }
 }
 
 impl std::fmt::Display for ClearRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EpochMismatch { expected, received } =>
+                write!(f, "Epoch mismatch: expected {expected}, received {received}. Command invalidated by generation change"),
             Self::ShutdownCommitted => f.write_str("Daemon shutdown is committed"),
             Self::DriverConfigError(err) => write!(f, "Driver limit configuration error: {err}"),
             Self::GravityCompUnconfirmed => f.write_str("Gravity compensation: the switch back to POS_VEL is not confirmed yet"),
@@ -978,6 +995,7 @@ impl std::fmt::Display for ClearRefusal {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub struct ClearContext {
+    pub expected_epoch: Option<u64>,
     pub shutdown_committed: bool,
     pub driver_config_error: Option<BoundedText<256>>,
     pub gravity_comp_unconfirmed: bool,
@@ -1003,6 +1021,7 @@ impl ClearContext {
     /// Context with every clear precondition satisfied (no driver, cool, within limits, no lease).
     pub const fn all_conditions_met() -> Self {
         Self {
+            expected_epoch: None,
             shutdown_committed: false,
             driver_config_error: None,
             gravity_comp_unconfirmed: false,
@@ -1031,6 +1050,7 @@ impl ClearContext {
 #[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub enum ClearFaultError {
     EStopActive,
+    EpochMismatch { expected: u64, received: u64 },
     FeedbackUnavailable,
     Rejected(ClearFaultRefusal),
 }
@@ -1039,6 +1059,8 @@ impl std::fmt::Display for ClearFaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EStopActive => f.write_str("E-Stop is latched, motion rejected"),
+            Self::EpochMismatch { expected, received } =>
+                write!(f, "Epoch mismatch: expected {expected}, received {received}. Command invalidated by generation change"),
             Self::FeedbackUnavailable => f.write_str("Actuator feedback unavailable: physical angles not received from hardware"),
             Self::Rejected(r) => write!(f, "Cannot clear fault while hardware fault condition persists: {r}"),
         }
@@ -1047,14 +1069,20 @@ impl std::fmt::Display for ClearFaultError {
 
 impl std::error::Error for ClearFaultError {}
 impl From<ClearFaultRefusal> for ClearFaultError {
-    fn from(r: ClearFaultRefusal) -> Self { Self::Rejected(r) }
+    fn from(r: ClearFaultRefusal) -> Self {
+        match r {
+            ClearFaultRefusal::EpochMismatch { expected, received } => Self::EpochMismatch { expected, received },
+            other => Self::Rejected(other),
+        }
+    }
 }
 impl From<ClearFaultError> for SafetyError {
     fn from(e: ClearFaultError) -> Self {
         match e {
             ClearFaultError::EStopActive => SafetyError::EStopActive,
+            ClearFaultError::EpochMismatch { expected, received } => SafetyError::EpochMismatch { expected, received },
             ClearFaultError::FeedbackUnavailable => SafetyError::FeedbackUnavailable,
-            ClearFaultError::Rejected(r) => SafetyError::ClearFaultRejected(r.render_message()),
+            ClearFaultError::Rejected(r) => r.into_safety_error(),
         }
     }
 }
@@ -1117,6 +1145,8 @@ pub struct SafetyManager {
     fault_code: Option<FaultCode>,
     /// Bitmask of every [`FaultKind`] latched since the last clear to `Idle`.
     latched_fault_kinds: u8,
+    /// Bitmask of every [`FaultCode`] latched since the last clear to `Idle`.
+    latched_fault_codes: u32,
     /// Sticky worst-of recoverability flag: set whenever ANY latched detail is non-recoverable,
     /// cleared only when the record is reset on clear.
     has_non_recoverable: bool,
@@ -1170,6 +1200,7 @@ impl Clone for SafetyManager {
             latch_count: self.latch_count,
             fault_code: self.fault_code,
             latched_fault_kinds: self.latched_fault_kinds,
+            latched_fault_codes: self.latched_fault_codes,
             has_non_recoverable: self.has_non_recoverable,
             latched_fault_details: self.latched_fault_details.clone(),
         }
@@ -1227,6 +1258,7 @@ impl Default for SafetyManager {
             latch_count: 0,
             fault_code: None,
             latched_fault_kinds: 0,
+            latched_fault_codes: 0,
             has_non_recoverable: false,
             latched_fault_details: vec![None; FaultKind::COUNT].into_boxed_slice(),
         }
@@ -1457,6 +1489,12 @@ impl SafetyManager {
             }
         }
         drained
+    }
+
+    /// True when `code` has been latched since the last clear to `Idle`.
+    #[inline]
+    pub fn has_latched_fault_code(&self, code: FaultCode) -> bool {
+        (self.latched_fault_codes & code.bit()) != 0
     }
 
     /// Most severe recorded [`FaultKind`] according to [`FaultKind::severity`].
@@ -1706,8 +1744,8 @@ impl SafetyManager {
     /// Always records `kind`, its bounded inline detail, and worst-of recoverability in the
     /// fixed-size record — even when another fault is already active and even when every
     /// preallocated `Arc<SafetyState>` pool slot is exhausted — and never allocates on the heap.
-    /// Decides the shown state by strict severity precedence without epoch churn or log spam on
-    /// repeated detection of an already-latched kind.
+    /// Every latch (new kind or repeat of the same kind, including E-stop) advances `epoch_id`,
+    /// while repeat detection of an already-recorded kind with the same code avoids Arc/log churn.
     pub fn latch(&mut self, kind: FaultKind, detail: FaultDetail) -> u64 {
         let code = detail.code(kind);
         let bounded_reason = detail.bounded_reason(kind);
@@ -1716,8 +1754,9 @@ impl SafetyManager {
         let prev_highest = self.highest_severity_kind();
         let prev_highest_rank = prev_highest.map_or(0, |k| k.severity(self.detail_code_for(k)));
 
-        // 1. Always record kind, worst-of recoverability, and inline detail (0 heap ops).
+        // 1. Always record kind, code, worst-of recoverability, and inline detail (0 heap ops).
         self.latched_fault_kinds |= kind.bit();
+        self.latched_fault_codes |= code.bit();
         if kind.always_non_recoverable() || !code.recoverable() {
             self.has_non_recoverable = true;
         }
@@ -1730,7 +1769,11 @@ impl SafetyManager {
             });
         }
 
-        // 2. Repeat detection of an already-recorded kind with the same code is idempotent.
+        // 2. EVERY latch (a new kind or a repeat of the same kind, including E-stop) advances epoch.
+        self.latch_count = self.latch_count.wrapping_add(1);
+        self.epoch_id = self.epoch_id.wrapping_add(1);
+
+        // Repeat detection of an already-recorded kind with the same code needs no Arc/log churn.
         if already_latched && prev_detail.is_some_and(|d| d.code == code) {
             return self.epoch_id;
         }
@@ -1741,7 +1784,6 @@ impl SafetyManager {
             || new_rank > prev_highest_rank
             || (prev_highest == Some(kind) && kind == FaultKind::Other && !keep_prev_other_detail);
 
-        self.latch_count = self.latch_count.wrapping_add(1);
         if kind == FaultKind::Estop {
             if upgrades_shown && *self.state_arc != SafetyState::EStop {
                 if self.deferred_logging {
@@ -1755,22 +1797,15 @@ impl SafetyManager {
             self.emit_or_queue_fault_log(&bounded_reason, code);
         }
 
-        if upgrades_shown {
-            if self.can_accept_fault_transition() {
-                if let Some(next_arc) = self.acquire_state_arc(kind, detail) {
-                    self.fault_code = Some(code);
-                    let replaced = self.try_replace_state_arc(next_arc);
-                    debug_assert!(replaced);
-                } else if !self.state_arc.is_stopped() {
-                    self.fault_code = Some(code);
-                    let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
-                    debug_assert!(replaced);
-                }
-            }
-            // E-stop latching while already stopped records EStop without churning the active fault epoch.
-            let estop_over_stopped = kind == FaultKind::Estop && prev_highest.is_some();
-            if !estop_over_stopped {
-                self.epoch_id = self.epoch_id.wrapping_add(1);
+        if upgrades_shown && self.can_accept_fault_transition() {
+            if let Some(next_arc) = self.acquire_state_arc(kind, detail) {
+                self.fault_code = Some(code);
+                let replaced = self.try_replace_state_arc(next_arc);
+                debug_assert!(replaced);
+            } else if !self.state_arc.is_stopped() {
+                self.fault_code = Some(code);
+                let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
+                debug_assert!(replaced);
             }
         }
 
@@ -1784,6 +1819,14 @@ impl SafetyManager {
     /// (fail closed). Performs zero heap allocations.
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     pub fn clear_check(&self, ctx: &ClearContext) -> Result<(), ClearRefusal> {
+        if let Some(received) = ctx.expected_epoch {
+            if received != self.epoch_id {
+                return Err(ClearRefusal::EpochMismatch {
+                    expected: self.epoch_id,
+                    received,
+                });
+            }
+        }
         if ctx.shutdown_committed {
             return Err(ClearRefusal::ShutdownCommitted);
         }
@@ -1947,6 +1990,7 @@ impl SafetyManager {
             }
             self.fault_code = None;
             self.latched_fault_kinds = 0;
+            self.latched_fault_codes = 0;
             self.has_non_recoverable = false;
             self.latched_fault_details.fill(None);
             self.epoch_id = self.epoch_id.wrapping_add(1);

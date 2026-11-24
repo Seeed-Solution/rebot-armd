@@ -1632,6 +1632,7 @@ impl SupervisorInner {
                 && self.last_heartbeat.elapsed() <= self.lease_timeout
         });
         ClearContext {
+            expected_epoch: None,
             shutdown_committed: self.shutdown_committed,
             driver_config_error: driver_config_error_override
                 .or_else(|| self.driver_config_error.as_deref().map(BoundedText::new)),
@@ -1674,12 +1675,28 @@ impl SupervisorInner {
     }
 
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
-        Self::check_concurrent_estop(self)?;
+        self.clear_fault_for_epoch(None)
+    }
+
+    /// Clear fault, optionally requiring an exact safety epoch (`expected_epoch`).
+    pub fn clear_fault_for_epoch(&mut self, expected_epoch: Option<u64>) -> Result<SafetyState, SafetyError> {
+        if self.consume_pending_estop() {
+            if let Some(received) = expected_epoch {
+                if received != self.safety.epoch_id() {
+                    return Err(SafetyError::EpochMismatch {
+                        expected: self.safety.epoch_id(),
+                        received,
+                    });
+                }
+            }
+            return Err(SafetyError::EStopActive);
+        }
         if self.driver_config_error.is_some() {
             self.reapply_driver_limits();
         }
         // Check universal preconditions via the single clear_check gate before any early return.
         let mut pre_ctx = self.build_clear_context_base(None);
+        pre_ctx.expected_epoch = expected_epoch;
         pre_ctx.feedback_fresh = true;
         pre_ctx.thermal_sensor_available = true;
         pre_ctx.thermal_below_threshold = true;
@@ -1688,7 +1705,7 @@ impl SupervisorInner {
         pre_ctx.joints_within_limits = true;
         pre_ctx.enable_state_known = true;
         if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
-            return Err(SafetyError::ClearFaultRejected(refusal.render_message()));
+            return Err(refusal.into_safety_error());
         }
         if !self.safety.state().is_stopped() && !self.safety.has_latched_fault() {
             return Ok(self.safety.state().clone());
@@ -1702,9 +1719,7 @@ impl SupervisorInner {
                     drop(drv);
                     let mut mctx = pre_ctx;
                     mctx.mit_modes_uncertain = true;
-                    return Err(SafetyError::ClearFaultRejected(
-                        self.safety.clear_check(&mctx).unwrap_err().render_message(),
-                    ));
+                    return Err(self.safety.clear_check(&mctx).unwrap_err().into_safety_error());
                 }
             }
             // decided from feedback read for this request, never from the cache
@@ -1743,17 +1758,19 @@ impl SupervisorInner {
                     self.update_thermal_cooldown_from_temps(&temps_copy);
                 }
                 // Run the single authoritative clear_check BEFORE operator confirmation / MIT recovery!
-                let mit_ctx = self.build_mit_recovery_clear_context();
+                let mut mit_ctx = self.build_mit_recovery_clear_context();
+                mit_ctx.expected_epoch = expected_epoch;
                 self.safety
                     .clear_check(&mit_ctx)
-                    .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))?;
+                    .map_err(|r| r.into_safety_error())?;
                 if !std::mem::take(&mut self.mit.recovery_confirmed) {
                     return Err(SafetyError::ClearFaultRejected(format!("{}: {}", crate::mit::RECOVERY_CONFIRM_CODE, crate::mit::RECOVERY_WARNING)));
                 }
-                return self.mit_expiry_recovery();
+                return self.mit_expiry_recovery_for_epoch(expected_epoch);
             }
         }
         let mut ctx = self.build_clear_context_base(None);
+        ctx.expected_epoch = expected_epoch;
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
             let disabling = drv.clear_fault_disables_joints();
@@ -1771,9 +1788,7 @@ impl SupervisorInner {
                 {
                     drop(drv);
                     ctx.resting_feedback_missing = true;
-                    return Err(SafetyError::ClearFaultRejected(
-                        self.safety.clear_check(&ctx).unwrap_err().render_message(),
-                    ));
+                    return Err(self.safety.clear_check(&ctx).unwrap_err().into_safety_error());
                 }
                 self.feedback_numeric_valid = true;
                 self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
@@ -1848,6 +1863,7 @@ impl SupervisorInner {
             }
             drop(drv);
             ctx = self.build_clear_context_base(None);
+            ctx.expected_epoch = expected_epoch;
             ctx.feedback_fresh = fb_fresh;
             ctx.hardware_error = hw_err;
             ctx.thermal_sensor_available = temp_fb;
@@ -1855,15 +1871,16 @@ impl SupervisorInner {
             ctx.enable_state_known = enable_known;
             self.safety
                 .clear_check(&ctx)
-                .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))?;
+                .map_err(|r| r.into_safety_error())?;
             self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
         } else {
             let temps_copy = self.temperatures.clone();
             self.update_thermal_cooldown_from_temps(&temps_copy);
             ctx = self.build_clear_context_base(None);
+            ctx.expected_epoch = expected_epoch;
             self.safety
                 .clear_check(&ctx)
-                .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))?;
+                .map_err(|r| r.into_safety_error())?;
         }
         self.clear_fault_finish(&ctx)
     }
@@ -1904,10 +1921,18 @@ impl SupervisorInner {
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
         if self.consume_pending_estop() {
+            if let Some(received) = ctx.expected_epoch {
+                if received != self.safety.epoch_id() {
+                    return Err(ClearFaultError::EpochMismatch {
+                        expected: self.safety.epoch_id(),
+                        received,
+                    });
+                }
+            }
             return Err(ClearFaultError::EStopActive);
         }
         let was_estop = *self.safety.state() == SafetyState::EStop;
-        let state = self.safety.clear_with_check(ctx).map_err(ClearFaultError::Rejected)?;
+        let state = self.safety.clear_with_check(ctx).map_err(ClearFaultError::from)?;
         self.handover_settling_since = None;
         if !was_estop && self.e_stop_latched.load(Ordering::SeqCst) {
             self.apply_stop_policy(StopPolicy::EStopLatch);
