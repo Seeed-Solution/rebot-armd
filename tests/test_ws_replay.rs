@@ -221,6 +221,44 @@ fn comparator_accepts_bijective_nondeterministic_renumbering_and_rejects_every_s
     assert!(compare_transcripts(&ps_2, &ps_3).is_empty());
     assert!(!compare_transcripts(&ps_2, &ps_0).is_empty());
 
+    // action.phase_ms: `start`/`done` normalize any u64 (>= 0) while rejecting floats/negatives/strings,
+    // and real work phases (`pose`, `wait`) still strictly require positive integers (> 0).
+    let phase_base = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action: json!({"id": 1, "state": "done", "kind": "sequence", "progress": 1.0, "phase_ms": {"done": 0, "pose": 6738, "start": 0, "wait": 51}}),
+        safety_state: json!("Armed"),
+        epoch_id: 1,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    let phase_loaded = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action: json!({"id": 1, "state": "done", "kind": "sequence", "progress": 1.0, "phase_ms": {"done": 2, "pose": 6810, "start": 3, "wait": 55}}),
+        safety_state: json!("Armed"),
+        epoch_id: 1,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    let phase_start_float = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action: json!({"id": 1, "state": "done", "kind": "sequence", "progress": 1.0, "phase_ms": {"done": 0, "pose": 6738, "start": 1.0, "wait": 51}}),
+        safety_state: json!("Armed"),
+        epoch_id: 1,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    let phase_pose_zero = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action: json!({"id": 1, "state": "done", "kind": "sequence", "progress": 1.0, "phase_ms": {"done": 0, "pose": 0, "start": 0, "wait": 51}}),
+        safety_state: json!("Armed"),
+        epoch_id: 1,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    assert!(compare_transcripts(&phase_base, &phase_loaded).is_empty());
+    assert!(!compare_transcripts(&phase_base, &phase_start_float).is_empty());
+    assert!(!compare_transcripts(&phase_base, &phase_pose_zero).is_empty());
+
     // Broken epoch equality -> diff.
     let mut bad_epoch_eq = shifted.clone();
     if let RecordedEvent::ServerFrame { frame, .. } = &mut bad_epoch_eq.events[3] {

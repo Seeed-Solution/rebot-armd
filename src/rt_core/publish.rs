@@ -28,7 +28,7 @@
 //! slot ([`super::triple`]). Readers share [`StateHub`]'s mutex with each other only.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -439,6 +439,8 @@ pub struct StateHub {
     /// Revision-tagged slow-changing planning environment published off-thread (never touched
     /// on `armd-control`; read by off-thread action preparation and macro orchestrators).
     prep_env: Mutex<Option<Arc<super::requests::actions::ActionPrepEnv>>>,
+    /// Number of off-RT readers currently waiting to acquire `self.state` inside `latest()`.
+    latest_waiters: AtomicUsize,
 }
 
 /// A publisher for an arm with `dof` joints and its hub.
@@ -460,6 +462,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         tick_frees: AtomicU64::new(0),
         prewarm_template: OnceLock::new(),
         prep_env: Mutex::new(None),
+        latest_waiters: AtomicUsize::new(0),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
 }
@@ -470,8 +473,23 @@ impl StateHub {
     /// copies the observation out of the slot (the copy is allocated and freed on the reader
     /// side; the slot keeps its memory, which the tick fills again).
     pub fn latest(&self) -> Option<Arc<Snapshot>> {
+        struct WaiterGuard<'a>(&'a AtomicUsize);
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.latest_waiters.fetch_add(1, Ordering::Release);
+        let _waiter = WaiterGuard(&self.latest_waiters);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        drop(_waiter);
         self.refresh(&mut st)
+    }
+
+    /// Number of threads currently waiting on the hub mutex inside [`Self::latest`] (tests).
+    #[doc(hidden)]
+    pub fn latest_waiters(&self) -> usize {
+        self.latest_waiters.load(Ordering::Acquire)
     }
 
     /// Displaced observations the tick freed itself because no reader drained the retire ring.

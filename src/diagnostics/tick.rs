@@ -1540,6 +1540,11 @@ impl TickWindow {
         percentiles(&mut v)
     }
 
+    /// Thread-CPU-time percentiles of lock-held tick execution (`CLOCK_THREAD_CPUTIME_ID` on Linux).
+    pub fn lock_cpu_us(&self) -> Percentiles {
+        self.col(|r| r.usage.lock_cpu_us)
+    }
+
     fn sum(&self, f: impl Fn(&TickSample) -> u32) -> u64 {
         self.rows.iter().fold(0u64, |acc, r| acc.saturating_add(u64::from(f(r))))
     }

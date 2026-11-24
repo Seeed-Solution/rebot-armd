@@ -250,20 +250,67 @@ async fn tick_timing_while_recording_and_saving() {
     sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
     for _ in 0..1000 { sup.tick(0.02).await; }
     let idle = sup.tick_stats();
+    let idle_cpu = sup.tick_lock_cpu_us();
     sup.start_recording(None, None).await.unwrap();
     for _ in 0..1000 { sup.tick(0.02).await; }
     let rec = sup.tick_stats();
-    // a 600 s episode at 50 Hz is 30000 frames; record that many, then save while ticking
+    let rec_cpu = sup.tick_lock_cpu_us();
+    // a 600 s episode at 50 Hz is 30000 frames; record that many, then save while ticking.
+    // Hold the off-lock parquet writer open across a deterministic tick batch so `during` always
+    // exercises concurrent ticking while the blocking save is in flight, then write the real
+    // 30000-frame parquet file to disk.
     for _ in 0..29000 { sup.tick(0.02).await; }
-    let saver = { let s = sup.clone(); tokio::spawn(async move { s.save_recording().await }) };
+    let (write_entered_tx, write_entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (write_release_tx, write_release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let saver = {
+        let s = sup.clone();
+        tokio::spawn(async move {
+            s.save_recording_with(move |path, frames| {
+                let _ = write_entered_tx.send(());
+                let _ = write_release_rx.recv();
+                armd::recording::write_episode_parquet(path, frames, None, &[])
+            })
+            .await
+        })
+    };
+    tokio::task::spawn_blocking(move || {
+        write_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("save_recording_with must enter the off-lock parquet writer")
+    })
+    .await
+    .unwrap();
     let mut during = 0;
+    for _ in 0..64 {
+        sup.tick(0.02).await;
+        during += 1;
+    }
+    let _ = write_release_tx.send(());
     while !saver.is_finished() { sup.tick(0.02).await; during += 1; tokio::task::yield_now().await; }
     saver.await.unwrap().unwrap();
     let saving = sup.tick_stats();
-    println!("TICK idle: tick p50/p99/max {}/{}/{} us, lock {}/{}/{} us", idle.tick_us.p50, idle.tick_us.p99, idle.tick_us.max, idle.lock_us.p50, idle.lock_us.p99, idle.lock_us.max);
-    println!("TICK recording: tick p50/p99/max {}/{}/{} us, lock {}/{}/{} us", rec.tick_us.p50, rec.tick_us.p99, rec.tick_us.max, rec.lock_us.p50, rec.lock_us.p99, rec.lock_us.max);
-    println!("TICK last 1000 incl. {during} ticks during a 30000-frame save: tick p50/p99/max {}/{}/{} us, lock {}/{}/{} us",
-        saving.tick_us.p50, saving.tick_us.p99, saving.tick_us.max, saving.lock_us.p50, saving.lock_us.p99, saving.lock_us.max);
+    let saving_cpu = sup.tick_lock_cpu_us();
+    println!("TICK idle: tick p50/p99/max {}/{}/{} us, lock {}/{}/{} us, lock_cpu {}/{}/{} us",
+        idle.tick_us.p50, idle.tick_us.p99, idle.tick_us.max,
+        idle.lock_us.p50, idle.lock_us.p99, idle.lock_us.max,
+        idle_cpu.p50, idle_cpu.p99, idle_cpu.max);
+    println!("TICK recording: tick p50/p99/max {}/{}/{} us, lock {}/{}/{} us, lock_cpu {}/{}/{} us",
+        rec.tick_us.p50, rec.tick_us.p99, rec.tick_us.max,
+        rec.lock_us.p50, rec.lock_us.p99, rec.lock_us.max,
+        rec_cpu.p50, rec_cpu.p99, rec_cpu.max);
+    println!("TICK last 1000 incl. {during} ticks during a 30000-frame save: tick p50/p99/max {}/{}/{} us, lock {}/{}/{} us, lock_cpu {}/{}/{} us",
+        saving.tick_us.p50, saving.tick_us.p99, saving.tick_us.max,
+        saving.lock_us.p50, saving.lock_us.p99, saving.lock_us.max,
+        saving_cpu.p50, saving_cpu.p99, saving_cpu.max);
+    assert!(during > 0, "expected ticks to keep running concurrently while saving 30000 frames");
+    // On Linux, `lock_us` includes off-CPU SCHED_OTHER preemption slices under CPU contention,
+    // whereas `lock_cpu_us` (`CLOCK_THREAD_CPUTIME_ID`) measures exact on-CPU lock-held work.
+    #[cfg(target_os = "linux")]
+    {
+        assert!(rec_cpu.max > 0 && saving_cpu.max > 0, "expected real CLOCK_THREAD_CPUTIME_ID samples: {rec_cpu:?} {saving_cpu:?}");
+        assert!(rec_cpu.p99 < 2000 && saving_cpu.p99 < 5000, "rec_cpu={rec_cpu:?} saving_cpu={saving_cpu:?} {rec:?} {saving:?}");
+    }
+    #[cfg(not(target_os = "linux"))]
     assert!(rec.lock_us.p99 < 2000 && saving.lock_us.p99 < 5000, "{rec:?} {saving:?}");
 }
 
