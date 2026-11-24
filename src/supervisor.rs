@@ -419,6 +419,10 @@ pub struct SupervisorInner {
     pub disable_pending: bool,
     /// The torque transition the RT started and serves from `poll_hardware` (None: none).
     pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
+    /// Persistent enable-lifecycle state owned by the single enable transition reducer.
+    pub(crate) enable_lifecycle: driver_transitions::EnableLifecycle,
+    /// Inline per-joint measured-position hold state (zero alloc on RT).
+    pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
     pub last_disable_attempt: Option<Instant>,
     /// Active background/transition disable intent carried into driver sends and periodic retries.
     pub(crate) active_disable_kind: Option<crate::driver::DisableKind>,
@@ -1083,6 +1087,8 @@ impl SupervisorInner {
             following_error_since: None,
             disable_pending: false,
             torque_transition: None,
+            enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
+            measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
             last_disable_attempt: None,
             active_disable_kind: None,
             last_stopped_torque_off_refusal: None,
@@ -4903,14 +4909,33 @@ impl SupervisorInner {
                     }
                 }
             }
-        } else if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus {
-            let send_to_bus = feedback_fresh
+        } else if !self.shutdown_committed && !self.disable_pending && !transition_owns_bus {
+            let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+            let is_stopped_or_failed_hold = self.safety.state().is_stopped()
+                || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
+            let send_to_bus = self.is_torqued
+                && feedback_fresh
                 && self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT)
                 && self.driver.as_ref().is_none_or(|d|
                     d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
+            let has_fallback_ramp = send_to_bus
+                && tracking_active
+                && self.driver.is_some()
+                && self.tracking.fallback_ramp.is_some();
 
-            if send_to_bus {
-                let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+            if is_stopped_or_failed_hold && !has_fallback_ramp {
+                self.tracking.invalidate();
+                if self.stopped_hold_eligible() {
+                    if self.driver.is_some() {
+                        tick_output = self.service_stopped_measured_hold(servo_dt, gravity_output_enabled);
+                    }
+                } else {
+                    self.measured_hold.clear();
+                }
+            } else if send_to_bus {
+                if !is_stopped_or_failed_hold {
+                    self.measured_hold.clear();
+                }
                 let arm_indices = self.config.arm_joints();
                 let has_residual = tracking_active
                     && self.tracking.has_residual_lead(&self.commanded_positions, &arm_indices);

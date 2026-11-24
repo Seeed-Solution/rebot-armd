@@ -2689,6 +2689,87 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.begin_disable_torque(kind)
     }
 
+    fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let mut hold_mask = 0u64;
+        for i in 0..self.servo_ids.len().min(64) {
+            if self.motor_evidence.get(i).copied() != Some(MotorTorqueEvidence::OffConfirmed) {
+                hold_mask |= 1u64 << i;
+            }
+        }
+        self.write_measured_hold_masked(hold_mask, targets).map(|_| ())
+    }
+
+    fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
+        let mut hold_mask = 0u64;
+        for i in 0..self.servo_ids.len().min(64) {
+            if self.motor_evidence.get(i).copied() != Some(MotorTorqueEvidence::OffConfirmed) {
+                hold_mask |= 1u64 << i;
+            }
+        }
+        self.write_measured_hold_masked(hold_mask, targets).map(|r| r.outcome)
+    }
+
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<HoldPassReport, ArmDriverError> {
+        self.assert_clock_matches_transport();
+        if targets.len() != self.servo_ids.len() {
+            return Err(ArmDriverError::JointCountMismatch {
+                expected: self.servo_ids.len(),
+                actual: targets.len(),
+            });
+        }
+        let dof = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut report = HoldPassReport::empty(dof);
+        let mut positions = Vec::with_capacity(dof);
+        let default_calib = feetech::FeetechJointCalib::default();
+        for (i, target) in targets.iter().enumerate().take(dof) {
+            if self.motor_evidence.get(i).copied() == Some(MotorTorqueEvidence::OffConfirmed) {
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+                continue;
+            }
+            let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if (hold_mask & (1u64 << i)) == 0 {
+                report.joint_status[i] = if fresh.is_none() {
+                    JointHoldStatus::UnheldNoFreshFeedback
+                } else {
+                    JointHoldStatus::SkippedOff
+                };
+                continue;
+            }
+            let Some(fresh_pos) = fresh else {
+                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                continue;
+            };
+            let pos = if target.position.is_finite() { target.position } else { fresh_pos };
+            let calib = self.config.joints.get(i).unwrap_or(&default_calib);
+            let range = self.effective_ranges.get(i).copied().unwrap_or_else(|| calib.effective_range_steps());
+            match calib.checked_rad_to_steps_in_range(pos, range) {
+                Ok(raw_steps) => {
+                    positions.push((self.servo_ids[i], raw_steps));
+                    report.joint_status[i] = JointHoldStatus::Held;
+                }
+                Err(_) => {
+                    report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                }
+            }
+        }
+        if !positions.is_empty() {
+            let sync_pkt = feetech::build_sync_write_positions(&positions)
+                .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
+            self.transport.write_all(&sync_pkt)?;
+            self.transport.flush()?;
+            self.drain_tx_echo(&sync_pkt)?;
+            if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
+                self.partial_pos_rx.append(&mut self.rx_buffer);
+            }
+            report.sent_any = true;
+        }
+        Ok(report)
+    }
+
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         self.assert_clock_matches_transport();
         if targets.len() != self.servo_ids.len() {
@@ -3254,6 +3335,58 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         self.begin_disable_torque(kind)
     }
 
+    fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let n = self.servo_ids.len().min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        self.write_measured_hold_masked(mask, targets).map(|_| ())
+    }
+
+    fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
+        let n = self.servo_ids.len().min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        self.write_measured_hold_masked(mask, targets).map(|r| r.outcome)
+    }
+
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<HoldPassReport, ArmDriverError> {
+        if targets.len() != self.servo_ids.len() {
+            return Err(ArmDriverError::JointCountMismatch {
+                expected: self.servo_ids.len(),
+                actual: targets.len(),
+            });
+        }
+        let dof = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut report = HoldPassReport::empty(dof);
+        for (i, target) in targets.iter().enumerate().take(dof) {
+            let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if (hold_mask & (1u64 << i)) == 0 {
+                report.joint_status[i] = if fresh.is_none() {
+                    JointHoldStatus::UnheldNoFreshFeedback
+                } else {
+                    JointHoldStatus::SkippedOff
+                };
+                continue;
+            }
+            let Some(fresh_pos) = fresh else {
+                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                continue;
+            };
+            let pos = if target.position.is_finite() { target.position } else { fresh_pos };
+            let angle_tenth = fashionstar::rad_to_tenth_deg(pos);
+            let pkt = fashionstar::build_set_angle(self.servo_ids[i], angle_tenth, 20, 1000);
+            self.transport.write_all(&pkt)?;
+            report.joint_status[i] = JointHoldStatus::Held;
+            report.sent_any = true;
+        }
+        if report.sent_any {
+            self.transport.flush()?;
+        }
+        Ok(report)
+    }
+
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         if targets.len() != self.servo_ids.len() {
             return Err(ArmDriverError::JointCountMismatch {
@@ -3718,6 +3851,7 @@ enum PendingTargetCmd {
     Mit { position: f32, velocity: Option<f32>, kp: Option<f32>, kd: Option<f32>, torque: Option<f32> },
     PosForce { position: f32, velocity: Option<f32> },
     RollbackHold { kp: Option<f32>, kd: Option<f32>, torque: Option<f32>, slot: u8 },
+    MeasuredHold { position: f32, kp: Option<f32>, kd: Option<f32>, torque: Option<f32>, slot: u8 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3852,6 +3986,49 @@ impl PendingTxQueue {
         self.buf[..self.len]
             .iter()
             .any(|slot| slot.is_some_and(|e| e.joint == joint))
+    }
+
+    /// Drop every queued entry targeting `joint`, compacting in place (0 heap allocs).
+    fn drop_joint(&mut self, joint: usize) -> usize {
+        let mut write = 0usize;
+        let mut dropped = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                if entry.joint == joint {
+                    dropped += 1;
+                } else {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
+        dropped
+    }
+
+    /// Drop every queued entry whose joint bit is NOT set in `hold_mask`, compacting in place.
+    fn drop_outside_mask(&mut self, hold_mask: u64) -> usize {
+        let mut write = 0usize;
+        let mut dropped = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                let keep = entry.joint < 64 && (hold_mask & (1u64 << entry.joint)) != 0;
+                if !keep {
+                    dropped += 1;
+                } else {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
+        dropped
     }
 
     /// Replace an existing `(joint, frame_id)` slot in place without moving it to the back
@@ -4366,7 +4543,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 let target = JointTarget { position, velocity, ..JointTarget::position(position) };
                 self.pos_force_frame(entry.joint, &target)
             }
-            PendingTargetCmd::RollbackHold { .. } => None,
+            PendingTargetCmd::RollbackHold { .. } | PendingTargetCmd::MeasuredHold { .. } => None,
         }
     }
 
@@ -5888,7 +6065,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         )),
                         PendingTargetCmd::PosVel { .. }
                         | PendingTargetCmd::PosForce { .. }
-                        | PendingTargetCmd::RollbackHold { .. } => None,
+                        | PendingTargetCmd::RollbackHold { .. }
+                        | PendingTargetCmd::MeasuredHold { .. } => None,
                     };
                     self.record_sent_target(entry.joint, sent_frame, mit_params);
                     sent_any = true;
@@ -7883,6 +8061,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.joint_hold_mode_verified_inner(joint)
     }
 
+    fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
+        let dropped = self.pending_hold_tx.drop_outside_mask(hold_mask);
+        if dropped > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(dropped as u32);
+            crate::diagnostics::tick::record_tx_deferred(0, self.total_pending_tx_len());
+        }
+    }
+
     fn has_any_joint_enabled(&self) -> bool {
         (0..self.motor_ids.len()).any(|i| self.motor_evidence_at(i) == MotorTorqueEvidence::OnConfirmed)
     }
@@ -9122,6 +9308,557 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.last_expired_oldest_age = None;
             Ok(TxBatchOutcome::Deferred { pending })
         }
+    }
+
+    /// Masked per-joint measured-position hold pass (§2/§3, zero heap allocation):
+    /// - Validates every joint independently: one unavailable joint (e.g. a POS_FORCE gripper
+    ///   with cleared mode verification, or a joint with stale feedback) NEVER vetoes other
+    ///   joints' holds.
+    /// - Skips `OffConfirmed` motors (`SkippedOff`) and drops any queued hold for them.
+    /// - Drops queued holds for any joint whose feedback went stale (> 100 ms) or whose hold
+    ///   mode is unverified, without dropping other joints' queued holds.
+    /// - Sends the fixed captured hold position supplied in `targets[i].position` while
+    ///   re-checking fresh feedback, verified mode, deadline, TX budget, stop gate, and
+    ///   stop-generation stamp at the write boundary (`Self::send`).
+    /// - Emits hold frames only (never enable or mode-switch frames).
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<HoldPassReport, ArmDriverError> {
+        self.discard_pending_tx_stopped();
+        self.last_hold_tx_sent_any = false;
+        self.last_expired_oldest_age = None;
+        let n = self.motor_ids.len();
+        if targets.len() != n {
+            self.reject_target_tx(MitFenceTripReason::PreflightRejected);
+            return Err(ArmDriverError::JointCountMismatch {
+                expected: n,
+                actual: targets.len(),
+            });
+        }
+        if n > MAX_MODE_JOINTS || n > crate::rt_core::mailbox::MAX_DOF {
+            self.discard_pending_hold_tx();
+            return Err(ArmDriverError::JointCountMismatch {
+                expected: MAX_MODE_JOINTS.min(crate::rt_core::mailbox::MAX_DOF),
+                actual: n,
+            });
+        }
+        if self.torque_hs.is_some() {
+            self.reject_target_tx(MitFenceTripReason::PreflightRejected);
+            return Err(ArmDriverError::TorqueTransitionPending);
+        }
+
+        let mut report = HoldPassReport::empty(n);
+        let fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
+        let total_joints = n.min(u8::MAX as usize) as u8;
+
+        // Classify every joint independently BEFORE any TX (zero cross-joint veto).
+        let mut active_mask = 0u64;
+        for i in 0..n {
+            if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+                continue;
+            }
+            let fresh_ok = self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_some();
+            let mode_ok = self.joint_hold_mode_verified_inner(i);
+            if (hold_mask & (1u64 << i)) == 0 {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = if !fresh_ok {
+                    JointHoldStatus::UnheldNoFreshFeedback
+                } else if !mode_ok {
+                    JointHoldStatus::UnheldNoVerifiedMode
+                } else {
+                    JointHoldStatus::SkippedOff
+                };
+                continue;
+            }
+            if !fresh_ok || !targets[i].position.is_finite() {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                continue;
+            }
+            if !mode_ok {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = JointHoldStatus::UnheldNoVerifiedMode;
+                continue;
+            }
+            let probe_target = if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
+                let vel = self.pos_force.as_ref().map(|pf| pf.close_speed_rad_s);
+                JointTarget {
+                    position: targets[i].position,
+                    velocity: vel,
+                    kp: None,
+                    kd: None,
+                    torque: None,
+                }
+            } else {
+                JointTarget {
+                    position: targets[i].position,
+                    velocity: Some(0.0),
+                    kp: targets[i].kp,
+                    kd: targets[i].kd,
+                    torque: targets[i].torque,
+                }
+            };
+            if self.target_frames_checked(i, &probe_target).is_err() {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = JointHoldStatus::UnheldNoVerifiedMode;
+                continue;
+            }
+            active_mask |= 1u64 << i;
+            report.joint_status[i] = JointHoldStatus::Held;
+        }
+
+        if active_mask == 0 {
+            let _ = self.pending_hold_tx.drop_outside_mask(0);
+            return Ok(report);
+        }
+
+        if fenced {
+            self.discard_pending_hold_tx();
+            self.fence_check()?;
+            if let Err(e) = self.pending_stop_check(None) {
+                self.trip_fence(MitFenceTripReason::EstopBeforeBatch { total_joints });
+                return Err(e);
+            }
+            let start_stamp = self.current_stop_stamp();
+            let pass = self.ensure_tx_pass();
+            let mut started = [None::<Instant>; 16];
+            let mut batch_frames = 0usize;
+            for (i, target) in targets.iter().enumerate() {
+                if (active_mask & (1u64 << i)) == 0 {
+                    continue;
+                }
+                if let Ok((frames, _)) = self.target_frames_checked(i, target) {
+                    batch_frames += frames.into_iter().flatten().count();
+                }
+            }
+            if pass.backpressured {
+                let reason = MitFenceTripReason::TxBackpressuredBeforeBatch;
+                self.trip_fence(reason);
+                return Err(ArmDriverError::MitFenceTripped(reason));
+            }
+            if pass.attempts.saturating_add(batch_frames) > self.tx_budget.max_frames {
+                let remaining = self.tx_budget.max_frames.saturating_sub(pass.attempts);
+                let reason = MitFenceTripReason::TxBudgetExceededPreflight {
+                    needed: batch_frames.min(u16::MAX as usize) as u16,
+                    remaining: remaining.min(u16::MAX as usize) as u16,
+                    max: self.tx_budget.max_frames.min(u16::MAX as usize) as u16,
+                };
+                self.trip_fence(reason);
+                return Err(ArmDriverError::MitFenceTripped(reason));
+            }
+            if self.now() >= pass.deadline {
+                let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
+                self.trip_fence(reason);
+                return Err(ArmDriverError::MitFenceTripped(reason));
+            }
+            let mut sent_any = false;
+            for (i, target) in targets.iter().enumerate() {
+                if (active_mask & (1u64 << i)) == 0 {
+                    continue;
+                }
+                let Ok((frames, _)) = self.target_frames_checked(i, target) else {
+                    report.joint_status[i] = JointHoldStatus::UnheldNoVerifiedMode;
+                    continue;
+                };
+                let slot_count = frames.into_iter().flatten().count();
+                let captured_pos = target.position;
+                for slot in 0..slot_count {
+                    if started[i].is_none() { started[i] = Some(self.now()); }
+                    match self.send(TxKind::RollbackHold(i), Some(start_stamp), None, true, |d| {
+                        if d.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed
+                            || !d.joint_hold_mode_verified_inner(i)
+                            || d.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none()
+                            || !captured_pos.is_finite()
+                        {
+                            return None;
+                        }
+                        let hold_target = if d.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
+                            let pf = d.pos_force.as_ref().filter(|pf| pf.joint == i)?;
+                            JointTarget {
+                                position: captured_pos,
+                                velocity: Some(pf.close_speed_rad_s),
+                                ..JointTarget::position(captured_pos)
+                            }
+                        } else {
+                            JointTarget {
+                                position: captured_pos,
+                                velocity: Some(0.0),
+                                kp: target.kp,
+                                kd: target.kd,
+                                torque: target.torque,
+                            }
+                        };
+                        d.target_frames_checked(i, &hold_target).ok()?.0.get(slot).copied().flatten()
+                    }) {
+                        Ok(sent_frame) => {
+                            let mit_params = self.resolved_mit_params(target);
+                            self.record_sent_target(i, sent_frame, Some(mit_params));
+                            sent_any = true;
+                        }
+                        Err(TxRefusal::BuildRefused) => {
+                            report.joint_status[i] = if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
+                                JointHoldStatus::SkippedOff
+                            } else if self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
+                                JointHoldStatus::UnheldNoFreshFeedback
+                            } else {
+                                JointHoldStatus::UnheldNoVerifiedMode
+                            };
+                            break;
+                        }
+                        Err(TxRefusal::Deferred) => {
+                            let reason = MitFenceTripReason::TxBudgetExhausted {
+                                completed_joints: i as u8,
+                                total_joints,
+                            };
+                            self.trip_fence(reason);
+                            return Err(ArmDriverError::MitFenceTripped(reason));
+                        }
+                        Err(TxRefusal::MitFenceTripped(reason)) => {
+                            return Err(ArmDriverError::MitFenceTripped(reason));
+                        }
+                        Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                            self.trip_fence(MitFenceTripReason::EstopDuringBatch {
+                                completed_joints: i as u8,
+                                total_joints,
+                            });
+                            return Err(ArmDriverError::EstopInhibited);
+                        }
+                        Err(TxRefusal::Transport(e)) => {
+                            self.mark_tx_pass_backpressured();
+                            if self.pending_stop_check(Some(start_stamp)).is_err() {
+                                self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
+                                    joint: (i + 1) as u8,
+                                    completed_joints: i as u8,
+                                    total_joints,
+                                });
+                                return Err(ArmDriverError::EstopInhibited);
+                            }
+                            self.trip_fence(MitFenceTripReason::TransmitFailed {
+                                joint: (i + 1) as u8,
+                                completed_joints: i as u8,
+                                total_joints,
+                                kind: TxFailKind::from_transport(&e),
+                            });
+                            return Err(e.into());
+                        }
+                        Err(TxRefusal::DeadlinePassed) => {
+                            let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
+                            self.trip_fence(reason);
+                            return Err(ArmDriverError::MitFenceTripped(reason));
+                        }
+                        Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                            return Err(Self::refusal_to_driver_err(r));
+                        }
+                    }
+                }
+            }
+            if self.pending_stop_check(Some(start_stamp)).is_err() {
+                self.trip_fence(MitFenceTripReason::EstopBeforeFlush { total_joints });
+                return Err(ArmDriverError::EstopInhibited);
+            }
+            if sent_any {
+                if self.flush_cutoff_exceeded() {
+                    self.mark_tx_pass_backpressured();
+                    self.last_hold_tx_sent_any = false;
+                    self.trip_fence(MitFenceTripReason::FlushFailed { kind: TxFailKind::Timeout });
+                    return Err(TransportError::Timeout.into());
+                }
+                if let Err(e) = self.can.flush() {
+                    self.mark_tx_pass_backpressured();
+                    self.last_hold_tx_sent_any = false;
+                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                        self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
+                    self.trip_fence(MitFenceTripReason::FlushFailed { kind: TxFailKind::from_transport(&e) });
+                    return Err(e.into());
+                }
+            }
+            if self.pending_stop_check(Some(start_stamp)).is_err() {
+                self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
+                return Err(ArmDriverError::EstopInhibited);
+            }
+            self.fence_check()?;
+            for (i, t) in started.into_iter().enumerate().take(n) {
+                if t.is_some() { self.mit_fence_last_cmd[i] = t; }
+            }
+            self.last_hold_tx_sent_any = sent_any;
+            report.sent_any = sent_any;
+            report.outcome = TxBatchOutcome::Complete;
+            return Ok(report);
+        }
+
+        // Unfenced masked bounded hold path.
+        if let Err(e) = self.pending_stop_check(None) {
+            self.discard_pending_hold_tx();
+            return Err(e);
+        }
+        let start_stamp = self.current_stop_stamp();
+        let stopped_carry = self.pending_hold_tx.drop_stopped(start_stamp);
+        if stopped_carry > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(stopped_carry as u32);
+        }
+        let (pre_dropped_stale, mut oldest_expired) =
+            self.pending_hold_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        if pre_dropped_stale > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stale(pre_dropped_stale as u32);
+        }
+
+        let mut staged_ids: [[Option<u32>; 2]; MAX_MODE_JOINTS] = [[None; 2]; MAX_MODE_JOINTS];
+        let mut new_keys = 0usize;
+        for (i, target) in targets.iter().enumerate() {
+            if (active_mask & (1u64 << i)) == 0 {
+                continue;
+            }
+            let probe_target = if self.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
+                let vel = self.pos_force.as_ref().map(|pf| pf.close_speed_rad_s);
+                JointTarget {
+                    position: target.position,
+                    velocity: vel,
+                    kp: None,
+                    kd: None,
+                    torque: None,
+                }
+            } else {
+                JointTarget {
+                    position: target.position,
+                    velocity: Some(0.0),
+                    kp: target.kp,
+                    kd: target.kd,
+                    torque: target.torque,
+                }
+            };
+            let Ok((frames, _)) = self.target_frames_checked(i, &probe_target) else {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = JointHoldStatus::UnheldNoVerifiedMode;
+                continue;
+            };
+            for (slot, maybe_frame) in frames.into_iter().enumerate() {
+                if let Some(frame) = maybe_frame {
+                    staged_ids[i][slot] = Some(frame.id);
+                    if self.pending_hold_tx.find_key(i, frame.id).is_none() {
+                        new_keys += 1;
+                    }
+                }
+            }
+        }
+        if self.pending_hold_tx.len() + new_keys > DAMIAO_PENDING_TX_CAPACITY {
+            let queued = self.pending_hold_tx.len();
+            self.discard_pending_hold_tx();
+            return Err(ArmDriverError::TxQueueFull {
+                queued,
+                new: new_keys,
+                capacity: DAMIAO_PENDING_TX_CAPACITY,
+            });
+        }
+
+        let batch_ts = self.now();
+        let total_slots = n.saturating_mul(2);
+        let start_flat = if total_slots > 0 { self.hold_cursor % total_slots } else { 0 };
+        for offset in 0..total_slots {
+            let flat = (start_flat + offset) % total_slots;
+            let i = flat / 2;
+            let slot = flat % 2;
+            if let Some(frame_id) = staged_ids[i][slot] {
+                let target = &targets[i];
+                let cmd = PendingTargetCmd::MeasuredHold {
+                    position: target.position,
+                    kp: target.kp,
+                    kd: target.kd,
+                    torque: target.torque,
+                    slot: slot as u8,
+                };
+                let ok = self.pending_hold_tx.upsert(i, frame_id, cmd, batch_ts, start_stamp);
+                debug_assert!(ok, "preflight checked pending_hold_tx capacity");
+            }
+        }
+
+        let _ = self.ensure_tx_pass();
+        let mut sent_any = false;
+        let mut dropped_stale_in_pass = 0usize;
+        while let Some(entry) = self.pending_hold_tx.front() {
+            let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
+            let i = entry.joint;
+            let PendingTargetCmd::MeasuredHold { position, kp, kd, torque, slot } = entry.cmd else {
+                let _ = self.pending_hold_tx.pop_front();
+                continue;
+            };
+            match self.send(
+                TxKind::RollbackHold(i),
+                Some(entry.stop_stamp),
+                Some(entry_deadline),
+                false,
+                |d| {
+                    if d.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed
+                        || !d.joint_hold_mode_verified_inner(i)
+                        || d.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none()
+                        || !position.is_finite()
+                    {
+                        return None;
+                    }
+                    let hold_target = if d.joint_modes.get(i).copied().flatten() == Some(DamiaoControlMode::PosForce) {
+                        let pf = d.pos_force.as_ref().filter(|pf| pf.joint == i)?;
+                        JointTarget {
+                            position,
+                            velocity: Some(pf.close_speed_rad_s),
+                            ..JointTarget::position(position)
+                        }
+                    } else {
+                        JointTarget {
+                            position,
+                            velocity: Some(0.0),
+                            kp,
+                            kd,
+                            torque,
+                        }
+                    };
+                    d.target_frames_checked(i, &hold_target)
+                        .ok()?
+                        .0
+                        .get(usize::from(slot))
+                        .copied()
+                        .flatten()
+                },
+            ) {
+                Ok(sent_frame) => {
+                    let _ = self.pending_hold_tx.pop_front();
+                    let mit_params = (
+                        kp.filter(|k| k.is_finite()).unwrap_or(self.default_kp),
+                        kd.filter(|k| k.is_finite()).unwrap_or(self.default_kd),
+                        torque.filter(|t| t.is_finite()).unwrap_or(0.0),
+                    );
+                    self.record_sent_target(i, sent_frame, Some(mit_params));
+                    sent_any = true;
+                    if total_slots > 0 {
+                        self.hold_cursor = (i * 2 + usize::from(slot) + 1) % total_slots;
+                    }
+                }
+                Err(TxRefusal::DeadlinePassed) => {
+                    let _ = self.pending_hold_tx.pop_front();
+                    let age = self.now().saturating_duration_since(entry.queued_at);
+                    oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
+                    dropped_stale_in_pass += 1;
+                    crate::diagnostics::tick::record_tx_dropped_stale(1);
+                }
+                Err(TxRefusal::Deferred) => break,
+                Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
+                    self.discard_pending_hold_tx();
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                Err(TxRefusal::BuildRefused) => {
+                    // Per-joint isolation: drop ONLY joint `i`'s queued holds and continue servicing
+                    // the remaining joints!
+                    let _ = self.pending_hold_tx.drop_joint(i);
+                    report.joint_status[i] = if self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed {
+                        JointHoldStatus::SkippedOff
+                    } else if self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
+                        JointHoldStatus::UnheldNoFreshFeedback
+                    } else {
+                        JointHoldStatus::UnheldNoVerifiedMode
+                    };
+                }
+                Err(TxRefusal::MitFenceTripped(reason)) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
+                    self.discard_pending_hold_tx();
+                    return Err(ArmDriverError::MitFenceTripped(reason));
+                }
+                Err(TxRefusal::Transport(e)) if e.is_tx_backpressure() => {
+                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                        self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
+                        self.discard_pending_hold_tx();
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
+                    if self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none() {
+                        let _ = self.pending_hold_tx.drop_joint(i);
+                        report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                        continue;
+                    }
+                    break;
+                }
+                Err(TxRefusal::Transport(e)) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
+                    self.mark_tx_pass_backpressured();
+                    self.discard_pending_hold_tx();
+                    if self.pending_stop_check(Some(start_stamp)).is_err() {
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
+                    return Err(e.into());
+                }
+                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                    self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
+                    self.discard_pending_hold_tx();
+                    return Err(Self::refusal_to_driver_err(r));
+                }
+            }
+        }
+
+        if self.pending_stop_check(Some(start_stamp)).is_err() {
+            self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
+            self.discard_pending_hold_tx();
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        if sent_any {
+            if self.flush_cutoff_exceeded() {
+                self.mark_tx_pass_backpressured();
+                self.discard_pending_hold_tx();
+                self.last_hold_tx_sent_any = false;
+                return Err(TransportError::Timeout.into());
+            }
+            if let Err(e) = self.can.flush() {
+                self.mark_tx_pass_backpressured();
+                self.discard_pending_hold_tx();
+                self.last_hold_tx_sent_any = false;
+                if self.pending_stop_check(Some(start_stamp)).is_err() {
+                    return Err(ArmDriverError::EstopInhibited);
+                }
+                return Err(e.into());
+            }
+        }
+        if self.pending_stop_check(Some(start_stamp)).is_err() {
+            self.discard_pending_hold_tx();
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        let (late_stale, late_oldest) =
+            self.pending_hold_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        if late_stale > 0 {
+            dropped_stale_in_pass += late_stale;
+            if let Some(age) = late_oldest {
+                oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
+            }
+            crate::diagnostics::tick::record_tx_dropped_stale(late_stale as u32);
+        }
+        // Per-joint post-pass check: if any queued joint's feedback went stale, drop ONLY that joint.
+        for i in 0..n {
+            if self.pending_hold_tx.has_joint(i)
+                && self.fresh_measured_position(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE).is_none()
+            {
+                let _ = self.pending_hold_tx.drop_joint(i);
+                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+            }
+        }
+
+        self.last_hold_tx_sent_any = sent_any;
+        report.sent_any = sent_any;
+        let newly_deferred = self.pending_hold_tx.mark_newly_deferred();
+        let pending = self.pending_hold_tx.len();
+        crate::diagnostics::tick::record_tx_deferred(newly_deferred as u32, self.total_pending_tx_len());
+        let total_dropped_stale = pre_dropped_stale.saturating_add(dropped_stale_in_pass);
+        report.outcome = if total_dropped_stale > 0 {
+            self.last_expired_oldest_age = oldest_expired;
+            TxBatchOutcome::Expired { dropped: total_dropped_stale, pending }
+        } else if pending == 0 {
+            self.last_expired_oldest_age = None;
+            TxBatchOutcome::Complete
+        } else {
+            self.last_expired_oldest_age = None;
+            TxBatchOutcome::Deferred { pending }
+        };
+        Ok(report)
     }
 
     fn last_hold_tx_sent_any(&self) -> bool {
@@ -10464,6 +11201,80 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         _max_rx_frames: u16,
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.begin_disable_torque(kind)
+    }
+
+    fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let n = self.motor_ids.len().min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        self.write_measured_hold_masked(mask, targets).map(|_| ())
+    }
+
+    fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
+        let n = self.motor_ids.len().min(64);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        self.write_measured_hold_masked(mask, targets).map(|r| r.outcome)
+    }
+
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<HoldPassReport, ArmDriverError> {
+        if targets.len() != self.motor_ids.len() {
+            return Err(ArmDriverError::JointCountMismatch {
+                expected: self.motor_ids.len(),
+                actual: targets.len(),
+            });
+        }
+        let dof = self.motor_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut report = HoldPassReport::empty(dof);
+        for (i, target) in targets.iter().enumerate().take(dof) {
+            let fresh = self.fresh_measured_position_for(i, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if (hold_mask & (1u64 << i)) == 0 {
+                report.joint_status[i] = if fresh.is_none() {
+                    JointHoldStatus::UnheldNoFreshFeedback
+                } else {
+                    JointHoldStatus::SkippedOff
+                };
+                continue;
+            }
+            let Some(fresh_pos) = fresh else {
+                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                continue;
+            };
+            let pos = if target.position.is_finite() { target.position } else { fresh_pos };
+            let kp = target.kp.unwrap_or(self.default_kp);
+            let kd = target.kd.unwrap_or(self.default_kd);
+            let torque = target.torque.unwrap_or(0.0);
+            let frame = robstride::build_mit_frame(
+                self.motor_ids[i],
+                pos,
+                0.0,
+                kp,
+                kd,
+                torque,
+                &self.limits,
+            );
+            let t0 = Instant::now();
+            let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
+            let res = self.can.transmit(&frame);
+            let wall_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
+            let kind = match &res {
+                Ok(()) => crate::diagnostics::tick::TxAttemptKind::Sent,
+                Err(TransportError::WouldBlock) => crate::diagnostics::tick::TxAttemptKind::WouldBlock,
+                Err(TransportError::NoBufferSpace) => crate::diagnostics::tick::TxAttemptKind::Enobufs,
+                Err(_) => crate::diagnostics::tick::TxAttemptKind::Error,
+            };
+            crate::diagnostics::tick::record_tx_attempt(kind, wall_ns, cpu_ns);
+            res?;
+            report.joint_status[i] = JointHoldStatus::Held;
+            report.sent_any = true;
+        }
+        if report.sent_any {
+            self.can.flush()?;
+        }
+        Ok(report)
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {

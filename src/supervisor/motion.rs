@@ -116,12 +116,11 @@ impl SupervisorInner {
         self.gripper_stream_contact_detector.reset();
         self.gripper_stream_lease = None;
 
-        // Lock onto measured_positions only when finite and the supervisor's own coherent
-        // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
-        // alongside `measured_positions`) is provably within the 250 ms freshness bound
-        // against the driver's clock. Use non-blocking `try_lock` so E-stop never waits on
-        // a contended driver mutex; if contended, poisoned, stale, or unbounded, hold
-        // `commanded_positions`.
+        // Clear any prior captured stopped-hold targets so the stopped hold pass captures fresh
+        // (`<= 100 ms`) measured positions with transport provenance (never falling back to old
+        // cached `commanded_positions`). Also update `commanded_positions` for observation
+        // telemetry when the coherent feedback snapshot is fresh and finite.
+        self.measured_hold.clear();
         const ESTOP_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
         let (driver_contended, snapshot_fresh) = match driver {
             None => (false, self.feedback_numeric_valid),

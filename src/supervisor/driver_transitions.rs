@@ -405,6 +405,79 @@ impl DisableConfirm {
     }
 }
 
+/// Persistent enable-lifecycle state owned by the single enable transition reducer.
+/// Stopped-hold eligibility is derived from this state together with per-motor torque evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnableLifecycle {
+    /// Torque is confirmed off (or never enabled).
+    Disarmed,
+    /// Enable transition reducer is active (`Enable` / `Validate`).
+    Enabling,
+    /// Enable and post-enable validation succeeded; arm is armed.
+    Armed,
+    /// Enable failed at any stage: queued enable work cancelled, `ENABLE_FAILED` latched,
+    /// and measured-position holds are serviced for `OnConfirmed | Unknown` motors.
+    FailedHold,
+}
+
+/// Inline per-joint measured-position hold state (0 heap allocations on RT).
+#[derive(Debug, Clone, Copy)]
+pub struct MeasuredHoldTracker {
+    /// Fixed captured target position per joint while feedback stays fresh (<= 100 ms).
+    /// Cleared to `None` when feedback goes stale/missing, mode becomes unverified, or
+    /// the motor is `OffConfirmed`, and recaptured when fresh feedback returns.
+    pub captured_positions: [Option<f32>; crate::rt_core::mailbox::MAX_DOF],
+    /// Most recent per-motor torque evidence observed from the driver.
+    pub motor_evidence: [crate::driver::MotorTorqueEvidence; crate::rt_core::mailbox::MAX_DOF],
+    /// Most recent per-joint hold status observed during hold evaluation/servicing.
+    pub joint_status: [crate::driver::JointHoldStatus; crate::rt_core::mailbox::MAX_DOF],
+    pub dof: usize,
+}
+
+impl MeasuredHoldTracker {
+    pub fn new(dof: usize) -> Self {
+        Self {
+            captured_positions: [None; crate::rt_core::mailbox::MAX_DOF],
+            motor_evidence: [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF],
+            joint_status: [crate::driver::JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
+            dof: dof.min(crate::rt_core::mailbox::MAX_DOF),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.captured_positions.fill(None);
+    }
+
+    pub fn any_possibly_energized(&self) -> bool {
+        self.motor_evidence[..self.dof]
+            .iter()
+            .any(|e| *e != crate::driver::MotorTorqueEvidence::OffConfirmed)
+    }
+
+    /// Append concise per-joint torque and hold status into a bounded text buffer (0 allocs).
+    pub fn write_summary(&self, buf: &mut crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>) {
+        if self.dof == 0 {
+            return;
+        }
+        buf.push_str("; joints=[");
+        for i in 0..self.dof {
+            if i > 0 {
+                buf.push_str(",");
+            }
+            let _ = core::fmt::write(
+                buf,
+                format_args!(
+                    "J{}:{}/{}",
+                    i + 1,
+                    self.motor_evidence[i].short_tag(),
+                    self.joint_status[i].short_tag()
+                ),
+            );
+        }
+        buf.push_str("]");
+    }
+}
+
 /// A torque transition the RT started ([`crate::rt_core::ops::CoreOps::commit_transition`])
 /// and serves once per [`crate::rt_core::ops::CoreOps::poll_hardware`]: the driver's
 /// handshake (`ArmDriver::begin_torque` / `poll_torque`), then, for a disable, the
@@ -1084,6 +1157,276 @@ impl SupervisorInner {
         self.disable_pending = false;
         self.active_disable_kind = None;
         self.gripper_hold_vel_ceiling = None;
+        self.enable_lifecycle = EnableLifecycle::Disarmed;
+        self.measured_hold.clear();
+    }
+
+    /// Persistent enable lifecycle owned by the transition reducer.
+    pub fn enable_lifecycle(&self) -> EnableLifecycle {
+        self.enable_lifecycle
+    }
+
+    /// Latest per-motor torque evidence observed by the stopped/failed-hold tracker.
+    pub fn motor_torque_evidence(&self) -> &[crate::driver::MotorTorqueEvidence] {
+        &self.measured_hold.motor_evidence[..self.measured_hold.dof]
+    }
+
+    /// Latest per-joint hold status observed by the stopped/failed-hold tracker.
+    pub fn joint_hold_status(&self) -> &[crate::driver::JointHoldStatus] {
+        &self.measured_hold.joint_status[..self.measured_hold.dof]
+    }
+
+    /// Stopped-hold eligibility derived from the transition reducer state (`FailedHold` /
+    /// `Armed`) or active torque flag.
+    #[inline]
+    pub(crate) fn stopped_hold_eligible(&self) -> bool {
+        matches!(self.enable_lifecycle, EnableLifecycle::FailedHold | EnableLifecycle::Armed)
+            || self.is_torqued
+    }
+
+    /// Evaluates each joint independently from driver-owned per-motor torque evidence, fresh
+    /// (`<= 100 ms`) finite measured position with transport provenance, and verified hold mode.
+    /// Captures a fixed hold target per joint while fresh, clears it on staleness/unverified/off,
+    /// and returns the bitmask of joints eligible for hold frames (zero heap allocations).
+    pub(crate) fn snapshot_measured_hold(&mut self) -> u64 {
+        use crate::driver::{JointHoldStatus, MotorTorqueEvidence, STOPPED_DISABLE_FEEDBACK_MAX_AGE};
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        self.measured_hold.dof = dof;
+        let Some(d) = self.driver.as_ref() else {
+            self.measured_hold.motor_evidence[..dof].fill(if self.is_torqued {
+                MotorTorqueEvidence::OnConfirmed
+            } else {
+                MotorTorqueEvidence::OffConfirmed
+            });
+            for j in 0..dof {
+                if self.is_torqued {
+                    if let Some(p) = self.measured_positions.get(j).copied().filter(|p| p.is_finite()) {
+                        let _ = self.measured_hold.captured_positions[j].get_or_insert(p);
+                        self.measured_hold.joint_status[j] = JointHoldStatus::Held;
+                    } else {
+                        self.measured_hold.captured_positions[j] = None;
+                        self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                    }
+                } else {
+                    self.measured_hold.captured_positions[j] = None;
+                    self.measured_hold.joint_status[j] = JointHoldStatus::SkippedOff;
+                }
+            }
+            return 0;
+        };
+        let Ok(drv) = d.lock() else {
+            for j in 0..dof {
+                self.measured_hold.motor_evidence[j] = MotorTorqueEvidence::Unknown;
+                self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+            }
+            return 0;
+        };
+        let mut ev = [MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF];
+        drv.motor_torque_evidence_into(&mut ev[..dof]);
+        let has_drv_fresh = drv.has_driver_fresh_position_api();
+        let drv_now = drv.clock_now();
+        let mut ages_arr = [None::<Duration>; crate::rt_core::mailbox::MAX_DOF];
+        let mut bounds_arr = [None::<Instant>; crate::rt_core::mailbox::MAX_DOF];
+        let mut has_bounds = false;
+        if !has_drv_fresh {
+            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+            drv.feedback_ages_into(&mut ages_buf);
+            drv.feedback_queue_bounds_into(&mut bounds_buf);
+            has_bounds = !bounds_buf.is_empty();
+            for j in 0..dof {
+                ages_arr[j] = ages_buf.get(j).copied().flatten();
+                bounds_arr[j] = bounds_buf.get(j).copied().flatten();
+            }
+            self.scratch.ages = ages_buf;
+            self.scratch.fb.bounds = bounds_buf;
+        }
+        let mut fresh_pos_arr = [None::<f32>; crate::rt_core::mailbox::MAX_DOF];
+        let mut mode_ok_arr = [false; crate::rt_core::mailbox::MAX_DOF];
+        for j in 0..dof {
+            fresh_pos_arr[j] = if has_drv_fresh {
+                drv.fresh_measured_position_for(j, STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+            } else {
+                let age_ok = ages_arr[j].is_some_and(|a| a <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+                let bound_ok = !has_bounds
+                    || bounds_arr[j].is_some_and(|b| {
+                        drv_now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                    });
+                if age_ok && bound_ok {
+                    self.measured_positions.get(j).copied().filter(|p| p.is_finite())
+                } else {
+                    None
+                }
+            };
+            mode_ok_arr[j] = drv.joint_hold_mode_verified(j);
+        }
+        drop(drv);
+        self.measured_hold.motor_evidence[..dof].copy_from_slice(&ev[..dof]);
+        let mut hold_mask = 0u64;
+        for j in 0..dof {
+            if ev[j] == MotorTorqueEvidence::OffConfirmed {
+                self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.joint_status[j] = JointHoldStatus::SkippedOff;
+                continue;
+            }
+            let Some(pos) = fresh_pos_arr[j] else {
+                self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
+                continue;
+            };
+            if !mode_ok_arr[j] {
+                self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+                continue;
+            }
+            let _ = self.measured_hold.captured_positions[j].get_or_insert(pos);
+            self.measured_hold.joint_status[j] = JointHoldStatus::Held;
+            hold_mask |= 1u64 << j;
+        }
+        hold_mask
+    }
+
+    /// Services one masked measured-position hold pass while stopped or in `FailedHold`
+    /// (zero heap allocation on RT; never falls back to cached `commanded_positions`).
+    pub(crate) fn service_stopped_measured_hold(
+        &mut self,
+        dt: f64,
+        gravity_output_enabled: bool,
+    ) -> crate::supervisor::TickOutput {
+        use crate::driver::{JointHoldStatus, TxBatchOutcome};
+        use crate::supervisor::TickOutput;
+        if self.urgent_stop_unapplied() {
+            return TickOutput::None;
+        }
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            return TickOutput::None;
+        }
+        if self.driver.is_none() {
+            return TickOutput::None;
+        }
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let hold_mask = self.snapshot_measured_hold();
+
+        let mut targets = std::mem::take(&mut self.scratch.targets);
+        targets.clear();
+        for i in 0..self.config.dof {
+            let pos = if i < dof {
+                self.measured_hold.captured_positions[i].unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            targets.push(crate::driver::JointTarget {
+                position: pos,
+                velocity: Some(0.0),
+                torque: if gravity_output_enabled {
+                    self.gravity_torques_ramped.get(i).copied()
+                } else {
+                    Some(0.0)
+                },
+                kp: None,
+                kd: None,
+            });
+        }
+
+        let ff = if self.mit.owner == crate::mit::MitOwner::Active && hold_mask != 0 {
+            match self.mit_prepare(&mut targets, dt) {
+                Ok(ff) => Some(ff),
+                Err(e) => {
+                    self.scratch.targets = targets;
+                    let mut buf = crate::mit::OutputErrorText::empty();
+                    let _ = core::fmt::write(&mut buf, format_args!("MIT hold output refused: {e}"));
+                    return TickOutput::Error {
+                        message: buf,
+                        now: self.mit_now(),
+                        max_age: crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
+                        is_hold: true,
+                        sent_any: false,
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
+        let write_result = self.driver.as_ref().and_then(|d| d.lock().ok()).map(|mut drv| {
+            if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
+                if cap.joint < targets.len() && (hold_mask & (1u64 << cap.joint)) != 0 {
+                    targets[cap.joint].velocity = Some(cap.close_speed_rad_s);
+                }
+            }
+            let r = drv.write_measured_hold_masked(hold_mask, &targets);
+            let now = drv.clock_now();
+            let max_age = drv.tx_frame_max_age();
+            let oldest_pending = drv.oldest_pending_tx_age();
+            let last_expired = drv.last_tx_expired_age();
+            let sent_any_fallback = drv.last_hold_tx_sent_any();
+            (r, now, max_age, oldest_pending, last_expired, sent_any_fallback)
+        });
+        self.scratch.targets = targets;
+
+        let Some((write_res, now, max_age, oldest_pending, last_expired, sent_any_fallback)) = write_result else {
+            return TickOutput::None;
+        };
+
+        let out = match write_res {
+            Ok(report) => {
+                let n = report.dof.min(dof);
+                for j in 0..n {
+                    self.measured_hold.joint_status[j] = report.joint_status[j];
+                    if report.joint_status[j] != JointHoldStatus::Held {
+                        self.measured_hold.captured_positions[j] = None;
+                    }
+                }
+                if hold_mask == 0 && !report.sent_any && matches!(report.outcome, TxBatchOutcome::Complete) {
+                    TickOutput::None
+                } else {
+                    match report.outcome {
+                        TxBatchOutcome::Complete => TickOutput::Complete { is_hold: true },
+                        TxBatchOutcome::Deferred { pending } => TickOutput::Deferred {
+                            pending,
+                            now,
+                            max_age,
+                            oldest_age: oldest_pending,
+                            is_hold: true,
+                            sent_any: report.sent_any,
+                            sent_mask: 0,
+                        },
+                        TxBatchOutcome::Expired { dropped, pending } => TickOutput::Expired {
+                            dropped,
+                            pending,
+                            now,
+                            max_age,
+                            oldest_age: last_expired,
+                            is_hold: true,
+                            sent_any: report.sent_any,
+                        },
+                    }
+                }
+            }
+            Err(crate::driver::ArmDriverError::EstopInhibited) => {
+                TickOutput::EstopInhibited { is_hold: true }
+            }
+            Err(e) => {
+                let mut buf = crate::mit::OutputErrorText::empty();
+                e.write_bounded(&mut buf);
+                TickOutput::Error {
+                    message: buf,
+                    now,
+                    max_age,
+                    is_hold: true,
+                    sent_any: sent_any_fallback,
+                }
+            }
+        };
+
+        if let Some(ff) = ff {
+            if matches!(out, TickOutput::Complete { .. }) {
+                self.mit.last_ff = ff;
+                self.mit.last_output = Some(self.mit_now());
+            }
+        }
+        out
     }
 
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {

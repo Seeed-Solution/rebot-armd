@@ -911,7 +911,7 @@ impl crate::supervisor::SupervisorInner {
     /// and the gap since the last flushed dynamic batch, each against [`MIT_DEADLINE`].
     /// Time of the MIT deadline bookkeeping: the driver's clock (the transport's deterministic
     /// clock in tests, the system clock otherwise), the same one that dates the feedback ages.
-    fn mit_now(&self) -> std::time::Instant {
+    pub(crate) fn mit_now(&self) -> std::time::Instant {
         self.driver.as_ref().and_then(|d| d.lock().ok()).map_or_else(std::time::Instant::now, |drv| drv.clock_now())
     }
 

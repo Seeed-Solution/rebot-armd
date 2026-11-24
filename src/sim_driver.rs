@@ -848,6 +848,96 @@ impl ArmDriver for SimArmDriver {
         }
     }
 
+    fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let mask = if self.enable_state() == EnableState::Disabled {
+            0
+        } else {
+            let n = self.dof.min(64);
+            if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+        };
+        self.write_measured_hold_masked(mask, targets).map(|_| ())
+    }
+
+    fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+        let mask = if self.enable_state() == EnableState::Disabled {
+            0
+        } else {
+            let n = self.dof.min(64);
+            if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+        };
+        self.write_measured_hold_masked(mask, targets).map(|r| r.outcome)
+    }
+
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<crate::driver::HoldPassReport, ArmDriverError> {
+        use crate::driver::{HoldPassReport, JointHoldStatus, MotorTorqueEvidence};
+        if self.torque_hs.is_some() {
+            return Err(ArmDriverError::Protocol("torque transition pending: no hold before its confirmation".into()));
+        }
+        if targets.len() != self.dof {
+            return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: targets.len() });
+        }
+        let dof = self.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let mut report = HoldPassReport::empty(dof);
+        let mut ev = [MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF];
+        self.motor_torque_evidence_into(&mut ev[..dof]);
+        let mut any_held = false;
+        let mut hold_pos = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        for (i, target) in targets.iter().enumerate().take(dof) {
+            if ev[i] == MotorTorqueEvidence::OffConfirmed {
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+                continue;
+            }
+            let fresh = self.fresh_measured_position_for(i, crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+            if (hold_mask & (1u64 << i)) == 0 {
+                report.joint_status[i] = if fresh.is_none() {
+                    JointHoldStatus::UnheldNoFreshFeedback
+                } else {
+                    JointHoldStatus::SkippedOff
+                };
+                continue;
+            }
+            let Some(fresh_p) = fresh else {
+                report.joint_status[i] = JointHoldStatus::UnheldNoFreshFeedback;
+                continue;
+            };
+            hold_pos[i] = if target.position.is_finite() { target.position } else { fresh_p };
+            report.joint_status[i] = JointHoldStatus::Held;
+            any_held = true;
+        }
+        if !any_held {
+            return Ok(report);
+        }
+        self.estop_check()?;
+        let off = self.zero_offsets.as_deref();
+        self.cmd_targets.clear();
+        self.cmd_targets.extend(targets.iter().zip(&self.modes).enumerate().map(|(i, (t, mode))| {
+            let q_joint = if i < dof && report.joint_status[i] == JointHoldStatus::Held {
+                hold_pos[i]
+            } else {
+                self.cached.get(i).map_or(0.0, |s| s.position)
+            };
+            let q = off.map_or(q_joint, |o| q_joint + o[i]);
+            match mode {
+                JointMode::Position => SimTarget::PosVel { q, vlim: POS_VEL_VLIM },
+                JointMode::Mit => SimTarget::Mit {
+                    q,
+                    dq: 0.0,
+                    kp: t.kp.unwrap_or(0.0),
+                    kd: t.kd.unwrap_or(0.0),
+                    tau: t.torque.filter(|v| v.is_finite()).unwrap_or(0.0),
+                },
+            }
+        }));
+        // `enable: None` guarantees zero enable or mode-switch side effect.
+        self.send_ref(true, None, SendGate::Target)?;
+        report.sent_any = true;
+        Ok(report)
+    }
+
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         if self.torque_hs.is_some() {
             return Err(ArmDriverError::Protocol("torque transition pending: no target before its confirmation".into()));
