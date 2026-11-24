@@ -3256,6 +3256,7 @@ mod tests {
             reclaim_macro_tx,
             reclaim_return_rx,
             safety_log_tx,
+            shutdown_hold_error: Arc::new(Mutex::new(None)),
             stats: Arc::new(ExecutorStats::default()),
             maint_req_rx,
             maint_rep_tx,
@@ -3306,5 +3307,191 @@ mod tests {
         }
         assert_eq!(drained, 2, "expected returned Fail payload reply and disconnect buffer reply");
         assert!(probe_dropped_on.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn drain_retired_states_conserves_hold_error_counts_and_retries_immediately_on_overflow() {
+        let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
+        core.lease_enabled = false;
+        core.set_torque(true).unwrap();
+        core.rt_executor_owned = true;
+        core.safety.set_off_thread_reclaim(true);
+
+        let (_, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
+        let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
+        let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
+        let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
+        let (reclaim_macro_tx, mut reclaim_macro_rx) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (mut safety_log_tx, mut safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
+        let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
+        let (_, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
+        let (persist_rep_tx, _) = RingBuffer::<PersistReply>::new(2);
+
+        // Pre-fill downstream `safety_log_tx` (cap 2) with 2 unrelated events.
+        safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+
+        let (_, _, _, stop_requests) = ReleaseEngine::new(BootId(1), Capacities::default());
+        let mut state = ControlState {
+            shutdown_committed: false,
+            control_stop: Arc::new(AtomicBool::new(false)),
+            stop_requests,
+            estop_ack_tx,
+            estop_overflow_gen: Arc::new(AtomicU64::new(0)),
+            reclaim_state_tx,
+            reclaim_traj_tx,
+            reclaim_macro_tx,
+            reclaim_return_rx,
+            safety_log_tx,
+            shutdown_hold_error: Arc::new(Mutex::new(None)),
+            stats: Arc::new(ExecutorStats::default()),
+            maint_req_rx,
+            maint_rep_tx,
+            pending_maint_reply: None,
+            persist_job_tx,
+            persist_cmd_rx,
+            persist_rep_tx,
+            persist_wake: thread::current(),
+            persist_granted: None,
+            next_persist_req: 1,
+            disconnect_code_buf: None,
+            disconnect_msg_buf: None,
+            hooks: PersistTestHooks::default(),
+        };
+
+        let t0 = Instant::now();
+        // 1. Hold error at t0 queues into inline ring, then `drain_retired_states` hits full
+        //    downstream `safety_log_tx`: count conserved (1), NOT dropped, throttle rolled back!
+        core.log_stopped_hold_output_failed_throttled(t0, false, "tx err #1");
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.last_hold_tx_error_log, Some(t0));
+        state.drain_retired_states(&mut core, t0);
+        assert_eq!(core.hold_tx_error_suppressed(), 1, "rejected event must fold back into suppressed counter");
+        assert_eq!(core.safety_log_ring_dropped, 0, "hold error must not be dropped on downstream full");
+        assert_eq!(core.last_hold_tx_error_log, None, "throttle timestamp must roll back when sink rejects");
+
+        // 2. Consumer drains `safety_log_rx` just 20 ms later -> next hold error at t0 + 20 ms
+        //    MUST deliver immediately (NOT wait 1 s!) with exact `suppressed == 1` (1 + 1 = 2)!
+        assert!(matches!(safety_log_rx.pop(), Ok(SafetyLogEvent::GravityCompRampComplete)));
+        assert!(matches!(safety_log_rx.pop(), Ok(SafetyLogEvent::GravityCompRampComplete)));
+        let t1 = t0 + Duration::from_millis(20);
+        core.log_stopped_hold_output_failed_throttled(t1, false, "tx err #2");
+        state.drain_retired_states(&mut core, t1);
+        match safety_log_rx.pop().expect("immediate delivery after consumer drain") {
+            SafetyLogEvent::StoppedHoldOutputFailed { partial, suppressed, message, logged_at } => {
+                assert!(!partial);
+                assert_eq!(suppressed, 1, "must carry exact 1 prior rejected occurrence");
+                assert_eq!(message.as_str(), "tx err #2");
+                assert_eq!(logged_at, t1);
+            }
+            other => panic!("unexpected log event: {other:?}"),
+        }
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.last_hold_tx_error_delivered, Some(t1));
+
+        // 3. Subsequent error 20 ms later (within 1 s of delivered t1) IS throttled cleanly.
+        let t2 = t1 + Duration::from_millis(20);
+        core.log_stopped_hold_output_failed_throttled(t2, false, "tx err #3");
+        state.drain_retired_states(&mut core, t2);
+        assert!(safety_log_rx.pop().is_err(), "error within 1 s of delivered event must stay throttled");
+        assert_eq!(core.hold_tx_error_suppressed(), 1);
+
+        // 4. Delayed recovery (R2 Major 1): past 1 s (t3 = t1 + 1050 ms), downstream ring is full
+        //    -> rejected (total 2). Consumer drains much later at t4 = t3 + 1200 ms with NO
+        //    intervening hold error -> retry delivers with diagnostic `logged_at == t3`, AND
+        //    starts the new 1 s throttle window at acceptance time `t4` so a new error 20 ms later
+        //    at `t4 + 20 ms` IS throttled (no back-to-back burst!).
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        let t3 = t1 + Duration::from_millis(1050);
+        core.log_stopped_hold_output_failed_throttled(t3, true, "tx err #4");
+        state.drain_retired_states(&mut core, t3);
+        assert_eq!(core.hold_tx_error_suppressed(), 2);
+        assert_eq!(core.last_hold_tx_error_log, Some(t1), "rolled back to last delivered t1");
+        assert!(safety_log_rx.pop().is_ok());
+        assert!(safety_log_rx.pop().is_ok());
+        let t4 = t3 + Duration::from_millis(1200);
+        state.drain_retired_states(&mut core, t4);
+        match safety_log_rx.pop().expect("retained retry must flush as soon as downstream ring drains") {
+            SafetyLogEvent::StoppedHoldOutputFailed { partial, suppressed, message, logged_at } => {
+                assert!(partial);
+                assert_eq!(suppressed, 1, "1 emitted + 1 suppressed == 2 exact occurrences (t2 + t3)");
+                assert_eq!(message.as_str(), "tx err #4");
+                assert_eq!(logged_at, t3, "event retains original occurrence timestamp for diagnostics");
+            }
+            other => panic!("unexpected log event: {other:?}"),
+        }
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        assert_eq!(core.last_hold_tx_error_log, Some(t4), "throttle window must start at retry acceptance t4");
+        assert_eq!(core.last_hold_tx_error_delivered, Some(t4));
+        // New error 20 ms after retry acceptance (`t4 + 20 ms`) MUST be throttled!
+        let t5 = t4 + Duration::from_millis(20);
+        core.log_stopped_hold_output_failed_throttled(t5, false, "tx err #5");
+        state.drain_retired_states(&mut core, t5);
+        assert!(safety_log_rx.pop().is_err(), "error 20 ms after delayed retry acceptance must be throttled");
+        assert_eq!(core.hold_tx_error_suppressed(), 1);
+
+        // 5. Production macro reclaim forwarding: fill downstream `reclaim_macro_tx` (cap 2) +
+        //    local `retired_macro_runs` (cap 8) -> admission backpressures -> drain downstream ->
+        //    forwarding frees local slots -> admission resumes!
+        for _ in 0..10 {
+            let ep = core.safety.epoch_id();
+            let _ = core.begin_sequence_action(None, ep).expect("admit macro");
+            core.request_macro_stop();
+            state.drain_retired_states(&mut core, t5);
+        }
+        assert!(!core.can_admit_macro_run(), "2 in reclaim_macro_tx + 8 in retired_macro_runs == saturated");
+        let ep = core.safety.epoch_id();
+        assert!(core.begin_sequence_action(None, ep).is_err(), "admission must backpressure when full");
+        // Off-thread consumer drains `reclaim_macro_rx` -> next drain forwards -> admission resumes!
+        assert!(reclaim_macro_rx.pop().is_ok());
+        assert!(reclaim_macro_rx.pop().is_ok());
+        state.drain_retired_states(&mut core, t5);
+        assert!(core.can_admit_macro_run());
+        assert!(core.begin_sequence_action(None, ep).is_ok());
+
+        // 6. R3 Major 4 (single-sink throttle enforcement): even if an extra
+        //    `StoppedHoldOutputFailed` enters the inline ring within 1 s of the last accepted
+        //    delivery (`t4`), `forward_deferred_safety_logs` enforces `window_ready` at the single
+        //    push site so two events are NEVER accepted within one driver-clock second!
+        let t6 = t4 + Duration::from_millis(500);
+        let mut msg = crate::safety::BoundedText::<160>::empty();
+        msg.push_str("tx err #6");
+        assert!(core.safety.log_stopped_hold_output_failed(false, 0, msg, t6));
+        state.drain_retired_states(&mut core, t6);
+        assert!(
+            safety_log_rx.pop().is_err(),
+            "single-sink gate must never accept a second hold error within 1 s of delivered t4"
+        );
+        assert_eq!(core.hold_tx_error_suppressed(), 2, "t5 (1) + t6 (1) must be conserved");
+
+        // 7. R3 Major 5 (lossless shutdown when downstream `safety_log_tx` remains full):
+        //    fill `safety_log_tx` to capacity and advance past 1 s, run final drain + shutdown
+        //    handoff -> exact pending aggregate (2 occurrences => suppressed == 1) transfers to
+        //    `shutdown_hold_error` so `OffThreadSinks` emits it without losing any count!
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        state.safety_log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+        let t7 = t4 + Duration::from_millis(1200);
+        state.drain_retired_states(&mut core, t7);
+        assert_eq!(core.hold_tx_error_suppressed(), 2, "full ring keeps exact count pending");
+        state.flush_pending_hold_error_for_shutdown(&mut core);
+        assert_eq!(core.hold_tx_error_suppressed(), 0);
+        let shutdown_ev = state
+            .shutdown_hold_error
+            .lock()
+            .unwrap()
+            .take()
+            .expect("shutdown handoff must capture pending hold error when ring is full");
+        match shutdown_ev {
+            SafetyLogEvent::StoppedHoldOutputFailed { partial, suppressed, message, logged_at } => {
+                assert!(!partial);
+                assert_eq!(suppressed, 1, "1 emitted + 1 suppressed == 2 exact pending occurrences");
+                assert_eq!(message.as_str(), "tx err #6");
+                assert_eq!(logged_at, t6);
+            }
+            other => panic!("unexpected shutdown handoff event: {other:?}"),
+        }
     }
 }

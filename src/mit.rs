@@ -754,7 +754,6 @@ impl crate::supervisor::SupervisorInner {
                     return TickOutput::Error {
                         message: buf,
                         now: self.mit_now(),
-                        max_age: crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
                         is_hold,
                         sent_any: false,
                         pf_status: crate::driver::PosForceTxStatus::Unobserved,

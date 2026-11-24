@@ -3059,8 +3059,11 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pf_refresh_attempted_this_tick: bool,
     /// True when an output pass ran since the previous `receive_feedback()` pass.
     output_ran_since_rx: bool,
-    /// Per-`(joint, frame_id)` continuity tracker for currently queued stopped-hold frames.
-    hold_key_ages: [Option<HoldKeyAge>; DAMIAO_PENDING_TX_CAPACITY],
+    /// Per-`(joint, frame_id)` continuity tracker for currently queued stopped-hold frames
+    /// (boxed once at driver creation to keep stack frames lean with 0 RT heap ops).
+    hold_key_ages: Box<[Option<HoldKeyAge>; DAMIAO_PENDING_TX_CAPACITY]>,
+    /// Preallocated scratch buffer swapped with `hold_key_ages` at pass end (0 stack copy, 0 RT alloc).
+    hold_key_ages_scratch: Box<[Option<HoldKeyAge>; DAMIAO_PENDING_TX_CAPACITY]>,
     /// Stop generation (`StopStamp`) that owns the current `hold_key_ages` records; any stop
     /// generation change immediately invalidates carried hold ages at the single stop-drop gate.
     hold_key_ages_stop_stamp: StopStamp,
@@ -3585,7 +3588,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_refresh_deferred_ticks: 0,
             pf_refresh_attempted_this_tick: false,
             output_ran_since_rx: false,
-            hold_key_ages: [None; DAMIAO_PENDING_TX_CAPACITY],
+            hold_key_ages: Box::new([None; DAMIAO_PENDING_TX_CAPACITY]),
+            hold_key_ages_scratch: Box::new([None; DAMIAO_PENDING_TX_CAPACITY]),
             hold_key_ages_stop_stamp: StopStamp { estop_gen: 0, stop_gen: 0 },
             last_hold_pass_zero_progress: false,
             last_hold_stall_age: None,
@@ -3650,14 +3654,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Clear all per-`(joint, frame_id)` stopped-hold stall continuity records.
     fn reset_hold_key_ages(&mut self) {
-        self.hold_key_ages = [None; DAMIAO_PENDING_TX_CAPACITY];
+        self.hold_key_ages.fill(None);
         self.last_hold_pass_zero_progress = false;
         self.last_hold_stall_age = None;
     }
 
     /// Remove the hold stall continuity record for a single `(joint, frame_id)` key once sent.
     fn take_hold_key_age(&mut self, joint: usize, frame_id: u32) -> Option<HoldKeyAge> {
-        for slot in &mut self.hold_key_ages {
+        for slot in self.hold_key_ages.iter_mut() {
             if slot.is_some_and(|k| k.joint == joint && k.frame_id == frame_id) {
                 return slot.take();
             }
@@ -3667,7 +3671,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Drop hold stall continuity records for a joint skipped by freshness policy (e.g. stale J7).
     fn drop_hold_key_ages_for_joint(&mut self, joint: usize) {
-        for slot in &mut self.hold_key_ages {
+        for slot in self.hold_key_ages.iter_mut() {
             if slot.is_some_and(|k| k.joint == joint) {
                 *slot = None;
             }
@@ -8300,7 +8304,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.drop_hold_key_ages_for_joint(j);
         }
         let prev_zero_progress = self.last_hold_pass_zero_progress;
-        let prev_ages = self.hold_key_ages;
+        self.hold_key_ages_scratch.copy_from_slice(&self.hold_key_ages[..]);
         // Drop stale carried-over holds without resetting `hold_cursor`, then still stage fresh
         // holds so a slow cadence (e.g. 100 ms) rotates across all frame keys instead of stalling.
         let (pre_dropped_stale, mut oldest_expired) =
@@ -8580,11 +8584,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.reset_hold_key_ages();
         } else {
             let pass_now = self.now();
-            let mut next_ages = [None; DAMIAO_PENDING_TX_CAPACITY];
+            self.hold_key_ages.fill(None);
             let mut next_len = 0usize;
             let mut max_stall_age: Option<Duration> = None;
             for entry in self.pending_hold_tx.iter() {
-                let prev = prev_ages
+                let prev = self
+                    .hold_key_ages_scratch
                     .iter()
                     .flatten()
                     .copied()
@@ -8612,7 +8617,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     (entry.queued_at, 1, key_hit_bp)
                 };
                 if next_len < DAMIAO_PENDING_TX_CAPACITY {
-                    next_ages[next_len] = Some(HoldKeyAge {
+                    self.hold_key_ages[next_len] = Some(HoldKeyAge {
                         joint: entry.joint,
                         frame_id: entry.frame_id,
                         unsent_since,
@@ -8626,7 +8631,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     max_stall_age = Some(max_stall_age.map_or(age, |m| m.max(age)));
                 }
             }
-            self.hold_key_ages = next_ages;
             self.last_hold_pass_zero_progress = !sent_any;
             self.last_hold_stall_age = max_stall_age;
         }

@@ -2462,7 +2462,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         inner_bus.with(|s| s.push_all_feedback());
         d.read_joint_states().unwrap();
         d.check_mapping_ranges();
-        let mut sup = SupervisorInner::new(cfg).with_driver(Box::new(d));
+        let mut sup = Box::new(SupervisorInner::new(cfg).with_driver(Box::new(d)));
         sup.lease_enabled = false;
         sup.tick(DT);
         sup.set_torque(true).unwrap();
@@ -2832,7 +2832,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             let sup = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
             let id = {
                 let mut inner = sup.inner().write().await;
-                *inner = sup_inner;
+                *inner = *sup_inner;
                 let ep = inner.safety.epoch_id();
                 inner.begin_sequence_action(None, ep).unwrap()
             };
@@ -2859,7 +2859,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             let sup2 = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
             let id2 = {
                 let mut inner = sup2.inner().write().await;
-                *inner = sup_inner2;
+                *inner = *sup_inner2;
                 let ep = inner.safety.epoch_id();
                 inner.begin_sequence_action(None, ep).unwrap()
             };
@@ -2900,7 +2900,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                 let sup3 = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
                 let id3 = {
                     let mut inner = sup3.inner().write().await;
-                    *inner = sup_inner3;
+                    *inner = *sup_inner3;
                     let ep = inner.safety.epoch_id();
                     inner.begin_sequence_action(None, ep).unwrap()
                 };
@@ -3024,7 +3024,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                         assert!(inner.active_trajectory.is_none());
                         assert_ne!(inner.macro_sub(id), Some(armd::macro_action::SubState::Running));
                     }
-                    *sup_b.inner().write().await = inner;
+                    *sup_b.inner().write().await = *inner;
                     id
                 };
                 let guard = sup_b.inner().write().await;
@@ -4016,4 +4016,429 @@ fn enable_refresh_waits_for_empty_queue_and_reports_queued_fault_or_motion_beyon
         assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE));
         assert!(!d.is_enabled());
     }
+}
+
+/// Major 1 regression: driving the driver clock across 100 ms specifically between the entry
+/// freshness gate (`check_pos_force_freshness_for_tx`) and staging (`pending_target_cmds_checked`)
+/// MUST NOT abort the arm batch with `PosForceTargetUnavailable` in EITHER motion
+/// (`write_joint_targets_bounded`) or stopped-hold (`write_estop_hold_bounded`); it must skip
+/// only J7, send healthy J1–J6 frames, request a J7 `0xCC` refresh, and report `Stale`.
+#[test]
+fn pos_force_crossing_100ms_between_entry_and_staging_skips_j7_in_motion_and_hold() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use armd::driver::{PosForceTxStatus, TxBatchOutcome};
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    struct LeapOnNthNowClock {
+        inner: MockClock,
+        armed: AtomicBool,
+        target_call: AtomicUsize,
+        calls: AtomicUsize,
+        jump: Duration,
+    }
+    impl DriverClock for LeapOnNthNowClock {
+        fn clock_id(&self) -> u64 {
+            self.inner.clock_id()
+        }
+        fn now(&self) -> Instant {
+            if self.armed.load(Ordering::SeqCst) {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.target_call.load(Ordering::SeqCst) {
+                    self.inner.advance(self.jump);
+                }
+            }
+            self.inner.now()
+        }
+        fn sleep(&self, dur: Duration) {
+            self.inner.sleep(dur);
+        }
+        fn yield_now(&self) {
+            self.inner.yield_now();
+        }
+    }
+
+    #[derive(Clone)]
+    struct LeapBus {
+        inner: FakeBus,
+        clock: Arc<LeapOnNthNowClock>,
+    }
+    impl CanTransport for LeapBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn flush_is_noop(&self) -> bool {
+            self.inner.flush_is_noop()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(self.clock.clone())
+        }
+    }
+
+    for is_hold in [false, true] {
+        // Sweep the clock jump across every `now()` call from entry through staging & drain so
+        // crossing 100 ms between entry and staging (and mid-staging / mid-drain) is covered.
+        for jump_on_call in 1..=6usize {
+            let base_clock = MockClock::new();
+            let raw_bus = FakeBus::with_clock(&b601_limits(), base_clock.clone());
+            raw_bus.with(|s| {
+                for (i, m) in s.motors.iter_mut().enumerate() {
+                    m.q = 0.1 * i as f32;
+                }
+                s.motors[J7].q = -1.0;
+                s.immediate_replies = true;
+            });
+            let leap_clock = Arc::new(LeapOnNthNowClock {
+                inner: base_clock.clone(),
+                armed: AtomicBool::new(false),
+                target_call: AtomicUsize::new(jump_on_call),
+                calls: AtomicUsize::new(0),
+                jump: Duration::from_millis(5),
+            });
+            let bus = LeapBus { inner: raw_bus.clone(), clock: leap_clock.clone() };
+            let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(b601_limits())
+                .unwrap()
+                .with_gripper_pos_force(pf())
+                .unwrap();
+            d.read_joint_states().unwrap();
+            raw_bus.with(|s| s.push_all_feedback());
+            d.read_joint_states().unwrap();
+            d.check_mapping_ranges();
+            d.set_torque(true).expect("enable");
+
+            // Keep J1–J6 fresh (queue_bound <= 10 ms) while parking J7 at 98 ms (still <= 100 ms!).
+            raw_bus.with(|s| {
+                s.immediate_replies = false;
+                s.motors[J7].mute_feedback = true;
+            });
+            base_clock.advance(Duration::from_millis(88));
+            raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            d.read_joint_states().unwrap();
+            base_clock.advance(Duration::from_millis(10));
+            raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            d.read_joint_states().unwrap();
+            // Now J7 age = 98 ms (passes entry gate!), J1–J6 age = 0 ms (queue_bound = 10 ms).
+            assert!(d.pos_force_feedback_fresh(), "J7 must start fresh at 98 ms");
+
+            raw_bus.clear_log();
+            d.begin_tx_tick();
+            leap_clock.calls.store(0, Ordering::SeqCst);
+            leap_clock.armed.store(true, Ordering::SeqCst);
+            let ts = targets(-1.2);
+            let res = if is_hold {
+                d.write_estop_hold_bounded(&ts)
+            } else {
+                d.write_joint_targets_bounded(&ts)
+            };
+            leap_clock.armed.store(false, Ordering::SeqCst);
+            assert!(
+                leap_clock.calls.load(Ordering::SeqCst) >= jump_on_call,
+                "is_hold={is_hold} jump_on_call={jump_on_call}: jump must have fired"
+            );
+            assert_eq!(
+                res.unwrap_or_else(|e| panic!("is_hold={is_hold} jump={jump_on_call}: must skip J7 cleanly, not fail: {e:?}")),
+                TxBatchOutcome::Complete,
+                "is_hold={is_hold} jump={jump_on_call}: healthy arm batch must complete"
+            );
+            assert!(
+                matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
+                "is_hold={is_hold} jump={jump_on_call}: expected PosForceTxStatus::Stale for J7"
+            );
+            let log = raw_bus.tx_log();
+            assert!(
+                j7_commands(&log).is_empty(),
+                "is_hold={is_hold} jump={jump_on_call}: must emit zero 0x307 frames: {log:?}"
+            );
+            assert!(
+                log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+                "is_hold={is_hold} jump={jump_on_call}: expected J7 0xCC refresh: {log:?}"
+            );
+            for id in 1u32..=6 {
+                assert!(
+                    log.iter().any(|f| f.id == 0x100 + id),
+                    "is_hold={is_hold} jump={jump_on_call}: J{id} frame missing: {log:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Blocker 2 driver unit regression: `pos_force_feedback_fresh()` resolves the configured J7
+/// independently of `pos_force_verified` or active TX mode (disabled/unverified, unknown mode,
+/// MIT mode) and enforces the inclusive `<= 100 ms` receive + queue-bound + finite-position check.
+#[test]
+fn pos_force_feedback_fresh_fail_closed_across_unverified_unknown_mode_and_100ms_boundary() {
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.immediate_replies = true);
+    d.set_torque(true).expect("enable pos-force");
+
+    // 1. Inclusive 100 ms boundary: exact 100 ms -> true; 101 ms -> false.
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(100));
+    assert!(d.pos_force_feedback_fresh(), "exact 100 ms age must be fresh (inclusive)");
+    clock.advance(Duration::from_millis(1));
+    assert!(!d.pos_force_feedback_fresh(), "101 ms age must be stale");
+
+    // 2. Disabled / unverified mode (`set_torque(false)`): J7 aged 150 ms (still <= 250 ms
+    //    `is_feedback_valid`) MUST still report `pos_force_feedback_fresh() == false`.
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_torque(false).expect("disable torque");
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    clock.advance(Duration::from_millis(140));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(10));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    assert!(d.is_feedback_valid(), "J7 at 150 ms is still within 250 ms general feedback validity");
+    assert!(
+        !d.pos_force_feedback_fresh(),
+        "disabled/unverified J7 at 150 ms must NOT bypass 100 ms freshness check"
+    );
+
+    // 3. Unknown J7 mode (`joint_modes[6] = None` after dropped CTRL_MODE write reply):
+    //    J7 aged 150 ms MUST still report `pos_force_feedback_fresh() == false`.
+    bus.with(|s| {
+        s.motors[J7].mute_feedback = false;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("re-enable");
+    bus.with(|s| s.motors[J7].no_write_ack = true);
+    let mut modes = vec![armd::driver::JointMode::Position; 7];
+    modes[J7] = armd::driver::JointMode::Mit;
+    let holds = targets(-1.0);
+    let _ = d.set_joint_modes(&modes, &holds);
+    bus.with(|s| {
+        s.motors[J7].no_write_ack = false;
+        s.motors[J7].mute_feedback = true;
+    });
+    assert!(d.joint_modes_uncertain(), "J7 mode must now be unknown");
+    clock.advance(Duration::from_millis(140));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(10));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    assert!(d.is_feedback_valid());
+    assert!(
+        !d.pos_force_feedback_fresh(),
+        "unknown-mode J7 at 150 ms must NOT bypass 100 ms freshness check"
+    );
+    // Fresh J7 reply (<= 100 ms) restores freshness even while mode is unknown.
+    bus.with(|s| {
+        s.motors[J7].mute_feedback = false;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    assert!(d.pos_force_feedback_fresh(), "fresh <= 100 ms J7 must satisfy pos_force_feedback_fresh");
+}
+
+/// R2 Blocker 1 regression:
+/// - A J7-only carried-over frame parked at exact 100 ms whose FIFO age also crosses `frame_max_age`
+///   (45 ms) MUST NOT be counted as FIFO `Expired` (`CAN_TX_STALLED`) even when the clock crosses
+///   100 ms on any `now()` call during preflight, mid-drain, or post-flush cleanup (shared single
+///   clock sample at each cleanup boundary).
+/// - Negative control: a carried-over J1–J6 frame aged past 45 ms STILL returns `TxBatchOutcome::Expired`.
+#[test]
+fn pos_force_carryover_j7_at_100ms_boundary_never_counted_as_fifo_expired() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use armd::driver::{PosForceTxStatus, TxBatchOutcome, TxBudget};
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    struct LeapOnNthNowClock {
+        inner: MockClock,
+        armed: AtomicBool,
+        target_call: AtomicUsize,
+        calls: AtomicUsize,
+        jump: Duration,
+    }
+    impl DriverClock for LeapOnNthNowClock {
+        fn clock_id(&self) -> u64 {
+            self.inner.clock_id()
+        }
+        fn now(&self) -> Instant {
+            if self.armed.load(Ordering::SeqCst) {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.target_call.load(Ordering::SeqCst) {
+                    self.inner.advance(self.jump);
+                }
+            }
+            self.inner.now()
+        }
+        fn sleep(&self, dur: Duration) {
+            self.inner.sleep(dur);
+        }
+        fn yield_now(&self) {
+            self.inner.yield_now();
+        }
+    }
+
+    #[derive(Clone)]
+    struct LeapBus {
+        inner: FakeBus,
+        clock: Arc<LeapOnNthNowClock>,
+    }
+    impl CanTransport for LeapBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn flush_is_noop(&self) -> bool {
+            self.inner.flush_is_noop()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(self.clock.clone())
+        }
+    }
+
+    // 1. J7-only carry-over parked at exact 100 ms (and queued_age = 44 ms), jumping +2 ms across
+    //    both 100 ms freshness and 45 ms FIFO expiry on EVERY `now()` call (1..=8): MUST NEVER
+    //    return `TxBatchOutcome::Expired`!
+    for jump_on_call in 1..=8usize {
+        let base_clock = MockClock::new();
+        let raw_bus = FakeBus::with_clock(&b601_limits(), base_clock.clone());
+        raw_bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+            }
+            s.motors[J7].q = -1.0;
+            s.immediate_replies = true;
+        });
+        let leap_clock = Arc::new(LeapOnNthNowClock {
+            inner: base_clock.clone(),
+            armed: AtomicBool::new(false),
+            target_call: AtomicUsize::new(jump_on_call),
+            calls: AtomicUsize::new(0),
+            jump: Duration::from_millis(2),
+        });
+        let bus = LeapBus { inner: raw_bus.clone(), clock: leap_clock.clone() };
+        let b6 = TxBudget {
+            max_frames: 6,
+            max_duration: Duration::from_millis(10),
+            frame_max_age: Duration::from_millis(45),
+        };
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits())
+            .unwrap()
+            .with_gripper_pos_force(pf())
+            .unwrap()
+            .with_tx_budget(b6);
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).expect("enable");
+        // Establish fresh empty-RX boundary + J1-J7 samples at t = 0 right after enable handshake.
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| {
+            s.immediate_replies = false;
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.motors[J7].mute_feedback = true);
+
+        // Advance 56 ms (keeping J1-J6 fresh), then emit batch with budget=6 -> J1-J6 send, ONLY J7 deferred!
+        base_clock.advance(Duration::from_millis(56));
+        raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        d.read_joint_states().unwrap();
+        d.begin_tx_tick();
+        assert_eq!(
+            d.write_joint_targets_bounded(&targets(-1.1)).unwrap(),
+            TxBatchOutcome::Deferred { pending: 1 }
+        );
+        // Advance 44 ms more -> J7 feedback age = exact 100 ms, carried-over J7 queue age = 44 ms (< 45 ms).
+        base_clock.advance(Duration::from_millis(44));
+        raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        d.read_joint_states().unwrap();
+        assert!(d.pos_force_feedback_fresh(), "J7 starts at exact 100 ms");
+
+        raw_bus.clear_log();
+        d.begin_tx_tick();
+        leap_clock.calls.store(0, Ordering::SeqCst);
+        leap_clock.armed.store(true, Ordering::SeqCst);
+        let outcome = d
+            .write_joint_targets_bounded(&targets(-1.2))
+            .unwrap_or_else(|e| panic!("jump={jump_on_call}: unexpected error {e:?}"));
+        leap_clock.armed.store(false, Ordering::SeqCst);
+        assert!(
+            !matches!(outcome, TxBatchOutcome::Expired { .. }),
+            "jump={jump_on_call}: J7-only carry-over crossing 100 ms must NEVER return Expired, got {outcome:?}"
+        );
+        assert!(
+            j7_commands(&raw_bus.tx_log()).is_empty(),
+            "jump={jump_on_call}: must not emit stale 0x307"
+        );
+        assert!(
+            matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
+            "jump={jump_on_call}: expected Stale status for J7"
+        );
+    }
+
+    // 2. Negative control: an expired J1–J6 carry-over frame (> 45 ms) alongside stale J7 MUST
+    //    still return `TxBatchOutcome::Expired { dropped: 1, pending: 0 }`.
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.immediate_replies = true);
+    d.set_torque(true).expect("enable");
+    d = d.with_tx_budget(TxBudget {
+        max_frames: 5,
+        max_duration: Duration::from_millis(10),
+        frame_max_age: Duration::from_millis(45),
+    });
+    bus.with(|s| {
+        s.immediate_replies = false;
+        s.motors[J7].mute_feedback = true;
+    });
+    d.begin_tx_tick();
+    // Budget 5 -> sends J1-J5, defers J6 + J7.
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets(-1.1)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 2 }
+    );
+    clock.advance(Duration::from_millis(105));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    d.begin_tx_tick();
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets(-1.2)).unwrap(),
+        TxBatchOutcome::Expired { dropped: 1, pending: 0 },
+        "stale J7 is dropped by freshness gate, while expired J6 MUST still return Expired"
+    );
 }

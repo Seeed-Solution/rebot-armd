@@ -2271,11 +2271,11 @@ impl SafetyManager {
                     }
                 }
                 FaultKind::J7FeedbackStale => {
-                    if ctx.has_driver && !ctx.feedback_fresh {
-                        return Err(ClearRefusal::FreshFeedbackRequired);
-                    }
                     if !ctx.j7_feedback_fresh {
                         return Err(ClearRefusal::J7FeedbackStale);
+                    }
+                    if ctx.has_driver && !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
                     }
                 }
                 FaultKind::ThermalTrip => {

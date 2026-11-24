@@ -62,6 +62,7 @@ enum Mode {
     Ok,
     WouldBlockAfter(usize),
     EnobufsAfter(usize),
+    HardError,
     #[cfg(target_os = "linux")]
     SocketCanOsAfter(usize, i32),
 }
@@ -75,6 +76,7 @@ struct NoAllocDamiaoBus {
     pending_rx: VecDeque<CanFrame>,
     clock: std::sync::Arc<MockClock>,
     mode: Mode,
+    mute_j7: bool,
     tx_count: usize,
     tx_step: Duration,
     flush_err: Option<Mode>,
@@ -94,6 +96,7 @@ impl NoAllocDamiaoBus {
             pending_rx: VecDeque::with_capacity(64),
             clock: std::sync::Arc::new(MockClock::new()),
             mode: Mode::Ok,
+            mute_j7: false,
             tx_count: 0,
             tx_step: Duration::ZERO,
             flush_err: None,
@@ -121,6 +124,9 @@ impl NoAllocDamiaoBus {
     }
 
     fn reply(&mut self, k: usize) {
+        if k == 6 && self.mute_j7 {
+            return;
+        }
         let frame = self.build_reply_frame(k);
         if self.rx.len() < self.rx.capacity() {
             self.rx.push_back(frame);
@@ -128,6 +134,9 @@ impl NoAllocDamiaoBus {
     }
 
     fn reply_pending(&mut self, k: usize) {
+        if k == 6 && self.mute_j7 {
+            return;
+        }
         let frame = self.build_reply_frame(k);
         if self.pending_rx.len() < self.pending_rx.capacity() {
             self.pending_rx.push_back(frame);
@@ -159,6 +168,7 @@ impl CanTransport for NoAllocDamiaoBus {
             Mode::Ok => {}
             Mode::WouldBlockAfter(n) if self.tx_count >= n => return Err(TransportError::WouldBlock),
             Mode::EnobufsAfter(n) if self.tx_count >= n => return Err(TransportError::NoBufferSpace),
+            Mode::HardError => return Err(TransportError::NotOpen),
             #[cfg(target_os = "linux")]
             Mode::SocketCanOsAfter(n, errno) if self.tx_count >= n => {
                 return Err(armd::transport::socketcan::map_socketcan_tx_error(
@@ -253,6 +263,7 @@ impl CanTransport for NoAllocDamiaoBus {
             None | Some(Mode::Ok) => Ok(()),
             Some(Mode::WouldBlockAfter(_)) => Err(TransportError::WouldBlock),
             Some(Mode::EnobufsAfter(_)) => Err(TransportError::NoBufferSpace),
+            Some(Mode::HardError) => Err(TransportError::NotOpen),
             #[cfg(target_os = "linux")]
             Some(Mode::SocketCanOsAfter(_, errno)) => {
                 Err(armd::transport::socketcan::map_socketcan_tx_error(
@@ -1258,4 +1269,526 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     let settle = pk_inner.unload_settle.as_ref().expect("settle remains active after transient gap");
     assert_eq!(settle.held_s, 0.0);
     assert!(settle.samples.is_empty(), "output gap must clear settle samples without freeing");
+}
+
+/// Item 1 + Item 3 + Item 4 RT zero-alloc/zero-free verification:
+/// - Full RT release across transient J7 staleness (skip + `0xCC` refresh), sustained J7
+///   staleness latching `J7_FEEDBACK_STALE`, `halt_motion_for_fault_rt(6)`, `reconcile_action`
+///   terminating a real running RT `MacroRun` (retiring it off-thread without freeing on RT),
+///   and `tick_publish`: strictly 0 allocs, 0 frees.
+/// - Subsequent rate-limited `"Stopped hold output failed"` (`SafetyLogEvent::StoppedHoldOutputFailed`)
+///   emission across 1.1 s (55 ticks: emit 0 suppressed -> 49 suppressed -> emit 49 suppressed):
+///   strictly 0 allocs, 0 frees on every control release.
+#[test]
+fn rt_j7_pos_force_staleness_macro_retire_and_throttled_hold_error_zero_alloc() {
+    use armd::safety::{FaultCode, FaultReason, SafetyLogEvent, SafetyState};
+
+    let limits = b601_limits();
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        joint_tracking: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let bus = SharedNoAllocBus::new(&limits);
+    bus.0.lock().unwrap().motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+    let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force drive");
+    let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(grip)
+        .unwrap();
+    driver.read_joint_states().unwrap();
+    driver.read_joint_states().unwrap();
+    driver.check_mapping_ranges();
+    driver.set_rt_mode(true);
+
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    inner.set_torque(true).expect("arm pos-force");
+    inner.rt_executor_owned = true;
+    inner.safety.set_off_thread_reclaim(true);
+
+    // Start a real running RT macro (`MacroRun`) so its retirement on J7_FEEDBACK_STALE is
+    // proven zero-alloc and zero-free on the control thread.
+    let ep = inner.safety.epoch_id();
+    let macro_id = inner
+        .begin_sequence_action(Some("rt-j7-macro".into()), ep)
+        .expect("begin macro");
+    assert!(inner.macro_run.is_some());
+
+    // Warm up triple-buffer observation slots with running macro before counting.
+    for _ in 0..5 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner.tick_publish(0.02, 1, false);
+        let _ = inner.core.hub().latest();
+    }
+    inner.safety.drain_log_events_off_thread();
+    reset_tx_metrics();
+
+    // 1. Mute J7 and advance 20 ms per tick across transient skip/0xCC ticks (120..240 ms)
+    //    and through the 250 ms latch tick (260 ms): strictly 0 allocs, 0 frees on EVERY tick!
+    bus.0.lock().unwrap().mute_j7 = true;
+    let mut latched_on_tick = None;
+    for tick in 1..=16 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "J7 stale skip/refresh/latch tick {tick} touched allocator"
+        );
+        if inner.safety.fault_code() == Some(FaultCode::J7FeedbackStale) && latched_on_tick.is_none() {
+            latched_on_tick = Some(tick);
+            break;
+        }
+    }
+    assert!(latched_on_tick.is_some(), "expected J7_FEEDBACK_STALE to latch within 16 ticks");
+    assert_eq!(*inner.safety.state(), SafetyState::Fault(FaultReason::J7FeedbackStale));
+    assert!(inner.macro_run.is_none(), "MacroRun must be removed from active slot");
+    assert_eq!(
+        inner.retired_macro_runs_len(),
+        1,
+        "MacroRun must be queued in retired_macro_runs for off-thread drop (0 free on RT)"
+    );
+    let snap = inner.core.hub().latest().expect("published observation after J7_FEEDBACK_STALE");
+    let act = snap.obs.action.as_ref().expect("published action after J7_FEEDBACK_STALE");
+    assert_eq!(act.id, macro_id);
+    assert_eq!(act.state.as_str(), "failed");
+    assert_eq!(act.code.as_deref(), Some("J7_FEEDBACK_STALE"));
+    drop(snap);
+    // Reclaim off-thread (outside counted).
+    assert!(inner.pop_retired_macro_run().is_some());
+    inner.safety.drain_log_events_off_thread();
+
+    // 2. Rate-limited `"Stopped hold output failed"` via deferred safety log ring across 55 ticks
+    //    (1.1 s on driver clock): unmute J7 so feedback remains fresh (< 500 ms BUS_LOSS) while
+    //    every stopped-hold TX returns Mode::HardError — strictly 0 allocs, 0 frees, exact counts!
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.mute_j7 = false;
+        g.mode = Mode::HardError;
+    }
+    let mut hold_log_events = Vec::new();
+    for tick in 0..55 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+            g.tx_count = 0;
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "rate-limited stopped hold error tick {tick} touched allocator"
+        );
+        while let Some(ev) = inner.safety.pop_log_event() {
+            if let SafetyLogEvent::StoppedHoldOutputFailed { partial, suppressed, .. } = ev {
+                hold_log_events.push((partial, suppressed));
+            }
+        }
+    }
+    assert_eq!(
+        hold_log_events,
+        vec![(false, 0), (false, 49)],
+        "expected exactly 2 deferred StoppedHoldOutputFailed events across 1.1 s with exact suppressed counts"
+    );
+    assert_eq!(inner.hold_tx_error_suppressed(), 4);
+    assert_eq!(inner.safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+}
+
+/// Major 4 RT zero-alloc/zero-free regression:
+/// Saturating `retired_macro_runs` guarantees the final admitted heap-backed `MacroRun` retires
+/// on `armd-control` with strictly 0 allocs and 0 frees, and subsequent macro admissions apply
+/// backpressure (`MotionError::MotionBusy`) until an off-thread drain frees a retirement slot.
+#[test]
+fn rt_macro_retirement_saturation_applies_admission_backpressure_with_zero_alloc_and_zero_free() {
+    use armd::macro_action::SubState;
+    use armd::motion::MotionError;
+    use armd::safety::FaultCode;
+    use armd::supervisor::ArmError;
+
+    let limits = b601_limits();
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        joint_tracking: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let bus = SharedNoAllocBus::new(&limits);
+    bus.0.lock().unwrap().motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+    let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force drive");
+    let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(grip)
+        .unwrap();
+    driver.read_joint_states().unwrap();
+    driver.read_joint_states().unwrap();
+    driver.check_mapping_ranges();
+    driver.set_rt_mode(true);
+
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    inner.set_torque(true).expect("arm pos-force");
+    inner.rt_executor_owned = true;
+    inner.safety.set_off_thread_reclaim(true);
+
+    // Fill 7 of 8 `retired_macro_runs` slots via real admission + macro stop (no off-thread drain).
+    for i in 0..7 {
+        let ep = inner.safety.epoch_id();
+        let _id = inner
+            .begin_sequence_action(Some(format!("fill-{i}")), ep)
+            .expect("admit while slots available");
+        if let Some(m) = inner.macro_run.as_mut() {
+            m.phase = Some("approach-heap-phase".into());
+            m.sub = SubState::Failed {
+                code: "TEST_SUB_CODE".into(),
+                message: "heap-backed sub-state message".into(),
+            };
+        }
+        inner.request_macro_stop();
+    }
+    assert_eq!(inner.retired_macro_runs_len(), 7);
+    assert!(inner.can_admit_macro_run(), "1 free slot must still admit 1 macro");
+
+    // Admit the 8th (final-capacity) heap-backed MacroRun and warm triple-buffer slots.
+    let ep = inner.safety.epoch_id();
+    let _last_id = inner
+        .begin_sequence_action(Some("slot-8-macro".into()), ep)
+        .expect("admit 8th macro");
+    // Expire the legacy-populated `previous_action` (with `phase_ms` BTreeMap from `request_macro_stop`)
+    // before measuring RT control-thread allocs/frees for the 8th macro's retirement.
+    inner.previous_action = None;
+    if let Some(m) = inner.macro_run.as_mut() {
+        m.phase = Some("grasp-descend-heap-phase".into());
+        m.sub = SubState::Failed {
+            code: "HEAP_SUB_CODE".into(),
+            message: "must not be freed on armd-control when retiring into final slot".into(),
+        };
+    }
+    assert!(!inner.can_admit_macro_run(), "active macro + 7 retired == capacity 8 -> no more room");
+
+    for _ in 0..5 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner.tick_publish(0.02, 1, false);
+        let _ = inner.core.hub().latest();
+    }
+    inner.safety.drain_log_events_off_thread();
+
+    // Trigger J7_FEEDBACK_STALE so the 8th heap-backed MacroRun retires on the RT control thread
+    // into slot 8/8: MUST be strictly (0 allocs, 0 frees) on EVERY tick!
+    bus.0.lock().unwrap().mute_j7 = true;
+    let mut latched = false;
+    for tick in 1..=16 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "saturated final-slot macro retirement tick {tick} touched allocator"
+        );
+        if inner.safety.fault_code() == Some(FaultCode::J7FeedbackStale) {
+            latched = true;
+            break;
+        }
+    }
+    assert!(latched);
+    assert!(inner.macro_run.is_none());
+    assert_eq!(inner.retired_macro_runs_len(), 8);
+
+    // Recover & re-arm WITHOUT draining `retired_macro_runs`: 9th admission MUST backpressure!
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.mute_j7 = false;
+        g.push_all_feedback();
+    }
+    let _ = inner.tick_publish(0.02, 1, false);
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.clock.advance(Duration::from_millis(20));
+        g.push_all_feedback();
+    }
+    let _ = inner.tick_publish(0.02, 1, false);
+    inner.clear_fault().expect("clear J7 fault");
+    inner.set_torque(true).expect("re-arm");
+    assert!(!inner.can_admit_macro_run());
+    let ep_full = inner.safety.epoch_id();
+    let err = inner
+        .begin_sequence_action(Some("overflow-macro".into()), ep_full)
+        .expect_err("saturated retired_macro_runs must reject macro admission");
+    assert!(
+        matches!(err, ArmError::Motion(MotionError::MotionBusy(_))),
+        "expected MotionBusy backpressure, got {err:?}"
+    );
+    assert!(inner.macro_run.is_none());
+
+    // Drain 1 retired MacroRun off-thread -> admission immediately succeeds again!
+    let reclaimed = inner.pop_retired_macro_run().expect("pop 1 retired macro");
+    drop(reclaimed);
+    assert_eq!(inner.retired_macro_runs_len(), 7);
+    assert!(inner.can_admit_macro_run());
+    let ep_ok = inner.safety.epoch_id();
+    let _ = inner
+        .begin_sequence_action(Some("post-drain-macro".into()), ep_ok)
+        .expect("admission must resume once a slot drains");
+}
+
+/// R2 Blocker 2 + R2 Major 1 + R2 Major 3 RT zero-alloc/zero-free regression:
+/// 1. Full RT release (`tick_publish`) latching `J7_FEEDBACK_STALE` with completely exhausted
+///    `SafetyManager` fault pools AND then upgrading to `ThermalTrip` with pools still exhausted:
+///    strictly (0 allocs, 0 frees) AND all 3 fault views (`state()`, `fault_code()`, `fault()`)
+///    resolve the winning `ThermalTrip` (never leaving stale `Fault(J7FeedbackStale)` in `state()`).
+/// 2. Counted `(0, 0)` alloc/free verification on BOTH refused (`J7FeedbackStale`) and successful
+///    (`Ok(Idle)`) `clear_fault_executor_bounded` paths.
+/// 3. Counted `(0, 0)` alloc/free verification on the production `forward_deferred_safety_logs`
+///    path across full downstream `rtrb` ring rejection, delayed recovery at `t + 1.2 s`, and
+///    throttled follow-up at `t + 1.22 s`.
+#[test]
+fn rt_j7_exhausted_pool_latch_bounded_clear_and_production_log_forwarding_zero_alloc() {
+    use armd::rt_core::executor::{forward_deferred_safety_logs, ExecutorStats};
+    use armd::safety::{
+        ClearFaultError, ClearRefusal, FaultCode, FaultReason, SafetyLogEvent, SafetyState,
+    };
+
+    let limits = b601_limits();
+    let mut cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        joint_tracking: None,
+        resting_pose: None,
+        ..ArmConfig::rebot_dm()
+    };
+    cfg.max_temperature = 75.0;
+    let bus = SharedNoAllocBus::new(&limits);
+    bus.0.lock().unwrap().motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+    let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force drive");
+    let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(grip)
+        .unwrap();
+    driver.read_joint_states().unwrap();
+    driver.read_joint_states().unwrap();
+    driver.check_mapping_ranges();
+    driver.set_rt_mode(true);
+
+    let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(driver));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    inner.set_torque(true).expect("arm pos-force");
+    inner.rt_executor_owned = true;
+    inner.safety.set_off_thread_reclaim(true);
+
+    for _ in 0..4 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner.tick_publish(0.02, 1, false);
+        let _ = inner.core.hub().latest();
+    }
+    inner.safety.drain_log_events_off_thread();
+
+    // 1. Exhaust ALL SafetyManager fault pools, then latch J7_FEEDBACK_STALE via live RT ticks.
+    let held_pools = inner.safety.drain_fault_arc_pool_for_test();
+    bus.0.lock().unwrap().mute_j7 = true;
+    let mut j7_latched = false;
+    for tick in 1..=16 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "empty-pool J7 latch tick {tick} touched allocator");
+        if inner.safety.fault_code() == Some(FaultCode::J7FeedbackStale) {
+            j7_latched = true;
+            break;
+        }
+    }
+    assert!(j7_latched);
+    assert_eq!(*inner.safety.state(), SafetyState::Fault(FaultReason::J7FeedbackStale));
+
+    // With pools STILL exhausted, latch higher-severity ThermalTrip:
+    // MUST be (0, 0) and follow the baseline pool-exhaustion contract (`test_rt_b3_alloc.rs:680`):
+    // existing stopped `state_arc` stays pinned without allocating while `fault_code()`,
+    // `fault()`, and `recoverable()` reflect the higher-severity `ThermalTrip`.
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.clock.advance(Duration::from_millis(20));
+        g.push_all_feedback();
+    }
+    inner.temperatures[0] = 90.0;
+    let ((), a, f) = counted(|| {
+        inner.safety.latch(
+            armd::safety::FaultKind::ThermalTrip,
+            armd::safety::FaultDetail::ThermalTrip { joint_idx: 0, temperature: 90.0, limit: 75.0 },
+        );
+    });
+    assert_eq!((a, f), (0, 0), "empty-pool ThermalTrip upgrade over J7 touched allocator");
+    assert_eq!(*inner.safety.state(), SafetyState::Fault(FaultReason::J7FeedbackStale));
+    assert!(inner.safety.has_latched_fault_kind(armd::safety::FaultKind::J7FeedbackStale));
+    assert!(inner.safety.has_latched_fault_kind(armd::safety::FaultKind::ThermalTrip));
+    assert_eq!(inner.safety.fault_code(), Some(FaultCode::ThermalTrip));
+    assert_eq!(inner.safety.fault().unwrap().code, FaultCode::ThermalTrip);
+    assert!(!inner.safety.recoverable());
+    assert!(!inner.safety.fault().unwrap().recoverable);
+    drop(held_pools);
+
+    // 2. Counted (0, 0) alloc/free on BOTH refused and successful `clear_fault_executor_bounded`
+    //    for `J7_FEEDBACK_STALE`.
+    let bus2 = SharedNoAllocBus::new(&b601_limits());
+    bus2.0.lock().unwrap().motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+    let grip2 = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force drive");
+    let mut driver2 = DamiaoArmDriver::new(bus2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits())
+        .unwrap()
+        .with_gripper_drive(grip2)
+        .unwrap();
+    driver2.read_joint_states().unwrap();
+    driver2.read_joint_states().unwrap();
+    driver2.check_mapping_ranges();
+    driver2.set_rt_mode(true);
+    let mut inner2 = SupervisorInner::new(cfg).with_driver(Box::new(driver2));
+    inner2.lease_enabled = false;
+    inner2.tick(0.02);
+    inner2.set_torque(true).expect("arm");
+    inner2.rt_executor_owned = true;
+    inner2.safety.set_off_thread_reclaim(true);
+    bus2.0.lock().unwrap().mute_j7 = true;
+    for _ in 0..16 {
+        {
+            let mut g = bus2.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner2.tick_publish(0.02, 1, false);
+        if inner2.safety.fault_code() == Some(FaultCode::J7FeedbackStale) {
+            break;
+        }
+    }
+    assert_eq!(inner2.safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+    // Refused bounded clear while J7 is still stale -> (0, 0) allocs/frees!
+    let dl_refuse = std::time::Instant::now() + Duration::from_millis(50);
+    let (refused_j7, a, f) = counted(|| {
+        matches!(
+            inner2.clear_fault_executor_bounded(dl_refuse),
+            Err(ClearFaultError::Rejected(ClearRefusal::J7FeedbackStale))
+        )
+    });
+    assert_eq!((a, f), (0, 0), "refused J7 clear_fault_executor_bounded touched allocator");
+    assert!(refused_j7, "expected ClearRefusal::J7FeedbackStale");
+
+    // Restore fresh J7 feedback across empty RX boundary -> successful bounded clear -> (0, 0)!
+    for _ in 0..2 {
+        {
+            let mut g = bus2.0.lock().unwrap();
+            g.mute_j7 = false;
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner2.tick_publish(0.02, 1, false);
+    }
+    let dl_ok = std::time::Instant::now() + Duration::from_millis(50);
+    let (cleared_idle, a, f) = counted(|| {
+        matches!(inner2.clear_fault_executor_bounded(dl_ok), Ok(SafetyState::Idle))
+    });
+    assert_eq!((a, f), (0, 0), "successful J7 clear_fault_executor_bounded touched allocator");
+    assert!(cleared_idle, "expected Ok(SafetyState::Idle) after fresh J7 feedback");
+
+    // 3. Counted (0, 0) alloc/free on the production `forward_deferred_safety_logs` forwarding
+    //    path across downstream ring saturation, delayed retry at t + 1.2 s, and next-tick throttle.
+    inner2.safety.latch(
+        armd::safety::FaultKind::J7FeedbackStale,
+        armd::safety::FaultDetail::J7FeedbackStale(None),
+    );
+    inner2.safety.drain_log_events_off_thread();
+    bus2.0.lock().unwrap().mode = Mode::HardError;
+    let (mut log_tx, mut log_rx) = rtrb::RingBuffer::<SafetyLogEvent>::new(2);
+    log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+    log_tx.push(SafetyLogEvent::GravityCompRampComplete).unwrap();
+    let stats = ExecutorStats::default();
+
+    // Tick at t0: hold error hits full downstream `log_tx` -> rejected, (0, 0) allocs/frees!
+    let t0 = {
+        let mut g = bus2.0.lock().unwrap();
+        g.clock.advance(Duration::from_millis(20));
+        g.push_all_feedback();
+        g.clock.now()
+    };
+    let (published, a, f) = counted(|| {
+        let p = inner2.tick_publish(0.02, 1, false);
+        let _ = forward_deferred_safety_logs(&mut inner2, &mut log_tx, &stats, t0);
+        p
+    });
+    assert!(published.kept.is_none());
+    drop(published);
+    assert_eq!((a, f), (0, 0), "downstream-full rejection in production forwarding touched allocator");
+    assert_eq!(inner2.hold_tx_error_suppressed(), 1);
+
+    // Consumer drains `log_rx` 1.2 s later with no intervening error -> retry delivers with (0, 0)!
+    assert!(log_rx.pop().is_ok());
+    assert!(log_rx.pop().is_ok());
+    let t_recover = {
+        let g = bus2.0.lock().unwrap();
+        g.clock.advance(Duration::from_millis(1200));
+        g.clock.now()
+    };
+    let (did_forward, a, f) = counted(|| {
+        forward_deferred_safety_logs(&mut inner2, &mut log_tx, &stats, t_recover)
+    });
+    assert!(did_forward);
+    assert_eq!((a, f), (0, 0), "delayed retry in production forwarding touched allocator");
+    assert_eq!(inner2.hold_tx_error_suppressed(), 0);
+    match log_rx.pop().expect("retry delivered") {
+        SafetyLogEvent::StoppedHoldOutputFailed { suppressed, logged_at, .. } => {
+            assert_eq!(suppressed, 0);
+            assert_eq!(logged_at, t0);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // Immediate next hold error 20 ms after retry acceptance -> MUST be throttled with (0, 0)!
+    let t_next = {
+        let mut g = bus2.0.lock().unwrap();
+        g.clock.advance(Duration::from_millis(20));
+        g.push_all_feedback();
+        g.clock.now()
+    };
+    let (published, a, f) = counted(|| {
+        let p = inner2.tick_publish(0.02, 1, false);
+        let _ = forward_deferred_safety_logs(&mut inner2, &mut log_tx, &stats, t_next);
+        p
+    });
+    assert!(published.kept.is_none());
+    drop(published);
+    assert_eq!((a, f), (0, 0), "post-retry throttled tick touched allocator");
+    assert!(log_rx.pop().is_err(), "error 20 ms after delayed retry acceptance must stay throttled");
+    assert_eq!(inner2.hold_tx_error_suppressed(), 1);
 }

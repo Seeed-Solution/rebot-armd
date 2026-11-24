@@ -183,7 +183,10 @@ impl DualRig {
                     .expect("submit TorqueOn transition");
                 let rep = fx.step();
                 assert!(rep.command.as_ref().is_some_and(|(_, r)| r.is_ok()), "TorqueOn: {rep:?}");
-                for _ in 0..5 {
+                for _ in 0..20 {
+                    if fx.core.safety.state().is_operational() {
+                        break;
+                    }
                     self.bus.with(|s| s.push_all_feedback());
                     fx.step();
                 }
@@ -2360,5 +2363,1703 @@ fn dual_owner_probe_rejects_pre_probe_reply_queued_between_drain_and_write() {
         rig.step();
         rig.clear_fault_and_enable();
         assert!(rig.inner().safety.state().is_operational());
+    }
+}
+
+impl DualRig {
+    /// Builds a 7-DOF B601-DM rig with J7 (index 6) configured in Damiao `PosForce` mode
+    /// (`CTRL_MODE_POS_FORCE`), matching production `ArmConfig::rebot_dm()`.
+    fn new_pos_force(kind: Owner, cfg: ArmConfig, budget: Option<TxBudget>) -> Self {
+        let limits = dm_limits();
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.motors[6].set_reg_u32(
+                armd::protocol::damiao::RID_CTRL_MODE,
+                armd::protocol::damiao::CTRL_MODE_POS_FORCE,
+            );
+            s.immediate_replies = true;
+            s.follow_commands = true;
+            s.push_all_feedback();
+        });
+        let tx_budget = budget.unwrap_or_else(|| cfg.damiao_tx_budget());
+        let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force gripper drive");
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_gripper_drive(grip)
+            .unwrap()
+            .with_tx_budget(tx_budget);
+        drv.read_joint_states().unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.tick(DT);
+        inner.set_torque(true).expect("initial pos-force arm");
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.push_all_feedback();
+        });
+        if tx_budget.max_frames >= 7 {
+            for _ in 0..3 {
+                clock.advance(ms(20));
+                bus.with(|s| s.push_all_feedback());
+                inner.tick(DT);
+            }
+        }
+        assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
+
+        let owner = match kind {
+            Owner::Legacy => RigOwner::Legacy(Box::new(inner)),
+            Owner::Executor => {
+                inner.rt_executor_owned = true;
+                let (fx, broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+                    inner,
+                    BootId(88),
+                    Capacities { commands: 8, plans: 4, replies: 16 },
+                    VirtualClock::from_mock_clock(clock.clone()),
+                );
+                RigOwner::Executor { fx: Box::new(fx), broker: Box::new(broker), next_req: 1 }
+            }
+        };
+        bus.clear_log();
+        reset_tx_metrics();
+        Self { owner, bus, clock }
+    }
+}
+
+fn j7_pf_frames(log: &[armd::transport::CanFrame]) -> Vec<armd::transport::CanFrame> {
+    log.iter().copied().filter(|f| f.id == 0x307).collect()
+}
+
+fn j7_refresh_frames(log: &[armd::transport::CanFrame]) -> Vec<armd::transport::CanFrame> {
+    log.iter()
+        .copied()
+        .filter(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC)
+        .collect()
+}
+
+/// Item 1 + Item 4 (Scenario 1 + config validation + full 6-frame budget refresh liveness):
+/// - Config bounds: `feedback_stale_fault_ms` accepts `200..=450` and rejects `< 200` and `> 450`.
+/// - Single 80 ms control-loop stall during `home` (with J7 reply queued in RX so
+///   `feedback_queue_bound` age > 100 ms while decode age is 0 ms) on realistic
+///   `0.45 ms/frame + 1 ms` spike bus: 0 faults, 0 `0x307` frames on stale tick, J7 `0xCC`
+///   refresh emitted, J1–J6 continue, `0x307` resumes once fresh, and `home` completes `done`
+///   at `[0; 7]` on BOTH Legacy and Executor.
+/// - Continuously full 6-frame budget across motion AND stopped-hold: Tick 1 sends J1–J6 first,
+///   Tick 2 prioritizes J7 `0xCC` refresh so refresh never starves and J1–J6 never false-stall.
+#[test]
+fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes() {
+    // Config bounds check (`200..=450 ms`, >= 2x 100 ms freshness, < 500 ms BUS_LOSS_TIMEOUT).
+    for (bad, ok) in [(199, false), (200, true), (250, true), (450, true), (451, false)] {
+        let mut c = base_cfg();
+        c.damiao_gripper.as_mut().unwrap().feedback_stale_fault_ms = Some(bad);
+        assert_eq!(c.validate().is_ok(), ok, "feedback_stale_fault_ms={bad}");
+    }
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // Part A: Realistic 0.45 ms/frame + 1 ms spikes during `home` with a single 80+ ms stall.
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        rig.bus.with(|s| {
+            s.tx_attempts = 0;
+            s.tx_step = us(450);
+            s.tx_spike_every = 2;
+            s.tx_spike_step = ms(1);
+        });
+
+        // Move away from home across all 7 joints (including J7 pos-force gripper).
+        let away = vec![0.20, -0.16, -0.18, 0.22, -0.15, 0.20, -1.20];
+        let ep = rig.inner().safety.epoch_id();
+        let (_, jog_id, _) = rig
+            .inner_mut()
+            .jog_action(away.clone(), Some(0.6), Some(ep), "joint_move")
+            .expect("start away jog");
+        let mut away_done = false;
+        for _ in 0..90 {
+            rig.step();
+            assert!(rig.inner().safety.state().is_operational(), "{owner:?}: {:?}", rig.inner().safety.fault());
+            if rig.inner().last_action.as_ref().is_some_and(|a| a.id == jog_id && a.state == "done") {
+                away_done = true;
+                break;
+            }
+        }
+        assert!(away_done, "{owner:?}: away jog did not finish");
+
+        // Start `home` back to [0; 7] and run 5 ticks so motion is in flight.
+        let ep = rig.inner().safety.epoch_id();
+        let (_, home_id, _) = rig
+            .inner_mut()
+            .jog_action(vec![0.0; 7], Some(0.6), Some(ep), "home")
+            .expect("start home");
+        for _ in 0..5 {
+            rig.step();
+            assert!(rig.inner().safety.state().is_operational());
+        }
+        let home_epoch = rig.inner().safety.epoch_id();
+
+        // Inject a realistic > 80 ms control-loop stall (total gap 105 ms since last empty RX
+        // boundary) with motor replies ALREADY sitting in the RX buffer so J7's decode age is
+        // 0 ms while its `feedback_queue_bound` age is 105 ms (> 100 ms!).
+        rig.bus.with(|s| s.push_all_feedback());
+        rig.clock.advance(ms(105));
+        rig.bus.clear_log();
+        rig.step_dt(DT, false);
+
+        assert!(
+            rig.inner().safety.state().is_operational(),
+            "{owner:?}: transient 80+ ms stall during home must NOT fault: {:?}",
+            rig.inner().safety.fault()
+        );
+        assert_eq!(rig.inner().safety.epoch_id(), home_epoch);
+        let stale_log = rig.bus.tx_log();
+        assert!(
+            j7_pf_frames(&stale_log).is_empty(),
+            "{owner:?}: must emit 0 0x307 frames while J7 queue-bound > 100 ms: {:?}",
+            j7_pf_frames(&stale_log)
+        );
+        for id in 1u32..=6 {
+            assert!(
+                stale_log.iter().any(|f| f.id == 0x100 + id),
+                "{owner:?}: J{id} must continue during transient J7 stall: {stale_log:?}"
+            );
+        }
+        assert!(
+            !j7_refresh_frames(&stale_log).is_empty(),
+            "{owner:?}: expected J7 0xCC refresh on stale tick: {stale_log:?}"
+        );
+
+        // Next ticks with fresh J7 feedback: 0x307 frames resume and `home` completes cleanly.
+        rig.bus.clear_log();
+        let mut resumed_j7 = false;
+        let mut home_done = false;
+        for _ in 0..100 {
+            rig.step();
+            assert!(
+                rig.inner().safety.state().is_operational(),
+                "{owner:?}: fault after recovering from stall: {:?}",
+                rig.inner().safety.fault()
+            );
+            if !j7_pf_frames(&rig.bus.tx_log()).is_empty() {
+                resumed_j7 = true;
+            }
+            if rig.inner().last_action.as_ref().is_some_and(|a| a.id == home_id && a.state == "done") {
+                home_done = true;
+                break;
+            }
+        }
+        assert!(resumed_j7, "{owner:?}: 0x307 frames did not resume after fresh J7 feedback");
+        assert!(home_done, "{owner:?}: home did not complete after transient stall");
+        for j in 0..7 {
+            assert!(
+                rig.inner().measured_positions[j].abs() < 0.03,
+                "{owner:?}: J{} not at home: {}",
+                j + 1,
+                rig.inner().measured_positions[j]
+            );
+        }
+
+        // Part B: Continuously full 6-frame budget across motion AND stopped-hold -> Tick 1 sends
+        // J1-J6 first, Tick 2 sends priority J7 0xCC refresh so refresh never starves.
+        let tight = TxBudget { max_frames: 6, max_duration: ms(10), frame_max_age: ms(45) };
+        let mut rig_full = DualRig::new_pos_force(owner, base_cfg(), Some(tight));
+        rig_full.bus.with(|s| {
+            s.motors[6].mute_feedback = true;
+            s.immediate_replies = false;
+        });
+        rig_full.clock.advance(ms(110));
+        // Tick 1 (motion): J1-J6 consume all 6 frames, 0 0x307, 0xCC deferred (deferred_ticks -> 1).
+        rig_full.bus.clear_log();
+        rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_full.step_dt(DT, false);
+        let t1 = rig_full.bus.tx_log();
+        assert!(j7_pf_frames(&t1).is_empty(), "{owner:?}: tick 1 emitted 0x307 while stale");
+        for id in 1u32..=6 {
+            assert!(t1.iter().any(|f| f.id == 0x100 + id), "{owner:?}: tick 1 did not send J{id}: {t1:?}");
+        }
+        assert!(j7_refresh_frames(&t1).is_empty(), "{owner:?}: tick 1 should prioritize J1-J6 before 0xCC: {t1:?}");
+        assert!(rig_full.inner().safety.state().is_operational());
+
+        // Tick 2 (motion): priority 0xCC refresh runs FIRST (1 frame) + 5 arm frames; no stall!
+        rig_full.bus.clear_log();
+        rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_full.step_dt(DT, false);
+        let t2 = rig_full.bus.tx_log();
+        assert!(j7_pf_frames(&t2).is_empty(), "{owner:?}: tick 2 emitted 0x307 while stale");
+        assert!(
+            !j7_refresh_frames(&t2).is_empty(),
+            "{owner:?}: tick 2 must send priority J7 0xCC refresh under full 6-frame budget: {t2:?}"
+        );
+        assert!(rig_full.inner().safety.state().is_operational());
+
+        // Unmute J7 -> recovers and resumes 0x307 with 0 faults.
+        rig_full.bus.with(|s| {
+            s.motors[6].mute_feedback = false;
+            s.push_all_feedback();
+        });
+        rig_full.bus.clear_log();
+        rig_full.step();
+        rig_full.step();
+        assert!(rig_full.inner().safety.state().is_operational());
+        assert!(!j7_pf_frames(&rig_full.bus.tx_log()).is_empty(), "{owner:?}: J7 did not resume after recovery");
+
+        // Same full 6-frame budget priority refresh check under stopped-hold.
+        // Mute J7 across normal 20 ms ticks (keeping J1-J6 queue_bound <= 20 ms fresh!) until J7
+        // crosses 100 ms: Tick 1 after stale sends J1-J6 holds first, Tick 2 sends priority 0xCC.
+        rig_full.inner_mut()
+            .safety
+            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("6-frame hold test".into()));
+        let hold_ep = rig_full.inner().safety.epoch_id();
+        rig_full.bus.with(|s| s.motors[6].mute_feedback = true);
+        for _ in 0..6 {
+            // Advance 120 ms over 6 normal 20 ms ticks so J1-J6 stay fresh (queue_bound <= 20 ms)
+            // while J7 crosses the inclusive 100 ms freshness limit.
+            rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig_full.step_dt(DT, false);
+        }
+        // First stale hold tick (> 100 ms): J1-J6 consume all 6 frames, 0 0x307, 0xCC deferred.
+        rig_full.bus.clear_log();
+        rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_full.step_dt(DT, false);
+        let h1 = rig_full.bus.tx_log();
+        assert!(j7_pf_frames(&h1).is_empty());
+        for id in 1u32..=6 {
+            assert!(h1.iter().any(|f| f.id == 0x100 + id), "{owner:?}: hold tick 1 missed J{id}: {h1:?}");
+        }
+        // Second stale hold tick: priority J7 0xCC refresh runs FIRST.
+        rig_full.bus.clear_log();
+        rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_full.step_dt(DT, false);
+        let h2 = rig_full.bus.tx_log();
+        assert!(j7_pf_frames(&h2).is_empty());
+        assert!(
+            !j7_refresh_frames(&h2).is_empty(),
+            "{owner:?}: hold tick 2 must send priority J7 0xCC refresh under 6-frame budget: {h2:?}"
+        );
+        assert_eq!(rig_full.inner().safety.epoch_id(), hold_ep, "{owner:?}: no false CAN_TX_STALLED in 6-frame hold");
+    }
+}
+
+/// Item 1 + Item 4 (carry-over stale J7 vs mixed-queue expiry + mid-batch clock crossing 100 ms):
+/// - J7-only carried-over frame crossing both 45 ms FIFO expiry and 100 ms freshness: stale-J7 wins
+///   over FIFO expiry (0 faults, 0 `0x307`, J7 `0xCC` emitted, J1-J6 continue).
+/// - Mixed-queue negative control (J6 + stale J7): stale J7 is dropped by Item 1, while J6's
+///   genuine > 45 ms FIFO expiry STILL latches `CAN_TX_STALLED`.
+/// - Clock crossing 100 ms during frame construction/submission: J1-J6 sent, 0 `0x307`, `0xCC` sent,
+///   still operational.
+#[test]
+fn dual_owner_pos_force_carryover_stale_j7_vs_mixed_queue_and_mid_batch_expiry() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // (a) J7-only carry-over crossing 45 ms + 100 ms -> stale J7 wins, 0 faults.
+        let b6 = TxBudget { max_frames: 6, max_duration: ms(10), frame_max_age: ms(45) };
+        let mut rig_j7 = DualRig::new_pos_force(owner, base_cfg(), Some(b6));
+        // Tick 1: sends J1-J6, defers ONLY J7 in `pending_tx`.
+        rig_j7.step();
+        assert!(rig_j7.inner().safety.state().is_operational());
+        // Advance 105 ms with J7 muted and J1-J6 fresh: J7 is both > 45 ms queued AND > 100 ms stale.
+        rig_j7.bus.with(|s| s.motors[6].mute_feedback = true);
+        rig_j7.clock.advance(ms(105));
+        rig_j7.bus.clear_log();
+        rig_j7.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_j7.step_dt(DT, false);
+        assert!(
+            rig_j7.inner().safety.state().is_operational(),
+            "{owner:?}: J7-only stale carry-over must NOT latch CAN_TX_STALLED: {:?}",
+            rig_j7.inner().safety.fault()
+        );
+        assert!(j7_pf_frames(&rig_j7.bus.tx_log()).is_empty());
+
+        // (b) Mixed-queue negative control (J6 + stale J7): J6 genuine expiry MUST latch CAN_TX_STALLED.
+        let b5 = TxBudget { max_frames: 5, max_duration: ms(10), frame_max_age: ms(45) };
+        let mut rig_mix = DualRig::new_pos_force(owner, base_cfg(), Some(b5));
+        rig_mix.step(); // Sends J1-J5, defers J6 + J7.
+        assert!(rig_mix.inner().safety.state().is_operational());
+        rig_mix.bus.with(|s| s.motors[6].mute_feedback = true);
+        rig_mix.clock.advance(ms(105));
+        rig_mix.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_mix.step_dt(DT, false);
+        assert_eq!(
+            rig_mix.inner().safety.fault_code(),
+            Some(FaultCode::CanTxStalled),
+            "{owner:?}: genuine J6 FIFO expiry in mixed queue must still latch CAN_TX_STALLED"
+        );
+
+        // (c) Mid-batch clock crossing 100 ms during frame construction/submission.
+        let mut rig_mid = DualRig::new_pos_force(owner, base_cfg(), None);
+        rig_mid.step(); // fresh J7 at t = t0
+        rig_mid.bus.with(|s| {
+            s.motors[6].mute_feedback = true;
+            s.tx_step = ms(1);
+        });
+        rig_mid.clock.advance(ms(99));
+        rig_mid.bus.clear_log();
+        rig_mid.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig_mid.step_dt(DT, false);
+        let mid_log = rig_mid.bus.tx_log();
+        assert!(
+            rig_mid.inner().safety.state().is_operational(),
+            "{owner:?}: mid-batch J7 crossing 100 ms must not fault: {:?}",
+            rig_mid.inner().safety.fault()
+        );
+        assert!(j7_pf_frames(&mid_log).is_empty(), "{owner:?}: emitted 0x307 after mid-batch expiry: {mid_log:?}");
+        for id in 1u32..=6 {
+            assert!(mid_log.iter().any(|f| f.id == 0x100 + id), "{owner:?}: J{id} missing on mid-batch tick");
+        }
+        assert!(!j7_refresh_frames(&mid_log).is_empty(), "{owner:?}: expected 0xCC refresh on mid-batch tick");
+    }
+}
+
+/// Item 1 + Item 4 (Scenario 2 + configurable 450 ms + absent queue_bound + > 500 ms BUS_LOSS +
+/// arm-joint loss negative control + macro terminal code + atomic live `clear_fault`):
+/// - J7 stale 300 ms (default 250 ms limit) latches recoverable `J7_FEEDBACK_STALE`, terminates
+///   running motion AND running macro with exact `"J7_FEEDBACK_STALE"` code, keeps J1-J6 holding
+///   with stable epoch, refuses `clear_fault` while J7 is stale (including live expiry before
+///   commit with zero mutation to `is_torqued` / limits), and recovers cleanly once J7 is fresh.
+/// - Configurable `450 ms` stays operational through 420 ms and latches recoverable
+///   `J7_FEEDBACK_STALE` by 460 ms (<= 500 ms).
+/// - Complete CAN silence > 500 ms STILL latches non-recoverable `BUS_LOSS` (unchanged).
+/// - Arm-joint J1 silence latches `BUS_LOSS`, never `J7_FEEDBACK_STALE`.
+/// - Recent J7 RX with frozen/stale queue-bound bounds staleness to recoverable `J7_FEEDBACK_STALE`
+///   without triggering `BUS_LOSS`.
+#[test]
+fn dual_owner_pos_force_sustained_300ms_staleness_recoverable_j7_fault_macro_and_atomic_clear() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // (a) Default 250 ms limit: 300 ms stale J7 during running motion -> recoverable J7_FEEDBACK_STALE.
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        let ep = rig.inner().safety.epoch_id();
+        let (_, jog_id, _) = rig
+            .inner_mut()
+            .jog_action(vec![0.3, -0.2, 0.0, 0.0, 0.0, 0.0, -1.0], Some(0.3), Some(ep), "joint_move")
+            .expect("start motion");
+        rig.step();
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+
+        // Stay below 250 ms (220 ms): still operational, 0 faults.
+        for _ in 0..11 {
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            assert!(
+                rig.inner().safety.state().is_operational(),
+                "{owner:?}: must not fault before 250 ms: {:?}",
+                rig.inner().safety.fault()
+            );
+        }
+        // Push past 250 ms (to ~300 ms total): latches recoverable J7_FEEDBACK_STALE.
+        for _ in 0..4 {
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+        }
+        assert_eq!(
+            rig.inner().safety.fault_code(),
+            Some(FaultCode::J7FeedbackStale),
+            "{owner:?}: 300 ms J7 staleness must latch J7_FEEDBACK_STALE"
+        );
+        assert_eq!(*rig.inner().safety.state(), SafetyState::Fault(FaultReason::J7FeedbackStale));
+        assert!(rig.inner().safety.recoverable(), "{owner:?}: J7_FEEDBACK_STALE must be recoverable");
+        assert!(!rig.inner().output_suspended, "{owner:?}: J1-J6 output must stay active while <= 500 ms");
+        let act = rig.inner().last_action.as_ref().expect("terminated action");
+        assert_eq!(act.id, jog_id);
+        assert_eq!(act.state, "failed");
+        assert_eq!(act.code.as_deref(), Some("J7_FEEDBACK_STALE"));
+        assert_eq!(
+            rig.inner().action_outcome(armd::rt_core::broker::ActionId(jog_id)),
+            Some(armd::rt_core::broker::Outcome::Failed("J7_FEEDBACK_STALE"))
+        );
+
+        // Subsequent stale ticks (still <= 440 ms < 500 ms BUS_LOSS): epoch stays stable, J1-J6 hold.
+        let latched_ep = rig.inner().safety.epoch_id();
+        rig.bus.clear_log();
+        for _ in 0..3 {
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            assert_eq!(rig.inner().safety.epoch_id(), latched_ep, "{owner:?}: epoch must stay stable");
+            assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+        }
+        let hold_log = rig.bus.tx_log();
+        for id in 1u32..=6 {
+            assert!(hold_log.iter().any(|f| f.id == 0x100 + id), "{owner:?}: J{id} hold stopped during J7_FEEDBACK_STALE");
+        }
+        assert!(j7_pf_frames(&hold_log).is_empty());
+
+        // Clear refused while J7 is STILL stale (> 100 ms), leaving `is_torqued` and `limits` unchanged.
+        let prev_torqued = rig.inner().is_torqued;
+        let prev_limits = rig.inner().config.limits.clone();
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(err.contains("J7") || err.contains("feedback"), "{err}");
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert_eq!(
+                    err,
+                    armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::J7FeedbackStale)
+                );
+            }
+        }
+        assert_eq!(rig.inner().is_torqued, prev_torqued);
+        assert_eq!(rig.inner().config.limits, prev_limits);
+        assert_eq!(rig.inner().safety.epoch_id(), latched_ep);
+
+        // Live refusal when J7 was fresh then crosses 100 ms (150 ms, still <= 250 ms bus-fresh):
+        // verify ZERO preflight commits across torque, limits, epoch, feedback publication, AND
+        // thermal cooldown!
+        rig.inner_mut().thermal_cooldown_duration = ms(80);
+        rig.bus.with(|s| {
+            s.motors[6].mute_feedback = false;
+            for m in &mut s.motors {
+                m.temperature_c = 40;
+            }
+            s.push_all_feedback();
+        });
+        rig.step(); // J7 becomes fresh
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+        // Move J1 position on the bus to a distinct value so any premature Legacy feedback
+        // publication on a refused clear is caught immediately.
+        let prev_measured = rig.inner().measured_positions.clone();
+        let prev_velocities = rig.inner().measured_velocities.clone();
+        let prev_fb_valid = rig.inner().feedback_numeric_valid;
+        let prev_last_fb_inst = rig.inner().last_can_feedback_instant;
+        let prev_limits_snap: Vec<(f32, f32)> = rig
+            .inner()
+            .config
+            .limits
+            .iter()
+            .map(|l| (l.min_position, l.max_position))
+            .collect();
+        rig.clock.advance(ms(140));
+        rig.bus.with(|s| {
+            s.motors[0].q = prev_measured[0] + 0.25;
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+        });
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(err.contains("J7") || err.contains("feedback"), "{err}");
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert_eq!(
+                    err,
+                    armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::J7FeedbackStale)
+                );
+            }
+        }
+        assert_eq!(rig.inner().is_torqued, prev_torqued);
+        assert_eq!(rig.inner().safety.epoch_id(), latched_ep);
+        assert_eq!(
+            rig.inner().measured_positions,
+            prev_measured,
+            "{owner:?}: refused stale-J7 clear must NOT publish sampled feedback positions"
+        );
+        assert_eq!(rig.inner().measured_velocities, prev_velocities);
+        assert_eq!(rig.inner().feedback_numeric_valid, prev_fb_valid);
+        assert_eq!(rig.inner().last_can_feedback_instant, prev_last_fb_inst);
+        let after_limits_snap: Vec<(f32, f32)> = rig
+            .inner()
+            .config
+            .limits
+            .iter()
+            .map(|l| (l.min_position, l.max_position))
+            .collect();
+        assert_eq!(after_limits_snap, prev_limits_snap);
+
+        // Prove thermal cooldown was NOT started/committed during the refused J7 clear:
+        // start warm (72 C: above 70 C cool threshold so thermal_cooldown resets, below 75 C trip
+        // threshold so only J7FeedbackStale is latched), cool to 40 C at t = 140 ms during a
+        // refused stale-J7 clear, then advance 100 ms (>= 80 ms cooldown!) with fresh cool J1–J7
+        // feedback and latch ThermalTrip: dwell MUST be 0 ms (not 100 ms -> Ok(Idle))!
+        {
+            let mut probe_rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            probe_rig.inner_mut().thermal_cooldown_duration = ms(80);
+            // Warm sample (above `max_temperature - 5 C` cool threshold, strictly below `max_temperature`
+            // trip threshold) resets thermal_cooldown cleanly without latching ThermalTrip.
+            let warm_c = (probe_rig.inner().config.max_temperature - 2.0).floor() as u8;
+            probe_rig.bus.with(|s| {
+                s.motors[0].temperature_c = warm_c;
+                s.push_all_feedback();
+            });
+            probe_rig.step();
+            assert!(
+                probe_rig.inner().safety.state().is_operational(),
+                "warm sample {warm_c} C must not latch ThermalTrip"
+            );
+            probe_rig.inner_mut().safety.latch(
+                armd::safety::FaultKind::J7FeedbackStale,
+                armd::safety::FaultDetail::J7FeedbackStale(None),
+            );
+            // Cool down to 40 C while J7 is aged 140 ms (stale > 100 ms, still <= 250 ms bus-fresh).
+            probe_rig.bus.with(|s| {
+                s.motors[6].mute_feedback = true;
+                for m in &mut s.motors {
+                    m.temperature_c = 40;
+                }
+            });
+            probe_rig.clock.advance(ms(140));
+            probe_rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            if owner == Owner::Executor {
+                // Directly read into driver without calling poll_hardware (which updates cooldown on ticks)
+                probe_rig.inner().driver.as_ref().unwrap().lock().unwrap().read_joint_states().unwrap();
+                probe_rig.inner_mut().temperatures.fill(40.0);
+            }
+            // Refused stale-J7 clear MUST NOT record cooldown timestamp!
+            match &mut probe_rig.owner {
+                RigOwner::Legacy(inner) => {
+                    let err = inner.clear_fault().unwrap_err().to_string();
+                    assert!(err.contains("J7"), "{err}");
+                }
+                RigOwner::Executor { fx, .. } => {
+                    let dl = armd::transport::DriverClock::now(&probe_rig.clock) + ms(200);
+                    assert_eq!(
+                        fx.core.clear_fault_executor_bounded(dl).unwrap_err(),
+                        armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::J7FeedbackStale)
+                    );
+                }
+            }
+            // Advance 100 ms (>= 80 ms cooldown required), push fresh cool J1–J7 feedback, and
+            // latch ThermalTrip: elapsed dwell MUST be 0 ms (had the refused J7 clear committed
+            // `thermal_cooldown`, dwell would be 100 ms >= 80 ms and clear would succeed!).
+            probe_rig.clock.advance(ms(100));
+            probe_rig.bus.with(|s| {
+                s.motors[6].mute_feedback = false;
+                s.push_all_feedback();
+            });
+            if owner == Owner::Executor {
+                probe_rig.inner().driver.as_ref().unwrap().lock().unwrap().read_joint_states().unwrap();
+            }
+            probe_rig.inner_mut().safety.latch(
+                armd::safety::FaultKind::ThermalTrip,
+                armd::safety::FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 },
+            );
+            match &mut probe_rig.owner {
+                RigOwner::Legacy(inner) => {
+                    let err = inner.clear_fault().unwrap_err().to_string();
+                    assert!(
+                        err.contains("0 ms of 80 ms"),
+                        "Legacy refused J7 clear must not have started thermal cooldown: {err}"
+                    );
+                }
+                RigOwner::Executor { fx, .. } => {
+                    let dl = armd::transport::DriverClock::now(&probe_rig.clock) + ms(200);
+                    assert_eq!(
+                        fx.core.clear_fault_executor_bounded(dl).unwrap_err(),
+                        armd::safety::ClearFaultError::Rejected(
+                            armd::safety::ClearRefusal::ThermalCooldownNotElapsed {
+                                elapsed_ms: 0,
+                                required_ms: 80,
+                            }
+                        ),
+                        "Executor refused J7 clear must not have started thermal cooldown"
+                    );
+                }
+            }
+        }
+        // Restore motor 0 position before continuing recovery check.
+        rig.bus.with(|s| {
+            s.motors[0].q = prev_measured[0];
+        });
+
+        // Fresh J7 feedback returns (<= 100 ms across an empty-RX boundary) -> clear_fault + torque_on recover!
+        rig.bus.with(|s| {
+            s.motors[6].mute_feedback = false;
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        rig.step(); // establishes fresh empty-RX boundary
+        rig.step(); // decodes post-boundary J7 sample with queue_bound <= 20 ms
+        rig.clear_fault_and_enable();
+        rig.bus.with(|s| s.immediate_replies = false);
+        assert!(rig.inner().safety.state().is_operational());
+
+        // (a2) Running macro (`MacroRun`) gets exact terminal code `"J7_FEEDBACK_STALE"`.
+        let ep2 = rig.inner().safety.epoch_id();
+        let macro_id = rig
+            .inner_mut()
+            .begin_sequence_action(Some("test-macro".into()), ep2)
+            .expect("begin macro");
+        assert!(rig.inner().macro_run.is_some());
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+        for _ in 0..16 {
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            if rig.inner().safety.fault_code() == Some(FaultCode::J7FeedbackStale) {
+                break;
+            }
+        }
+        assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+        assert!(rig.inner().macro_run.is_none(), "{owner:?}: MacroRun must be retired on J7_FEEDBACK_STALE");
+        assert_eq!(
+            rig.inner().action_outcome(armd::rt_core::broker::ActionId(macro_id)),
+            Some(armd::rt_core::broker::Outcome::Failed("J7_FEEDBACK_STALE"))
+        );
+
+        // (b) Configurable 450 ms limit: 420 ms operational, 460 ms latches recoverable J7_FEEDBACK_STALE,
+        //     and (c) past 500 ms complete silence STILL escalates to non-recoverable BUS_LOSS!
+        let mut cfg450 = base_cfg();
+        cfg450.damiao_gripper.as_mut().unwrap().feedback_stale_fault_ms = Some(450);
+        let mut rig450 = DualRig::new_pos_force(owner, cfg450, None);
+        rig450.bus.with(|s| s.motors[6].mute_feedback = true);
+        for _ in 0..21 {
+            // 420 ms < 450 ms
+            rig450.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig450.step_dt(DT, false);
+            assert!(rig450.inner().safety.state().is_operational(), "{owner:?}: 450 ms config faulted early");
+        }
+        for _ in 0..3 {
+            // 460 ms >= 450 ms, still <= 500 ms BUS_LOSS_TIMEOUT
+            rig450.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig450.step_dt(DT, false);
+        }
+        assert_eq!(rig450.inner().safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+        assert!(rig450.inner().safety.recoverable());
+        // Continue past 500 ms complete silence (540 ms) -> BUS_LOSS unchanged!
+        for _ in 0..4 {
+            rig450.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig450.step_dt(DT, false);
+        }
+        assert_eq!(
+            rig450.inner().safety.fault_code(),
+            Some(FaultCode::BusLoss),
+            "{owner:?}: > 500 ms complete CAN silence must still latch BUS_LOSS"
+        );
+        assert!(!rig450.inner().safety.recoverable());
+
+        // (d) Arm-joint J1 silence negative control: never latches J7_FEEDBACK_STALE; latches BUS_LOSS > 500 ms.
+        let mut rig_arm = DualRig::new_pos_force(owner, base_cfg(), None);
+        rig_arm.bus.with(|s| s.motors[0].mute_feedback = true);
+        for _ in 0..16 {
+            // 320 ms: J7 is fresh, J1 is silent -> neither J7_FEEDBACK_STALE nor BUS_LOSS yet.
+            rig_arm.bus.with(|s| for i in 1..7 { s.push_feedback(i); });
+            rig_arm.step_dt(DT, false);
+            assert_ne!(rig_arm.inner().safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+        }
+        for _ in 0..12 {
+            rig_arm.bus.with(|s| for i in 1..7 { s.push_feedback(i); });
+            rig_arm.step_dt(DT, false);
+        }
+        assert_eq!(rig_arm.inner().safety.fault_code(), Some(FaultCode::BusLoss));
+
+        // (e) Continuous saturated RX (queue never empties so J7 `rx_at` stays <= 20 ms fresh and
+        //     `bus_feedback_fresh == true`, while `feedback_queue_bound[J7]` stays stuck old):
+        //     bounded by `feedback_stale_fault_ms` -> latches recoverable J7_FEEDBACK_STALE without BUS_LOSS.
+        let mut rig_sat = DualRig::new_pos_force(owner, base_cfg(), None);
+        for _ in 0..16 {
+            // Keep RX saturated (> 260 frames) so receive_feedback hits its cap without observing
+            // an empty queue, refreshing `last_feedback_instant` while `queue_bound` stays stale.
+            rig_sat.bus.with(|s| {
+                for _ in 0..45 {
+                    s.push_all_feedback();
+                }
+            });
+            rig_sat.step_dt(DT, false);
+        }
+        assert_eq!(
+            rig_sat.inner().safety.fault_code(),
+            Some(FaultCode::J7FeedbackStale),
+            "{owner:?}: stale queue-bound with fresh RX must latch recoverable J7_FEEDBACK_STALE"
+        );
+        assert!(rig_sat.inner().safety.recoverable());
+        assert_ne!(rig_sat.inner().safety.fault_code(), Some(FaultCode::BusLoss));
+    }
+}
+
+/// Item 2 + Item 4 (Scenario 3 + expired-plus-new replacement + dual-slot independent progress):
+/// - Stopped hold with 0 queued frames and stale J7 -> NEVER latches `CAN_TX_STALLED`.
+/// - Expired-plus-new hold replacement on healthy bus -> NO instant false `CAN_TX_STALLED`.
+/// - Dual-slot joint (uncertain mode emitting `0x101` + `0x001`): slot 0 succeeds (`sent_any = true`)
+///   while slot 1 hits persistent backpressure (`backpressure_tx_ids = [0x001]`): latches
+///   `CAN_TX_STALLED` once slot 1 stays queued >= `max_age` at BOTH 50 Hz and slow 90 ms cadence.
+#[test]
+fn dual_owner_stopped_hold_zero_queued_stale_j7_and_dual_slot_backlog() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // (a) Task Scenario 3: stopped hold with 0 queued frames and stale J7 -> NEVER CAN_TX_STALLED.
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        rig.inner_mut()
+            .safety
+            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("stopped hold stale J7".into()));
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+        for tick in 0..16 {
+            // 16 normal 20 ms ticks = 320 ms: J1-J6 stay fresh (queue_bound <= 20 ms) while J7
+            // goes stale past 100 ms (tick 6) and latches J7_FEEDBACK_STALE past 250 ms.
+            rig.bus.clear_log();
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            assert_ne!(
+                rig.inner().safety.fault_code(),
+                Some(FaultCode::CanTxStalled),
+                "{owner:?}: stopped hold with 0 queued frames and stale J7 must NEVER latch CAN_TX_STALLED"
+            );
+            let pending_hold = rig
+                .inner()
+                .driver
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .pending_hold_tx_len();
+            assert_eq!(pending_hold, 0, "{owner:?}: expected 0 queued hold frames");
+            let log = rig.bus.tx_log();
+            if tick >= 6 {
+                assert!(j7_pf_frames(&log).is_empty(), "{owner:?}: emitted 0x307 while stale on tick {tick}");
+            }
+            for id in 1u32..=6 {
+                assert!(log.iter().any(|f| f.id == 0x100 + id), "{owner:?}: J{id} hold missing on tick {tick}");
+            }
+        }
+        // By ~320 ms total J7 staleness, Item 1 records FaultKind::J7FeedbackStale (while
+        // preserving existing equal-severity FaultCode::Other and NEVER latching CAN_TX_STALLED).
+        assert!(rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::J7FeedbackStale));
+        assert_ne!(rig.inner().safety.fault_code(), Some(FaultCode::CanTxStalled));
+
+        // (b) Expired-plus-new hold replacement (budget 4, advance 60 ms > 45 ms): no false CAN_TX_STALLED.
+        let b4 = TxBudget { max_frames: 4, max_duration: ms(10), frame_max_age: ms(45) };
+        let mut rig_rep = DualRig::new(owner, base_cfg(), Some(b4));
+        rig_rep.inner_mut()
+            .safety
+            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("expired-plus-new".into()));
+        let rep_ep = rig_rep.inner().safety.epoch_id();
+        rig_rep.step(); // Sends J1-J4, defers J5-J7.
+        rig_rep.step_dt(0.06, true); // 60 ms > 45 ms -> drops old J5-J7, stages fresh, sends J5-J7 + J1!
+        assert_eq!(rig_rep.inner().safety.epoch_id(), rep_ep);
+        assert_eq!(rig_rep.inner().safety.fault_code(), Some(FaultCode::Other));
+
+        // (c) Dual-slot joint independent progress at BOTH 50 Hz (20 ms) and slow cadence (90 ms):
+        //     slot 0 (`0x101`) sends every tick (`sent_any == true`) while slot 1 (`0x001`) hits
+        //     persistent ENOBUFS backpressure -> MUST latch `CAN_TX_STALLED` once slot 1 age >= 45 ms!
+        for step_s in [0.02f64, 0.09f64] {
+            let limits = dm_limits();
+            let clock = MockClock::new();
+            let bus = FakeBus::with_clock(&limits, clock.clone());
+            bus.with(|s| {
+                s.immediate_replies = false;
+                s.follow_commands = true;
+                s.push_all_feedback();
+            });
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(limits)
+                .unwrap();
+            drv.read_joint_states().unwrap();
+            drv.check_mapping_ranges();
+            // Trigger uncertain mode on J1 (`joint_modes[0] = None`) by dropping CTRL_MODE ack during
+            // a mode switch attempt, so stopped-hold emits BOTH `0x101` (PosVel) and `0x001` (MIT) on J1.
+            let mut inner = SupervisorInner::new(base_cfg()).with_driver(Box::new(drv));
+            inner.lease_enabled = false;
+            inner.tick(DT);
+            inner.set_torque(true).expect("arm");
+            {
+                let mut d = inner.driver.as_ref().unwrap().lock().unwrap();
+                bus.with(|s| s.motors[0].no_write_ack = true);
+                let mut modes = vec![armd::driver::JointMode::Position; 7];
+                modes[0] = armd::driver::JointMode::Mit;
+                let holds = vec![JointTarget::position(0.0); 7];
+                let _ = d.set_joint_modes(&modes, &holds);
+                bus.with(|s| s.motors[0].no_write_ack = false);
+                assert!(d.joint_modes_uncertain(), "J1 mode must be uncertain to emit dual hold slots");
+            }
+            inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("dual-slot test".into()));
+            let mut dual_rig = match owner {
+                Owner::Legacy => DualRig { owner: RigOwner::Legacy(Box::new(inner)), bus, clock },
+                Owner::Executor => {
+                    inner.rt_executor_owned = true;
+                    let (fx, broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+                        inner,
+                        BootId(91),
+                        Capacities { commands: 8, plans: 4, replies: 16 },
+                        VirtualClock::from_mock_clock(clock.clone()),
+                    );
+                    DualRig {
+                        owner: RigOwner::Executor { fx: Box::new(fx), broker: Box::new(broker), next_req: 1 },
+                        bus,
+                        clock,
+                    }
+                }
+            };
+            // Block ONLY slot 1 (`0x001`) while slot 0 (`0x101`) succeeds every tick (`sent_any == true`).
+            dual_rig.bus.with(|s| s.backpressure_tx_ids = vec![0x001]);
+            dual_rig.bus.clear_log();
+            let mut latched = false;
+            for _ in 0..8 {
+                dual_rig.step_dt(step_s, true);
+                if dual_rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
+                    latched = true;
+                    break;
+                }
+            }
+            assert!(
+                latched,
+                "{owner:?} step={step_s}s: blocked dual-slot 0x001 must latch CAN_TX_STALLED even while 0x101 sends"
+            );
+            assert!(
+                dual_rig.bus.tx_log().iter().any(|f| f.id == 0x101),
+                "{owner:?} step={step_s}s: sibling slot 0x101 must have transmitted"
+            );
+            let detail = dual_rig.inner().safety.tx_stall_detail().expect("tx_stall_detail");
+            assert!(detail.is_hold && detail.queued > 0, "{owner:?}: expected queued > 0 hold stall, got {detail:?}");
+        }
+    }
+}
+
+/// Item 3 + Item 4 (rate-limited `"Stopped hold output failed"` <= 1/s with exact suppressed
+/// counter on BOTH Legacy and Executor deferred-log paths, rapid clear/re-fault window continuity,
+/// and deferred-ring overflow retention).
+#[test]
+fn dual_owner_stopped_hold_output_failed_rate_limit_and_suppressed_counter() {
+    use std::sync::Mutex;
+
+    struct CaptureHoldErrors(Arc<Mutex<Vec<String>>>);
+    struct MsgVisitor(String);
+    impl tracing::field::Visit for MsgVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+    impl tracing::Subscriber for CaptureHoldErrors {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            *meta.level() <= tracing::Level::ERROR
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut v = MsgVisitor(String::new());
+            event.record(&mut v);
+            if v.0.contains("Stopped hold output") {
+                self.0.lock().unwrap().push(v.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new(owner, base_cfg(), None);
+        if owner == Owner::Executor {
+            rig.inner_mut().safety.set_off_thread_reclaim(true);
+        }
+        rig.inner_mut()
+            .safety
+            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("rate limit test".into()));
+        rig.inner_mut().safety.drain_log_events_off_thread();
+        rig.bus.with(|s| s.tx_error = true);
+
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sub = CaptureHoldErrors(Arc::clone(&lines));
+        tracing::subscriber::with_default(sub, || {
+            // Run 105 ticks at 20 ms = 2.1 s on driver clock:
+            // tick 0 (t=0 ms): emit #1 (suppressed = 0)
+            // ticks 1..=49 (49 ticks): suppressed
+            // tick 50 (t=1000 ms): emit #2 (suppressed = 49)
+            // ticks 51..=99 (49 ticks): suppressed
+            // tick 100 (t=2000 ms): emit #3 (suppressed = 49)
+            // ticks 101..=104 (4 ticks): suppressed (buffered = 4)
+            for _ in 0..105 {
+                rig.step();
+                if owner == Owner::Executor {
+                    rig.inner_mut().safety.drain_log_events_off_thread();
+                }
+            }
+            let captured = lines.lock().unwrap().clone();
+            assert_eq!(
+                captured.len(),
+                3,
+                "{owner:?}: expected exactly 3 error logs across 2.1 s (<= 1/s), got: {captured:?}"
+            );
+            assert!(
+                !captured[0].contains("suppressed"),
+                "{owner:?}: first log must have 0 suppressed: {}",
+                captured[0]
+            );
+            assert!(
+                captured[1].contains("suppressed 49 events"),
+                "{owner:?}: second log must report 49 suppressed: {}",
+                captured[1]
+            );
+            assert!(
+                captured[2].contains("suppressed 49 events"),
+                "{owner:?}: third log must report 49 suppressed: {}",
+                captured[2]
+            );
+            assert_eq!(rig.inner().hold_tx_error_suppressed(), 4);
+            assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::Other));
+
+            // Rapid clear / re-fault within the same 1 s window: MUST keep 1/s throttle AND
+            // preserve the buffered suppressed count (no reset on clear_fault!).
+            rig.bus.with(|s| s.tx_error = false);
+            match &mut rig.owner {
+                RigOwner::Legacy(inner) => {
+                    inner.clear_fault().expect("legacy clear");
+                }
+                RigOwner::Executor { fx, .. } => {
+                    let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                    fx.core.clear_fault_executor_bounded(dl).expect("executor clear");
+                }
+            }
+            rig.inner_mut()
+                .safety
+                .trigger_fault_coded(FaultCode::Other, FaultReason::Other("re-fault".into()));
+            rig.bus.with(|s| s.tx_error = true);
+            lines.lock().unwrap().clear();
+            // 5 more ticks (t = 2100..2180 ms, still < 3000 ms): 0 logs, suppressed increases 4 -> 9.
+            for _ in 0..5 {
+                rig.step();
+                if owner == Owner::Executor {
+                    rig.inner_mut().safety.drain_log_events_off_thread();
+                }
+            }
+            assert!(
+                lines.lock().unwrap().is_empty(),
+                "{owner:?}: rapid clear/re-fault must not bypass 1/s window: {:?}",
+                lines.lock().unwrap()
+            );
+            assert_eq!(rig.inner().hold_tx_error_suppressed(), 9);
+
+            // Advance past t = 3000 ms: next error emits with exact `suppressed 9 events`!
+            rig.clock.advance(ms(850));
+            rig.step();
+            if owner == Owner::Executor {
+                rig.inner_mut().safety.drain_log_events_off_thread();
+            }
+            let after_clear = lines.lock().unwrap().clone();
+            assert_eq!(after_clear.len(), 1, "{owner:?}: expected 1 log after 1 s elapsed: {after_clear:?}");
+            assert!(
+                after_clear[0].contains("suppressed 9 events"),
+                "{owner:?}: expected suppressed 9 events across clear/re-fault, got: {}",
+                after_clear[0]
+            );
+            assert_eq!(rig.inner().hold_tx_error_suppressed(), 0);
+
+            // Deferred-ring overflow retention (Executor path): fill SAFETY_LOG_CAPACITY with
+            // unrelated events so `log_stopped_hold_output_failed` returns false -> count retained,
+            // 0 dropped, and emitted immediately once ring drains!
+            if owner == Owner::Executor {
+                lines.lock().unwrap().clear();
+                rig.clock.advance(ms(1050));
+                for _ in 0..armd::safety::SAFETY_LOG_CAPACITY {
+                    rig.inner_mut().safety.log_gravity_comp_ramp_complete();
+                }
+                let dropped_before = rig.inner().safety.log_dropped();
+                rig.step(); // Ring full -> retains count (+1), does not drop or advance throttle!
+                assert_eq!(rig.inner().safety.log_dropped(), dropped_before);
+                assert_eq!(rig.inner().hold_tx_error_suppressed(), 1);
+                // Drain unrelated events; very next error tick retries immediately (suppressed = 1)!
+                rig.inner_mut().safety.drain_log_events_off_thread();
+                rig.step();
+                rig.inner_mut().safety.drain_log_events_off_thread();
+                let flushed = lines.lock().unwrap().clone();
+                assert_eq!(flushed.len(), 1, "expected immediate retry emit after ring drained: {flushed:?}");
+                assert!(
+                    flushed[0].contains("suppressed 1 events"),
+                    "expected retained suppressed 1 events, got: {}",
+                    flushed[0]
+                );
+                assert_eq!(rig.inner().hold_tx_error_suppressed(), 0);
+            }
+        });
+    }
+}
+
+/// Item 1 + Item 4 (gravity compensation transient & sustained J7 staleness + real_flush +
+/// stop-stamp change during J7 refresh):
+/// - Gravity comp with transient (< 250 ms) J7 loss stays Active (arm-only feedback freshness)
+///   and exits/hands back cleanly without wedging.
+/// - Gravity comp with sustained (>= 250 ms) J7 loss latches recoverable `J7_FEEDBACK_STALE` and
+///   exits gravity comp cleanly via `gravity_comp_exit_cause`.
+/// - Real-flush transport (`real_flush = true`) flushes J7 `0xCC` refresh without miscounting it
+///   as a hold frame, and a mid-refresh `StopRequests::request()` returns `EstopInhibited`.
+#[test]
+fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
+    // Part A: Gravity comp transient (< 250 ms) & sustained (>= 250 ms) J7 staleness.
+    let mut cfg = base_cfg();
+    if let Some(ref mut gc) = cfg.gravity_comp {
+        gc.ramp_in_s = 0.04;
+        gc.exit_hold_ms = 40;
+    }
+    let mut rig = DualRig::new_pos_force(Owner::Legacy, cfg, None);
+    rig.bus.with(|s| s.immediate_replies = true);
+    rig.inner_mut()
+        .enter_gravity_comp(armd::gravity_comp::GravityCompRequest::default())
+        .expect("enter gravity comp");
+    rig.bus.with(|s| s.immediate_replies = false);
+    for _ in 0..5 {
+        rig.step();
+    }
+    assert!(rig.inner().gravity_comp.is_some(), "expected active gravity comp");
+
+    // Transient 120 ms J7 loss (< 250 ms) while J1-J6 stay fresh: gravity comp stays active!
+    rig.bus.with(|s| s.motors[6].mute_feedback = true);
+    for _ in 0..6 {
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+        assert!(
+            rig.inner().safety.state().is_operational(),
+            "transient J7 staleness in gravity comp must not fault: {:?}",
+            rig.inner().safety.fault()
+        );
+        assert!(rig.inner().gravity_comp.is_some(), "transient J7 staleness must not kick out gravity comp");
+    }
+    // Exit gravity comp while J1-J6 are fresh (J7 still transiently stale, total 200 ms < 250 ms):
+    // arm-only handback must complete without wedging or faulting!
+    rig.bus.with(|s| s.immediate_replies = true);
+    rig.inner_mut().exit_gravity_comp("STOPPED", "operator exit");
+    for _ in 0..4 {
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+    }
+    assert!(rig.inner().gravity_comp.is_none(), "arm-only handback must complete without wedging on stale J7");
+    assert!(rig.inner().safety.state().is_operational(), "transient J7 loss (< 250 ms) must stay operational");
+
+    // Re-enter with fresh J7, then mute J7 >= 250 ms -> latches J7_FEEDBACK_STALE and exits cleanly.
+    rig.bus.with(|s| {
+        s.motors[6].mute_feedback = false;
+        s.push_all_feedback();
+    });
+    rig.step();
+    rig.inner_mut()
+        .enter_gravity_comp(armd::gravity_comp::GravityCompRequest::default())
+        .expect("re-enter gravity comp");
+    rig.bus.with(|s| s.immediate_replies = false);
+    for _ in 0..4 {
+        rig.step();
+    }
+    rig.bus.with(|s| s.motors[6].mute_feedback = true);
+    for _ in 0..16 {
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+    }
+    assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+    assert!(rig.inner().safety.recoverable());
+
+    // Part B: Real-flush (`real_flush = true`) & stop-stamp change during J7 0xCC refresh.
+    let limits = dm_limits();
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.motors[6].set_reg_u32(
+            armd::protocol::damiao::RID_CTRL_MODE,
+            armd::protocol::damiao::CTRL_MODE_POS_FORCE,
+        );
+        s.immediate_replies = true;
+        s.real_flush = true;
+        s.push_all_feedback();
+    });
+    let grip = armd::driver::gripper_drive_from_profile(&base_cfg()).unwrap();
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(grip)
+        .unwrap();
+    let stops = StopRequests::new();
+    drv.set_estop_gate(EstopGate::new(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    ).with_stops(stops.clone()));
+    drv.read_joint_states().unwrap();
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+    drv.set_torque(true).unwrap();
+
+    // Advance 110 ms across two RX passes with J1-J6 fresh and J7 muted so J1-J6 have
+    // queue_bound <= 10 ms (fresh) while J7 is > 100 ms stale -> stopped-hold sends J1-J6 + 0xCC.
+    bus.with(|s| s.motors[6].mute_feedback = true);
+    clock.advance(ms(100));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    drv.read_joint_states().unwrap();
+    clock.advance(ms(10));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    drv.read_joint_states().unwrap();
+    bus.clear_log();
+    drv.begin_tx_tick();
+    let holds = vec![JointTarget::position(0.0); 7];
+    assert_eq!(drv.write_estop_hold_bounded(&holds).unwrap(), TxBatchOutcome::Complete);
+    assert!(drv.last_hold_tx_sent_any(), "J1-J6 hold frames were sent and flushed");
+    assert!(!j7_refresh_frames(&bus.tx_log()).is_empty(), "0xCC refresh sent on real_flush bus");
+    assert!(j7_pf_frames(&bus.tx_log()).is_empty());
+
+    // Stop-stamp changes during J7 refresh attempt -> returns EstopInhibited!
+    let stops_trigger = stops.clone();
+    bus.with(|s| {
+        s.on_tx = Some(Arc::new(move || {
+            let _ = stops_trigger.request();
+        }));
+    });
+    drv.begin_tx_tick();
+    let err = drv.write_estop_hold_bounded(&holds).unwrap_err();
+    assert!(is_estop_inhibited(&err), "stop during refresh/hold must return EstopInhibited, got {err:?}");
+}
+
+/// Blocker 1 regression (both Legacy and RT Executor):
+/// When J7 reaches `feedback_stale_fault_ms` (250 ms) in the SAME release that a J1–J6 motion
+/// transmit fails (`TickOutput::Error`) or motion FIFO expires (`TickOutput::Expired`), the
+/// recoverable `J7_FEEDBACK_STALE` MUST NOT mask the non-recoverable `DRIVER_WRITE_FAILED` /
+/// `CAN_TX_STALLED` latch. Both conditions are recorded, the non-recoverable fault wins, and
+/// clearing still enforces fresh J7 feedback.
+#[test]
+fn dual_owner_same_release_j7_staleness_never_masks_motion_write_or_expiry_failure() {
+    use armd::safety::FaultKind;
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // (a) Same-release J7 >= 250 ms + hard motion TX write failure -> DRIVER_WRITE_FAILED wins.
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        let ep = rig.inner().safety.epoch_id();
+        rig.inner_mut()
+            .jog_action(vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], Some(0.6), Some(ep), "joint_move")
+            .expect("start motion");
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+        // Advance 11 normal ticks (220 ms < 250 ms): J7 stale-skipped, J1–J6 moving, operational.
+        for _ in 0..11 {
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            assert!(rig.inner().safety.state().is_operational(), "{owner:?}: faulted early");
+        }
+        // Advance to 260 ms (>= 250 ms threshold) AND inject hard TX error on the exact same release!
+        rig.clock.advance(ms(40));
+        rig.bus.with(|s| {
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+            s.tx_error = true;
+        });
+        rig.step_dt(DT, false);
+        assert_eq!(
+            rig.inner().safety.fault_code(),
+            Some(FaultCode::DriverWriteFailed),
+            "{owner:?}: same-release J7 staleness MUST NOT mask non-recoverable DRIVER_WRITE_FAILED"
+        );
+        assert!(!rig.inner().safety.recoverable(), "{owner:?}: combined fault must be non-recoverable");
+        assert!(rig.inner().safety.has_latched_fault_kind(FaultKind::Other));
+        assert!(rig.inner().safety.has_latched_fault_kind(FaultKind::J7FeedbackStale));
+        assert!(rig.inner().safety.has_latched_fault_code(FaultCode::DriverWriteFailed));
+        assert!(rig.inner().safety.has_latched_fault_code(FaultCode::J7FeedbackStale));
+
+        // Even with J1–J6 fresh and tx_error cleared, clear_fault still refuses while J7 is stale!
+        rig.bus.with(|s| {
+            s.tx_error = false;
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+        });
+        rig.step_dt(DT, false);
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(err.contains("J7") || err.contains("feedback"), "{err}");
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                assert_eq!(
+                    fx.core.clear_fault_executor_bounded(dl).unwrap_err(),
+                    armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::J7FeedbackStale)
+                );
+            }
+        }
+
+        // (b) Same-release J7 >= 250 ms + motion FIFO expiry -> CAN_TX_STALLED wins (non-recoverable).
+        let b4 = TxBudget { max_frames: 4, max_duration: ms(10), frame_max_age: ms(45) };
+        let mut rig_exp = DualRig::new_pos_force(owner, base_cfg(), Some(b4));
+        let ep_exp = rig_exp.inner().safety.epoch_id();
+        rig_exp
+            .inner_mut()
+            .jog_action(vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], Some(0.6), Some(ep_exp), "joint_move")
+            .expect("start motion");
+        rig_exp.bus.with(|s| s.motors[6].mute_feedback = true);
+        // Advance 11 ticks (220 ms): J1–J6 drain cleanly (budget 4 -> 2 deferred per tick, drain next tick).
+        for _ in 0..10 {
+            rig_exp.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig_exp.step_dt(DT, false);
+        }
+        // Ensure a motion frame is queued in pending_tx, then advance 50 ms (> 45 ms frame_max_age,
+        // and J7 crosses >= 250 ms) so THIS release returns `TickOutput::Expired` + J7 >= 250 ms!
+        rig_exp.bus.with(|s| {
+            s.tx_stall = true;
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+        });
+        rig_exp.step_dt(DT, false);
+        rig_exp.clock.advance(ms(55));
+        rig_exp.bus.with(|s| {
+            s.tx_stall = false;
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+        });
+        rig_exp.step_dt(DT, false);
+        assert_eq!(
+            rig_exp.inner().safety.fault_code(),
+            Some(FaultCode::CanTxStalled),
+            "{owner:?}: same-release J7 staleness MUST NOT mask non-recoverable CAN_TX_STALLED"
+        );
+        assert!(!rig_exp.inner().safety.recoverable());
+        assert!(rig_exp.inner().safety.has_latched_fault_kind(FaultKind::CanTxStalled));
+        assert!(rig_exp.inner().safety.has_latched_fault_kind(FaultKind::J7FeedbackStale));
+    }
+}
+
+/// Blocker 2 dual-owner regression (Legacy + RT Executor):
+/// Invalidating J7 verification/mode (e.g. disabling torque) after `J7_FEEDBACK_STALE` latches
+/// MUST NOT bypass the `<= 100 ms` clear check; J7 at 101..=250 ms is refused, and J7 at exact
+/// 100 ms succeeds.
+#[test]
+fn dual_owner_j7_clear_fail_closed_when_unverified_and_at_100ms_boundary() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+        for _ in 0..16 {
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            if rig.inner().safety.fault_code() == Some(FaultCode::J7FeedbackStale) {
+                break;
+            }
+        }
+        assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+
+        // Disable torque so driver invalidates active pos-force mode / verification, then deliver
+        // J7 feedback aged 150 ms (101..=250 ms, so `is_feedback_valid()` is true while J7 > 100 ms).
+        rig.bus.with(|s| {
+            s.motors[6].mute_feedback = false;
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        rig.step();
+        {
+            let mut drv = rig.inner().driver.as_ref().unwrap().lock().unwrap();
+            drv.set_torque(false).expect("disable torque");
+        }
+        rig.bus.with(|s| {
+            s.immediate_replies = false;
+            s.motors[6].mute_feedback = true;
+        });
+        rig.clock.advance(ms(140));
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(0.01, false);
+        assert!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().is_feedback_valid(),
+            "{owner:?}: general 250 ms feedback validity is true at 150 ms"
+        );
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(err.contains("J7") || err.contains("feedback"), "{owner:?}: {err}");
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                assert_eq!(
+                    fx.core.clear_fault_executor_bounded(dl).unwrap_err(),
+                    armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::J7FeedbackStale),
+                    "Executor must refuse unverified J7 at 150 ms"
+                );
+            }
+        }
+
+        // Exact inclusive 100 ms boundary -> clears cleanly!
+        rig.bus.with(|s| {
+            s.motors[6].mute_feedback = false;
+            s.push_all_feedback();
+        });
+        // Establish fresh empty-RX boundary + decode sample at t=0, then advance exact 100 ms.
+        {
+            let mut drv = rig.inner().driver.as_ref().unwrap().lock().unwrap();
+            drv.read_joint_states().unwrap();
+        }
+        rig.bus.with(|s| s.push_all_feedback());
+        if owner == Owner::Executor {
+            let now = armd::transport::DriverClock::now(&rig.clock);
+            let _ = rig.inner_mut().poll_hardware(&armd::rt_core::ops::ServiceBudget::for_release(now, now + ms(20)));
+        } else {
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().read_joint_states().unwrap();
+        }
+        rig.clock.advance(ms(100));
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                assert_eq!(inner.clear_fault().expect("exact 100 ms must clear"), SafetyState::Idle);
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                assert_eq!(
+                    fx.core.clear_fault_executor_bounded(dl).expect("exact 100 ms must clear"),
+                    SafetyState::Idle
+                );
+            }
+        }
+    }
+}
+
+/// R2 Major 2 dual-owner regression (Legacy + RT Executor):
+/// Backlog stall accounting (`CAN_TX_STALLED` transition or subsequent backlog stall tick —
+/// including suppressed RT deferred-logging ticks that emit nothing) MUST use its own throttle
+/// and NEVER suppress a genuine `"Stopped hold output failed"` hard write error on the next release.
+#[test]
+fn dual_owner_backlog_stall_diagnostic_never_suppresses_stopped_hold_output_failed() {
+    use std::sync::Mutex;
+
+    struct CaptureHoldErrors(Arc<Mutex<Vec<String>>>);
+    struct MsgVisitor(String);
+    impl tracing::field::Visit for MsgVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+    impl tracing::Subscriber for CaptureHoldErrors {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            *meta.level() <= tracing::Level::ERROR
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut v = MsgVisitor(String::new());
+            event.record(&mut v);
+            if v.0.contains("Stopped hold output") {
+                self.0.lock().unwrap().push(v.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new(owner, base_cfg(), None);
+        if owner == Owner::Executor {
+            rig.inner_mut().safety.set_off_thread_reclaim(true);
+        }
+        rig.inner_mut()
+            .safety
+            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("backlog-then-error".into()));
+        rig.inner_mut().safety.drain_log_events_off_thread();
+
+        // 1. Stall stopped-hold backlog until `CAN_TX_STALLED` latches, plus 1 extra backlog tick
+        //    (testing both transition and already-latched backlog accounting).
+        rig.bus.with(|s| s.tx_stall = true);
+        let mut stalled = false;
+        for _ in 0..8 {
+            rig.step();
+            if owner == Owner::Executor {
+                rig.inner_mut().safety.drain_log_events_off_thread();
+            }
+            if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
+                stalled = true;
+                break;
+            }
+        }
+        assert!(stalled, "{owner:?}: expected stopped-hold CAN_TX_STALLED");
+        // One more already-latched backlog tick right before the hard write error.
+        rig.step();
+        if owner == Owner::Executor {
+            rig.inner_mut().safety.drain_log_events_off_thread();
+        }
+
+        // 2. Immediately on the very next release (20 ms later, well inside 1 s!), inject a hard
+        //    write error: `"Stopped hold output failed"` MUST emit immediately (NOT suppressed)!
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sub = CaptureHoldErrors(Arc::clone(&lines));
+        tracing::subscriber::with_default(sub, || {
+            rig.bus.with(|s| {
+                s.tx_stall = false;
+                s.tx_error = true;
+            });
+            rig.step();
+            if owner == Owner::Executor {
+                rig.inner_mut().safety.drain_log_events_off_thread();
+            }
+        });
+        let captured = lines.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "{owner:?}: backlog stall must NEVER suppress immediate Stopped hold output failed: {captured:?}"
+        );
+        assert_eq!(rig.inner().hold_tx_error_suppressed(), 0);
+    }
+}
+
+/// R3 Major 2: a provably fresh J7 RX sample arriving between two stale output passes MUST start
+/// a fresh staleness episode (bound to `pf_fresh_gen`), so an earlier stale output cannot make
+/// the next stale output prematurely trip `J7_FEEDBACK_STALE` when the newest sample is < limit.
+#[test]
+fn dual_owner_fresh_j7_rx_between_two_stale_outputs_resets_staleness_episode() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        // 1. Sample #1 at t = 0; mute J7 and advance 105 ms -> first stale output (105 ms < 250 ms).
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+        rig.clock.advance(ms(105));
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+        assert!(
+            rig.inner().safety.state().is_operational(),
+            "{owner:?}: 105 ms stale must not fault yet: {:?}",
+            rig.inner().safety.fault()
+        );
+
+        // 2. At t = 240 ms, a provably fresh J7 RX sample (#2) arrives via RX poll ONLY (no
+        //    output pass observes it while fresh!), establishing a new empty-queue bound and
+        //    advancing `pf_fresh_gen`.
+        rig.clock.advance(ms(135));
+        rig.bus.with(|s| {
+            s.motors[6].mute_feedback = false;
+            s.push_all_feedback();
+        });
+        {
+            let drv = rig.inner().driver.as_ref().unwrap();
+            let mut g = drv.lock().unwrap();
+            // First poll drains/sets rx_empty_instant at t = 240 ms; second decodes bounded fresh J7.
+            let _ = g.read_joint_states().unwrap();
+            rig.bus.with(|s| s.push_all_feedback());
+            let _ = g.read_joint_states().unwrap();
+            assert!(g.pos_force_feedback_fresh(), "{owner:?}: sample #2 must be provably fresh at t=240 ms");
+        }
+        rig.bus.with(|s| s.motors[6].mute_feedback = true);
+
+        // 3. Output resumes at t = 350 ms: 110 ms since fresh sample #2 (350 ms since sample #1!).
+        //    Because sample #2 started a new episode (`pf_fresh_gen` advanced), J7 is only 110 ms
+        //    stale (< 250 ms) and MUST NOT prematurely latch `J7_FEEDBACK_STALE`!
+        rig.clock.advance(ms(110));
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+        assert!(
+            rig.inner().safety.state().is_operational(),
+            "{owner:?}: 110 ms since fresh sample #2 must NOT latch J7_FEEDBACK_STALE (old timer leaked): {:?}",
+            rig.inner().safety.fault()
+        );
+
+        // 4. Advance 150 ms more (260 ms since sample #2 >= 250 ms limit) -> NOW latches recoverable
+        //    `J7_FEEDBACK_STALE` cleanly!
+        rig.clock.advance(ms(150));
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+        assert_eq!(
+            rig.inner().safety.fault_code(),
+            Some(FaultCode::J7FeedbackStale),
+            "{owner:?}: expected J7_FEEDBACK_STALE once sample #2 exceeds 250 ms"
+        );
+        assert!(rig.inner().safety.recoverable());
+    }
+}
+
+/// R3 Major 3: on RT Executor, an authorized stop applied before Step 2 RX causes `receive_feedback`
+/// to drop older-generation holds via `drop_stopped_hold_tx`. Step 5's newly queued holds under the
+/// new stop generation MUST NOT inherit carried `hold_key_ages` from the previous stop generation.
+#[test]
+fn rt_executor_stop_generation_emptied_in_rx_never_inherits_prior_hold_backlog_age() {
+    let mut rig = DualRig::new(Owner::Executor, base_cfg(), None);
+    // Wire the executor's `StopRequests` into `core` and `drv.estop_gate` exactly like `spawn_executor`.
+    match &mut rig.owner {
+        RigOwner::Executor { fx, .. } => {
+            let stops = fx.stops().clone();
+            fx.core.attach_stop_requests(stops);
+            let gate = fx.core.estop_gate();
+            fx.core.driver.as_ref().unwrap().lock().unwrap().set_estop_gate(gate);
+        }
+        RigOwner::Legacy(_) => unreachable!(),
+    }
+    rig.inner_mut()
+        .safety
+        .trigger_fault_coded(FaultCode::Other, FaultReason::Other("stop-gen-reset".into()));
+    assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::Other));
+
+    // 1. Stall stopped-hold TX for 2 ticks (20 ms elapsed on queued hold keys, < 45 ms limit):
+    //    `CAN_TX_STALLED` must NOT latch yet, and `hold_key_ages` now holds ~20 ms of age.
+    rig.bus.with(|s| s.tx_stall = true);
+    rig.step(); // tick 1: stages keys at t0 (age 0 ms)
+    rig.step(); // tick 2: +20 ms (age 20 ms < 45 ms)
+    assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::Other));
+
+    // 2. Request an authorized stop (bumping `stop_gen`!) and advance 30 ms (> 45 ms combined with
+    //    prior 20 ms if the old age leaked!). During this release: Step 1 applies the stop, Step 2
+    //    `receive_feedback` calls `drop_stopped_hold_tx` (clearing both old holds AND old ages),
+    //    and Step 5 stages fresh holds under the new generation (age 0 ms!).
+    match &mut rig.owner {
+        RigOwner::Executor { fx, .. } => {
+            fx.stops().request();
+        }
+        RigOwner::Legacy(_) => unreachable!(),
+    }
+    rig.clock.advance(ms(30));
+    rig.bus.with(|s| s.push_all_feedback());
+    rig.step_dt(DT, false);
+    assert_eq!(
+        rig.inner().safety.fault_code(),
+        Some(FaultCode::Other),
+        "new stop generation must NOT inherit prior-generation hold backlog age and latch CAN_TX_STALLED"
+    );
+
+    // 3. Only after a genuine new >= 45 ms backlog accumulates under the new generation (3 × 20 ms
+    //    = 60 ms >= 45 ms) does `CAN_TX_STALLED` latch.
+    let mut stalled = false;
+    for _ in 0..4 {
+        rig.step();
+        if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
+            stalled = true;
+            break;
+        }
+    }
+    assert!(stalled, "genuine new >= 45 ms backlog under the new stop generation must latch CAN_TX_STALLED");
+}
+
+/// R3 Major 1: when `J7_FEEDBACK_STALE` is co-latched with `HardwareFault` and J7 feedback is
+/// stale (`> 100 ms`), BOTH Legacy `clear_fault` and RT Executor `clear_fault_executor` refuse
+/// with `J7_FEEDBACK_STALE` BEFORE issuing any physical motor fault-reset (`0xFB`) command.
+#[test]
+fn clear_fault_refuses_hardware_reset_when_j7_feedback_is_stale() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        // Latch both J7FeedbackStale and HardwareFault (motor error code 0x0B on J1), clearing any
+        // pre-fault buffered `FakeBus` replies from rig setup so `clear_fault`'s read sees live state.
+        rig.bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[0].state_override = Some(0x0B);
+            s.motors[6].mute_feedback = true;
+        });
+        rig.clock.advance(ms(260));
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+        assert!(rig.inner().safety.has_latched_fault_kind(armd::safety::FaultKind::J7FeedbackStale));
+        // Push one more live J1..J6 cycle (with J1 still at 0x0B, J7 muted) so `s.pending` has no
+        // non-fault replies and `clear_fault` observes both live HardwareFault and stale J7.
+        rig.bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            for i in 0..6 {
+                s.push_feedback(i);
+            }
+        });
+
+        rig.bus.clear_log();
+        let err = match owner {
+            Owner::Legacy => rig.inner_mut().clear_fault().unwrap_err(),
+            Owner::Executor => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                rig.inner_mut().clear_fault_executor(deadline).unwrap_err()
+            }
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("J7") || err_msg.contains("gripper") || err_msg.contains("pos-force"),
+            "{owner:?}: stale J7 must refuse before hardware fault reset: {err:?} ({err_msg})"
+        );
+        let reset_frames: Vec<_> = rig
+            .bus
+            .tx_log()
+            .into_iter()
+            .filter(|f| f.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB])
+            .collect();
+        assert!(
+            reset_frames.is_empty(),
+            "{owner:?}: must emit ZERO 0xFB hardware-reset frames when J7 is stale: {reset_frames:?}"
+        );
+    }
+}
+
+/// R3 Minor 1: unfenced J1–J6 MIT (`0x001..=0x006`) + J7 PosForce (`0x307`) dual-owner `home`
+/// regression verifying that during an 80+ ms control-loop stall all six MIT frames continue
+/// transmitting while `0x307` is absent and `0xCC` polls J7, then `0x307` resumes cleanly.
+#[test]
+fn dual_owner_mit_j1_j6_posforce_j7_80ms_stall_during_home_continues_mit_frames() {
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        // Switch J1–J6 into Damiao MIT mode while J7 remains verified `PosForce`.
+        {
+            rig.bus.with(|s| {
+                s.immediate_replies = true;
+                for m in &mut s.motors[0..6] {
+                    m.set_reg_u32(
+                        armd::protocol::damiao::RID_CTRL_MODE,
+                        armd::protocol::damiao::CTRL_MODE_MIT,
+                    );
+                }
+            });
+            let holds: Vec<armd::driver::JointTarget> = (0..7)
+                .map(|i| armd::driver::JointTarget {
+                    position: rig.inner().measured_positions[i],
+                    velocity: Some(0.0),
+                    kp: Some(40.0),
+                    kd: Some(2.0),
+                    torque: Some(0.0),
+                })
+                .collect();
+            let modes = [
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Position,
+            ];
+            let drv = rig.inner().driver.as_ref().unwrap();
+            drv.lock().unwrap().set_joint_modes(&modes, &holds).expect("switch J1–J6 to MIT");
+            rig.bus.with(|s| {
+                s.immediate_replies = false;
+                s.push_all_feedback();
+            });
+            rig.step();
+        }
+
+        let ep = rig.inner().safety.epoch_id();
+        let (_, _home_id, _) = rig
+            .inner_mut()
+            .jog_action(vec![0.0; 7], Some(0.6), Some(ep), "home")
+            .expect("start MIT+PosForce home");
+        for _ in 0..3 {
+            rig.step();
+            assert!(rig.inner().safety.state().is_operational());
+        }
+
+        // Inject 80+ ms stall (105 ms queue-bound gap): J7 > 100 ms skipped + 0xCC refresh while
+        // all six J1–J6 MIT frames (`0x001..=0x006`) transmit cleanly!
+        rig.bus.with(|s| s.push_all_feedback());
+        rig.clock.advance(ms(105));
+        rig.bus.clear_log();
+        rig.step_dt(DT, false);
+
+        assert!(
+            rig.inner().safety.state().is_operational(),
+            "{owner:?}: MIT+PosForce 80+ ms stall must not fault: {:?}",
+            rig.inner().safety.fault()
+        );
+        let stale_log = rig.bus.tx_log();
+        assert!(
+            j7_pf_frames(&stale_log).is_empty(),
+            "{owner:?}: 0x307 must be absent while J7 is stale: {:?}",
+            j7_pf_frames(&stale_log)
+        );
+        for id in 1u32..=6 {
+            assert!(
+                stale_log.iter().any(|f| f.id == id),
+                "{owner:?}: expected MIT wire frame 0x{id:03X} for J{id} while J7 skipped: {stale_log:?}"
+            );
+        }
+        assert!(
+            !j7_refresh_frames(&stale_log).is_empty(),
+            "{owner:?}: expected J7 0xCC refresh: {stale_log:?}"
+        );
+
+        // Next fresh tick: 0x307 resumes alongside J1–J6 MIT frames!
+        rig.bus.clear_log();
+        rig.step();
+        let fresh_log = rig.bus.tx_log();
+        assert!(
+            !j7_pf_frames(&fresh_log).is_empty(),
+            "{owner:?}: expected 0x307 to resume once J7 feedback is fresh"
+        );
+        for id in 1u32..=6 {
+            assert!(
+                fresh_log.iter().any(|f| f.id == id),
+                "{owner:?}: expected MIT wire frame 0x{id:03X} after J7 recovery"
+            );
+        }
     }
 }

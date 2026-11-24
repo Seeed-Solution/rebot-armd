@@ -376,7 +376,6 @@ pub(crate) enum TickOutput {
         oldest_age: Option<Duration>,
         hold_stall_age: Option<Duration>,
         is_hold: bool,
-        sent_any: bool,
         sent_mask: u64,
         pf_status: crate::driver::PosForceTxStatus,
     },
@@ -388,13 +387,11 @@ pub(crate) enum TickOutput {
         oldest_age: Option<Duration>,
         hold_stall_age: Option<Duration>,
         is_hold: bool,
-        sent_any: bool,
         pf_status: crate::driver::PosForceTxStatus,
     },
     Error {
         message: crate::mit::OutputErrorText,
         now: Instant,
-        max_age: Duration,
         is_hold: bool,
         sent_any: bool,
         pf_status: crate::driver::PosForceTxStatus,
@@ -2644,9 +2641,20 @@ impl SupervisorInner {
         }
     }
 
+    /// Number of retired `MacroRun` instances currently queued for off-thread drop.
+    pub fn retired_macro_runs_len(&self) -> usize {
+        self.retired_macro_runs.len()
+    }
+
     /// Pop one retired `MacroRun` for off-thread drop (0 alloc, 0 drop).
-    pub(crate) fn pop_retired_macro_run(&mut self) -> Option<crate::macro_action::MacroRun> {
+    pub fn pop_retired_macro_run(&mut self) -> Option<crate::macro_action::MacroRun> {
         self.retired_macro_runs.pop_front()
+    }
+
+    /// Current exact count of suppressed `"Stopped hold output failed"` log events pending the
+    /// next 1/s log window (or deferred-ring retry).
+    pub fn hold_tx_error_suppressed(&self) -> u64 {
+        self.hold_tx_error_suppressed
     }
 
     /// Return an `UnloadSettle` buffer to `unload_settle_spare` (resetting its logical state
@@ -2989,7 +2997,6 @@ impl SupervisorInner {
                 oldest_age: drv.oldest_pending_tx_age(),
                 hold_stall_age,
                 is_hold,
-                sent_any: hold_sent_any,
                 sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
                 pf_status,
             },
@@ -3001,7 +3008,6 @@ impl SupervisorInner {
                 oldest_age: drv.last_tx_expired_age(),
                 hold_stall_age,
                 is_hold,
-                sent_any: hold_sent_any,
                 pf_status,
             },
             Err(crate::driver::ArmDriverError::EstopInhibited) => {
@@ -3013,7 +3019,6 @@ impl SupervisorInner {
                 TickOutput::Error {
                     message: buf,
                     now,
-                    max_age,
                     is_hold,
                     sent_any: hold_sent_any,
                     pf_status,
@@ -3175,7 +3180,6 @@ impl SupervisorInner {
                 is_hold,
                 sent_mask,
                 pf_status,
-                ..
             } => {
                 // Classify using the pass's original motion vs stopped-hold context BEFORE
                 // `handle_j7_feedback_staleness` so a same-release J7 threshold crossing can never
@@ -3247,7 +3251,6 @@ impl SupervisorInner {
                 hold_stall_age,
                 is_hold,
                 pf_status,
-                ..
             } => {
                 // Classify using the pass's original motion vs stopped-hold context BEFORE
                 // `handle_j7_feedback_staleness` so a same-release J7 threshold crossing can never
@@ -3275,7 +3278,7 @@ impl SupervisorInner {
                 self.handle_j7_feedback_staleness(pf_status, now);
                 false
             }
-            TickOutput::Error { message, now, is_hold, sent_any, pf_status, .. } => {
+            TickOutput::Error { message, now, is_hold, sent_any, pf_status } => {
                 // Classify using the pass's original motion vs stopped-hold context BEFORE
                 // `handle_j7_feedback_staleness` so recoverable J7 staleness can never mask a
                 // non-recoverable motion `DRIVER_WRITE_FAILED` latch.
