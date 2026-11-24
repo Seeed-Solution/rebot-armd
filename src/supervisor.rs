@@ -11018,9 +11018,6 @@ impl ArmSupervisor {
         local_gen: u64,
     ) -> Option<crate::rt_core::requests::lease::LeaseOutcome> {
         use crate::rt_core::requests::lease::{install_lease_disconnect, prepare_lease_disconnect};
-        if conn.id() != 0 {
-            self.closed_bitset.mark_closed(conn.id());
-        }
         if local_gen > 0 {
             self.atomic_fenced_lease_gen
                 .fetch_max(local_gen, Ordering::SeqCst);
@@ -11030,6 +11027,9 @@ impl ArmSupervisor {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
+        }
+        if conn.id() != 0 {
+            self.closed_bitset.mark_closed(conn.id());
         }
         match self.owner_mode() {
             OWNER_EXECUTOR => {

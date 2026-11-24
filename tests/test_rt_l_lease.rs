@@ -3314,7 +3314,7 @@ async fn m1_disconnect_fences_lease_first_both_owners_and_transfer_lock_over_500
             let _ = ws1.close(None).await;
             drop(ws1);
             wait_until(Duration::from_secs(2), || {
-                sup.is_connection_fenced_closed(conn_id)
+                sup.is_connection_fenced_closed(conn_id) && sup.has_pending_disconnect_hold()
             })
             .await;
             assert!(
