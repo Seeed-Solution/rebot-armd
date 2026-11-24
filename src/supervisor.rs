@@ -778,12 +778,66 @@ pub struct SupervisorInner {
     /// `exit_hold_ms` (and stationary settle when tracking is enabled) so the mode switch runs
     /// on the next release's dedicated TX pass without bypassing the current release's cutoff.
     pub(crate) gravity_comp_handback_ready: bool,
-    /// Preallocated terminal action message buffer reused by `reconcile_action` on RT (0 alloc).
-    pub(crate) action_msg_spare: String,
+    /// Preallocated terminal action message buffers reused on RT (0 alloc / 0 free across
+    /// consecutive RT-started failures occupying both `last_action` and `previous_action`).
+    pub(crate) action_msg_spares: [Option<String>; 4],
     /// Retired `ActiveTrajectory` instances queued for off-thread drop on RT executor (0 free on RT).
     pub(crate) retired_trajectories: std::collections::VecDeque<ActiveTrajectory>,
     /// Preallocated reusable `UnloadSettle` ring returned on stop/finish (0 alloc / 0 free on RT).
     pub(crate) unload_settle_spare: Option<UnloadSettle>,
+}
+
+/// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
+/// `Option<String>` message transitions (`None <-> Some`) through `spare` so `armd-control`
+/// never allocates or drops heap strings on action start, failure, or `previous_action` expiry.
+fn sync_action_obs(
+    dst: &mut Option<ActionStatus>,
+    src: Option<&ActionStatus>,
+    spare: Option<&mut String>,
+) {
+    match (src, dst.as_mut()) {
+        (Some(s), Some(d)) => {
+            if let Some(sp) = spare {
+                match (s.message.is_some(), d.message.is_some()) {
+                    (true, false) if sp.capacity() > 0 => {
+                        d.message = Some(std::mem::take(sp));
+                    }
+                    (false, true) => {
+                        if let Some(old) = d.message.take() {
+                            if old.capacity() > sp.capacity() {
+                                *sp = old;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            d.clone_from(s);
+        }
+        (Some(s), None) => {
+            if let (Some(src_msg), Some(sp)) = (s.message.as_deref(), spare) {
+                if sp.capacity() >= src_msg.len() {
+                    let mut blank = ActionStatus::blank();
+                    blank.message = Some(std::mem::take(sp));
+                    blank.clone_from(s);
+                    *dst = Some(blank);
+                    return;
+                }
+            }
+            *dst = Some(s.clone());
+        }
+        (None, Some(d)) => {
+            if let Some(sp) = spare {
+                if let Some(old) = d.message.take() {
+                    if old.capacity() > sp.capacity() {
+                        *sp = old;
+                    }
+                }
+            }
+            *dst = None;
+        }
+        (None, None) => {}
+    }
 }
 
 /// Zero-allocation tracker of continuous thermal cooldown dwell across consecutive fresh
@@ -1210,7 +1264,12 @@ impl SupervisorInner {
             last_hold_tx_error_log: None,
             pending_deferred_done: None,
             gravity_comp_handback_ready: false,
-            action_msg_spare: String::with_capacity(256),
+            action_msg_spares: [
+                Some(String::with_capacity(256)),
+                Some(String::with_capacity(256)),
+                None,
+                None,
+            ],
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
         };
@@ -1733,33 +1792,17 @@ impl SupervisorInner {
         out.disable_pending = self.disable_pending;
         out.feedback_valid = self.hardware_feedback_fresh(Duration::from_millis(250));
         out.commanded_positions.clone_from(&self.commanded_positions);
-        if let Some(s) = spares {
-            match (&self.last_action, out.action.as_mut()) {
-                (Some(src), Some(dst)) => match (src.message.is_some(), dst.message.is_some()) {
-                    (true, false) if s.action_msg.capacity() > 0 => {
-                        dst.message = Some(std::mem::take(&mut s.action_msg));
-                    }
-                    (false, true) => {
-                        if let Some(old) = dst.message.take() {
-                            if old.capacity() > s.action_msg.capacity() {
-                                s.action_msg = old;
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                (None, Some(dst)) => {
-                    if let Some(old) = dst.message.take() {
-                        if old.capacity() > s.action_msg.capacity() {
-                            s.action_msg = old;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        out.action.clone_from(&self.last_action);
-        set_opt(&mut out.previous_action, self.previous_action.as_ref().filter(|(_, until)| timestamp < *until).map(|(a, _)| a));
+        let (action_spare, prev_action_spare) = match spares {
+            Some(s) => (Some(&mut s.action_msg), Some(&mut s.prev_action_msg)),
+            None => (None, None),
+        };
+        sync_action_obs(&mut out.action, self.last_action.as_ref(), action_spare);
+        let prev_src = self
+            .previous_action
+            .as_ref()
+            .filter(|(_, until)| timestamp < *until)
+            .map(|(a, _)| a);
+        sync_action_obs(&mut out.previous_action, prev_src, prev_action_spare);
         out.control_mode = if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position };
         self.gravity_comp_observation_into(&mut out.gravity_comp);
         match self.driver.as_ref().map(|d| d.lock()) {
@@ -2559,7 +2602,7 @@ impl SupervisorInner {
     }
 
     /// Pop one retired `ActiveTrajectory` for off-thread drop (0 alloc, 0 drop).
-    pub(crate) fn pop_retired_trajectory(&mut self) -> Option<ActiveTrajectory> {
+    pub fn pop_retired_trajectory(&mut self) -> Option<ActiveTrajectory> {
         self.retired_trajectories.pop_front()
     }
 

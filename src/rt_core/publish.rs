@@ -89,12 +89,14 @@ fn copy_into<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
 #[derive(Debug, Default)]
 pub struct ObservationSpares {
     pub action_msg: String,
+    pub prev_action_msg: String,
 }
 
 impl ObservationSpares {
     pub fn preallocated() -> Self {
         Self {
             action_msg: String::with_capacity(256),
+            prev_action_msg: String::with_capacity(256),
         }
     }
 }
@@ -228,6 +230,9 @@ impl StatePublisher {
         let slot = self.producer.back_mut();
         if spares.action_msg.capacity() > slot.spares.action_msg.capacity() {
             slot.spares.action_msg = spares.action_msg;
+        }
+        if spares.prev_action_msg.capacity() > slot.spares.prev_action_msg.capacity() {
+            slot.spares.prev_action_msg = spares.prev_action_msg;
         }
     }
 

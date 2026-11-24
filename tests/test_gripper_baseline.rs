@@ -1311,7 +1311,7 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
     // Queue must now be empty on the executor owner, and a stale-generation StoreBaseline must
     // be refused without mutating live state.
     let taken_after = handle
-        .take_baseline_pending_async(Vec::with_capacity(armd::supervisor::GRIPPER_BASELINE_PENDING_MAX), false)
+        .take_baseline_pending_async(false)
         .await
         .unwrap();
     assert!(taken_after.moves.is_empty(), "queued records were not drained: {}", taken_after.moves.len());
@@ -1322,8 +1322,9 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
         .unwrap();
     assert!(!stale_stored, "stale generation StoreBaseline must be refused");
 
-    // Verify EVERY maintenance release servicing TakeBaselinePending / StoreBaseline did 0
-    // allocations/frees on `armd-control` (measured by active `TimedAlloc` global allocator).
+    // Verify EVERY tick (including the live opening motion completion tick and EVERY maintenance
+    // release servicing TakeBaselinePending / StoreBaseline) did 0 allocations/frees on
+    // `armd-control` (measured by active `TimedAlloc` global allocator).
     tokio::time::sleep(Duration::from_millis(20)).await;
     let samples = sup.tick_samples();
     let maint_allocs: Vec<(u64, u32)> = samples
@@ -1335,6 +1336,21 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
     assert!(
         maint_allocs.iter().all(|&(_, calls)| calls == 0),
         "baseline maintenance op allocated on armd-control: {maint_allocs:?}"
+    );
+    // Verify EVERY post-warmup tick (`release_seq > 3`, after the 3 triple-buffer slots obtain
+    // their initial `ArmObservation` buffers — covering the live opening motion, its completion
+    // tick retiring `ActiveTrajectory` off-thread, and every baseline maintenance op) did 0
+    // allocations/frees on `armd-control` (measured by active `TimedAlloc` global allocator).
+    let post_warmup = samples.iter().filter(|s| s.release_seq > 3).count();
+    assert!(post_warmup >= 50, "expected >= 50 post-warmup ticks, got {post_warmup}");
+    let nonzero_ticks: Vec<(u64, u64, u32)> = samples
+        .iter()
+        .filter(|s| s.release_seq > 3 && s.usage.lock_alloc_calls != 0)
+        .map(|s| (s.release_seq, s.maint_req_id, s.usage.lock_alloc_calls))
+        .collect();
+    assert!(
+        nonzero_ticks.is_empty(),
+        "post-warmup control tick allocated/freed on armd-control (release_seq, maint_req_id, calls): {nonzero_ticks:?}"
     );
 
     // Stopping the executor causes the spawned consumer task to exit cleanly (no hang/panic).

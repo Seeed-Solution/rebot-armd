@@ -1161,9 +1161,9 @@ impl RtExecutorHandle {
 
     pub async fn take_baseline_pending_async(
         &self,
-        fresh_pending: Vec<crate::gripper_baseline::MoveRecord>,
         clear_dirty: bool,
     ) -> Result<BaselineTakeReply, OwnerError> {
+        let fresh_pending = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
         match self
             .call_maintenance_async(MaintenanceOp::TakeBaselinePending {
                 fresh_pending,

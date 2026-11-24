@@ -120,14 +120,27 @@ impl SupervisorInner {
             }
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
-                    if msg.capacity() > self.action_msg_spare.capacity() {
-                        self.action_msg_spare = msg;
-                    }
+                    self.recycle_action_msg_spare(msg);
                 }
             }
         }
-        if format_superseded_msg && self.action_msg_spare.capacity() < 256 {
-            self.action_msg_spare = String::with_capacity(256);
+        if format_superseded_msg {
+            // Off-RT start: ensure two 256-byte spares exist (matching `last_action` and
+            // `previous_action`) so back-to-back RT failures never allocate or free.
+            let ready = self
+                .action_msg_spares
+                .iter()
+                .filter(|s| s.as_ref().is_some_and(|b| b.capacity() >= 256))
+                .count();
+            for _ in ready..2 {
+                if let Some(slot) = self
+                    .action_msg_spares
+                    .iter_mut()
+                    .find(|s| s.as_ref().is_none_or(|b| b.capacity() < 256))
+                {
+                    *slot = Some(String::with_capacity(256));
+                }
+            }
         }
         self.next_action_id += 1;
         let id = self.next_action_id;
@@ -153,14 +166,73 @@ impl SupervisorInner {
         id
     }
 
+    /// Take a preallocated message buffer (`capacity >= min_cap` when available) for RT action
+    /// termination without allocating or freeing on `armd-control`. If the target action already
+    /// holds a smaller buffer, it is recycled into `action_msg_spares` before taking a spare.
+    pub(crate) fn take_action_msg_buf(&mut self, action_id: u64, min_cap: usize) -> String {
+        if let Some(existing) = self
+            .last_action
+            .as_mut()
+            .filter(|a| a.id == action_id)
+            .and_then(|a| a.message.take())
+        {
+            if existing.capacity() >= min_cap {
+                return existing;
+            }
+            self.recycle_action_msg_spare(existing);
+        }
+        if let Some(slot) = self
+            .action_msg_spares
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|b| b.capacity() >= min_cap))
+        {
+            return slot.take().unwrap_or_default();
+        }
+        let mut best_idx = None;
+        let mut best_cap = 0usize;
+        for (i, s) in self.action_msg_spares.iter().enumerate() {
+            if let Some(b) = s {
+                if b.capacity() > best_cap {
+                    best_cap = b.capacity();
+                    best_idx = Some(i);
+                }
+            }
+        }
+        best_idx.and_then(|i| self.action_msg_spares[i].take()).unwrap_or_default()
+    }
+
+    /// Return a `String` message buffer to `action_msg_spares` without freeing on `armd-control`
+    /// whenever a spare slot is free.
+    pub(crate) fn recycle_action_msg_spare(&mut self, mut msg: String) {
+        if msg.capacity() == 0 {
+            return;
+        }
+        msg.clear();
+        if let Some(slot) = self.action_msg_spares.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(msg);
+            return;
+        }
+        if let Some(min_slot) = self
+            .action_msg_spares
+            .iter_mut()
+            .min_by_key(|s| s.as_ref().map_or(0, String::capacity))
+        {
+            if min_slot.as_ref().is_none_or(|b| msg.capacity() > b.capacity()) {
+                *min_slot = Some(msg);
+            }
+        }
+    }
+
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
         let mut store_offset_req: Option<(f32, Option<(crate::auth::OperatorAuth, Option<String>)>)> = None;
+        let mut incoming_message = message;
+        let mut displaced_message: Option<String> = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.state = state.into();
             a.code = code.map(Into::into);
-            a.message = message;
+            displaced_message = std::mem::replace(&mut a.message, incoming_message.take());
             a.finished_at = Some(now);
             if state != "failed" || code != Some("WORKSPACE_VIOLATION") {
                 a.constraint_id = None;
@@ -201,6 +273,9 @@ impl SupervisorInner {
                 if code.is_some() { " " } else { "" },
                 code.unwrap_or(""),
             );
+        }
+        if let Some(unused_msg) = displaced_message.or(incoming_message) {
+            self.recycle_action_msg_spare(unused_msg);
         }
         if let Some((offset_rad, operator_auth)) = store_offset_req {
             let candidate_jaw = self.gripper_calib_jaw_opening.clone();
@@ -1346,12 +1421,7 @@ impl SupervisorInner {
             if (is_macro || is_replay) && carried { self.stop_motion(); }
             self.pending_deferred_done = None;
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
-            let mut message = self
-                .last_action
-                .as_mut()
-                .filter(|a| a.id == id)
-                .and_then(|a| a.message.take())
-                .unwrap_or_else(|| std::mem::take(&mut self.action_msg_spare));
+            let mut message = self.take_action_msg_buf(id, 256);
             message.clear();
             match cause {
                 ReconcileCause::Static(_, _, text) => message.push_str(text),
@@ -1505,7 +1575,9 @@ impl SupervisorInner {
                 } else {
                     DeferredCompletionTarget::Anonymous
                 };
-                self.active_trajectory = None;
+                if let Some(old_traj) = self.active_trajectory.take() {
+                    self.retire_active_trajectory(old_traj);
+                }
                 self.commanded_velocities.fill(0.0);
                 crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 Some(DeferredActionDone {
@@ -1526,8 +1598,8 @@ impl SupervisorInner {
                         crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
                     }
                     self.commanded_accelerations.fill(0.0);
-                } else {
-                    self.active_trajectory = None;
+                } else if let Some(old_traj) = self.active_trajectory.take() {
+                    self.retire_active_trajectory(old_traj);
                 }
                 if action_id.is_none() && self.park_release == Some(ParkRelease::Opening) {
                     tracing::warn!("Park release opening failed ({code}: {message}); skipping re-close and keeping held state");
@@ -1546,12 +1618,7 @@ impl SupervisorInner {
                         };
                     }
                 } else if let Some(id) = action_id {
-                    let mut msg = self
-                        .last_action
-                        .as_mut()
-                        .filter(|a| a.id == id)
-                        .and_then(|a| a.message.take())
-                        .unwrap_or_else(|| std::mem::take(&mut self.action_msg_spare));
+                    let mut msg = self.take_action_msg_buf(id, message.as_str().len().max(160));
                     msg.clear();
                     msg.push_str(message.as_str());
                     self.finish_action(id, "failed", Some(code), Some(msg), None, None, None);

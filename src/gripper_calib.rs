@@ -303,8 +303,7 @@ pub fn take_baseline_snapshot(inner: &mut SupervisorInner) -> Option<(PathBuf, c
 pub async fn step_baseline_persister_once(supervisor: &ArmSupervisor) -> bool {
     if let Some(handle) = supervisor.executor_handle() {
         let id = handle.baseline_identity().clone();
-        let fresh_pending = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
-        let taken = match handle.take_baseline_pending_async(fresh_pending, id.path.is_some()).await {
+        let taken = match handle.take_baseline_pending_async(id.path.is_some()).await {
             Ok(t) => t,
             Err(crate::rt_core::executor::OwnerError::Stopped) => return false,
             Err(_) => return true,
@@ -387,7 +386,17 @@ pub async fn step_baseline_persister_once(supervisor: &ArmSupervisor) -> bool {
     }
     let snapshot = take_baseline_snapshot(&mut *supervisor.inner().write().await);
     let Some((path, b)) = snapshot else { return true };
-    let text = match serde_json::to_string_pretty(&b) { Ok(t) => t, Err(_) => return true };
+    let text = match serde_json::to_string_pretty(&b) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Failed to serialize gripper baseline {}: {e}", path.display());
+            let mut inner = supervisor.inner().write().await;
+            if !inner.detached {
+                inner.gripper_baseline_dirty = true;
+            }
+            return true;
+        }
+    };
     if let Err(e) = PendingWrite::new(path.clone(), text).run().await {
         tracing::warn!("Failed to write gripper baseline {}: {e}", path.display());
         let mut inner = supervisor.inner().write().await;

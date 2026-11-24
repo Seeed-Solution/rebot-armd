@@ -1924,8 +1924,9 @@ impl GripperMotion {
             .max(self.timeout_s);
     }
 
-    /// Attach the driver's ceiling torque estimate (N·m) so uncalibrated moving-jaw grasp contact
-    /// scales with the configured motor current cap (`>= max(0.82 N·m, 0.9 * ceiling_estimate)`).
+    /// Attach the driver's ceiling torque estimate (N·m) so moving-jaw grasp contact (both
+    /// calibrated and uncalibrated) scales with the configured motor current cap
+    /// (`>= max(0.82 N·m, 0.9 * ceiling_estimate)`).
     pub fn with_ceiling_torque_estimate(mut self, ceiling_torque_estimate_nm: Option<f32>) -> Self {
         self.ceiling_torque_estimate_nm = ceiling_torque_estimate_nm.filter(|v| v.is_finite() && *v > 0.0);
         self
@@ -2786,6 +2787,28 @@ pub struct MacroMotionDiag {
 
 impl ActionStatus {
     pub fn is_running(&self) -> bool { self.state == "running" }
+
+    /// Zero-allocation empty shell used to place a preallocated string spare into
+    /// `ActionStatus::message` before `clone_from` on `armd-control`.
+    pub(crate) fn blank() -> Self {
+        Self {
+            id: 0, kind: crate::model::HolderLabel::new(""), tag: None,
+            state: crate::model::HolderLabel::new(""), code: None, message: None, progress: 0.0,
+            started_at: 0.0, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
+            task: None, phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
+            episode: None, t_s: None, power_scale: None,
+            sequence_id: None, step_index: None, step_type: None, repeat_index: None, repeats: None, failed_step: None, episodes: Vec::new(),
+            align: None, align_turn_rad: None, angle_spread_deg: None, orientation: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None, depth_anchor: None, object_depth_m: None, object_length_m: None, jaw_clear: None, border: None, border_shift_px: None, probe_mode: None, lateral_baseline_m: None, lateral_baseline_err_mm: None, height_estimates: Vec::new(), yaw_estimates: Vec::new(), width_estimates: Vec::new(),
+            recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
+            descend_contact: None, descend_contact_height_m: None, post_lift: None,
+            pre_open: None, pre_open_m: None, held_width_m: None,
+            stop_rad: None, offset_rad: None, pass: None,
+            approach: None, approach_reason: None, approach_signs: None, approach_flipped: None,
+            phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
+            constraint_id: None, geometry_id: None, violation_phase: None, reason: None,
+            durability_confirmed: None, durability_warning: None, policy_stats: None, measurement: None,
+        }
+    }
 }
 
 /// One evaluated source, reported in `ActionStatus.height_estimates` / `yaw_estimates` /
