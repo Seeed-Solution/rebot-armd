@@ -565,6 +565,12 @@ impl Normalizer {
                         return NormValue::Object(out);
                     }
                 }
+                "steps"
+                    if parent_key == Some("policy_stats")
+                        && val.as_u64().is_some_and(|n| n > 0) =>
+                {
+                    return NormValue::NormPositiveU64;
+                }
                 "expected_duration_s" if parent_ctx.is_command_ack => {
                     // Mock joint settling varies by ~3 us on Cartesian planners; quantize to 1 ms
                     // strictly on `command_ack` so any >= 1 ms drift fails.

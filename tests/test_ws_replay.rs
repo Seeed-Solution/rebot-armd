@@ -193,6 +193,34 @@ fn comparator_accepts_bijective_nondeterministic_renumbering_and_rejects_every_s
     assert!(!compare_transcripts(&ep_ok, &ep_zero).is_empty());
     assert!(!compare_transcripts(&ep_ok, &ep_float).is_empty());
 
+    // policy_stats.steps normalizes positive integer counts (2 vs 3) but rejects 0 and float.
+    let ps_2 = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action: json!({"id": 1, "state": "cancelled", "code": "STOPPED", "policy_stats": {"steps": 2, "period_us": 50000}}),
+        safety_state: json!("Idle"),
+        epoch_id: 1,
+        is_torqued: false,
+        control_mode: "position".into(),
+    }]);
+    let ps_3 = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action: json!({"id": 1, "state": "cancelled", "code": "STOPPED", "policy_stats": {"steps": 3, "period_us": 50000}}),
+        safety_state: json!("Idle"),
+        epoch_id: 1,
+        is_torqued: false,
+        control_mode: "position".into(),
+    }]);
+    let ps_0 = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action: json!({"id": 1, "state": "cancelled", "code": "STOPPED", "policy_stats": {"steps": 0, "period_us": 50000}}),
+        safety_state: json!("Idle"),
+        epoch_id: 1,
+        is_torqued: false,
+        control_mode: "position".into(),
+    }]);
+    assert!(compare_transcripts(&ps_2, &ps_3).is_empty());
+    assert!(!compare_transcripts(&ps_2, &ps_0).is_empty());
+
     // Broken epoch equality -> diff.
     let mut bad_epoch_eq = shifted.clone();
     if let RecordedEvent::ServerFrame { frame, .. } = &mut bad_epoch_eq.events[3] {
