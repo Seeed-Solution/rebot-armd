@@ -945,6 +945,7 @@ impl SupervisorInner {
     }
 
     /// Bounded, zero-allocation error from [`Self::request_disable_bounded`].
+    #[allow(clippy::result_large_err)] // inline bounded error keeps RT disable retry zero-alloc
     pub(crate) fn request_disable_bounded(&mut self) -> Result<(), RequestDisableError> {
         // a blocking disable (park, thermal trip, fault path) replaces a transition in flight
         // (the driver's disable replaces its pending enable): that transition ends SUPERSEDED
