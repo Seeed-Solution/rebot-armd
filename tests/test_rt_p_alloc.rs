@@ -135,6 +135,9 @@ struct ZeroAllocDriver {
     rx_at: Vec<Option<Instant>>,
     seqs: Vec<u64>,
     clock: Arc<ScriptedClock>,
+    reject_writes: Arc<AtomicBool>,
+    has_torque_feedback: bool,
+    pos_force_close_speed: Option<f32>,
 }
 
 impl ZeroAllocDriver {
@@ -148,6 +151,9 @@ impl ZeroAllocDriver {
             rx_at: vec![Some(now); dof],
             seqs: vec![1; dof],
             clock,
+            reject_writes: Arc::new(AtomicBool::new(false)),
+            has_torque_feedback: true,
+            pos_force_close_speed: None,
         }
     }
 }
@@ -156,7 +162,7 @@ impl ArmDriver for ZeroAllocDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities {
             velocity_feedback: true,
-            torque_feedback: true,
+            torque_feedback: self.has_torque_feedback,
             temperature_feedback: true,
             torque_feedforward: false,
             enable_feedback: true,
@@ -226,11 +232,29 @@ impl ArmDriver for ZeroAllocDriver {
         self.read_joint_states_into(out)?;
         Ok((self.dof as u16, false))
     }
+    fn gripper_pos_force_info(&self) -> Option<armd::driver::GripperPosForceInfo> {
+        self.pos_force_close_speed.map(|s| armd::driver::GripperPosForceInfo {
+            joint: 6,
+            active: true,
+            close_speed_rad_s: s,
+            ceiling_torque_estimate_nm: None,
+        })
+    }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         for (i, t) in targets.iter().enumerate().take(self.dof) {
             self.q[i] = t.position;
         }
         Ok(())
+    }
+    fn write_joint_targets_bounded(
+        &mut self,
+        targets: &[JointTarget],
+    ) -> Result<armd::driver::TxBatchOutcome, ArmDriverError> {
+        if self.reject_writes.load(Ordering::Acquire) {
+            return Ok(armd::driver::TxBatchOutcome::Deferred { pending: 1 });
+        }
+        self.write_joint_targets(targets)?;
+        Ok(armd::driver::TxBatchOutcome::Complete)
     }
     fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
         self.enabled = enable;
@@ -268,6 +292,7 @@ fn latest_snap(sup: &ArmSupervisor, dl: Instant) -> ActionSnapshot {
 async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     let clock = ScriptedClock::new();
     let drv = ZeroAllocDriver::new(&INSPECT, clock.clone());
+    let reject_writes = drv.reject_writes.clone();
     let sup = Arc::new(
         ArmSupervisor::new(ArmConfig {
             collision: None,
@@ -279,6 +304,12 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     sup.set_lease_enabled(false).await;
     {
         let mut inner = sup.inner().write().await;
+        // Major 7: seed a pre-existing held object BEFORE handover to prove clearing & re-setting
+        // a held object on RT performs strictly 0 allocs and 0 frees!
+        inner.held = Some(armd::supervisor::HeldObject {
+            label: "pre_seeded_object".into(),
+            spill_safe: true,
+        });
         inner.commanded_positions = INSPECT.to_vec();
         inner.measured_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
@@ -470,7 +501,8 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     );
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "FinishMacro(Done) must be 0-alloc");
 
-    // 6) Forced FinishMacro(Failed) during active gripper + deferred MacroFinish acceptance!
+    // 6) Forced FinishMacro(Failed) during active gripper under REJECTED bus writes + duplicate
+    //    finish -> PARENT_REPLACED + later acceptance (Blocker 2 + Major 7 pre-seeded held clear)!
     let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
     let mut begin2 = BeginMacroSpec::new(MacroKind::Place, boot);
     begin2.macro_deadline = Some(clock.now() + Duration::from_secs(10));
@@ -493,13 +525,26 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
             Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 3);
-    // Forced FinishMacro(Failed) while gripper child is running (also clears held with 0 dealloc)!
+    // Reject bus writes for 3 ticks while forced FinishMacro + duplicate FinishMacro arrive!
+    reject_writes.store(true, Ordering::Release);
     let snap = latest_snap(&sup, clock.now() + DEFAULT_FINISH_DEADLINE);
     let mut fail = FinishMacroSpec::failed(parent2, boot, "TARGET_LOST", "forced abort");
     fail.held = HeldUpdate::Clear;
     handle.broker().lock().unwrap().submit(ClientId(1), 12, snap.owner.authority, clock.now() + DEFAULT_FINISH_DEADLINE,
         Submit::Action(ActionSubmit::FinishMacro(fail))).unwrap();
-    clock.run_steps(period_ns, 5);
+    clock.run_steps(period_ns, 2);
+    // Duplicate forced finish while bus still rejecting -> PARENT_REPLACED with 0 alloc!
+    let mut dup_auth = snap.owner.authority;
+    dup_auth.parent_generation = parent2.0;
+    handle.broker().lock().unwrap().submit(ClientId(1), 13, dup_auth, clock.now() + DEFAULT_FINISH_DEADLINE,
+        Submit::Action(ActionSubmit::FinishMacro(fail))).unwrap();
+    clock.run_steps(period_ns, 2);
+    let reps_rej = drain(&handle);
+    assert!(reps_rej.iter().any(|r| matches!(r, Reply::Refused { code: "PARENT_REPLACED", .. })), "{reps_rej:?}");
+    assert!(!reps_rej.iter().any(|r| matches!(r, Reply::Terminal { .. })), "must not emit terminal while bus rejects: {reps_rej:?}");
+    // Allow bus acceptance -> terminal commits with 0 alloc and clears held with 0 free!
+    reject_writes.store(false, Ordering::Release);
+    clock.run_steps(period_ns, 3);
     let reps = drain(&handle);
     assert!(reps.iter().any(|r| matches!(r, Reply::Terminal { request, action, outcome: Outcome::Failed("TARGET_LOST"), .. } if *request == r_b2 && *action == parent2)), "{reps:?}");
     assert!(sup.hub().latest().unwrap().rt.owner.held.is_none(), "forced FinishMacro(HeldUpdate::Clear) must clear held with 0 dealloc");
@@ -508,7 +553,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
     let bad_slot = PlanSlot::default();
     let write = |dst: &mut PlanSlot| *dst = bad_slot.clone();
-    handle.broker().lock().unwrap().submit(ClientId(1), 13, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
+    handle.broker().lock().unwrap().submit(ClientId(1), 14, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
         Submit::Action(ActionSubmit::InstallPrepared {
             write: &write,
             kind: PreparedActionKind::Gripper,
@@ -524,6 +569,38 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     let reps = drain(&handle);
     assert!(reps.iter().any(|r| matches!(r, Reply::Refused { code: "WRONG_TARGET", .. })), "{reps:?}");
 
+    // 8) Major 15: qualifying gripper open + MaintenanceOp::TakeBaselinePending replenishment -> 0 alloc!
+    let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let prep_open = prepare_gripper(&snap, &json!({"command": "open", "speed": 1.0}), GripperBaselineCmd::None).unwrap();
+    let open_slot = prep_open.to_plan_slot(None).unwrap();
+    let r_open = submit_prep(15, PreparedActionKind::Gripper, open_slot, snap.owner.authority, false);
+    clock.run_steps(period_ns, 350);
+    let reps = drain(&handle);
+    assert!(reps.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == r_open)), "{reps:?}");
+    let maint_handle = handle.clone();
+    let maint_task = tokio::task::spawn_blocking(move || {
+        maint_handle.call_maintenance(armd::rt_core::executor::MaintenanceOp::TakeBaselinePending {
+            fresh_pending: Vec::with_capacity(8),
+            fresh_samples: vec![armd::gripper_baseline::MoveSamples::default(); 2],
+            clear_dirty: false,
+        })
+    });
+    // Drive the scripted clock on the main test task while the maintenance op drains on RT!
+    while !maint_task.is_finished() {
+        clock.run_steps(period_ns, 1);
+        tokio::task::yield_now().await;
+    }
+    let maint_res = maint_task.await.unwrap().expect("TakeBaselinePending must succeed");
+    match maint_res {
+        armd::rt_core::executor::MaintenanceResult::BaselineTaken(reply) => {
+            assert!(
+                !reply.moves.is_empty(),
+                "Major 15: qualifying RT gripper opening must yield baseline move records via TakeBaselinePending"
+            );
+        }
+        _ => panic!("expected BaselineTaken reply"),
+    }
+
     // Final hard B2 invariant: 0 allocs across ALL releases and sub-release wakes!
     assert_eq!(
         handle.stats().release_allocs.snapshot(),
@@ -537,4 +614,191 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     );
 
     handle.stop_and_join();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b2_pr_p_gripper_refusals_missing_torque_feedback_and_zero_quantized_speed_are_zero_alloc() {
+    // Major 6: prove strictly 0 allocs/frees on RT when:
+    // (a) driver lacks torque_feedback while max_close_torque_nm is configured -> UNSUPPORTED
+    // (b) pos_force close speed quantizes to 0 -> INVALID_COMMAND
+    let clock = ScriptedClock::new();
+    let mut drv = ZeroAllocDriver::new(&INSPECT, clock.clone());
+    drv.has_torque_feedback = false;
+    let mut cfg = ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    if let Some(gp) = cfg.gripper_policy.as_mut() {
+        gp.max_close_torque_nm = Some(2.0);
+    }
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        inner.tick(0.02);
+    }
+    let period_ns = 20_000_000u64;
+    let mut ec = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
+    ec.alloc_timing = true;
+    let handle = sup
+        .start_executor_with_hooks(
+            ec,
+            PersistTestHooks {
+                clock: Some(clock.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let boot = handle.boot();
+    clock.run_steps(period_ns, 2);
+
+    // (a) Standalone RT gripper close with missing torque feedback -> UNSUPPORTED, 0 alloc!
+    let snap = latest_snap(&sup, clock.now() + DEFAULT_ACTION_DEADLINE);
+    let mut s_arr = [0.0f32; MAX_DOF];
+    s_arr[..snap.commanded_positions.len()].copy_from_slice(&snap.commanded_positions);
+    let mut slot = PlanSlot::default();
+    slot.set(Primitive::Action(StagedAction::Gripper {
+        child: None,
+        dof: snap.commanded_positions.len() as u8,
+        start: s_arr,
+        command: armd::rt_core::requests::actions::GripperCommandKind::Close,
+        fraction: None,
+        grasp: true,
+        speed: 0.5,
+        timeout_s: Some(4.0),
+        max_budget_s: None,
+        extend_pos_force_close_timeout: false,
+        speed_scale: None,
+    }));
+    let w = |dst: &mut PlanSlot| *dst = slot.clone();
+    let r_a = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            1,
+            snap.owner.authority,
+            clock.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w,
+                kind: PreparedActionKind::Gripper,
+                prepared_boot: boot,
+                admission_request_id: 0,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    clock.run_steps(period_ns, 2);
+    let reps = drain(&handle);
+    assert!(
+        reps.iter().any(|r| matches!(r, Reply::Refused { request, code: "UNSUPPORTED" } if *request == r_a)),
+        "expected UNSUPPORTED for missing torque feedback, got {reps:?}"
+    );
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    handle.stop_and_join();
+
+    // (b) Pos-force close speed quantizing to zero -> INVALID_COMMAND, 0 alloc!
+    let clock2 = ScriptedClock::new();
+    let mut drv2 = ZeroAllocDriver::new(&INSPECT, clock2.clone());
+    drv2.pos_force_close_speed = Some(0.5);
+    let mut cfg2 = ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    cfg2.damiao_gripper = Some(armd::model::DamiaoGripperDrive {
+        mode: armd::model::DamiaoGripperMode::PosForce,
+        current_ceiling_raw: 1000,
+        close_speed_rad_s: 0.5,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    });
+    let sup2 = Arc::new(ArmSupervisor::new(cfg2).with_driver(Box::new(drv2)));
+    sup2.set_lease_enabled(false).await;
+    {
+        let mut inner = sup2.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        inner.tick(0.02);
+    }
+    let mut ec2 = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
+    ec2.alloc_timing = true;
+    let handle2 = sup2
+        .start_executor_with_hooks(
+            ec2,
+            PersistTestHooks {
+                clock: Some(clock2.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let boot2 = handle2.boot();
+    clock2.run_steps(period_ns, 2);
+    let snap2 = latest_snap(&sup2, clock2.now() + DEFAULT_ACTION_DEADLINE);
+    let mut s_arr2 = [0.0f32; MAX_DOF];
+    s_arr2[..snap2.commanded_positions.len()].copy_from_slice(&snap2.commanded_positions);
+    let mut slot2 = PlanSlot::default();
+    slot2.set(Primitive::Action(StagedAction::Gripper {
+        child: None,
+        dof: snap2.commanded_positions.len() as u8,
+        start: s_arr2,
+        command: armd::rt_core::requests::actions::GripperCommandKind::Close,
+        fraction: None,
+        grasp: true,
+        speed: 1e-6, // quantizes to 0 on Damiao pos_force wire!
+        timeout_s: Some(4.0),
+        max_budget_s: None,
+        extend_pos_force_close_timeout: false,
+        speed_scale: None,
+    }));
+    let w2 = |dst: &mut PlanSlot| *dst = slot2.clone();
+    let r_b = handle2
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(
+            ClientId(1),
+            1,
+            snap2.owner.authority,
+            clock2.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w2,
+                kind: PreparedActionKind::Gripper,
+                prepared_boot: boot2,
+                admission_request_id: 0,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    clock2.run_steps(period_ns, 2);
+    let reps2 = drain(&handle2);
+    assert!(
+        reps2.iter().any(|r| matches!(r, Reply::Refused { request, code: "INVALID_COMMAND" } if *request == r_b)),
+        "expected INVALID_COMMAND for 0-quantized pos_force close speed, got {reps2:?}"
+    );
+    assert_eq!(handle2.stats().total_allocs(), AllocCounts::ZERO);
+    handle2.stop_and_join();
 }

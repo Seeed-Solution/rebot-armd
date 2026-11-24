@@ -1423,3 +1423,1667 @@ fn a7_grasp_select_phase_a_live_refusal_and_phase_b_macro_hook() {
     assert!(matches!(fx.step().command, Some((req, Ok(_))) if req == r));
     assert!(fx.active().is_some());
 }
+
+// ============================================================================
+// Independent Review Coverage Tests (Blockers 1-3, Majors 1-15, Minors 1-2)
+// ============================================================================
+
+#[test]
+fn review_b1_descent_rules_refuse_table_violation_on_direct_and_fitted_final_leg() {
+    use armd::backlash::{DescentRules, Pre, Request as BacklashRequest};
+    use armd::motion::{plan_cartesian_opts, resolve_goal_opts, PathOpts};
+    use armd::rt_core::requests::actions::resolve_cartesian_legs_with_rules;
+
+    let (fx, _b, _clock, _stop) = fixture();
+    let snap = snap_of(&fx);
+    let input = snap.plan_input_in(GoalFrame::Tcp).unwrap();
+    let start_tcp = armd::motion::start_pose(&input);
+    let goal_p = [start_tcp.p[0], start_tcp.p[1], start_tcp.p[2] - 0.04];
+    let (goal, opts) = resolve_goal_opts(
+        &input,
+        &GoalSpec::Absolute {
+            p: goal_p,
+            r: None,
+        },
+    );
+    let direct = plan_cartesian_opts(&input, goal, Speed::default(), PathOpts::from(opts)).unwrap();
+    let end_tcp_z = input
+        .arm
+        .fk_f32(direct.last_slice())
+        .map(|e| armd::motion::end_to_tcp(&e, &input.tcp_offset).p[2])
+        .unwrap();
+    let start_tcp_z = start_tcp.p[2];
+    assert!(end_tcp_z < start_tcp_z - 0.02);
+
+    // 1) Direct path crossing DescentRules::table MUST be rejected with WorkspaceViolation
+    //    (even when Pre::Off or Pre::Direct!).
+    let bound_above_end = end_tcp_z + 0.015;
+    let strict_rules = DescentRules {
+        table: Some((vec![input.tcp_offset], bound_above_end)),
+        ..DescentRules::tcp_at(input.tcp_offset)
+    };
+    let err_off = resolve_cartesian_legs_with_rules(
+        &input,
+        &snap.env.config.limits,
+        direct.clone(),
+        Pre::Off,
+        None,
+        Some(&strict_rules),
+        false,
+        false,
+    )
+    .expect_err("direct path descending below rules.table must be refused");
+    assert!(
+        matches!(err_off, armd::ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })),
+        "expected WorkspaceViolation, got {err_off:?}"
+    );
+
+    let err_direct = resolve_cartesian_legs_with_rules(
+        &input,
+        &snap.env.config.limits,
+        direct.clone(),
+        Pre::Direct("request".into()),
+        None,
+        Some(&strict_rules),
+        false,
+        false,
+    )
+    .expect_err("Pre::Direct fallback crossing rules.table must be refused");
+    assert!(
+        matches!(err_direct, armd::ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })),
+        "expected WorkspaceViolation, got {err_direct:?}"
+    );
+
+    // 2) Pre::Ready whose fitted final quintic violates table clearance:
+    //    build a same-side plan, then construct a table bound that passes `direct` (start and end
+    //    are both above `bound`), while a synthetic pre-target dips a tool point below `bound` on
+    //    the fitted quintic leg -> selector MUST NOT return the violating quintic leg!
+    let plan = snap
+        .env
+        .approach_plan("place_final", BacklashRequest::SameSide)
+        .expect("same_side approach plan");
+    let pre = armd::backlash::plan_cartesian_pre(
+        &input,
+        &direct,
+        &plan,
+        Some(&DescentRules::tcp_at(input.tcp_offset)),
+        Speed::default(),
+        opts,
+    );
+    let Pre::Ready(mut cp) = pre else {
+        panic!("expected Pre::Ready for same_side test move, got {pre:?}");
+    };
+    // Perturb the final quintic target slightly downward in J2/J3 via a second tool corner
+    // so `direct` stays above `bound` while the fitted quintic dips below `bound`.
+    let corner_point = [0.0, 0.0, -0.05];
+    let direct_min_z = direct
+        .q
+        .iter()
+        .filter_map(|q| input.arm.fk_f32(q).map(|e| e.transform_point(&corner_point)[2]))
+        .fold(f64::INFINITY, f64::min);
+    // Make cp.path end at a joint config where corner_point is strictly lower than direct_min_z.
+    let mut dipped_end = cp.path.last_slice().to_vec();
+    dipped_end[1] += 0.25;
+    let dipped_z = input
+        .arm
+        .fk_f32(&dipped_end)
+        .map(|e| e.transform_point(&corner_point)[2])
+        .unwrap();
+    let bound = direct_min_z - 1e-4;
+    if dipped_z < bound - 1e-4 {
+        let mut last = [0.0f32; 7];
+        last[..dipped_end.len()].copy_from_slice(&dipped_end);
+        cp.path.q.push(last);
+        cp.path.s.push(1.0);
+        let rules_clear_direct = DescentRules {
+            table: Some((vec![corner_point], bound)),
+            ..DescentRules::tcp_at(input.tcp_offset)
+        };
+        let resolved = resolve_cartesian_legs_with_rules(
+            &input,
+            &snap.env.config.limits,
+            direct.clone(),
+            Pre::Ready(cp.clone()),
+            Some(&plan),
+            Some(&rules_clear_direct),
+            false,
+            false,
+        )
+        .expect("direct clears bound, so fallback should succeed with direct path");
+        assert!(
+            resolved.approach_leg.is_none(),
+            "fitted final leg violating table bound must NOT be selected"
+        );
+        assert_eq!(
+            resolved.outcome.as_ref().and_then(|o| o.approach.as_deref()),
+            Some("direct")
+        );
+    }
+
+    // 3) Pre::Ready whose fitted final leg fails AND direct ALSO violates rules.table -> WorkspaceViolation!
+    let err_both = resolve_cartesian_legs_with_rules(
+        &input,
+        &snap.env.config.limits,
+        direct,
+        Pre::Ready(cp),
+        Some(&plan),
+        Some(&strict_rules),
+        false,
+        false,
+    )
+    .expect_err("when both fitted final leg and direct fallback cross rules.table, must refuse");
+    assert!(
+        matches!(err_both, armd::ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })),
+        "expected WorkspaceViolation, got {err_both:?}"
+    );
+}
+
+#[derive(Clone)]
+struct RejectingBusDriver {
+    q: Arc<Mutex<Vec<f32>>>,
+    reject_writes: Arc<std::sync::atomic::AtomicBool>,
+    last_written: Arc<Mutex<Vec<f32>>>,
+    has_torque_feedback: bool,
+    clock: VirtualClock,
+}
+
+impl RejectingBusDriver {
+    fn new(init_q: &[f32], clock: VirtualClock) -> Self {
+        Self {
+            q: Arc::new(Mutex::new(init_q.to_vec())),
+            reject_writes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_written: Arc::new(Mutex::new(init_q.to_vec())),
+            has_torque_feedback: true,
+            clock,
+        }
+    }
+}
+
+impl armd::driver::ArmDriver for RejectingBusDriver {
+    fn capabilities(&self) -> armd::driver::DriverCapabilities {
+        armd::driver::DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: self.has_torque_feedback,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        }
+    }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+    fn clock_now(&self) -> Instant { self.clock.now() }
+    fn enable_state(&self) -> armd::driver::EnableState { armd::driver::EnableState::Enabled }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool {
+        self.q.lock().unwrap().len() == dof
+    }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        vec![Some(self.clock.now()); self.q.lock().unwrap().len()]
+    }
+    fn feedback_seqs(&self) -> Vec<u64> {
+        vec![10; self.q.lock().unwrap().len()]
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+        let q = self.q.lock().unwrap();
+        Ok(q.iter()
+            .map(|&p| armd::model::JointState {
+                position: p,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 30.0,
+            })
+            .collect())
+    }
+    fn write_joint_targets(&mut self, targets: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
+        let pos: Vec<f32> = targets.iter().map(|t| t.position).collect();
+        *self.last_written.lock().unwrap() = pos;
+        Ok(())
+    }
+    fn write_joint_targets_bounded(
+        &mut self,
+        targets: &[armd::driver::JointTarget],
+    ) -> Result<armd::driver::TxBatchOutcome, armd::driver::ArmDriverError> {
+        let pos: Vec<f32> = targets.iter().map(|t| t.position).collect();
+        *self.last_written.lock().unwrap() = pos;
+        if self.reject_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(armd::driver::TxBatchOutcome::Deferred { pending: 1 });
+        }
+        Ok(armd::driver::TxBatchOutcome::Complete)
+    }
+    fn set_torque(&mut self, _enable: bool) -> Result<(), armd::driver::ArmDriverError> { Ok(()) }
+}
+
+#[test]
+fn review_b2_forced_finish_and_timeout_under_rejected_bus_holds_jaw_and_refuses_duplicates() {
+    use std::sync::atomic::Ordering;
+
+    let clock = VirtualClock::starting_at(Instant::now());
+    let drv = RejectingBusDriver::new(&INSPECT, clock.clone());
+    let mut inner = SupervisorInner::new(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    });
+    inner.lease_enabled = false;
+    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.commanded_positions = INSPECT.to_vec();
+    inner.measured_positions = INSPECT.to_vec();
+    inner.target_positions = INSPECT.to_vec();
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    for _ in 0..3 {
+        inner.tick(DT);
+    }
+    let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
+        inner,
+        BOOT,
+        Capacities {
+            commands: 8,
+            plans: 4,
+            replies: 32,
+        },
+        clock.clone(),
+    );
+
+    // Part A: Explicit forced finish during active gripper close while bus rejects writes!
+    let dl = fx.now() + DEFAULT_ACTION_DEADLINE;
+    let r_begin = b
+        .submit(
+            ClientId(1),
+            1,
+            auth(&fx),
+            dl,
+            Submit::Action(ActionSubmit::BeginMacro(BeginMacroSpec::new(MacroKind::Grasp, BOOT))),
+        )
+        .unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let parent = fx.active().unwrap();
+    let _ = drain_all(&mut b);
+
+    // Start gripper child moving closed; measured jaw lags behind commanded at -0.35.
+    let snap = snap_of(&fx);
+    let c1 = ChildSpec {
+        ticket: ChildTicket { parent, child_seq: 1 },
+        timeout_s: 10.0,
+        timeout_code: "GRASP_TIMEOUT",
+        contact: None,
+    };
+    let slot = prepare_child_gripper_slot(
+        &snap.commanded_positions,
+        GripperCommand::Move,
+        Some(0.2),
+        false,
+        0.5,
+        Some(8.0),
+        None,
+        false,
+        c1,
+    )
+    .unwrap();
+    submit_child(&mut b, ClientId(1), 2, auth(&fx), dl, BOOT, slot, false).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    fx.step();
+    let _ = drain_all(&mut b);
+
+    // Pin measured jaw to -0.35 and make bus reject TX writes!
+    let held_jaw = -0.35f32;
+    drv.q.lock().unwrap()[6] = held_jaw;
+    fx.core.measured_positions[6] = held_jaw;
+    drv.reject_writes.store(true, Ordering::SeqCst);
+
+    // Submit forced FinishMacro(Failed) with a diagnostic message (Minor 1).
+    let fail_spec = FinishMacroSpec::failed(parent, BOOT, "TARGET_LOST", "aborted while closing");
+    let r_fin = b
+        .submit(
+            ClientId(1),
+            3,
+            auth(&fx),
+            fx.now() + DEFAULT_FINISH_DEADLINE,
+            Submit::Action(ActionSubmit::FinishMacro(fail_spec)),
+        )
+        .unwrap();
+    let rep1 = fx.step();
+    assert!(matches!(rep1.command, Some((r, Ok(_))) if r == r_fin), "{rep1:?}");
+    assert!(rep1.ended.is_none(), "terminal MUST NOT emit while bus rejects hold TX");
+    assert!(
+        (drv.last_written.lock().unwrap()[6] - held_jaw).abs() < 1e-4,
+        "jaw target must hold measured {held_jaw}, got {}",
+        drv.last_written.lock().unwrap()[6]
+    );
+    let reps1 = drain_all(&mut b);
+    assert!(reps1.iter().any(|(_, r)| matches!(r, Reply::Ack { request, .. } if *request == r_fin)));
+    assert!(!reps1.iter().any(|(_, r)| matches!(r, Reply::Terminal { .. })));
+
+    // Several more rejected releases:
+    // - Duplicate FinishMacro -> PARENT_REPLACED (no premature terminal!)
+    let mut dup_auth = auth(&fx);
+    dup_auth.parent_generation = parent.0;
+    let r_dup = b
+        .submit(
+            ClientId(1),
+            4,
+            dup_auth,
+            fx.now() + DEFAULT_FINISH_DEADLINE,
+            Submit::Action(ActionSubmit::FinishMacro(fail_spec)),
+        )
+        .unwrap();
+    let rep_dup = fx.step();
+    assert_eq!(rep_dup.command, Some((r_dup, Err("PARENT_REPLACED"))));
+    assert!(rep_dup.ended.is_none());
+    assert!((drv.last_written.lock().unwrap()[6] - held_jaw).abs() < 1e-4);
+
+    // - Replacement BeginMacro while finishing hold is pending bus accept -> MOTION_BUSY!
+    let mut repl_auth = auth(&fx);
+    repl_auth.parent_generation = 0;
+    let r_repl = b
+        .submit(
+            ClientId(2),
+            1,
+            repl_auth,
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(BeginMacroSpec::new(MacroKind::Place, BOOT))),
+        )
+        .unwrap();
+    let rep_repl = fx.step();
+    assert_eq!(rep_repl.command, Some((r_repl, Err("MOTION_BUSY"))));
+    assert!(rep_repl.ended.is_none());
+    assert!((drv.last_written.lock().unwrap()[6] - held_jaw).abs() < 1e-4);
+    let _ = drain_all(&mut b);
+
+    // Now allow the bus to accept the hold write -> exact single Terminal arrives with message!
+    drv.reject_writes.store(false, Ordering::SeqCst);
+    let rep_ok = fx.step();
+    assert_eq!(rep_ok.ended, Some((parent, Outcome::Failed("TARGET_LOST"))));
+    assert!((drv.last_written.lock().unwrap()[6] - held_jaw).abs() < 1e-4);
+    assert_eq!(
+        fx.core.last_action.as_ref().and_then(|a| a.message.as_deref()),
+        Some("aborted while closing"),
+        "Minor 1: deferred MacroFinish must preserve finish diagnostic message"
+    );
+    let reps_ok = drain_all(&mut b);
+    assert_eq!(
+        reps_ok
+            .iter()
+            .filter(|(_, r)| matches!(
+                r,
+                Reply::Terminal { request, action, outcome: Outcome::Failed("TARGET_LOST"), children: 1 }
+                    if *request == r_begin && *action == parent
+            ))
+            .count(),
+        1
+    );
+
+    // Part B: Parent deadline expiry wins over child expiry AND defers until bus accepts jaw hold!
+    let mut b2 = BeginMacroSpec::new(MacroKind::Grasp, BOOT);
+    b2.macro_deadline = Some(fx.now() + Duration::from_millis(80));
+    b2.timeout_code = armd::safety::BoundedText::new("GRASP_TIMEOUT");
+    let r_b2 = b
+        .submit(
+            ClientId(1),
+            10,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(b2)),
+        )
+        .unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let parent2 = fx.active().unwrap();
+    let _ = drain_all(&mut b);
+
+    let snap2 = snap_of(&fx);
+    let c2 = ChildSpec {
+        ticket: ChildTicket { parent: parent2, child_seq: 1 },
+        timeout_s: 0.04, // shorter than parent deadline!
+        timeout_code: "CHILD_TIMEOUT",
+        contact: None,
+    };
+    let slot2 = prepare_child_gripper_slot(
+        &snap2.commanded_positions,
+        GripperCommand::Move,
+        Some(0.8),
+        false,
+        0.4,
+        Some(8.0),
+        None,
+        false,
+        c2,
+    )
+    .unwrap();
+    submit_child(&mut b, ClientId(1), 11, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, BOOT, slot2, false).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let _ = drain_all(&mut b);
+
+    let held_jaw2 = -0.22f32;
+    drv.q.lock().unwrap()[6] = held_jaw2;
+    fx.core.measured_positions[6] = held_jaw2;
+    drv.reject_writes.store(true, Ordering::SeqCst);
+
+    // Jump past BOTH child deadline (40ms) and parent deadline (80ms) at once!
+    clock.advance(Duration::from_millis(120));
+    let rep_exp = fx.step();
+    assert!(rep_exp.ended.is_none(), "parent timeout must defer terminal until bus accepts jaw hold");
+    assert!((fx.core.commanded_positions[6] - held_jaw2).abs() < 1e-4);
+    // One more rejected tick -> still no terminal, jaw still held!
+    let rep_exp2 = fx.step();
+    assert!(rep_exp2.ended.is_none());
+    assert!((drv.last_written.lock().unwrap()[6] - held_jaw2).abs() < 1e-4);
+
+    // Accept on bus -> parent emits GRASP_TIMEOUT (NOT child timeout!).
+    drv.reject_writes.store(false, Ordering::SeqCst);
+    let rep_exp3 = fx.step();
+    assert_eq!(rep_exp3.ended, Some((parent2, Outcome::Failed("GRASP_TIMEOUT"))));
+    let reps_exp = drain_all(&mut b);
+    assert!(reps_exp.iter().any(|(_, r)| matches!(
+        r,
+        Reply::Terminal { request, action, outcome: Outcome::Failed("GRASP_TIMEOUT"), .. }
+            if *request == r_b2 && *action == parent2
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gripper_calib.json");
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    }));
+    let initial_rev;
+    let zc_id = {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.measured_positions[6] = -0.05;
+        inner.commanded_positions[6] = -0.05;
+        inner.target_positions[6] = -0.05;
+        inner.gripper_calib_path = Some(path.clone());
+        inner.set_mock_gripper_stall_offset(Some(0.05));
+        initial_rev = inner.gripper_calib_revision;
+        let epoch = inner.safety.epoch_id();
+        let s2 = inner.current_admission_stamp();
+        let a2 = inner.check_admission(s2).unwrap();
+        SupervisorInner::start_gripper_zero_check(
+            a2,
+            &json!({"threshold_rad": 0.10, "store_offset": true}),
+            epoch,
+        )
+        .unwrap()
+        .0
+    };
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+
+    // Wait for zero_check(store_offset=true) to complete and armd-persist to activate + refresh prep_env!
+    let wait_dl = Instant::now() + Duration::from_secs(5);
+    let mut refreshed = false;
+    while Instant::now() < wait_dl {
+        if let (Some(pub_snap), Some(env)) = (sup.hub().latest(), sup.hub().prep_env()) {
+            let done = pub_snap
+                .obs
+                .action
+                .as_ref()
+                .is_some_and(|a| a.id == zc_id && a.state == "done");
+            if done
+                && pub_snap.rt.owner.gripper_calib_revision > initial_rev
+                && env.gripper_calib_revision == pub_snap.rt.owner.gripper_calib_revision
+            {
+                refreshed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(refreshed, "live zero_check activation must advance and republish ActionPrepEnv");
+
+    // Immediately capture fresh snapshot -> MUST NOT return PLAN_STALE!
+    let dl = Instant::now() + DEFAULT_ACTION_DEADLINE;
+    let snap = ActionSnapshot::capture(&sup, sup.capture_admission_stamp(), dl)
+        .await
+        .expect("fresh ActionSnapshot after live calibration must succeed (not PLAN_STALE)");
+    assert!(snap.env.gripper_calib_revision > initial_rev);
+
+    // 1) Fresh standalone gripper succeeds!
+    let g_prep = prepare_gripper(&snap, &json!({"command": "move", "fraction": 0.2, "speed": 1.0}), GripperBaselineCmd::None).unwrap();
+    let g_slot = g_prep.to_plan_slot(None).unwrap();
+    let write_g = |dst: &mut PlanSlot| *dst = g_slot.clone();
+    let (_, mut rx_g) = handle
+        .submit_internal_action(
+            ClientId(1),
+            1,
+            snap.owner.authority,
+            dl,
+            ActionSubmit::InstallPrepared {
+                write: &write_g,
+                kind: PreparedActionKind::Gripper,
+                prepared_boot: handle.boot(),
+                admission_request_id: 0,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: g_prep.stamp.gripper_calib_revision,
+                power_budget_revision: None,
+            },
+        )
+        .unwrap();
+    let mut ack_g = None;
+    for _ in 0..200 {
+        handle.pump_broker_replies();
+        if let Ok(r) = rx_g.try_recv() {
+            ack_g = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(matches!(ack_g, Some(Reply::Ack { .. })), "fresh gripper after calib failed: {ack_g:?}");
+    let g_action_id = match ack_g {
+        Some(Reply::Ack { action: Some(a), .. }) => a,
+        other => panic!("expected Ack with ActionId, got {other:?}"),
+    };
+    let mut g_ended = false;
+    let g_wait_dl = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < g_wait_dl {
+        handle.poll_external_replies(|_, r| {
+            if matches!(r, Reply::Terminal { action, .. } if action == g_action_id) {
+                g_ended = true;
+            }
+            DeliveryDecision::Delivered
+        });
+        if g_ended {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(g_ended, "fresh gripper action after calib must complete");
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // 2) Fresh standalone move_to succeeds!
+    let snap2 = ActionSnapshot::capture(&sup, sup.capture_admission_stamp(), Instant::now() + DEFAULT_ACTION_DEADLINE)
+        .await
+        .unwrap();
+    let p0 = armd::motion::start_pose(&snap2.plan_input_in(GoalFrame::Tcp).unwrap()).p;
+    let m_prep = prepare_move_to(&snap2, &json!({"position": [p0[0] + 0.02, p0[1], p0[2]]})).unwrap();
+    let m_slot = m_prep.to_plan_slot(None).unwrap();
+    let write_m = |dst: &mut PlanSlot| *dst = m_slot.clone();
+    let (_, mut rx_m) = handle
+        .submit_internal_action(
+            ClientId(1),
+            2,
+            snap2.owner.authority,
+            Instant::now() + DEFAULT_ACTION_DEADLINE,
+            ActionSubmit::InstallPrepared {
+                write: &write_m,
+                kind: PreparedActionKind::MoveToLinear,
+                prepared_boot: handle.boot(),
+                admission_request_id: 0,
+                check_workspace_revision: true,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: Some(snap2.env.power_budget_revision),
+            },
+        )
+        .unwrap();
+    let mut ack_m = None;
+    for _ in 0..200 {
+        handle.pump_broker_replies();
+        if let Ok(r) = rx_m.try_recv() {
+            ack_m = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(matches!(ack_m, Some(Reply::Ack { .. })), "fresh move_to after calib failed: {ack_m:?}");
+    let m_action_id = match ack_m {
+        Some(Reply::Ack { action: Some(a), .. }) => a,
+        other => panic!("expected Ack with ActionId, got {other:?}"),
+    };
+    let mut m_ended = false;
+    for _ in 0..600 {
+        handle.poll_external_replies(|_, r| {
+            if matches!(r, Reply::Terminal { action, .. } if action == m_action_id) {
+                m_ended = true;
+            }
+            DeliveryDecision::Delivered
+        });
+        if m_ended {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(m_ended, "fresh move_to action after calib must complete");
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // 3) Fresh A7 BeginMacro -> FinishMacro succeeds!
+    let snap3 = ActionSnapshot::capture(&sup, sup.capture_admission_stamp(), Instant::now() + DEFAULT_ACTION_DEADLINE)
+        .await
+        .unwrap();
+    let begin = BeginMacroSpec::new(MacroKind::Place, handle.boot());
+    let (mid, _) = armd::macro_action::begin_macro_executor(
+        &sup,
+        &snap3.stamp,
+        begin,
+        Instant::now() + DEFAULT_ACTION_DEADLINE,
+    )
+    .await
+    .expect("fresh BeginMacro after live calib must succeed");
+    assert!(mid > 0);
+    handle.stop_and_join();
+}
+
+#[test]
+fn review_m1_m2_m3_deadline_precedence_parent_authority_and_single_use_admission() {
+    let (mut fx, mut b, clock, _stop) = fixture();
+
+    // --- Major 1: FinishMacro(Done) submitted after parent expiry with valid request deadline ---
+    let mut begin = BeginMacroSpec::new(MacroKind::Place, BOOT);
+    begin.macro_deadline = Some(fx.now() + Duration::from_millis(80));
+    begin.timeout_code = armd::safety::BoundedText::new("PLACE_TIMEOUT");
+    let r_b1 = b
+        .submit(
+            ClientId(1),
+            1,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(begin)),
+        )
+        .unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let parent1 = fx.active().unwrap();
+    let _ = drain_all(&mut b);
+
+    // Advance virtual clock PAST parent macro_deadline while FinishMacro request deadline is still valid!
+    clock.advance(Duration::from_millis(120));
+    let done_spec = FinishMacroSpec::done(parent1, BOOT);
+    let r_done = b
+        .submit(
+            ClientId(1),
+            2,
+            auth(&fx),
+            fx.now() + DEFAULT_FINISH_DEADLINE,
+            Submit::Action(ActionSubmit::FinishMacro(done_spec)),
+        )
+        .unwrap();
+    let rep = fx.step();
+    assert_eq!(rep.command, Some((r_done, Err("DEADLINE_EXPIRED"))));
+    assert_eq!(rep.ended, Some((parent1, Outcome::Failed("PLACE_TIMEOUT"))));
+    let reps = drain_all(&mut b);
+    assert!(reps.iter().any(|(_, r)| matches!(
+        r,
+        Reply::Terminal { request, action, outcome: Outcome::Failed("PLACE_TIMEOUT"), .. }
+            if *request == r_b1 && *action == parent1
+    )));
+
+    // --- Major 2: Two-client parent authority with leases disabled ---
+    assert!(!fx.core.lease_enabled);
+    let r_b2 = b
+        .submit(
+            ClientId(11),
+            1,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(BeginMacroSpec::new(MacroKind::Sequence, BOOT))),
+        )
+        .unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let parent2 = fx.active().unwrap();
+    let _ = drain_all(&mut b);
+
+    // Client 22 (different client!) tries InstallChild with parent2's ID -> MUST refuse LEASE_LOST!
+    let snap = snap_of(&fx);
+    let mut tgt = snap.commanded_positions.clone();
+    tgt[0] += 0.03;
+    let max_vel: Vec<f32> = snap.env.planning_limits(None).iter().map(|l| l.max_velocity).collect();
+    let c1 = ChildSpec {
+        ticket: ChildTicket { parent: parent2, child_seq: 1 },
+        timeout_s: 10.0,
+        timeout_code: "SEQUENCE_TIMEOUT",
+        contact: None,
+    };
+    let slot = prepare_child_joint_slot(&snap.commanded_positions, &tgt, &max_vel, 0.2, None, c1).unwrap();
+    let r_hijack_child = submit_child(&mut b, ClientId(22), 1, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, BOOT, slot, true).unwrap();
+    assert_eq!(fx.step().command, Some((r_hijack_child, Err("LEASE_LOST"))));
+    assert_eq!(fx.active(), Some(parent2));
+
+    // Client 22 tries FinishMacro(Done) with parent2's ID -> MUST refuse LEASE_LOST!
+    let r_hijack_fin = b
+        .submit(
+            ClientId(22),
+            2,
+            auth(&fx),
+            fx.now() + DEFAULT_FINISH_DEADLINE,
+            Submit::Action(ActionSubmit::FinishMacro(FinishMacroSpec::done(parent2, BOOT))),
+        )
+        .unwrap();
+    assert_eq!(fx.step().command, Some((r_hijack_fin, Err("LEASE_LOST"))));
+    assert_eq!(fx.active(), Some(parent2));
+    let _ = drain_all(&mut b);
+
+    // Original owner Client 11 finishes parent2 cleanly!
+    b.submit(
+        ClientId(11),
+        2,
+        auth(&fx),
+        fx.now() + DEFAULT_FINISH_DEADLINE,
+        Submit::Action(ActionSubmit::FinishMacro(FinishMacroSpec::done(parent2, BOOT))),
+    )
+    .unwrap();
+    assert_eq!(fx.step().ended, Some((parent2, Outcome::Completed)));
+    let _ = r_b2;
+    let _ = drain_all(&mut b);
+
+    // --- Major 3: Single-use original admission_request_id across InstallPrepared & BeginMacro ---
+    let snap = snap_of(&fx);
+    let prep = prepare_gripper(&snap, &json!({"command": "open", "speed": 1.0}), GripperBaselineCmd::None).unwrap();
+    let slot1 = prep.to_plan_slot(None).unwrap();
+    let slot2 = prep.to_plan_slot(None).unwrap();
+    let orig_req_id = 4242u64;
+    let w1 = |dst: &mut PlanSlot| *dst = slot1.clone();
+    let r_first = b
+        .submit(
+            ClientId(1),
+            10,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w1,
+                kind: PreparedActionKind::Gripper,
+                prepared_boot: BOOT,
+                admission_request_id: orig_req_id,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: prep.stamp.gripper_calib_revision,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(fx.step().command, Some((r, Ok(_))) if r == r_first));
+    let _ = step_until_ended(&mut fx, 400);
+    let _ = drain_all(&mut b);
+
+    // Re-submit the SAME original admission_request_id with a brand new broker seq/RequestId -> STALE_ADMISSION!
+    let w2 = |dst: &mut PlanSlot| *dst = slot2.clone();
+    let r_second = b
+        .submit(
+            ClientId(1),
+            11,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w2,
+                kind: PreparedActionKind::Gripper,
+                prepared_boot: BOOT,
+                admission_request_id: orig_req_id,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: prep.stamp.gripper_calib_revision,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(fx.step().command, Some((r_second, Err("STAMP_REUSED"))));
+
+    // Same for BeginMacro with reused admission_request_id = 4343!
+    let mut bm = BeginMacroSpec::new(MacroKind::Place, BOOT);
+    bm.admission_request_id = 4343;
+    let r_bm1 = b
+        .submit(ClientId(1), 12, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, Submit::Action(ActionSubmit::BeginMacro(bm)))
+        .unwrap();
+    assert!(matches!(fx.step().command, Some((r, Ok(_))) if r == r_bm1));
+    let p_bm = fx.active().unwrap();
+    b.submit(ClientId(1), 13, auth(&fx), fx.now() + DEFAULT_FINISH_DEADLINE, Submit::Action(ActionSubmit::FinishMacro(FinishMacroSpec::done(p_bm, BOOT)))).unwrap();
+    assert_eq!(fx.step().ended, Some((p_bm, Outcome::Completed)));
+    let _ = drain_all(&mut b);
+
+    let r_bm2 = b
+        .submit(ClientId(1), 14, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, Submit::Action(ActionSubmit::BeginMacro(bm)))
+        .unwrap();
+    assert_eq!(fx.step().command, Some((r_bm2, Err("STAMP_REUSED"))));
+}
+
+#[test]
+fn review_m4_m5_gripper_calib_and_power_budget_revision_fencing() {
+    let (mut fx, mut b, _clock, _stop) = fixture();
+    let dl = fx.now() + DEFAULT_ACTION_DEADLINE;
+
+    // --- Major 4: gripper_calib_revision change between prepare and commit -> PLAN_STALE ---
+    let snap = snap_of(&fx);
+    let g_prep = prepare_gripper(&snap, &json!({"command": "open", "speed": 1.0}), GripperBaselineCmd::None).unwrap();
+    assert_eq!(g_prep.stamp.gripper_calib_revision, Some(fx.core.gripper_calib_revision));
+    let g_slot = g_prep.to_plan_slot(None).unwrap();
+    // Bump gripper_calib_revision before commit!
+    fx.core.gripper_calib_revision += 1;
+    let wg = |dst: &mut PlanSlot| *dst = g_slot.clone();
+    let r_g = b
+        .submit(
+            ClientId(1),
+            1,
+            auth(&fx),
+            dl,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &wg,
+                kind: PreparedActionKind::Gripper,
+                prepared_boot: BOOT,
+                admission_request_id: 0,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: g_prep.stamp.gripper_calib_revision,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(fx.step().command, Some((r_g, Err("PLAN_STALE"))));
+    let _ = drain_all(&mut b);
+
+    // Same for child gripper and child Cartesian power_budget_revision (Major 5)!
+    b.submit(ClientId(1), 2, auth(&fx), dl, Submit::Action(ActionSubmit::BeginMacro(BeginMacroSpec::new(MacroKind::Place, BOOT)))).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let parent = fx.active().unwrap();
+    let _ = drain_all(&mut b);
+
+    let snap2 = snap_of(&fx);
+    let old_g_rev = snap2.env.gripper_calib_revision;
+    let old_p_rev = snap2.env.power_budget_revision;
+
+    // Stale child gripper_calib_revision -> PLAN_STALE!
+    fx.core.gripper_calib_revision += 1;
+    let cg = ChildSpec { ticket: ChildTicket { parent, child_seq: 1 }, timeout_s: 10.0, timeout_code: "PLACE_TIMEOUT", contact: None };
+    let cg_slot = prepare_child_gripper_slot(&snap2.commanded_positions, GripperCommand::Open, None, false, 1.0, Some(8.0), None, false, cg).unwrap();
+    let wcg = |dst: &mut PlanSlot| *dst = cg_slot.clone();
+    let r_cg = b
+        .submit(
+            ClientId(1),
+            3,
+            auth(&fx),
+            dl,
+            Submit::Action(ActionSubmit::InstallChild {
+                write: &wcg,
+                prepared_boot: BOOT,
+                check_workspace_revision: false,
+                calibration_revision: None,
+                gripper_calib_revision: Some(old_g_rev),
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(fx.step().command, Some((r_cg, Err("PLAN_STALE"))));
+
+    // Stale child power_budget_revision -> PLAN_STALE (Major 5)!
+    fx.core.power_budget_revision += 1;
+    let input = snap2.plan_input_in(GoalFrame::Tcp).unwrap();
+    let p0 = armd::motion::start_pose(&input).p;
+    let path = armd::motion::plan_cartesian(&input, armd::motion::resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.015, p0[1], p0[2]], r: None }), Speed::default()).unwrap();
+    let cc = ChildSpec { ticket: ChildTicket { parent, child_seq: 1 }, timeout_s: 10.0, timeout_code: "PLACE_TIMEOUT", contact: None };
+    let cc_slot = armd::rt_core::requests::actions::prepare_child_cartesian_slot(&snap2.commanded_positions, &path, None, cc).unwrap();
+    let wcc = |dst: &mut PlanSlot| *dst = cc_slot.clone();
+    let r_cc = b
+        .submit(
+            ClientId(1),
+            4,
+            auth(&fx),
+            dl,
+            Submit::Action(ActionSubmit::InstallChild {
+                write: &wcc,
+                prepared_boot: BOOT,
+                check_workspace_revision: true,
+                calibration_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: Some(old_p_rev),
+            }),
+        )
+        .unwrap();
+    assert_eq!(fx.step().command, Some((r_cc, Err("PLAN_STALE"))));
+}
+
+#[test]
+fn review_m8_m9_mixed_legacy_child_refused_and_gripper_to_jog_replacement_order() {
+    use armd::rt_core::ops::Primitive;
+    use armd::safety::SafetyState;
+
+    let clock = VirtualClock::starting_at(Instant::now());
+    let drv = RejectingBusDriver::new(&INSPECT, clock.clone());
+    let mut inner = SupervisorInner::new(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    });
+    inner.lease_enabled = false;
+    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.commanded_positions = INSPECT.to_vec();
+    inner.measured_positions = INSPECT.to_vec();
+    inner.target_positions = INSPECT.to_vec();
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    for _ in 0..3 {
+        inner.tick(DT);
+    }
+    let (mut fx, mut b, _clock, _stop) = ReleaseFixture::new_with_clock(
+        inner,
+        BOOT,
+        Capacities {
+            commands: 8,
+            plans: 4,
+            replies: 32,
+        },
+        clock,
+    );
+    let dl = fx.now() + DEFAULT_ACTION_DEADLINE;
+
+    // --- Major 8: Legacy Submit::Install child against A7 ActiveSlot::Macro -> UNSUPPORTED ---
+    let r_begin = b
+        .submit(ClientId(1), 1, auth(&fx), dl, Submit::Action(ActionSubmit::BeginMacro(BeginMacroSpec::new(MacroKind::Sequence, BOOT))))
+        .unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let parent = fx.active().unwrap();
+    let _ = drain_all(&mut b);
+
+    let mut q_arr = [0.0f32; MAX_DOF];
+    q_arr[..INSPECT.len()].copy_from_slice(&INSPECT);
+    let mut tgt_arr = q_arr;
+    tgt_arr[0] += 0.03;
+    let legacy_child_prim = Primitive::JointQuinticLimited {
+        dof: INSPECT.len() as u8,
+        start: q_arr,
+        q: tgt_arr,
+        max_velocity: [1.0; MAX_DOF],
+        duration_s: 0.2,
+        settle_s: 0.1,
+        child: Some(ChildSpec {
+            ticket: ChildTicket { parent, child_seq: 1 },
+            timeout_s: 10.0,
+            timeout_code: "SEQUENCE_TIMEOUT",
+            contact: None,
+        }),
+    };
+    let w_leg = |dst: &mut PlanSlot| dst.set(legacy_child_prim);
+    let r_leg = b
+        .submit(ClientId(1), 2, auth(&fx), dl, Submit::Install(&w_leg))
+        .unwrap();
+    assert_eq!(fx.step().command, Some((r_leg, Err("UNSUPPORTED"))));
+    assert_eq!(fx.active(), Some(parent), "refused mixed legacy child must keep A7 parent intact");
+    let reps_m8 = drain_all(&mut b);
+    assert!(!reps_m8.iter().any(|(_, r)| matches!(r, Reply::Terminal { .. })));
+
+    // --- Major 9: Active macro gripper child replaced by RT jog -> post-quiesce start, target, SafetyState::Moving, Terminal(old) < Ack(new) ---
+    let snap = snap_of(&fx);
+    let cg = ChildSpec {
+        ticket: ChildTicket { parent, child_seq: 1 },
+        timeout_s: 10.0,
+        timeout_code: "SEQUENCE_TIMEOUT",
+        contact: None,
+    };
+    let cg_slot = prepare_child_gripper_slot(&snap.commanded_positions, GripperCommand::Move, Some(0.1), false, 0.5, Some(8.0), None, false, cg).unwrap();
+    submit_child(&mut b, ClientId(1), 3, auth(&fx), dl, BOOT, cg_slot, false).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    fx.step();
+    let _ = drain_all(&mut b);
+
+    // Diverge measured jaw (-0.25) from commanded jaw (-0.55) to verify post-quiesce start!
+    let meas_jaw = -0.25f32;
+    drv.q.lock().unwrap()[6] = meas_jaw;
+    fx.core.measured_positions[6] = meas_jaw;
+    fx.core.commanded_positions[6] = -0.55;
+
+    let mut jog_start = [0.0f32; MAX_DOF];
+    jog_start[..INSPECT.len()].copy_from_slice(&fx.core.commanded_positions);
+    jog_start[6] = meas_jaw; // post-quiesce jaw position!
+    let mut jog_target = jog_start;
+    jog_target[0] += 0.12;
+    let jog_prim = Primitive::JointQuintic {
+        dof: INSPECT.len() as u8,
+        start: jog_start,
+        q: jog_target,
+        duration_s: 0.4,
+    };
+    let mut jog_auth = auth(&fx);
+    jog_auth.parent_generation = 0;
+    let w_jog = |dst: &mut PlanSlot| dst.set(jog_prim);
+    let r_jog = b
+        .submit(ClientId(1), 4, jog_auth, dl, Submit::Install(&w_jog))
+        .unwrap();
+    let rep_jog = fx.step();
+    assert!(matches!(rep_jog.command, Some((r, Ok(_))) if r == r_jog), "{rep_jog:?}");
+    let jog_id = fx.active().expect("jog must be active");
+    assert_ne!(jog_id, parent);
+    // Verify target_positions is the JOG's target (NOT overwritten by old quiesce!),
+    // jaw snapped to meas_jaw, and safety is SafetyState::Moving (NOT reset to Armed!).
+    assert!(
+        (fx.core.target_positions[0] - jog_target[0]).abs() < 1e-4,
+        "jog target J1 was overwritten: expected {}, got {}",
+        jog_target[0],
+        fx.core.target_positions[0]
+    );
+    assert!(
+        (fx.core.target_positions[6] - meas_jaw).abs() < 1e-4,
+        "jog target J7 must preserve post-quiesce jaw {meas_jaw}, got {}",
+        fx.core.target_positions[6]
+    );
+    assert_eq!(fx.core.safety.state(), &SafetyState::Moving, "safety state must remain Moving after replacement");
+    let reps_jog = drain_all(&mut b);
+    let pos_term = reps_jog
+        .iter()
+        .position(|(_, r)| matches!(r, Reply::Terminal { request, action, outcome: Outcome::Superseded, .. } if *request == r_begin && *action == parent))
+        .expect("old parent must emit exactly one Terminal(Superseded)");
+    let pos_ack = reps_jog
+        .iter()
+        .position(|(_, r)| matches!(r, Reply::Ack { request, action: Some(a), .. } if *request == r_jog && *a == jog_id))
+        .expect("new jog must emit Ack");
+    assert!(pos_term < pos_ack, "Terminal(old) must strictly precede Ack(new): {reps_jog:?}");
+    // Verify old parent emitted EXACTLY ONE terminal!
+    assert_eq!(
+        reps_jog
+            .iter()
+            .filter(|(_, r)| matches!(r, Reply::Terminal { action, .. } if *action == parent))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_m10_reply_router_interleaved_external_and_backpressure() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    }));
+    sup.set_lease_enabled(false).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        for _ in 0..3 {
+            inner.tick(DT);
+        }
+    }
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if sup.hub().latest().is_some_and(|s| !s.rt.owner.boot.is_zero()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Submit 3 external refused commands whose replies sit at the head of the broker reply ring!
+    let pub_snap = sup.hub().latest().unwrap();
+    let dl = Instant::now() + DEFAULT_ACTION_DEADLINE;
+    let mut ext_reqs = Vec::new();
+    for seq in 1..=3u64 {
+        let mut bad_begin = BeginMacroSpec::new(MacroKind::Place, BootId(9999));
+        bad_begin.admission_request_id = 0;
+        let r = handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(
+                ClientId(99),
+                seq,
+                pub_snap.rt.owner.authority,
+                dl,
+                Submit::Action(ActionSubmit::BeginMacro(bad_begin)),
+            )
+            .unwrap();
+        ext_reqs.push(r);
+    }
+    // Wait until all 3 external replies are in the broker ring / external queue, then apply
+    // downstream Backpressured on poll_external_replies so they remain buffered!
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let delivered_bp = handle.poll_external_replies(|_, _| DeliveryDecision::Backpressured);
+    assert_eq!(delivered_bp, 0);
+    assert_eq!(handle.pending_external_replies(), 3, "external replies must buffer in FIFO without dropping");
+
+    // While external consumer is backpressured, drive BeginMacro + MacroCtx::install_joint_child + finish!
+    let mut adm = sup.capture_admission_stamp();
+    adm.connection_id = 7;
+    let snap = ActionSnapshot::capture(&sup, adm, dl).await.unwrap();
+    let mut begin = BeginMacroSpec::new(MacroKind::Sequence, handle.boot());
+    begin.admission_request_id = adm.request_id;
+    let (parent_id, r_begin) = armd::macro_action::begin_macro_executor(&sup, &snap.stamp, begin, dl)
+        .await
+        .expect("BeginMacro must NOT deadlock behind backpressured external replies");
+    let ctx = MacroCtx {
+        sup: sup.clone(),
+        id: parent_id,
+        stamp: adm,
+        deadline: Instant::now() + Duration::from_secs(10),
+        phase_timeout_s: 8.0,
+        timeout_code: "SEQUENCE_TIMEOUT",
+        timeout_message: "timeout".into(),
+    };
+    let mut tgt = snap.commanded_positions.clone();
+    tgt[0] += 0.04;
+    ctx.install_joint_child("s1", tgt, snap.env.planning_limits(Some(0.8)), true, None, None)
+        .await
+        .expect("MacroCtx child must succeed despite backpressured external replies");
+    ctx.finish(FinishState::Done, None, None, None, None, HeldUpdate::Unchanged).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // Now stop backpressuring and drain external replies -> assert EXACT FIFO order:
+    // ext_reqs[0..3] Refused followed by BeginMacro Terminal(Completed), and ZERO internal child/finish ACKs!
+    let mut drained = Vec::new();
+    handle.poll_external_replies(|c, r| {
+        drained.push((c, r));
+        DeliveryDecision::Delivered
+    });
+    assert_eq!(drained.len(), 4, "expected 3 external Refused + 1 BeginMacro Terminal, got {drained:?}");
+    for (idx, req_id) in ext_reqs.iter().enumerate() {
+        assert!(
+            matches!(drained[idx], (ClientId(99), Reply::Refused { request, code: "WRONG_TARGET" }) if request == *req_id),
+            "FIFO mismatch at index {idx}: {:?}",
+            drained[idx]
+        );
+    }
+    assert!(
+        matches!(
+            drained[3],
+            (ClientId(7), Reply::Terminal { request, action, outcome: Outcome::Completed, children: 1 })
+                if request == r_begin && action == ActionId(parent_id)
+        ),
+        "expected BeginMacro Terminal(Completed, children=1) at tail, got {:?}",
+        drained[3]
+    );
+    handle.stop_and_join();
+}
+
+struct DetachedMockVision {
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl DetachedMockVision {
+    fn new() -> Self {
+        Self {
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+impl armd::grasp::DetectionSource for DetachedMockVision {
+    fn inference_enabled(&self) -> armd::grasp::BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(true) })
+    }
+    fn set_inference(&self, _enabled: bool) -> armd::grasp::BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn next_frame(
+        &self,
+        _after: Option<u64>,
+        _wait_ms: u64,
+    ) -> armd::grasp::BoxFuture<'_, Result<Option<armd::grasp::DetectionFrame>, String>> {
+        self.trigger_with_focus(&["yolo"], 100, None)
+    }
+    fn per_request_pipelines(&self) -> armd::grasp::BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(true) })
+    }
+    fn trigger_with_focus(
+        &self,
+        _pipelines: &'static [&'static str],
+        _wait_ms: u64,
+        _focus: Option<&armd::grasp::MaskFocus>,
+    ) -> armd::grasp::BoxFuture<'_, Result<Option<armd::grasp::DetectionFrame>, String>> {
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(Some(armd::grasp::DetectionFrame {
+                frame_id: id,
+                captured_at: Instant::now(),
+                policy_captured_at: None,
+                image_size_px: [640.0, 480.0],
+                depth: None,
+                model_generation: Some(1),
+                detections: vec![armd::grasp::Detection {
+                    label: "cube".into(),
+                    score: 0.95,
+                    raw_score_valid: true,
+                    box_norm: [0.46, 0.46, 0.54, 0.54],
+                    angle_deg: Some(15.0),
+                    angle_conf: Some(0.9),
+                    grasp_width_px: Some(36.0),
+                    mask_focus: false,
+                    disp_fg: None,
+                    disp_bg: None,
+                    depth_conf: None,
+                    length_px: None,
+                    jaw_clear: None,
+                    depth_angle_deg: None,
+                    depth_angle_conf: None,
+                    depth_width_px: None,
+                    contour_norm: None,
+                }],
+            }))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_m11_m12_m13_m14_production_adapters_detached_shell_and_same_side_joint_parity() {
+    // --- Part A (Major 14): Same-side joint parity across Legacy & RT Executor ---
+    {
+        let mut cfg = ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.backlash_approach = Some(armd::backlash::BacklashApproach::default());
+        let mut leg_inner = common::sim_at(cfg.clone(), &INSPECT);
+        let mut target_pose = INSPECT.to_vec();
+        target_pose[0] += 0.12;
+        armd::poses::save(&mut leg_inner, &json!({"name": "ss_pose", "positions": target_pose})).unwrap();
+        let adm = leg_inner.current_admission_stamp();
+        let snap = ActionSnapshot::from_inner(&leg_inner, adm, Instant::now() + DEFAULT_ACTION_DEADLINE);
+        let prep = prepare_saved_pose(&snap, &json!({"name": "ss_pose", "speed_scale": 1.0})).unwrap();
+        assert!(prep.approach_leg.is_some(), "same-side joint move must prepare approach_leg off-thread");
+        let slot = prep.to_plan_slot(None).unwrap();
+        match slot.primitive {
+            armd::rt_core::ops::Primitive::Action(armd::rt_core::requests::actions::StagedAction::Joint {
+                approach_then,
+                target,
+                ..
+            }) => {
+                assert!(approach_then.is_some(), "RT joint slot must stage approach_then leg");
+                assert!(
+                    (target[0] - target_pose[0]).abs() > 1e-3,
+                    "leg 1 target must be pre-target, not final target"
+                );
+                assert!(
+                    (approach_then.unwrap().target[0] - target_pose[0]).abs() < 1e-5,
+                    "leg 2 target must equal final target"
+                );
+            }
+            other => panic!("expected StagedAction::Joint, got {other:?}"),
+        }
+        // Install on Legacy and run to completion.
+        let ctx = armd::rt_core::requests::actions::OwnerCheckCtx::for_legacy(&leg_inner);
+        let (leg_id, leg_dur) = armd::rt_core::requests::actions::install_move_joint(
+            &mut leg_inner,
+            &prep.stamp,
+            &ctx,
+            armd::rt_core::requests::actions::JointInstallPayload::Legacy(Box::new(prep.clone())),
+        )
+        .unwrap();
+        assert!(leg_dur > 0.5);
+        for _ in 0..300 {
+            leg_inner.tick(DT);
+            if leg_inner.last_action.as_ref().is_some_and(|a| a.id == leg_id && !a.is_running()) {
+                break;
+            }
+        }
+        assert_eq!(leg_inner.last_action.as_ref().unwrap().state, "done");
+        assert_eq!(leg_inner.last_action.as_ref().unwrap().approach.as_deref(), Some("same_side"));
+
+        // Install the SAME prepared slot on RT Executor and run to completion.
+        let (mut fx, mut b, _clk, _st) = fixture();
+        fx.core.config.backlash_approach = Some(armd::backlash::BacklashApproach::default());
+        armd::poses::save(&mut fx.core, &json!({"name": "ss_pose", "positions": target_pose})).unwrap();
+        let snap_rt = snap_of(&fx);
+        let prep_rt = prepare_saved_pose(&snap_rt, &json!({"name": "ss_pose", "speed_scale": 1.0})).unwrap();
+        let slot_rt = prep_rt.to_plan_slot(None).unwrap();
+        let r = submit_slot_prepared(
+            &mut b,
+            ClientId(1),
+            1,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            PreparedActionKind::MoveToPose,
+            BOOT,
+            slot_rt,
+            true,
+            prep_rt.stamp.poses_revision,
+            prep_rt.stamp.power_budget_revision,
+        )
+        .unwrap();
+        assert!(matches!(fx.step().command, Some((req, Ok(_))) if req == r));
+        let (_, outcome) = step_until_ended(&mut fx, 300);
+        assert_eq!(outcome, Outcome::Completed);
+        for i in 0..6 {
+            assert!(
+                (fx.core.commanded_positions[i] - leg_inner.commanded_positions[i]).abs() < 1e-3,
+                "joint {i} parity mismatch: rt={} legacy={}",
+                fx.core.commanded_positions[i],
+                leg_inner.commanded_positions[i]
+            );
+        }
+    }
+
+    // --- Part B (Majors 11, 12, 13 + Minor 2): Real production adapters on live OWNER_EXECUTOR ---
+    let mut exec_cfg = ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    };
+    // Use fast valid close speed on both gripper_policy and damiao_gripper (pos_force clamps
+    // to min(gripper_policy.close_speed_rad_s, damiao_gripper.close_speed_rad_s)) and start
+    // the jaw open so the authentic rebot_dm grasp lifecycle finishes in ~12s wall-clock.
+    if let Some(gp) = exec_cfg.gripper_policy.as_mut() {
+        gp.close_speed_rad_s = Some(2.0);
+    }
+    if let Some(dg) = exec_cfg.damiao_gripper.as_mut() {
+        dg.close_speed_rad_s = 2.0;
+    }
+    let open_j7 = exec_cfg.gripper_policy.as_ref().map_or(0.0, |g| g.open_rad);
+    let sup = Arc::new(ArmSupervisor::new(exec_cfg));
+    sup.set_lease_enabled(false).await;
+    let mut start_q = INSPECT.to_vec();
+    start_q[6] = open_j7;
+    let mut pose_q = start_q.clone();
+    pose_q[0] += 0.05;
+    let seq_id;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = start_q.clone();
+        inner.measured_positions = start_q.clone();
+        inner.target_positions = start_q.clone();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        for _ in 0..3 {
+            inner.tick(DT);
+        }
+        let (saved_pose, _) = armd::poses::save(&mut inner, &json!({"name": "seq_p1", "positions": pose_q})).unwrap();
+        let (saved_seq, _) = armd::sequences::save(
+            &mut inner,
+            &json!({
+                "name": "exec_seq",
+                "steps": [
+                    {"type": "pose", "pose_id": saved_pose.id, "speed_scale": 1.0, "gripper": "keep"},
+                    {"type": "wait", "s": 0.02}
+                ]
+            }),
+        )
+        .unwrap();
+        seq_id = saved_seq.id;
+    }
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+    // Verify legacy shell rejects lock-path admission (`OWNER_TRANSFERRED`).
+    assert!(
+        sup.inner().write().await.acquire_lease("probe").is_err(),
+        "legacy shell MUST be detached"
+    );
+    for _ in 0..100 {
+        if sup.hub().latest().is_some_and(|s| !s.rt.owner.boot.is_zero()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let wait_macro_end = |sup: Arc<ArmSupervisor>, handle: armd::rt_core::executor::RtExecutorHandle, action_id: u64| async move {
+        let dl = Instant::now() + Duration::from_secs(45);
+        let mut terminal = None;
+        while Instant::now() < dl {
+            handle.poll_external_replies(|_, r| {
+                if let Reply::Terminal { action, outcome, .. } = r {
+                    if action == ActionId(action_id) {
+                        terminal = Some(outcome);
+                    }
+                }
+                DeliveryDecision::Delivered
+            });
+            if let Some(o) = terminal {
+                return o;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let latest = sup.hub().latest();
+        panic!(
+            "macro {action_id} did not emit terminal in time; macro={:?} motion_active={:?} safety={:?}",
+            latest.as_ref().map(|s| s.rt.owner.macro_state),
+            latest.as_ref().map(|s| s.rt.owner.motion_active),
+            latest.as_ref().map(|s| &s.obs.safety_state),
+        );
+    };
+
+    // 1) Major 13: sequences::begin_executor refuses recording BEFORE starting parent macro!
+    {
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 31;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
+        let plan_with_rec = armd::sequences::prepare_run_from_snapshot(
+            &snap,
+            &json!({"id": seq_id, "record": {"dataset": "demo"}}),
+            snap.owner.authority.epoch,
+            false,
+        )
+        .unwrap();
+        let err = armd::sequences::begin_executor(&sup, adm, plan_with_rec)
+            .await
+            .expect_err("recording-enabled sequence must be refused BEFORE BeginMacro on executor");
+        assert!(matches!(err, armd::ArmError::Motion(armd::motion::MotionError::Unsupported(_))), "{err:?}");
+        assert!(!sup.hub().latest().unwrap().rt.owner.macro_state.alive, "no parent macro may start");
+    }
+
+    // 2) Major 11: Real sequences::begin_executor end-to-end on detached shell!
+    {
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 32;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
+        let plan = armd::sequences::prepare_run_from_snapshot(&snap, &json!({"id": seq_id}), snap.owner.authority.epoch, true).unwrap();
+        let (id, _) = armd::sequences::begin_executor(&sup, adm, plan).await.unwrap();
+        let outcome = wait_macro_end(sup.clone(), handle.clone(), id).await;
+        assert_eq!(outcome, Outcome::Completed, "sequences::begin_executor must complete");
+        let q_end = sup.hub().latest().unwrap().rt.commanded_positions[0];
+        assert!((q_end - pose_q[0]).abs() < 5e-3, "expected J1={}, got {q_end}", pose_q[0]);
+    }
+
+    // 3) Major 11: Real place::begin_executor end-to-end on detached shell!
+    {
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 33;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
+        let tcp0 = armd::motion::start_pose(&snap.plan_input_in(GoalFrame::Tcp).unwrap()).p;
+        let pending = armd::place::prepare_from_snapshot(
+            &snap,
+            &json!({"position": [tcp0[0] + 0.02, tcp0[1], tcp0[2]], "approach_height_m": 0.02, "release": false, "retreat": false}),
+            snap.owner.authority.epoch,
+        )
+        .unwrap();
+        let planned = armd::place::plan(pending).unwrap();
+        let (id, _) = armd::place::begin_executor(&sup, adm, planned).await.unwrap();
+        let outcome = wait_macro_end(sup.clone(), handle.clone(), id).await;
+        assert_eq!(outcome, Outcome::Completed, "place::begin_executor must complete");
+    }
+
+    // 4) Majors 11 & 12: Real grasp::begin_executor on detached shell (runs approach/centring/align/preopen/descend/close/lift without touching sup.inner()!)
+    {
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 34;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
+        let setup = snap.env.grasp_setup.clone().unwrap();
+        let pose_end = snap.env.config.arm_model.fk_f32(&snap.commanded_positions).unwrap();
+        let cam = armd::grasp::CamModel::assumed(&snap.env.config.arm_model, &setup, &snap.env.config.camera_mount);
+        // Project a reachable table point directly below the current end-link so approach is always IK-reachable!
+        let target_pt = [pose_end.p[0], pose_end.p[1], setup.table_z_m + setup.grasp_height_m];
+        let proj = cam.project(&pose_end, &target_pt).unwrap_or([cam.cx, cam.cy]);
+        let uv = cam.to_norm(proj);
+        let box_norm = [
+            (uv[0] - 0.04).clamp(0.05, 0.90),
+            (uv[1] - 0.04).clamp(0.05, 0.90),
+            (uv[0] + 0.04).clamp(0.10, 0.95),
+            (uv[1] + 0.04).clamp(0.10, 0.95),
+        ];
+        let vision: Arc<dyn armd::grasp::DetectionSource> = Arc::new(DetachedMockVision::new());
+        let pending = armd::grasp::prepare_from_snapshot(
+            &snap,
+            &json!({
+                "label": "cube",
+                "box_norm": box_norm,
+                "approach": "direct",
+                "overrides": {
+                    "approach_speed_mps": 0.15,
+                    "descend_speed_mps": 0.15,
+                    "settle_delay_s": 0.05,
+                    "height_probe_m": 0.0,
+                    "recentre_height_m": 0.0,
+                    "post_lift_settle_ms": 50
+                }
+            }),
+            snap.owner.authority.epoch,
+        )
+        .unwrap();
+        let planned = armd::grasp::plan(pending).unwrap();
+        let (id, _) = armd::grasp::begin_executor(&sup, adm, vision, planned).await.unwrap();
+        let outcome = wait_macro_end(sup.clone(), handle.clone(), id).await;
+        // In sim without a physical cube in the jaws, grasp runs through approach/centring/align/
+        // preopen/descend/close/held_width_m -> NOT_HOLDING (or CENTRING_FAILED if mock detection
+        // stays centered); crucially it MUST NOT fail with OWNER_TRANSFERRED or INTERNAL!
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Completed
+                    | Outcome::Failed("NOT_HOLDING")
+                    | Outcome::Failed("DROPPED")
+                    | Outcome::Failed("CENTRING_FAILED")
+            ),
+            "grasp::begin_executor must run cleanly on detached shell without touching SupervisorLock, got {outcome:?}"
+        );
+    }
+
+    // 5) Majors 11 & 12: Real measure_multiview::begin_executor on detached shell!
+    {
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 35;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
+        let vision: Arc<dyn armd::grasp::DetectionSource> = Arc::new(DetachedMockVision::new());
+        let plan = armd::measure_multiview::prepare_from_snapshot(
+            &snap,
+            &json!({"label": "cube", "views": 2, "settle_min_s": 0.5}),
+            snap.owner.authority.epoch,
+        )
+        .unwrap();
+        let (id, _) = armd::measure_multiview::begin_executor(&sup, adm, plan, vision).await.unwrap();
+        let outcome = wait_macro_end(sup.clone(), handle.clone(), id).await;
+        // Mock vision has no snapshot JPEG server, so settle completes cleanly and capture stops
+        // cleanly at SNAPSHOT_FAILED / DETECTION_UNAVAILABLE (or completes with measurement stored
+        // via owner-aware `sup.action_measurement(id)` — never touching detached `sup.inner()`).
+        assert!(
+            !matches!(outcome, Outcome::Failed("INTERNAL") | Outcome::Failed("OWNER_TRANSFERRED")),
+            "measure_multiview::begin_executor failed with unexpected detached-shell error: {outcome:?}"
+        );
+        // Verify owner-aware record_action_measurement / action_measurement works with detached shell!
+        sup.record_action_measurement(id, json!({"ok": true, "height_m": 0.042})).await;
+        let m = sup.action_measurement(id).await.expect("owner-aware measurement readback");
+        assert_eq!(m["height_m"], json!(0.042));
+    }
+
+    // 6) Major 11 + Minor 2: Real calib_hover::begin_executor + cancellation readback!
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 36;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE).await.unwrap();
+        let tcp0 = armd::motion::start_pose(&snap.plan_input_in(GoalFrame::EndLink).unwrap()).p;
+        let plan = armd::calib_hover::prepare_from_snapshot(
+            &snap,
+            &[],
+            &json!({
+                "candidate_fingerprint": "fp-exec-test",
+                "rpy_rad": [0.0, 1.57, 0.0],
+                "points": [{
+                    "id": "p1",
+                    "approach_m": [tcp0[0], tcp0[1], tcp0[2] + 0.04],
+                    "hover_m": [tcp0[0], tcp0[1], tcp0[2] + 0.01]
+                }]
+            }),
+            snap.owner.authority.epoch,
+        )
+        .unwrap();
+        let upstream = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:1").unwrap();
+        let (id, _, job_id) = armd::calib_hover::begin_executor(
+            &sup,
+            adm,
+            plan,
+            upstream,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        // Cancel via Step-1 StopRequests and wait for hover worker to persist & update job readback.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = handle.stop_requests().request();
+        let outcome = wait_macro_end(sup.clone(), handle.clone(), id).await;
+        assert_eq!(outcome, Outcome::Stopped);
+        let mut found = None;
+        for _ in 0..100 {
+            let jobs = sup.hover_jobs_snapshot().await;
+            if let Some(j) = jobs.into_iter().find(|j| j.id == job_id && j.state != "running") {
+                found = Some(j);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let job = found.expect("Minor 2: calib_hover job must be updated on executor cancellation");
+        assert_eq!(job.state, "cancelled");
+        assert!(job.end.is_some(), "Minor 2: cancelled hover job must record end arm state");
+        assert!(job.code.is_some(), "Minor 2: cancelled hover job must record owner cancellation code");
+    }
+
+    handle.stop_and_join();
+}
+
+#[test]
+fn review_m15_rt_gripper_opening_records_baseline_samples_and_recycles_spares() {
+    let (mut fx, mut b, _clock, _stop) = fixture();
+    let g_idx = fx.core.config.gripper_index().unwrap();
+    let policy = fx.core.config.gripper_policy.clone().unwrap();
+    // Start closed, open fully so opening travel qualifies for free-torque baseline learning.
+    fx.core.commanded_positions[g_idx] = policy.closed_rad;
+    fx.core.measured_positions[g_idx] = policy.closed_rad;
+    fx.core.target_positions[g_idx] = policy.closed_rad;
+    assert!(fx.core.gripper_baseline_pending.is_empty());
+
+    let snap = snap_of(&fx);
+    let prep = prepare_gripper(&snap, &json!({"command": "open", "speed": 1.0}), GripperBaselineCmd::None).unwrap();
+    let slot = prep.to_plan_slot(None).unwrap();
+    let w = |dst: &mut PlanSlot| *dst = slot.clone();
+    let r = b
+        .submit(
+            ClientId(1),
+            1,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::InstallPrepared {
+                write: &w,
+                kind: PreparedActionKind::Gripper,
+                prepared_boot: BOOT,
+                admission_request_id: 0,
+                check_workspace_revision: false,
+                poses_revision: None,
+                calibration_revision: None,
+                gripper_calib_revision: prep.stamp.gripper_calib_revision,
+                power_budget_revision: None,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(fx.step().command, Some((req, Ok(_))) if req == r));
+    let (_, outcome) = step_until_ended(&mut fx, 400);
+    assert_eq!(outcome, Outcome::Completed);
+    assert!(
+        !fx.core.gripper_baseline_pending.is_empty(),
+        "Major 15: qualifying RT gripper opening must record MoveSamples into gripper_baseline_pending"
+    );
+}
