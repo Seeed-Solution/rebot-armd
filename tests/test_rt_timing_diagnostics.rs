@@ -188,6 +188,19 @@ fn pause_hub(sup: &Arc<ArmSupervisor>) -> (mpsc::SyncSender<()>, thread::JoinHan
     (rel_tx, jh)
 }
 
+/// Acquires `hub.reader_guard()` and runs one clean primer release so `armd-dispatch` wakes,
+/// finishes its pre-lock `drain_sinks()` call, and deterministically blocks on `hub.latest()`
+/// before the caller's paused burst starts.
+fn pause_dispatch_at_hub(
+    sup: &Arc<ArmSupervisor>,
+    clock: &LatenessClock,
+) -> (mpsc::SyncSender<()>, thread::JoinHandle<()>) {
+    let pair = pause_hub(sup);
+    clock.run_schedule(&[0]);
+    thread::sleep(Duration::from_millis(10));
+    pair
+}
+
 /// Shared 10-release schedule on a 10 ms period exercising exact boundaries, sub-µs >1 ms
 /// classification, and multi-period skips:
 /// - Sorted `wake_lateness_us`: [200, 500, 1000, 1000, 2500, 5000, 6200, 10000, 12000, 23400]
@@ -380,9 +393,9 @@ async fn executor_owner_http_diagnostics_exact_lateness_skips_diag_dropped_and_z
     assert_eq!(body["wake_lateness_over_10ms"], 2);
     assert!(body["max_tick"]["wake_lateness_us"].is_u64(), "{body}");
 
-    // Saturate the droppable `diag_tx` ring (cap 256) by stalling `armd-dispatch` via
-    // `hub.reader_guard()`, and place a 15 ms lateness + 1 skip on the final dropped release.
-    let (rel_hub, hub_jh) = pause_hub(&sup);
+    // Saturate the droppable `diag_tx` ring (cap 256) by stalling `armd-dispatch` at `hub.latest()`
+    // via `pause_dispatch_at_hub`, and place a 15 ms lateness + 1 skip on the final dropped release.
+    let (rel_hub, hub_jh) = pause_dispatch_at_hub(&sup, &clock);
     let mut sat_schedule = vec![100_000u64; DIAG_RING_CAPACITY + 19];
     sat_schedule.push(15_000_000); // > 10 ms, +1 skip on a guaranteed-dropped TickSample!
     clock.run_schedule(&sat_schedule);
@@ -525,19 +538,25 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     q0["wake_lateness_over_5ms"] = serde_json::json!(0);
     q0["wake_lateness_over_10ms"] = serde_json::json!(0);
 
-    let mut q1 = q0.clone();
+    let mut q_mid = q0.clone();
+    q_mid["since_boot_ticks"] = serde_json::json!(250);
+    q_mid["releases_started"] = serde_json::json!(250);
+    q_mid["releases_total"] = serde_json::json!(250);
+    q_mid["wake_lateness_us"] = serde_json::json!({ "p50": 150, "p99": 500, "max": 800 });
+    q_mid["wake_late_max_ever"] = serde_json::json!(800);
+
+    let mut q1 = q_mid.clone();
     q1["since_boot_ticks"] = serde_json::json!(300);
     q1["releases_started"] = serde_json::json!(300);
     q1["releases_total"] = serde_json::json!(300);
-    q1["wake_lateness_us"] = serde_json::json!({ "p50": 150, "p99": 500, "max": 800 });
-    q1["wake_late_max_ever"] = serde_json::json!(800);
 
     let q1_lines = format!(
-        "{}\n{}\n{}\n{}\n",
-        serde_json::json!({ "type": "meta", "run_id": "q1-clean" }),
-        serde_json::json!({ "type": "sample", "run_id": "q1-clean", "phase": "baseline", "tick": q0 }),
-        serde_json::json!({ "type": "sample", "run_id": "q1-clean", "phase": "final", "tick": q1 }),
-        serde_json::json!({ "type": "summary", "run_id": "q1-clean", "stop_reason": "completed", "fault": null }),
+        "{}\n{}\n{}\n{}\n{}\n",
+        serde_json::json!({ "type": "meta", "run_id": "q1-clean", "enabled_loads": { "obs_poll": true } }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-clean", "phase": "baseline", "elapsed_s": 0.0, "tick": q0, "counters": { "obs_ok": 0 } }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-clean", "phase": "idle_tail_start", "elapsed_s": 3.0, "tick": q_mid, "counters": { "obs_ok": 20 } }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-clean", "phase": "final", "elapsed_s": 4.2, "tick": q1, "counters": { "obs_ok": 20 }, "safety_state": "Idle" }),
+        serde_json::json!({ "type": "summary", "run_id": "q1-clean", "stop_reason": "completed", "fault": null, "safety_state": "Idle", "terminal_safety_verified": true, "counters": { "obs_ok": 20 } }),
     );
     std::fs::write(&q1_path, q1_lines).unwrap();
     let q1_rep = run_analyze(&q1_path, None);
@@ -563,17 +582,22 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     d0["control_thread_lock_attempts"] = serde_json::json!(0);
     d0["control_thread_alloc_ops"] = serde_json::json!(0);
     d0["enqueue_to_wire_us"] = serde_json::json!({ "p50": 100, "p99": 200, "max": 250 });
-    let mut d1 = d0.clone();
+    let mut d_mid = d0.clone();
+    d_mid["since_boot_ticks"] = serde_json::json!(250);
+    d_mid["releases_started"] = serde_json::json!(250);
+    d_mid["releases_total"] = serde_json::json!(250);
+    d_mid["diag_dropped"] = serde_json::json!(5);
+    let mut d1 = d_mid.clone();
     d1["since_boot_ticks"] = serde_json::json!(300);
     d1["releases_started"] = serde_json::json!(300);
     d1["releases_total"] = serde_json::json!(300);
-    d1["diag_dropped"] = serde_json::json!(5);
     let drop_lines = format!(
-        "{}\n{}\n{}\n{}\n",
-        serde_json::json!({ "type": "meta", "run_id": "q1-drop" }),
-        serde_json::json!({ "type": "sample", "run_id": "q1-drop", "phase": "baseline", "tick": d0 }),
-        serde_json::json!({ "type": "sample", "run_id": "q1-drop", "phase": "final", "tick": d1 }),
-        serde_json::json!({ "type": "summary", "run_id": "q1-drop", "stop_reason": "completed", "fault": null }),
+        "{}\n{}\n{}\n{}\n{}\n",
+        serde_json::json!({ "type": "meta", "run_id": "q1-drop", "enabled_loads": { "obs_poll": true } }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-drop", "phase": "baseline", "elapsed_s": 0.0, "tick": d0, "counters": { "obs_ok": 0 } }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-drop", "phase": "idle_tail_start", "elapsed_s": 3.0, "tick": d_mid, "counters": { "obs_ok": 20 } }),
+        serde_json::json!({ "type": "sample", "run_id": "q1-drop", "phase": "final", "elapsed_s": 4.2, "tick": d1, "counters": { "obs_ok": 20 }, "safety_state": "Idle" }),
+        serde_json::json!({ "type": "summary", "run_id": "q1-drop", "stop_reason": "completed", "fault": null, "safety_state": "Idle", "terminal_safety_verified": true, "counters": { "obs_ok": 20 } }),
     );
     std::fs::write(&drop_path, drop_lines).unwrap();
     let drop_rep = run_analyze(&drop_path, Some(&devstat_path));
@@ -1627,12 +1651,29 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
         t["control_thread_lock_attempts"] = serde_json::json!(0);
         t["control_thread_alloc_ops"] = serde_json::json!(0);
         t["enqueue_to_wire_us"] = serde_json::json!({ "p50": 80, "p99": 150, "max": 200 });
-        serde_json::json!({ "type": "sample", "phase": "baseline", "elapsed_s": elapsed_s, "tick": t })
+        serde_json::json!({
+            "type": "sample",
+            "phase": "baseline",
+            "elapsed_s": elapsed_s,
+            "tick": t,
+            "counters": { "obs_ok": if elapsed_s > 0.0 { 25 } else { 0 } },
+            "safety_state": "Idle"
+        })
+    };
+
+    let make_idle_start = |ticks: u64, elapsed_s: f64| -> serde_json::Value {
+        let mut s = make_clean(ticks, elapsed_s);
+        s["phase"] = serde_json::json!("idle_tail_start");
+        s["counters"] = serde_json::json!({ "obs_ok": 25 });
+        s
     };
 
     let write_and_run_raw = |name: &str, lines: &[serde_json::Value], include_summary: bool| -> String {
         let p = dir.path().join(name);
-        let mut buf = format!("{}\n", serde_json::json!({ "type": "meta", "run_id": name }));
+        let mut buf = format!(
+            "{}\n",
+            serde_json::json!({ "type": "meta", "run_id": name, "enabled_loads": { "obs_poll": true } })
+        );
         for l in lines {
             let mut rec = l.clone();
             if let Some(obj) = rec.as_object_mut() {
@@ -1643,7 +1684,15 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
         if include_summary {
             buf.push_str(&format!(
                 "{}\n",
-                serde_json::json!({ "type": "summary", "run_id": name, "stop_reason": "completed", "fault": null })
+                serde_json::json!({
+                    "type": "summary",
+                    "run_id": name,
+                    "stop_reason": "completed",
+                    "fault": null,
+                    "safety_state": "Idle",
+                    "terminal_safety_verified": true,
+                    "counters": { "obs_ok": 25 }
+                })
             ));
         }
         std::fs::write(&p, buf).unwrap();
@@ -1662,8 +1711,11 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
         write_and_run_raw(name, &owned, true)
     };
 
-    // 1. Clean full-coverage run -> PASS
-    let clean_rep = write_and_run("clean.jsonl", &[make_clean(100, 0.0), make_clean(300, 4.0)]);
+    // 1. Clean full-coverage run (baseline -> idle_tail_start -> settled final >= 1.0 s later) -> PASS
+    let clean_rep = write_and_run(
+        "clean.jsonl",
+        &[make_clean(100, 0.0), make_idle_start(250, 3.0), make_clean(300, 4.2)],
+    );
     assert!(clean_rep.contains("**Overall Verdict: PASS**"), "{clean_rep}");
 
     // 2. Counter reset (releases_total decreased 300 -> 50) -> INVALID
@@ -1787,11 +1839,15 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
     pre0["tick"]["release_us"]["max"] = serde_json::json!(25_000);
     pre0["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
     pre0["tick"]["releases_over_20ms"] = serde_json::json!(1);
-    let mut pre1 = make_clean(300, 4.0);
+    let mut pre_mid = make_idle_start(250, 3.0);
+    pre_mid["tick"]["release_us"]["max"] = serde_json::json!(25_000);
+    pre_mid["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
+    pre_mid["tick"]["releases_over_20ms"] = serde_json::json!(1);
+    let mut pre1 = make_clean(300, 4.2);
     pre1["tick"]["release_us"]["max"] = serde_json::json!(25_000);
     pre1["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
     pre1["tick"]["releases_over_20ms"] = serde_json::json!(1);
-    let pre_rep = write_and_run("prerun_spike.jsonl", &[pre0, pre1]);
+    let pre_rep = write_and_run("prerun_spike.jsonl", &[pre0, pre_mid, pre1]);
     assert!(pre_rep.contains("**Overall Verdict: PASS**"), "{pre_rep}");
 
     // 13. In-run 25 ms spike that aged out past 1000-tick window (releases_over_20ms: 0 -> 1) -> FAIL!
@@ -1877,32 +1933,37 @@ fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
     assert!(wake_roll_rep.contains("**Overall Verdict: FAIL**"), "{wake_roll_rep}");
 
     let mut wake_mask0 = make_clean(100, 0.0);
-    wake_mask0["tick"]["wake_late_max_ever"] = serde_json::json!(15_000);
-    let mut wake_mask1 = make_clean(1600, 30.0);
-    wake_mask1["tick"]["wake_late_max_ever"] = serde_json::json!(15_000);
-    let wake_mask_rep = write_and_run("masked_wake.jsonl", &[wake_mask0, wake_mask1]);
+    wake_mask0["tick"]["wake_late_max_ever"] = serde_json::json!(20_000);
+    let mut wake_mask_mid = make_idle_start(1600, 30.0);
+    wake_mask_mid["tick"]["wake_late_max_ever"] = serde_json::json!(20_000);
+    let mut wake_mask1 = make_clean(1650, 31.2);
+    wake_mask1["tick"]["wake_late_max_ever"] = serde_json::json!(20_000);
+    let wake_mask_rep = write_and_run("masked_wake.jsonl", &[wake_mask0, wake_mask_mid, wake_mask1]);
     assert!(wake_mask_rep.contains("**Overall Verdict: INCOMPLETE"), "{wake_mask_rep}");
     assert!(wake_mask_rep.contains("masks in-run wake peak"), "{wake_mask_rep}");
 
     // 19. Major #4: missing/proxy-only allocation evidence MUST NEVER produce PASS!
     let mut no_alloc0 = make_clean(100, 0.0);
-    let mut no_alloc1 = make_clean(300, 4.0);
-    for sample in [&mut no_alloc0, &mut no_alloc1] {
+    let mut no_alloc_mid = make_idle_start(250, 3.0);
+    let mut no_alloc1 = make_clean(300, 4.2);
+    for sample in [&mut no_alloc0, &mut no_alloc_mid, &mut no_alloc1] {
         let obj = sample["tick"].as_object_mut().unwrap();
         obj.remove("control_thread_alloc_ops");
         obj.remove("max_tick");
         obj.remove("max_lock");
         obj.remove("max_release");
     }
-    let no_alloc_rep = write_and_run("no_alloc_evidence.jsonl", &[no_alloc0, no_alloc1]);
+    let no_alloc_rep = write_and_run("no_alloc_evidence.jsonl", &[no_alloc0, no_alloc_mid, no_alloc1]);
     assert!(no_alloc_rep.contains("**Overall Verdict: INCOMPLETE"), "{no_alloc_rep}");
     assert!(no_alloc_rep.contains("INCOMPLETE (missing/malformed allocation evidence)"), "{no_alloc_rep}");
 
     let mut proxy_alloc0 = make_clean(100, 0.0);
-    let mut proxy_alloc1 = make_clean(300, 4.0);
+    let mut proxy_alloc_mid = make_idle_start(250, 3.0);
+    let mut proxy_alloc1 = make_clean(300, 4.2);
     proxy_alloc0["tick"].as_object_mut().unwrap().remove("control_thread_alloc_ops");
+    proxy_alloc_mid["tick"].as_object_mut().unwrap().remove("control_thread_alloc_ops");
     proxy_alloc1["tick"].as_object_mut().unwrap().remove("control_thread_alloc_ops");
-    let proxy_alloc_rep = write_and_run("proxy_alloc_only.jsonl", &[proxy_alloc0, proxy_alloc1]);
+    let proxy_alloc_rep = write_and_run("proxy_alloc_only.jsonl", &[proxy_alloc0, proxy_alloc_mid, proxy_alloc1]);
     assert!(proxy_alloc_rep.contains("**Overall Verdict: INCOMPLETE"), "{proxy_alloc_rep}");
     assert!(proxy_alloc_rep.contains("PASS (proxy)"), "{proxy_alloc_rep}");
 
@@ -2282,11 +2343,16 @@ async fn tail_stall_sub_release_overrun_in_flight_stall_and_load_py_boundaries()
             .iter()
             .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("sample"))
             .collect();
-        assert!(sample_recs.len() >= 2, "expected >= 2 samples: {raw}");
+        assert!(sample_recs.len() >= 3, "expected >= 3 samples (baseline, idle_tail_start, final): {raw}");
         assert_eq!(sample_recs[0]["phase"], "baseline");
         assert_eq!(
             sample_recs[0]["counters"]["obs_ok"], 0,
             "baseline sample MUST complete before any load worker fires even with --baseline-s 0"
+        );
+        assert_eq!(
+            sample_recs[sample_recs.len() - 2]["phase"],
+            "idle_tail_start",
+            "load.py must persist idle_tail_start immediately before final: {raw}"
         );
         let last_sample = *sample_recs.last().unwrap();
         assert_eq!(last_sample["phase"], "final");
@@ -2302,6 +2368,7 @@ async fn tail_stall_sub_release_overrun_in_flight_stall_and_load_py_boundaries()
         let summary_rec = recs.last().unwrap();
         assert_eq!(summary_rec["type"], "summary");
         assert_eq!(summary_rec["stop_reason"], "completed");
+        assert_eq!(summary_rec["terminal_safety_verified"], true);
         assert!(
             summary_rec["idle_tail_elapsed_s"].as_f64().unwrap_or(0.0) >= 1.0,
             "load.py must wait >= 1.0 s of idle releases before final sample: {summary_rec}"
@@ -2510,6 +2577,114 @@ async fn completion_published_strictly_last_never_visible_during_tail_both_owner
         let after_stop = sup.tick_stats();
         assert!(!after_stop.loop_active);
         assert_eq!(after_stop.in_flight_release_us, 0);
+    }
+
+    // (c) Finding #3: Preemption strictly AFTER sample amendment and B2 tail-allocation accounting
+    //     and BEFORE the completion seal, with next grid point still in the future (50 ms period,
+    //     18 ms pre-amend + 4 ms pre-seal = 22 ms >= 20 ms while next grid at 50 ms is NOT crossed).
+    //     Both owners MUST keep releases_total == 0 / in_flight > 0 during pre-seal preemption,
+    //     then record releases_over_20ms == 1 and release_us_max_ever >= 22_000 at seal!
+    for use_executor in [false, true] {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = TailBarrierClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut legacy_jh = None;
+        let mut exec_handle = None;
+        let stats_ref = if use_executor {
+            let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(50));
+            cfg.alloc_timing = true;
+            let h = sup
+                .start_executor_with_hooks(
+                    cfg,
+                    PersistTestHooks {
+                        clock: Some(clock.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let s = h.stats().clone();
+            exec_handle = Some(h);
+            s
+        } else {
+            let loop_stats = Arc::new(ExecutorStats::default());
+            sup.attach_legacy_loop_stats(loop_stats.clone());
+            let rt = tokio::runtime::Handle::current();
+            let sup_t = sup.clone();
+            let clock_t = clock.clone();
+            let stop_t = stop.clone();
+            let stats_t = loop_stats.clone();
+            legacy_jh = Some(thread::spawn(move || {
+                run_periodic_with_clock(Duration::from_millis(50), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                    rt.block_on(sup_t.control_tick(dt));
+                });
+            }));
+            loop_stats
+        };
+
+        // First release: stall 22 ms strictly AFTER sample amendment / B2 tail-allocation
+        // accounting and BEFORE `commit_release_outcome_with_clock`, pausing on the barrier to
+        // verify zero premature completion while the next 50 ms grid point is still in the future.
+        stats_ref.pre_seal_delay_once_ns.store(22_000_000, Ordering::Release);
+        clock.arm_barrier.store(true, Ordering::Release);
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.inner.cv.notify_all();
+        }
+        clock.wait_entered();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let mid = sup.tick_stats();
+        assert_eq!(mid.releases_started, 1);
+        assert_eq!(
+            mid.releases_total, 0,
+            "owner(exec={use_executor}) MUST NOT publish completion during pre-seal preemption: {mid:?}"
+        );
+        assert!(mid.in_flight_release_us > 0);
+
+        clock.release_barrier();
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while (s.completed_sleeps < 1 || s.waiting_for_ns.is_none()) && Instant::now() < deadline {
+                let (next, _) = clock.inner.cv.wait_timeout(s, Duration::from_millis(20)).unwrap();
+                s = next;
+            }
+            assert!(s.waiting_for_ns.is_some());
+        }
+
+        let sealed = sup.tick_stats();
+        assert_eq!(sealed.releases_total, 1);
+        assert_eq!(sealed.in_flight_release_us, 0);
+        assert_eq!(
+            sealed.releases_over_20ms, 1,
+            "pre-seal preemption crossing 20 ms (with next grid point still in future) MUST record breach (exec={use_executor}): {sealed:?}"
+        );
+        assert!(sealed.release_us_max_ever >= 22_000, "{sealed:?}");
+        assert_eq!(sealed.skipped_releases, 0, "50 ms grid point was NOT crossed: {sealed:?}");
+
+        // Second release: 18 ms pre-amend + 4 ms pre-seal (split across the old timestamp line!) = 22 ms!
+        stats_ref.post_stats_delay_once_ns.store(18_000_000, Ordering::Release);
+        stats_ref.pre_seal_delay_once_ns.store(4_000_000, Ordering::Release);
+        clock.inner.run_schedule(&[0]);
+        let sealed2 = sup.tick_stats();
+        assert_eq!(sealed2.releases_total, 2);
+        assert_eq!(
+            sealed2.releases_over_20ms, 2,
+            "18 ms pre-amend + 4 ms post-amend/pre-seal preemption MUST cross 20 ms threshold (exec={use_executor}): {sealed2:?}"
+        );
+        assert_eq!(sealed2.skipped_releases, 0);
+
+        if let Some(h) = exec_handle {
+            assert_eq!(h.stats().total_allocs(), AllocCounts::ZERO);
+            h.stop_and_join();
+        } else {
+            stop.store(true, Ordering::Release);
+            clock.wake();
+            legacy_jh.unwrap().join().unwrap();
+        }
     }
 }
 
@@ -2787,6 +2962,124 @@ async fn loop_exit_and_wait_boundary_skip_accounting_both_owners() {
         assert_eq!(snap.skipped_releases, 0);
         assert!(!snap.loop_active);
     }
+
+    // ---- (3) Finding #4: Real Linux wall-clock check-to-sleep shutdown test on BOTH owners ----
+    // Preempt strictly AFTER `mono_now_ns() >= at_ns` passes inside `sleep_until_ns` and BEFORE
+    // entering the kernel futex sleep; request shutdown AFTER the next grid point has expired.
+    // Both owners MUST preserve the crossed deadline (`skipped_releases >= 1`), while a genuine
+    // idle-sleep shutdown (stop requested BEFORE next grid point) MUST add 0 skips!
+    for use_executor in [false, true] {
+        // (3a) Check-to-sleep boundary preemption across 10 ms period + shutdown -> skipped_releases >= 1!
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut legacy_jh = None;
+        let mut exec_handle = None;
+        let stats_ref = if use_executor {
+            let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(10));
+            cfg.alloc_timing = true;
+            let h = sup
+                .start_executor_with_hooks(cfg, PersistTestHooks::default())
+                .await
+                .unwrap();
+            let s = h.stats().clone();
+            exec_handle = Some(h);
+            s
+        } else {
+            let loop_stats = Arc::new(ExecutorStats::default());
+            sup.attach_legacy_loop_stats(loop_stats.clone());
+            let rt = tokio::runtime::Handle::current();
+            let sup_t = sup.clone();
+            let stop_t = stop.clone();
+            let stats_t = loop_stats.clone();
+            legacy_jh = Some(thread::spawn(move || {
+                armd::rt_core::executor::run_periodic(Duration::from_millis(10), &stop_t, &stats_t, |dt| {
+                    rt.block_on(sup_t.control_tick(dt));
+                });
+            }));
+            loop_stats
+        };
+
+        // Wait for at least 1 real release to complete cleanly, then arm a 35 ms stall right at
+        // the check-to-sleep boundary (after `mono_now_ns() >= at_ns`, before kernel wait).
+        let wait_r1 = Instant::now() + Duration::from_secs(2);
+        while stats_ref.releases_total.load(Ordering::Acquire) < 1 && Instant::now() < wait_r1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(stats_ref.releases_total.load(Ordering::Acquire) >= 1);
+        let skips_before = stats_ref.skipped_releases.load(Ordering::Acquire);
+        stats_ref.check_to_sleep_delay_once_ns.store(35_000_000, Ordering::Release);
+        // Wait until the control thread consumes the one-shot hook (entered the check-to-sleep stall).
+        let wait_hook = Instant::now() + Duration::from_secs(2);
+        while stats_ref.check_to_sleep_delay_once_ns.load(Ordering::Acquire) != 0 && Instant::now() < wait_hook {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(stats_ref.check_to_sleep_delay_once_ns.load(Ordering::Acquire), 0);
+        // Let >= 18 ms elapse so the 10 ms deadline expires BEFORE shutdown is requested.
+        tokio::time::sleep(Duration::from_millis(18)).await;
+        if let Some(h) = exec_handle {
+            h.stop_and_join();
+            assert_eq!(h.stats().total_allocs(), AllocCounts::ZERO);
+        } else {
+            stats_ref.signal_stop(&stop);
+            legacy_jh.unwrap().join().unwrap();
+        }
+        let snap = sup.tick_stats();
+        assert!(!snap.loop_active);
+        assert!(
+            snap.skipped_releases > skips_before,
+            "check-to-sleep shutdown past deadline MUST preserve crossed grid point (exec={use_executor}, before={skips_before}, snap={snap:?})"
+        );
+
+        // (3b) Real Linux wall-clock genuine idle sleep shutdown (40 ms period, stop 2 ms into sleep) -> 0 skips!
+        let sup_idle = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let stop_idle = Arc::new(AtomicBool::new(false));
+        let mut legacy_idle_jh = None;
+        let mut exec_idle = None;
+        let stats_idle = if use_executor {
+            let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(40));
+            cfg.alloc_timing = true;
+            let h = sup_idle
+                .start_executor_with_hooks(cfg, PersistTestHooks::default())
+                .await
+                .unwrap();
+            let s = h.stats().clone();
+            exec_idle = Some(h);
+            s
+        } else {
+            let loop_stats = Arc::new(ExecutorStats::default());
+            sup_idle.attach_legacy_loop_stats(loop_stats.clone());
+            let rt = tokio::runtime::Handle::current();
+            let sup_t = sup_idle.clone();
+            let stop_t = stop_idle.clone();
+            let stats_t = loop_stats.clone();
+            legacy_idle_jh = Some(thread::spawn(move || {
+                armd::rt_core::executor::run_periodic(Duration::from_millis(40), &stop_t, &stats_t, |dt| {
+                    rt.block_on(sup_t.control_tick(dt));
+                });
+            }));
+            loop_stats
+        };
+        let wait_idle_r1 = Instant::now() + Duration::from_secs(2);
+        while stats_idle.releases_total.load(Ordering::Acquire) < 1 && Instant::now() < wait_idle_r1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(stats_idle.releases_total.load(Ordering::Acquire) >= 1);
+        let skips_idle_before = stats_idle.skipped_releases.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        if let Some(h) = exec_idle {
+            h.stop_and_join();
+            assert_eq!(h.stats().total_allocs(), AllocCounts::ZERO);
+        } else {
+            stats_idle.signal_stop(&stop_idle);
+            legacy_idle_jh.unwrap().join().unwrap();
+        }
+        let snap_idle = sup_idle.tick_stats();
+        assert!(!snap_idle.loop_active);
+        assert_eq!(
+            snap_idle.skipped_releases, skips_idle_before,
+            "genuine idle-sleep shutdown BEFORE deadline must add 0 skips (exec={use_executor}): {snap_idle:?}"
+        );
+    }
 }
 
 // ============================================================================
@@ -2835,26 +3128,48 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
         t
     };
 
-    let write_jsonl = |name: &str, run_id: &str, t0: serde_json::Value, t1: serde_json::Value, summary: serde_json::Value| -> std::path::PathBuf {
+    let write_jsonl_full = |name: &str,
+                            run_id: &str,
+                            t0: serde_json::Value,
+                            t_mid: serde_json::Value,
+                            t1: serde_json::Value,
+                            summary: serde_json::Value|
+     -> std::path::PathBuf {
         let p = dir.path().join(name);
         let content = format!(
-            "{}\n{}\n{}\n{}\n",
-            serde_json::json!({ "type": "meta", "run_id": run_id }),
-            serde_json::json!({ "type": "sample", "run_id": run_id, "phase": "baseline", "elapsed_s": 0.0, "tick": t0 }),
-            serde_json::json!({ "type": "sample", "run_id": run_id, "phase": "final", "elapsed_s": 4.0, "tick": t1 }),
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": run_id, "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": run_id, "phase": "baseline", "elapsed_s": 0.0, "tick": t0, "counters": { "obs_ok": 0 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": run_id, "phase": "idle_tail_start", "elapsed_s": 3.0, "tick": t_mid, "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": run_id, "phase": "final", "elapsed_s": 4.2, "tick": t1, "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
             summary,
         );
         std::fs::write(&p, content).unwrap();
         p
     };
 
+    let complete_summary = |run_id: &str, stop_reason: &str, stop_detail: Option<&str>| -> serde_json::Value {
+        serde_json::json!({
+            "type": "summary",
+            "run_id": run_id,
+            "stop_reason": stop_reason,
+            "stop_detail": stop_detail,
+            "fault": null,
+            "safety_state": "Idle",
+            "terminal_safety_verified": true,
+            "terminal_observation_error": null,
+            "counters": { "obs_ok": 25 }
+        })
+    };
+
     // 0. Positive control: complete native capture -> PASS.
-    let pos_path = write_jsonl(
+    let pos_path = write_jsonl_full(
         "positive_control.jsonl",
         "pos-1",
         make_tick(100),
+        make_tick(250),
         make_tick(300),
-        serde_json::json!({ "type": "summary", "run_id": "pos-1", "stop_reason": "completed", "stop_detail": null, "fault": null }),
+        complete_summary("pos-1", "completed", None),
     );
     let pos_rep = run_analyze(&pos_path, Some(&devstat_path));
     assert!(pos_rep.contains("**Overall Verdict: PASS**"), "positive control must PASS:\n{pos_rep}");
@@ -2862,12 +3177,13 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
     // 1. Synthetic case 1: `final-during-tail` (mutates ONLY final sample's in_flight_release_us = 5000) -> INVALID!
     let mut tail_t1 = make_tick(300);
     tail_t1["in_flight_release_us"] = serde_json::json!(5_000);
-    let tail_path = write_jsonl(
+    let tail_path = write_jsonl_full(
         "final-during-tail.jsonl",
         "final-during-tail",
         make_tick(100),
+        make_tick(250),
         tail_t1,
-        serde_json::json!({ "type": "summary", "run_id": "final-during-tail", "stop_reason": "completed", "stop_detail": null, "fault": null }),
+        complete_summary("final-during-tail", "completed", None),
     );
     let tail_rep = run_analyze(&tail_path, Some(&devstat_path));
     assert!(tail_rep.contains("**Overall Verdict: INVALID"), "final-during-tail must be INVALID:\n{tail_rep}");
@@ -2891,12 +3207,13 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
     assert!(legacy_rep.contains("PASS (proxy)"), "legacy-unsealed must retain proxy breakdowns:\n{legacy_rep}");
 
     // 3. Synthetic case 3: `interrupted` (mutates ONLY summary.stop_reason = "interrupted") -> INVALID!
-    let int_path = write_jsonl(
+    let int_path = write_jsonl_full(
         "interrupted.jsonl",
         "interrupted",
         make_tick(100),
+        make_tick(250),
         make_tick(300),
-        serde_json::json!({ "type": "summary", "run_id": "interrupted", "stop_reason": "interrupted", "stop_detail": "signal:2", "fault": null }),
+        complete_summary("interrupted", "interrupted", Some("signal:2")),
     );
     let int_rep = run_analyze(&int_path, Some(&devstat_path));
     assert!(int_rep.contains("**Overall Verdict: INVALID"), "interrupted must be INVALID:\n{int_rep}");
@@ -2906,38 +3223,41 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
     );
 
     // 4. Additional stop_reason enum cases: "error" -> INVALID, "fault" -> FAIL, unknown -> INVALID.
-    let err_path = write_jsonl(
+    let err_path = write_jsonl_full(
         "stop_error.jsonl",
         "err-1",
         make_tick(100),
+        make_tick(250),
         make_tick(300),
-        serde_json::json!({ "type": "summary", "run_id": "err-1", "stop_reason": "error", "stop_detail": "idle_tail_no_release_progress", "fault": null }),
+        complete_summary("err-1", "error", Some("idle_tail_insufficient_release_progress")),
     );
     let err_rep = run_analyze(&err_path, Some(&devstat_path));
     assert!(err_rep.contains("**Overall Verdict: INVALID"), "{err_rep}");
     assert!(err_rep.contains("stop_reason='error'"), "{err_rep}");
 
-    let fault_path = write_jsonl(
+    let fault_path = write_jsonl_full(
         "stop_fault.jsonl",
         "flt-1",
         make_tick(100),
+        make_tick(250),
         make_tick(300),
-        serde_json::json!({ "type": "summary", "run_id": "flt-1", "stop_reason": "fault", "stop_detail": "safety_state=EStop", "fault": null }),
+        complete_summary("flt-1", "fault", Some("safety_state=EStop")),
     );
     let fault_rep = run_analyze(&fault_path, Some(&devstat_path));
     assert!(fault_rep.contains("**Overall Verdict: FAIL**"), "{fault_rep}");
 
-    // 5. Strict JSONL grammar checks: malformed JSON, unknown type, trailing record after summary,
-    //    foreign run_id, missing meta, duplicate final sample, loop_active == false -> ALL INVALID!
+    // 5. Strict JSONL grammar checks: malformed JSON, duplicate object keys at top-level & nested,
+    //    nonstandard NaN/Infinity constants, trailing record after summary, foreign run_id,
+    //    loop_active == false -> ALL INVALID!
     let malformed_path = dir.path().join("malformed.jsonl");
     std::fs::write(
         &malformed_path,
         format!(
             "{}\n{}\n{{broken json\n{}\n{}\n",
-            serde_json::json!({ "type": "meta", "run_id": "m1" }),
-            serde_json::json!({ "type": "sample", "run_id": "m1", "phase": "baseline", "tick": make_tick(100) }),
-            serde_json::json!({ "type": "sample", "run_id": "m1", "phase": "final", "tick": make_tick(300) }),
-            serde_json::json!({ "type": "summary", "run_id": "m1", "stop_reason": "completed", "fault": null }),
+            serde_json::json!({ "type": "meta", "run_id": "m1", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "m1", "phase": "baseline", "elapsed_s": 0.0, "tick": make_tick(100) }),
+            serde_json::json!({ "type": "sample", "run_id": "m1", "phase": "final", "elapsed_s": 4.2, "tick": make_tick(300) }),
+            complete_summary("m1", "completed", None),
         ),
     )
     .unwrap();
@@ -2945,16 +3265,190 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
     assert!(mal_rep.contains("**Overall Verdict: INVALID"), "{mal_rep}");
     assert!(mal_rep.contains("malformed JSON at line 3"), "{mal_rep}");
 
+    // Blocker #2a: duplicate key in summary ("interrupted" overwritten by "completed") with otherwise valid gate evidence -> INVALID!
+    let dup_sum_path = dir.path().join("dup_summary_key.jsonl");
+    std::fs::write(
+        &dup_sum_path,
+        format!(
+            "{}\n{}\n{}\n{}\n{{\"type\":\"summary\",\"run_id\":\"dup-s\",\"stop_reason\":\"interrupted\",\"stop_reason\":\"completed\",\"fault\":null,\"safety_state\":\"Idle\",\"terminal_safety_verified\":true,\"counters\":{{\"obs_ok\":25}}}}\n",
+            serde_json::json!({ "type": "meta", "run_id": "dup-s", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "dup-s", "phase": "baseline", "elapsed_s": 0.0, "tick": make_tick(100), "counters": { "obs_ok": 0 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": "dup-s", "phase": "idle_tail_start", "elapsed_s": 3.0, "tick": make_tick(250), "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": "dup-s", "phase": "final", "elapsed_s": 4.2, "tick": make_tick(300), "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
+        ),
+    )
+    .unwrap();
+    let dup_sum_rep = run_analyze(&dup_sum_path, Some(&devstat_path));
+    assert!(dup_sum_rep.contains("**Overall Verdict: INVALID"), "duplicate summary key must be INVALID:\n{dup_sum_rep}");
+    assert!(dup_sum_rep.contains("duplicate JSON object key 'stop_reason'"), "{dup_sum_rep}");
+
+    // Blocker #2b: nested duplicate key in tick ("releases_over_20ms":1 overwritten by 0) -> INVALID!
+    let dup_tick_raw = serde_json::to_string(&make_tick(300))
+        .unwrap()
+        .replacen("\"releases_over_20ms\":0", "\"releases_over_20ms\":1,\"releases_over_20ms\":0", 1);
+    let dup_tick_path = dir.path().join("dup_tick_key.jsonl");
+    std::fs::write(
+        &dup_tick_path,
+        format!(
+            "{}\n{}\n{}\n{{\"type\":\"sample\",\"run_id\":\"dup-t\",\"phase\":\"final\",\"elapsed_s\":4.2,\"tick\":{},\"counters\":{{\"obs_ok\":25}},\"safety_state\":\"Idle\"}}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "dup-t", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "dup-t", "phase": "baseline", "elapsed_s": 0.0, "tick": make_tick(100), "counters": { "obs_ok": 0 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": "dup-t", "phase": "idle_tail_start", "elapsed_s": 3.0, "tick": make_tick(250), "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
+            dup_tick_raw,
+            complete_summary("dup-t", "completed", None),
+        ),
+    )
+    .unwrap();
+    let dup_tick_rep = run_analyze(&dup_tick_path, Some(&devstat_path));
+    assert!(dup_tick_rep.contains("**Overall Verdict: INVALID"), "nested duplicate key must be INVALID:\n{dup_tick_rep}");
+    assert!(dup_tick_rep.contains("duplicate JSON object key 'releases_over_20ms'"), "{dup_tick_rep}");
+
+    // Blocker #2c: nonstandard NaN constant -> INVALID!
+    let nan_path = dir.path().join("nonstandard_nan.jsonl");
+    std::fs::write(
+        &nan_path,
+        format!(
+            "{}\n{}\n{}\n{{\"type\":\"sample\",\"run_id\":\"nan-1\",\"phase\":\"final\",\"elapsed_s\":NaN,\"tick\":{},\"counters\":{{\"obs_ok\":25}},\"safety_state\":\"Idle\"}}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "nan-1", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "nan-1", "phase": "baseline", "elapsed_s": 0.0, "tick": make_tick(100), "counters": { "obs_ok": 0 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": "nan-1", "phase": "idle_tail_start", "elapsed_s": 3.0, "tick": make_tick(250), "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
+            serde_json::to_string(&make_tick(300)).unwrap(),
+            complete_summary("nan-1", "completed", None),
+        ),
+    )
+    .unwrap();
+    let nan_rep = run_analyze(&nan_path, Some(&devstat_path));
+    assert!(nan_rep.contains("**Overall Verdict: INVALID"), "NaN constant must be INVALID:\n{nan_rep}");
+    assert!(nan_rep.contains("nonstandard JSON constant 'NaN'"), "{nan_rep}");
+
+    // Blocker #1a: meta + full_load + final 10 ms later + completed (no baseline, no idle_tail_start) -> INVALID!
+    let short_nobase_path = dir.path().join("full_load_10ms_final.jsonl");
+    std::fs::write(
+        &short_nobase_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "short-1", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "short-1", "phase": "full_load", "elapsed_s": 0.0, "tick": make_tick(100), "counters": { "obs_ok": 5 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": "short-1", "phase": "final", "elapsed_s": 0.01, "tick": make_tick(101), "counters": { "obs_ok": 5 }, "safety_state": "Idle" }),
+            complete_summary("short-1", "completed", None),
+        ),
+    )
+    .unwrap();
+    let short_nobase_rep = run_analyze(&short_nobase_path, Some(&devstat_path));
+    assert!(short_nobase_rep.contains("**Overall Verdict: INVALID"), "full_load->final 10 ms capture must be INVALID:\n{short_nobase_rep}");
+    assert!(short_nobase_rep.contains("expected 'baseline'"), "{short_nobase_rep}");
+    assert!(short_nobase_rep.contains("missing idle_tail_start"), "{short_nobase_rep}");
+
+    // Blocker #1b: short idle tail duration (0.4 s < 1.0 s) and insufficient releases_total progress (2 < 10) -> INVALID!
+    let short_tail_path = dir.path().join("short_idle_tail.jsonl");
+    std::fs::write(
+        &short_tail_path,
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "st-1", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "st-1", "phase": "baseline", "elapsed_s": 0.0, "tick": make_tick(100), "counters": { "obs_ok": 0 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": "st-1", "phase": "idle_tail_start", "elapsed_s": 3.0, "tick": make_tick(250), "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
+            serde_json::json!({ "type": "sample", "run_id": "st-1", "phase": "final", "elapsed_s": 3.4, "tick": make_tick(252), "counters": { "obs_ok": 25 }, "safety_state": "Idle" }),
+            complete_summary("st-1", "completed", None),
+        ),
+    )
+    .unwrap();
+    let short_tail_rep = run_analyze(&short_tail_path, Some(&devstat_path));
+    assert!(short_tail_rep.contains("**Overall Verdict: INVALID"), "{short_tail_rep}");
+    assert!(short_tail_rep.contains("idle tail duration 0.400s < required 1.000s"), "{short_tail_rep}");
+    assert!(short_tail_rep.contains("insufficient releases_total progress across idle tail"), "{short_tail_rep}");
+
+    // Blocker #1c: requested obs_poll enabled in meta but obs_ok == 0 -> INVALID!
+    let mut no_load_sum = complete_summary("nl-1", "completed", None);
+    no_load_sum["counters"]["obs_ok"] = serde_json::json!(0);
+    let no_load_path = write_jsonl_full(
+        "requested_load_skipped.jsonl",
+        "nl-1",
+        make_tick(100),
+        make_tick(250),
+        make_tick(300),
+        no_load_sum,
+    );
+    let no_load_rep = run_analyze(&no_load_path, Some(&devstat_path));
+    assert!(no_load_rep.contains("**Overall Verdict: INVALID"), "{no_load_rep}");
+    assert!(no_load_rep.contains("requested load(s) did not run (obs_poll)"), "{no_load_rep}");
+
+    // Major #6a: unverified terminal safety state (terminal_safety_verified == false) -> INVALID!
+    let mut unv_sum = complete_summary("unv-1", "completed", None);
+    unv_sum["terminal_safety_verified"] = serde_json::json!(false);
+    unv_sum["terminal_observation_error"] = serde_json::json!("HTTP_500");
+    let unv_path = write_jsonl_full(
+        "unverified_safety.jsonl",
+        "unv-1",
+        make_tick(100),
+        make_tick(250),
+        make_tick(300),
+        unv_sum,
+    );
+    let unv_rep = run_analyze(&unv_path, Some(&devstat_path));
+    assert!(unv_rep.contains("**Overall Verdict: INVALID"), "{unv_rep}");
+    assert!(unv_rep.contains("unverified terminal safety state"), "{unv_rep}");
+    assert!(unv_rep.contains("| Fault / stop trace check | `0 faults` | unverified terminal safety observation | INVALID |"), "{unv_rep}");
+
+    // Major #7: mixed process restart + fault AND mixed host reboot + release breach -> INVALID
+    //           (process continuity checked BEFORE hard_fail), while retaining observed FAIL rows!
+    let mut restart_flt_t1 = make_tick(300);
+    restart_flt_t1["process_start_unix_ns"] = serde_json::json!(1_700_000_999_000_000_000u64);
+    let restart_flt_path = write_jsonl_full(
+        "restart_and_fault.jsonl",
+        "rf-1",
+        make_tick(100),
+        make_tick(250),
+        restart_flt_t1,
+        complete_summary("rf-1", "fault", Some("safety_state=EStop")),
+    );
+    let restart_flt_rep = run_analyze(&restart_flt_path, Some(&devstat_path));
+    assert!(
+        restart_flt_rep.contains("**Overall Verdict: INVALID (process restart: process_start_unix_ns changed"),
+        "restart+fault MUST return INVALID (not FAIL):\n{restart_flt_rep}"
+    );
+    assert!(
+        restart_flt_rep.contains("| Fault / stop trace check | `0 faults` | stop_reason=fault (safety_state=EStop) | FAIL |"),
+        "restart+fault MUST retain observed fault in gate table:\n{restart_flt_rep}"
+    );
+
+    let mut reboot_breach_mid = make_tick(250);
+    reboot_breach_mid["releases_over_20ms"] = serde_json::json!(1);
+    reboot_breach_mid["release_us_max_ever"] = serde_json::json!(25_000);
+    reboot_breach_mid["release_us"]["max"] = serde_json::json!(25_000);
+    let mut reboot_breach_t1 = reboot_breach_mid.clone();
+    reboot_breach_t1["boot_id"] = serde_json::json!("boot-uuid-fix3-2");
+    reboot_breach_t1["since_boot_ticks"] = serde_json::json!(300);
+    reboot_breach_t1["releases_started"] = serde_json::json!(300);
+    reboot_breach_t1["releases_total"] = serde_json::json!(300);
+    let reboot_breach_path = write_jsonl_full(
+        "reboot_and_breach.jsonl",
+        "rb-1",
+        make_tick(100),
+        reboot_breach_mid,
+        reboot_breach_t1,
+        complete_summary("rb-1", "completed", None),
+    );
+    let reboot_breach_rep = run_analyze(&reboot_breach_path, Some(&devstat_path));
+    assert!(
+        reboot_breach_rep.contains("**Overall Verdict: INVALID (host reboot: boot_id changed"),
+        "reboot+breach MUST return INVALID:\n{reboot_breach_rep}"
+    );
+    assert!(
+        reboot_breach_rep.contains("| Every release (`release_us`) |") && reboot_breach_rep.contains("| FAIL |"),
+        "reboot+breach MUST retain observed release FAIL in gate table:\n{reboot_breach_rep}"
+    );
+
     let trailing_path = dir.path().join("trailing_after_summary.jsonl");
     std::fs::write(
         &trailing_path,
         format!(
             "{}\n{}\n{}\n{}\n{}\n",
-            serde_json::json!({ "type": "meta", "run_id": "t1" }),
-            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "baseline", "tick": make_tick(100) }),
-            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "final", "tick": make_tick(300) }),
-            serde_json::json!({ "type": "summary", "run_id": "t1", "stop_reason": "completed", "fault": null }),
-            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "full_load", "tick": make_tick(305) }),
+            serde_json::json!({ "type": "meta", "run_id": "t1", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "baseline", "elapsed_s": 0.0, "tick": make_tick(100) }),
+            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "final", "elapsed_s": 4.2, "tick": make_tick(300) }),
+            complete_summary("t1", "completed", None),
+            serde_json::json!({ "type": "sample", "run_id": "t1", "phase": "full_load", "elapsed_s": 4.5, "tick": make_tick(305) }),
         ),
     )
     .unwrap();
@@ -2967,10 +3461,10 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
         &foreign_path,
         format!(
             "{}\n{}\n{}\n{}\n",
-            serde_json::json!({ "type": "meta", "run_id": "r-a" }),
-            serde_json::json!({ "type": "sample", "run_id": "r-a", "phase": "baseline", "tick": make_tick(100) }),
-            serde_json::json!({ "type": "sample", "run_id": "r-other", "phase": "final", "tick": make_tick(300) }),
-            serde_json::json!({ "type": "summary", "run_id": "r-a", "stop_reason": "completed", "fault": null }),
+            serde_json::json!({ "type": "meta", "run_id": "r-a", "enabled_loads": { "obs_poll": true } }),
+            serde_json::json!({ "type": "sample", "run_id": "r-a", "phase": "baseline", "elapsed_s": 0.0, "tick": make_tick(100) }),
+            serde_json::json!({ "type": "sample", "run_id": "r-other", "phase": "final", "elapsed_s": 4.2, "tick": make_tick(300) }),
+            complete_summary("r-a", "completed", None),
         ),
     )
     .unwrap();
@@ -2980,12 +3474,13 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
 
     let mut inactive_t1 = make_tick(300);
     inactive_t1["loop_active"] = serde_json::json!(false);
-    let inactive_path = write_jsonl(
+    let inactive_path = write_jsonl_full(
         "loop_inactive.jsonl",
         "inact-1",
         make_tick(100),
+        make_tick(250),
         inactive_t1,
-        serde_json::json!({ "type": "summary", "run_id": "inact-1", "stop_reason": "completed", "fault": null }),
+        complete_summary("inact-1", "completed", None),
     );
     let inactive_rep = run_analyze(&inactive_path, Some(&devstat_path));
     assert!(inactive_rep.contains("**Overall Verdict: INVALID"), "{inactive_rep}");
@@ -2996,15 +3491,19 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
     let mut b19_0 = make_tick(100);
     b19_0["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 19_500 });
     b19_0["wake_late_max_ever"] = serde_json::json!(19_500);
+    let mut b19_mid = make_tick(250);
+    b19_mid["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 19_500 });
+    b19_mid["wake_late_max_ever"] = serde_json::json!(19_500);
     let mut b19_1 = make_tick(300);
     b19_1["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 19_500 });
     b19_1["wake_late_max_ever"] = serde_json::json!(19_500);
-    let b19_path = write_jsonl(
+    let b19_path = write_jsonl_full(
         "mit_prerun_19ms.jsonl",
         "mit-19",
         b19_0,
+        b19_mid,
         b19_1,
-        serde_json::json!({ "type": "summary", "run_id": "mit-19", "stop_reason": "completed", "fault": null }),
+        complete_summary("mit-19", "completed", None),
     );
     let b19_rep = run_analyze(&b19_path, Some(&devstat_path));
     assert!(b19_rep.contains("**Overall Verdict: INCOMPLETE"), "baseline-only 19.5 ms wake must be INCOMPLETE, not FAIL/PASS:\n{b19_rep}");
@@ -3013,54 +3512,70 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
     let mut hw30_0 = make_tick(100);
     hw30_0["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 400 });
     hw30_0["wake_late_max_ever"] = serde_json::json!(30_000);
+    let mut hw30_mid = make_tick(250);
+    hw30_mid["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 25_000 });
+    hw30_mid["wake_late_max_ever"] = serde_json::json!(30_000);
     let mut hw30_1 = make_tick(300);
     hw30_1["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 25_000 });
     hw30_1["wake_late_max_ever"] = serde_json::json!(30_000);
-    let hw30_path = write_jsonl(
+    let hw30_path = write_jsonl_full(
         "mit_mixed_25ms_hwm30.jsonl",
         "mit-hw30",
         hw30_0,
+        hw30_mid,
         hw30_1,
-        serde_json::json!({ "type": "summary", "run_id": "mit-hw30", "stop_reason": "completed", "fault": null }),
+        complete_summary("mit-hw30", "completed", None),
     );
     let hw30_rep = run_analyze(&hw30_path, Some(&devstat_path));
     assert!(hw30_rep.contains("**Overall Verdict: INCOMPLETE"), "mixed 25 ms window under 30 ms HWM must not PASS:\n{hw30_rep}");
 
-    // (6c) Late marker across 1500-tick gap with 15 ms pre-run HWM -> INCOMPLETE (unaligned marker rejected!).
+    // (6c) Late marker across 1500-tick gap with 20 ms pre-run HWM (upper bound 46.6 ms >= 45 ms) -> INCOMPLETE!
     let mut lm0 = make_tick(100);
-    lm0["wake_late_max_ever"] = serde_json::json!(15_000);
-    let mut lm1 = make_tick(1600);
-    lm1["wake_late_max_ever"] = serde_json::json!(15_000);
-    lm1["since_marker"] = serde_json::json!({
+    lm0["wake_late_max_ever"] = serde_json::json!(20_000);
+    let mut lm_mid = make_tick(1600);
+    lm_mid["wake_late_max_ever"] = serde_json::json!(20_000);
+    lm_mid["since_marker"] = serde_json::json!({
         "marker_id": 1, "status": "active", "releases_total_delta": 50, "wake_late_max": 200
     });
-    let lm_path = write_jsonl(
+    let mut lm1 = make_tick(1650);
+    lm1["wake_late_max_ever"] = serde_json::json!(20_000);
+    lm1["since_marker"] = serde_json::json!({
+        "marker_id": 1, "status": "active", "releases_total_delta": 100, "wake_late_max": 200
+    });
+    let lm_path = write_jsonl_full(
         "mit_late_marker.jsonl",
         "mit-lm",
         lm0,
+        lm_mid,
         lm1,
-        serde_json::json!({ "type": "summary", "run_id": "mit-lm", "stop_reason": "completed", "fault": null }),
+        complete_summary("mit-lm", "completed", None),
     );
     let lm_rep = run_analyze(&lm_path, Some(&devstat_path));
-    assert!(lm_rep.contains("**Overall Verdict: INCOMPLETE"), "late unaligned marker must NOT mask 1500-tick gap:\n{lm_rep}");
+    assert!(lm_rep.contains("**Overall Verdict: INCOMPLETE"), "late unaligned marker must NOT mask 1500-tick gap with 20 ms HWM:\n{lm_rep}");
 
-    // (6d) Properly baseline-aligned marker across 1500-tick gap with 15 ms pre-run HWM -> PASS!
+    // (6d) Properly baseline-aligned marker across 1500-tick gap with 20 ms pre-run HWM -> PASS!
     let mut am0 = make_tick(100);
-    am0["wake_late_max_ever"] = serde_json::json!(15_000);
+    am0["wake_late_max_ever"] = serde_json::json!(20_000);
     am0["since_marker"] = serde_json::json!({
         "marker_id": 2, "status": "active", "releases_total_delta": 0, "wake_late_max": 0
     });
-    let mut am1 = make_tick(1600);
-    am1["wake_late_max_ever"] = serde_json::json!(15_000);
-    am1["since_marker"] = serde_json::json!({
+    let mut am_mid = make_tick(1600);
+    am_mid["wake_late_max_ever"] = serde_json::json!(20_000);
+    am_mid["since_marker"] = serde_json::json!({
         "marker_id": 2, "status": "active", "releases_total_delta": 1500, "wake_late_max": 300
     });
-    let am_path = write_jsonl(
+    let mut am1 = make_tick(1650);
+    am1["wake_late_max_ever"] = serde_json::json!(20_000);
+    am1["since_marker"] = serde_json::json!({
+        "marker_id": 2, "status": "active", "releases_total_delta": 1550, "wake_late_max": 300
+    });
+    let am_path = write_jsonl_full(
         "mit_aligned_marker.jsonl",
         "mit-am",
         am0,
+        am_mid,
         am1,
-        serde_json::json!({ "type": "summary", "run_id": "mit-am", "stop_reason": "completed", "fault": null }),
+        complete_summary("mit-am", "completed", None),
     );
     let am_rep = run_analyze(&am_path, Some(&devstat_path));
     assert!(am_rep.contains("**Overall Verdict: PASS**"), "properly baseline-aligned marker must PASS:\n{am_rep}");
@@ -3068,21 +3583,214 @@ async fn synthetic_false_pass_cases_grammar_mit_and_load_py_interrupt() {
     // (6e) Strictly post-rollover window (1200 - 100 >= 1000) with 25 ms wake even under 30 ms pre-run HWM -> FAIL!
     let mut pr0 = make_tick(100);
     pr0["wake_late_max_ever"] = serde_json::json!(30_000);
-    let mut pr1 = make_tick(1200);
+    let mut pr_mid = make_tick(1200);
+    pr_mid["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 25_000 });
+    pr_mid["wake_late_max_ever"] = serde_json::json!(30_000);
+    let mut pr1 = make_tick(1250);
     pr1["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 25_000 });
     pr1["wake_late_max_ever"] = serde_json::json!(30_000);
-    let pr_path = write_jsonl(
+    let pr_path = write_jsonl_full(
         "mit_post_rollover_25ms.jsonl",
         "mit-pr",
         pr0,
+        pr_mid,
         pr1,
-        serde_json::json!({ "type": "summary", "run_id": "mit-pr", "stop_reason": "completed", "fault": null }),
+        complete_summary("mit-pr", "completed", None),
     );
     let pr_rep = run_analyze(&pr_path, Some(&devstat_path));
     assert!(pr_rep.contains("**Overall Verdict: FAIL**"), "post-rollover 25 ms wake must FAIL:\n{pr_rep}");
 
-    // 7. Live `load.py` SIGINT interruption test (on lock-free RT executor so Lock Gate stays clean):
-    //    sends SIGINT mid-run and verifies `stop_reason == "interrupted"` + exit code 130 + `analyze.py` INVALID!
+    // (6f) Minor #8: 1,100-tick gap with 500 us pre-run wake HWM and 400 us observed peak
+    //      (conservative MIT upper bound = 20 + 0.50 + 1.40 + 0.20 + 5 = 27.10 ms << 45 ms) -> PASS!
+    let mut lo0 = make_tick(100);
+    lo0["wake_late_max_ever"] = serde_json::json!(500);
+    lo0["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 400 });
+    let mut lo_mid = make_tick(1200);
+    lo_mid["wake_late_max_ever"] = serde_json::json!(500);
+    lo_mid["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 400 });
+    let mut lo1 = make_tick(1250);
+    lo1["wake_late_max_ever"] = serde_json::json!(500);
+    lo1["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 400 });
+    let lo_path = write_jsonl_full(
+        "mit_gap_low_hwm_500us.jsonl",
+        "mit-lo",
+        lo0,
+        lo_mid,
+        lo1,
+        complete_summary("mit-lo", "completed", None),
+    );
+    let lo_rep = run_analyze(&lo_path, Some(&devstat_path));
+    assert!(
+        lo_rep.contains("**Overall Verdict: PASS**"),
+        "1,100-tick gap bounded by 500 us HWM (< 45 ms MIT) MUST PASS:\n{lo_rep}"
+    );
+
+    // 7. Live `load.py` tests:
+    //    (7a) Major #5: signal handler re-entry while holding BOTH SharedState._lock & Event._cond -> 0 deadlock!
+    {
+        let scripts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/rt_qual");
+        let py_code = r#"
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import load
+state = load.SharedState()
+handler = load.make_signal_handler(state)
+prev = signal.signal(signal.SIGINT, handler)
+try:
+    # Hold BOTH SharedState._lock and interrupt_event._cond on the main thread while delivering
+    # two nested SIGINTs to verify zero same-thread lock re-entry deadlock!
+    with state._lock:
+        with state.interrupt_event._cond:
+            os.kill(os.getpid(), signal.SIGINT)
+            os.kill(os.getpid(), signal.SIGINT)
+    assert state.apply_pending_signal() is True
+    assert state.get_stop_reason() == ("interrupted", f"signal:{signal.SIGINT}")
+    assert state.workers_stop.is_set()
+    assert state.interrupt_event.is_set()
+finally:
+    signal.signal(signal.SIGINT, prev)
+"#;
+        let out = Command::new("python3")
+            .args(["-B", "-c", py_code])
+            .arg(&scripts_dir)
+            .output()
+            .expect("run signal re-entry test");
+        assert!(
+            out.status.success(),
+            "signal re-entry test failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    //    (7b) Blocker #1e + Major #6b: live `load.py` against real/stub HTTP servers verifying:
+    //         - deadline expiring during --baseline-s before load starts -> stop_reason="error", exit 3, INVALID!
+    //         - post-idle /api/v1/observation HTTP 500 while /diagnostics/tick succeeds -> stop_reason="error",
+    //           terminal_safety_verified=false, safety_state=null, INVALID!
+    {
+        let scripts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/rt_qual");
+        let out_deadline = dir.path().join("live_deadline_before_load.jsonl");
+        let out_obs_fail = dir.path().join("live_terminal_obs_fail.jsonl");
+        let py_stub = r#"
+import http.server, json, socketserver, subprocess, sys, threading, time
+
+scripts_dir, out_deadline, out_obs_fail = sys.argv[1], sys.argv[2], sys.argv[3]
+mode = {"fail_obs_after": 999999, "obs_calls": 0, "tick_calls": 0}
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+    def do_GET(self):
+        if self.path.startswith("/api/v1/diagnostics/tick"):
+            mode["tick_calls"] += 1
+            n = 100 + mode["tick_calls"] * 25
+            payload = {
+                "instance_id": "stub-1", "boot_id": "boot-stub-1",
+                "process_start_unix_ns": 1700000000000000000,
+                "owner_mode": "executor", "loop_active": True,
+                "stats_snapshot_lapped": False, "stats_writer_drops": 0,
+                "in_flight_release_us": 0, "since_boot_ticks": n,
+                "releases_started": n, "releases_total": n,
+                "release_us": {"p50": 500, "p99": 900, "max": 1200},
+                "release_us_max_ever": 1200, "releases_over_10ms": 0,
+                "releases_over_15ms": 0, "releases_over_20ms": 0,
+                "wake_lateness_us": {"p50": 50, "p99": 100, "max": 200},
+                "wake_late_max_ever": 200, "skipped_releases": 0,
+                "diag_dropped": 0, "tick_us": {"p50": 500, "p99": 900, "max": 1200},
+                "period_us": {"p50": 20000, "p99": 20100, "max": 20200},
+                "lock_us": {"max": 0}, "wait_us": {"max": 0},
+                "reader_hold_us": {"max": 0}, "writer_hold_us": {"max": 0},
+            }
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/api/v1/observation"):
+            mode["obs_calls"] += 1
+            if mode["obs_calls"] > mode["fail_obs_after"]:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'{"error":"simulated terminal obs failure"}')
+                return
+            body = json.dumps({"safety_state": "Idle", "fault": None, "feedback_age_ms": [1.0]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+srv = Server(("127.0.0.1", 0), Handler)
+port = srv.server_address[1]
+t = threading.Thread(target=srv.serve_forever, daemon=True)
+t.start()
+try:
+    # Case A: deadline (0.05 s) expires during --baseline-s (0.25 s) before load starts -> exit 3, error!
+    rc_a = subprocess.run([
+        sys.executable, "-B", f"{scripts_dir}/load.py",
+        "--host", "127.0.0.1", "--port", str(port),
+        "--duration", "0.05", "--baseline-s", "0.25", "--cooldown-s", "0",
+        "--no-motion", "--no-record", "--no-measure", "--no-ws-stream",
+        "--no-blackbox-log", "--no-bulk-http", "--obs-poll",
+        "--output", out_deadline,
+    ], check=False)
+    assert rc_a.returncode == 3, f"expected exit 3 on skipped load, got {rc_a.returncode}"
+
+    # Case B: post-idle /observation fails (HTTP 500) after load & pre-idle observation succeed -> exit 3!
+    # With --duration 0.15, obs-poll at 5 Hz runs ~1 call + pre-idle call = fail after call 2!
+    mode["obs_calls"] = 0
+    mode["tick_calls"] = 0
+    mode["fail_obs_after"] = 2
+    rc_b = subprocess.run([
+        sys.executable, "-B", f"{scripts_dir}/load.py",
+        "--host", "127.0.0.1", "--port", str(port),
+        "--duration", "0.15", "--baseline-s", "0", "--cooldown-s", "0",
+        "--obs-hz", "5", "--no-motion", "--no-record", "--no-measure",
+        "--no-ws-stream", "--no-blackbox-log", "--no-bulk-http", "--obs-poll",
+        "--output", out_obs_fail,
+    ], check=False)
+    assert rc_b.returncode == 3, f"expected exit 3 on terminal obs failure, got {rc_b.returncode}"
+finally:
+    srv.shutdown()
+"#;
+        let out = Command::new("python3")
+            .args(["-B", "-c", py_stub])
+            .arg(&scripts_dir)
+            .arg(&out_deadline)
+            .arg(&out_obs_fail)
+            .output()
+            .expect("run load.py stub tests");
+        assert!(
+            out.status.success(),
+            "load.py stub tests failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let dl_raw = std::fs::read_to_string(&out_deadline).unwrap();
+        let dl_sum: serde_json::Value = serde_json::from_str(dl_raw.lines().last().unwrap()).unwrap();
+        assert_eq!(dl_sum["stop_reason"], "error");
+        let dl_rep = run_analyze(&out_deadline, Some(&devstat_path));
+        assert!(dl_rep.contains("**Overall Verdict: INVALID"), "{dl_rep}");
+
+        let ob_raw = std::fs::read_to_string(&out_obs_fail).unwrap();
+        let ob_sum: serde_json::Value = serde_json::from_str(ob_raw.lines().last().unwrap()).unwrap();
+        assert_eq!(ob_sum["stop_reason"], "error");
+        assert_eq!(ob_sum["terminal_safety_verified"], false);
+        assert!(ob_sum["safety_state"].is_null(), "failed terminal obs must NOT leave stale safety_state: {ob_sum}");
+        let ob_rep = run_analyze(&out_obs_fail, Some(&devstat_path));
+        assert!(ob_rep.contains("**Overall Verdict: INVALID"), "{ob_rep}");
+    }
+
+    //    (7c) Live `load.py` SIGINT interruption test (on lock-free RT executor so Lock Gate stays clean):
+    //         sends SIGINT mid-run and verifies `stop_reason == "interrupted"` + exit code 130 + `analyze.py` INVALID!
     {
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
         let handle = sup
@@ -3336,7 +4044,7 @@ async fn executor_amend_ring_retains_32_paused_releases_and_accounts_saturation(
         .unwrap();
 
     const COUNT: usize = 32;
-    let (rel_hub1, hub_jh1) = pause_hub(&sup);
+    let (rel_hub1, hub_jh1) = pause_dispatch_at_hub(&sup, &clock);
     for i in 0..COUNT {
         let delay_ns = 2_000_000u64 + (i as u64) * 100_000;
         handle.stats().post_stats_delay_once_ns.store(delay_ns, Ordering::Release);
@@ -3346,13 +4054,13 @@ async fn executor_amend_ring_retains_32_paused_releases_and_accounts_saturation(
     hub_jh1.join().unwrap();
 
     let snap = sup.tick_stats();
-    assert_eq!(snap.releases_total, COUNT as u64);
+    assert_eq!(snap.releases_total, (COUNT + 1) as u64);
     assert_eq!(snap.diag_dropped, 0, "32 paused amended releases must not overflow 256-slot diag/amend rings");
     assert_eq!(snap.stats_writer_drops, 0);
     assert!(!snap.stats_snapshot_lapped);
     let samples = sup.tick_samples();
-    assert_eq!(samples.len(), COUNT);
-    for (i, s) in samples.iter().enumerate() {
+    assert_eq!(samples.len(), COUNT + 1);
+    for (i, s) in samples[1..].iter().enumerate() {
         let expected_min_us = 2_000u32 + (i as u32) * 100;
         assert!(
             s.release_us >= expected_min_us,
@@ -3363,10 +4071,11 @@ async fn executor_amend_ring_retains_32_paused_releases_and_accounts_saturation(
     }
     assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
 
-    // 2. Overflow test: pause `armd-dispatch` and burst > DIAG_RING_CAPACITY (256) amended releases
-    //    so ring saturation is deterministically accounted in `diag_dropped` with 0 heap allocs.
-    let (rel_hub2, hub_jh2) = pause_hub(&sup);
-    for _ in 0..(DIAG_RING_CAPACITY + 32) {
+    // 2. Overflow test: block `armd-dispatch` at `hub.latest()` and burst > DIAG_RING_CAPACITY (256)
+    //    amended releases so ring saturation is deterministically accounted in `diag_dropped` with 0 heap allocs.
+    const OVERFLOW_BURST: usize = DIAG_RING_CAPACITY + 32;
+    let (rel_hub2, hub_jh2) = pause_dispatch_at_hub(&sup, &clock);
+    for _ in 0..OVERFLOW_BURST {
         handle.stats().post_stats_delay_once_ns.store(1_500_000, Ordering::Release);
         clock.run_schedule(&[0]);
     }
@@ -3374,10 +4083,10 @@ async fn executor_amend_ring_retains_32_paused_releases_and_accounts_saturation(
     hub_jh2.join().unwrap();
 
     let after = sup.tick_stats();
-    assert_eq!(after.releases_total, COUNT as u64 + (DIAG_RING_CAPACITY + 32) as u64);
+    assert_eq!(after.releases_total, (COUNT + 2 + OVERFLOW_BURST) as u64);
     assert!(
         after.diag_dropped >= 32,
-        "overflowing 256-slot diag/amend rings must increment diag_dropped, got {}",
+        "overflowing 256-slot diag/amend rings must increment diag_dropped >= 32, got {}",
         after.diag_dropped
     );
     assert_eq!(after.stats_writer_drops, 0);

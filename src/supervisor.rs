@@ -4777,6 +4777,17 @@ impl ArmSupervisor {
         *self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats);
     }
 
+    /// Signals stop on the legacy periodic control loop, recording the monotonic shutdown timestamp
+    /// and waking Linux futex sleep when legacy loop stats are attached.
+    pub fn signal_legacy_stop(&self, stop: &AtomicBool) {
+        let stats = self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(stats) = stats {
+            stats.signal_stop(stop);
+        } else {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Handle to the synchronous RT executor when ownership has transferred.
     pub fn executor_handle(&self) -> Option<crate::rt_core::executor::RtExecutorHandle> {
         let slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());

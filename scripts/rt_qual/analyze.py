@@ -72,6 +72,74 @@ PCT_MAX_REQUIRED_KEYS = (
 RECOGNIZED_OWNER_MODES = ("legacy", "executor")
 VALID_STOP_REASONS = ("completed", "interrupted", "fault", "error")
 INVALID_BOOT_ID_PLACEHOLDERS = frozenset({"unknown", "unknown-boot", "none", "null", "n/a", "na"})
+FAULT_SAFETY_STATES = frozenset({"Fault", "EStop", "E_STOP", "FAULT"})
+KNOWN_LOAD_KEYS = frozenset(
+    {"motion", "obs_poll", "ws_stream", "measure", "record", "blackbox_log", "bulk_http"}
+)
+MIN_IDLE_TAIL_S = 1.0
+IDLE_TAIL_PERIOD_MULTIPLIER = 20.0
+MIN_IDLE_TAIL_RELEASES = 10
+
+
+def _strict_object_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"duplicate JSON object key {k!r}")
+        out[k] = v
+    return out
+
+
+def _strict_parse_constant(token: str) -> Any:
+    raise ValueError(f"nonstandard JSON constant {token!r}")
+
+
+def strict_json_loads(raw: str) -> Any:
+    return json.loads(
+        raw,
+        object_pairs_hook=_strict_object_pairs_hook,
+        parse_constant=_strict_parse_constant,
+    )
+
+
+def missing_requested_load_activity(enabled_loads: dict[str, bool], counters: dict[str, Any]) -> list[str]:
+    """Return enabled load names with zero observed execution activity in `counters`."""
+    missing: list[str] = []
+    if enabled_loads.get("obs_poll"):
+        obs_ok = get_nonneg_int(counters, "obs_ok")
+        if not (obs_ok is not None and obs_ok > 0):
+            missing.append("obs_poll")
+    if enabled_loads.get("ws_stream"):
+        ws_msgs = get_nonneg_int(counters, "ws_msgs") or 0
+        ws_reconn = get_nonneg_int(counters, "ws_reconnects") or 0
+        ws_err = counters.get("ws_err")
+        if not (ws_msgs > 0 or ws_reconn > 0 or (isinstance(ws_err, dict) and bool(ws_err))):
+            missing.append("ws_stream")
+    if enabled_loads.get("measure"):
+        m_ok = get_nonneg_int(counters, "measure_ok") or 0
+        m_err = counters.get("measure_err")
+        if not (m_ok > 0 or (isinstance(m_err, dict) and bool(m_err))):
+            missing.append("measure")
+    if enabled_loads.get("blackbox_log"):
+        bb_ok = get_nonneg_int(counters, "blackbox_ok") or 0
+        bb_err = counters.get("blackbox_err")
+        if not (bb_ok > 0 or (isinstance(bb_err, dict) and bool(bb_err))):
+            missing.append("blackbox_log")
+    if enabled_loads.get("bulk_http"):
+        b_ok = get_nonneg_int(counters, "bulk_ok") or 0
+        b_err = counters.get("bulk_err")
+        if not (b_ok > 0 or (isinstance(b_err, dict) and bool(b_err))):
+            missing.append("bulk_http")
+    if enabled_loads.get("motion"):
+        moves = get_nonneg_int(counters, "motion_moves_done") or 0
+        cycles = get_nonneg_int(counters, "motion_cycles_done") or 0
+        if not (moves > 0 or cycles > 0):
+            missing.append("motion")
+    if enabled_loads.get("record"):
+        rec_state = counters.get("record_state")
+        if not (isinstance(rec_state, str) and rec_state not in ("disabled", "pending", "")):
+            missing.append("record")
+    return missing
 
 
 def get_nonneg_int(d: dict[str, Any], key: str) -> int | None:
@@ -275,6 +343,7 @@ class LoadRun:
     has_summary: bool = False
     grammar_errors: list[str] = field(default_factory=list)
     final_sample_count: int = 0
+    idle_tail_start_count: int = 0
 
 
 def load_input(path: Path) -> LoadRun:
@@ -285,7 +354,7 @@ def load_input(path: Path) -> LoadRun:
     # Auto-detect legacy dev6 tickload.json (single JSON object with "ticks": [...]) vs native JSONL.
     if text.startswith("{"):
         try:
-            obj = json.loads(text)
+            obj = strict_json_loads(text)
             if isinstance(obj, dict) and isinstance(obj.get("ticks"), list):
                 samples: list[LoadSample] = []
                 failed_polls: list[dict[str, Any]] = []
@@ -314,7 +383,7 @@ def load_input(path: Path) -> LoadRun:
                     "measure": obj.get("measure"),
                 }
                 return LoadRun("tickload_json", meta, summary, samples, failed_polls=failed_polls)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             pass
 
     meta: dict[str, Any] = {}
@@ -323,6 +392,7 @@ def load_input(path: Path) -> LoadRun:
     meta_count = 0
     summary_count = 0
     final_sample_count = 0
+    idle_tail_start_count = 0
     samples = []
     failed_polls = []
     grammar_errors: list[str] = []
@@ -335,9 +405,10 @@ def load_input(path: Path) -> LoadRun:
         if not line:
             continue
         try:
-            rec = json.loads(line)
-        except json.JSONDecodeError as exc:
-            grammar_errors.append(f"malformed JSON at line {line_no}: {exc.msg}")
+            rec = strict_json_loads(line)
+        except (json.JSONDecodeError, ValueError) as exc:
+            msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+            grammar_errors.append(f"malformed JSON at line {line_no}: {msg}")
             continue
         if not isinstance(rec, dict):
             grammar_errors.append(f"non-object JSON record at line {line_no}")
@@ -383,6 +454,8 @@ def load_input(path: Path) -> LoadRun:
             phase_str = str(rec.get("phase") or "unknown")
             if phase_str == "final":
                 final_sample_count += 1
+            elif phase_str == "idle_tail_start":
+                idle_tail_start_count += 1
             if poll_failed or not isinstance(tick, dict):
                 failed_polls.append(
                     {
@@ -421,6 +494,7 @@ def load_input(path: Path) -> LoadRun:
         has_summary=has_summary,
         grammar_errors=grammar_errors,
         final_sample_count=final_sample_count,
+        idle_tail_start_count=idle_tail_start_count,
     )
 
 
@@ -1060,13 +1134,17 @@ def analyze(
     summary_stop_reason: str | None = None
     summary_stop_detail: str | None = None
     stop_reason_fault = False
+    jsonl_capture_complete = load_run.source_format != "jsonl"
+    terminal_safety_ok = load_run.source_format != "jsonl"
     if load_run.failed_polls:
         first_err = load_run.failed_polls[0].get("error", "poll failed")
         invalid_reasons.append(f"failed poll(s): {len(load_run.failed_polls)} poll failure(s) (first: {first_err})")
     if n_samples < 2:
         invalid_reasons.append(f"fewer than 2 tick samples ({n_samples}); cannot compute run delta")
     if load_run.source_format == "jsonl":
+        jsonl_ok = True
         if not load_run.has_summary:
+            jsonl_ok = False
             invalid_reasons.append("incomplete capture: missing terminal summary record")
         else:
             summary_stop_reason = get_nonempty_str(load_run.summary, "stop_reason")
@@ -1075,20 +1153,125 @@ def analyze(
                 pass
             elif summary_stop_reason == "fault":
                 stop_reason_fault = True
+                jsonl_ok = False
             elif summary_stop_reason in ("interrupted", "error"):
+                jsonl_ok = False
                 detail_sfx = f" ({summary_stop_detail})" if summary_stop_detail else ""
                 invalid_reasons.append(f"incomplete run: stop_reason='{summary_stop_reason}'{detail_sfx}")
             else:
+                jsonl_ok = False
                 invalid_reasons.append(
                     f"invalid or missing summary stop_reason: {load_run.summary.get('stop_reason')!r} "
                     f"(expected one of {VALID_STOP_REASONS})"
                 )
+        if samples[0].phase != "baseline":
+            jsonl_ok = False
+            invalid_reasons.append(
+                f"incomplete capture: first sample phase is '{samples[0].phase}' (expected 'baseline')"
+            )
         if load_run.final_sample_count > 1:
+            jsonl_ok = False
             invalid_reasons.append(f"duplicate final samples ({load_run.final_sample_count}; expected exactly 1)")
         if samples[-1].phase != "final":
+            jsonl_ok = False
             invalid_reasons.append(
                 f"incomplete capture: last sample phase is '{samples[-1].phase}' (expected 'final')"
             )
+
+        if load_run.has_summary and summary_stop_reason == "completed":
+            # 1. Verify persisted idle-tail boundary (`idle_tail_start` -> `final`) with required
+            #    wall duration >= max(1.0 s, 2 * period * 10) and monotonic `releases_total` progress.
+            required_idle_tail_s = max(
+                MIN_IDLE_TAIL_S, IDLE_TAIL_PERIOD_MULTIPLIER * (float(nom_period_us) / 1_000_000.0)
+            )
+            if load_run.idle_tail_start_count == 0:
+                jsonl_ok = False
+                invalid_reasons.append(
+                    "incomplete capture: missing idle_tail_start boundary sample before final"
+                )
+            elif load_run.idle_tail_start_count > 1:
+                jsonl_ok = False
+                invalid_reasons.append(
+                    f"duplicate idle_tail_start samples ({load_run.idle_tail_start_count}; expected exactly 1)"
+                )
+            elif n_samples < 3 or samples[-2].phase != "idle_tail_start":
+                jsonl_ok = False
+                invalid_reasons.append(
+                    "incomplete capture: idle_tail_start sample must immediately precede final sample"
+                )
+            else:
+                pre_idle = samples[-2]
+                fin_idle = samples[-1]
+                idle_dt_s: float | None = None
+                if pre_idle.elapsed_s is not None and fin_idle.elapsed_s is not None:
+                    idle_dt_s = fin_idle.elapsed_s - pre_idle.elapsed_s
+                elif pre_idle.ts_unix is not None and fin_idle.ts_unix is not None:
+                    idle_dt_s = fin_idle.ts_unix - pre_idle.ts_unix
+                if idle_dt_s is None or idle_dt_s < required_idle_tail_s:
+                    jsonl_ok = False
+                    got_str = "missing" if idle_dt_s is None else f"{idle_dt_s:.3f}s"
+                    invalid_reasons.append(
+                        f"incomplete capture: idle tail duration {got_str} < required {required_idle_tail_s:.3f}s"
+                    )
+                pre_rel = get_nonneg_int(pre_idle.tick, "releases_total")
+                fin_rel = get_nonneg_int(fin_idle.tick, "releases_total")
+                if pre_rel is None or fin_rel is None:
+                    jsonl_ok = False
+                    invalid_reasons.append(
+                        "incomplete capture: missing releases_total on idle_tail_start/final boundary"
+                    )
+                elif not process_identity_changed:
+                    if (fin_rel - pre_rel) < MIN_IDLE_TAIL_RELEASES:
+                        jsonl_ok = False
+                        invalid_reasons.append(
+                            f"incomplete capture: insufficient releases_total progress across idle tail "
+                            f"({fin_rel - pre_rel} < {MIN_IDLE_TAIL_RELEASES})"
+                        )
+                    base_rel = get_nonneg_int(samples[0].tick, "releases_total")
+                    if base_rel is not None and pre_rel <= base_rel:
+                        jsonl_ok = False
+                        invalid_reasons.append(
+                            "incomplete capture: zero releases completed before idle tail "
+                            f"(baseline={base_rel}, idle_tail_start={pre_rel})"
+                        )
+
+            # 2. Verify requested load configuration is declared and every enabled load ran.
+            raw_enabled = load_run.meta.get("enabled_loads")
+            if (
+                not isinstance(raw_enabled, dict)
+                or not raw_enabled
+                or any(k not in KNOWN_LOAD_KEYS or not isinstance(v, bool) for k, v in raw_enabled.items())
+            ):
+                jsonl_ok = False
+                invalid_reasons.append("incomplete capture: missing or malformed meta.enabled_loads")
+            else:
+                term_counters = (
+                    load_run.summary.get("counters")
+                    if isinstance(load_run.summary.get("counters"), dict)
+                    else samples[-1].counters
+                )
+                unmet_loads = missing_requested_load_activity(raw_enabled, term_counters)
+                if unmet_loads:
+                    jsonl_ok = False
+                    invalid_reasons.append(
+                        f"incomplete capture: requested load(s) did not run ({', '.join(unmet_loads)})"
+                    )
+
+            # 3. Verify fresh post-idle terminal safety observation succeeded.
+            ts_ver = get_strict_bool(load_run.summary, "terminal_safety_verified")
+            ts_state = get_nonempty_str(load_run.summary, "safety_state")
+            ts_err = load_run.summary.get("terminal_observation_error")
+            ts_err_present = ts_err is not None and str(ts_err).strip() != ""
+            if ts_ver is True and ts_state is not None and not ts_err_present:
+                terminal_safety_ok = True
+            else:
+                terminal_safety_ok = False
+                jsonl_ok = False
+                invalid_reasons.append(
+                    "unverified terminal safety state (missing or failed terminal observation)"
+                )
+
+        jsonl_capture_complete = jsonl_ok
     if instance_changed:
         invalid_reasons.append(f"daemon restart: instance_id changed ({' -> '.join(distinct_instance_ids)})")
     if boot_id_changed:
@@ -1494,6 +1677,16 @@ def analyze(
             break
 
     faults_seen = sorted({s.fault for s in samples if s.fault})
+    for s in samples:
+        if s.safety_state in FAULT_SAFETY_STATES:
+            tag = f"safety_state={s.safety_state}"
+            if tag not in faults_seen:
+                faults_seen.append(tag)
+    sum_safety = get_nonempty_str(load_run.summary, "safety_state")
+    if sum_safety in FAULT_SAFETY_STATES:
+        tag = f"safety_state={sum_safety}"
+        if tag not in faults_seen:
+            faults_seen.append(tag)
     if load_run.summary.get("fault") and load_run.summary["fault"] not in faults_seen:
         faults_seen.append(str(load_run.summary["fault"]))
     if stop_reason_fault and not faults_seen:
@@ -1574,15 +1767,7 @@ def analyze(
         and (writer_drops_max is not None and writer_drops_max == 0)
         and not terminal_in_flight_incomplete
         and not contradiction_seen
-        and (
-            load_run.source_format != "jsonl"
-            or (
-                load_run.has_summary
-                and summary_stop_reason == "completed"
-                and load_run.final_sample_count == 1
-                and samples[-1].phase == "final"
-            )
-        )
+        and jsonl_capture_complete
         and n_samples >= 2
         and release_over_20_delta is not None
         and (releases_total_series.verified_in_run_delta or 0) > 0
@@ -1631,15 +1816,7 @@ def analyze(
             and not load_run.failed_polls
             and not load_run.grammar_errors
             and not terminal_in_flight_incomplete
-            and (
-                load_run.source_format != "jsonl"
-                or (
-                    load_run.has_summary
-                    and summary_stop_reason == "completed"
-                    and load_run.final_sample_count == 1
-                    and samples[-1].phase == "final"
-                )
-            )
+            and jsonl_capture_complete
             and n_samples >= 2
             and skipped_delta is not None
         )
@@ -1793,7 +1970,7 @@ def analyze(
         mit_gaps.append("wake_lateness_us not exposed (using period proxy)")
     elif wake_lateness_partial:
         mit_gaps.append("wake_lateness_us missing on some samples")
-    if wake_rollover_masked:
+    if wake_rollover_masked and (mit_total_ms is None or mit_total_ms >= MIT_WATCHDOG_MS):
         mit_gaps.append(
             "pre-run wake_late_max_ever masks in-run wake peak across >1000-tick sample gap without baseline-aligned since_marker"
         )
@@ -1823,6 +2000,15 @@ def analyze(
         mit_detail = f"n/a (missing timing fields; gap: {'; '.join(mit_gaps)})"
 
     fault_pass = len(faults_seen) == 0
+    if not fault_pass:
+        fault_status = "FAIL"
+        fault_detail = "; ".join(faults_seen)
+    elif load_run.source_format == "jsonl" and not terminal_safety_ok:
+        fault_status = "INVALID"
+        fault_detail = "unverified terminal safety observation"
+    else:
+        fault_status = "PASS"
+        fault_detail = "none"
 
     hard_fail = (
         (not release_pass)
@@ -1839,8 +2025,13 @@ def analyze(
         or (not alloc_evidence_complete)
         or bool(mit_gaps)
     )
+    continuity_reasons = [
+        r for r in invalid_reasons if r.startswith(("daemon restart:", "host reboot:", "process restart:"))
+    ]
     if load_run.source_format == "tickload_json":
         overall_verdict = "DIAGNOSTIC ONLY (legacy tickload.json; cannot certify Stage 3 §6 gate)"
+    elif process_identity_changed:
+        overall_verdict = f"INVALID ({'; '.join(continuity_reasons[:3])})"
     elif hard_fail:
         overall_verdict = "FAIL"
     elif invalid_reasons:
@@ -1882,7 +2073,7 @@ def analyze(
     out.append(f"| MIT watchdog budget | `20 + extra + 5 < 45 ms` | {mit_detail} | {mit_status} |")
     out.append(
         f"| Fault / stop trace check | `0 faults` | "
-        f"{'none' if fault_pass else '; '.join(faults_seen)} | {'PASS' if fault_pass else 'FAIL'} |"
+        f"{fault_detail} | {fault_status} |"
     )
     out.append("")
 

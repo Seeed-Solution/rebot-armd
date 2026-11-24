@@ -1973,7 +1973,7 @@ mod tests {
 
         let make_sample = move |k: u64| -> TickSample {
             let ku = k as u32;
-            let waited_for = if k % 2 == 0 {
+            let waited_for = if k.is_multiple_of(2) {
                 Some(Holder {
                     kind: "read",
                     location: loc_read,
@@ -1985,7 +1985,7 @@ mod tests {
             } else {
                 None
             };
-            let longest_hold = if k % 3 == 0 {
+            let longest_hold = if k.is_multiple_of(3) {
                 Some(Holder {
                     kind: "write",
                     location: loc_write,
@@ -2022,12 +2022,12 @@ mod tests {
                 usage: ThreadUsage {
                     lock_cpu_us: ku % 500,
                     tx_frames: 2,
-                    tx_would_block: u32::from(k % 5 == 0),
-                    tx_enobufs: u32::from(k % 11 == 0),
-                    tx_deferred: u32::from(k % 13 == 0),
+                    tx_would_block: u32::from(k.is_multiple_of(5)),
+                    tx_enobufs: u32::from(k.is_multiple_of(11)),
+                    tx_deferred: u32::from(k.is_multiple_of(13)),
                     tx_pending: ku % 7,
-                    tx_dropped_stale: u32::from(k % 17 == 0),
-                    tx_dropped_stopped: u32::from(k % 19 == 0),
+                    tx_dropped_stale: u32::from(k.is_multiple_of(17)),
+                    tx_dropped_stopped: u32::from(k.is_multiple_of(19)),
                     tx_send_us: ku % 600,
                     tx_send_cpu_us: ku % 200,
                     tx_frame_max_us: ku % 300,
@@ -2036,7 +2036,7 @@ mod tests {
                 },
                 waited_for,
                 longest_hold,
-                late: k % 7 == 0,
+                late: k.is_multiple_of(7),
                 release_seq: k,
                 safety_epoch: k * 3 + 1,
                 maint_req_id: k * 5 + 2,

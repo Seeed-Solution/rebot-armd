@@ -50,6 +50,8 @@ VALID_STOP_REASONS = ("completed", "interrupted", "fault", "error")
 _STOP_REASON_PRIORITY = {"completed": 0, "error": 1, "interrupted": 2, "fault": 3}
 MIN_IDLE_TAIL_S = 1.0
 IDLE_TAIL_PERIOD_MULTIPLIER = 20.0  # 2 * period * 10 idle releases minimum
+MIN_IDLE_TAIL_RELEASES = 10
+SIGNAL_POLL_SLICE_S = 0.05
 
 # Default J1 joint-path waypoints matching qual-ref/tickload.py (B601-RS workspace).
 DEFAULT_RPY = (0.0, math.radians(41.0), 0.0)
@@ -118,10 +120,13 @@ def extract_rx_ages_ms(obs: Any) -> list[float]:
 class SharedState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # Lock-free pending signal slot written ONLY by the OS signal handler so signal delivery
+        # never acquires `_lock` or `Event._cond` (prevents same-thread re-entry deadlock).
+        self._pending_signal: int | None = None
         # Signals background load workers and periodic tick sampler to wind down.
         self.workers_stop = threading.Event()
-        # Set ONLY by SIGINT/SIGTERM or an arm fault (never set by normal load completion),
-        # so the post-load idle tail wait sleeps for the full >= 1 s idle window unless interrupted.
+        # Set ONLY by SIGINT/SIGTERM (applied in normal control flow) or an arm fault (never set
+        # by normal load completion), so the post-load idle tail waits for the full >= 1 s window.
         self.interrupt_event = threading.Event()
         self.phase: str = "init"
         self.fault: str | None = None
@@ -149,6 +154,59 @@ class SharedState:
             "record_episode_id": None,
         }
 
+    def record_signal_lockfree(self, signum: int) -> None:
+        """Async-signal-safe recorder: touches NO locks and NO threading.Event primitives."""
+        if self._pending_signal is None:
+            self._pending_signal = signum
+
+    def apply_pending_signal(self) -> bool:
+        """Apply any signal recorded by `record_signal_lockfree` in normal control flow."""
+        sig = self._pending_signal
+        if sig is not None:
+            self.request_interrupt(f"signal:{sig}")
+            return True
+        return False
+
+    def is_workers_stopped(self) -> bool:
+        if self._pending_signal is not None:
+            return True
+        return self.workers_stop.is_set()
+
+    def is_interrupted(self) -> bool:
+        if self._pending_signal is not None:
+            return True
+        return self.interrupt_event.is_set()
+
+    def wait_workers_stop(self, timeout_s: float) -> bool:
+        """Wait for `workers_stop` or a lock-free pending signal in bounded slices."""
+        if self.apply_pending_signal() or self.workers_stop.is_set():
+            return True
+        end = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            rem = end - time.monotonic()
+            if rem <= 0.0:
+                return self.apply_pending_signal() or self.workers_stop.is_set()
+            if self.workers_stop.wait(min(rem, SIGNAL_POLL_SLICE_S)):
+                self.apply_pending_signal()
+                return True
+            if self.apply_pending_signal():
+                return True
+
+    def wait_interrupt(self, timeout_s: float) -> bool:
+        """Wait for `interrupt_event` or a lock-free pending signal in bounded slices."""
+        if self.apply_pending_signal() or self.interrupt_event.is_set():
+            return True
+        end = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            rem = end - time.monotonic()
+            if rem <= 0.0:
+                return self.apply_pending_signal() or self.interrupt_event.is_set()
+            if self.interrupt_event.wait(min(rem, SIGNAL_POLL_SLICE_S)):
+                self.apply_pending_signal()
+                return True
+            if self.apply_pending_signal():
+                return True
+
     def set_stop_reason(self, reason: str, detail: str | None = None) -> None:
         if reason not in VALID_STOP_REASONS:
             raise ValueError(f"invalid stop_reason: {reason!r}")
@@ -160,6 +218,7 @@ class SharedState:
                 self.stop_detail = detail
 
     def get_stop_reason(self) -> tuple[str, str | None]:
+        self.apply_pending_signal()
         with self._lock:
             return self.stop_reason, self.stop_detail
 
@@ -167,6 +226,17 @@ class SharedState:
         self.set_stop_reason("interrupted", detail)
         self.workers_stop.set()
         self.interrupt_event.set()
+
+    def clear_safety_state(self) -> None:
+        with self._lock:
+            self.safety_state = None
+
+    def snapshot_counters(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in self.counters.items()
+            }
 
     def set_phase(self, phase: str) -> None:
         with self._lock:
@@ -444,7 +514,7 @@ def sample_tick_once(
         "run_id": run_id,
         "ts_unix": round(now_unix, 6),
         "ts_iso": utc_iso(now_unix),
-        "elapsed_s": round(elapsed, 3),
+        "elapsed_s": round(elapsed, 6),
         "phase": phase,
         "enabled_loads": enabled_loads,
         "tick": tick_data,
@@ -496,14 +566,50 @@ def infer_nominal_period_s(tick: Any) -> float:
     return 0.02
 
 
-def extract_completed_count(tick: Any) -> int | None:
+def extract_releases_total(tick: Any) -> int | None:
+    """Strictly extract monotonic `releases_total` (never falls back to `since_boot_ticks`)."""
     if not isinstance(tick, dict):
         return None
-    for key in ("releases_total", "since_boot_ticks"):
-        v = tick.get(key)
-        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
-            return int(v)
+    v = tick.get("releases_total")
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        return int(v)
     return None
+
+
+def missing_requested_load_activity(enabled_loads: dict[str, bool], counters: dict[str, Any]) -> list[str]:
+    """Return names of enabled loads that recorded zero execution activity."""
+    missing: list[str] = []
+    if enabled_loads.get("obs_poll"):
+        if not (isinstance(counters.get("obs_ok"), int) and counters["obs_ok"] > 0):
+            missing.append("obs_poll")
+    if enabled_loads.get("ws_stream"):
+        ws_ok = (counters.get("ws_msgs") or 0) > 0 or (counters.get("ws_reconnects") or 0) > 0 or bool(counters.get("ws_err"))
+        if not ws_ok:
+            missing.append("ws_stream")
+    if enabled_loads.get("measure"):
+        if not ((counters.get("measure_ok") or 0) > 0 or bool(counters.get("measure_err"))):
+            missing.append("measure")
+    if enabled_loads.get("blackbox_log"):
+        if not ((counters.get("blackbox_ok") or 0) > 0 or bool(counters.get("blackbox_err"))):
+            missing.append("blackbox_log")
+    if enabled_loads.get("bulk_http"):
+        if not ((counters.get("bulk_ok") or 0) > 0 or bool(counters.get("bulk_err"))):
+            missing.append("bulk_http")
+    if enabled_loads.get("motion"):
+        if not ((counters.get("motion_moves_done") or 0) > 0 or (counters.get("motion_cycles_done") or 0) > 0):
+            missing.append("motion")
+    if enabled_loads.get("record"):
+        if counters.get("record_state") in ("disabled", "pending", None):
+            missing.append("record")
+    return missing
+
+
+def make_signal_handler(state: SharedState) -> Any:
+    """Return an async-signal-safe handler that never acquires Python locks or Event primitives."""
+    def _on_signal(signum: int, _frame: Any) -> None:
+        state.record_signal_lockfree(signum)
+
+    return _on_signal
 
 
 def capture_settled_final_sample(
@@ -520,7 +626,8 @@ def capture_settled_final_sample(
     and `in_flight_release_us == 0`. Immediately stops if a release is stalled >= 20 ms."""
     sample = sample_tick_once(base_url, run_id, t0, state, enabled_loads, phase_override="final")
     for _ in range(max_attempts - 1):
-        if state.interrupt_event.is_set():
+        if state.is_interrupted():
+            state.apply_pending_signal()
             break
         tick = sample.get("tick")
         if not isinstance(tick, dict) or sample.get("tick_error"):
@@ -541,7 +648,7 @@ def capture_settled_final_sample(
         has_active_in_flight = in_flight_int is not None and in_flight_int > 0
         if not (has_open_count or has_active_in_flight):
             break
-        if state.interrupt_event.wait(settle_sleep_s):
+        if state.wait_interrupt(settle_sleep_s):
             break
         sample = sample_tick_once(base_url, run_id, t0, state, enabled_loads, phase_override="final")
     return sample
@@ -549,7 +656,8 @@ def capture_settled_final_sample(
 
 def check_arm_state(arm: Arm, state: SharedState) -> bool:
     """Return True if healthy, False if faulted or stopped."""
-    if state.workers_stop.is_set():
+    if state.is_workers_stopped():
+        state.apply_pending_signal()
         return False
     st = arm.state()
     if state.note_observation(st):
@@ -568,7 +676,8 @@ def execute_one_cycle(
     home_joints: list[float] | None,
 ) -> bool:
     """Run one bounded motion cycle. Returns False if stopped/faulted/deadline."""
-    if state.workers_stop.is_set() or time.monotonic() >= deadline:
+    if state.is_workers_stopped() or time.monotonic() >= deadline:
+        state.apply_pending_signal()
         return False
     if motion_mode == "tickload":
         targets = (DEFAULT_POINT_B, DEFAULT_POINT_A)
@@ -580,7 +689,7 @@ def execute_one_cycle(
             if not check_arm_state(arm, state):
                 return False
             if dwell_s > 0:
-                state.workers_stop.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
+                state.wait_workers_stop(min(dwell_s, max(0.0, deadline - time.monotonic())))
     else:
         assert home_joints is not None
         p_plus = list(home_joints)
@@ -597,7 +706,7 @@ def execute_one_cycle(
             if not check_arm_state(arm, state):
                 return False
             if dwell_s > 0:
-                state.workers_stop.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
+                state.wait_workers_stop(min(dwell_s, max(0.0, deadline - time.monotonic())))
     state.inc("motion_cycles_done")
     return True
 
@@ -716,9 +825,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.record:
         state.set_counter("record_state", "pending")
 
-    def on_signal(signum: int, _frame: Any) -> None:
-        state.request_interrupt(f"signal:{signum}")
-
+    on_signal = make_signal_handler(state)
     prev_sigint = signal.signal(signal.SIGINT, on_signal)
     prev_sigterm = signal.signal(signal.SIGTERM, on_signal)
 
@@ -733,6 +840,10 @@ def main(argv: list[str] | None = None) -> int:
     sampler_thread: threading.Thread | None = None
     idle_wait_s = MIN_IDLE_TAIL_S
     idle_elapsed_s = 0.0
+    requested_any_load = any(enabled_loads.values())
+    load_entered = False
+    terminal_safety_verified = False
+    terminal_observation_error: str | None = None
 
     try:
         with out_path.open("w", encoding="utf-8") as fh:
@@ -796,11 +907,17 @@ def main(argv: list[str] | None = None) -> int:
                 sampler_thread.start()
 
             try:
-                if args.baseline_s > 0 and not state.workers_stop.is_set():
-                    state.workers_stop.wait(min(args.baseline_s, max(0.0, deadline - time.monotonic())))
+                if args.baseline_s > 0 and not state.is_workers_stopped():
+                    state.wait_workers_stop(min(args.baseline_s, max(0.0, deadline - time.monotonic())))
+
+                state.apply_pending_signal()
+                if requested_any_load and not state.is_workers_stopped() and time.monotonic() >= deadline:
+                    state.set_stop_reason("error", "deadline_expired_before_load_start")
+                    state.workers_stop.set()
 
                 # Spawn background load threads.
-                if not state.workers_stop.is_set() and time.monotonic() < deadline:
+                if not state.is_workers_stopped() and time.monotonic() < deadline:
+                    load_entered = True
                     if args.obs_poll:
                         workers.append(threading.Thread(
                             target=run_obs_poll, args=(http_base, args.obs_hz, deadline, state),
@@ -833,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 # Foreground motion + recording inside `with Arm(...)`.
                 needs_arm = args.motion or args.record
-                if needs_arm and not state.workers_stop.is_set() and time.monotonic() < deadline:
+                if needs_arm and not state.is_workers_stopped() and time.monotonic() < deadline:
                     arm_kwargs: dict[str, Any] = {
                         "host": http_base,
                         "enable": args.motion,
@@ -868,11 +985,11 @@ def main(argv: list[str] | None = None) -> int:
                                     if not check_arm_state(arm, state):
                                         raise RuntimeError(f"arm faulted after move A: {state.fault}")
                                     if args.dwell_s > 0:
-                                        state.workers_stop.wait(min(args.dwell_s, max(0.0, deadline - time.monotonic())))
+                                        state.wait_workers_stop(min(args.dwell_s, max(0.0, deadline - time.monotonic())))
 
                             cycle_idx = 0
                             # Record one episode (wraps cycle 0 when motion is enabled, else timed window).
-                            if args.record and not state.workers_stop.is_set() and time.monotonic() < deadline:
+                            if args.record and not state.is_workers_stopped() and time.monotonic() < deadline:
                                 state.set_phase("motion_record" if args.motion else "record_load")
                                 try:
                                     arm.create_dataset(args.record_dataset, exist_ok=True)
@@ -888,7 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
                                                 raise RuntimeError(f"arm faulted during recorded cycle: {state.fault}")
                                         else:
                                             rec_wait = min(args.record_seconds, max(0.0, deadline - time.monotonic()))
-                                            state.workers_stop.wait(rec_wait)
+                                            state.wait_workers_stop(rec_wait)
                                     state.set_counter("record_episode_id", rec.episode_id)
                                     state.set_counter("record_state", "saved" if rec.episode_id else "discarded")
                                 except RebotError as exc:
@@ -900,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
                             # Remaining motion cycles under full load.
                             if args.motion:
                                 state.set_phase("full_load")
-                                while cycle_idx < args.cycles and not state.workers_stop.is_set() and time.monotonic() < deadline:
+                                while cycle_idx < args.cycles and not state.is_workers_stopped() and time.monotonic() < deadline:
                                     ok = execute_one_cycle(
                                         arm, args.motion_mode, args.speed_scale, args.dwell_s,
                                         args.j1_delta_rad, deadline, state, home_joints,
@@ -908,17 +1025,17 @@ def main(argv: list[str] | None = None) -> int:
                                     cycle_idx += 1
                                     if not ok:
                                         break
-                                if not state.has_fault() and not state.workers_stop.is_set():
+                                if not state.has_fault() and not state.is_workers_stopped():
                                     state.set_phase("cooldown")
                                     arm.home()
                                     check_arm_state(arm, state)
                                     if args.cooldown_s > 0:
-                                        state.workers_stop.wait(min(args.cooldown_s, max(0.0, deadline - time.monotonic())))
+                                        state.wait_workers_stop(min(args.cooldown_s, max(0.0, deadline - time.monotonic())))
                             else:
                                 state.set_phase("full_load")
                                 remaining = max(0.0, deadline - time.monotonic())
                                 if remaining > 0:
-                                    state.workers_stop.wait(remaining)
+                                    state.wait_workers_stop(remaining)
                     except RebotError as exc:
                         # Check whether the arm faulted; never clear faults.
                         try:
@@ -931,18 +1048,20 @@ def main(argv: list[str] | None = None) -> int:
                     except RuntimeError as exc:
                         if not state.has_fault():
                             state.trip_fault(str(exc))
-                else:
+                elif not state.is_workers_stopped():
                     state.set_phase("full_load")
                     remaining = max(0.0, deadline - time.monotonic())
                     if remaining > 0:
-                        state.workers_stop.wait(remaining)
+                        state.wait_workers_stop(remaining)
             except KeyboardInterrupt:
                 state.request_interrupt("KeyboardInterrupt")
             except Exception as exc:
                 state.set_stop_reason("error", f"load_exception:{err_tag(exc)}: {exc}")
 
+            state.apply_pending_signal()
+
             # Stop all background loads and periodic sampler cleanly, then revoke sampler writes
-            # so a timed-out background sampler can never append records after final/summary.
+            # so a timed-out background sampler can never append records after idle_tail_start/final/summary.
             state.workers_stop.set()
             for w in workers:
                 w.join(timeout=3.0)
@@ -956,49 +1075,89 @@ def main(argv: list[str] | None = None) -> int:
             if alive_threads:
                 state.set_stop_reason("error", f"threads_still_alive:{','.join(alive_threads)}")
 
-            # Post-load idle release tail: wait >= max(1.0 s, 2 * period * 10) of idle releases
-            # on `interrupt_event` (NOT `workers_stop`) before taking the settled `final` sample.
+            if state.get_stop_reason()[0] == "completed" and requested_any_load:
+                if not load_entered:
+                    state.set_stop_reason("error", "deadline_expired_before_load_start")
+                else:
+                    missing_loads = missing_requested_load_activity(enabled_loads, state.snapshot_counters())
+                    if missing_loads:
+                        state.set_stop_reason("error", f"requested_load_no_activity:{','.join(missing_loads)}")
+
+            # Post-load idle release tail:
+            # 1. Verify safety observation before entering idle tail (fail-closed on errors).
+            # 2. Persist explicit `idle_tail_start` diagnostics boundary sample.
+            # 3. Wait >= max(1.0 s, 2 * period * 10) of idle releases on `interrupt_event`.
+            # 4. Verify terminal safety observation strictly AFTER idle tail (fail-closed; never
+            #    retain stale healthy safety_state if the terminal observation request fails).
+            # 5. Capture settled `final` sample and verify `releases_total` progressed across the tail.
             pre_idle_total: int | None = None
+            pre_idle_elapsed_s: float | None = None
             reason_now, _ = state.get_stop_reason()
             if reason_now == "completed":
                 try:
                     obs_pre = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
                     state.note_observation(obs_pre)
-                except Exception:
-                    pass
-                reason_now, _ = state.get_stop_reason()
-            if reason_now == "completed":
-                try:
-                    pre_idle_tick = http_get_json(f"{http_base}/api/v1/diagnostics/tick", timeout=2.0)
-                    pre_idle_total = extract_completed_count(pre_idle_tick)
+                    _, pre_safety = extract_fault_info(obs_pre)
+                    if pre_safety is None:
+                        state.set_stop_reason("error", "pre_idle_observation_missing_safety_state")
                 except Exception as exc:
-                    state.set_stop_reason("error", f"pre_idle_poll_failed:{err_tag(exc)}: {exc}")
+                    state.clear_safety_state()
+                    state.set_stop_reason("error", f"pre_idle_observation_failed:{err_tag(exc)}: {exc}")
                 reason_now, _ = state.get_stop_reason()
+
             if reason_now == "completed":
                 state.set_phase("idle_tail")
+                pre_idle_sample = sample_tick_once(
+                    http_base, args.run_id, t0, state, enabled_loads, phase_override="idle_tail_start"
+                )
                 idle_start = time.monotonic()
-                idle_deadline = idle_start + idle_wait_s
-                try:
-                    while not state.interrupt_event.is_set():
-                        rem = idle_deadline - time.monotonic()
-                        if rem <= 0.0:
-                            break
-                        state.interrupt_event.wait(rem)
-                except KeyboardInterrupt:
-                    state.request_interrupt("KeyboardInterrupt")
-                idle_elapsed_s = time.monotonic() - idle_start
-                reason_now, _ = state.get_stop_reason()
-                if reason_now == "completed" and idle_elapsed_s < idle_wait_s:
+                writer.write_terminal(pre_idle_sample)
+                if pre_idle_sample.get("tick_error") or not isinstance(pre_idle_sample.get("tick"), dict):
                     state.set_stop_reason(
                         "error",
-                        f"idle_tail_short:{idle_elapsed_s:.3f}s<{idle_wait_s:.3f}s",
+                        f"pre_idle_poll_failed:{pre_idle_sample.get('tick_error') or 'no_tick'}",
                     )
-                if state.get_stop_reason()[0] == "completed":
+                else:
+                    pre_idle_total = extract_releases_total(pre_idle_sample.get("tick"))
+                    pre_idle_elapsed_s = pre_idle_sample.get("elapsed_s")
+                    if pre_idle_total is None:
+                        state.set_stop_reason("error", "pre_idle_missing_releases_total")
+                reason_now, _ = state.get_stop_reason()
+
+                if reason_now == "completed":
+                    idle_deadline = idle_start + idle_wait_s
                     try:
-                        obs_post = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
-                        state.note_observation(obs_post)
-                    except Exception:
-                        pass
+                        while not state.is_interrupted():
+                            rem = idle_deadline - time.monotonic()
+                            if rem <= 0.0:
+                                break
+                            state.wait_interrupt(rem)
+                    except KeyboardInterrupt:
+                        state.request_interrupt("KeyboardInterrupt")
+                    state.apply_pending_signal()
+                    idle_elapsed_s = time.monotonic() - idle_start
+                    reason_now, _ = state.get_stop_reason()
+                    if reason_now == "completed" and idle_elapsed_s < idle_wait_s:
+                        state.set_stop_reason(
+                            "error",
+                            f"idle_tail_short:{idle_elapsed_s:.3f}s<{idle_wait_s:.3f}s",
+                        )
+
+            # Always poll terminal safety state after idle tail / shutdown; never swallow failures.
+            try:
+                obs_post = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
+                state.note_observation(obs_post)
+                _, post_safety = extract_fault_info(obs_post)
+                if post_safety is not None:
+                    terminal_safety_verified = True
+                else:
+                    terminal_observation_error = "missing_safety_state"
+                    state.clear_safety_state()
+                    state.set_stop_reason("error", "terminal_observation_missing_safety_state")
+            except Exception as exc:
+                terminal_observation_error = f"{err_tag(exc)}: {exc}"
+                state.clear_safety_state()
+                state.set_stop_reason("error", f"terminal_observation_failed:{err_tag(exc)}: {exc}")
 
             final_sample = capture_settled_final_sample(http_base, args.run_id, t0, state, enabled_loads)
             if state.get_stop_reason()[0] == "completed":
@@ -1008,15 +1167,25 @@ def main(argv: list[str] | None = None) -> int:
                         f"final_poll_failed:{final_sample.get('tick_error') or 'no_tick'}",
                     )
                 else:
-                    final_total = extract_completed_count(final_sample.get("tick"))
-                    if not (
-                        pre_idle_total is not None
-                        and final_total is not None
-                        and final_total > pre_idle_total
+                    final_total = extract_releases_total(final_sample.get("tick"))
+                    final_elapsed_s = final_sample.get("elapsed_s")
+                    if (
+                        pre_idle_total is None
+                        or final_total is None
+                        or (final_total - pre_idle_total) < MIN_IDLE_TAIL_RELEASES
                     ):
                         state.set_stop_reason(
                             "error",
-                            f"idle_tail_no_release_progress:{pre_idle_total}->{final_total}",
+                            f"idle_tail_insufficient_release_progress:{pre_idle_total}->{final_total}",
+                        )
+                    elif (
+                        not isinstance(pre_idle_elapsed_s, (int, float))
+                        or not isinstance(final_elapsed_s, (int, float))
+                        or (final_elapsed_s - pre_idle_elapsed_s) < idle_wait_s
+                    ):
+                        state.set_stop_reason(
+                            "error",
+                            f"idle_tail_boundary_elapsed_short:{pre_idle_elapsed_s}->{final_elapsed_s}",
                         )
             writer.write_terminal(final_sample)
 
@@ -1033,11 +1202,13 @@ def main(argv: list[str] | None = None) -> int:
                 "run_id": args.run_id,
                 "ts_unix": round(time.time(), 6),
                 "ts_iso": utc_iso(time.time()),
-                "elapsed_s": round(time.monotonic() - t0, 3),
+                "elapsed_s": round(time.monotonic() - t0, 6),
                 "stop_reason": final_stop_reason,
                 "stop_detail": final_stop_detail,
                 "idle_tail_target_s": round(idle_wait_s, 3),
                 "idle_tail_elapsed_s": round(idle_elapsed_s, 3),
+                "terminal_safety_verified": terminal_safety_verified,
+                "terminal_observation_error": terminal_observation_error,
                 "fault": state.fault,
                 "safety_state": state.safety_state,
                 "counters": final_sample["counters"],

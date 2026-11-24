@@ -376,7 +376,7 @@ where
             supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
             // Stop the legacy periodic loop first so it stops competing for the supervisor lock
             // and actuator bus while bounded emergency disable runs.
-            control_stop.store(true, Ordering::SeqCst);
+            supervisor.signal_legacy_stop(&control_stop);
             let sup = Arc::clone(supervisor);
             let outcome = tokio::task::spawn_blocking(move || {
                 sup.attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT)
@@ -391,7 +391,7 @@ where
         after_legacy_commit_before_abort().await;
         // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
         server_handle.abort();
-        control_stop.store(true, Ordering::SeqCst);
+        supervisor.signal_legacy_stop(&control_stop);
         info!("armd stopped after shutdown readiness confirmation");
         return Ok(());
     }

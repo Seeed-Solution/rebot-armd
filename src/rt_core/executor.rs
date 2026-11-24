@@ -12,7 +12,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle, Thread, ThreadId};
 use std::time::{Duration, Instant};
@@ -347,11 +347,26 @@ pub struct ExecutorStats {
     /// and strictly BEFORE final timestamp, sample amendment, and completion publication (0 in production).
     #[doc(hidden)]
     pub post_stats_delay_once_ns: AtomicU64,
+    /// Optional one-shot test delay (ns) injected strictly AFTER sample amendment and tail-allocation
+    /// accounting and strictly BEFORE the `stats_seq` completion seal (0 in production).
+    #[doc(hidden)]
+    pub pre_seal_delay_once_ns: AtomicU64,
     /// Optional one-shot test delay (ns) injected strictly AFTER completion publication and right
     /// BEFORE wait-entry (`sleep_until_ns`) / loop-exit check to test post-commit preemption
     /// accounting on both continuation and shutdown (0 in production).
     #[doc(hidden)]
     pub before_sleep_delay_once_ns: AtomicU64,
+    /// Optional one-shot test delay (ns) injected inside Linux `sleep_until_ns` strictly AFTER the
+    /// `mono_now_ns() >= at_ns` entry check and BEFORE the kernel sleep syscall (0 in production).
+    #[doc(hidden)]
+    pub check_to_sleep_delay_once_ns: AtomicU64,
+    /// 4-byte aligned futex word mirrored from `stop` (`0` running, `1` stop requested) so Linux
+    /// `FUTEX_WAIT_BITSET` atomically detects stop-before-sleep (`EAGAIN`) and wakes immediately
+    /// on shutdown without spinning.
+    stop_word: AtomicU32,
+    /// Monotonic `CLOCK_MONOTONIC` timestamp (`mono_now_ns().max(1)`) recorded once when
+    /// [`Self::signal_stop`] is called (`0` if stop was flipped via a raw `&AtomicBool`).
+    stop_requested_mono_ns: AtomicU64,
     /// Cumulative count of off-thread `diag_amend_rx` amendments whose target sample had already
     /// been evicted from `LockFreeTickStats` (merged into `stats_writer_drops` as explicit coverage loss).
     pub amend_missed: AtomicU64,
@@ -361,6 +376,34 @@ pub struct ExecutorStats {
 }
 
 impl ExecutorStats {
+    /// Records the monotonic shutdown request timestamp, sets `stop` and `stop_word`,
+    /// and wakes any thread parked in Linux `FUTEX_WAIT_BITSET`.
+    pub fn signal_stop(&self, stop: &AtomicBool) {
+        let now = mono_now_ns().max(1);
+        let _ = self.stop_requested_mono_ns.compare_exchange(
+            0,
+            now,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        stop.store(true, Ordering::Release);
+        self.stop_word.store(1, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            const FUTEX_WAKE: libc::c_int = 1;
+            const FUTEX_PRIVATE_FLAG: libc::c_int = 128;
+            libc::syscall(
+                libc::SYS_futex,
+                &self.stop_word as *const AtomicU32,
+                FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                i32::MAX,
+                std::ptr::null::<libc::timespec>(),
+                std::ptr::null::<u32>(),
+                0u32,
+            );
+        }
+    }
+
     /// Attaches the supervisor's [`LockFreeTickStats`] ring for legacy single-completion publication.
     pub(crate) fn attach_legacy_tick_ring(&self, ring: Arc<crate::diagnostics::tick::LockFreeTickStats>) {
         let _ = self.legacy_tick_ring.set(ring);
@@ -471,30 +514,36 @@ impl ExecutorStats {
 
     /// Commits one completed (or panicked) release's full monotonic qualification outcome STRICTLY
     /// LAST inside a single control-thread seqlock transaction (zero allocation, zero mutex):
-    /// - atomically clears `in_flight_start_mono_ns = 0` alongside advancing `releases_total`;
-    /// - updates `wake_lateness_over_{1,5,10}ms`, `wake_late_max_ever`, `releases_total`,
-    ///   `release_us_max_ever`, `releases_over_{10,15,20}ms`, `skipped_releases`, `diag_dropped`;
-    /// - updates active `since_marker` peaks for this release;
-    /// - acknowledges any pending `marker_requested_gen` strictly AFTER this release's counters
-    ///   are committed so pre-marker debt is never charged to the newly marked interval.
+    /// - atomically clears `in_flight_start_mono_ns = 0` BEFORE taking the final release end timestamp;
+    /// - samples `end_ns = now_ns()` strictly AFTER all release work (sample push/amend, dispatcher
+    ///   wake, B2 tail allocation accounting, and clearing `in_flight_start_mono_ns`);
+    /// - computes `overrun_skipped = releases.advance_overrun(end_ns)` from that same `end_ns`;
+    /// - updates `wake_lateness_over_{1,5,10}ms`, `wake_late_max_ever`, `release_us_max_ever`,
+    ///   `releases_over_{10,15,20}ms`, `skipped_releases`, `diag_dropped`, active `since_marker`
+    ///   peaks, any pending marker acknowledgement, and `releases_total` as the final payload store
+    ///   before publishing `stats_seq` with `Ordering::Release`.
     #[inline]
-    pub fn commit_release_outcome(
+    pub fn commit_release_outcome_with_clock(
         &self,
+        actual_ns: u64,
         wake_lateness_ns: u64,
-        release_ns: u64,
-        skipped_delta: u64,
+        wake_skipped: u64,
         diag_dropped_delta: u64,
+        releases: &mut Releases,
+        now_ns: impl FnOnce() -> u64,
     ) {
-        let (wake_us, w1, w5, w10) = crate::diagnostics::tick::classify_wake_lateness_ns(wake_lateness_ns);
-        let (rel_us, r10, r15, r20) = crate::diagnostics::tick::classify_release_duration_ns(release_ns);
-
         let s0 = self.stats_seq.load(Ordering::Relaxed);
         self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
 
         self.in_flight_start_mono_ns.store(0, Ordering::Relaxed);
-        let rel_total = self.releases_total.load(Ordering::Relaxed).saturating_add(1);
-        self.releases_total.store(rel_total, Ordering::Relaxed);
+        let end_ns = now_ns();
+        let release_ns = end_ns.saturating_sub(actual_ns);
+        let overrun_skipped = releases.advance_overrun(end_ns);
+        let skipped_delta = wake_skipped.saturating_add(overrun_skipped);
+        let (wake_us, w1, w5, w10) = crate::diagnostics::tick::classify_wake_lateness_ns(wake_lateness_ns);
+        let (rel_us, r10, r15, r20) = crate::diagnostics::tick::classify_release_duration_ns(release_ns);
+
         let prev_rel_max = self.release_us_max_ever.load(Ordering::Relaxed);
         if u64::from(rel_us) > prev_rel_max {
             self.release_us_max_ever.store(u64::from(rel_us), Ordering::Relaxed);
@@ -521,6 +570,8 @@ impl ExecutorStats {
         self.skipped_releases.store(skips, Ordering::Relaxed);
         let diag_drops = self.diag_dropped.load(Ordering::Relaxed).saturating_add(diag_dropped_delta);
         self.diag_dropped.store(diag_drops, Ordering::Relaxed);
+
+        let rel_total = self.releases_total.load(Ordering::Relaxed).saturating_add(1);
 
         let ack = self.marker_ack_gen.load(Ordering::Relaxed);
         if ack > 0 {
@@ -550,6 +601,7 @@ impl ExecutorStats {
             self.marker_ack_gen.store(req, Ordering::Relaxed);
         }
 
+        self.releases_total.store(rel_total, Ordering::Relaxed);
         self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
     }
 
@@ -1519,7 +1571,7 @@ impl RtExecutorShared {
         self.persist_stop.store(true, Ordering::Release);
         self.persist_park_thread.unpark();
         self.maint_client.close();
-        self.control_stop.store(true, Ordering::Release);
+        self.stats.signal_stop(&self.control_stop);
         if let Some(clock) = self.clock.as_ref() {
             clock.wake();
         }
@@ -3366,7 +3418,14 @@ fn control_thread_main(
         if let Some(c) = clock_hook.as_ref() {
             c.sleep_until_ns(target_ns, &control_stop)
         } else {
-            sleep_until_ns(target_ns)
+            sleep_until_ns(target_ns, &control_stop, &stats)
+        }
+    };
+    let stop_bound_ns = || -> u64 {
+        if clock_hook.is_none() {
+            stats.stop_requested_mono_ns.load(Ordering::Acquire)
+        } else {
+            0
         }
     };
     let sleep_dur = |d: Duration| {
@@ -3407,6 +3466,7 @@ fn control_thread_main(
             &stats,
             ran_any_release,
             &now_ns_fn,
+            &stop_bound_ns,
             &sleep_until,
             &sleep_dur,
         ) {
@@ -3772,40 +3832,47 @@ fn control_thread_main(
             sleep_dur(Duration::from_nanos(post_stats_delay_ns));
         }
 
-        // Measure duration after ALL release work (including diag push, dispatcher wake, B2 tail
-        // probe, and any post-push tail delay). If duration grew past `stamped_release_us`, push
-        // one lock-free amendment on the preallocated SPSC `diag_amend_tx` ring and wake the
-        // dispatcher BEFORE taking the final release end timestamp and publishing completion.
-        let mut release_end_ns = now_ns_fn();
-        let mut final_release_ns = release_end_ns.saturating_sub(actual_ns);
-        let final_release_us = crate::diagnostics::tick::ns_to_us_u32(final_release_ns);
-        if pushed_sample && diag_dropped_delta == 0 && final_release_us > stamped_release_us {
-            if diag_amend_tx.push((step_num, final_release_us)).is_err() {
+        // Probe duration after diag push, dispatcher wake, B2 tail probe, and any post-push
+        // delay. If duration grew past `stamped_release_us`, push one lock-free amendment on the
+        // preallocated SPSC `diag_amend_tx` ring and wake the dispatcher BEFORE recording tail
+        // allocations and taking the final release end timestamp inside the completion seal.
+        let probe_release_us =
+            crate::diagnostics::tick::ns_to_us_u32(now_ns_fn().saturating_sub(actual_ns));
+        if pushed_sample && diag_dropped_delta == 0 && probe_release_us > stamped_release_us {
+            if diag_amend_tx.push((step_num, probe_release_us)).is_err() {
                 diag_dropped_delta = diag_dropped_delta.saturating_add(1);
             }
             hub.wake();
-            release_end_ns = now_ns_fn();
-            final_release_ns = release_end_ns.saturating_sub(actual_ns);
         }
 
         // Record ALL tail allocations (covering `post_publish_delay_once`, `diag_tx.push`,
         // `hub.wake()`, B2 tail probe + local drop, and `diag_amend_tx.push` + `hub.wake()`)
-        // strictly BEFORE publishing completion.
+        // strictly BEFORE the final release end timestamp and completion publication.
         let tail_alloc_delta = crate::diagnostics::alloc::snapshot_counts().delta_since(tail_alloc_start);
         if tail_alloc_delta.total() > 0 {
             stats.release_allocs.record(tail_alloc_delta);
         }
 
-        let overrun_skipped = releases.advance_overrun(release_end_ns);
+        // Optional test preemption hook strictly AFTER tail allocation accounting and BEFORE
+        // the completion seal (exercises preemption after sample amendment / alloc accounting).
+        let pre_seal_delay_ns = stats.pre_seal_delay_once_ns.swap(0, Ordering::AcqRel);
+        if pre_seal_delay_ns > 0 {
+            sleep_dur(Duration::from_nanos(pre_seal_delay_ns));
+        }
+
         // PUBLISH COMPLETION STRICTLY LAST: single `stats_seq` Release seal atomically clears
-        // `in_flight_start_mono_ns = 0`, advances `releases_total`, and publishes all breach,
-        // peak, skip, drop, and marker counters; `completed_releases` follows with Release
-        // ordering for direct B2 alloc readers.
-        stats.commit_release_outcome(
+        // `in_flight_start_mono_ns = 0`, samples the final release end timestamp STRICTLY AFTER
+        // all release work and clearing the in-flight marker, computes overrun skips from that
+        // exact timestamp, updates all breach/peak/skip/drop/marker counters, and publishes
+        // `releases_total` + `stats_seq` last; `completed_releases` follows with Release ordering
+        // for direct B2 alloc readers.
+        stats.commit_release_outcome_with_clock(
+            actual_ns,
             wake_lateness_ns,
-            final_release_ns,
-            wake_skipped.saturating_add(overrun_skipped),
+            wake_skipped,
             diag_dropped_delta,
+            &mut releases,
+            now_ns_fn,
         );
         stats.completed_releases.fetch_add(1, Ordering::Release);
 
@@ -3875,9 +3942,10 @@ fn control_thread_main(
     }
 
     // Loop-exit final accounting pass (normal shutdown): if the loop exited after a release
-    // without entering a genuine sleep, account any scheduled deadlines crossed in the tail.
+    // without entering a genuine sleep, account any scheduled deadlines crossed before shutdown.
     let exit_skips = if !panicked && ran_any_release && !stopped_cleanly {
-        releases.advance_overrun(now_ns_fn())
+        let sb = stop_bound_ns();
+        releases.advance_overrun(if sb != 0 { sb } else { now_ns_fn() })
     } else {
         0
     };
@@ -3939,23 +4007,83 @@ fn mono_now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// Sleeps until the absolute monotonic time `at_ns`. Returns `false` without sleeping if
-/// `mono_now_ns() >= at_ns` already on entry, or `true` if `clock_nanosleep` actually ran.
+/// Sleeps until the absolute `CLOCK_MONOTONIC` time `at_ns`, or wakes early on `stats.signal_stop()`.
+///
+/// Returns `false` if the thread did NOT enter a clean pre-deadline sleep (either `mono_now_ns() >= at_ns`
+/// on entry, or shutdown was requested after `at_ns` / at the check-to-sleep boundary), so callers
+/// account any crossed deadlines. Returns `true` if the thread genuinely slept until `at_ns` or was
+/// woken cleanly before `at_ns`.
 #[cfg(target_os = "linux")]
-fn sleep_until_ns(at_ns: u64) -> bool {
+fn sleep_until_ns(at_ns: u64, stop: &AtomicBool, stats: &ExecutorStats) -> bool {
     if mono_now_ns() >= at_ns {
         return false;
     }
-    // SAFETY: timespec is plain old data; all-zero is valid
+    if stats.check_to_sleep_delay_once_ns.load(Ordering::Relaxed) != 0 {
+        let delay_ns = stats.check_to_sleep_delay_once_ns.swap(0, Ordering::AcqRel);
+        if delay_ns > 0 {
+            thread::sleep(Duration::from_nanos(delay_ns));
+        }
+    }
+    if stop.load(Ordering::Acquire) {
+        let stop_req = stats.stop_requested_mono_ns.load(Ordering::Acquire);
+        return stop_req != 0 && stop_req < at_ns;
+    }
+    // SAFETY: timespec is plain old data; all-zero is valid.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     ts.tv_sec = (at_ns / 1_000_000_000) as _;
     ts.tv_nsec = (at_ns % 1_000_000_000) as _;
+    const FUTEX_WAIT_BITSET: libc::c_int = 9;
+    const FUTEX_PRIVATE_FLAG: libc::c_int = 128;
+    const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
     loop {
-        // SAFETY: `ts` is valid; the remaining-time pointer is unused with TIMER_ABSTIME.
-        let rc = unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
-        if rc != libc::EINTR {
+        // Atomically verify `stop_word == 0` and wait on an absolute `CLOCK_MONOTONIC` hrtimer.
+        // SAFETY: `stop_word` is a 4-byte aligned `AtomicU32`; `ts` is a valid `timespec`.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                &stats.stop_word as *const AtomicU32,
+                FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG,
+                0u32,
+                &ts as *const libc::timespec,
+                std::ptr::null::<u32>(),
+                FUTEX_BITSET_MATCH_ANY,
+            )
+        };
+        if rc == 0 {
+            if stop.load(Ordering::Acquire) || stats.stop_word.load(Ordering::Acquire) != 0 {
+                // Woken by `FUTEX_WAKE` while genuinely parked.
+                let stop_req = stats.stop_requested_mono_ns.load(Ordering::Acquire);
+                return !(stop_req != 0 && stop_req >= at_ns);
+            }
+            // Spurious futex wakeup while still running: keep sleeping until `at_ns`.
+            if mono_now_ns() >= at_ns {
+                return true;
+            }
+            continue;
+        }
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err == libc::EINTR {
+            if stop.load(Ordering::Acquire) {
+                let stop_req = stats.stop_requested_mono_ns.load(Ordering::Acquire);
+                return stop_req != 0 && stop_req < at_ns;
+            }
+            continue;
+        }
+        if err == libc::EAGAIN {
+            // `stop_word != 0` was already set before entering the kernel sleep (never slept).
+            let stop_req = stats.stop_requested_mono_ns.load(Ordering::Acquire);
+            return stop_req != 0 && stop_req < at_ns;
+        }
+        if err == libc::ETIMEDOUT {
+            if stop.load(Ordering::Acquire) {
+                let stop_req = stats.stop_requested_mono_ns.load(Ordering::Acquire);
+                if stop_req != 0 {
+                    return stop_req < at_ns;
+                }
+            }
             return true;
         }
+        return false;
     }
 }
 
@@ -3966,12 +4094,26 @@ fn mono_now_ns() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sleep_until_ns(at_ns: u64) -> bool {
+fn sleep_until_ns(at_ns: u64, stop: &AtomicBool, stats: &ExecutorStats) -> bool {
     let now = mono_now_ns();
     if now >= at_ns {
         return false;
     }
-    thread::sleep(Duration::from_nanos(at_ns - now));
+    if stats.check_to_sleep_delay_once_ns.load(Ordering::Relaxed) != 0 {
+        let delay_ns = stats.check_to_sleep_delay_once_ns.swap(0, Ordering::AcqRel);
+        if delay_ns > 0 {
+            thread::sleep(Duration::from_nanos(delay_ns));
+        }
+    }
+    if stop.load(Ordering::Acquire) {
+        let stop_req = stats.stop_requested_mono_ns.load(Ordering::Acquire);
+        return stop_req != 0 && stop_req < at_ns;
+    }
+    let rem = at_ns.saturating_sub(mono_now_ns());
+    if rem == 0 {
+        return false;
+    }
+    thread::sleep(Duration::from_nanos(rem));
     true
 }
 
@@ -3985,12 +4127,14 @@ enum WaitOutcome {
 /// the loop continues or stops, without spinning on an expired first deadline or fabricating
 /// skips on a clean stop during genuine sleep.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn wait_for_next_release(
     stop: &AtomicBool,
     releases: &mut Releases,
     stats: &ExecutorStats,
     ran_any_release: bool,
     now_ns: &impl Fn() -> u64,
+    stop_bound_ns: &impl Fn() -> u64,
     sleep_until: &impl Fn(u64) -> bool,
     sleep_dur: &impl Fn(Duration),
 ) -> WaitOutcome {
@@ -4015,11 +4159,13 @@ fn wait_for_next_release(
                 }
                 return WaitOutcome::Wake { scheduled_ns };
             }
-            let crossed = releases.advance_overrun(now_ns());
+            let stopping = stop.load(Ordering::Acquire);
+            let sb = if stopping { stop_bound_ns() } else { 0 };
+            let crossed = releases.advance_overrun(if sb != 0 { sb } else { now_ns() });
             if crossed > 0 {
                 stats.record_boundary_skips(crossed);
             }
-            if stop.load(Ordering::Acquire) {
+            if stopping {
                 return WaitOutcome::Stop { stopped_cleanly: true };
             }
             continue;
@@ -4106,14 +4252,14 @@ pub fn account_periodic_overrun_on_panic_exit(stats: &ExecutorStats) {
     if let Some((actual_ns, wake_lateness_ns, wake_skipped, next_ns, period_ns)) =
         ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
     {
-        let end_ns = mono_now_ns();
-        let release_ns = end_ns.saturating_sub(actual_ns);
-        let exit_skips = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
-        stats.commit_release_outcome(
+        let mut exit_releases = Releases { period_ns, next_ns };
+        stats.commit_release_outcome_with_clock(
+            actual_ns,
             wake_lateness_ns,
-            release_ns,
-            wake_skipped.saturating_add(exit_skips),
+            wake_skipped,
             0,
+            &mut exit_releases,
+            mono_now_ns,
         );
     }
 }
@@ -4147,7 +4293,14 @@ pub fn run_periodic_with_clock(
         if let Some(c) = clock {
             c.sleep_until_ns(target_ns, stop)
         } else {
-            sleep_until_ns(target_ns)
+            sleep_until_ns(target_ns, stop, stats)
+        }
+    };
+    let stop_bound_ns = || -> u64 {
+        if clock.is_none() {
+            stats.stop_requested_mono_ns.load(Ordering::Acquire)
+        } else {
+            0
         }
     };
     let sleep_dur = |d: Duration| {
@@ -4167,6 +4320,7 @@ pub fn run_periodic_with_clock(
             stats,
             ran_any_release,
             &now_ns,
+            &stop_bound_ns,
             &sleep_until,
             &sleep_dur,
         ) {
@@ -4217,14 +4371,14 @@ pub fn run_periodic_with_clock(
                                     crate::diagnostics::tick::ns_to_us_u32(t.saturating_sub(actual_ns))
                                 });
                             }
-                            let end_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
-                            let release_ns = end_ns.saturating_sub(actual_ns);
-                            let exit_skips = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
-                            self.stats.commit_release_outcome(
+                            let mut exit_releases = Releases { period_ns, next_ns };
+                            self.stats.commit_release_outcome_with_clock(
+                                actual_ns,
                                 wake_lateness_ns,
-                                release_ns,
-                                wake_skipped.saturating_add(exit_skips),
+                                wake_skipped,
                                 0,
+                                &mut exit_releases,
+                                || self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns),
                             );
                         }
                     }
@@ -4242,11 +4396,7 @@ pub fn run_periodic_with_clock(
         // Optional test tail-stall hook (strictly BEFORE sample publication and completion seal).
         let post_stats_delay_ns = stats.post_stats_delay_once_ns.swap(0, Ordering::AcqRel);
         if post_stats_delay_ns > 0 {
-            if let Some(c) = clock {
-                c.sleep(Duration::from_nanos(post_stats_delay_ns), stop);
-            } else {
-                thread::sleep(Duration::from_nanos(post_stats_delay_ns));
-            }
+            sleep_dur(Duration::from_nanos(post_stats_delay_ns));
         }
 
         // Publish rolling sample FIRST (before completion seal). `record_staged` stages all
@@ -4262,36 +4412,42 @@ pub fn run_periodic_with_clock(
             _ => None,
         };
 
-        // Take the final release end timestamp STRICTLY AFTER sample publication. If OS
-        // preemption crossed `record_staged`, amend the slot monotonically and re-sample `end_ns`
-        // before sealing completion so both rolling and monotonic capture the entire tail.
-        let mut end_ns = now_ns();
-        let mut final_release_ns = end_ns.saturating_sub(actual_ns);
-        let final_release_us = crate::diagnostics::tick::ns_to_us_u32(final_release_ns);
+        // If OS preemption crossed `record_staged`, amend the slot monotonically BEFORE the
+        // completion seal.
+        let probe_release_us =
+            crate::diagnostics::tick::ns_to_us_u32(now_ns().saturating_sub(actual_ns));
         if let (Some(seq), Some(ring)) = (recorded_seq, stats.legacy_tick_ring.get()) {
-            if final_release_us > stamped_us {
-                ring.amend_slot_release_us(seq, final_release_us);
-                end_ns = now_ns();
-                final_release_ns = end_ns.saturating_sub(actual_ns);
+            if probe_release_us > stamped_us {
+                ring.amend_slot_release_us(seq, probe_release_us);
             }
         }
 
-        let overrun_skipped = releases.advance_overrun(end_ns);
+        // Optional test preemption hook strictly AFTER sample amendment and BEFORE the
+        // completion seal (exercises preemption after sample publication / amendment).
+        let pre_seal_delay_ns = stats.pre_seal_delay_once_ns.swap(0, Ordering::AcqRel);
+        if pre_seal_delay_ns > 0 {
+            sleep_dur(Duration::from_nanos(pre_seal_delay_ns));
+        }
+
         // PUBLISH COMPLETION STRICTLY LAST: atomically clears `in_flight_start_mono_ns = 0`,
-        // advances `releases_total`, and publishes all breach, peak, skip, and marker counters
-        // under one `stats_seq` Release store.
-        stats.commit_release_outcome(
+        // samples the final release end timestamp strictly AFTER all release work and clearing
+        // the in-flight marker, computes overrun skips from that timestamp, and publishes all
+        // breach, peak, skip, marker, and `releases_total` counters under one `stats_seq` Release.
+        stats.commit_release_outcome_with_clock(
+            actual_ns,
             wake_lateness_ns,
-            final_release_ns,
-            wake_skipped.saturating_add(overrun_skipped),
+            wake_skipped,
             0,
+            &mut releases,
+            now_ns,
         );
     };
 
     // Loop-exit final accounting pass (normal shutdown): if the loop exited after a release
-    // without entering a genuine sleep, account any scheduled deadlines crossed in the tail.
+    // without entering a genuine sleep, account any scheduled deadlines crossed before shutdown.
     let exit_skips = if ran_any_release && !stopped_cleanly {
-        releases.advance_overrun(now_ns())
+        let sb = stop_bound_ns();
+        releases.advance_overrun(if sb != 0 { sb } else { now_ns() })
     } else {
         0
     };
