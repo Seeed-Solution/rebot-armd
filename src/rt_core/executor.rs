@@ -860,8 +860,16 @@ pub enum MaintenanceResult {
     PlanningSnapshot(PlanningSnapshot),
     Observation(Box<ArmObservation>),
     FaultCleared(Result<SafetyState, ClearFaultError>),
-    JointZeroOffsetsSet(Result<(), String>),
-    MotorZeroSet(Result<(), String>),
+    JointZeroOffsetsSet {
+        result: Result<(), String>,
+        calibration_revision: u64,
+        workspace_revision: u64,
+    },
+    MotorZeroSet {
+        result: Result<(), String>,
+        calibration_revision: u64,
+        workspace_revision: u64,
+    },
     BaselineTaken(BaselineTakeReply),
     BaselineStored(bool),
     BaselineDirtyMarked,
@@ -2155,21 +2163,21 @@ impl RtExecutorHandle {
     pub fn set_joint_zero_offsets(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
         let offsets_copy = offsets.clone();
         match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets { offsets })? {
-            MaintenanceResult::JointZeroOffsetsSet(r) => {
-                if r.is_ok() {
+            MaintenanceResult::JointZeroOffsetsSet {
+                result,
+                calibration_revision,
+                workspace_revision,
+            } => {
+                if result.is_ok() {
                     if let Some(cur) = self.shared.hub.prep_env() {
                         let mut next = (*cur).clone();
                         next.joint_zero_offsets = offsets_copy;
-                        if let Some(pub_snap) = self.shared.hub.latest() {
-                            next.calibration_revision = pub_snap.rt.owner.calibration_revision;
-                            next.workspace_revision = pub_snap.rt.owner.authority.config_revision;
-                        } else {
-                            next.calibration_revision = next.calibration_revision.saturating_add(1);
-                        }
+                        next.calibration_revision = calibration_revision;
+                        next.workspace_revision = workspace_revision;
                         self.shared.hub.update_prep_env(Arc::new(next));
                     }
                 }
-                Ok(r)
+                Ok(result)
             }
             _ => Err(OwnerError::Protocol),
         }
@@ -2177,18 +2185,20 @@ impl RtExecutorHandle {
 
     pub fn set_motor_zero(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
         match self.call_maintenance(MaintenanceOp::SetMotorZero { joint })? {
-            MaintenanceResult::MotorZeroSet(r) => {
-                if r.is_ok() {
-                    if let (Some(cur), Some(pub_snap)) =
-                        (self.shared.hub.prep_env(), self.shared.hub.latest())
-                    {
+            MaintenanceResult::MotorZeroSet {
+                result,
+                calibration_revision,
+                workspace_revision,
+            } => {
+                if result.is_ok() {
+                    if let Some(cur) = self.shared.hub.prep_env() {
                         let mut next = (*cur).clone();
-                        next.calibration_revision = pub_snap.rt.owner.calibration_revision;
-                        next.workspace_revision = pub_snap.rt.owner.authority.config_revision;
+                        next.calibration_revision = calibration_revision;
+                        next.workspace_revision = workspace_revision;
                         self.shared.hub.update_prep_env(Arc::new(next));
                     }
                 }
-                Ok(r)
+                Ok(result)
             }
             _ => Err(OwnerError::Protocol),
         }
@@ -2770,7 +2780,11 @@ impl ControlState {
                     core.set_joint_zero_offsets(&offsets)
                 };
                 returned_offsets = Some(offsets);
-                MaintenanceResult::JointZeroOffsetsSet(res)
+                MaintenanceResult::JointZeroOffsetsSet {
+                    result: res,
+                    calibration_revision: core.calibration_revision,
+                    workspace_revision: core.workspace_revision,
+                }
             }
             MaintenanceOp::SetMotorZero { joint } => {
                 let res = if core.driver.is_some() {
@@ -2783,7 +2797,11 @@ impl ControlState {
                 } else {
                     core.set_motor_zero(joint)
                 };
-                MaintenanceResult::MotorZeroSet(res)
+                MaintenanceResult::MotorZeroSet {
+                    result: res,
+                    calibration_revision: core.calibration_revision,
+                    workspace_revision: core.workspace_revision,
+                }
             }
             MaintenanceOp::TakeBaselinePending { fresh_pending, mut fresh_samples, clear_dirty } => {
                 let moves = if core.gripper_baseline_pending.is_empty() {
