@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 RELEASE_BUDGET_MS = 20.0
+RELEASE_BUDGET_US = 20_000
+TICK_WINDOW_CAPACITY = 1000
 MIT_PERIOD_MS = 20.0
 MIT_MARGIN_MS = 5.0
 MIT_WATCHDOG_MS = 45.0
@@ -39,6 +41,53 @@ LOCK_PHASE_KEYS = (
     "obs_us",
     "publish_us",
 )
+
+MONOTONIC_REQUIRED_KEYS = (
+    "releases_total",
+    "release_us_max_ever",
+    "releases_over_10ms",
+    "releases_over_15ms",
+    "releases_over_20ms",
+    "wake_late_max_ever",
+    "skipped_releases",
+    "since_boot_ticks",
+    "diag_dropped",
+)
+
+PCT_FULL_REQUIRED_KEYS = (
+    "release_us",
+    "wake_lateness_us",
+    "tick_us",
+    "period_us",
+)
+
+PCT_MAX_REQUIRED_KEYS = (
+    "lock_us",
+    "wait_us",
+    "reader_hold_us",
+    "writer_hold_us",
+)
+
+
+def get_nonneg_int(d: dict[str, Any], key: str) -> int | None:
+    v = d.get(key)
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        return int(v)
+    return None
+
+
+def get_pct(d: dict[str, Any], key: str, sub: str) -> int | None:
+    obj = d.get(key)
+    if not isinstance(obj, dict):
+        return None
+    return get_nonneg_int(obj, sub)
+
+
+def get_nonempty_str(d: dict[str, Any], key: str) -> str | None:
+    v = d.get(key)
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return None
 
 
 def us_to_ms(val: float | int | None) -> float | None:
@@ -67,71 +116,96 @@ def max_or_none(vals: list[float]) -> float | None:
     return max(vals) if vals else None
 
 
+def max_int_or_none(vals: list[int]) -> int | None:
+    return max(vals) if vals else None
+
+
 @dataclass
 class CounterSeries:
     present_any: bool
+    present_all: bool
     partial_missing: bool
+    missing_count: int
     reset_detected: bool
     start: int | None
     end: int | None
     total_delta: int | None
+    verified_in_run_delta: int | None
     per_sample_deltas: list[int | None]
 
 
 def analyze_counter_series(samples: list[LoadSample], key: str) -> CounterSeries:
     """Chronologically track a cumulative monotonic integer field across all adjacent samples.
 
-    Detects missing samples (`partial_missing`) and counter resets (`cur < prev`, summing both
-    pre-reset and post-reset increments so e.g. `0 -> 7 -> 0` yields `total_delta=7` and
-    `reset_detected=True` rather than hiding events behind an endpoint-only difference).
+    - Requires >= 2 samples to compute a run delta (`total_delta = None` for 1-sample runs so
+      process-lifetime counts are never mistaken for run deltas).
+    - Never defaults missing/malformed entries to 0.
+    - Detects counter resets (`cur < prev`) and cross-instance restarts (`instance_id` change):
+      `verified_in_run_delta` sums ONLY strictly non-decreasing steps between adjacent samples
+      sharing the same `instance_id` (both `None` or equal strings).
     """
-    raw_vals: list[int | None] = [
-        int(s.tick[key])
-        if isinstance(s.tick.get(key), int) and not isinstance(s.tick.get(key), bool)
-        else None
-        for s in samples
-    ]
+    raw_vals: list[int | None] = [get_nonneg_int(s.tick, key) for s in samples]
+    inst_vals: list[str | None] = [get_nonempty_str(s.tick, "instance_id") for s in samples]
     present_vals = [v for v in raw_vals if v is not None]
+    missing_count = len(raw_vals) - len(present_vals)
     if not present_vals:
-        return CounterSeries(False, False, False, None, None, None, [None] * len(samples))
+        return CounterSeries(False, False, False, len(raw_vals), False, None, None, None, None, [None] * len(samples))
 
-    partial_missing = any(v is None for v in raw_vals)
-    reset_detected = False
+    present_all = missing_count == 0
+    partial_missing = missing_count > 0
     per_sample: list[int | None] = [None] * len(samples)
 
-    if len(samples) == 1:
-        v0 = present_vals[0]
-        per_sample[0] = v0
-        return CounterSeries(True, False, False, v0, v0, v0, per_sample)
+    if len(samples) < 2:
+        return CounterSeries(
+            present_any=True,
+            present_all=present_all,
+            partial_missing=partial_missing,
+            missing_count=missing_count,
+            reset_detected=False,
+            start=present_vals[0],
+            end=present_vals[-1],
+            total_delta=None,
+            verified_in_run_delta=None,
+            per_sample_deltas=per_sample,
+        )
 
-    total_delta = 0
+    reset_detected = False
+    verified_delta = 0
+    any_verified_step = False
     prev_val: int | None = None
-    for idx, val in enumerate(raw_vals):
+    prev_inst: str | None = None
+    for idx, (val, inst) in enumerate(zip(raw_vals, inst_vals)):
         if val is None:
             per_sample[idx] = None
             continue
         if prev_val is None:
-            # First observed value establishes the run baseline (0 delta on that sample).
             per_sample[idx] = 0
+        elif prev_inst is not None and inst is not None and prev_inst != inst:
+            # Daemon instance changed: do not treat cross-process difference as an in-run delta.
+            per_sample[idx] = None
         elif val >= prev_val:
             step = val - prev_val
             per_sample[idx] = step
-            total_delta += step
+            verified_delta += step
+            any_verified_step = True
         else:
-            # Counter decreased (daemon restart / counter reset): count post-reset increments
-            # AND flag reset_detected so coverage is marked incomplete.
             reset_detected = True
-            per_sample[idx] = val
-            total_delta += val
+            per_sample[idx] = None
         prev_val = val
+        prev_inst = inst
 
+    total_delta = verified_delta if any_verified_step else None
+    verified_in_run_delta = verified_delta if any_verified_step else None
     return CounterSeries(
         present_any=True,
+        present_all=present_all,
         partial_missing=partial_missing,
+        missing_count=missing_count,
         reset_detected=reset_detected,
         start=present_vals[0],
         end=present_vals[-1],
         total_delta=total_delta,
+        verified_in_run_delta=verified_in_run_delta,
         per_sample_deltas=per_sample,
     )
 
@@ -156,6 +230,7 @@ class LoadRun:
     meta: dict[str, Any]
     summary: dict[str, Any]
     samples: list[LoadSample]
+    failed_polls: list[dict[str, Any]] = field(default_factory=list)
 
 
 def load_input(path: Path) -> LoadRun:
@@ -169,12 +244,14 @@ def load_input(path: Path) -> LoadRun:
             obj = json.loads(text)
             if isinstance(obj, dict) and isinstance(obj.get("ticks"), list):
                 samples: list[LoadSample] = []
+                failed_polls: list[dict[str, Any]] = []
                 for idx, t in enumerate(obj["ticks"]):
                     if not isinstance(t, dict):
+                        failed_polls.append({"line": idx + 1, "phase": "tickload", "error": "non-object tick entry"})
                         continue
                     samples.append(
                         LoadSample(
-                            index=idx,
+                            index=len(samples),
                             ts_unix=None,
                             ts_iso=None,
                             elapsed_s=float(idx * 5),
@@ -192,13 +269,14 @@ def load_input(path: Path) -> LoadRun:
                     "fault": None if str(obj.get("fault")) in ("None", "null", "") else str(obj.get("fault")),
                     "measure": obj.get("measure"),
                 }
-                return LoadRun("tickload_json", meta, summary, samples)
+                return LoadRun("tickload_json", meta, summary, samples, failed_polls=failed_polls)
         except json.JSONDecodeError:
             pass
 
     meta = {}
     summary = {}
     samples = []
+    failed_polls = []
     idx = 0
     for line_no, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
@@ -213,7 +291,23 @@ def load_input(path: Path) -> LoadRun:
         elif rtype == "summary":
             summary = rec
         else:
-            tick = rec.get("tick") if "tick" in rec else (rec if "tick_us" in rec else None)
+            tick_err = rec.get("tick_error")
+            poll_failed = bool(rec.get("poll_failed")) or (tick_err is not None and str(tick_err).strip() != "")
+            has_tick_field = "tick" in rec
+            tick = (
+                rec.get("tick")
+                if has_tick_field
+                else (rec if ("tick_us" in rec or "release_us" in rec) else None)
+            )
+            if poll_failed or (not isinstance(tick, dict) and (rtype == "sample" or has_tick_field)):
+                failed_polls.append(
+                    {
+                        "line": line_no,
+                        "phase": str(rec.get("phase") or "unknown"),
+                        "elapsed_s": rec.get("elapsed_s"),
+                        "error": str(tick_err) if tick_err else "missing or non-object tick payload",
+                    }
+                )
             if not isinstance(tick, dict):
                 continue
             samples.append(
@@ -231,9 +325,9 @@ def load_input(path: Path) -> LoadRun:
                 )
             )
             idx += 1
-    if not samples:
+    if not samples and not failed_polls:
         raise ValueError(f"No tick samples found in {path}")
-    return LoadRun("jsonl", meta, summary, samples)
+    return LoadRun("jsonl", meta, summary, samples, failed_polls=failed_polls)
 
 
 # ---- devstat.txt parsing ----------------------------------------------------
@@ -586,9 +680,9 @@ def infer_nominal_period_us(samples: list[LoadSample], override_us: int | None) 
     if override_us is not None:
         return override_us
     p50s = [
-        float(s.tick["period_us"]["p50"])
+        float(v)
         for s in samples
-        if isinstance(s.tick.get("period_us"), dict) and s.tick["period_us"].get("p50")
+        if (v := get_pct(s.tick, "period_us", "p50")) is not None and v > 0
     ]
     if not p50s:
         return 20_000
@@ -598,15 +692,16 @@ def infer_nominal_period_us(samples: list[LoadSample], override_us: int | None) 
 
 
 def collect_unique_breakdowns(samples: list[LoadSample]) -> list[tuple[str, str, int, dict[str, Any]]]:
-    """Return deduplicated (kind, phase, sample_idx, breakdown) sorted by tick_us desc."""
+    """Return deduplicated (kind, phase, sample_idx, breakdown) sorted by release_us/tick_us desc."""
     by_sig: dict[tuple[Any, ...], list[Any]] = {}
     for s in samples:
-        for kind in ("max_tick", "max_lock"):
+        for kind in ("max_release", "max_tick", "max_lock"):
             bd = s.tick.get(kind)
             if not isinstance(bd, dict):
                 continue
             holder = bd.get("waited_for")
             sig = (
+                bd.get("release_us"),
                 bd.get("tick_us"),
                 bd.get("lock_us"),
                 bd.get("wait_us"),
@@ -625,7 +720,13 @@ def collect_unique_breakdowns(samples: list[LoadSample]) -> list[tuple[str, str,
             elif kind not in by_sig[sig][0]:
                 by_sig[sig][0].append(kind)
     rows = [("+".join(v[0]), v[1], v[2], v[3]) for v in by_sig.values()]
-    rows.sort(key=lambda r: (r[3].get("tick_us") or 0, r[3].get("lock_us") or 0), reverse=True)
+    rows.sort(
+        key=lambda r: (
+            get_nonneg_int(r[3], "release_us") or get_nonneg_int(r[3], "tick_us") or 0,
+            get_nonneg_int(r[3], "lock_us") or 0,
+        ),
+        reverse=True,
+    )
     return rows
 
 
@@ -649,6 +750,30 @@ def compute_dict_deltas(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
     return deltas
 
 
+def _render_all_failed_report(load_run: LoadRun, devstat: DevstatRun | None) -> str:
+    run_id = load_run.meta.get("run_id") or (devstat.meta.get("run_id") if devstat else "unknown")
+    n_fail = len(load_run.failed_polls)
+    out = [
+        f"# SG2002 Real-Time Qualification Report (`{run_id}`)",
+        "",
+        f"**Overall Verdict: INVALID (all {n_fail} poll(s) failed; no tick samples captured)**",
+        "",
+        "## 1. Stage 3 §6 Gate Verdict",
+        "",
+        "| Criterion | Target | Measured / Evidence | Status |",
+        "|---|---|---|---|",
+        f"| Every release (`release_us`) | `< {RELEASE_BUDGET_MS:.0f} ms` | no valid tick samples ({n_fail} failed poll(s)) | INVALID |",
+        f"| Zero skipped deadlines | `0` | no valid tick samples ({n_fail} failed poll(s)) | INVALID |",
+        "",
+        "## 2. Failed Polls",
+        "",
+    ]
+    for fp in load_run.failed_polls[:20]:
+        out.append(f"- line {fp.get('line')}: phase=`{fp.get('phase')}`, error=`{fp.get('error')}`")
+    out.append("")
+    return "\n".join(out)
+
+
 def analyze(
     load_run: LoadRun,
     devstat: DevstatRun | None,
@@ -656,113 +781,283 @@ def analyze(
     top_intervals: int = 5,
 ) -> str:
     samples = load_run.samples
+    if not samples:
+        return _render_all_failed_report(load_run, devstat)
+
     nom_period_us = infer_nominal_period_us(samples, nominal_period_us)
     nom_period_ms = nom_period_us / 1000.0
+    n_samples = len(samples)
 
-    # Aggregate global metrics across all samples.
-    tick_max_us = max((s.tick.get("tick_us", {}).get("max", 0) for s in samples), default=0)
-    tick_p99_max_us = max((s.tick.get("tick_us", {}).get("p99", 0) for s in samples), default=0)
-    tick_p50_med_us = median_or_none([float(s.tick["tick_us"]["p50"]) for s in samples if "tick_us" in s.tick])
+    # ---- Strict non-defaulting extraction (missing/malformed NEVER defaults to 0) ----
+    def collect_pct(key: str, sub: str) -> tuple[list[int], int]:
+        vals: list[int] = []
+        missing = 0
+        for s in samples:
+            v = get_pct(s.tick, key, sub)
+            if v is None:
+                missing += 1
+            else:
+                vals.append(v)
+        return vals, missing
 
-    lock_max_us = max((s.tick.get("lock_us", {}).get("max", 0) for s in samples), default=0)
-    wait_max_us = max((s.tick.get("wait_us", {}).get("max", 0) for s in samples), default=0)
-    reader_hold_max_us = max((s.tick.get("reader_hold_us", {}).get("max", 0) for s in samples), default=0)
-    writer_hold_max_us = max((s.tick.get("writer_hold_us", {}).get("max", 0) for s in samples), default=0)
-    period_max_us = max((s.tick.get("period_us", {}).get("max", 0) for s in samples), default=0)
-    period_p99_max_us = max((s.tick.get("period_us", {}).get("p99", 0) for s in samples), default=0)
+    rel_max_vals, rel_max_miss = collect_pct("release_us", "max")
+    rel_p99_vals, rel_p99_miss = collect_pct("release_us", "p99")
+    rel_p50_vals, rel_p50_miss = collect_pct("release_us", "p50")
+    has_release_us = bool(rel_max_vals)
+    release_us_max_us = max_int_or_none(rel_max_vals)
+    release_us_p99_max_us = max_int_or_none(rel_p99_vals)
+    release_us_p50_med_us = median_or_none([float(v) for v in rel_p50_vals])
 
-    first_ticks = samples[0].tick.get("since_boot_ticks")
-    last_ticks = samples[-1].tick.get("since_boot_ticks")
-    release_count = (
-        int(last_ticks) - int(first_ticks)
-        if isinstance(first_ticks, int) and isinstance(last_ticks, int) and last_ticks >= first_ticks
-        else None
-    )
+    tick_max_vals, tick_max_miss = collect_pct("tick_us", "max")
+    tick_p99_vals, tick_p99_miss = collect_pct("tick_us", "p99")
+    tick_p50_vals, tick_p50_miss = collect_pct("tick_us", "p50")
+    tick_max_us = max_int_or_none(tick_max_vals)
+    tick_p99_max_us = max_int_or_none(tick_p99_vals)
+    tick_p50_med_us = median_or_none([float(v) for v in tick_p50_vals])
 
+    lock_max_vals, lock_max_miss = collect_pct("lock_us", "max")
+    wait_max_vals, wait_max_miss = collect_pct("wait_us", "max")
+    reader_hold_vals, reader_hold_miss = collect_pct("reader_hold_us", "max")
+    writer_hold_vals, writer_hold_miss = collect_pct("writer_hold_us", "max")
+    period_max_vals, period_max_miss = collect_pct("period_us", "max")
+    period_p99_vals, period_p99_miss = collect_pct("period_us", "p99")
+    period_p50_vals, period_p50_miss = collect_pct("period_us", "p50")
+    lock_max_us = max_int_or_none(lock_max_vals)
+    wait_max_us = max_int_or_none(wait_max_vals)
+    reader_hold_max_us = max_int_or_none(reader_hold_vals)
+    writer_hold_max_us = max_int_or_none(writer_hold_vals)
+    period_max_us = max_int_or_none(period_max_vals)
+    period_p99_max_us = max_int_or_none(period_p99_vals)
+
+    wake_max_vals, wake_max_miss = collect_pct("wake_lateness_us", "max")
+    wake_p99_vals, wake_p99_miss = collect_pct("wake_lateness_us", "p99")
+    wake_p50_vals, wake_p50_miss = collect_pct("wake_lateness_us", "p50")
+    has_wake_lateness = bool(wake_max_vals)
+    wake_lateness_partial = has_wake_lateness and (wake_max_miss > 0 or wake_p99_miss > 0 or wake_p50_miss > 0)
+    wake_lateness_max_us = max_int_or_none(wake_max_vals)
+    wake_lateness_p99_max_us = max_int_or_none(wake_p99_vals)
+    wake_lateness_p50_med_us = median_or_none([float(v) for v in wake_p50_vals])
+
+    # ---- Monotonic counter series ----
+    since_boot_series = analyze_counter_series(samples, "since_boot_ticks")
+    releases_total_series = analyze_counter_series(samples, "releases_total")
+    release_max_ever_series = analyze_counter_series(samples, "release_us_max_ever")
+    rel_over_10ms = analyze_counter_series(samples, "releases_over_10ms")
+    rel_over_15ms = analyze_counter_series(samples, "releases_over_15ms")
+    rel_over_20ms = analyze_counter_series(samples, "releases_over_20ms")
+    wake_late_max_ever_series = analyze_counter_series(samples, "wake_late_max_ever")
     late_series = analyze_counter_series(samples, "late_count")
-    first_late = late_series.start
-    last_late = late_series.end
-    late_delta = late_series.total_delta
-    late_any_nonzero = any((s.tick.get("late_count") or 0) > 0 for s in samples)
-
-    # Q1 executor/legacy timing fields (absent in older JSON; keep proxy fallbacks).
     skipped_series = analyze_counter_series(samples, "skipped_releases")
-    has_skipped_releases = skipped_series.present_any
-    skipped_start = skipped_series.start
-    skipped_end = skipped_series.end
-    skipped_delta = skipped_series.total_delta
-    skipped_coverage_gap = skipped_series.partial_missing or skipped_series.reset_detected
-
     diag_series = analyze_counter_series(samples, "diag_dropped")
-    has_diag_dropped = diag_series.present_any
-    diag_dropped_start = diag_series.start
-    diag_dropped_end = diag_series.end
-    diag_dropped_delta = diag_series.total_delta
-    diag_samples_lost = bool(has_diag_dropped and diag_dropped_delta is not None and diag_dropped_delta > 0)
-    diag_coverage_gap = (not has_diag_dropped) or diag_series.partial_missing or diag_series.reset_detected
-
-    wake_dicts = [s.tick["wake_lateness_us"] for s in samples if isinstance(s.tick.get("wake_lateness_us"), dict)]
-    has_wake_lateness = bool(wake_dicts)
-    wake_lateness_partial = has_wake_lateness and len(wake_dicts) < len(samples)
-    wake_lateness_max_us = (
-        max(int(w.get("max", 0)) for w in wake_dicts) if has_wake_lateness else None
-    )
-    wake_lateness_p99_max_us = (
-        max(int(w.get("p99", 0)) for w in wake_dicts) if has_wake_lateness else None
-    )
-    wake_lateness_p50_med_us = (
-        median_or_none([float(w["p50"]) for w in wake_dicts if w.get("p50") is not None])
-        if has_wake_lateness
-        else None
-    )
     wake_over_1ms = analyze_counter_series(samples, "wake_lateness_over_1ms")
     wake_over_5ms = analyze_counter_series(samples, "wake_lateness_over_5ms")
     wake_over_10ms = analyze_counter_series(samples, "wake_lateness_over_10ms")
+
+    first_ticks = since_boot_series.start
+    last_ticks = since_boot_series.end
+    release_count = (
+        releases_total_series.verified_in_run_delta
+        if releases_total_series.present_all and not releases_total_series.reset_detected
+        else since_boot_series.verified_in_run_delta
+    )
+
+    first_late = late_series.start
+    last_late = late_series.end
+    late_delta = late_series.verified_in_run_delta
+    late_any_nonzero = any((get_nonneg_int(s.tick, "late_count") or 0) > 0 for s in samples)
+
+    has_skipped_releases = skipped_series.present_any
+    skipped_start = skipped_series.start
+    skipped_end = skipped_series.end
+    skipped_delta = skipped_series.verified_in_run_delta
+    skipped_coverage_gap = skipped_series.partial_missing or skipped_series.reset_detected
+
+    has_diag_dropped = diag_series.present_any
+    diag_dropped_start = diag_series.start
+    diag_dropped_end = diag_series.end
+    diag_dropped_delta = diag_series.verified_in_run_delta
+    diag_samples_lost = bool(has_diag_dropped and diag_dropped_delta is not None and diag_dropped_delta > 0)
+    diag_coverage_gap = (not has_diag_dropped) or diag_series.partial_missing or diag_series.reset_detected
+
     has_wake_over_1ms, wake_over_1ms_end, wake_over_1ms_delta = (
         wake_over_1ms.present_any,
         wake_over_1ms.end,
-        wake_over_1ms.total_delta,
+        wake_over_1ms.verified_in_run_delta,
     )
     has_wake_over_5ms, wake_over_5ms_end, wake_over_5ms_delta = (
         wake_over_5ms.present_any,
         wake_over_5ms.end,
-        wake_over_5ms.total_delta,
+        wake_over_5ms.verified_in_run_delta,
     )
     has_wake_over_10ms, wake_over_10ms_end, wake_over_10ms_delta = (
         wake_over_10ms.present_any,
         wake_over_10ms.end,
-        wake_over_10ms.total_delta,
+        wake_over_10ms.verified_in_run_delta,
     )
 
+    # ---- Instance continuity, owner mode continuity, lock-free snapshot integrity ----
+    instance_ids = [get_nonempty_str(s.tick, "instance_id") for s in samples]
+    distinct_instance_ids = sorted({i for i in instance_ids if i is not None})
+    instance_missing_count = sum(1 for i in instance_ids if i is None)
+    instance_changed = len(distinct_instance_ids) > 1
+    instance_id_latest = distinct_instance_ids[-1] if distinct_instance_ids else None
+
+    owner_modes = [get_nonempty_str(s.tick, "owner_mode") for s in samples]
+    distinct_owner_modes = sorted({m for m in owner_modes if m is not None})
+    owner_mode_changed = len(distinct_owner_modes) > 1
     owner_mode: str | None = None
-    for s in reversed(samples):
-        if isinstance(s.tick.get("owner_mode"), str) and s.tick["owner_mode"]:
-            owner_mode = s.tick["owner_mode"]
+    for m in reversed(owner_modes):
+        if m is not None:
+            owner_mode = m
             break
 
-    has_enqueue_to_wire = any("enqueue_to_wire_us" in s.tick for s in samples)
-    enqueue_to_wire_max_us = (
-        max(
-            (
-                s.tick["enqueue_to_wire_us"]["max"]
-                if isinstance(s.tick.get("enqueue_to_wire_us"), dict)
-                else int(s.tick.get("enqueue_to_wire_us") or 0)
-            )
-            for s in samples
-            if "enqueue_to_wire_us" in s.tick
+    snapshot_lapped_any = any(s.tick.get("stats_snapshot_lapped") is True for s in samples)
+    writer_drops_max = max_int_or_none(
+        [v for s in samples if (v := get_nonneg_int(s.tick, "stats_writer_drops")) is not None]
+    )
+
+    latest_since_marker: dict[str, Any] | None = None
+    for s in reversed(samples):
+        sm = s.tick.get("since_marker")
+        if isinstance(sm, dict):
+            latest_since_marker = sm
+            break
+
+    # ---- INVALIDity checks (fail-closed: never default missing to 0, never grant PASS) ----
+    invalid_reasons: list[str] = []
+    if load_run.failed_polls:
+        first_err = load_run.failed_polls[0].get("error", "poll failed")
+        invalid_reasons.append(f"failed poll(s): {len(load_run.failed_polls)} poll failure(s) (first: {first_err})")
+    if n_samples < 2:
+        invalid_reasons.append(f"fewer than 2 tick samples ({n_samples}); cannot compute run delta")
+    if instance_changed:
+        invalid_reasons.append(f"daemon restart: instance_id changed ({' -> '.join(distinct_instance_ids)})")
+    if owner_mode_changed:
+        invalid_reasons.append(f"owner_mode changed mid-run ({' -> '.join(distinct_owner_modes)})")
+    if snapshot_lapped_any:
+        invalid_reasons.append("lock-free tick_stats snapshot lapped (stats_snapshot_lapped=true)")
+    if writer_drops_max is not None and writer_drops_max > 0:
+        invalid_reasons.append(f"lock-free tick_stats writer contention drops detected ({writer_drops_max})")
+
+    # Check every monotonic counter for decreases (daemon restart / counter reset).
+    monotonic_checks: list[tuple[str, CounterSeries]] = [
+        ("releases_total", releases_total_series),
+        ("since_boot_ticks", since_boot_series),
+        ("release_us_max_ever", release_max_ever_series),
+        ("releases_over_10ms", rel_over_10ms),
+        ("releases_over_15ms", rel_over_15ms),
+        ("releases_over_20ms", rel_over_20ms),
+        ("wake_late_max_ever", wake_late_max_ever_series),
+        ("skipped_releases", skipped_series),
+        ("diag_dropped", diag_series),
+        ("wake_lateness_over_1ms", wake_over_1ms),
+        ("wake_lateness_over_5ms", wake_over_5ms),
+        ("wake_lateness_over_10ms", wake_over_10ms),
+        ("late_count", late_series),
+    ]
+    for name, series in monotonic_checks:
+        if series.reset_detected:
+            invalid_reasons.append(f"counter decreased mid-run (restart/reset): {name}")
+
+    # Require positive release progress between first and last sample.
+    if n_samples >= 2:
+        if releases_total_series.present_all and not releases_total_series.reset_detected and not instance_changed:
+            if releases_total_series.verified_in_run_delta == 0:
+                invalid_reasons.append("zero releases completed between first and last sample (releases_total delta=0)")
+        elif since_boot_series.present_all and not since_boot_series.reset_detected and not instance_changed:
+            if since_boot_series.verified_in_run_delta == 0:
+                invalid_reasons.append("zero releases completed between first and last sample (since_boot_ticks delta=0)")
+
+    # Check window rollover gap when monotonic counters are missing.
+    all_monotonic_present = all(
+        s.present_all
+        for s in (
+            releases_total_series,
+            release_max_ever_series,
+            rel_over_10ms,
+            rel_over_15ms,
+            rel_over_20ms,
+            wake_late_max_ever_series,
+            skipped_series,
         )
-        if has_enqueue_to_wire
-        else None
     )
+    max_adjacent_gap_ticks = 0.0
+    for i in range(1, n_samples):
+        t0 = get_nonneg_int(samples[i - 1].tick, "since_boot_ticks")
+        t1 = get_nonneg_int(samples[i].tick, "since_boot_ticks")
+        if t0 is not None and t1 is not None and t1 >= t0:
+            max_adjacent_gap_ticks = max(max_adjacent_gap_ticks, float(t1 - t0))
+        dt_s: float | None = None
+        if samples[i - 1].elapsed_s is not None and samples[i].elapsed_s is not None:
+            dt_s = samples[i].elapsed_s - samples[i - 1].elapsed_s
+        elif samples[i - 1].ts_unix is not None and samples[i].ts_unix is not None:
+            dt_s = samples[i].ts_unix - samples[i - 1].ts_unix
+        if dt_s is not None and dt_s > 0.0:
+            est_ticks = dt_s * (1_000_000.0 / float(nom_period_us))
+            max_adjacent_gap_ticks = max(max_adjacent_gap_ticks, est_ticks)
+    window_gap_without_monotonic = (not all_monotonic_present) and (max_adjacent_gap_ticks > TICK_WINDOW_CAPACITY)
+    if window_gap_without_monotonic:
+        invalid_reasons.append(
+            f"sample gap ({max_adjacent_gap_ticks:.0f} ticks > window {TICK_WINDOW_CAPACITY}) "
+            "with missing monotonic counters"
+        )
 
-    has_lock_attempts = any("control_thread_lock_attempts" in s.tick for s in samples)
-    lock_attempts_max = (
-        max(int(s.tick.get("control_thread_lock_attempts") or 0) for s in samples)
-        if has_lock_attempts
-        else None
-    )
+    # Check every required field (strictly validating nested percentile keys).
+    missing_required_fields: list[str] = []
+    if instance_missing_count > 0:
+        missing_required_fields.append(f"instance_id ({instance_missing_count}/{n_samples})")
+    for key, series in (
+        ("releases_total", releases_total_series),
+        ("release_us_max_ever", release_max_ever_series),
+        ("releases_over_10ms", rel_over_10ms),
+        ("releases_over_15ms", rel_over_15ms),
+        ("releases_over_20ms", rel_over_20ms),
+        ("wake_late_max_ever", wake_late_max_ever_series),
+        ("skipped_releases", skipped_series),
+        ("since_boot_ticks", since_boot_series),
+        ("diag_dropped", diag_series),
+    ):
+        if series.missing_count > 0:
+            missing_required_fields.append(f"{key} ({series.missing_count}/{n_samples})")
+    for key, m_p50, m_p99, m_max in (
+        ("release_us", rel_p50_miss, rel_p99_miss, rel_max_miss),
+        ("wake_lateness_us", wake_p50_miss, wake_p99_miss, wake_max_miss),
+        ("tick_us", tick_p50_miss, tick_p99_miss, tick_max_miss),
+        ("period_us", period_p50_miss, period_p99_miss, period_max_miss),
+    ):
+        worst_miss = max(m_p50, m_p99, m_max)
+        if worst_miss > 0:
+            missing_required_fields.append(f"{key} ({worst_miss}/{n_samples})")
+    for key, m_max in (
+        ("lock_us", lock_max_miss),
+        ("wait_us", wait_max_miss),
+        ("reader_hold_us", reader_hold_miss),
+        ("writer_hold_us", writer_hold_miss),
+    ):
+        if m_max > 0:
+            missing_required_fields.append(f"{key}.max ({m_max}/{n_samples})")
+    if missing_required_fields:
+        invalid_reasons.append("missing/malformed required field(s): " + ", ".join(missing_required_fields))
 
-    # Lock holders observed on max_tick / max_lock.
+    # Optional external telemetry fields (never default missing to 0).
+    enq_vals: list[int] = []
+    for s in samples:
+        if "enqueue_to_wire_us" not in s.tick:
+            continue
+        raw_e = s.tick.get("enqueue_to_wire_us")
+        v = get_nonneg_int(raw_e, "max") if isinstance(raw_e, dict) else get_nonneg_int(s.tick, "enqueue_to_wire_us")
+        if v is not None:
+            enq_vals.append(v)
+    has_enqueue_to_wire = len(enq_vals) == n_samples
+    enqueue_to_wire_max_us = max_int_or_none(enq_vals)
+
+    lock_attempt_vals = [
+        v for s in samples if (v := get_nonneg_int(s.tick, "control_thread_lock_attempts")) is not None
+    ]
+    has_lock_attempts = len(lock_attempt_vals) == n_samples
+    lock_attempts_max = max_int_or_none(lock_attempt_vals)
+
+    # Lock holders observed on max_release / max_tick / max_lock.
     breakdowns = collect_unique_breakdowns(samples)
     lock_wait_holders = [
         bd["waited_for"]
@@ -770,7 +1065,7 @@ def analyze(
         if isinstance(bd.get("waited_for"), dict)
     ]
     alloc_calls_max = max(
-        (int(bd.get("lock_alloc_calls") or 0) for _, _, _, bd in breakdowns),
+        (get_nonneg_int(bd, "lock_alloc_calls") or 0 for _, _, _, bd in breakdowns),
         default=0,
     )
 
@@ -782,12 +1077,27 @@ def analyze(
         [float(s.rx_age_ms["p99"]) for s in samples if s.rx_age_ms and s.rx_age_ms.get("p99") is not None]
     )
 
-    # Per-phase lock percentiles across all samples.
+    # Per-phase lock percentiles across all samples (strict non-defaulting).
     phase_stats: dict[str, dict[str, float | None]] = {}
     for pk in LOCK_PHASE_KEYS:
-        p50s = [float(s.tick["lock_phases"][pk]["p50"]) for s in samples if pk in s.tick.get("lock_phases", {})]
-        p99s = [float(s.tick["lock_phases"][pk]["p99"]) for s in samples if pk in s.tick.get("lock_phases", {})]
-        maxs = [float(s.tick["lock_phases"][pk]["max"]) for s in samples if pk in s.tick.get("lock_phases", {})]
+        p50s = [
+            float(v)
+            for s in samples
+            if isinstance(s.tick.get("lock_phases"), dict)
+            and (v := get_pct(s.tick["lock_phases"], pk, "p50")) is not None
+        ]
+        p99s = [
+            float(v)
+            for s in samples
+            if isinstance(s.tick.get("lock_phases"), dict)
+            and (v := get_pct(s.tick["lock_phases"], pk, "p99")) is not None
+        ]
+        maxs = [
+            float(v)
+            for s in samples
+            if isinstance(s.tick.get("lock_phases"), dict)
+            and (v := get_pct(s.tick["lock_phases"], pk, "max")) is not None
+        ]
         phase_stats[pk] = {
             "p50_ms": us_to_ms(median_or_none(p50s)),
             "p99_ms": us_to_ms(max_or_none(p99s)),
@@ -796,32 +1106,38 @@ def analyze(
 
     # Wake lateness (real Q1 field when present; legacy period_us proxy otherwise) & MIT budget.
     if has_wake_lateness and wake_lateness_max_us is not None:
-        wake_extra_ms = wake_lateness_max_us / 1000.0
+        wake_extra_ms: float | None = wake_lateness_max_us / 1000.0
         wake_extra_label = "wake lateness"
-    else:
+    elif period_max_us is not None:
         wake_extra_ms = max(0.0, (period_max_us - nom_period_us) / 1000.0)
         wake_extra_label = "sched overrun proxy"
-    rx_max_ms = phase_stats["rx_us"]["max_ms"] or 0.0
-    tx_max_ms = phase_stats["tx_us"]["max_ms"] or 0.0
-    # Worst start-to-TX completion observed in any breakdown (wait + pre + rx + control + tx),
-    # or tick_us.max if larger.
-    start_to_tx_ms = max(
+    else:
+        wake_extra_ms = None
+        wake_extra_label = "missing"
+
+    bd_start_to_tx_vals = [
         (
-            (
-                (bd.get("wait_us") or 0)
-                + (bd.get("pre_us") or 0)
-                + (bd.get("rx_us") or 0)
-                + (bd.get("control_us") or 0)
-                + (bd.get("tx_us") or 0)
-            )
-            / 1000.0
-            for _, _, _, bd in breakdowns
-        ),
-        default=us_to_ms(tick_max_us) or 0.0,
+            (get_nonneg_int(bd, "wait_us") or 0)
+            + (get_nonneg_int(bd, "pre_us") or 0)
+            + (get_nonneg_int(bd, "rx_us") or 0)
+            + (get_nonneg_int(bd, "control_us") or 0)
+            + (get_nonneg_int(bd, "tx_us") or 0)
+        )
+        / 1000.0
+        for _, _, _, bd in breakdowns
+    ]
+    start_to_tx_ms: float | None = (
+        max(bd_start_to_tx_vals)
+        if bd_start_to_tx_vals
+        else (us_to_ms(release_us_max_us) if release_us_max_us is not None else us_to_ms(tick_max_us))
     )
     enq_ms = (enqueue_to_wire_max_us / 1000.0) if enqueue_to_wire_max_us is not None else 0.0
-    worst_extra_ms = wake_extra_ms + start_to_tx_ms + enq_ms
-    mit_total_ms = MIT_PERIOD_MS + worst_extra_ms + MIT_MARGIN_MS
+    if wake_extra_ms is not None and start_to_tx_ms is not None:
+        worst_extra_ms: float | None = wake_extra_ms + start_to_tx_ms + enq_ms
+        mit_total_ms: float | None = MIT_PERIOD_MS + worst_extra_ms + MIT_MARGIN_MS
+    else:
+        worst_extra_ms = None
+        mit_total_ms = None
 
     # Control thread info (latest non-null).
     ctl_sched: dict[str, Any] = {}
@@ -835,73 +1151,152 @@ def analyze(
         faults_seen.append(str(load_run.summary["fault"]))
 
     # ---- Gate Evaluation ----
-    release_pass = (tick_max_us / 1000.0) < RELEASE_BUDGET_MS
-    release_gap_reasons: list[str] = []
-    if diag_samples_lost:
-        release_gap_reasons.append(f"`diag_dropped` delta={diag_dropped_delta}")
-    if not has_diag_dropped:
-        release_gap_reasons.append("`diag_dropped` not exposed")
-    elif diag_series.partial_missing:
-        release_gap_reasons.append("`diag_dropped` missing on some samples")
-    if diag_series.reset_detected:
-        release_gap_reasons.append("`diag_dropped` counter reset mid-run")
-    if not release_pass:
+    # 1. Release latency (< 20 ms): gated strictly on `release_us` + monotonic `releases_over_20ms` delta.
+    #    Scoped to the run so pre-run spikes sitting in samples[0]'s window do not trigger false FAIL
+    #    when `releases_over_20ms` delta == 0, while in-run spikes that rolled past 1000 ticks DO FAIL.
+    release_over_20_delta = rel_over_20ms.verified_in_run_delta
+    release_over_15_delta = rel_over_15ms.verified_in_run_delta
+    release_over_10_delta = rel_over_10ms.verified_in_run_delta
+    release_in_run_breach = False
+    if release_over_20_delta is not None and release_over_20_delta > 0:
+        release_in_run_breach = True
+    elif not rel_over_20ms.present_any and has_release_us and n_samples >= 2:
+        # Fallback when `releases_over_20ms` is absent: only flag hard FAIL if an in-run sample
+        # provably introduced a >= 20 ms `release_us` peak.
+        first_rel = get_pct(samples[0].tick, "release_us", "max")
+        first_t = get_nonneg_int(samples[0].tick, "since_boot_ticks")
+        first_inst = get_nonempty_str(samples[0].tick, "instance_id")
+        for s in samples[1:]:
+            cur_inst = get_nonempty_str(s.tick, "instance_id")
+            if first_inst is not None and cur_inst is not None and cur_inst != first_inst:
+                break
+            cur_rel = get_pct(s.tick, "release_us", "max")
+            if cur_rel is not None and cur_rel >= RELEASE_BUDGET_US:
+                if first_rel is not None and cur_rel > first_rel:
+                    release_in_run_breach = True
+                    break
+                mr = s.tick.get("max_release")
+                cur_t = get_nonneg_int(s.tick, "since_boot_ticks")
+                if (
+                    isinstance(mr, dict)
+                    and (ta := get_nonneg_int(mr, "ticks_ago")) is not None
+                    and first_t is not None
+                    and cur_t is not None
+                    and cur_t > first_t
+                    and ta < (cur_t - first_t)
+                ):
+                    release_in_run_breach = True
+                    break
+
+    release_fields_valid = (
+        has_release_us
+        and rel_max_miss == 0
+        and rel_p99_miss == 0
+        and rel_p50_miss == 0
+        and rel_over_20ms.present_all
+        and rel_over_15ms.present_all
+        and rel_over_10ms.present_all
+        and release_max_ever_series.present_all
+        and releases_total_series.present_all
+        and not rel_over_20ms.reset_detected
+        and not releases_total_series.reset_detected
+        and not release_max_ever_series.reset_detected
+        and not instance_changed
+        and not owner_mode_changed
+        and not load_run.failed_polls
+        and not snapshot_lapped_any
+        and (writer_drops_max is None or writer_drops_max == 0)
+        and n_samples >= 2
+        and release_over_20_delta is not None
+        and (releases_total_series.verified_in_run_delta or 0) > 0
+    )
+    release_pass = not release_in_run_breach
+    if release_in_run_breach:
         release_status = "FAIL"
-    elif diag_samples_lost:
-        release_status = "INCOMPLETE (diag_dropped > 0)"
-    elif release_gap_reasons:
-        release_status = "INCOMPLETE (diag coverage gap)"
+    elif not release_fields_valid:
+        release_status = "INVALID"
     else:
         release_status = "PASS"
-    release_detail = (
-        f"`tick_us.max` = **{fmt_ms(us_to_ms(tick_max_us))} ms** "
-        f"(p99 max {fmt_ms(us_to_ms(tick_p99_max_us))} ms, p50 med {fmt_ms(us_to_ms(tick_p50_med_us))} ms)"
-        + (f" (incomplete: {'; '.join(release_gap_reasons)})" if release_gap_reasons else "")
-    )
 
-    if has_skipped_releases and skipped_delta is not None:
-        skipped_pass = skipped_delta == 0
-        skipped_gap_notes: list[str] = []
-        if skipped_series.partial_missing:
-            skipped_gap_notes.append("skipped_releases missing on some samples")
-        if skipped_series.reset_detected:
-            skipped_gap_notes.append("skipped_releases counter reset mid-run")
-        if not skipped_pass:
-            skipped_status = "FAIL"
-        elif skipped_gap_notes:
-            skipped_status = "INCOMPLETE (counter coverage gap)"
-        else:
-            skipped_status = "PASS"
-        diag_note = f", diag_dropped delta={diag_dropped_delta}" if has_diag_dropped else ""
-        gap_suffix = f" (gap: {'; '.join(skipped_gap_notes)})" if skipped_gap_notes else ""
-        skipped_detail = (
-            f"skipped_releases delta={skipped_delta} (start={fmt_int(skipped_start)}, end={fmt_int(skipped_end)}), "
-            f"late_count delta={fmt_int(late_delta)}{diag_note}{gap_suffix}"
+    if has_release_us:
+        release_detail = (
+            f"`release_us.max` = **{fmt_ms(us_to_ms(release_us_max_us))} ms** "
+            f"(p99 max {fmt_ms(us_to_ms(release_us_p99_max_us))} ms, p50 med {fmt_ms(us_to_ms(release_us_p50_med_us))} ms), "
+            f"`release_us_max_ever`={fmt_ms(us_to_ms(release_max_ever_series.end))} ms, "
+            f"`releases_over_20ms` Δ={fmt_int(release_over_20_delta)} "
+            f"(`>=15ms` Δ={fmt_int(release_over_15_delta)}, `>=10ms` Δ={fmt_int(release_over_10_delta)})"
         )
     else:
-        skipped_pass = (late_delta == 0 if late_delta is not None else not late_any_nonzero) and period_max_us <= (2 * nom_period_us)
-        skipped_status = "PASS (proxy)" if skipped_pass else "FAIL"
+        release_detail = (
+            f"`release_us` missing (proxy `tick_us.max` = **{fmt_ms(us_to_ms(tick_max_us))} ms**, "
+            f"p99 max {fmt_ms(us_to_ms(tick_p99_max_us))} ms, p50 med {fmt_ms(us_to_ms(tick_p50_med_us))} ms)"
+        )
+
+    # 2. Deadlines (`skipped_releases` delta == 0)
+    if has_skipped_releases:
+        skipped_breach = skipped_delta is not None and skipped_delta > 0
+        skipped_valid = (
+            skipped_series.present_all
+            and not skipped_series.reset_detected
+            and not instance_changed
+            and not owner_mode_changed
+            and not load_run.failed_polls
+            and n_samples >= 2
+            and skipped_delta is not None
+        )
+        skipped_pass = not skipped_breach
+        if skipped_breach:
+            skipped_status = "FAIL"
+        elif not skipped_valid:
+            skipped_status = "INVALID"
+        else:
+            skipped_status = "PASS"
+        diag_note = f", diag_dropped delta={fmt_int(diag_dropped_delta)}" if has_diag_dropped else ""
+        skipped_detail = (
+            f"skipped_releases delta={fmt_int(skipped_delta)} (start={fmt_int(skipped_start)}, end={fmt_int(skipped_end)}), "
+            f"late_count delta={fmt_int(late_delta)}{diag_note}"
+        )
+    else:
+        proxy_ok = (
+            (late_delta == 0 if late_delta is not None else not late_any_nonzero)
+            and (period_max_us is not None and period_max_us <= (2 * nom_period_us))
+        )
+        skipped_pass = True  # Legacy proxy is not an authoritative hard-fail; missing field drives INVALID.
+        skipped_status = "PASS (proxy)" if proxy_ok else "INVALID (proxy breach)"
         skipped_detail = (
             f"late_count delta={fmt_int(late_delta)} (start={fmt_int(first_late)}, end={fmt_int(last_late)}), "
             f"period_us.max={fmt_ms(us_to_ms(period_max_us))} ms "
-            f"(gap: ExecutorStats::skipped_releases not exposed in /diagnostics/tick)"
+            f"(missing required field `skipped_releases`)"
         )
 
-    # Lock gate: fail if any lock attempt counter > 0 or any tick waited for lock / non-zero wait_us (> 50 us indicates real lock wait, > 0 in RT executor).
-    lock_wait_observed = bool(lock_wait_holders) or wait_max_us > 0 or writer_hold_max_us > 0 or reader_hold_max_us > 0
-    if has_lock_attempts:
-        lock_pass = (lock_attempts_max == 0) and not lock_wait_observed
-        lock_status = "PASS" if lock_pass else "FAIL"
+    # 3. Lock gate (never defaults missing wait_us/reader_hold/writer_hold to 0).
+    lock_fields_present = (
+        wait_max_miss == 0
+        and reader_hold_miss == 0
+        and writer_hold_miss == 0
+        and wait_max_us is not None
+        and reader_hold_max_us is not None
+        and writer_hold_max_us is not None
+    )
+    lock_wait_observed = (
+        bool(lock_wait_holders)
+        or (wait_max_us is not None and wait_max_us > 0)
+        or (writer_hold_max_us is not None and writer_hold_max_us > 0)
+        or (reader_hold_max_us is not None and reader_hold_max_us > 0)
+    )
+    if has_lock_attempts and lock_attempts_max is not None:
+        lock_breach = (lock_attempts_max > 0) or lock_wait_observed
+        lock_pass = not lock_breach
+        if lock_breach:
+            lock_status = "FAIL"
+        elif not lock_fields_present:
+            lock_status = "INVALID"
+        else:
+            lock_status = "PASS"
         lock_detail = f"control_thread_lock_attempts={lock_attempts_max}, wait_us.max={fmt_ms(us_to_ms(wait_max_us))} ms"
     else:
         lock_pass = not lock_wait_observed
-        if lock_pass:
-            lock_status = "PASS (proxy)"
-            lock_detail = (
-                "wait_us.max=0.00 ms, waited_for=none, reader/writer_hold=0 "
-                "(gap: SupervisorLock::control_thread_attempts not exposed; confirm via B1 cargo test)"
-            )
-        else:
+        if lock_wait_observed:
             worst_h = max(lock_wait_holders, key=lambda h: h.get("hold_us", 0)) if lock_wait_holders else None
             holder_note = (
                 f", worst waited_for={worst_h.get('kind')}@{worst_h.get('location')} ({fmt_ms(us_to_ms(worst_h.get('hold_us')))} ms)"
@@ -914,6 +1309,20 @@ def analyze(
                 f"writer_hold.max={fmt_ms(us_to_ms(writer_hold_max_us))} ms, "
                 f"reader_hold.max={fmt_ms(us_to_ms(reader_hold_max_us))} ms{holder_note}"
             )
+        elif not lock_fields_present:
+            lock_status = "INVALID"
+            lock_detail = (
+                f"missing required lock timing field(s) "
+                f"(wait_us.max={fmt_ms(us_to_ms(wait_max_us))} ms, "
+                f"reader_hold.max={fmt_ms(us_to_ms(reader_hold_max_us))} ms, "
+                f"writer_hold.max={fmt_ms(us_to_ms(writer_hold_max_us))} ms)"
+            )
+        else:
+            lock_status = "PASS (proxy)"
+            lock_detail = (
+                "wait_us.max=0.00 ms, waited_for=none, reader/writer_hold=0 "
+                "(gap: SupervisorLock::control_thread_attempts not exposed; confirm via B1 cargo test)"
+            )
 
     alloc_timing_confirmed = False
     if devstat is not None:
@@ -921,17 +1330,17 @@ def analyze(
     if alloc_calls_max > 0:
         alloc_pass = False
         alloc_status = "FAIL"
-        alloc_detail = f"lock_alloc_calls max={alloc_calls_max} on max_tick/max_lock"
+        alloc_detail = f"lock_alloc_calls max={alloc_calls_max} on max_release/max_tick/max_lock"
     else:
         alloc_pass = True
         alloc_status = "PASS (proxy)"
         alloc_detail = (
-            f"lock_alloc_calls=0 on max_tick/max_lock "
-            f"(gap: only reported on max_tick/max_lock and zero unless ARMD_ALLOC_TIMING=1; "
+            f"lock_alloc_calls=0 on max_release/max_tick/max_lock "
+            f"(gap: only reported on breakdowns and zero unless ARMD_ALLOC_TIMING=1; "
             f"ARMD_ALLOC_TIMING=1 confirmed={alloc_timing_confirmed})"
         )
 
-    mit_observable_pass = mit_total_ms < MIT_WATCHDOG_MS
+    mit_observable_pass = True if mit_total_ms is None else (mit_total_ms < MIT_WATCHDOG_MS)
     mit_gaps: list[str] = []
     if diag_samples_lost:
         mit_gaps.append(f"diag_dropped delta={diag_dropped_delta} lost tick/wake samples")
@@ -949,38 +1358,45 @@ def analyze(
         mit_gaps.append("enqueue-to-wire CAN latency not exposed")
     if not mit_observable_pass:
         mit_status = "FAIL"
+    elif mit_total_ms is None:
+        mit_status = "INVALID"
     elif diag_samples_lost:
         mit_status = "INCOMPLETE (diag_dropped > 0)"
     elif not mit_gaps:
         mit_status = "PASS"
     else:
         mit_status = "INCOMPLETE (observable PASS)"
-    mit_detail = (
-        f"20.00 + {wake_extra_ms:.2f} ({wake_extra_label}) + {start_to_tx_ms:.2f} (start->TX) "
-        f"+ {enq_ms:.2f} (enqueue->wire) + 5.00 = {mit_total_ms:.2f} ms vs 45.00 ms"
-        + (f" (gap: {'; '.join(mit_gaps)})" if mit_gaps else "")
-    )
+    if mit_total_ms is not None and wake_extra_ms is not None and start_to_tx_ms is not None:
+        mit_detail = (
+            f"20.00 + {wake_extra_ms:.2f} ({wake_extra_label}) + {start_to_tx_ms:.2f} (start->TX) "
+            f"+ {enq_ms:.2f} (enqueue->wire) + 5.00 = {mit_total_ms:.2f} ms vs 45.00 ms"
+            + (f" (gap: {'; '.join(mit_gaps)})" if mit_gaps else "")
+        )
+    else:
+        mit_detail = f"n/a (missing timing fields; gap: {'; '.join(mit_gaps)})"
 
     fault_pass = len(faults_seen) == 0
 
-    hard_fail = (not release_pass) or (not skipped_pass) or (not lock_pass) or (not alloc_pass) or (not mit_observable_pass) or (not fault_pass)
+    hard_fail = (
+        (not release_pass)
+        or (not skipped_pass)
+        or (not lock_pass)
+        or (not alloc_pass)
+        or (not mit_observable_pass)
+        or (not fault_pass)
+    )
     any_gaps = (
-        (not has_skipped_releases)
-        or skipped_coverage_gap
-        or (not has_wake_lateness)
-        or wake_lateness_partial
-        or diag_samples_lost
-        or diag_coverage_gap
+        diag_samples_lost
         or (not has_lock_attempts)
         or (not has_enqueue_to_wire)
         or (not alloc_timing_confirmed)
     )
     if hard_fail:
         overall_verdict = "FAIL"
+    elif invalid_reasons:
+        overall_verdict = f"INVALID ({'; '.join(invalid_reasons[:3])})"
     elif diag_samples_lost:
         overall_verdict = f"INCOMPLETE (diagnostic samples dropped: diag_dropped delta={diag_dropped_delta})"
-    elif diag_series.reset_detected or skipped_series.reset_detected:
-        overall_verdict = "INCOMPLETE (counter reset detected mid-run; coverage incomplete)"
     elif any_gaps:
         overall_verdict = "INCOMPLETE (all observable criteria PASS; diagnostic gaps remain)"
     else:
@@ -993,6 +1409,12 @@ def analyze(
     out.append("")
     out.append(f"**Overall Verdict: {overall_verdict}**")
     out.append("")
+    if invalid_reasons:
+        out.append("### Validity Findings")
+        out.append("")
+        for r in invalid_reasons:
+            out.append(f"- **INVALID**: {r}")
+        out.append("")
 
     # 1. Gate Criteria Table
     out.append("## 1. Stage 3 §6 Gate Verdict")
@@ -1000,7 +1422,7 @@ def analyze(
     out.append("| Criterion | Target | Measured / Evidence | Status |")
     out.append("|---|---|---|---|")
     out.append(
-        f"| Every measured release | `< {RELEASE_BUDGET_MS:.0f} ms` | "
+        f"| Every release (`release_us`) | `< {RELEASE_BUDGET_MS:.0f} ms` | "
         f"{release_detail} | "
         f"{release_status} |"
     )
@@ -1023,15 +1445,36 @@ def analyze(
             if l.startswith("Version:"):
                 armd_ver = l.split(":", 1)[1].strip()
                 break
-    out.append(f"- **Input format**: `{load_run.source_format}` ({len(samples)} tick-stats snapshots, nominal period `{nom_period_ms:.1f} ms`)")
+    out.append(
+        f"- **Input format**: `{load_run.source_format}` ({len(samples)} tick-stats snapshots, "
+        f"{len(load_run.failed_polls)} failed poll(s), nominal period `{nom_period_ms:.1f} ms`)"
+    )
     if load_run.meta.get("target"):
         out.append(f"- **Target**: `{load_run.meta['target']}` | **armd version**: `{armd_ver}`")
+    if instance_id_latest is not None:
+        out.append(f"- **Instance ID**: `{instance_id_latest}` (distinct={len(distinct_instance_ids)})")
     if release_count is not None:
-        out.append(f"- **Releases covered**: `{release_count}` (`since_boot_ticks`: {first_ticks} -> {last_ticks})")
+        out.append(
+            f"- **Releases covered**: `{release_count}` "
+            f"(`releases_total`: {fmt_int(releases_total_series.start)} -> {fmt_int(releases_total_series.end)}, "
+            f"`since_boot_ticks`: {fmt_int(first_ticks)} -> {fmt_int(last_ticks)})"
+        )
     if owner_mode is not None:
         out.append(f"- **Owner mode**: `{owner_mode}`")
-    if has_wake_lateness:
+    if has_release_us or release_max_ever_series.present_any:
+        out.append(
+            f"- **Full release duration (`release_us`)**: p50 med=`{fmt_ms(us_to_ms(release_us_p50_med_us))} ms`, "
+            f"p99 max=`{fmt_ms(us_to_ms(release_us_p99_max_us))} ms`, "
+            f"window max=`{fmt_ms(us_to_ms(release_us_max_us))} ms`, "
+            f"`release_us_max_ever`=`{fmt_ms(us_to_ms(release_max_ever_series.end))} ms` | "
+            f"`>=10ms` Δ={fmt_int(release_over_10_delta)}, "
+            f"`>=15ms` Δ={fmt_int(release_over_15_delta)}, "
+            f"`>=20ms` Δ={fmt_int(release_over_20_delta)}"
+        )
+    if has_wake_lateness or wake_late_max_ever_series.present_any:
         thresh_parts: list[str] = []
+        if wake_late_max_ever_series.present_any:
+            thresh_parts.append(f"`wake_late_max_ever`=`{fmt_ms(us_to_ms(wake_late_max_ever_series.end))} ms`")
         if has_wake_over_1ms:
             thresh_parts.append(f"`>1ms` Δ={fmt_int(wake_over_1ms_delta)} (total {fmt_int(wake_over_1ms_end)})")
         if has_wake_over_5ms:
@@ -1043,6 +1486,14 @@ def analyze(
             f"- **Wake lateness (`wake_lateness_us`)**: p50 med=`{fmt_ms(us_to_ms(wake_lateness_p50_med_us))} ms`, "
             f"p99 max=`{fmt_ms(us_to_ms(wake_lateness_p99_max_us))} ms`, "
             f"max=`{fmt_ms(us_to_ms(wake_lateness_max_us))} ms`{thresh_suffix}"
+        )
+    if latest_since_marker is not None:
+        out.append(
+            f"- **Baseline marker (`since_marker`)**: id=`{latest_since_marker.get('marker_id')}`, "
+            f"status=`{latest_since_marker.get('status')}`, "
+            f"releases Δ=`{fmt_int(get_nonneg_int(latest_since_marker, 'releases_total_delta'))}`, "
+            f"release_us_max=`{fmt_ms(us_to_ms(get_nonneg_int(latest_since_marker, 'release_us_max')))} ms`, "
+            f"wake_late_max=`{fmt_ms(us_to_ms(get_nonneg_int(latest_since_marker, 'wake_late_max')))} ms`"
         )
     if has_diag_dropped:
         out.append(
@@ -1098,10 +1549,11 @@ def analyze(
             by_phase[s.phase] = []
         by_phase[s.phase].append(s)
 
+    rel_col_key = "release_us" if has_release_us else "tick_us"
     wake_col_hdr = "`wake_lateness_us` p99/max (ms)" if has_wake_lateness else "Wake Overrun Proxy (ms)"
     skip_col_hdr = "`skipped`/`late` Δ" if has_skipped_releases else "`late_count` Δ"
     out.append(
-        f"| Phase | Samples | `tick_us` p50 med (ms) | `tick_us` p99 max (ms) | `tick_us` max (ms) | "
+        f"| Phase | Samples | `{rel_col_key}` p50 med (ms) | `{rel_col_key}` p99 max (ms) | `{rel_col_key}` max (ms) | "
         f"`lock_us` max (ms) | `wait_us` max (ms) | `period_us` max (ms) | {wake_col_hdr} | "
         f"{skip_col_hdr} | RX Age p99/max (ms) | Enqueue→Wire |"
     )
@@ -1112,33 +1564,19 @@ def analyze(
         return sum(vals) if vals else None
 
     def phase_row(name: str, grp: list[LoadSample]) -> str:
-        t_p50 = us_to_ms(median_or_none([float(x.tick["tick_us"]["p50"]) for x in grp if "tick_us" in x.tick]))
-        t_p99 = us_to_ms(max_or_none([float(x.tick["tick_us"]["p99"]) for x in grp if "tick_us" in x.tick]))
-        t_max = us_to_ms(max_or_none([float(x.tick["tick_us"]["max"]) for x in grp if "tick_us" in x.tick]))
-        l_max = us_to_ms(max_or_none([float(x.tick["lock_us"]["max"]) for x in grp if "lock_us" in x.tick]))
-        w_max = us_to_ms(max_or_none([float(x.tick["wait_us"]["max"]) for x in grp if "wait_us" in x.tick]))
-        p_max_us = max_or_none([float(x.tick["period_us"]["max"]) for x in grp if "period_us" in x.tick])
+        t_p50 = us_to_ms(median_or_none([float(v) for x in grp if (v := get_pct(x.tick, rel_col_key, "p50")) is not None]))
+        t_p99 = us_to_ms(max_or_none([float(v) for x in grp if (v := get_pct(x.tick, rel_col_key, "p99")) is not None]))
+        t_max = us_to_ms(max_or_none([float(v) for x in grp if (v := get_pct(x.tick, rel_col_key, "max")) is not None]))
+        l_max = us_to_ms(max_or_none([float(v) for x in grp if (v := get_pct(x.tick, "lock_us", "max")) is not None]))
+        w_max = us_to_ms(max_or_none([float(v) for x in grp if (v := get_pct(x.tick, "wait_us", "max")) is not None]))
+        p_max_us = max_or_none([float(v) for x in grp if (v := get_pct(x.tick, "period_us", "max")) is not None])
         p_max = us_to_ms(p_max_us)
         if has_wake_lateness:
             wl_p99 = us_to_ms(
-                max_or_none(
-                    [
-                        float(x.tick["wake_lateness_us"]["p99"])
-                        for x in grp
-                        if isinstance(x.tick.get("wake_lateness_us"), dict)
-                        and x.tick["wake_lateness_us"].get("p99") is not None
-                    ]
-                )
+                max_or_none([float(v) for x in grp if (v := get_pct(x.tick, "wake_lateness_us", "p99")) is not None])
             )
             wl_max = us_to_ms(
-                max_or_none(
-                    [
-                        float(x.tick["wake_lateness_us"]["max"])
-                        for x in grp
-                        if isinstance(x.tick.get("wake_lateness_us"), dict)
-                        and x.tick["wake_lateness_us"].get("max") is not None
-                    ]
-                )
+                max_or_none([float(v) for x in grp if (v := get_pct(x.tick, "wake_lateness_us", "max")) is not None])
             )
             wake_str = f"{fmt_ms(wl_p99)} / {fmt_ms(wl_max)}" if wl_max is not None else "n/a"
         else:
@@ -1176,19 +1614,19 @@ def analyze(
         out.append(f"| `{pk}` | {fmt_ms(st['p50_ms'])} | {fmt_ms(st['p99_ms'])} | **{fmt_ms(st['max_ms'])}** |")
     out.append("")
 
-    out.append("### Worst Measured Ticks (Wall vs CPU)")
+    out.append("### Worst Measured Releases (Wall vs CPU)")
     out.append("")
     out.append(
-        "| Kind | Phase | `tick` (ms) | `wait` (ms) | `lock` wall (ms) | `lock` CPU (ms) | Off-CPU (ms) | "
+        "| Kind | Phase | `release`/`tick` (ms) | `wait` (ms) | `lock` wall (ms) | `lock` CPU (ms) | Off-CPU (ms) | "
         "`rx`/`ctl`/`tx`/`obs`/`pub` (ms) | `lock_vcsw`/`ivcsw` | `maj`/`min` flt | Alloc calls | Lock Holder (`waited_for`) |"
     )
     out.append("|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|")
     for kind, ph, _sidx, bd in breakdowns[:12]:
-        lw = us_to_ms(bd.get("lock_us")) or 0.0
-        lc = us_to_ms(bd.get("lock_cpu_us")) or 0.0
+        lw = us_to_ms(get_nonneg_int(bd, "lock_us")) or 0.0
+        lc = us_to_ms(get_nonneg_int(bd, "lock_cpu_us")) or 0.0
         off_cpu = max(0.0, lw - lc)
         sub_str = "/".join(
-            fmt_ms(us_to_ms(bd.get(k)), 1) for k in ("rx_us", "control_us", "tx_us", "obs_us", "publish_us")
+            fmt_ms(us_to_ms(get_nonneg_int(bd, k)), 1) for k in ("rx_us", "control_us", "tx_us", "obs_us", "publish_us")
         )
         csw_str = f"{bd.get('lock_vcsw', 0)}/{bd.get('lock_ivcsw', 0)}"
         flt_str = f"{bd.get('lock_majflt', 0)}/{bd.get('lock_minflt', 0)}"
@@ -1198,8 +1636,11 @@ def analyze(
             if isinstance(wf, dict)
             else "none"
         )
+        rel_or_tick = get_nonneg_int(bd, "release_us")
+        if rel_or_tick is None or rel_or_tick == 0:
+            rel_or_tick = get_nonneg_int(bd, "tick_us")
         out.append(
-            f"| `{kind}` | `{ph}` | **{fmt_ms(us_to_ms(bd.get('tick_us')))}** | {fmt_ms(us_to_ms(bd.get('wait_us')))} | "
+            f"| `{kind}` | `{ph}` | **{fmt_ms(us_to_ms(rel_or_tick))}** | {fmt_ms(us_to_ms(get_nonneg_int(bd, 'wait_us')))} | "
             f"{fmt_ms(lw)} | {fmt_ms(lc)} | **{fmt_ms(off_cpu)}** | {sub_str} | {csw_str} | {flt_str} | "
             f"{bd.get('lock_alloc_calls', 0)} | {wf_str} |"
         )
@@ -1259,8 +1700,27 @@ def analyze(
             elif i < len(samples):
                 matched_load.append(samples[i])
 
-            worst_tick_ms = max_or_none([us_to_ms(ls.tick.get("tick_us", {}).get("max")) or 0.0 for ls in matched_load])
-            worst_lock_ms = max_or_none([us_to_ms(ls.tick.get("lock_us", {}).get("max")) or 0.0 for ls in matched_load])
+            worst_tick_ms = max_or_none(
+                [
+                    ms
+                    for ls in matched_load
+                    if (
+                        ms := us_to_ms(
+                            get_pct(ls.tick, "release_us", "max")
+                            if get_pct(ls.tick, "release_us", "max") is not None
+                            else get_pct(ls.tick, "tick_us", "max")
+                        )
+                    )
+                    is not None
+                ]
+            )
+            worst_lock_ms = max_or_none(
+                [
+                    ms
+                    for ls in matched_load
+                    if (ms := us_to_ms(get_pct(ls.tick, "lock_us", "max"))) is not None
+                ]
+            )
             phases_hit = sorted({ls.phase for ls in matched_load})
 
             ctl_prev = find_armd_control_task(prev_d.armd_tasks)
@@ -1379,6 +1839,13 @@ def analyze(
 
     # 6. Diagnostic Gaps
     gaps: list[str] = []
+    if not has_release_us:
+        gaps.append("`release_us`: full control-thread release duration is not present in input JSON.")
+    if not all_monotonic_present:
+        gaps.append(
+            "`releases_total` / `release_us_max_ever` / `releases_over_{10,15,20}ms` / `wake_late_max_ever`: "
+            "process-lifetime monotonic counters are missing on some or all samples."
+        )
     if not has_skipped_releases:
         gaps.append(
             "`skipped_releases`: tracked in `ExecutorStats::skipped_releases` (`src/rt_core/executor.rs`), "

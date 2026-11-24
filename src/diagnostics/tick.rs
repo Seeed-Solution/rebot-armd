@@ -21,10 +21,29 @@ pub const WAKE_LATENESS_1MS_NS: u64 = 1_000_000;
 pub const WAKE_LATENESS_5MS_NS: u64 = 5_000_000;
 pub const WAKE_LATENESS_10MS_NS: u64 = 10_000_000;
 
+/// Inclusive full-release duration thresholds evaluated on raw nanoseconds (`>= 10 / 15 / 20 ms`),
+/// matching the strict Stage 3 §6 `< 20 ms` gate (`release_ns >= 20_000_000` fails `< 20 ms`).
+pub const RELEASE_10MS_NS: u64 = 10_000_000;
+pub const RELEASE_15MS_NS: u64 = 15_000_000;
+pub const RELEASE_20MS_NS: u64 = 20_000_000;
+
 /// Converts nanoseconds to saturating microseconds (`u32`).
 #[inline]
 pub fn ns_to_us_u32(ns: u64) -> u32 {
     (ns / 1_000).min(u64::from(u32::MAX)) as u32
+}
+
+/// Converts raw full release duration (ns) to saturating microseconds and inclusive threshold
+/// flags (`>= 10 ms`, `>= 15 ms`, `>= 20 ms`).
+#[inline]
+pub fn classify_release_duration_ns(release_ns: u64) -> (u32, bool, bool, bool) {
+    let us = ns_to_us_u32(release_ns);
+    (
+        us,
+        release_ns >= RELEASE_10MS_NS,
+        release_ns >= RELEASE_15MS_NS,
+        release_ns >= RELEASE_20MS_NS,
+    )
 }
 
 /// Converts raw wakeup lateness (`actual_release_start - scheduled_release`, ns) to saturating
@@ -557,14 +576,60 @@ pub struct TxDiagnostics {
     pub since_boot_dropped_stopped: u64,
 }
 
+/// Coherent per-run baseline deltas and peaks since the latest operator
+/// `POST /api/v1/diagnostics/tick/mark`, acknowledged by the control thread at a single
+/// release completion boundary.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TickSinceMarker {
+    pub marker_id: u64,
+    /// `"pending"` until the control thread completes a release and captures the coherent
+    /// baseline; `"active"` once acknowledged.
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_total_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_over_10ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_over_15ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_over_20ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_releases_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diag_dropped_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_lateness_over_1ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_lateness_over_5ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_lateness_over_10ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_us_max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_late_max: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TickSnapshot {
+    /// Unique identifier for this daemon/supervisor instance (changes on every restart).
+    #[serde(default)]
+    pub instance_id: String,
     /// Ticks in the window (at most [`TICK_WINDOW`]).
     pub window: usize,
     /// Whole `ArmSupervisor::tick` call: lock wait, tick body and telemetry broadcast.
     pub tick_us: Percentiles,
     /// Full release duration on the control thread from wake through all release work, µs.
     pub release_us: Percentiles,
+    /// Monotonic completed releases since process start (control-thread written only).
+    pub releases_total: u64,
+    /// Monotonic all-time maximum full `release_us` since process start, µs (never ages out).
+    pub release_us_max_ever: u64,
+    /// Monotonic releases since process start with full duration `>= 10 ms` / `>= 15 ms` / `>= 20 ms`.
+    pub releases_over_10ms: u64,
+    pub releases_over_15ms: u64,
+    pub releases_over_20ms: u64,
+    /// Monotonic all-time maximum wakeup lateness since process start, µs (never ages out).
+    pub wake_late_max_ever: u64,
     /// Time the supervisor write lock was held by the tick.
     pub lock_us: Percentiles,
     /// Ticks since start whose `dt` exceeded two control periods.
@@ -631,6 +696,9 @@ pub struct TickSnapshot {
     /// Cumulative non-blocking writer contention drops on `LockFreeTickStats` (0 with single control writer).
     #[serde(default)]
     pub stats_writer_drops: u64,
+    /// Coherent deltas and peaks since the latest `POST /api/v1/diagnostics/tick/mark`, if requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_marker: Option<TickSinceMarker>,
 }
 
 impl Default for TickStats {
@@ -1372,9 +1440,16 @@ impl TickWindow {
 
     pub fn snapshot(&self) -> TickSnapshot {
         TickSnapshot {
+            instance_id: String::new(),
             window: self.rows.len(),
             tick_us: self.col(|r| r.tick_us),
             release_us: self.col(|r| r.release_us),
+            releases_total: 0,
+            release_us_max_ever: 0,
+            releases_over_10ms: 0,
+            releases_over_15ms: 0,
+            releases_over_20ms: 0,
+            wake_late_max_ever: 0,
             lock_us: self.col(|r| r.lock_us),
             late_count: self.late_count,
             since_boot_ticks: self.ticks,
@@ -1433,6 +1508,7 @@ impl TickWindow {
             stats_snapshot_lapped: self.snapshot_lapped,
             stats_reader_retries: 0,
             stats_writer_drops: 0,
+            since_marker: None,
         }
     }
 }

@@ -42,9 +42,25 @@ pub async fn get_blackbox(Extension(state): Extension<DiagnosticsState>, Query(q
     blocking(move || blackbox_body(&state, seconds, prev)).await
 }
 
-/// `GET /api/v1/diagnostics/tick`: control tick timing over the last 1000 ticks.
+/// `GET /api/v1/diagnostics/tick`: control tick timing over the last 1000 ticks plus monotonic
+/// process-lifetime peaks/thresholds and optional baseline marker deltas.
 pub async fn get_tick(axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>) -> Response {
     axum::Json(supervisor.tick_stats()).into_response()
+}
+
+/// `POST /api/v1/diagnostics/tick/mark`: request a coherent control-thread baseline marker for
+/// qualification runs (operator-protected; never mutates process-lifetime monotonic counters).
+pub async fn post_tick_mark(
+    axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>,
+) -> Response {
+    match supervisor.mark_tick_baseline() {
+        Ok(marker_id) => axum::Json(serde_json::json!({
+            "marker_id": marker_id,
+            "status": "pending",
+        }))
+        .into_response(),
+        Err(e) => crate::api::rest::ApiError::from(e).into_response(),
+    }
 }
 
 /// `GET /api/v1/diagnostics/power`: supply-current estimate, recent peaks and the budget in

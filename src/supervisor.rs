@@ -4570,6 +4570,8 @@ pub struct ArmSupervisor {
     sinks: Arc<std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>>,
     /// Shared periodic-loop timing stats attached in Legacy mode (`run_periodic`).
     legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
+    /// Unique identifier for this daemon/supervisor instance (changes across restarts).
+    instance_id: String,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -4638,6 +4640,12 @@ impl ArmSupervisor {
         inner.requested_estop_count = requested_estop_count.clone();
         let hub = inner.core.hub().clone();
         let control_period_us = (1e6 / f64::from(inner.config.control_frequency_hz.max(1))) as u64;
+        static NEXT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
+        let boot_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let seq = NEXT_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let instance_id = format!("armd-{}-{boot_ns:x}-{seq}", std::process::id());
         Self {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
@@ -4659,6 +4667,7 @@ impl ArmSupervisor {
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
             legacy_loop_stats: std::sync::Mutex::new(None),
+            instance_id,
         }
     }
 
@@ -5981,11 +5990,55 @@ impl ArmSupervisor {
         self.tick_stats.window().samples().to_vec()
     }
 
+    /// Requests a coherent control-thread baseline marker (`POST /api/v1/diagnostics/tick/mark`)
+    /// on the currently active periodic owner. Returns 503 if no control loop is actively running.
+    pub fn mark_tick_baseline(&self) -> Result<u64, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let Some(h) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                if h.is_exited() || !h.stats().is_loop_active() {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_STOPPED".into(),
+                        message: "RT executor control loop is not active".into(),
+                    });
+                }
+                Ok(h.stats().request_marker())
+            }
+            OWNER_LEGACY => {
+                let stats = self
+                    .legacy_loop_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let Some(s) = stats else {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "CONTROL_LOOP_INACTIVE".into(),
+                        message: "Legacy periodic control loop is not active".into(),
+                    });
+                };
+                if !s.is_loop_active() {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "CONTROL_LOOP_INACTIVE".into(),
+                        message: "Legacy periodic control loop is not active".into(),
+                    });
+                }
+                Ok(s.request_marker())
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
     /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). Reads the lock-free ring
     /// without ever blocking the control thread.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
         self.drain_diag();
         let mut snap = self.tick_stats.snapshot();
+        snap.instance_id = self.instance_id.clone();
         snap.owner_mode = self.owner_mode_name();
         let active_stats = if let Some(h) = self.executor_handle() {
             Some(Arc::clone(h.stats()))
@@ -5996,11 +6049,22 @@ impl ArmSupervisor {
                 .clone()
         };
         if let Some(s) = active_stats {
-            snap.skipped_releases = s.skipped_releases.load(Ordering::Relaxed);
-            snap.diag_dropped = s.diag_dropped.load(Ordering::Relaxed);
-            snap.wake_lateness_over_1ms = s.wake_lateness_over_1ms.load(Ordering::Relaxed);
-            snap.wake_lateness_over_5ms = s.wake_lateness_over_5ms.load(Ordering::Relaxed);
-            snap.wake_lateness_over_10ms = s.wake_lateness_over_10ms.load(Ordering::Relaxed);
+            let mono = s.snapshot_monotonic();
+            if !mono.coherent {
+                snap.stats_snapshot_lapped = true;
+            }
+            snap.releases_total = mono.releases_total;
+            snap.release_us_max_ever = mono.release_us_max_ever;
+            snap.releases_over_10ms = mono.releases_over_10ms;
+            snap.releases_over_15ms = mono.releases_over_15ms;
+            snap.releases_over_20ms = mono.releases_over_20ms;
+            snap.wake_late_max_ever = mono.wake_late_max_ever;
+            snap.skipped_releases = mono.skipped_releases;
+            snap.diag_dropped = mono.diag_dropped;
+            snap.wake_lateness_over_1ms = mono.wake_lateness_over_1ms;
+            snap.wake_lateness_over_5ms = mono.wake_lateness_over_5ms;
+            snap.wake_lateness_over_10ms = mono.wake_lateness_over_10ms;
+            snap.since_marker = mono.since_marker;
         }
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {

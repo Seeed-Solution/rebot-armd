@@ -243,13 +243,44 @@ impl AtomicAllocCounters {
     }
 }
 
-/// Counters the executor thread updates with plain atomic stores.
+/// Coherent snapshot of control-thread-written monotonic qualification counters and any
+/// operator-requested baseline marker, read lock-free via [`ExecutorStats::snapshot_monotonic`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonotonicStatsSnapshot {
+    pub coherent: bool,
+    pub releases_total: u64,
+    pub release_us_max_ever: u64,
+    pub releases_over_10ms: u64,
+    pub releases_over_15ms: u64,
+    pub releases_over_20ms: u64,
+    pub wake_late_max_ever: u64,
+    pub skipped_releases: u64,
+    pub diag_dropped: u64,
+    pub wake_lateness_over_1ms: u64,
+    pub wake_lateness_over_5ms: u64,
+    pub wake_lateness_over_10ms: u64,
+    pub since_marker: Option<crate::diagnostics::tick::TickSinceMarker>,
+}
+
+const MAX_MONOTONIC_SEQLOCK_RETRIES: usize = 64;
+
+/// Counters the executor / periodic control thread updates with plain atomic stores.
 #[derive(Debug, Default)]
 pub struct ExecutorStats {
     /// Steps started.
     pub steps: AtomicU64,
     /// Whole releases completed (Release-incremented strictly AFTER `release_allocs` is updated).
     pub completed_releases: AtomicU64,
+    /// Monotonic completed releases since process start (control-thread written only).
+    pub releases_total: AtomicU64,
+    /// Monotonic all-time maximum full `release_us` since process start, µs (control-thread written only).
+    pub release_us_max_ever: AtomicU64,
+    /// Monotonic releases since process start with full duration `>= 10 ms` / `>= 15 ms` / `>= 20 ms`.
+    pub releases_over_10ms: AtomicU64,
+    pub releases_over_15ms: AtomicU64,
+    pub releases_over_20ms: AtomicU64,
+    /// Monotonic all-time maximum wakeup lateness since process start, µs (control-thread written only).
+    pub wake_late_max_ever: AtomicU64,
     /// Steps whose elapsed time exceeded [`LATE_LOG_AFTER`].
     pub late: AtomicU64,
     /// Elapsed time of the latest late step, microseconds.
@@ -262,6 +293,27 @@ pub struct ExecutorStats {
     pub wake_lateness_over_1ms: AtomicU64,
     pub wake_lateness_over_5ms: AtomicU64,
     pub wake_lateness_over_10ms: AtomicU64,
+    /// True while the owning periodic control loop is actively running (`control_thread_main` or
+    /// `run_periodic_with_clock`); cleared via RAII guard on exit.
+    loop_active: AtomicBool,
+    /// Monotonic marker request generation written ONLY by `POST /api/v1/diagnostics/tick/mark`.
+    marker_requested_gen: AtomicU64,
+    /// Control-thread seqlock protecting coherent publication of all monotonic counters,
+    /// `marker_ack_gen`, baseline counter snapshots, and `since_*` peaks.
+    stats_seq: AtomicU64,
+    /// Control-thread acknowledged marker generation.
+    marker_ack_gen: AtomicU64,
+    base_releases_total: AtomicU64,
+    base_releases_over_10ms: AtomicU64,
+    base_releases_over_15ms: AtomicU64,
+    base_releases_over_20ms: AtomicU64,
+    base_skipped_releases: AtomicU64,
+    base_diag_dropped: AtomicU64,
+    base_wake_over_1ms: AtomicU64,
+    base_wake_over_5ms: AtomicU64,
+    base_wake_over_10ms: AtomicU64,
+    since_release_us_max: AtomicU64,
+    since_wake_late_max: AtomicU64,
     /// Monotonic count of deferred safety log events dropped due to queue overflow (never reset).
     pub safety_log_dropped: AtomicU64,
     /// Sub-release transition wakes started by `armd-control`.
@@ -299,13 +351,29 @@ impl ExecutorStats {
     pub(crate) fn has_legacy_tick_ring(&self) -> bool {
         self.legacy_tick_ring.get().is_some()
     }
+
+    /// Returns `true` while the owning control loop is actively running.
+    #[inline]
+    pub fn is_loop_active(&self) -> bool {
+        self.loop_active.load(Ordering::Acquire)
+    }
+
+    /// Requests a coherent control-thread baseline marker (`POST /api/v1/diagnostics/tick/mark`).
+    /// Writes ONLY `marker_requested_gen`; never touches any control-thread counter/peak atomic.
+    pub fn request_marker(&self) -> u64 {
+        self.marker_requested_gen.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    }
+
     /// Classifies raw wakeup lateness (`actual_release_start - scheduled_release`, ns), updates
-    /// the cumulative `> 1 / 5 / 10 ms` counters atomically (zero allocation), and returns the
-    /// saturating microsecond value for `TickSample::wake_lateness_us`.
+    /// the cumulative `> 1 / 5 / 10 ms` counters and `wake_late_max_ever` atomically (zero
+    /// allocation), and returns the saturating microsecond value for `TickSample::wake_lateness_us`.
     #[inline]
     pub fn record_wake_lateness_ns(&self, lateness_ns: u64) -> u32 {
         let (us, over_1ms, over_5ms, over_10ms) =
             crate::diagnostics::tick::classify_wake_lateness_ns(lateness_ns);
+        let s0 = self.stats_seq.load(Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
         if over_1ms {
             self.wake_lateness_over_1ms.fetch_add(1, Ordering::Relaxed);
         }
@@ -315,7 +383,218 @@ impl ExecutorStats {
         if over_10ms {
             self.wake_lateness_over_10ms.fetch_add(1, Ordering::Relaxed);
         }
+        self.wake_late_max_ever.fetch_max(u64::from(us), Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
         us
+    }
+
+    /// Commits one completed (or panicked) release's full monotonic qualification outcome inside a
+    /// single control-thread seqlock transaction (zero allocation, zero mutex):
+    /// - updates `wake_lateness_over_{1,5,10}ms`, `wake_late_max_ever`, `releases_total`,
+    ///   `release_us_max_ever`, `releases_over_{10,15,20}ms`, `skipped_releases`, `diag_dropped`;
+    /// - updates active `since_marker` peaks for this release;
+    /// - acknowledges any pending `marker_requested_gen` strictly AFTER this release's counters
+    ///   are committed so pre-marker debt is never charged to the newly marked interval.
+    #[inline]
+    pub fn commit_release_outcome(
+        &self,
+        wake_lateness_ns: u64,
+        release_ns: u64,
+        skipped_delta: u64,
+        diag_dropped_delta: u64,
+    ) {
+        let (wake_us, w1, w5, w10) = crate::diagnostics::tick::classify_wake_lateness_ns(wake_lateness_ns);
+        let (rel_us, r10, r15, r20) = crate::diagnostics::tick::classify_release_duration_ns(release_ns);
+
+        let s0 = self.stats_seq.load(Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+
+        let rel_total = self.releases_total.load(Ordering::Relaxed).saturating_add(1);
+        self.releases_total.store(rel_total, Ordering::Relaxed);
+        let prev_rel_max = self.release_us_max_ever.load(Ordering::Relaxed);
+        if u64::from(rel_us) > prev_rel_max {
+            self.release_us_max_ever.store(u64::from(rel_us), Ordering::Relaxed);
+        }
+        let rel_10 = self.releases_over_10ms.load(Ordering::Relaxed).saturating_add(u64::from(r10));
+        self.releases_over_10ms.store(rel_10, Ordering::Relaxed);
+        let rel_15 = self.releases_over_15ms.load(Ordering::Relaxed).saturating_add(u64::from(r15));
+        self.releases_over_15ms.store(rel_15, Ordering::Relaxed);
+        let rel_20 = self.releases_over_20ms.load(Ordering::Relaxed).saturating_add(u64::from(r20));
+        self.releases_over_20ms.store(rel_20, Ordering::Relaxed);
+
+        let prev_wake_max = self.wake_late_max_ever.load(Ordering::Relaxed);
+        if u64::from(wake_us) > prev_wake_max {
+            self.wake_late_max_ever.store(u64::from(wake_us), Ordering::Relaxed);
+        }
+        let wake_1 = self.wake_lateness_over_1ms.load(Ordering::Relaxed).saturating_add(u64::from(w1));
+        self.wake_lateness_over_1ms.store(wake_1, Ordering::Relaxed);
+        let wake_5 = self.wake_lateness_over_5ms.load(Ordering::Relaxed).saturating_add(u64::from(w5));
+        self.wake_lateness_over_5ms.store(wake_5, Ordering::Relaxed);
+        let wake_10 = self.wake_lateness_over_10ms.load(Ordering::Relaxed).saturating_add(u64::from(w10));
+        self.wake_lateness_over_10ms.store(wake_10, Ordering::Relaxed);
+
+        let skips = self.skipped_releases.load(Ordering::Relaxed).saturating_add(skipped_delta);
+        self.skipped_releases.store(skips, Ordering::Relaxed);
+        let diag_drops = self.diag_dropped.load(Ordering::Relaxed).saturating_add(diag_dropped_delta);
+        self.diag_dropped.store(diag_drops, Ordering::Relaxed);
+
+        let ack = self.marker_ack_gen.load(Ordering::Relaxed);
+        if ack > 0 {
+            let sr = self.since_release_us_max.load(Ordering::Relaxed);
+            if u64::from(rel_us) > sr {
+                self.since_release_us_max.store(u64::from(rel_us), Ordering::Relaxed);
+            }
+            let sw = self.since_wake_late_max.load(Ordering::Relaxed);
+            if u64::from(wake_us) > sw {
+                self.since_wake_late_max.store(u64::from(wake_us), Ordering::Relaxed);
+            }
+        }
+
+        let req = self.marker_requested_gen.load(Ordering::Acquire);
+        if req != ack {
+            self.base_releases_total.store(rel_total, Ordering::Relaxed);
+            self.base_releases_over_10ms.store(rel_10, Ordering::Relaxed);
+            self.base_releases_over_15ms.store(rel_15, Ordering::Relaxed);
+            self.base_releases_over_20ms.store(rel_20, Ordering::Relaxed);
+            self.base_skipped_releases.store(skips, Ordering::Relaxed);
+            self.base_diag_dropped.store(diag_drops, Ordering::Relaxed);
+            self.base_wake_over_1ms.store(wake_1, Ordering::Relaxed);
+            self.base_wake_over_5ms.store(wake_5, Ordering::Relaxed);
+            self.base_wake_over_10ms.store(wake_10, Ordering::Relaxed);
+            self.since_release_us_max.store(0, Ordering::Relaxed);
+            self.since_wake_late_max.store(0, Ordering::Relaxed);
+            self.marker_ack_gen.store(req, Ordering::Relaxed);
+        }
+
+        self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Accounts remaining shutdown/panic-exit overrun skips inside the control-thread seqlock.
+    #[inline]
+    pub fn record_exit_skips(&self, skipped_delta: u64) {
+        if skipped_delta == 0 {
+            return;
+        }
+        let s0 = self.stats_seq.load(Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        let skips = self.skipped_releases.load(Ordering::Relaxed).saturating_add(skipped_delta);
+        self.skipped_releases.store(skips, Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Reads one atomically coherent snapshot of all monotonic counters and `since_marker`
+    /// with bounded seqlock retries (never spins infinitely).
+    pub fn snapshot_monotonic(&self) -> MonotonicStatsSnapshot {
+        for _ in 0..MAX_MONOTONIC_SEQLOCK_RETRIES {
+            let s1 = self.stats_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let releases_total = self.releases_total.load(Ordering::Relaxed);
+            let release_us_max_ever = self.release_us_max_ever.load(Ordering::Relaxed);
+            let releases_over_10ms = self.releases_over_10ms.load(Ordering::Relaxed);
+            let releases_over_15ms = self.releases_over_15ms.load(Ordering::Relaxed);
+            let releases_over_20ms = self.releases_over_20ms.load(Ordering::Relaxed);
+            let wake_late_max_ever = self.wake_late_max_ever.load(Ordering::Relaxed);
+            let skipped_releases = self.skipped_releases.load(Ordering::Relaxed);
+            let diag_dropped = self.diag_dropped.load(Ordering::Relaxed);
+            let wake_lateness_over_1ms = self.wake_lateness_over_1ms.load(Ordering::Relaxed);
+            let wake_lateness_over_5ms = self.wake_lateness_over_5ms.load(Ordering::Relaxed);
+            let wake_lateness_over_10ms = self.wake_lateness_over_10ms.load(Ordering::Relaxed);
+            let ack = self.marker_ack_gen.load(Ordering::Relaxed);
+            let b_rel = self.base_releases_total.load(Ordering::Relaxed);
+            let b_r10 = self.base_releases_over_10ms.load(Ordering::Relaxed);
+            let b_r15 = self.base_releases_over_15ms.load(Ordering::Relaxed);
+            let b_r20 = self.base_releases_over_20ms.load(Ordering::Relaxed);
+            let b_skip = self.base_skipped_releases.load(Ordering::Relaxed);
+            let b_diag = self.base_diag_dropped.load(Ordering::Relaxed);
+            let b_w1 = self.base_wake_over_1ms.load(Ordering::Relaxed);
+            let b_w5 = self.base_wake_over_5ms.load(Ordering::Relaxed);
+            let b_w10 = self.base_wake_over_10ms.load(Ordering::Relaxed);
+            let s_rel_max = self.since_release_us_max.load(Ordering::Relaxed);
+            let s_wake_max = self.since_wake_late_max.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let s2 = self.stats_seq.load(Ordering::Relaxed);
+            if s1 == s2 {
+                let req = self.marker_requested_gen.load(Ordering::Acquire);
+                let since_marker = if req == 0 {
+                    None
+                } else if ack == req {
+                    Some(crate::diagnostics::tick::TickSinceMarker {
+                        marker_id: req,
+                        status: "active",
+                        releases_total_delta: Some(releases_total.saturating_sub(b_rel)),
+                        releases_over_10ms_delta: Some(releases_over_10ms.saturating_sub(b_r10)),
+                        releases_over_15ms_delta: Some(releases_over_15ms.saturating_sub(b_r15)),
+                        releases_over_20ms_delta: Some(releases_over_20ms.saturating_sub(b_r20)),
+                        skipped_releases_delta: Some(skipped_releases.saturating_sub(b_skip)),
+                        diag_dropped_delta: Some(diag_dropped.saturating_sub(b_diag)),
+                        wake_lateness_over_1ms_delta: Some(wake_lateness_over_1ms.saturating_sub(b_w1)),
+                        wake_lateness_over_5ms_delta: Some(wake_lateness_over_5ms.saturating_sub(b_w5)),
+                        wake_lateness_over_10ms_delta: Some(wake_lateness_over_10ms.saturating_sub(b_w10)),
+                        release_us_max: Some(s_rel_max),
+                        wake_late_max: Some(s_wake_max),
+                    })
+                } else {
+                    Some(crate::diagnostics::tick::TickSinceMarker {
+                        marker_id: req,
+                        status: "pending",
+                        releases_total_delta: None,
+                        releases_over_10ms_delta: None,
+                        releases_over_15ms_delta: None,
+                        releases_over_20ms_delta: None,
+                        skipped_releases_delta: None,
+                        diag_dropped_delta: None,
+                        wake_lateness_over_1ms_delta: None,
+                        wake_lateness_over_5ms_delta: None,
+                        wake_lateness_over_10ms_delta: None,
+                        release_us_max: None,
+                        wake_late_max: None,
+                    })
+                };
+                return MonotonicStatsSnapshot {
+                    coherent: true,
+                    releases_total,
+                    release_us_max_ever,
+                    releases_over_10ms,
+                    releases_over_15ms,
+                    releases_over_20ms,
+                    wake_late_max_ever,
+                    skipped_releases,
+                    diag_dropped,
+                    wake_lateness_over_1ms,
+                    wake_lateness_over_5ms,
+                    wake_lateness_over_10ms,
+                    since_marker,
+                };
+            }
+            std::hint::spin_loop();
+        }
+        MonotonicStatsSnapshot {
+            coherent: false,
+            releases_total: self.releases_total.load(Ordering::Relaxed),
+            release_us_max_ever: self.release_us_max_ever.load(Ordering::Relaxed),
+            releases_over_10ms: self.releases_over_10ms.load(Ordering::Relaxed),
+            releases_over_15ms: self.releases_over_15ms.load(Ordering::Relaxed),
+            releases_over_20ms: self.releases_over_20ms.load(Ordering::Relaxed),
+            wake_late_max_ever: self.wake_late_max_ever.load(Ordering::Relaxed),
+            skipped_releases: self.skipped_releases.load(Ordering::Relaxed),
+            diag_dropped: self.diag_dropped.load(Ordering::Relaxed),
+            wake_lateness_over_1ms: self.wake_lateness_over_1ms.load(Ordering::Relaxed),
+            wake_lateness_over_5ms: self.wake_lateness_over_5ms.load(Ordering::Relaxed),
+            wake_lateness_over_10ms: self.wake_lateness_over_10ms.load(Ordering::Relaxed),
+            since_marker: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_odd_stats_seq_for_test(&self, odd: bool) {
+        let cur = self.stats_seq.load(Ordering::Relaxed);
+        let target = if odd { cur | 1 } else { cur & !1 };
+        self.stats_seq.store(target, Ordering::Release);
     }
 
     /// Combined cumulative heap counts across both whole releases and sub-release wakes
@@ -2960,6 +3239,15 @@ fn control_thread_main(
         }
     };
 
+    struct LoopActiveGuard<'a>(&'a AtomicBool);
+    impl Drop for LoopActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    stats.loop_active.store(true, Ordering::Release);
+    let _loop_active = LoopActiveGuard(&stats.loop_active);
+
     let mut releases = Releases::start_at(now_ns_fn(), cfg.period);
     let mut last_release_start = now_inst();
     let mut last_release_end_ns: Option<u64> = None;
@@ -2986,19 +3274,16 @@ fn control_thread_main(
         let actual_ns = now_ns_fn();
         let release_start = now_inst();
         let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
-        let wake_lateness_us;
+        let wake_lateness_us = crate::diagnostics::tick::ns_to_us_u32(wake_lateness_ns);
+        let wake_skipped;
         let step_num;
 
         // ---- Window 1: Whole release (disjoint from sub-release wakes) ----
         let release_res = {
             // Declared FIRST -> drops LAST, after catch_unwind and ALL release locals drop!
             let _alloc_scope = WholeReleaseAllocGuard::enter(&stats, false);
-            wake_lateness_us = stats.record_wake_lateness_ns(wake_lateness_ns);
             let usage_start = UsageMark::now();
-            let skipped = releases.advance(actual_ns);
-            if skipped > 0 {
-                stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
-            }
+            wake_skipped = releases.advance(actual_ns);
             let elapsed = release_start.saturating_duration_since(last_release_start);
             last_release_start = release_start;
             if elapsed > LATE_LOG_AFTER {
@@ -3317,6 +3602,7 @@ fn control_thread_main(
         let pre_diag_release_ns = pre_diag_end_ns
             .saturating_sub(actual_ns)
             .saturating_sub(wake_sleep_ns);
+        let mut diag_dropped_delta: u64 = 0;
         if step_sample.is_some() || step_res.is_err() {
             let mut sample = step_sample.unwrap_or(TickSample {
                 tick_us: crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns),
@@ -3328,7 +3614,7 @@ fn control_thread_main(
             });
             sample.release_us = crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns);
             if diag_tx.push(sample).is_err() {
-                stats.diag_dropped.fetch_add(1, Ordering::Relaxed);
+                diag_dropped_delta = 1;
             }
             hub.wake();
         }
@@ -3338,10 +3624,16 @@ fn control_thread_main(
             let _tail_local = state.run_tail_alloc_probe(&state.hooks.inject_release_tail_once);
         }
         let release_end_ns = now_ns_fn();
+        let final_release_ns = release_end_ns
+            .saturating_sub(actual_ns)
+            .saturating_sub(wake_sleep_ns);
         let overrun_skipped = releases.advance_overrun(release_end_ns);
-        if overrun_skipped > 0 {
-            stats.skipped_releases.fetch_add(overrun_skipped, Ordering::Relaxed);
-        }
+        stats.commit_release_outcome(
+            wake_lateness_ns,
+            final_release_ns,
+            wake_skipped.saturating_add(overrun_skipped),
+            diag_dropped_delta,
+        );
         last_release_end_ns = Some(release_end_ns);
         let tail_alloc_delta = crate::diagnostics::alloc::snapshot_counts().delta_since(tail_alloc_start);
         if tail_alloc_delta.total() > 0 {
@@ -3351,10 +3643,7 @@ fn control_thread_main(
 
         if let Err(err) = step_res {
             if let Some(end_ns) = last_release_end_ns.take() {
-                let final_skipped = releases.missed_at_exit(end_ns);
-                if final_skipped > 0 {
-                    stats.skipped_releases.fetch_add(final_skipped, Ordering::Relaxed);
-                }
+                stats.record_exit_skips(releases.missed_at_exit(end_ns));
             }
             panicked = true;
             e_stop_latched.store(true, Ordering::SeqCst);
@@ -3422,10 +3711,7 @@ fn control_thread_main(
 
     // Account any final release overrun that elapsed past `releases.next_ns()` right before loop exit.
     if let Some(end_ns) = last_release_end_ns.take() {
-        let final_skipped = releases.missed_at_exit(end_ns);
-        if final_skipped > 0 {
-            stats.skipped_releases.fetch_add(final_skipped, Ordering::Relaxed);
-        }
+        stats.record_exit_skips(releases.missed_at_exit(end_ns));
     }
 
     if !panicked && teardown_disable.requested.load(Ordering::Acquire) {
@@ -3573,21 +3859,30 @@ impl Releases {
 }
 
 thread_local! {
-    /// Active `(next_ns, period_ns)` of an in-flight `run_periodic_with_clock` release on this
-    /// thread so explicit panic-exit wrappers (e.g. `src/main.rs` before `process::exit`) and
-    /// unwind guards account the final overrun exactly once.
-    static ACTIVE_PERIODIC_GRID: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// Active `(actual_ns, wake_lateness_ns, wake_skipped, next_ns, period_ns)` of an in-flight
+    /// `run_periodic_with_clock` release on this thread so explicit panic-exit wrappers
+    /// (`src/main.rs` before `process::exit`) and unwind guards commit the release outcome and
+    /// final overrun exactly once.
+    static ACTIVE_PERIODIC_RELEASE: std::cell::Cell<Option<(u64, u64, u64, u64, u64)>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Accounts any final overrun skips for the calling thread's in-flight `run_periodic` release
-/// immediately before a panic-exit handler calls `attempt_legacy_panic_disable` / `process::exit`.
-/// Consumes the thread-local grid once so unwind paths cannot double-count.
+/// Accounts release duration and any final overrun skips for the calling thread's in-flight
+/// `run_periodic` release immediately before a panic-exit handler calls `attempt_legacy_panic_disable`
+/// / `process::exit`. Consumes the thread-local state once so unwind paths cannot double-count.
 pub fn account_periodic_overrun_on_panic_exit(stats: &ExecutorStats) {
-    if let Some((next_ns, period_ns)) = ACTIVE_PERIODIC_GRID.try_with(|c| c.take()).ok().flatten() {
-        let skipped = Releases { period_ns, next_ns }.missed_at_exit(mono_now_ns());
-        if skipped > 0 {
-            stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
-        }
+    if let Some((actual_ns, wake_lateness_ns, wake_skipped, next_ns, period_ns)) =
+        ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
+    {
+        let end_ns = mono_now_ns();
+        let release_ns = end_ns.saturating_sub(actual_ns);
+        let exit_skips = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
+        stats.commit_release_outcome(
+            wake_lateness_ns,
+            release_ns,
+            wake_skipped.saturating_add(exit_skips),
+            0,
+        );
     }
 }
 
@@ -3605,6 +3900,15 @@ pub fn run_periodic_with_clock(
     clock: Option<&dyn ExecutorClock>,
     mut step: impl FnMut(f64),
 ) {
+    struct LoopActiveGuard<'a>(&'a AtomicBool);
+    impl Drop for LoopActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    stats.loop_active.store(true, Ordering::Release);
+    let _loop_active = LoopActiveGuard(&stats.loop_active);
+
     let now_inst = || clock.map_or_else(Instant::now, ExecutorClock::now);
     let now_ns = || clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
     let mut releases = Releases::start_at(now_ns(), period);
@@ -3623,9 +3927,7 @@ pub fn run_periodic_with_clock(
         let actual_ns = now_ns();
         let woke = now_inst();
         let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
-        let _ = stats.record_wake_lateness_ns(wake_lateness_ns);
-        let skipped = releases.advance(actual_ns);
-        if skipped > 0 { stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed); }
+        let wake_skipped = releases.advance(actual_ns);
         let elapsed = woke.saturating_duration_since(last);
         last = woke;
         if elapsed > LATE_LOG_AFTER {
@@ -3637,39 +3939,54 @@ pub fn run_periodic_with_clock(
             wake_lateness_ns,
             stats.has_legacy_tick_ring(),
         );
-        let _ = ACTIVE_PERIODIC_GRID.try_with(|c| c.set(Some((releases.next_ns, releases.period_ns))));
+        let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| {
+            c.set(Some((
+                actual_ns,
+                wake_lateness_ns,
+                wake_skipped,
+                releases.next_ns,
+                releases.period_ns,
+            )))
+        });
         struct PeriodicUnwindGridGuard<'a> {
             stats: &'a ExecutorStats,
             clock: Option<&'a dyn ExecutorClock>,
-            actual_ns: u64,
         }
         impl Drop for PeriodicUnwindGridGuard<'_> {
             fn drop(&mut self) {
-                if let Some((next_ns, period_ns)) = ACTIVE_PERIODIC_GRID.try_with(|c| c.take()).ok().flatten() {
+                if let Some((actual_ns, wake_lateness_ns, wake_skipped, next_ns, period_ns)) =
+                    ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take()).ok().flatten()
+                {
                     if std::thread::panicking() {
-                        let end_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
+                        let pre_pub_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
                         if let Some(mut sample) = crate::diagnostics::tick::take_periodic_sample() {
                             sample.release_us = crate::diagnostics::tick::ns_to_us_u32(
-                                end_ns.saturating_sub(self.actual_ns),
+                                pre_pub_ns.saturating_sub(actual_ns),
                             );
                             if let Some(ring) = self.stats.legacy_tick_ring.get() {
                                 let _ = ring.record(&sample);
                             }
                         }
-                        let skipped = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
-                        if skipped > 0 {
-                            self.stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
-                        }
+                        let end_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
+                        let release_ns = end_ns.saturating_sub(actual_ns);
+                        let exit_skips = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
+                        self.stats.commit_release_outcome(
+                            wake_lateness_ns,
+                            release_ns,
+                            wake_skipped.saturating_add(exit_skips),
+                            0,
+                        );
                     }
                 }
             }
         }
-        let _unwind_grid = PeriodicUnwindGridGuard { stats, clock, actual_ns };
+        let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
         step(elapsed.as_secs_f64());
-        let _ = ACTIVE_PERIODIC_GRID.try_with(|c| c.take());
+        let _ = ACTIVE_PERIODIC_RELEASE.try_with(|c| c.take());
         drop(_unwind_grid);
         // Single legacy release-completion point: stamp full `release_us` and publish the prepared
-        // sample once into `LockFreeTickStats` before measuring `end_ns` for overrun accounting.
+        // sample once into `LockFreeTickStats`, then measure `end_ns` (strictly after ring publication)
+        // and commit all monotonic counters and overrun skips in one coherent seqlock transaction.
         if let Some(mut sample) = crate::diagnostics::tick::take_periodic_sample() {
             let pre_pub_ns = now_ns();
             sample.release_us = crate::diagnostics::tick::ns_to_us_u32(
@@ -3680,17 +3997,18 @@ pub fn run_periodic_with_clock(
             }
         }
         let end_ns = now_ns();
+        let final_release_ns = end_ns.saturating_sub(actual_ns);
         let overrun_skipped = releases.advance_overrun(end_ns);
-        if overrun_skipped > 0 {
-            stats.skipped_releases.fetch_add(overrun_skipped, Ordering::Relaxed);
-        }
+        stats.commit_release_outcome(
+            wake_lateness_ns,
+            final_release_ns,
+            wake_skipped.saturating_add(overrun_skipped),
+            0,
+        );
         last_release_end_ns = Some(end_ns);
     }
     if let Some(end_ns) = last_release_end_ns.take() {
-        let final_skipped = releases.missed_at_exit(end_ns);
-        if final_skipped > 0 {
-            stats.skipped_releases.fetch_add(final_skipped, Ordering::Relaxed);
-        }
+        stats.record_exit_skips(releases.missed_at_exit(end_ns));
     }
 }
 

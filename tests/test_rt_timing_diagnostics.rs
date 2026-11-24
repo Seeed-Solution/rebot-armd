@@ -464,7 +464,7 @@ fn base_tick_json(period_max: u64, tick_max: u64) -> serde_json::Value {
 fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let dir = tempfile::tempdir().unwrap();
 
-    // (a) Legacy tickload.json lacking Q1 fields: proxies & gaps preserved.
+    // (a) Legacy tickload.json lacking Q1/monotonic fields: proxies & gaps preserved, verdict INVALID.
     let legacy_path = dir.path().join("legacy_tickload.json");
     let t0 = base_tick_json(22_000, 1_500);
     let mut t1 = base_tick_json(23_000, 1_800);
@@ -472,16 +472,26 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let legacy = serde_json::json!({ "fault": null, "ticks": [t0, t1] });
     std::fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
     let legacy_rep = run_analyze(&legacy_path, None);
+    assert!(legacy_rep.contains("**Overall Verdict: INVALID"), "{legacy_rep}");
     assert!(legacy_rep.contains("PASS (proxy)"), "{legacy_rep}");
     assert!(legacy_rep.contains("Wake Overrun Proxy (ms)"), "{legacy_rep}");
     assert!(legacy_rep.contains("3.00 (sched overrun proxy)"), "{legacy_rep}");
     assert!(legacy_rep.contains("`skipped_releases`:"), "{legacy_rep}");
     assert!(legacy_rep.contains("`wake_lateness_us`:"), "{legacy_rep}");
 
-    // (b) New Q1 JSONL with diag_dropped == 0: real fields used, closed gaps omitted!
+    // (b) Full Q1 JSONL with release_us + monotonic counters + diag_dropped == 0:
+    //     real fields used, closed gaps omitted!
     let q1_path = dir.path().join("q1_clean.jsonl");
     let mut q0 = base_tick_json(26_000, 1_500);
+    q0["instance_id"] = serde_json::json!("armd-test-1");
     q0["owner_mode"] = serde_json::json!("executor");
+    q0["release_us"] = serde_json::json!({ "p50": 600, "p99": 1000, "max": 1600 });
+    q0["releases_total"] = serde_json::json!(100);
+    q0["release_us_max_ever"] = serde_json::json!(1600);
+    q0["releases_over_10ms"] = serde_json::json!(0);
+    q0["releases_over_15ms"] = serde_json::json!(0);
+    q0["releases_over_20ms"] = serde_json::json!(0);
+    q0["wake_late_max_ever"] = serde_json::json!(750);
     q0["skipped_releases"] = serde_json::json!(0);
     q0["diag_dropped"] = serde_json::json!(0);
     q0["wake_lateness_us"] = serde_json::json!({ "p50": 120, "p99": 400, "max": 750 });
@@ -491,7 +501,9 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
 
     let mut q1 = q0.clone();
     q1["since_boot_ticks"] = serde_json::json!(300);
+    q1["releases_total"] = serde_json::json!(300);
     q1["wake_lateness_us"] = serde_json::json!({ "p50": 150, "p99": 500, "max": 800 });
+    q1["wake_late_max_ever"] = serde_json::json!(800);
 
     let q1_lines = format!(
         "{}\n{}\n{}\n",
@@ -524,6 +536,7 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     d0["enqueue_to_wire_us"] = serde_json::json!({ "p50": 100, "p99": 200, "max": 250 });
     let mut d1 = d0.clone();
     d1["since_boot_ticks"] = serde_json::json!(300);
+    d1["releases_total"] = serde_json::json!(300);
     d1["diag_dropped"] = serde_json::json!(5);
     let drop_lines = format!(
         "{}\n{}\n{}\n",
@@ -539,9 +552,12 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     );
     assert!(drop_rep.contains("INCOMPLETE (diag_dropped > 0)"), "{drop_rep}");
 
-    // (d) diag_dropped > 0 WITH an observed release breach (>= 20 ms) -> MUST still be FAIL!
+    // (d) diag_dropped > 0 WITH an observed in-run release breach (>= 20 ms) -> MUST still be FAIL!
     let breach_path = dir.path().join("q1_drop_breach.jsonl");
     let mut b1 = d1.clone();
+    b1["release_us"]["max"] = serde_json::json!(25_000);
+    b1["release_us_max_ever"] = serde_json::json!(25_000);
+    b1["releases_over_20ms"] = serde_json::json!(1);
     b1["tick_us"]["max"] = serde_json::json!(25_000);
     b1["max_tick"]["tick_us"] = serde_json::json!(25_000);
     let breach_lines = format!(
@@ -554,12 +570,13 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let breach_rep = run_analyze(&breach_path, Some(&devstat_path));
     assert!(breach_rep.contains("**Overall Verdict: FAIL**"), "{breach_rep}");
 
-    // (e) Missing `diag_dropped` with all other criteria clean -> MUST be INCOMPLETE (not PASS)!
+    // (e) Missing required `diag_dropped` with all other criteria clean -> MUST be INVALID (not PASS)!
     let missing_dd_path = dir.path().join("q1_missing_diag_dropped.jsonl");
     let mut m0 = d0.clone();
     m0.as_object_mut().unwrap().remove("diag_dropped");
     let mut m1 = m0.clone();
     m1["since_boot_ticks"] = serde_json::json!(300);
+    m1["releases_total"] = serde_json::json!(300);
     std::fs::write(
         &missing_dd_path,
         format!(
@@ -571,18 +588,20 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     )
     .unwrap();
     let missing_dd_rep = run_analyze(&missing_dd_path, Some(&devstat_path));
-    assert!(missing_dd_rep.contains("**Overall Verdict: INCOMPLETE"), "{missing_dd_rep}");
-    assert!(missing_dd_rep.contains("`diag_dropped`: not present in input JSON"), "{missing_dd_rep}");
+    assert!(missing_dd_rep.contains("**Overall Verdict: INVALID"), "{missing_dd_rep}");
+    assert!(missing_dd_rep.contains("diag_dropped (2/2)"), "{missing_dd_rep}");
 
-    // (f) Mid-run counter reset `0 -> 7 -> 0` on `diag_dropped` -> delta=7 AND INCOMPLETE!
+    // (f) Mid-run counter reset `0 -> 7 -> 0` on `diag_dropped` & `since_boot_ticks` decrease -> INVALID!
     let reset_dd_path = dir.path().join("q1_reset_dd.jsonl");
     let mut r0 = d0.clone();
     r0["diag_dropped"] = serde_json::json!(0);
     let mut r1 = d0.clone();
     r1["since_boot_ticks"] = serde_json::json!(200);
+    r1["releases_total"] = serde_json::json!(200);
     r1["diag_dropped"] = serde_json::json!(7);
     let mut r2 = d0.clone();
     r2["since_boot_ticks"] = serde_json::json!(50);
+    r2["releases_total"] = serde_json::json!(50);
     r2["diag_dropped"] = serde_json::json!(0);
     std::fs::write(
         &reset_dd_path,
@@ -596,20 +615,20 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     )
     .unwrap();
     let reset_dd_rep = run_analyze(&reset_dd_path, Some(&devstat_path));
-    assert!(
-        reset_dd_rep.contains("**Overall Verdict: INCOMPLETE (diagnostic samples dropped: diag_dropped delta=7)**"),
-        "{reset_dd_rep}"
-    );
+    assert!(reset_dd_rep.contains("**Overall Verdict: INVALID"), "{reset_dd_rep}");
+    assert!(reset_dd_rep.contains("counter decreased mid-run (restart/reset): releases_total"), "{reset_dd_rep}");
 
-    // (g) Mid-run counter reset `0 -> 7 -> 0` on `skipped_releases` -> delta=7 AND FAIL!
+    // (g) Mid-run counter reset `0 -> 7 -> 0` on `skipped_releases` (verified in-run breach 0->7 before reset) -> FAIL!
     let reset_skip_path = dir.path().join("q1_reset_skip.jsonl");
     let mut s0 = d0.clone();
     s0["skipped_releases"] = serde_json::json!(0);
     let mut s1 = d0.clone();
     s1["since_boot_ticks"] = serde_json::json!(200);
+    s1["releases_total"] = serde_json::json!(200);
     s1["skipped_releases"] = serde_json::json!(7);
     let mut s2 = d0.clone();
     s2["since_boot_ticks"] = serde_json::json!(50);
+    s2["releases_total"] = serde_json::json!(50);
     s2["skipped_releases"] = serde_json::json!(0);
     std::fs::write(
         &reset_skip_path,
@@ -626,13 +645,15 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     assert!(reset_skip_rep.contains("**Overall Verdict: FAIL**"), "{reset_skip_rep}");
     assert!(reset_skip_rep.contains("skipped_releases delta=7"), "{reset_skip_rep}");
 
-    // (h) Partial missing `diag_dropped` on middle sample -> INCOMPLETE!
+    // (h) Partial missing `diag_dropped` on middle sample -> INVALID!
     let partial_dd_path = dir.path().join("q1_partial_dd.jsonl");
     let mut p1 = d0.clone();
     p1["since_boot_ticks"] = serde_json::json!(200);
+    p1["releases_total"] = serde_json::json!(200);
     p1.as_object_mut().unwrap().remove("diag_dropped");
     let mut p2 = d0.clone();
     p2["since_boot_ticks"] = serde_json::json!(300);
+    p2["releases_total"] = serde_json::json!(300);
     std::fs::write(
         &partial_dd_path,
         format!(
@@ -645,8 +666,8 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     )
     .unwrap();
     let partial_dd_rep = run_analyze(&partial_dd_path, Some(&devstat_path));
-    assert!(partial_dd_rep.contains("**Overall Verdict: INCOMPLETE"), "{partial_dd_rep}");
-    assert!(partial_dd_rep.contains("`diag_dropped` missing on some samples"), "{partial_dd_rep}");
+    assert!(partial_dd_rep.contains("**Overall Verdict: INVALID"), "{partial_dd_rep}");
+    assert!(partial_dd_rep.contains("diag_dropped (1/3)"), "{partial_dd_rep}");
 
     // (i) Recurring phase `full_load -> cooldown -> full_load`: skip occurring during `cooldown`
     // must be attributed strictly to `cooldown` (2 / 0), NOT `full_load` (0 / 0)!
@@ -655,9 +676,11 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     f0["skipped_releases"] = serde_json::json!(0);
     let mut c1 = q0.clone();
     c1["since_boot_ticks"] = serde_json::json!(200);
+    c1["releases_total"] = serde_json::json!(200);
     c1["skipped_releases"] = serde_json::json!(2);
     let mut f2 = q0.clone();
     f2["since_boot_ticks"] = serde_json::json!(300);
+    f2["releases_total"] = serde_json::json!(300);
     f2["skipped_releases"] = serde_json::json!(2);
     std::fs::write(
         &recur_path,
