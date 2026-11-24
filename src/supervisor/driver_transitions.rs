@@ -403,6 +403,7 @@ fn torque_error_code(e: &SafetyError) -> &'static str {
         SafetyError::FeedbackUnavailable => "FEEDBACK_UNAVAILABLE",
         SafetyError::FaultActive(_) => "FAULT_ACTIVE",
         SafetyError::NotArmed(_) => "NOT_ARMED",
+        SafetyError::TorqueOffWouldDrop { .. } => "TORQUE_OFF_WOULD_DROP",
         _ => "ENABLE_FAILED",
     }
 }
@@ -1106,6 +1107,19 @@ impl SupervisorInner {
     /// which judged stationarity over its hold window; otherwise the current velocity
     /// sample must be within the resting-pose limit.
     pub(super) fn torque_off(&mut self, stillness_verified: bool) -> Result<SafetyState, SafetyError> {
+        self.torque_off_in_place(stillness_verified)?;
+        Ok(self.safety.state().clone())
+    }
+
+    pub(crate) fn torque_off_no_state_clone(&mut self) -> Result<(), SafetyError> {
+        if self.torque_transition.is_some() {
+            return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into()));
+        }
+        self.gravity_comp_servo_busy()?;
+        self.torque_off_in_place(false)
+    }
+
+    fn torque_off_in_place(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
         self.torque_off_check(stillness_verified)?;
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
@@ -1113,15 +1127,15 @@ impl SupervisorInner {
             self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
             return Err(error);
         }
-        self.torque_off_finish()
+        self.torque_off_finish_in_place()
     }
 
-    /// The refusals of a torque off: E-stop / fault, not at the resting pose.
+    /// The refusals of a torque off: E-stop / fault (rest-pose gated), not at the resting pose.
     fn torque_off_check(&self, stillness_verified: bool) -> Result<(), SafetyError> {
-        if self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst) {
-            return Err(SafetyError::MotionForbiddenInFaultState(
-                "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
-            ));
+        if self.safety.state().is_stopped() || self.estop_pending() {
+            return self
+                .may_disable_torque_while_stopped()
+                .map_err(|r| r.into_safety_error(&self.config.joint_names));
         }
 
         let violation = if stillness_verified { self.resting_pose_static_violation() } else { self.resting_pose_violation() };
@@ -1136,13 +1150,15 @@ impl SupervisorInner {
         Ok(())
     }
 
-    /// Torque off after the confirmed disable: safety state, gripper stall reset.
-    fn torque_off_finish(&mut self) -> Result<SafetyState, SafetyError> {
-        let state = self.safety.set_torque(false)?;
+    /// Torque off after the confirmed disable without cloning `SafetyState` (zero-alloc on RT).
+    fn torque_off_finish_in_place(&mut self) -> Result<(), SafetyError> {
+        if !self.safety.state().is_stopped() && !self.estop_pending() {
+            let _ = self.safety.set_torque(false)?;
+        }
         self.reset_gripper_stall();
         self.gripper_hold_vel_ceiling = None;
         if self.driver.is_none() { self.measured_velocities.fill(0.0); }
-        Ok(state)
+        Ok(())
     }
 
     /// A transition is in flight ([`TorqueTransition`]): ordinary output and blocking torque
@@ -1206,7 +1222,7 @@ impl SupervisorInner {
             Ok(match started {
                 None => {
                     self.disable_confirmed();
-                    self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e))
+                    self.torque_off_finish_in_place().map(|()| Rt::Done).map_err(|e| torque_error_code(&e))
                 }
                 Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
                     self.torque_transition = Some(TorqueTransition::Disable { confirm: None });
@@ -1359,7 +1375,7 @@ impl SupervisorInner {
                     }
                     Some(true) => {
                         self.disable_confirmed();
-                        self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e))
+                        self.torque_off_finish_in_place().map(|()| Rt::Done).map_err(|e| torque_error_code(&e))
                     }
                     Some(false) => {
                         self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(

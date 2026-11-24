@@ -25,11 +25,13 @@ mod config;
 mod motion;
 mod streams;
 mod actions;
+mod torque_off;
 
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
 pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
+pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
 
 #[derive(Debug, Error)]
 pub enum ArmError {

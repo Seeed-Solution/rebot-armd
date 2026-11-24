@@ -839,7 +839,10 @@ impl CoreOps for SupervisorInner {
                 if self.driver.is_some() {
                     return Err("UNSUPPORTED");
                 }
-                self.set_torque(false).map(drop).map_err(ArmError::Safety)
+                if self.safety.state().is_stopped() || self.estop_pending() {
+                    self.may_disable_torque_while_stopped().map_err(|_| "TORQUE_OFF_WOULD_DROP")?;
+                }
+                self.torque_off_no_state_clone().map_err(ArmError::Safety)
             }
         };
         r.map(|_| Committed::authorized(d, None)).map_err(static_code)
@@ -850,7 +853,11 @@ impl CoreOps for SupervisorInner {
         if self.core.transition_pending() || self.torque_transition_pending() { return Err("TRANSITION_BUSY"); }
         // starts the bus owner's handshake (ArmDriver::begin_torque); a refusal before any
         // frame refuses the commit, a later failure is the transition's terminal
-        let progress = self.begin_torque_transition(matches!(op, TransitionOp::TorqueOn)).map_err(|e| static_code(ArmError::Safety(e)))?;
+        let enable = matches!(op, TransitionOp::TorqueOn);
+        if !enable && (self.safety.state().is_stopped() || self.estop_pending()) {
+            self.may_disable_torque_while_stopped().map_err(|_| "TORQUE_OFF_WOULD_DROP")?;
+        }
+        let progress = self.begin_torque_transition(enable).map_err(|e| static_code(ArmError::Safety(e)))?;
         // the next service is the next poll (the begin's wake is on the driver's clock)
         self.core.begin_transition(progress.map(|p| match p { TorqueProgress::Pending { .. } => TorqueProgress::Pending { wake: ctx.now }, done => done }));
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
