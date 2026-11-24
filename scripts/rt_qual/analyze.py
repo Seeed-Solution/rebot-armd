@@ -1001,7 +1001,7 @@ def analyze(
     )
     out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 
-    def phase_row(name: str, grp: list[LoadSample]) -> str:
+    def phase_row(name: str, grp: list[LoadSample], prev_sample: LoadSample | None = None) -> str:
         t_p50 = us_to_ms(median_or_none([float(x.tick["tick_us"]["p50"]) for x in grp if "tick_us" in x.tick]))
         t_p99 = us_to_ms(max_or_none([float(x.tick["tick_us"]["p99"]) for x in grp if "tick_us" in x.tick]))
         t_max = us_to_ms(max_or_none([float(x.tick["tick_us"]["max"]) for x in grp if "tick_us" in x.tick]))
@@ -1034,11 +1034,12 @@ def analyze(
         else:
             wake_p = max(0.0, (p_max_us - nom_period_us) / 1000.0) if p_max_us is not None else None
             wake_str = fmt_ms(wake_p)
-        l0 = grp[0].tick.get("late_count")
+        l0 = prev_sample.tick.get("late_count") if prev_sample is not None else grp[0].tick.get("late_count")
         l1 = grp[-1].tick.get("late_count")
-        ld = (int(l1) - int(l0)) if isinstance(l0, int) and isinstance(l1, int) else None
+        ld = (int(l1) - int(l0)) if isinstance(l0, int) and isinstance(l1, int) and l1 >= l0 else None
         if has_skipped_releases:
-            _, _, _, sd = cumulative_delta(grp, "skipped_releases")
+            delta_grp = [prev_sample, *grp] if prev_sample is not None else grp
+            _, _, _, sd = cumulative_delta(delta_grp, "skipped_releases")
             skip_str = f"{fmt_int(sd)} / {fmt_int(ld)}"
         else:
             skip_str = fmt_int(ld)
@@ -1052,8 +1053,10 @@ def analyze(
             f"{skip_str} | {rx_str} | {enq_str} |"
         )
 
+    prev_phase_last: LoadSample | None = None
     for ph in phases_ordered:
-        out.append(phase_row(ph, by_phase[ph]))
+        out.append(phase_row(ph, by_phase[ph], prev_phase_last))
+        prev_phase_last = by_phase[ph][-1]
     if len(phases_ordered) > 1:
         out.append(phase_row("ALL", samples))
     out.append("")

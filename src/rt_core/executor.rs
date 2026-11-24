@@ -47,9 +47,10 @@ pub const RECLAIM_STATE_CAPACITY: usize = 64;
 /// Capacity of the persistence reply ring (`armd-control` -> `armd-persist` / `OffThreadSinks`).
 pub const PERSIST_REP_CAPACITY: usize = 8;
 /// Lock-free SPSC capacity for clean-exit reclamation when consumer rings remain full at teardown.
-/// Sized strictly >= sum of all bounded owner queues + retained slots + pending E-stop acks.
+/// Sized strictly >= sum of all bounded owner queues + retained slots + pending E-stop acks +
+/// retired safety states (`17 maint + 6 persist + 64 pending_estop_acks + 64 retired`).
 const EXIT_RECLAIM_CAPACITY: usize =
-    MAINT_QUEUE_CAPACITY + 2 + PERSIST_REP_CAPACITY + 8 + ESTOP_ACK_CAPACITY;
+    MAINT_QUEUE_CAPACITY + 1 + 6 + ESTOP_ACK_CAPACITY + RECLAIM_STATE_CAPACITY;
 
 /// Startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -849,6 +850,7 @@ enum PersistCmd {
     },
 }
 
+#[allow(clippy::large_enum_variant)] // inline in preallocated SPSC ring: boxing would allocate on armd-control
 enum PersistReply {
     Reserved {
         reservation: Option<Reservation>,
@@ -871,7 +873,7 @@ enum PersistReply {
 
 /// Lock-free SPSC clean-exit handoff for bounded owner payloads when consumer rings remain full
 /// at teardown; guaranteed nonblocking on `armd-control` and dropped off-thread in `OffThreadSinks`.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::large_enum_variant)] // inline in preallocated SPSC ring: boxing would allocate on armd-control
 enum ExitReclaim {
     MaintReply(MaintReply),
     PersistReply(PersistReply),
@@ -1929,10 +1931,12 @@ impl ControlState {
             });
         } else {
             // `can_offload_msg` was false so `returned_msg` is guaranteed `None`; retain `job`
-            // until `flush_retained_persist` drains a slot.
+            // until `flush_retained_persist` drains a slot (if an adversarial hook replaces an
+            // existing retained job, offload the old one via lock-free `exit_reclaim_tx`).
             debug_assert!(returned_msg.is_none());
-            debug_assert!(self.retained_persist_job.is_none());
-            self.retained_persist_job = Some(job);
+            if let Some(prev) = self.retained_persist_job.replace(job) {
+                let _ = self.exit_reclaim_tx.push(ExitReclaim::PersistJob(prev));
+            }
         }
     }
 
