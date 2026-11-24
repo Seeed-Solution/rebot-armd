@@ -3502,12 +3502,13 @@ async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware
     mock.lock().unwrap().advance_clock(Duration::from_millis(5));
     supervisor.tick(0.02).await;
 
-    // Now rising edge: hardware packet arrives with error byte 0x20 on arm joint 1
+    // Now rising edge: hardware packet arrives in response to the next SYNC_READ with error byte 0x20
     let cs_overload = calculate_checksum(1, 10, 0x20, &normal_params);
     let mut rx_overload = vec![0xFF, 0xFF, 1, 10, 0x20];
     rx_overload.extend_from_slice(&normal_params);
     rx_overload.push(cs_overload);
-    mock.lock().unwrap().provide_rx(&rx_overload);
+    let sync_read_pos = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    mock.lock().unwrap().stage_reply(&sync_read_pos, &rx_overload);
 
     // Tick: Feetech driver decodes 0x20, check_hardware_status detects rising edge and faults
     let obs_fault = supervisor.tick(0.02).await;

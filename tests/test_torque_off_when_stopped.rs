@@ -5626,3 +5626,262 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         );
     }
 }
+
+/// Rule E3: Feetech request/reply correlation.
+/// - Before every request, pending RX bytes are discarded.
+/// - Replies are accepted ONLY if received within that request's timeout window, after write.
+/// - A timed-out request poisons the line: discard until idle before the next request.
+/// - Each reply is stamped with ITS OWN receive time, never poll start.
+#[test]
+fn e3_feetech_delayed_torque_read_rejected_and_delayed_position_never_fresh() {
+    use armd::driver::{FeetechArmDriver, MotorTorqueEvidence};
+    use armd::protocol::feetech;
+    use armd::transport::{DriverClock, Transport, TransportError};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct TimedReply {
+        deliver_at: Instant,
+        bytes: Vec<u8>,
+    }
+
+    struct ScriptedSerialState {
+        clock: MockClock,
+        rx: VecDeque<u8>,
+        scheduled: Vec<TimedReply>,
+        tx_log: Vec<Vec<u8>>,
+        /// Optional hook invoked on write to schedule replies relative to write time.
+        on_write: Option<Box<dyn FnMut(&[u8], Instant, &mut Vec<TimedReply>) + Send>>,
+        /// Step added to clock on empty read (default 1 ms).
+        idle_step: Duration,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedSerial(Arc<Mutex<ScriptedSerialState>>);
+
+    impl ScriptedSerial {
+        fn new(clock: MockClock) -> Self {
+            Self(Arc::new(Mutex::new(ScriptedSerialState {
+                clock,
+                rx: VecDeque::new(),
+                scheduled: Vec::new(),
+                tx_log: Vec::new(),
+                on_write: None,
+                idle_step: Duration::from_millis(1),
+            })))
+        }
+        fn with<R>(&self, f: impl FnOnce(&mut ScriptedSerialState) -> R) -> R {
+            f(&mut self.0.lock().unwrap())
+        }
+    }
+
+    impl Transport for ScriptedSerial {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(Arc::new(self.0.lock().unwrap().clock.clone()))
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            let mut s = self.0.lock().unwrap();
+            let now = s.clock.now();
+            let mut ready = Vec::new();
+            let mut pending = Vec::new();
+            for item in s.scheduled.drain(..) {
+                if item.deliver_at <= now {
+                    ready.push(item);
+                } else {
+                    pending.push(item);
+                }
+            }
+            s.scheduled = pending;
+            for item in ready {
+                s.rx.extend(item.bytes);
+            }
+            let avail = s.rx.len().min(buf.len());
+            if avail == 0 {
+                let step = s.idle_step;
+                s.clock.advance(step);
+                return Ok(0);
+            }
+            for b in buf.iter_mut().take(avail) {
+                *b = s.rx.pop_front().unwrap();
+            }
+            Ok(avail)
+        }
+        fn write(&mut self, buf: &[u8]) -> Result<usize, TransportError> {
+            let mut s = self.0.lock().unwrap();
+            s.tx_log.push(buf.to_vec());
+            let now = s.clock.now();
+            let mut scheduled = std::mem::take(&mut s.scheduled);
+            if let Some(ref mut cb) = s.on_write {
+                cb(buf, now, &mut scheduled);
+            }
+            s.scheduled = scheduled;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn clear_input_buffer(&mut self) {
+            self.0.lock().unwrap().rx.clear();
+        }
+    }
+
+    // 1. Delayed torque-read reply arriving after timeout / during next request is REJECTED:
+    //    timed-out request poisons the line, forcing discard-until-idle before the next request.
+    {
+        let clock = MockClock::new();
+        let serial = ScriptedSerial::new(clock.clone());
+        let late_zero = feetech_reg_u8_resp(1, 0);
+        let req_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let req_count_cb = req_count.clone();
+        let late_zero_cb = late_zero.clone();
+        serial.with(|s| {
+            s.on_write = Some(Box::new(move |buf, now, sched| {
+                // Only fire on REG_TORQUE_ENABLE read requests.
+                if buf == feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1).as_slice() {
+                    let n = req_count_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        // Request 1 reply arrives at +27 ms (2 ms PAST the 25 ms read timeout),
+                        // right in the middle of Request 2's pre-request window!
+                        sched.push(TimedReply {
+                            deliver_at: now + Duration::from_millis(27),
+                            bytes: late_zero_cb.clone(),
+                        });
+                    }
+                    // Request 2 itself receives NO genuine reply from the servo.
+                }
+            }));
+        });
+        let mut drv = FeetechArmDriver::new(serial.clone(), vec![1])
+            .with_calibrated(true)
+            .with_tx_echo(Some(false));
+
+        // Request 1: times out at 25 ms -> poisons the line!
+        let err1 = drv
+            .read_register_u8_direct(1, feetech::REG_TORQUE_ENABLE)
+            .unwrap_err();
+        assert!(
+            matches!(err1, armd::driver::ArmDriverError::Timeout(1)),
+            "first torque read must time out: {err1:?}"
+        );
+
+        // Request 2 immediately after: MUST discard Request 1's late 0x0 reply (arriving at +27 ms)
+        // during its poisoned-line discard-until-idle pass BEFORE writing Request 2, and because
+        // Request 2 gets no genuine reply of its own, MUST fail (NEVER accept 0x0 as OffConfirmed)!
+        let err2 = drv
+            .read_register_u8_direct(1, feetech::REG_TORQUE_ENABLE)
+            .unwrap_err();
+        assert!(
+            matches!(err2, armd::driver::ArmDriverError::Timeout(1)),
+            "delayed torque-read reply from request 1 MUST be discarded/rejected, not returned to request 2: {err2:?}"
+        );
+        let mut ev = [MotorTorqueEvidence::OnConfirmed; 1];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev[0], MotorTorqueEvidence::Unknown);
+
+        // Also verify pre-queued stale RX bytes already in the buffer before a request are discarded.
+        serial.with(|s| {
+            s.rx.extend(late_zero.iter().copied());
+        });
+        let err3 = drv
+            .read_register_u8_direct(1, feetech::REG_TORQUE_ENABLE)
+            .unwrap_err();
+        assert!(
+            matches!(err3, armd::driver::ArmDriverError::Timeout(1)),
+            "pending pre-request RX bytes must be discarded before transmitting: {err3:?}"
+        );
+    }
+
+    // 2. Delayed position reply (arriving past the 4 ms CHUNK_TIMEOUT) is NEVER accepted or
+    //    stamped as fresh!
+    {
+        let clock = MockClock::new();
+        let serial = ScriptedSerial::new(clock.clone());
+        let pos_bytes = feetech_feedback_bytes(&[1], &[2048]);
+        serial.with(|s| {
+            s.idle_step = Duration::from_micros(500);
+            let pos_bytes = pos_bytes.clone();
+            s.on_write = Some(Box::new(move |buf, now, sched| {
+                if buf
+                    == feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8)
+                        .unwrap()
+                        .as_slice()
+                {
+                    // Reply arrives at +4.2 ms (PAST the 4 ms CHUNK_TIMEOUT, inside the old
+                    // 500 us post-timeout drain window that previously stamped it fresh!).
+                    sched.push(TimedReply {
+                        deliver_at: now + Duration::from_micros(4200),
+                        bytes: pos_bytes.clone(),
+                    });
+                }
+            }));
+        });
+        let mut drv = FeetechArmDriver::new(serial.clone(), vec![1])
+            .with_calibrated(true)
+            .with_tx_echo(Some(false));
+
+        let _ = drv.read_joint_states().unwrap();
+        assert!(
+            drv.feedback_receive_instants()[0].is_none(),
+            "delayed position reply past CHUNK_TIMEOUT must NEVER be accepted or stamped fresh"
+        );
+        let mut pos_out = [0.0f32; 1];
+        assert!(
+            !drv.fresh_joint_positions_into(&[0], Duration::from_millis(100), &mut pos_out),
+            "delayed position reply must never produce fresh rest-pose evidence"
+        );
+    }
+
+    // 3. Per-reply receive timestamps (NEVER poll start): in one SYNC_READ poll for servos [1, 2],
+    //    servo 1 arrives at req_written + 1 ms and servo 2 arrives at req_written + 3 ms.
+    //    Each servo MUST be stamped with ITS OWN receive instant!
+    {
+        let clock = MockClock::new();
+        let serial = ScriptedSerial::new(clock.clone());
+        let fb1 = feetech_feedback_bytes(&[1], &[2048]);
+        let fb2 = feetech_feedback_bytes(&[2], &[2100]);
+        let written_at = Arc::new(Mutex::new(None::<Instant>));
+        let written_at_cb = written_at.clone();
+        serial.with(|s| {
+            s.idle_step = Duration::from_millis(1);
+            s.on_write = Some(Box::new(move |buf, now, sched| {
+                if buf
+                    == feetech::build_sync_read(&[1, 2], feetech::REG_PRESENT_POSITION_L, 8)
+                        .unwrap()
+                        .as_slice()
+                {
+                    *written_at_cb.lock().unwrap() = Some(now);
+                    sched.push(TimedReply {
+                        deliver_at: now + Duration::from_millis(1),
+                        bytes: fb1.clone(),
+                    });
+                    sched.push(TimedReply {
+                        deliver_at: now + Duration::from_millis(3),
+                        bytes: fb2.clone(),
+                    });
+                }
+            }));
+        });
+        let mut drv = FeetechArmDriver::new(serial.clone(), vec![1, 2])
+            .with_calibrated(true)
+            .with_tx_echo(Some(false));
+
+        let poll_start = clock.now();
+        let _ = drv.read_joint_states().unwrap();
+        let req_ts = written_at.lock().unwrap().expect("sync read written");
+        let rx_instants = drv.feedback_receive_instants();
+        let t1 = rx_instants[0].expect("servo 1 timestamp");
+        let t2 = rx_instants[1].expect("servo 2 timestamp");
+        assert!(t1 > poll_start, "servo 1 must not be stamped with poll_start");
+        assert_eq!(
+            t1.saturating_duration_since(req_ts),
+            Duration::from_millis(1),
+            "servo 1 must be stamped with its own receive instant (+1 ms)"
+        );
+        assert_eq!(
+            t2.saturating_duration_since(req_ts),
+            Duration::from_millis(3),
+            "servo 2 must be stamped with its own receive instant (+3 ms)"
+        );
+        assert!(t2 > t1, "distinct reply arrivals must carry distinct receive timestamps");
+    }
+}

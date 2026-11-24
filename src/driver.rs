@@ -1388,6 +1388,11 @@ pub struct FeetechArmDriver<T: Transport> {
     incomplete_chunk_idx: Option<usize>,
     incomplete_frame_started_at: Option<Instant>,
     partial_pos_rx: Vec<u8>,
+    /// Per-byte host monotonic receive timestamps aligned 1:1 with `rx_buffer` (E3).
+    rx_timestamps: Vec<Instant>,
+    /// True after any Feetech request times out or observes an ambiguous duplicate reply; the next
+    /// request MUST discard RX bytes until continuous line idle before transmitting (E3).
+    line_poisoned: bool,
     consecutive_missed_echoes: u32,
     warned_missed_echoes: bool,
 }
@@ -1440,6 +1445,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             incomplete_chunk_idx: None,
             incomplete_frame_started_at: None,
             partial_pos_rx: Vec::with_capacity(64),
+            rx_timestamps: Vec::with_capacity(256),
+            line_poisoned: false,
             consecutive_missed_echoes: 0,
             warned_missed_echoes: false,
         }
@@ -1630,6 +1637,85 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.incomplete_frame_started_at = None;
     }
 
+    #[inline]
+    fn clear_rx(&mut self) {
+        self.rx_buffer.clear();
+        self.rx_timestamps.clear();
+    }
+
+    #[inline]
+    fn push_rx(&mut self, bytes: &[u8], rx_at: Instant) {
+        self.rx_buffer.extend_from_slice(bytes);
+        self.rx_timestamps.resize(self.rx_buffer.len(), rx_at);
+    }
+
+    #[inline]
+    fn drain_rx_prefix(&mut self, n: usize) {
+        let count = n.min(self.rx_buffer.len());
+        self.rx_buffer.drain(..count);
+        let ts_count = count.min(self.rx_timestamps.len());
+        self.rx_timestamps.drain(..ts_count);
+    }
+
+    /// Continuous quiet period required to declare a poisoned half-duplex serial line idle (E3).
+    const LINE_IDLE_QUIET: Duration = Duration::from_millis(3);
+    /// Upper bound for draining a poisoned line before failing closed (E3).
+    const LINE_IDLE_MAX_WAIT: Duration = Duration::from_millis(30);
+
+    /// Drains and discards all RX bytes until the serial line remains continuously quiet for
+    /// [`Self::LINE_IDLE_QUIET`], clearing `line_poisoned`. Fails closed if late traffic never
+    /// subsides within [`Self::LINE_IDLE_MAX_WAIT`].
+    fn discard_until_idle(&mut self) -> Result<(), ArmDriverError> {
+        self.assert_clock_matches_transport();
+        self.transport.clear_input_buffer();
+        self.clear_rx();
+        let start = self.clock_now();
+        let mut quiet_since = start;
+        let mut discard_buf = [0u8; 64];
+        loop {
+            let before_read = self.clock_now();
+            match self.transport.read(&mut discard_buf) {
+                Ok(n) if n > 0 => {
+                    quiet_since = self.clock_now();
+                    if self.elapsed_since(start) >= Self::LINE_IDLE_MAX_WAIT {
+                        return Err(ArmDriverError::Protocol(
+                            "Feetech serial line remained busy while clearing timed-out request".into(),
+                        ));
+                    }
+                }
+                Ok(_) | Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    if self.clock_now() == before_read {
+                        self.clock_sleep(Duration::from_micros(500));
+                    }
+                    if self.elapsed_since(quiet_since) >= Self::LINE_IDLE_QUIET {
+                        self.line_poisoned = false;
+                        self.transport.clear_input_buffer();
+                        self.clear_rx();
+                        return Ok(());
+                    }
+                    if self.elapsed_since(start) >= Self::LINE_IDLE_MAX_WAIT {
+                        return Err(ArmDriverError::Protocol(
+                            "Feetech serial line did not reach idle before timeout".into(),
+                        ));
+                    }
+                    self.clock_yield();
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Rule E3 pre-request boundary: discard all pending RX bytes before every request; if a
+    /// prior request timed out (`line_poisoned`), actively discard until the serial line is idle.
+    fn discard_pending_rx_for_request(&mut self) -> Result<(), ArmDriverError> {
+        self.transport.clear_input_buffer();
+        self.clear_rx();
+        if self.line_poisoned {
+            self.discard_until_idle()?;
+        }
+        Ok(())
+    }
+
     fn is_aborted(&self) -> bool {
         self.abort_flag
             .as_ref()
@@ -1691,6 +1777,9 @@ impl<T: Transport> FeetechArmDriver<T> {
         if let Some(idx) = self.servo_ids.iter().position(|&id| id == servo_id) {
             self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
         }
+        // E3: Discard pending RX before transmitting (best-effort on protective cut so noisy RX
+        // never blocks a thermal/exit disable write).
+        let _ = self.discard_pending_rx_for_request();
         let pkt = feetech::build_set_torque(servo_id, false);
         self.transport.write_all(&pkt)?;
         let _ = self.transport.flush();
@@ -1741,7 +1830,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         let start = self.clock_now();
         const DRAIN_TIMEOUT: Duration = Duration::from_millis(5);
 
-        let resync_rx = |rx: &mut Vec<u8>| {
+        let resync_rx = |rx: &mut Vec<u8>, ts: &mut Vec<Instant>| {
             let mut i = 0;
             while i < rx.len() {
                 if rx[i] != 0xFF {
@@ -1773,7 +1862,10 @@ impl<T: Transport> FeetechArmDriver<T> {
                 break;
             }
             if i > 0 {
-                rx.drain(..i.min(rx.len()));
+                let count = i.min(rx.len());
+                rx.drain(..count);
+                let ts_count = count.min(ts.len());
+                ts.drain(..ts_count);
             }
         };
 
@@ -1785,14 +1877,15 @@ impl<T: Transport> FeetechArmDriver<T> {
         {
             match self.transport.read(&mut temp) {
                 Ok(n) if n > 0 => {
-                    self.rx_buffer.extend_from_slice(&temp[..n]);
+                    let rx_at = self.clock_now();
+                    self.push_rx(&temp[..n], rx_at);
                 }
                 _ => {
                     self.clock_yield();
                 }
             }
 
-            resync_rx(&mut self.rx_buffer);
+            resync_rx(&mut self.rx_buffer, &mut self.rx_timestamps);
 
             if let Ok((pkt, consumed)) = feetech::parse_response(&self.rx_buffer) {
                 if &self.rx_buffer[..consumed] != tx
@@ -1809,11 +1902,11 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
         }
 
-        resync_rx(&mut self.rx_buffer);
+        resync_rx(&mut self.rx_buffer, &mut self.rx_timestamps);
 
         let mut drained = false;
         if let Some(pos) = self.rx_buffer.windows(tx.len()).position(|w| w == tx) {
-            self.rx_buffer.drain(..pos + tx.len());
+            self.drain_rx_prefix(pos + tx.len());
             drained = true;
             if self.tx_echo.is_none() || self.tx_echo_auto {
                 self.tx_echo = Some(true);
@@ -1888,15 +1981,14 @@ impl<T: Transport> FeetechArmDriver<T> {
     fn ping_servo_barrier(&mut self, id: u8) -> Result<(), ArmDriverError> {
         self.assert_clock_matches_transport();
         self.invalidate_partial_pos_rx();
-        self.transport.clear_input_buffer();
-        self.rx_buffer.clear();
+        self.discard_pending_rx_for_request()?;
         let req = feetech::build_ping(id);
         self.transport.write_all(&req)?;
         self.transport.flush()?;
+        let req_written_at = self.clock_now();
         let echo_drained = self.drain_tx_echo(&req)?;
 
         let mut temp = [0u8; 1];
-        let start = self.clock_now();
         const PING_TIMEOUT: Duration = Duration::from_millis(25);
         let require_echo = !echo_drained && self.tx_echo == Some(true);
         let mut can_skip_echo = !echo_drained && self.tx_echo != Some(false);
@@ -1909,7 +2001,12 @@ impl<T: Transport> FeetechArmDriver<T> {
                         let is_req_echo = can_skip_echo
                             && consumed >= req.len()
                             && self.rx_buffer[consumed - req.len()..consumed] == req[..];
-                        self.rx_buffer.drain(..consumed);
+                        let pkt_rx_at = self
+                            .rx_timestamps
+                            .get(consumed - 1)
+                            .copied()
+                            .unwrap_or_else(|| self.clock_now());
+                        self.drain_rx_prefix(consumed);
                         if is_req_echo {
                             can_skip_echo = false;
                             echo_seen = true;
@@ -1920,49 +2017,67 @@ impl<T: Transport> FeetechArmDriver<T> {
                         if require_echo && !echo_seen {
                             continue;
                         }
+                        if pkt_rx_at < req_written_at
+                            || pkt_rx_at.saturating_duration_since(req_written_at) >= PING_TIMEOUT
+                        {
+                            continue;
+                        }
                         if pkt.id == id && pkt.params.is_empty() {
                             return Ok(());
                         }
                     }
                     Err(feetech::FeetechError::IncompleteFrame { .. }) => break,
                     Err(_) => {
-                        self.rx_buffer.remove(0);
+                        self.drain_rx_prefix(1);
                     }
                 }
             }
-            if self.elapsed_since(start) >= PING_TIMEOUT {
+            if self.elapsed_since(req_written_at) >= PING_TIMEOUT {
                 break;
             }
             match self.transport.read(&mut temp) {
-                Ok(n) if n > 0 => self.rx_buffer.extend_from_slice(&temp[..n]),
+                Ok(n) if n > 0 => {
+                    let rx_at = self.clock_now();
+                    if rx_at < req_written_at
+                        || rx_at.saturating_duration_since(req_written_at) >= PING_TIMEOUT
+                    {
+                        break;
+                    }
+                    self.push_rx(&temp[..n], rx_at);
+                }
                 _ => self.clock_yield(),
             }
         }
+        self.line_poisoned = true;
+        self.clear_rx();
         Err(ArmDriverError::Timeout(id))
     }
 
     /// Causally ordered `REG_TORQUE_ENABLE` readback for servo `idx`: if a previous 1-byte read
     /// timed out (`unmatched_1b_read[idx]`), requires a 0-byte `PING` FIFO barrier first so a
-    /// late 1-byte reply cannot be misread as the new torque-register state.
-    fn read_torque_enable_causal(&mut self, idx: usize, id: u8) -> Result<u8, ArmDriverError> {
+    /// late 1-byte reply cannot be misread as the new torque-register state. Returns `(value, rx_at)`
+    /// stamped with the reply's own host monotonic receive time (E3).
+    fn read_torque_enable_causal(&mut self, idx: usize, id: u8) -> Result<(u8, Instant), ArmDriverError> {
         if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
             self.ping_servo_barrier(id)?;
             if let Some(flag) = self.unmatched_1b_read.get_mut(idx) {
                 *flag = false;
             }
         }
-        self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE)
+        let (params, rx_at) = self.read_register_direct_timestamped(id, feetech::REG_TORQUE_ENABLE, 1)?;
+        Ok((params[0], rx_at))
     }
 
     /// Reads REG_TORQUE_ENABLE from each servo in `ids` (indexed like `servo_ids`), records
-    /// the per-motor causal torque evidence, and returns (disabled count, enabled count, read errors).
+    /// the per-motor causal torque evidence stamped with each reply's own receive time, and
+    /// returns (disabled count, enabled count, read errors).
     fn read_torque_enable_states(&mut self, ids: &[u8]) -> (usize, usize, Vec<String>) {
         let mut count_0 = 0;
         let mut count_1 = 0;
         let mut read_errors = Vec::new();
         for (idx, &id) in ids.iter().enumerate() {
             match self.read_torque_enable_causal(idx, id) {
-                Ok(v @ (0 | 1)) => {
+                Ok((v @ (0 | 1), rx_at)) => {
                     if v == 0 {
                         count_0 += 1;
                         self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
@@ -1970,10 +2085,10 @@ impl<T: Transport> FeetechArmDriver<T> {
                         count_1 += 1;
                         self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
                     }
-                    self.last_enable_confirmed[idx] = Some(self.clock_now());
+                    self.last_enable_confirmed[idx] = Some(rx_at);
                     self.missed_enable_polls[idx] = 0;
                 }
-                Ok(v) => {
+                Ok((v, _)) => {
                     self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                     read_errors.push(format!("servo {} returned unexpected value {}", id, v));
                 }
@@ -1987,25 +2102,30 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     pub fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
-        self.read_register_direct(id, reg, 1).map(|p| p[0])
+        self.read_register_direct_timestamped(id, reg, 1).map(|(p, _)| p[0])
     }
 
     pub fn read_register_u16_direct(&mut self, id: u8, reg: u8) -> Result<u16, ArmDriverError> {
-        self.read_register_direct(id, reg, 2).map(|p| u16::from_le_bytes([p[0], p[1]]))
+        self.read_register_direct_timestamped(id, reg, 2)
+            .map(|(p, _)| u16::from_le_bytes([p[0], p[1]]))
     }
 
-    fn read_register_direct(&mut self, id: u8, reg: u8, len: u8) -> Result<Vec<u8>, ArmDriverError> {
+    fn read_register_direct_timestamped(
+        &mut self,
+        id: u8,
+        reg: u8,
+        len: u8,
+    ) -> Result<(Vec<u8>, Instant), ArmDriverError> {
         self.assert_clock_matches_transport();
         self.invalidate_partial_pos_rx();
-        self.transport.clear_input_buffer();
-        self.rx_buffer.clear();
+        self.discard_pending_rx_for_request()?;
         let req = feetech::build_read(id, reg, len);
         self.transport.write_all(&req)?;
         self.transport.flush()?;
+        let req_written_at = self.clock_now();
         let echo_drained = self.drain_tx_echo(&req)?;
 
         let mut temp = [0u8; 1];
-        let start = self.clock_now();
         const READ_TIMEOUT: Duration = Duration::from_millis(25);
         let require_echo = !echo_drained && self.tx_echo == Some(true);
         let mut can_skip_echo = !echo_drained && self.tx_echo != Some(false);
@@ -2015,8 +2135,15 @@ impl<T: Transport> FeetechArmDriver<T> {
             while !self.rx_buffer.is_empty() {
                 match feetech::parse_response(&self.rx_buffer) {
                     Ok((pkt, consumed)) => {
-                        let is_req_echo = can_skip_echo && consumed >= req.len() && self.rx_buffer[consumed - req.len()..consumed] == req[..];
-                        self.rx_buffer.drain(..consumed);
+                        let is_req_echo = can_skip_echo
+                            && consumed >= req.len()
+                            && self.rx_buffer[consumed - req.len()..consumed] == req[..];
+                        let pkt_rx_at = self
+                            .rx_timestamps
+                            .get(consumed - 1)
+                            .copied()
+                            .unwrap_or_else(|| self.clock_now());
+                        self.drain_rx_prefix(consumed);
                         if is_req_echo {
                             can_skip_echo = false;
                             echo_seen = true;
@@ -2030,6 +2157,11 @@ impl<T: Transport> FeetechArmDriver<T> {
                             continue;
                         }
                         if pkt.id == feetech::BROADCAST_ID {
+                            continue;
+                        }
+                        if pkt_rx_at < req_written_at
+                            || pkt_rx_at.saturating_duration_since(req_written_at) >= READ_TIMEOUT
+                        {
                             continue;
                         }
                         if pkt.id == id && pkt.params.len() == len as usize {
@@ -2046,7 +2178,8 @@ impl<T: Transport> FeetechArmDriver<T> {
                                         Ok((extra, c)) => {
                                             scan = &scan[c..];
                                             if extra.id == id && extra.params.len() == 1 {
-                                                self.rx_buffer.clear();
+                                                self.clear_rx();
+                                                self.line_poisoned = true;
                                                 if let Some(idx) = self.servo_ids.iter().position(|&sid| sid == id) {
                                                     self.unmatched_1b_read[idx] = true;
                                                 }
@@ -2060,25 +2193,31 @@ impl<T: Transport> FeetechArmDriver<T> {
                                     }
                                 }
                             }
-                            return Ok(pkt.params);
+                            return Ok((pkt.params, pkt_rx_at));
                         }
                     }
                     Err(feetech::FeetechError::IncompleteFrame { .. }) => {
                         break;
                     }
                     Err(_) => {
-                        self.rx_buffer.remove(0);
+                        self.drain_rx_prefix(1);
                     }
                 }
             }
 
-            if self.elapsed_since(start) >= READ_TIMEOUT {
+            if self.elapsed_since(req_written_at) >= READ_TIMEOUT {
                 break;
             }
 
             match self.transport.read(&mut temp) {
                 Ok(n) if n > 0 => {
-                    self.rx_buffer.extend_from_slice(&temp[..n]);
+                    let rx_at = self.clock_now();
+                    if rx_at < req_written_at
+                        || rx_at.saturating_duration_since(req_written_at) >= READ_TIMEOUT
+                    {
+                        break;
+                    }
+                    self.push_rx(&temp[..n], rx_at);
                 }
                 _ => {
                     self.clock_yield();
@@ -2086,6 +2225,9 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
         }
 
+        // E3: Timed-out request poisons the serial line until drained idle before the next request.
+        self.line_poisoned = true;
+        self.clear_rx();
         if len == 1 {
             if let Some(idx) = self.servo_ids.iter().position(|&sid| sid == id) {
                 self.unmatched_1b_read[idx] = true;
@@ -2105,8 +2247,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     fn write_register_u8_cleanup(&mut self, id: u8, reg: u8, val: u8) -> Result<(), ArmDriverError> {
         self.assert_clock_matches_transport();
         self.invalidate_partial_pos_rx();
-        self.transport.clear_input_buffer();
-        self.rx_buffer.clear();
+        self.discard_pending_rx_for_request()?;
         let pkt = feetech::build_write_u8(id, reg, val);
         self.transport.write_all(&pkt)?;
         self.transport.flush()?;
@@ -2120,8 +2261,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
         }
         self.invalidate_partial_pos_rx();
-        self.transport.clear_input_buffer();
-        self.rx_buffer.clear();
+        self.discard_pending_rx_for_request()?;
         let pkt = feetech::build_write_u16(id, reg, val);
         self.transport.write_all(&pkt)?;
         self.transport.flush()?;
@@ -2156,12 +2296,14 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
 
             // 2. Read torque enable status
-            let torque_en = self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE)?;
+            let (torque_en_params, torque_en_rx_at) =
+                self.read_register_direct_timestamped(id, feetech::REG_TORQUE_ENABLE, 1)?;
+            let torque_en = torque_en_params[0];
             match torque_en {
                 0 => {
                     if joint_idx < self.motor_evidence.len() {
                         self.motor_evidence[joint_idx] = MotorTorqueEvidence::OffConfirmed;
-                        self.last_enable_confirmed[joint_idx] = Some(self.clock_now());
+                        self.last_enable_confirmed[joint_idx] = Some(torque_en_rx_at);
                         self.missed_enable_polls[joint_idx] = 0;
                     }
                     all_enabled = false;
@@ -2169,7 +2311,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                 1 => {
                     if joint_idx < self.motor_evidence.len() {
                         self.motor_evidence[joint_idx] = MotorTorqueEvidence::OnConfirmed;
-                        self.last_enable_confirmed[joint_idx] = Some(self.clock_now());
+                        self.last_enable_confirmed[joint_idx] = Some(torque_en_rx_at);
                         self.missed_enable_polls[joint_idx] = 0;
                     }
                     all_disabled = false;
@@ -2373,17 +2515,35 @@ impl<T: Transport> FeetechArmDriver<T> {
     fn decode_position_frames_from(
         &mut self,
         rx: &mut Vec<u8>,
+        rx_ts: Option<&mut Vec<Instant>>,
         expected_ids: &std::collections::HashSet<u8>,
         replied_ids: &mut std::collections::HashSet<u8>,
-        read_time: Instant,
+        fallback_time: Instant,
+        window: Option<(Instant, Duration)>,
     ) {
         let default_calib = feetech::FeetechJointCalib::default();
+        let mut rx_ts = rx_ts;
         while !rx.is_empty() {
             match feetech::parse_response(rx) {
                 Ok((pkt, consumed)) => {
+                    let pkt_rx_at = rx_ts
+                        .as_deref()
+                        .and_then(|ts| ts.get(consumed.saturating_sub(1)).copied())
+                        .unwrap_or(fallback_time);
                     rx.drain(..consumed);
+                    if let Some(ts) = rx_ts.as_deref_mut() {
+                        let c = consumed.min(ts.len());
+                        ts.drain(..c);
+                    }
                     if pkt.id == feetech::BROADCAST_ID {
                         continue;
+                    }
+                    if let Some((req_written_at, timeout)) = window {
+                        if pkt_rx_at < req_written_at
+                            || pkt_rx_at.saturating_duration_since(req_written_at) >= timeout
+                        {
+                            continue;
+                        }
                     }
                     if expected_ids.contains(&pkt.id) && !replied_ids.contains(&pkt.id) {
                         if let Some(joint_idx) = self.servo_ids.iter().position(|&id| id == pkt.id) {
@@ -2409,13 +2569,13 @@ impl<T: Transport> FeetechArmDriver<T> {
                                 self.cached_loads[joint_idx] = load;
                                 self.motor_status[joint_idx] = pkt.error;
                                 if self.last_feedback_instant[joint_idx].is_none_or(|prev| {
-                                    read_time.saturating_duration_since(prev) > STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                                    pkt_rx_at.saturating_duration_since(prev) > STOPPED_DISABLE_FEEDBACK_MAX_AGE
                                 }) || !self.cached_states[joint_idx].position.is_finite()
                                 {
                                     self.feedback_continuity_epoch[joint_idx] =
                                         self.feedback_continuity_epoch[joint_idx].wrapping_add(1);
                                 }
-                                self.last_feedback_instant[joint_idx] = Some(read_time);
+                                self.last_feedback_instant[joint_idx] = Some(pkt_rx_at);
                                 self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
 
                                 replied_ids.insert(pkt.id);
@@ -2428,30 +2588,45 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
                 Err(_) => {
                     rx.remove(0);
+                    if let Some(ts) = rx_ts.as_deref_mut() {
+                        if !ts.is_empty() {
+                            ts.remove(0);
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn decode_position_frames(
+    fn decode_position_frames_windowed(
         &mut self,
         expected_ids: &std::collections::HashSet<u8>,
         replied_ids: &mut std::collections::HashSet<u8>,
-        read_time: Instant,
+        req_written_at: Instant,
+        timeout: Duration,
     ) {
         let mut rx = std::mem::take(&mut self.rx_buffer);
-        self.decode_position_frames_from(&mut rx, expected_ids, replied_ids, read_time);
+        let mut ts = std::mem::take(&mut self.rx_timestamps);
+        self.decode_position_frames_from(
+            &mut rx,
+            Some(&mut ts),
+            expected_ids,
+            replied_ids,
+            req_written_at,
+            Some((req_written_at, timeout)),
+        );
         self.rx_buffer = rx;
+        self.rx_timestamps = ts;
     }
 
     fn decode_partial_position_frames(
         &mut self,
         expected_ids: &std::collections::HashSet<u8>,
         replied_ids: &mut std::collections::HashSet<u8>,
-        read_time: Instant,
+        inc_ts: Instant,
     ) {
         let mut rx = std::mem::take(&mut self.partial_pos_rx);
-        self.decode_position_frames_from(&mut rx, expected_ids, replied_ids, read_time);
+        self.decode_position_frames_from(&mut rx, None, expected_ids, replied_ids, inc_ts, None);
         self.partial_pos_rx = rx;
     }
 }
@@ -2787,6 +2962,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 positions_to_write.push((self.servo_ids[i], raw_steps));
             }
             if !positions_to_write.is_empty() {
+                self.discard_pending_rx_for_request()?;
                 let sync_pkt = feetech::build_sync_write_positions(&positions_to_write)
                     .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
                 self.transport.write_all(&sync_pkt)?;
@@ -2804,6 +2980,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 // Invalidate this motor's torque evidence BEFORE the write reaches the transport.
                 // Any servo whose write is skipped by abort above keeps its prior evidence intact.
                 self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                if let Err(e) = self.discard_pending_rx_for_request() {
+                    write_err = Some(e);
+                    break;
+                }
                 let pkt = feetech::build_set_torque(id, true);
                 if let Err(e) = self.transport.write_all(&pkt) {
                     write_err = Some(e.into());
@@ -2832,20 +3012,20 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             for (idx, &id) in ids.iter().enumerate() {
                 self.strict_stop_check(Some(start_stamp))?;
                 match self.read_torque_enable_causal(idx, id) {
-                    Ok(1) => {
+                    Ok((1, rx_at)) => {
                         one_count += 1;
                         self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
-                        self.last_enable_confirmed[idx] = Some(self.clock_now());
+                        self.last_enable_confirmed[idx] = Some(rx_at);
                         self.missed_enable_polls[idx] = 0;
                     }
-                    Ok(0) => {
+                    Ok((0, rx_at)) => {
                         all_enabled = false;
                         self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
-                        self.last_enable_confirmed[idx] = Some(self.clock_now());
+                        self.last_enable_confirmed[idx] = Some(rx_at);
                         self.missed_enable_polls[idx] = 0;
                         read_errors.push(format!("servo {} returned 0", id));
                     }
-                    Ok(v) => {
+                    Ok((v, _)) => {
                         all_enabled = false;
                         self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                         read_errors.push(format!("servo {} returned unexpected value {}", id, v));
@@ -3011,6 +3191,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             self.drain_tx_echo(&sync_pkt)?;
             if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
                 self.partial_pos_rx.append(&mut self.rx_buffer);
+                self.rx_timestamps.clear();
             }
             for i in 0..dof {
                 if (held_mask & (1u64 << i)) != 0 {
@@ -3049,6 +3230,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.drain_tx_echo(&sync_pkt)?;
         if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
             self.partial_pos_rx.append(&mut self.rx_buffer);
+            self.rx_timestamps.clear();
         }
         Ok(())
     }
@@ -3070,6 +3252,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             let inc_ts = self.incomplete_frame_started_at.take().unwrap_or_else(|| self.clock_now());
             if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
                 self.invalidate_partial_pos_rx();
+                self.line_poisoned = true;
             } else if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
                 let expected_ids: std::collections::HashSet<u8> = inc_chunk.iter().copied().collect();
                 let mut replied_ids = std::collections::HashSet::new();
@@ -3086,6 +3269,9 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 {
                     match self.transport.read(&mut drain_buf) {
                         Ok(n) if n > 0 => {
+                            if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
+                                break;
+                            }
                             self.partial_pos_rx.extend_from_slice(&drain_buf[..n]);
                             self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
                         }
@@ -3095,15 +3281,6 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                             }
                             self.clock_yield();
                         }
-                    }
-                    if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL && replied_ids.len() < inc_chunk.len() {
-                        if let Ok(n) = self.transport.read(&mut drain_buf) {
-                            if n > 0 {
-                                self.partial_pos_rx.extend_from_slice(&drain_buf[..n]);
-                                self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
-                            }
-                        }
-                        break;
                     }
                 }
 
@@ -3117,8 +3294,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                         self.incomplete_frame_started_at = Some(inc_ts);
                     } else {
                         self.invalidate_partial_pos_rx();
+                        self.line_poisoned = true;
                     }
                 } else {
+                    if !all_replied && inc_timed_out {
+                        self.line_poisoned = true;
+                    }
                     self.invalidate_partial_pos_rx();
                 }
             } else {
@@ -3132,40 +3313,64 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| self.elapsed_since(t) >= Duration::from_millis(200)));
         if did_enable_poll {
             self.last_enable_poll = Some(self.clock_now());
-            self.transport.clear_input_buffer();
-            self.rx_buffer.clear();
-            if let Ok(sync_read) = feetech::build_sync_read(&self.servo_ids, feetech::REG_TORQUE_ENABLE, 1) {
+            if self.discard_pending_rx_for_request().is_err() {
+                for ev in &mut self.motor_evidence {
+                    *ev = MotorTorqueEvidence::Unknown;
+                }
+            } else if let Ok(sync_read) = feetech::build_sync_read(&self.servo_ids, feetech::REG_TORQUE_ENABLE, 1) {
                 let _ = self.transport.write_all(&sync_read);
                 let _ = self.transport.flush();
+                let req_written_at = self.clock_now();
                 let _ = self.drain_tx_echo(&sync_read);
 
                 let mut temp_en = [0u8; 1];
-                let start_en = self.clock_now();
-                let mut replies: std::collections::HashMap<u8, Option<u8>> = std::collections::HashMap::new();
+                const ENABLE_POLL_TIMEOUT: Duration = Duration::from_millis(3);
+                let mut replies: std::collections::HashMap<u8, Option<(u8, Instant)>> = std::collections::HashMap::new();
+                let mut had_duplicate = false;
 
                 while replies.len() < self.servo_ids.len()
-                    && self.elapsed_since(start_en) < Duration::from_millis(3)
+                    && self.elapsed_since(req_written_at) < ENABLE_POLL_TIMEOUT
                     && self.elapsed_since(start_time) < Duration::from_millis(10)
                 {
                     if let Ok(n) = self.transport.read(&mut temp_en) {
                         if n > 0 {
-                            self.rx_buffer.extend_from_slice(&temp_en[..n]);
+                            let rx_at = self.clock_now();
+                            if rx_at < req_written_at
+                                || rx_at.saturating_duration_since(req_written_at) >= ENABLE_POLL_TIMEOUT
+                                || self.elapsed_since(start_time) >= Duration::from_millis(10)
+                            {
+                                break;
+                            }
+                            self.push_rx(&temp_en[..n], rx_at);
                         }
                     }
                     while !self.rx_buffer.is_empty() {
                         match feetech::parse_response(&self.rx_buffer) {
                             Ok((pkt, consumed)) => {
-                                self.rx_buffer.drain(..consumed);
+                                let pkt_rx_at = self
+                                    .rx_timestamps
+                                    .get(consumed - 1)
+                                    .copied()
+                                    .unwrap_or(req_written_at);
+                                self.drain_rx_prefix(consumed);
+                                if pkt_rx_at < req_written_at
+                                    || pkt_rx_at.saturating_duration_since(req_written_at) >= ENABLE_POLL_TIMEOUT
+                                {
+                                    continue;
+                                }
                                 if pkt.id != feetech::BROADCAST_ID && self.servo_ids.contains(&pkt.id) && pkt.params.len() == 1 {
                                     replies
                                         .entry(pkt.id)
-                                        .and_modify(|slot| *slot = None)
-                                        .or_insert(Some(pkt.params[0]));
+                                        .and_modify(|slot| {
+                                            *slot = None;
+                                            had_duplicate = true;
+                                        })
+                                        .or_insert(Some((pkt.params[0], pkt_rx_at)));
                                 }
                             }
                             Err(feetech::FeetechError::IncompleteFrame { .. }) => break,
                             Err(_) => {
-                                self.rx_buffer.remove(0);
+                                self.drain_rx_prefix(1);
                             }
                         }
                     }
@@ -3174,6 +3379,12 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                     }
                 }
 
+                if replies.len() < self.servo_ids.len() || had_duplicate {
+                    // E3: Timed-out or ambiguous enable poll poisons the line until drained idle.
+                    self.line_poisoned = true;
+                }
+                self.clear_rx();
+
                 let now = self.clock_now();
                 for (idx, &id) in self.servo_ids.iter().enumerate() {
                     if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
@@ -3181,14 +3392,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                         continue;
                     }
                     match replies.get(&id) {
-                        Some(Some(0)) => {
+                        Some(Some((0, reply_rx_at))) => {
                             self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
-                            self.last_enable_confirmed[idx] = Some(now);
+                            self.last_enable_confirmed[idx] = Some(*reply_rx_at);
                             self.missed_enable_polls[idx] = 0;
                         }
-                        Some(Some(1)) => {
+                        Some(Some((1, reply_rx_at))) => {
                             self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
-                            self.last_enable_confirmed[idx] = Some(now);
+                            self.last_enable_confirmed[idx] = Some(*reply_rx_at);
                             self.missed_enable_polls[idx] = 0;
                         }
                         Some(_) => {
@@ -3224,36 +3435,50 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 break 'chunk_loop;
             }
 
-            self.transport.clear_input_buffer();
-            self.rx_buffer.clear();
+            if self.discard_pending_rx_for_request().is_err() {
+                self.poll_cursor = chunk_idx;
+                break 'chunk_loop;
+            }
+            if self.elapsed_since(start_time) >= MAX_READ_DURATION {
+                self.poll_cursor = chunk_idx;
+                break 'chunk_loop;
+            }
             let sync_read = feetech::build_sync_read(chunk, feetech::REG_PRESENT_POSITION_L, 8)
                 .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
 
             self.transport.write_all(&sync_read)?;
             self.transport.flush()?;
+            let req_written_at = self.clock_now();
             self.drain_tx_echo(&sync_read)?;
 
             let expected_ids: std::collections::HashSet<u8> = chunk.iter().copied().collect();
             let mut replied_ids = std::collections::HashSet::new();
-            let chunk_start = self.clock_now();
             const CHUNK_TIMEOUT: Duration = Duration::from_millis(4);
-            let mut read_time = self.clock_now();
 
-            while replied_ids.len() < chunk.len() && self.elapsed_since(chunk_start) < CHUNK_TIMEOUT && self.elapsed_since(start_time) < MAX_READ_DURATION {
-                self.decode_position_frames(&expected_ids, &mut replied_ids, read_time);
+            while replied_ids.len() < chunk.len()
+                && self.elapsed_since(req_written_at) < CHUNK_TIMEOUT
+                && self.elapsed_since(start_time) < MAX_READ_DURATION
+            {
+                self.decode_position_frames_windowed(&expected_ids, &mut replied_ids, req_written_at, CHUNK_TIMEOUT);
                 if replied_ids.len() >= chunk.len() {
                     break;
                 }
 
                 match self.transport.read(&mut temp_chunk) {
                     Ok(n) if n > 0 => {
-                        read_time = self.clock_now();
-                        self.rx_buffer.extend_from_slice(&temp_chunk[..n]);
+                        let byte_rx_at = self.clock_now();
+                        if byte_rx_at < req_written_at
+                            || byte_rx_at.saturating_duration_since(req_written_at) >= CHUNK_TIMEOUT
+                            || byte_rx_at.saturating_duration_since(start_time) >= MAX_READ_DURATION
+                        {
+                            break;
+                        }
+                        self.push_rx(&temp_chunk[..n], byte_rx_at);
                     }
                     _ => {}
                 }
 
-                self.decode_position_frames(&expected_ids, &mut replied_ids, read_time);
+                self.decode_position_frames_windowed(&expected_ids, &mut replied_ids, req_written_at, CHUNK_TIMEOUT);
 
                 if replied_ids.len() < chunk.len() {
                     self.clock_yield();
@@ -3262,42 +3487,32 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
             if replied_ids.len() < chunk.len() {
                 self.missed_poll_replies += 1;
-                if self.elapsed_since(start_time) < MAX_READ_DURATION {
-                    self.clock_sleep(Duration::from_micros(500));
-                }
-                let mut drain_buf = [0u8; 64];
-                let mut drained_bytes = 0;
-                while self.elapsed_since(start_time) < MAX_READ_DURATION && drained_bytes < 256 {
-                    match self.transport.read(&mut drain_buf) {
-                        Ok(n) if n > 0 => {
-                            let drain_time = self.clock_now();
-                            self.rx_buffer.extend_from_slice(&drain_buf[..n]);
-                            drained_bytes += n;
-                            self.decode_position_frames(&expected_ids, &mut replied_ids, drain_time);
-                        }
-                        _ => break,
+                if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.rx_buffer, chunk, 10) {
+                    let tail_offset = self.rx_buffer.len() - tail.len();
+                    let tail_started_at = self
+                        .rx_timestamps
+                        .get(tail_offset)
+                        .copied()
+                        .unwrap_or(req_written_at);
+                    if tail_started_at >= req_written_at
+                        && tail_started_at.saturating_duration_since(req_written_at) < CHUNK_TIMEOUT
+                    {
+                        self.partial_pos_rx = tail.to_vec();
+                        self.incomplete_chunk_idx = Some(chunk_idx);
+                        self.incomplete_frame_started_at = Some(tail_started_at);
+                        self.clear_rx();
+                        self.poll_cursor = (chunk_idx + 1) % num_chunks;
+                        break 'chunk_loop;
                     }
                 }
-                if self.rx_buffer.len() > 512 {
-                    let trim = self.rx_buffer.len() - 256;
-                    self.rx_buffer.drain(..trim);
-                }
-            }
-
-            if replied_ids.len() < chunk.len() {
-                if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.rx_buffer, chunk, 10) {
-                    self.partial_pos_rx = tail.to_vec();
-                    self.incomplete_chunk_idx = Some(chunk_idx);
-                    self.incomplete_frame_started_at = Some(read_time);
-                    self.rx_buffer.clear();
-                    self.poll_cursor = (chunk_idx + 1) % num_chunks;
-                    break 'chunk_loop;
-                }
+                // E3: Timed-out position chunk poisons the line so the next request discards
+                // until idle rather than misattributing a delayed reply as fresh.
+                self.line_poisoned = true;
             }
             self.incomplete_chunk_idx = None;
             self.incomplete_frame_started_at = None;
             self.partial_pos_rx.clear();
-            self.rx_buffer.clear();
+            self.clear_rx();
             self.poll_cursor = (chunk_idx + 1) % num_chunks;
         }
 
