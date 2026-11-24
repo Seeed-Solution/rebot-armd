@@ -76,7 +76,52 @@ impl SupervisorInner {
     pub(crate) fn retire_motion_payloads(&mut self) {
         self.release_servo_target();
         let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
-        let trajectory = self.active_trajectory.take().filter(|t| t.has_heap_storage());
+        let trajectory = match self.active_trajectory.take() {
+            Some(traj) => {
+                if self.rt_executor_owned
+                    && traj.motion_limits.is_none()
+                    && traj.then.is_none()
+                {
+                    match traj.reference {
+                        Reference::Gripper(mut b) => {
+                            if self.move_samples_spares.len() < self.move_samples_spares.capacity() {
+                                if let Some(samples) = b.take_samples_spare() {
+                                    self.recycle_move_samples_rt(samples);
+                                }
+                            }
+                            if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() {
+                                self.gripper_motion_spare = Some(b);
+                                None
+                            } else {
+                                let rebuilt = ActiveTrajectory {
+                                    action_id: traj.action_id,
+                                    reference: Reference::Gripper(b),
+                                    then: None,
+                                    span: traj.span,
+                                    motion_limits: None,
+                                    motion_max_velocity: traj.motion_max_velocity,
+                                };
+                                rebuilt.has_heap_storage().then_some(rebuilt)
+                            }
+                        }
+                        reference => {
+                            let rebuilt = ActiveTrajectory {
+                                action_id: traj.action_id,
+                                reference,
+                                then: None,
+                                span: traj.span,
+                                motion_limits: None,
+                                motion_max_velocity: traj.motion_max_velocity,
+                            };
+                            rebuilt.has_heap_storage().then_some(rebuilt)
+                        }
+                    }
+                } else {
+                    traj.has_heap_storage().then_some(traj)
+                }
+            }
+            None => None,
+        };
         self.clear_unload_settle();
         let unload_settle = self.unload_settle.take();
         if trajectory.is_some() || unload_settle.is_some() || servo_ws_min_depths.is_some() {
@@ -442,11 +487,11 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.is_torqued = false;
                 self.tracking.invalidate();
-                self.active_trajectory = None;
+                self.replace_active_trajectory(None);
                 self.reset_gripper_stall();
-                self.commanded_velocities = vec![0.0; self.config.dof];
+                self.commanded_velocities.fill(0.0);
                 if self.driver.is_none() {
-                    self.measured_velocities = vec![0.0; self.config.dof];
+                    self.measured_velocities.fill(0.0);
                 }
                 let _ = self.safety.set_torque(false);
                 self.mit_torque_off();
@@ -1045,7 +1090,7 @@ impl SupervisorInner {
 
         self.config_motion_check()?;
         self.gravity_comp_motion_busy()?;
-        if self.has_mit_motion_blocker() {
+        if self.mit_motion_blocked() {
             if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
         }
         #[cfg(feature = "policy-runtime")]
@@ -1065,6 +1110,9 @@ impl SupervisorInner {
         }
         if self.pending_rearm || self.pending_normal_unload {
             return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
+        }
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
+            return Err(MotionError::MotionBusy("macro finishing hold pending bus acceptance".into()).into());
         }
         self.pending_normal_unload = false;
 
@@ -1093,17 +1141,40 @@ impl SupervisorInner {
         }
 
         let zeros = [0.0f32; MAX_DOF];
+        let mut start_pos = [0.0f32; MAX_DOF];
+        let (start_dof, quiesce_macro_gripper) = self.post_quiesce_commanded_positions(&mut start_pos);
+        let mut start_vel = [0.0f32; MAX_DOF];
+        let vel_dof = self.commanded_velocities.len().min(MAX_DOF);
+        start_vel[..vel_dof].copy_from_slice(&self.commanded_velocities[..vel_dof]);
+        if quiesce_macro_gripper {
+            if let Some(g) = self.config.gripper_index().filter(|&g| g < vel_dof) {
+                start_vel[g] = 0.0;
+            }
+        }
         let traj = TrajectoryPlanner::plan(
-            &self.commanded_positions,
-            &self.commanded_velocities,
+            &start_pos[..start_dof],
+            &start_vel[..vel_dof],
             target,
             &zeros[..self.config.dof],
             duration_secs,
             limits,
         )?;
-        let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, target, limits, true)?;
+        let (traj, power_scale) = self.power_fit_quintic(
+            traj,
+            &start_pos[..start_dof],
+            &start_vel[..vel_dof],
+            target,
+            limits,
+            true,
+        )?;
         self.check_workspace_quintic_inline(&traj)?;
 
+        // Commit old-macro gripper quiesce strictly AFTER all validation succeeded and BEFORE
+        // mutating new motion state (target_positions / safety / active_trajectory).
+        if quiesce_macro_gripper {
+            self.hold_gripper_at_measured();
+            self.releasing = false;
+        }
         self.last_heartbeat = Instant::now();
         if self.config.gripper_index().is_some_and(|g| target.len() > g && (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
             self.gripper_hold_vel_ceiling = None;
@@ -1118,7 +1189,7 @@ impl SupervisorInner {
         if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
         // No `speed_scale` here, so `active_tracking_limits` already uses `planning_limits()`
         // when `motion_limits` is None (avoids cloning `Vec<JointLimit>` and joint name strings).
-        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
+        self.replace_active_trajectory(Some(ActiveTrajectory::quintic(traj, Some(id))));
         Ok((self.safety.epoch_id(), id, duration))
     }
 
@@ -1217,6 +1288,9 @@ impl SupervisorInner {
 
         if self.pending_rearm || self.pending_normal_unload {
             return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
+        }
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
+            return Err(MotionError::MotionBusy("macro finishing hold pending bus acceptance".into()).into());
         }
         self.pending_normal_unload = false;
 
@@ -1317,6 +1391,9 @@ impl SupervisorInner {
     }
 
     pub(crate) fn busy_reason_static(&self) -> Option<&'static str> {
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) {
+            return Some("macro finishing hold pending bus acceptance");
+        }
         if self.calibration_busy { return Some("a calibration apply is running"); }
         if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted"); }
         #[cfg(feature = "policy-runtime")]
@@ -1446,7 +1523,8 @@ impl SupervisorInner {
         }
         if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
         if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
-        if self.mit_motion_blocker().is_some() { return Err("PLAN_STALE"); }
+        if self.macro_run.as_ref().is_some_and(|m| m.finishing) { return Err("MOTION_BUSY"); }
+        if self.mit_motion_blocked() { return Err("PLAN_STALE"); }
         if self.calibration_busy
             || self.zero_check_persisting.is_some()
             || self.active_trajectory.is_some()

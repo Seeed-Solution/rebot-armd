@@ -70,6 +70,13 @@ pub static TEST_ACK_STAMP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 /// `lease_granted` onto `ordinary_out_tx`, allowing heartbeat-triggered `lease_lost` to race ahead.
 pub static TEST_LEASE_GRANTED_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test hook: pause (ms) after a deferred action install (`complete_pending_plan` /
+/// `complete_pending_replay` / `complete_macro_check`) releases the owner lock and before
+/// enqueueing its `command_ack` onto `ordinary_out_tx`, allowing a concurrent Stop/terminal to
+/// race against the ACK gate. 0 (no pause) outside tests.
+#[doc(hidden)]
+pub static TEST_DEFERRED_ACK_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 static TEST_WS_WRITE_HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TEST_WS_WRITE_PAUSED_CONNS: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -720,13 +727,13 @@ impl WsWriterHandle {
 /// Returning `false` from the subscriber callback keeps pending terminals at the head of
 /// `TerminalBroadcaster`'s bounded FIFO (preserving capacity accounting and holding back newer
 /// telemetry broadcasts) until this guard drops and wakes `armd-dispatch`.
-struct CommandReplyGateGuard {
+pub(super) struct CommandReplyGateGuard {
     active: Arc<AtomicBool>,
     hub: Arc<crate::rt_core::publish::StateHub>,
 }
 
 impl CommandReplyGateGuard {
-    fn enter(active: &Arc<AtomicBool>, hub: &Arc<crate::rt_core::publish::StateHub>) -> Self {
+    pub(super) fn enter(active: &Arc<AtomicBool>, hub: &Arc<crate::rt_core::publish::StateHub>) -> Self {
         active.store(true, Ordering::Release);
         Self {
             active: Arc::clone(active),
@@ -2434,7 +2441,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
                     let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
-                    let Some(reply) = actions::complete_macro_check(
+                    let Some((reply, macro_gate)) = actions::complete_macro_check(
                         request_id,
                         generation,
                         stamp,
@@ -2444,8 +2451,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_generation,
                         &recv_deps,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
+                    if reply.get("type").and_then(Value::as_str) == Some("command_ack") {
+                        let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                    let sent = worker_writer.send_ordinary_control(reply).await;
+                    drop(macro_gate);
+                    if !sent { break; }
                     continue;
                 }
                 item = worker_ordinary_queue.pop(macro_active) => match item {
@@ -2699,7 +2715,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let allows_deferred = entry.is_some_and(|e| e.reply == ReplyPolicy::CommandDeferred);
             if allows_deferred {
                 if let Some((plan, generation)) = action_pending.plan.take() {
-                    let Some(next) = actions::complete_pending_plan(
+                    let Some((next, gate)) = actions::complete_pending_plan(
                         plan,
                         generation,
                         stamp,
@@ -2707,7 +2723,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_connection,
                         &recv_generation,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
+                    reply_gate_guard = gate;
                     response = next;
                 }
 
@@ -2725,7 +2743,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
 
                 if let Some((request_id, input, generation)) = action_pending.replay.take() {
-                    let Some(next) = actions::complete_pending_replay(
+                    let Some((next, gate)) = actions::complete_pending_replay(
                         request_id,
                         input,
                         generation,
@@ -2734,7 +2752,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &recv_connection,
                         &recv_generation,
                         &worker_closing,
+                        &worker_command_reply_pending,
                     ).await else { break; };
+                    reply_gate_guard = gate;
                     response = next;
                 }
                 #[cfg(feature = "policy-runtime")]
@@ -2835,6 +2855,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             if let Some(response) = response {
                 if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
                     let delay_ms = TEST_LEASE_GRANTED_DELAY_MS.load(Ordering::Relaxed);
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                } else if reply_gate_guard.is_some()
+                    && response.get("type").and_then(Value::as_str) == Some("command_ack")
+                {
+                    let delay_ms = TEST_DEFERRED_ACK_DELAY_MS.load(Ordering::Relaxed);
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::broker::{BootId, Broker, Capacities};
+use super::broker::{BootId, Broker, Capacities, ClientId};
 use super::config_iface::{ConfigAuthority, ConfigDomain, ConfigProposal, Reservation};
 use super::mailbox::TargetWriter;
 use super::ops::{CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, MAX_SERVICE_WAKES};
@@ -840,6 +840,7 @@ pub enum MaintenanceOp {
     SetMotorZero { joint: usize },
     TakeBaselinePending {
         fresh_pending: Vec<crate::gripper_baseline::MoveRecord>,
+        fresh_samples: Vec<crate::gripper_baseline::MoveSamples>,
         clear_dirty: bool,
     },
     StoreBaseline {
@@ -885,6 +886,7 @@ struct MaintReply {
     returned_probe: Option<Box<dyn Any + Send>>,
     returned_driver_config_error: Option<String>,
     returned_pending: Option<Vec<crate::gripper_baseline::MoveRecord>>,
+    returned_samples: Option<Vec<crate::gripper_baseline::MoveSamples>>,
     returned_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
 }
 
@@ -921,6 +923,7 @@ impl MaintClientInner {
             drop(reply.returned_probe);
             drop(reply.returned_driver_config_error);
             drop(reply.returned_pending);
+            drop(reply.returned_samples);
             drop(reply.returned_baseline);
             if let Some(waiter) = self.waiters.remove(&reply.id) {
                 let res = match reply.result {
@@ -1600,6 +1603,7 @@ enum PersistReply {
         _returned_probe: Option<Box<dyn Any + Send>>,
     },
     Activated {
+        activated_revision: u64,
         _returned_policy: Option<GripperPolicy>,
         _returned_jaw: Option<JawOpening>,
         _returned_code: Option<String>,
@@ -1861,8 +1865,67 @@ impl TeardownDisable {
     }
 }
 
+/// Single plug-in hook for PR L's per-connection WebSocket reply router (A6/A7).
+///
+/// In PR P, WebSocket ordinary commands on `OWNER_EXECUTOR` remain gated at `503
+/// EXECUTOR_ROUTING_PENDING` (`src/api/ws.rs:492, 2461`) because connection lifecycle and
+/// per-client reply routing belong to PR L. PR L installs its per-connection router once via
+/// [`RtExecutorHandle::attach_external_reply_sink`]. Until a sink is attached,
+/// [`crate::macro_action::begin_macro_executor`] refuses new executor macros at admission with
+/// `503 EXECUTOR_ROUTING_PENDING` so no macro can commit without a terminal reply sink.
+pub trait ExternalReplySink: Send + Sync {
+    fn deliver(
+        &self,
+        client: ClientId,
+        reply: super::broker::Reply,
+    ) -> super::broker::DeliveryDecision;
+}
+
+impl<F> ExternalReplySink for F
+where
+    F: Fn(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision + Send + Sync,
+{
+    fn deliver(
+        &self,
+        client: ClientId,
+        reply: super::broker::Reply,
+    ) -> super::broker::DeliveryDecision {
+        (self)(client, reply)
+    }
+}
+
+/// Shared bounded FIFO broker reply dispatcher (A7 / Major 10):
+/// routes replies for internal broker RPCs (`BeginMacro` ACK/Refused, `InstallChild`, `FinishMacro`)
+/// directly to their keyed oneshot waiters without head-of-line blocking behind unrelated replies,
+/// while buffering all other replies (including `BeginMacro` `Terminal`s and external client traffic)
+/// in a bounded (`<= external_cap`) FIFO queue and forwarding them to the attached
+/// [`ExternalReplySink`] (PR L's per-connection WS reply router hook).
+///
+/// Lock order: ALWAYS lock `RtExecutorShared::broker` BEFORE `RtExecutorShared::reply_router`.
+/// NEVER invoke `ExternalReplySink::deliver` while holding either lock.
+struct ActionReplyRouter {
+    waiters: std::collections::HashMap<super::broker::RequestId, tokio::sync::oneshot::Sender<super::broker::Reply>>,
+    external: VecDeque<(ClientId, super::broker::Reply)>,
+    external_cap: usize,
+    external_sink: Option<Arc<dyn ExternalReplySink>>,
+}
+
+impl ActionReplyRouter {
+    fn new(external_cap: usize) -> Self {
+        let cap = external_cap.max(1);
+        Self {
+            waiters: std::collections::HashMap::new(),
+            external: VecDeque::with_capacity(cap),
+            external_cap: cap,
+            external_sink: None,
+        }
+    }
+}
+
 struct RtExecutorShared {
+    boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
+    reply_router: Mutex<ActionReplyRouter>,
     target_writer: Arc<Mutex<TargetWriter>>,
     stop_requests: StopRequests,
     stats: Arc<ExecutorStats>,
@@ -1887,7 +1950,6 @@ struct RtExecutorShared {
     persist_park_thread: Thread,
     clock: Option<Arc<dyn ExecutorClock>>,
     baseline_identity: BaselineIdentity,
-    boot: BootId,
 }
 
 impl RtExecutorShared {
@@ -1993,6 +2055,7 @@ impl RtExecutorShared {
         }
         let _ = self.hub.latest();
         self.broker.lock().unwrap_or_else(|e| e.into_inner()).poll(|_, _| true);
+        self.reply_router.lock().unwrap_or_else(|e| e.into_inner()).waiters.clear();
     }
 
     fn teardown_and_join(&self) {
@@ -2013,12 +2076,209 @@ pub struct RtExecutorHandle {
 }
 
 impl RtExecutorHandle {
+    pub fn boot(&self) -> BootId { self.shared.boot }
     pub fn broker(&self) -> &Arc<Mutex<Broker<PlanSlot>>> { &self.shared.broker }
+
+    /// Submits an internal A6/A7 action command (`BeginMacro`, `InstallChild`, `FinishMacro`, or
+    /// `InstallPrepared`) and atomically registers a keyed oneshot waiter in the shared bounded
+    /// FIFO reply router BEFORE releasing the broker lock (preventing ACK stealing and
+    /// head-of-line deadlock behind unrelated replies).
+    ///
+    /// For `BeginMacro` (which produces `Ack` followed later by `Terminal` under the same
+    /// `RequestId`), the oneshot receives ONLY the initial `Ack`/`Refused`; the subsequent
+    /// `Terminal` automatically routes into the external FIFO queue.
+    pub fn submit_internal_action<'a>(
+        &self,
+        client: ClientId,
+        seq: u64,
+        auth: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<super::broker::Reply>,
+        ),
+        super::broker::AdmitError,
+    > {
+        let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let req_id = broker.submit(
+            client,
+            seq,
+            auth,
+            deadline,
+            super::broker::Submit::Action(sub),
+        )?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut router = self
+            .shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        router.waiters.insert(req_id, tx);
+        Ok((req_id, rx))
+    }
+
+    /// Removes a previously registered internal waiter (e.g. on timeout/cancellation).
+    pub fn cancel_internal_waiter(&self, req_id: super::broker::RequestId) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiters
+            .remove(&req_id);
+    }
+
+    /// Single hook where PR L plugs in its per-connection WebSocket reply router.
+    /// Once attached, [`Self::has_external_reply_sink`] becomes `true`,
+    /// [`crate::macro_action::begin_macro_executor`] admits executor macros, and
+    /// [`Self::pump_broker_replies`] forwards external replies (including `BeginMacro`
+    /// `Reply::Terminal`s) to `sink` in strict FIFO order without holding broker/router locks.
+    pub fn attach_external_reply_sink(&self, sink: Arc<dyn ExternalReplySink>) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink = Some(sink);
+        self.pump_broker_replies();
+    }
+
+    /// Detaches the external reply sink (returning executor macro admission to fail-closed
+    /// `503 EXECUTOR_ROUTING_PENDING`).
+    pub fn detach_external_reply_sink(&self) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink = None;
+    }
+
+    /// Returns `true` when an external reply sink (PR L's per-connection WS reply router) is
+    /// currently attached to this executor handle.
+    pub fn has_external_reply_sink(&self) -> bool {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external_sink
+            .is_some()
+    }
+
+    fn pump_broker_to_router(&self) -> (usize, Option<Arc<dyn ExternalReplySink>>) {
+        use super::broker::DeliveryDecision;
+        let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut router = self
+            .shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = broker.try_poll(|client, reply| {
+            if let Some(tx) = router.waiters.remove(&reply.request()) {
+                let _ = tx.send(reply);
+                DeliveryDecision::Delivered
+            } else if router.external.len() < router.external_cap {
+                router.external.push_back((client, reply));
+                DeliveryDecision::Delivered
+            } else {
+                DeliveryDecision::Backpressured
+            }
+        });
+        broker.reclaim_plans();
+        (n, router.external_sink.clone())
+    }
+
+    /// Pumps ready replies from the broker into matching internal waiters or the bounded external
+    /// FIFO buffer (`<= reply_capacity`), forwarding buffered external replies to the attached
+    /// [`ExternalReplySink`] (if any) without holding broker/router locks, and reclaims retired
+    /// plan slots.
+    pub fn pump_broker_replies(&self) -> usize {
+        use super::broker::DeliveryDecision;
+        let (mut total, sink) = self.pump_broker_to_router();
+        if let Some(sink) = sink {
+            let mut delivered_any = false;
+            loop {
+                let next = self
+                    .shared
+                    .reply_router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .external
+                    .pop_front();
+                let Some((client, reply)) = next else {
+                    break;
+                };
+                match sink.deliver(client, reply) {
+                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => {
+                        delivered_any = true;
+                    }
+                    DeliveryDecision::Backpressured => {
+                        self.shared
+                            .reply_router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .external
+                            .push_front((client, reply));
+                        break;
+                    }
+                }
+            }
+            if delivered_any {
+                total += self.pump_broker_to_router().0;
+            }
+        }
+        total
+    }
+
+    /// Drains external (non-internal-waiter) replies in strict broker FIFO order while honouring
+    /// downstream backpressure (`DeliveryDecision::Backpressured` keeps the undelivered reply at
+    /// the front of the bounded queue and never steals internal macro ACKs).
+    pub fn poll_external_replies<F>(&self, mut deliver: F) -> usize
+    where
+        F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
+    {
+        use super::broker::DeliveryDecision;
+        self.pump_broker_replies();
+        let mut delivered = 0usize;
+        {
+            let mut router = self
+                .shared
+                .reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            while let Some((client, reply)) = router.external.pop_front() {
+                match deliver(client, reply) {
+                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => delivered += 1,
+                    DeliveryDecision::Backpressured => {
+                        router.external.push_front((client, reply));
+                        break;
+                    }
+                }
+            }
+        }
+        if delivered > 0 {
+            self.pump_broker_replies();
+        }
+        delivered
+    }
+
+    /// Number of buffered external replies currently waiting in the bounded router queue.
+    pub fn pending_external_replies(&self) -> usize {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external
+            .len()
+    }
+
+    pub fn disconnect_client(&self, client: ClientId) {
+        self.shared.broker.lock().unwrap_or_else(|e| e.into_inner()).disconnect(client);
+    }
     pub fn target_writer(&self) -> &Arc<Mutex<TargetWriter>> { &self.shared.target_writer }
     pub fn stop_requests(&self) -> &StopRequests { &self.shared.stop_requests }
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
     pub fn executor_thread_id(&self) -> ThreadId { self.shared.executor_thread_id }
-    pub fn boot(&self) -> BootId { self.shared.boot }
     pub fn is_exited(&self) -> bool { self.shared.exited.load(Ordering::Acquire) }
     pub fn baseline_identity(&self) -> &BaselineIdentity { &self.shared.baseline_identity }
     #[doc(hidden)]
@@ -2229,9 +2489,14 @@ impl RtExecutorHandle {
         clear_dirty: bool,
     ) -> Result<BaselineTakeReply, OwnerError> {
         let fresh_pending = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
+        let mut fresh_samples = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
+        for _ in 0..crate::supervisor::GRIPPER_BASELINE_PENDING_MAX {
+            fresh_samples.push(crate::gripper_baseline::MoveSamples::default());
+        }
         match self
             .call_maintenance_async(MaintenanceOp::TakeBaselinePending {
                 fresh_pending,
+                fresh_samples,
                 clear_dirty,
             })
             .await?
@@ -2351,6 +2616,9 @@ pub(crate) fn spawn_executor(
     };
     let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
     core.attach_stop_requests(stop_requests.clone());
+    core.attach_closed_bitset(broker.closed_bitset());
+    core.boot_id = cfg.boot;
+    hub.update_prep_env(Arc::new(super::requests::actions::ActionPrepEnv::from_inner(&core)));
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
     let (diag_amend_tx, diag_amend_rx) = RingBuffer::<(u64, u32)>::new(DIAG_RING_CAPACITY);
@@ -2519,7 +2787,9 @@ pub(crate) fn spawn_executor(
     let monitor_thread = stats.spawn_monitor(control_stop.clone()).ok();
 
     let shared = Arc::new(RtExecutorShared {
+        boot: cfg.boot,
         broker: Arc::new(Mutex::new(broker)),
+        reply_router: Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)),
         target_writer: Arc::new(Mutex::new(target_writer)),
         stop_requests,
         stats,
@@ -2546,7 +2816,6 @@ pub(crate) fn spawn_executor(
         persist_park_thread,
         clock: hooks.clock.clone(),
         baseline_identity,
-        boot: cfg.boot,
     });
     Ok((RtExecutorHandle { shared }, sinks))
 }
@@ -2904,6 +3173,7 @@ impl ControlState {
         let mut returned_offsets = None;
         let mut returned_probe = None;
         let mut returned_pending = None;
+        let mut returned_samples = None;
         let mut returned_baseline = None;
         let result = match req.op {
             MaintenanceOp::RequestShutdown => {
@@ -2952,13 +3222,19 @@ impl ControlState {
             MaintenanceOp::SetMotorZero { .. } => MaintenanceResult::MotorZeroSet(Err(
                 "EXECUTOR_UNSUPPORTED: set_motor_zero is not available while the RT executor owns the arm; use the legacy owner",
             )),
-            MaintenanceOp::TakeBaselinePending { fresh_pending, clear_dirty } => {
+            MaintenanceOp::TakeBaselinePending { fresh_pending, mut fresh_samples, clear_dirty } => {
                 let moves = if core.gripper_baseline_pending.is_empty() {
                     returned_pending = Some(fresh_pending);
                     Vec::new()
                 } else {
                     std::mem::replace(&mut core.gripper_baseline_pending, fresh_pending)
                 };
+                // Replenish preallocated `MoveSamples` spares without RT allocation or deallocation.
+                while core.move_samples_spares.len() < core.move_samples_spares.capacity() {
+                    let Some(s) = fresh_samples.pop() else { break; };
+                    core.move_samples_spares.push(s);
+                }
+                returned_samples = Some(fresh_samples);
                 let tool = &core.config.active_tool;
                 let stroke = core
                     .config
@@ -3030,6 +3306,7 @@ impl ControlState {
             returned_probe,
             returned_driver_config_error,
             returned_pending,
+            returned_samples,
             returned_baseline,
         });
     }
@@ -3069,27 +3346,28 @@ impl ControlState {
                 returned_probe: reply.returned_probe,
                 returned_driver_config_error: reply.returned_driver_config_error,
                 returned_pending,
+                returned_samples: reply.returned_samples,
                 returned_baseline: reply.returned_baseline,
             });
         }
         while let Ok(req) = self.maint_req_rx.pop() {
-            let (result, returned_offsets, returned_probe, returned_pending, returned_baseline) = match req.op {
+            let (result, returned_offsets, returned_probe, returned_pending, returned_samples, returned_baseline) = match req.op {
                 MaintenanceOp::SetJointZeroOffsets { offsets, .. } => {
-                    (MaintenanceResult::Stopped, Some(offsets), None, None, None)
+                    (MaintenanceResult::Stopped, Some(offsets), None, None, None, None)
                 }
                 MaintenanceOp::ProbeOwnedPayload { payload } => {
-                    (MaintenanceResult::Stopped, None, Some(payload), None, None)
+                    (MaintenanceResult::Stopped, None, Some(payload), None, None, None)
                 }
-                MaintenanceOp::TakeBaselinePending { fresh_pending, .. } => {
-                    (MaintenanceResult::Stopped, None, None, Some(fresh_pending), None)
+                MaintenanceOp::TakeBaselinePending { fresh_pending, fresh_samples, .. } => {
+                    (MaintenanceResult::Stopped, None, None, Some(fresh_pending), Some(fresh_samples), None)
                 }
                 MaintenanceOp::StoreBaseline { baseline, .. } => {
-                    (MaintenanceResult::Stopped, None, None, None, Some(baseline))
+                    (MaintenanceResult::Stopped, None, None, None, None, Some(baseline))
                 }
                 MaintenanceOp::Config(ex) => {
-                    (MaintenanceResult::StoppedWithConfig(ex), None, None, None, None)
+                    (MaintenanceResult::StoppedWithConfig(ex), None, None, None, None, None)
                 }
-                _ => (MaintenanceResult::Stopped, None, None, None, None),
+                _ => (MaintenanceResult::Stopped, None, None, None, None, None),
             };
             self.push_maint_reply_or_offload(MaintReply {
                 id: req.id,
@@ -3098,6 +3376,7 @@ impl ControlState {
                 returned_probe,
                 returned_driver_config_error: None,
                 returned_pending,
+                returned_samples,
                 returned_baseline,
             });
         }
@@ -3721,8 +4000,10 @@ impl ControlState {
                     Some(msg_buf),
                 ) {
                     Ok((old_policy, old_jaw, ret_code, ret_msg)) => {
+                        let activated_revision = core.gripper_calib_revision;
                         self.push_persist_reply_or_retain(
                             PersistReply::Activated {
+                                activated_revision,
                                 _returned_policy: old_policy,
                                 _returned_jaw: old_jaw,
                                 _returned_code: ret_code,
@@ -3770,8 +4051,10 @@ impl ControlState {
                     operator_revoked,
                 ) {
                     Ok((old_policy, old_jaw)) => {
+                        let activated_revision = core.gripper_calib_revision;
                         self.push_persist_reply_or_retain(
                             PersistReply::Activated {
+                                activated_revision,
                                 _returned_policy: old_policy,
                                 _returned_jaw: old_jaw,
                                 _returned_code: None,
@@ -3845,6 +4128,7 @@ fn spawn_persist_worker(
     }
 
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
+        let hub_for_refresh = Arc::clone(&hub);
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             let mut pending = Some(cmd);
@@ -3949,6 +4233,7 @@ fn spawn_persist_worker(
                 config_write_mutex: &config_write_mutex,
                 cw_guard: Some(_cw),
                 published_config: &published_config,
+                hub: &hub_for_refresh,
                 persist_stop: &persist_stop,
                 control_exited: &control_exited,
                 hooks: &hooks,
@@ -3976,6 +4261,7 @@ struct ExecutorPersistBackend<'a> {
     config_write_mutex: &'a Arc<tokio::sync::Mutex<()>>,
     cw_guard: Option<tokio::sync::MutexGuard<'a, ()>>,
     published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
+    hub: &'a Arc<StateHub>,
     persist_stop: &'a Arc<AtomicBool>,
     control_exited: &'a Arc<AtomicBool>,
     hooks: &'a PersistTestHooks,
@@ -4305,13 +4591,20 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
                             return ZeroCheckCommitStop::WorkerDisconnected;
                         }
                         match self.wait_reply() {
-                            Some(PersistReply::Activated { .. }) => {
+                            Some(PersistReply::Activated { activated_revision, .. }) => {
+                                let prep_pol = pub_pol.clone();
                                 self.published_config.apply_zero_check_commit(
                                     self.job.offset_rad,
                                     pub_pol,
                                     pub_jaw,
-                                    self.job.base_revision + 1,
+                                    activated_revision,
                                 );
+                                if let Some(cur) = self.hub.prep_env() {
+                                    let mut next = (*cur).clone();
+                                    next.config.gripper_policy = Some(prep_pol);
+                                    next.gripper_calib_revision = activated_revision;
+                                    self.hub.update_prep_env(Arc::new(next));
+                                }
                                 tracing::info!(
                                     "Executor zero_check reconciliation succeeded for {file_name} on retry {attempt}/{max_attempts}"
                                 );
@@ -4377,13 +4670,20 @@ impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> 
             msg_buf: String::with_capacity(160),
         });
         if !self.hooks.leave_final_reply_queued {
-            if let Some(PersistReply::Activated { .. }) = self.wait_reply() {
+            if let Some(PersistReply::Activated { activated_revision, .. }) = self.wait_reply() {
+                let prep_pol = pub_policy.clone();
                 self.published_config.apply_zero_check_commit(
                     self.job.offset_rad,
                     pub_policy,
                     pub_jaw,
-                    self.job.base_revision + 1,
+                    activated_revision,
                 );
+                if let Some(cur) = self.hub.prep_env() {
+                    let mut next = (*cur).clone();
+                    next.config.gripper_policy = Some(prep_pol);
+                    next.gripper_calib_revision = activated_revision;
+                    self.hub.update_prep_env(Arc::new(next));
+                }
             }
         }
         Ok(())
@@ -5926,6 +6226,7 @@ mod tests {
                     returned_probe: None,
                     returned_driver_config_error: None,
                     returned_pending: None,
+                    returned_samples: None,
                     returned_baseline: None,
                 })
                 .unwrap();
@@ -6579,6 +6880,7 @@ mod tests {
                     returned_probe: None,
                     returned_driver_config_error: None,
                     returned_pending: None,
+                    returned_samples: None,
                     returned_baseline: None,
                 })
                 .unwrap();

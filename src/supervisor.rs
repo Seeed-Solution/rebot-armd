@@ -95,11 +95,23 @@ impl AdmissionStamp {
         lease_gen: u64,
         broker_request_id: u64,
     ) -> Self {
+        Self::from_broker_conn(stop_gen, estop_epoch, lease_gen, 0, broker_request_id)
+    }
+
+    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request carrying the original
+    /// WS `connection_id` (`0` for non-WS callers) so closed-connection checks run on `armd-control`.
+    pub(crate) fn from_broker_conn(
+        stop_gen: u64,
+        estop_epoch: u64,
+        lease_gen: u64,
+        connection_id: u64,
+        broker_request_id: u64,
+    ) -> Self {
         Self {
             stop_gen,
             estop_epoch,
             lease_gen,
-            connection_id: 0,
+            connection_id,
             request_id: if broker_request_id == 0 {
                 0
             } else {
@@ -667,11 +679,19 @@ pub struct HeldObject {
 /// Owner identity bound to a [`DeferredActionDone`] so a later `Complete` never commits a
 /// stale or superseded action, macro child, or internal park gripper step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // inline Copy HolderLabel avoids RT heap allocation
 pub(crate) enum DeferredCompletionTarget {
     Action(u64),
     MacroSub {
         action_id: u64,
         ticket: crate::macro_action::ChildTicket,
+    },
+    MacroFinish {
+        action_id: u64,
+        state: crate::model::HolderLabel,
+        code: Option<crate::model::HolderLabel>,
+        message: crate::motion::StepErrorText,
+        clear_held: bool,
     },
     ParkRelease(ParkRelease),
     Anonymous,
@@ -690,6 +710,23 @@ pub(crate) struct DeferredActionDone {
     pub(crate) is_gripper: bool,
 }
 
+/// Single per-tick TX cutoff computed ONCE in the owner:
+/// `drv_effective = min(control-release deadline, active action/macro parent & child deadlines)`
+/// translated into the driver clock domain and installed at the driver TX choke point.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EffectiveTxCutoff {
+    /// Control-release deadline minus publish margin in the driver clock domain (safety holds use
+    /// this ceiling so an action deadline never clips a safety/E-stop hold).
+    pub(crate) drv_release_cap: Instant,
+    /// Active action/macro deadline translated into the driver clock domain (`None` when idle or
+    /// already quiesced/finishing).
+    pub(crate) drv_action_cutoff: Option<Instant>,
+    /// Owner-clock anchor sampled together with `drv_anchor` when translating deadlines.
+    pub(crate) owner_anchor: Instant,
+    /// Driver-clock anchor sampled together with `owner_anchor`.
+    pub(crate) drv_anchor: Instant,
+}
+
 /// Zero-allocation classification of a bounded driver output write in one release,
 /// explicitly bound to whether the submitted batch was a stopped hold (`is_hold`).
 #[derive(Debug)]
@@ -699,6 +736,13 @@ pub(crate) enum TickOutput {
     /// Driver refused target/hold because an E-stop or authorized stop is pending/latched.
     /// Zero-allocation typed refusal (avoids formatting or matching `ESTOP_INHIBITED`).
     EstopInhibited { is_hold: bool },
+    /// Driver TX choke point refused target writes because the active action/macro deadline
+    /// elapsed before transmit (zero frames placed on the wire after the deadline; never counted
+    /// as a CAN bus stall).
+    ActionDeadlineRefused {
+        drv_now: Instant,
+        pf_status: crate::driver::PosForceTxStatus,
+    },
     Complete {
         is_hold: bool,
         now: Instant,
@@ -748,7 +792,8 @@ impl TickOutput {
     pub(crate) fn j7_stale(&self) -> bool {
         matches!(
             self,
-            Self::Complete { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
+            Self::ActionDeadlineRefused { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
+                | Self::Complete { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
                 | Self::Deferred { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
                 | Self::Expired { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
                 | Self::Error { pf_status: crate::driver::PosForceTxStatus::Stale { .. }, .. }
@@ -769,6 +814,8 @@ pub struct SupervisorInner {
     pub config: ArmConfig,
     pub safety: SafetyManager,
     pub held: Option<HeldObject>,
+    /// Preallocated reusable `HeldObject::label` buffer on RT (0 alloc / 0 free).
+    pub(crate) held_label_spare: String,
     /// A gripper Open is running: `held` is cleared when it completes, not when it starts, so an
     /// interrupted release still counts as holding.
     pub releasing: bool,
@@ -1115,6 +1162,8 @@ pub struct SupervisorInner {
     pub tool_commissioning_revision: u64,
     /// Single-pass Step-2 hardware poll state consumed once by `tick_control` in the same release.
     pub(crate) pending_rx_poll: PendingRxPoll,
+    /// Active per-tick TX cutoff installed for the current control output pass (`None` outside tick).
+    pub(crate) active_tx_cutoff: Option<EffectiveTxCutoff>,
     /// Authorized-stop generations wired into `estop_gate()` when owned by an RT executor.
     pub(crate) stop_requests: Option<crate::rt_core::urgent::StopRequests>,
     /// True on the empty shell left inside `ArmSupervisor::inner` after executor ownership transfer.
@@ -1221,6 +1270,23 @@ pub struct SupervisorInner {
     /// `urgent_stop_unapplied()` and before J7 intent stamping (`None` in production, 0 alloc).
     #[doc(hidden)]
     pub post_stop_check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Preallocated reusable `Box<GripperMotion>` shell for zero-alloc / zero-free RT gripper actions.
+    pub(crate) gripper_motion_spare: Option<Box<GripperMotion>>,
+    /// Preallocated reusable `MoveSamples` buffers for zero-alloc RT `LearnMode::Opening` moves.
+    pub(crate) move_samples_spares: Vec<crate::gripper_baseline::MoveSamples>,
+    /// Cached scalar `driver.capabilities().torque_feedback` (true without driver) so RT gripper
+    /// commits check close-torque capability without acquiring `driver.lock()`.
+    pub(crate) driver_has_torque_feedback: bool,
+    /// Cached scalar pos-force gripper close speed limit (rad/s) for lock-free RT gripper commits.
+    pub(crate) driver_gripper_close_speed_limit: Option<f32>,
+    /// Cached scalar pos-force gripper ceiling torque estimate (N·m) for lock-free RT gripper commits.
+    pub(crate) driver_gripper_ceiling_torque_estimate: Option<f32>,
+    /// Owner boot identity (matches process boot in Legacy mode and `ExecutorConfig::boot` on RT).
+    pub(crate) boot_id: crate::rt_core::broker::BootId,
+    /// Monotonic revision for `config.power_budget` (starts at 1; checked by prepared actions).
+    pub power_budget_revision: u64,
+    /// Lock-free exact closed-connection bitset shared with the RT `Broker` (checked on RT commits).
+    rt_closed_connections: Option<Arc<crate::rt_core::requests::actions::ClosedBitset>>,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -1890,6 +1956,7 @@ impl SupervisorInner {
             tool_commissioning_confirmed_at: None,
             tool_commissioning_revision: 1,
             pending_rx_poll: PendingRxPoll::default(),
+            active_tx_cutoff: None,
             stop_requests: None,
             detached: false,
             persist_capacity_available: true,
@@ -1937,6 +2004,15 @@ impl SupervisorInner {
             j7_intent: None,
             j7_admitted_stamp: None,
             post_stop_check_hook: None,
+            gripper_motion_spare: None,
+            move_samples_spares: Vec::new(),
+            driver_has_torque_feedback: true,
+            driver_gripper_close_speed_limit: None,
+            driver_gripper_ceiling_torque_estimate: None,
+            held_label_spare: String::new(),
+            boot_id: crate::rt_core::broker::BootId::process(),
+            power_budget_revision: 1,
+            rt_closed_connections: None,
         };
         inner.prepare_workspace_eval_bufs();
         inner
@@ -2003,11 +2079,76 @@ impl SupervisorInner {
     /// resuming async install or stale [`Admitted`] token from that connection can start motion.
     pub fn mark_connection_closed(&mut self, connection_id: u64) {
         self.closed_connections.mark_closed(connection_id);
+        if let Some(rt) = self.rt_closed_connections.as_ref() {
+            rt.mark_closed(connection_id);
+        }
     }
 
-    /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under the owner lock.
+    /// True when driven by the RT `ReleaseEngine` (live `start_executor` or `ReleaseFixture`).
+    pub(crate) fn is_rt_owner(&self) -> bool {
+        self.rt_executor_owned || self.rt_closed_connections.is_some()
+    }
+
+    /// Attaches the broker's lock-free closed-connection bitset read on `armd-control`.
+    pub(crate) fn attach_closed_bitset(
+        &mut self,
+        bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
+    ) {
+        self.rt_closed_connections = Some(bitset);
+        self.prewarm_rt_gripper_spares();
+    }
+
+    /// Prewarms the RT `move_samples_spares` pool and `gripper_motion_spare` box off-thread.
+    pub(crate) fn prewarm_rt_gripper_spares(&mut self) {
+        let target_spares = GRIPPER_BASELINE_PENDING_MAX + 2;
+        if self.move_samples_spares.capacity() < target_spares {
+            self.move_samples_spares
+                .reserve(target_spares - self.move_samples_spares.len());
+        }
+        while self.move_samples_spares.len() < target_spares {
+            self.move_samples_spares
+                .push(crate::gripper_baseline::MoveSamples::default());
+        }
+        if self.gripper_motion_spare.is_none() {
+            if let (Some(g_idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) {
+                let lim = &self.config.limits[g_idx];
+                let limit_zero = crate::model::JointLimit {
+                    name: String::new(),
+                    min_position: lim.min_position,
+                    max_position: lim.max_position,
+                    max_velocity: lim.max_velocity,
+                    max_acceleration: lim.max_acceleration,
+                };
+                let req = crate::motion::GripperRequest {
+                    command: crate::motion::GripperCommand::Open,
+                    fraction: None,
+                    grasp: false,
+                    speed: 0.5,
+                    timeout_s: None,
+                    tag: None,
+                };
+                if let Ok(m) = crate::motion::GripperMotion::try_with_close_speed_limit(
+                    req,
+                    policy.clone_without_jaw_opening(),
+                    limit_zero,
+                    self.commanded_positions.get(g_idx).copied().unwrap_or(0.0),
+                    g_idx,
+                    None,
+                ) {
+                    self.gripper_motion_spare = Some(Box::new(m));
+                }
+            }
+        }
+    }
+
+    /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under
+    /// either the legacy owner lock or the lock-free RT broker bitset.
     pub fn is_connection_closed(&self, connection_id: u64) -> bool {
         self.closed_connections.is_closed(connection_id)
+            || self
+                .rt_closed_connections
+                .as_ref()
+                .is_some_and(|rt| rt.is_closed(connection_id))
     }
 
     /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
@@ -2551,8 +2692,28 @@ impl SupervisorInner {
         if let Some(ref hook) = self.before_publish_hook {
             hook();
         }
-        let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
-        core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
+        let owner = self.published_owner_meta();
+        let SupervisorInner {
+            core,
+            measured_positions,
+            measured_velocities,
+            commanded_positions,
+            commanded_velocities,
+            joint_feedback_queue_bounds,
+            ..
+        } = self;
+        core.publish_with_rt_meta(
+            obs,
+            generation,
+            sampled_at,
+            valid_until,
+            measured_positions,
+            measured_velocities,
+            commanded_positions,
+            commanded_velocities,
+            joint_feedback_queue_bounds,
+            owner,
+        );
         TickPublished { kept, body_end }
     }
 
@@ -2570,9 +2731,10 @@ impl SupervisorInner {
         dt: f64,
         generation: u64,
         keep: bool,
-        release_bound: Option<(Instant, Instant)>,
+        release_deadline: Option<Instant>,
     ) -> TickPublished {
-        let timestamp = self.tick_control_inner(dt, release_bound);
+        let mut sys_now = Instant::now;
+        let timestamp = self.tick_control_inner(dt, release_deadline, &mut sys_now);
         self.publish_at(timestamp, generation, keep)
     }
 
@@ -2596,6 +2758,38 @@ impl SupervisorInner {
         self.joint_feedback_queue_bounds.reserve(dof);
         self.motor_errors.reserve(dof);
         self.gravity_torques.reserve(arm_dof);
+        self.driver_has_torque_feedback = self
+            .driver
+            .as_ref()
+            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        let pf_info = self
+            .config
+            .gripper_index()
+            .and_then(|g| {
+                self.driver
+                    .as_ref()
+                    .and_then(|d| d.lock().ok())
+                    .and_then(|drv| drv.gripper_pos_force_info())
+                    .filter(|info| info.joint == g)
+            });
+        self.driver_gripper_close_speed_limit = pf_info
+            .as_ref()
+            .map(|info| info.close_speed_rad_s)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        self.driver_gripper_ceiling_torque_estimate = pf_info
+            .as_ref()
+            .and_then(|info| info.ceiling_torque_estimate_nm)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        // Maintain the strict single-buffer invariant on RT: EXACTLY ONE 128-byte heap String
+        // exists across `(self.held, self.held_label_spare)`, so transitions between `Some` and
+        // `None` never drop or allocate on `armd-control` even if an object was held at handover.
+        if let Some(h) = self.held.as_mut() {
+            h.label.reserve(128);
+            self.held_label_spare = String::new();
+        } else {
+            self.held_label_spare.reserve(128);
+        }
+        self.prewarm_rt_gripper_spares();
         let tmpl = self.current_observation();
         self.core.try_prewarm_observations(|| {
             let mut obs = tmpl.clone();
@@ -3508,13 +3702,359 @@ impl SupervisorInner {
         true
     }
 
+    /// Replaces `self.active_trajectory`, retiring any previous trajectory without RT frees.
+    pub(crate) fn replace_active_trajectory(&mut self, next: Option<ActiveTrajectory>) {
+        if let Some(old) = std::mem::replace(&mut self.active_trajectory, next) {
+            self.retire_active_trajectory(old);
+        }
+    }
+
     /// Queue a replaced `ActiveTrajectory` for off-thread drop when owned by the RT executor
     /// (prevents dropping heap-backed `motion_limits` / path data on `armd-control`).
+    /// Zero-heap trajectories (e.g., pinned `PlanSlotRef` paths/replays or inline quintics)
+    /// drop immediately so `PlanSlotRef` pins return to 0 without consuming `retired_trajectories`;
+    /// clean `Box<GripperMotion>` shells are recycled into `gripper_motion_spare` (0 dealloc).
     pub(crate) fn retire_active_trajectory(&mut self, traj: ActiveTrajectory) {
-        if self.rt_executor_owned
-            && self.retired_trajectories.len() < self.retired_trajectories.capacity()
-        {
+        if !self.rt_executor_owned {
+            drop(traj);
+            return;
+        }
+        if traj.motion_limits.is_none() && traj.then.is_none() {
+            if let Reference::Gripper(mut b) = traj.reference {
+                if self.move_samples_spares.len() < self.move_samples_spares.capacity() {
+                    if let Some(samples) = b.take_samples_spare() {
+                        self.recycle_move_samples_rt(samples);
+                    }
+                }
+                if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() {
+                    self.gripper_motion_spare = Some(b);
+                    return;
+                }
+                let traj = ActiveTrajectory {
+                    action_id: traj.action_id,
+                    reference: Reference::Gripper(b),
+                    then: None,
+                    span: traj.span,
+                    motion_limits: None,
+                    motion_max_velocity: traj.motion_max_velocity,
+                };
+                if self.retired_trajectories.len() < self.retired_trajectories.capacity() {
+                    self.retired_trajectories.push_back(traj);
+                }
+                return;
+            }
+        }
+        if !traj.has_heap_storage() {
+            drop(traj);
+            return;
+        }
+        if self.retired_trajectories.len() < self.retired_trajectories.capacity() {
             self.retired_trajectories.push_back(traj);
+        }
+    }
+
+    /// Boxes a `GripperMotion` reusing `gripper_motion_spare` when available (0 alloc on RT).
+    pub(crate) fn box_gripper_motion_rt(&mut self, motion: GripperMotion) -> Box<GripperMotion> {
+        if let Some(mut spare) = self.gripper_motion_spare.take() {
+            *spare = motion;
+            spare
+        } else {
+            Box::new(motion)
+        }
+    }
+
+    /// Zero-alloc `Copy` snapshot of the active tool's free-motion gripper torque baseline
+    /// (`None` if unlearned or belonging to another tool/follower/stroke).
+    pub(crate) fn gripper_baseline_data_rt(&self) -> Option<crate::gripper_baseline::BaselineData> {
+        let policy = self.config.gripper_policy.as_ref()?;
+        let tool = &self.config.active_tool;
+        let follower = self.follower.as_deref();
+        let lo = policy.closed_rad.min(policy.open_rad);
+        let hi = policy.closed_rad.max(policy.open_rad);
+        self.gripper_baseline
+            .as_ref()
+            .filter(|b| {
+                b.belongs_to(&tool.id, &tool.config_digest, follower)
+                    && (b.lo_rad - lo).abs() < 1e-3
+                    && (b.hi_rad - hi).abs() < 1e-3
+            })
+            .map(crate::gripper_baseline::FreeTorqueBaseline::data_snapshot)
+    }
+
+    /// Zero-alloc RT check for close-torque feedback capability using the cached scalar
+    /// `driver_has_torque_feedback` (no mutex lock and no formatted error string allocation).
+    pub(crate) fn check_gripper_close_torque_feedback_rt(
+        &self,
+        command: crate::motion::GripperCommand,
+        fraction: Option<f64>,
+        policy: &crate::model::GripperPolicy,
+        gripper_idx: usize,
+    ) -> Result<(), &'static str> {
+        if policy.max_close_torque_nm.is_none() {
+            return Ok(());
+        }
+        let close_dir = if policy.closed_rad >= policy.open_rad { 1.0_f32 } else { -1.0_f32 };
+        let cur = self.commanded_positions.get(gripper_idx).copied().unwrap_or(0.0);
+        let target = match command {
+            crate::motion::GripperCommand::Open => policy.open_rad,
+            crate::motion::GripperCommand::Close => policy.closed_rad,
+            crate::motion::GripperCommand::Move => {
+                policy.closed_rad + fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad)
+            }
+            crate::motion::GripperCommand::Seek => policy.closed_rad + close_dir * 0.6,
+        };
+        let is_closing = matches!(command, crate::motion::GripperCommand::Close | crate::motion::GripperCommand::Seek)
+            || (target - cur) * close_dir > 1e-4;
+        if is_closing && self.driver.is_some() && !self.driver_has_torque_feedback {
+            return Err("UNSUPPORTED");
+        }
+        Ok(())
+    }
+
+    /// Pops one preallocated `MoveSamples` buffer for zero-alloc RT `LearnMode::Opening` recording.
+    pub(crate) fn take_move_samples_spare_rt(&mut self) -> Option<crate::gripper_baseline::MoveSamples> {
+        self.move_samples_spares.pop()
+    }
+
+    /// Recycles a `MoveSamples` buffer back into `move_samples_spares` without RT deallocation.
+    pub(crate) fn recycle_move_samples_rt(&mut self, mut samples: crate::gripper_baseline::MoveSamples) {
+        samples.reset();
+        if self.move_samples_spares.len() < self.move_samples_spares.capacity() {
+            self.move_samples_spares.push(samples);
+        }
+    }
+
+    /// Single shared RT point for attaching baseline data and (only when `motion` will record
+    /// learning) one preallocated `MoveSamples` spare from `move_samples_spares`.
+    /// Must be called ONLY after final admission and start checks succeed; any unused spare is
+    /// returned to the pool without dropping on `armd-control`.
+    pub(crate) fn attach_gripper_learning_rt(
+        &mut self,
+        motion: crate::motion::GripperMotion,
+        baseline: Option<crate::gripper_baseline::BaselineData>,
+        learn: crate::motion::LearnMode,
+    ) -> crate::motion::GripperMotion {
+        let spare = if motion.will_record_learning(learn) {
+            self.take_move_samples_spare_rt()
+        } else {
+            None
+        };
+        let (motion, unused) = motion.with_baseline_data_and_samples(baseline, learn, spare);
+        if let Some(buf) = unused {
+            self.recycle_move_samples_rt(buf);
+        }
+        motion
+    }
+
+    /// Test-only accessor for the current RT learning-buffer spare pool depth.
+    #[doc(hidden)]
+    pub fn test_move_samples_spare_count(&self) -> usize {
+        self.move_samples_spares.len()
+    }
+
+    /// Computes the commanded joint vector that will hold immediately after quiescing an active
+    /// macro gripper child (without mutating `self` so refused replacements leave state untouched).
+    /// Returns `(dof, will_quiesce_macro_gripper)`.
+    pub(crate) fn post_quiesce_commanded_positions(
+        &self,
+        out: &mut [f32; crate::rt_core::mailbox::MAX_DOF],
+    ) -> (usize, bool) {
+        let dof = self.commanded_positions.len().min(crate::rt_core::mailbox::MAX_DOF);
+        out[..dof].copy_from_slice(&self.commanded_positions[..dof]);
+        let active_macro_gripper = self.macro_run.as_ref().is_some_and(|m| {
+            self.active_trajectory.as_ref().is_some_and(|a| {
+                a.action_id == Some(m.id) && matches!(a.reference, Reference::Gripper(_))
+            })
+        });
+        if active_macro_gripper {
+            if let Some(g) = self.config.gripper_index().filter(|&g| g < dof) {
+                if let Some(&meas) = self.measured_positions.get(g).filter(|v| v.is_finite()) {
+                    out[g] = meas;
+                }
+            }
+        }
+        (dof, active_macro_gripper)
+    }
+
+    /// Updates `self.held` on RT without allocating or freeing heap memory.
+    pub(crate) fn set_held_rt(&mut self, label: crate::model::HolderLabel, spill_safe: bool) {
+        let src = label.as_str();
+        if let Some(existing) = self.held.as_mut() {
+            existing.spill_safe = spill_safe;
+            if existing.label.capacity() < src.len()
+                && self.held_label_spare.capacity() >= src.len()
+            {
+                let old = std::mem::replace(
+                    &mut existing.label,
+                    std::mem::take(&mut self.held_label_spare),
+                );
+                if old.capacity() > 0 && self.held_label_spare.capacity() == 0 {
+                    // Only reachable if prewarm wasn't called; recycle instead of dropping on RT.
+                    let mut recycled = old;
+                    recycled.clear();
+                    self.held_label_spare = recycled;
+                }
+            }
+            existing.label.clear();
+            if existing.label.capacity() >= src.len() {
+                existing.label.push_str(src);
+            }
+        } else {
+            let mut buf = if self.held_label_spare.capacity() >= src.len() {
+                std::mem::take(&mut self.held_label_spare)
+            } else {
+                String::new()
+            };
+            buf.clear();
+            if buf.capacity() >= src.len() {
+                buf.push_str(src);
+            }
+            self.held = Some(HeldObject {
+                label: buf,
+                spill_safe,
+            });
+        }
+    }
+
+    /// Clears `self.held`, recycling its heap `label` buffer into `held_label_spare` on RT
+    /// so clearing a held object never deallocates on `armd-control`.
+    pub(crate) fn clear_held_rt(&mut self) {
+        if let Some(old) = self.held.take() {
+            if self.rt_executor_owned && old.label.capacity() > self.held_label_spare.capacity() {
+                let mut recycled = old.label;
+                recycled.clear();
+                self.held_label_spare = recycled;
+            }
+        }
+    }
+
+    /// True while macro parent `parent_id` has an active child trajectory, quintic settle,
+    /// deferred TX completion (`MacroSub`), or `SubState::Running`.
+    pub(crate) fn macro_child_running(&self, parent_id: u64) -> bool {
+        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == parent_id) else {
+            return false;
+        };
+        if run.sub == crate::macro_action::SubState::Running || run.hold_pending_bus_accept {
+            return true;
+        }
+        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(parent_id)) {
+            return true;
+        }
+        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == parent_id) {
+            return true;
+        }
+        self.pending_deferred_done.as_ref().is_some_and(|d| {
+            matches!(d.target, DeferredCompletionTarget::MacroSub { action_id, .. } if action_id == parent_id)
+        })
+    }
+
+    /// Allocation-free quiesce of any active child motion/settle/deferred completion belonging
+    /// to macro `id` (preserving gripper measured-position hold safety semantics!).
+    /// Returns true if any active trajectory, settle, or deferred `MacroSub` was quiesced.
+    pub(crate) fn quiesce_macro_children_rt(&mut self, id: u64) -> bool {
+        let mut quiesced = false;
+        let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
+        if carried {
+            quiesced = true;
+            let is_gripper = self
+                .active_trajectory
+                .as_ref()
+                .is_some_and(|a| matches!(a.reference, Reference::Gripper(_)));
+            if is_gripper {
+                self.hold_gripper_at_measured();
+                self.releasing = false;
+            }
+            self.replace_active_trajectory(None);
+            self.tracking.invalidate();
+            self.commanded_velocities.fill(0.0);
+            self.commanded_accelerations.fill(0.0);
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+            self.safety.mark_motion_finished();
+        }
+        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
+            quiesced = true;
+            self.quintic_settle = None;
+        }
+        if self.pending_deferred_done.as_ref().is_some_and(|d| {
+            matches!(d.target, DeferredCompletionTarget::MacroSub { action_id, .. } if action_id == id)
+        }) {
+            quiesced = true;
+            self.pending_deferred_done = None;
+        }
+        if quiesced && self.is_rt_owner() && self.driver.is_some() {
+            if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
+                m.hold_pending_bus_accept = true;
+            }
+        }
+        quiesced
+    }
+
+    /// Zero-allocation `Copy` owner metadata published on every control tick into `RtSample`.
+    pub(crate) fn published_owner_meta(&self) -> crate::rt_core::publish::PublishedOwnerMeta {
+        use crate::rt_core::publish::{PublishedHeld, PublishedMacroState, PublishedOwnerMeta};
+        let authority = crate::rt_core::broker::Authority {
+            lease_generation: self.current_active_lease_gen(),
+            epoch: self.safety.epoch_id(),
+            stop_generation: self.current_stop_gen(),
+            config_revision: self.workspace_revision,
+            parent_generation: self
+                .last_action
+                .as_ref()
+                .filter(|a| a.is_running())
+                .map_or(0, |a| a.id),
+        };
+        let held = self.held.as_ref().map(|h| PublishedHeld {
+            label: crate::model::HolderLabel::new(&h.label),
+            spill_safe: h.spill_safe,
+        });
+        let macro_state = self
+            .macro_run
+            .as_ref()
+            .map(|m| PublishedMacroState {
+                active_id: m.id,
+                alive: !m.stop_requested
+                    && !m.finishing
+                    && self
+                        .last_action
+                        .as_ref()
+                        .is_some_and(|a| a.id == m.id && a.is_running()),
+                children: m.children,
+                child_seq: m.child.seq,
+                child_running: self.macro_child_running(m.id),
+                child_sub: m.sub,
+                child_watch: m.child.watch,
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "policy-runtime")]
+        let policy_busy = self.policy_loading || self.policy_run.is_some();
+        #[cfg(not(feature = "policy-runtime"))]
+        let policy_busy = false;
+        PublishedOwnerMeta {
+            arm: self.core.id(),
+            boot: self.boot_id,
+            authority,
+            calibration_revision: self.calibration_revision,
+            poses_revision: self.poses.revision,
+            sequences_revision: self.sequences.revision,
+            grasp_setup_revision: self.grasp_setup_revision,
+            gripper_calib_revision: self.gripper_calib_revision,
+            power_budget_revision: self.power_budget_revision,
+            tool_digest_hash: crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest),
+            motion_active: self.active_trajectory.is_some() || self.servo_target.is_some(),
+            config_inhibited: self.core.motion_inhibited_by_config(),
+            calibration_busy: self.calibration_busy,
+            feedback_valid: self.commit_feedback_valid(),
+            is_torqued: self.is_torqued,
+            pending_rearm: self.pending_rearm,
+            pending_normal_unload: self.pending_normal_unload,
+            collision_hold: self.collision.hold.is_some(),
+            handover_settling: self.handover_settling_since.is_some(),
+            gravity_comp_active: self.gravity_comp.is_some(),
+            policy_busy,
+            zero_check_persisting: self.zero_check_persisting.is_some(),
+            torque_or_power_hold: self.torque_guard.hold.is_some() || self.power.gov.hold.is_some(),
+            held,
+            macro_state,
         }
     }
 
@@ -3982,6 +4522,7 @@ impl SupervisorInner {
                     self.releasing = false;
                 }
                 DeferredCompletionTarget::ParkRelease(ParkRelease::Closing)
+                | DeferredCompletionTarget::MacroFinish { .. }
                 | DeferredCompletionTarget::Anonymous => {}
             }
         }
@@ -4152,6 +4693,7 @@ impl SupervisorInner {
         j7_is_hold: bool,
         intent: crate::driver::PosForceIntent,
         current_stamp: crate::driver::PosForceIntentStamp,
+        cutoff: Option<EffectiveTxCutoff>,
         tick_output: &mut TickOutput,
         allow_output_accepted: &mut bool,
     ) {
@@ -4159,9 +4701,65 @@ impl SupervisorInner {
         if drv.enable_state() == EnableState::Disabled {
             return;
         }
+        // Single effective TX cutoff with the stop/hold/freeze exception:
+        // - Fresh J7 `Target` motion respects the active action/macro deadline (`drv_action_cutoff`)
+        //   identically to arm motion frames (zero post-deadline target frames on the wire).
+        // - Stop / Hold / Freeze-class J7 frames (`j7_is_hold`, explicit `Hold`/`Stop`, stale
+        //   admission stamp degraded to `Hold`, or stale J7 feedback requiring a FREEZE frame)
+        //   restore the unclipped control-release deadline (`drv_release_cap`) so an action/macro
+        //   deadline ends motion and NEVER suppresses a stop, hold, or freeze.
+        let j7_effective_hold_or_freeze = j7_is_hold
+            || !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
+            || intent.stamp != current_stamp
+            || !drv.pos_force_feedback_fresh();
+        let action_cap = cutoff.and_then(|c| c.drv_action_cutoff);
+        if j7_effective_hold_or_freeze {
+            if let Some(c) = cutoff {
+                if c.drv_action_cutoff.is_some() {
+                    drv.set_tx_release_deadline(Some(c.drv_release_cap));
+                }
+            }
+        } else if let Some(cap) = action_cap {
+            let pre_now = drv.clock_now();
+            if matches!(tick_output, TickOutput::ActionDeadlineRefused { .. }) || pre_now >= cap {
+                drv.discard_pending_tx();
+                *allow_output_accepted = false;
+                if !matches!(tick_output, TickOutput::ActionDeadlineRefused { .. }) {
+                    *tick_output = TickOutput::ActionDeadlineRefused {
+                        drv_now: pre_now,
+                        pf_status: crate::driver::PosForceTxStatus::Unobserved,
+                    };
+                }
+                return;
+            }
+        }
         let now = drv.clock_now();
         let max_age = drv.tx_frame_max_age();
-        match drv.emit_pos_force_j7(intent, current_stamp) {
+        let emit_res = drv.emit_pos_force_j7(intent, current_stamp);
+        if !j7_effective_hold_or_freeze
+            && matches!(
+                emit_res,
+                Ok(PosForceEmitOutcome::Deferred { .. })
+                    | Err(ArmDriverError::Transport(
+                        crate::transport::TransportError::Timeout
+                    ))
+            )
+            && action_cap.is_some_and(|cap| drv.clock_now() >= cap)
+        {
+            let refused_now = drv.clock_now();
+            let pf_status = match emit_res {
+                Ok(PosForceEmitOutcome::Deferred { pf_status, .. }) => pf_status,
+                _ => drv.take_last_pos_force_tx_status(),
+            };
+            drv.discard_pending_tx();
+            *allow_output_accepted = false;
+            *tick_output = TickOutput::ActionDeadlineRefused {
+                drv_now: refused_now,
+                pf_status,
+            };
+            return;
+        }
+        match emit_res {
             Ok(PosForceEmitOutcome::NotApplicable) => {}
             Ok(PosForceEmitOutcome::AwaitingFirstFresh { pf_status, .. }) => {
                 match tick_output {
@@ -4175,7 +4773,8 @@ impl SupervisorInner {
                             pf_status,
                         };
                     }
-                    TickOutput::Complete { pf_status: dst_pf, .. }
+                    TickOutput::ActionDeadlineRefused { pf_status: dst_pf, .. }
+                    | TickOutput::Complete { pf_status: dst_pf, .. }
                     | TickOutput::Deferred { pf_status: dst_pf, .. }
                     | TickOutput::Expired { pf_status: dst_pf, .. }
                     | TickOutput::Error { pf_status: dst_pf, .. } => {
@@ -4201,6 +4800,9 @@ impl SupervisorInner {
                             sent_mask: if j7_is_hold { pf_bit_hold } else { 0 },
                             pf_status,
                         };
+                    }
+                    TickOutput::ActionDeadlineRefused { pf_status: dst_pf, .. } => {
+                        *dst_pf = pf_status;
                     }
                     TickOutput::Complete { is_hold, due_mask, sent_mask, pf_status: dst_pf, .. } => {
                         if *is_hold {
@@ -4254,6 +4856,9 @@ impl SupervisorInner {
                             sent_mask: 0,
                             pf_status,
                         };
+                    }
+                    TickOutput::ActionDeadlineRefused { drv_now, .. } => {
+                        *tick_output = TickOutput::ActionDeadlineRefused { drv_now, pf_status };
                     }
                     TickOutput::Complete { is_hold, now, max_age, due_mask, sent_mask, .. } => {
                         *allow_output_accepted = false;
@@ -4349,6 +4954,9 @@ impl SupervisorInner {
                     .map_or(0, |c| if c.joint.saturating_mul(2) < 64 { 1u64 << (c.joint * 2) } else { 0 });
                 let pf_status = drv.take_last_pos_force_tx_status();
                 match tick_output {
+                    TickOutput::ActionDeadlineRefused { pf_status: dst_pf, .. } => {
+                        *dst_pf = pf_status;
+                    }
                     TickOutput::Error { is_hold, due_mask, pf_status: dst_pf, .. }
                     | TickOutput::Expired { is_hold, due_mask, pf_status: dst_pf, .. } => {
                         if *is_hold {
@@ -4409,6 +5017,7 @@ impl SupervisorInner {
         let Some(ref d) = self.driver else {
             return;
         };
+        let cutoff = self.active_tx_cutoff;
         let mut drv = match d.try_lock() {
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
@@ -4419,6 +5028,7 @@ impl SupervisorInner {
             j7_is_hold,
             intent,
             current_stamp,
+            cutoff,
             tick_output,
             allow_output_accepted,
         );
@@ -4633,6 +5243,15 @@ impl SupervisorInner {
                         tracing::error!("Control output failed: {}", crate::driver::ESTOP_INHIBITED);
                     }
                 }
+                false
+            }
+            TickOutput::ActionDeadlineRefused { drv_now, pf_status } => {
+                // TX was refused by the active action/macro deadline, not a CAN bus stall:
+                // clear any bus-stall streak and leave `batch_completed = false` so the tick's
+                // post-output reconciliation terminates the expired action cleanly, while still
+                // accounting any J7 staleness observed by a stop/hold/freeze epilogue frame.
+                self.reset_tx_joint_progress();
+                self.handle_j7_feedback_staleness(pf_status, drv_now);
                 false
             }
             TickOutput::Complete { is_hold, now, max_age, due_mask, sent_mask, pf_status } => {
@@ -5114,28 +5733,106 @@ impl SupervisorInner {
     /// timestamp (the recording sample's). The control loop fills its published sample with
     /// [`Self::fill_observation`] at this timestamp.
     pub fn tick_control(&mut self, dt: f64) -> f64 {
-        self.tick_control_inner(dt, None)
+        let mut sys_now = Instant::now;
+        self.tick_control_inner(dt, None, &mut sys_now)
     }
 
     /// [`Self::tick_control`] bounded by an explicit control release deadline (`now`,
     /// `release_deadline`) so TX start-cutoffs never run past `release_deadline - publish_margin`.
     pub fn tick_control_with_deadline(&mut self, dt: f64, now: Instant, release_deadline: Instant) -> f64 {
-        self.tick_control_inner(dt, Some((now, release_deadline)))
+        let mut fixed_now = move || now;
+        self.tick_control_inner(dt, Some(release_deadline), &mut fixed_now)
     }
 
-    fn tick_control_inner(&mut self, dt: f64, release_bound: Option<(Instant, Instant)>) -> f64 {
-        let applied_tx_cap = if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.lock() {
-                let drv_now = drv.clock_now();
-                let cap = match release_bound {
-                    Some((now, release_deadline)) => self.driver_tx_release_cap(drv_now, now, release_deadline),
-                    None => {
-                        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
-                        drv_now + period.saturating_sub(self.tx_release_publish_margin())
-                    }
-                };
-                drv.set_tx_release_deadline(Some(cap));
-                true
+    /// [`Self::tick_control`] bounded by `release_deadline` with a live monotonic clock sampler
+    /// `now_fn` so pre-step and transmit-point macro deadline checks always take fresh clock reads.
+    pub fn tick_control_with_clock(
+        &mut self,
+        dt: f64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        self.tick_control_inner(dt, Some(release_deadline), now_fn)
+    }
+
+    /// Legacy [`Self::tick_control`] with an injected clock sampler (for deterministic tests of
+    /// mid-tick deadline checks without release-deadline capping).
+    #[doc(hidden)]
+    pub fn tick_control_legacy_with_clock(
+        &mut self,
+        dt: f64,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> f64 {
+        self.tick_control_inner(dt, None, now_fn)
+    }
+
+    /// Computes the single per-tick TX cutoff ONCE in the owner:
+    ///   `effective_cutoff = min(control-release deadline, active action/macro parent & child deadlines)`
+    /// translated into the driver clock domain, and installs it as THE deadline on `self.driver`
+    /// via `set_tx_release_deadline`. Safety/stopped holds are never clipped by an action deadline.
+    fn install_effective_tx_cutoff(
+        &self,
+        release_deadline: Option<Instant>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> (bool, Option<EffectiveTxCutoff>) {
+        let Some(ref d) = self.driver else {
+            return (false, None);
+        };
+        let Ok(mut drv) = d.lock() else {
+            return (false, None);
+        };
+        let owner_now = now_fn();
+        let drv_now = drv.clock_now();
+        let drv_release_cap = match release_deadline {
+            Some(rd) => self.driver_tx_release_cap(drv_now, owner_now, rd),
+            None => {
+                let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+                drv_now + period.saturating_sub(self.tx_release_publish_margin())
+            }
+        };
+        let drv_action_cutoff = if self.safety.state().is_stopped() {
+            None
+        } else {
+            self.active_action_deadline()
+                .map(|dl| drv_now + dl.saturating_duration_since(owner_now))
+        };
+        let drv_effective = drv_action_cutoff.map_or(drv_release_cap, |ac| drv_release_cap.min(ac));
+        drv.set_tx_release_deadline(Some(drv_effective));
+        (
+            true,
+            Some(EffectiveTxCutoff {
+                drv_release_cap,
+                drv_action_cutoff,
+                owner_anchor: owner_now,
+                drv_anchor: drv_now,
+            }),
+        )
+    }
+
+    fn tick_control_inner(
+        &mut self,
+        dt: f64,
+        release_deadline: Option<Instant>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> f64 {
+        // Legacy callers without a preceding Step-2 `poll_hardware_for_release` run `poll_hardware_rx`
+        // below; bound any stale-joint recovery TX during RX intake to the control-release cap.
+        let applied_rx_tx_cap = if !self.pending_rx_poll.active {
+            if let Some(ref d) = self.driver {
+                if let Ok(mut drv) = d.lock() {
+                    let drv_now = drv.clock_now();
+                    let cap = match release_deadline {
+                        Some(rd) => self.driver_tx_release_cap(drv_now, now_fn(), rd),
+                        None => {
+                            let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+                            drv_now + period.saturating_sub(self.tx_release_publish_margin())
+                        }
+                    };
+                    drv.set_tx_release_deadline(Some(cap));
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -5957,14 +6654,20 @@ impl SupervisorInner {
         self.torque_guard_tick(servo_dt);
         // Supply-current estimate (src/power.rs).
         self.power_tick(servo_dt);
-        // Enforce macro contact guard and child deadline BEFORE stepping any trajectory or
-        // submitting targets: a success-on-contact stop immediately replaces the trajectory with
-        // a hold at the measured pose so this release sends the replacement hold and commits
-        // `SubState::Done` strictly through the post-output accepted-output gate.
+        // Pre-step deadline check ONLY to avoid advancing the reference when a macro parent or
+        // child deadline has already elapsed before Step 3.
         if self.macro_run.is_some() {
-            self.step_macro_contact();
-            self.expire_macro_child(Instant::now());
+            let pre_step_now = now_fn();
+            if !self.enforce_macro_deadlines(pre_step_now) {
+                self.step_macro_contact();
+            }
         }
+        // Compute effective_cutoff = min(control-release deadline, active action/macro parent &
+        // child deadlines) ONCE for this tick and pass it as THE deadline to the driver TX choke
+        // point. If a deadline elapses anywhere during Step 3, tracking, or the driver lock/TX
+        // critical section, the TX choke point refuses writes past the cutoff and the next tick holds.
+        let (applied_output_tx_cap, tx_cutoff) = self.install_effective_tx_cutoff(release_deadline, now_fn);
+        self.active_tx_cutoff = tx_cutoff;
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
@@ -6140,6 +6843,8 @@ impl SupervisorInner {
             } else if self.gripper_baseline_pending.len() < self.gripper_baseline_pending.capacity().min(GRIPPER_BASELINE_PENDING_MAX) {
                 // learned off the tick (gripper_calib::spawn_baseline_persister); capacity is reserved
                 self.gripper_baseline_pending.push(rec);
+            } else if self.rt_executor_owned {
+                self.recycle_move_samples_rt(rec.samples);
             }
         }
         if let Some(id) = approach_started {
@@ -6193,8 +6898,8 @@ impl SupervisorInner {
                     if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
                 }
                 if finished && approach_started.is_none() {
-                    self.active_trajectory = None;
-                    self.commanded_velocities = vec![0.0; self.config.dof];
+                    self.replace_active_trajectory(None);
+                    self.commanded_velocities.fill(0.0);
                     if !self.pending_normal_unload {
                         self.safety.mark_motion_finished();
                         if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
@@ -6737,6 +7442,7 @@ impl SupervisorInner {
                                 | TickOutput::Expired { .. }
                                 | TickOutput::Error { .. }
                                 | TickOutput::EstopInhibited { .. }
+                                | TickOutput::ActionDeadlineRefused { .. }
                                 | TickOutput::None => {
                                     self.tracking.invalidate();
                                 }
@@ -6857,7 +7563,7 @@ impl SupervisorInner {
                 }
             }
             match &tick_output {
-                TickOutput::EstopInhibited { .. } => {
+                TickOutput::EstopInhibited { .. } | TickOutput::ActionDeadlineRefused { .. } => {
                     tick_output = TickOutput::None;
                 }
                 TickOutput::Complete { is_hold: false, .. }
@@ -6870,8 +7576,11 @@ impl SupervisorInner {
         }
         // Tick epilogue (BOTH Legacy and RT Executor owners): invoke the ONE J7 PosForce emitter
         // exactly once per control tick AFTER whatever arm-write path ran (whether arm output
-        // succeeded, deferred, expired, errored, tripped the MIT fence before/mid-batch, hit
-        // stale precheck / BuildRefused / invalid caller J7 target, or was skipped by send_to_bus).
+        // succeeded, deferred, expired, errored, hit action deadline cutoff, tripped the MIT fence
+        // before/mid-batch, hit stale precheck / BuildRefused / invalid caller J7 target, or was
+        // skipped by send_to_bus). Fresh `Target` intents respect `active_tx_cutoff`'s action/macro
+        // deadline; stop/hold/freeze-class frames restore `drv_release_cap` so a deadline never
+        // suppresses a stop, hold, or freeze.
         if !self.shutdown_committed
             && self.is_torqued
             && !self.disable_pending
@@ -6898,6 +7607,10 @@ impl SupervisorInner {
             );
         }
         self.j7_intent = None;
+        let action_deadline_refused_at = match tick_output {
+            TickOutput::ActionDeadlineRefused { drv_now, .. } => Some(drv_now),
+            _ => None,
+        };
         let has_pending_motion = matches!(tick_output, TickOutput::None)
             && self.max_tx_joint_no_progress_ticks() > 0
             && self.driver.as_ref().is_some_and(|d| {
@@ -6929,6 +7642,13 @@ impl SupervisorInner {
             self.step_gravity_comp_exit(servo_dt, gravity_stiff_hold_completed);
         }
 
+        let mut tick_now = now_fn();
+        if let (Some(drv_refused_now), Some(c)) = (action_deadline_refused_at, self.active_tx_cutoff) {
+            let translated = c.owner_anchor + drv_refused_now.saturating_duration_since(c.drv_anchor);
+            if translated > tick_now {
+                tick_now = translated;
+            }
+        }
         if let Some(done) = deferred_done {
             if !self.safety.state().is_stopped() {
                 if j7_stale && done.is_gripper {
@@ -6938,9 +7658,6 @@ impl SupervisorInner {
                     self.pending_deferred_done = Some(done);
                 }
             }
-        }
-        if self.macro_run.is_some() {
-            self.expire_macro_child(Instant::now());
         }
         if self.pending_deferred_done.is_some() {
             let current_epoch = self.safety.epoch_id();
@@ -6963,6 +7680,10 @@ impl SupervisorInner {
                                     && m.sub == SubState::Running
                             })
                         }
+                        DeferredCompletionTarget::MacroFinish { action_id, .. } => {
+                            self.macro_run.as_ref().is_some_and(|m| m.id == action_id)
+                                && self.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running())
+                        }
                         DeferredCompletionTarget::ParkRelease(phase) => {
                             self.pending_normal_unload && self.park_release == Some(phase)
                         }
@@ -6972,13 +7693,18 @@ impl SupervisorInner {
                         }
                     }
             });
+            let deadline_expired_for_sub = matches!(
+                self.pending_deferred_done.as_ref().map(|d| d.target),
+                Some(DeferredCompletionTarget::MacroSub { action_id, .. })
+                    if self.macro_deadline_elapsed(action_id, tick_now)
+            );
             if !done_still_valid {
                 self.pending_deferred_done = None;
-            } else if tick_output_accepted {
+            } else if tick_output_accepted && !deadline_expired_for_sub {
                 if let Some(done) = self.pending_deferred_done.take() {
                     if done.clear_releasing {
                         self.releasing = false;
-                        self.held = None;
+                        self.clear_held_rt();
                     }
                     if !self.pending_normal_unload {
                         self.safety.mark_motion_finished();
@@ -6995,9 +7721,40 @@ impl SupervisorInner {
                                     settled: done.settled,
                                     holding: done.holding,
                                     gripper_gap_rad: done.gripper_gap_rad,
-                                    at: Instant::now(),
+                                    at: tick_now,
                                 });
                             }
+                        }
+                        DeferredCompletionTarget::MacroFinish {
+                            action_id,
+                            state,
+                            code,
+                            message,
+                            clear_held,
+                        } => {
+                            if clear_held {
+                                self.clear_held_rt();
+                            }
+                            let msg = if !message.is_empty() {
+                                if self.rt_executor_owned {
+                                    let mut buf = self.take_action_msg_buf(action_id, message.as_str().len().max(160));
+                                    buf.clear();
+                                    buf.push_str(message.as_str());
+                                    Some(buf)
+                                } else {
+                                    Some(message.as_str().to_owned())
+                                }
+                            } else {
+                                None
+                            };
+                            self.finish_macro_inner(
+                                action_id,
+                                state.as_str(),
+                                code.as_deref(),
+                                msg,
+                                done.holding,
+                                done.gripper_gap_rad,
+                            );
                         }
                         DeferredCompletionTarget::Action(id) => {
                             self.finish_action(
@@ -7013,6 +7770,15 @@ impl SupervisorInner {
                         DeferredCompletionTarget::ParkRelease(_)
                         | DeferredCompletionTarget::Anonymous => {}
                     }
+                }
+            }
+        }
+
+        // Clear macro replacement-hold pending flag only once an output release is accepted on the bus.
+        if tick_output_accepted {
+            if let Some(m) = self.macro_run.as_mut() {
+                if !m.finishing {
+                    m.hold_pending_bus_accept = false;
                 }
             }
         }
@@ -7105,7 +7871,7 @@ impl SupervisorInner {
 
         // Settle and action completion require an accepted output on both tracking-on and
         // tracking-off paths so deferred releases never finalize an action early.
-        self.reconcile_action(servo_dt, tick_output_accepted);
+        self.reconcile_action(servo_dt, tick_output_accepted, tick_now);
         self.expire_motion_limit();
         self.tick_phase(3);
         let timestamp = self.start_time.elapsed().as_secs_f64();
@@ -7126,7 +7892,8 @@ impl SupervisorInner {
             }
         }
 
-        if applied_tx_cap {
+        self.active_tx_cutoff = None;
+        if applied_rx_tx_cap || applied_output_tx_cap {
             if let Some(ref d) = self.driver {
                 if let Ok(mut drv) = d.lock() {
                     drv.set_tx_release_deadline(None);
@@ -7175,16 +7942,16 @@ pub struct JointGoalSnapshot {
 /// ([`prepare_quintic`]), with the inputs it was made from.
 #[derive(Debug, Clone)]
 pub struct PreparedQuintic {
-    start: Vec<f32>,
-    v0: Vec<f32>,
-    target: Vec<f32>,
-    limits: Vec<crate::model::JointLimit>,
-    workspace_revision: u64,
-    tcp_offset: [f64; 3],
-    power: Option<crate::power::PowerBudget>,
-    checked_workspace: bool,
-    traj: MultiJointQuinticTrajectory,
-    power_scale: Option<f64>,
+    pub(crate) start: Vec<f32>,
+    pub(crate) v0: Vec<f32>,
+    pub(crate) target: Vec<f32>,
+    pub(crate) limits: Vec<crate::model::JointLimit>,
+    pub(crate) workspace_revision: u64,
+    pub(crate) tcp_offset: [f64; 3],
+    pub(crate) power: Option<crate::power::PowerBudget>,
+    pub(crate) checked_workspace: bool,
+    pub(crate) traj: MultiJointQuinticTrajectory,
+    pub(crate) power_scale: Option<f64>,
 }
 
 /// The work of [`SupervisorInner::start_quintic`] that needs no lock, for the joints `q`:
@@ -7503,7 +8270,8 @@ impl TerminalBroadcaster {
 }
 
 /// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
-pub(crate) struct TerminalSubscription {
+#[doc(hidden)]
+pub struct TerminalSubscription {
     broadcaster: Arc<TerminalBroadcaster>,
     id: u64,
 }
@@ -7565,6 +8333,9 @@ pub struct ArmSupervisor {
     legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
     /// Unique identifier for this daemon/supervisor instance (changes across restarts).
     instance_id: String,
+    /// Off-RT sidecar store of `calib_hover` jobs when `OWNER_EXECUTOR` is active (never touched
+    /// by `armd-control`; bounded to `calib_hover::KEEP_JOBS`).
+    executor_hover_jobs: std::sync::Mutex<Vec<crate::calib_hover::HoverJob>>,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -7723,6 +8494,7 @@ impl ArmSupervisor {
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
+        hub.update_prep_env(Arc::new(crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner)));
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
         let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
         static NEXT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -7767,6 +8539,82 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             instance_id,
+            executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Owner-aware storage of a `measure_multiview` measurement payload for action `id`.
+    /// On `OWNER_EXECUTOR`, stores in `self.hub` (never touching `SupervisorLock` or `armd-control`)
+    /// so `StateHub::refresh` attaches `action.measurement` into every published observation and
+    /// delivered terminal identically to the Legacy owner.
+    pub async fn record_action_measurement(&self, id: u64, value: serde_json::Value) {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            self.hub.record_action_measurement(id, value);
+        } else {
+            self.inner()
+                .write()
+                .await
+                .update_action(id, |a| a.measurement = Some(value));
+        }
+    }
+
+    /// Owner-aware readback of the measurement payload recorded for action `id`.
+    /// Never touches `SupervisorLock` when `OWNER_EXECUTOR` is active.
+    pub async fn action_measurement(&self, id: u64) -> Option<serde_json::Value> {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            self.hub.action_measurement(id)
+        } else {
+            let inner = self.inner().read().await;
+            inner
+                .last_action
+                .as_ref()
+                .filter(|a| a.id == id)
+                .and_then(|a| a.measurement.clone())
+                .or_else(|| {
+                    inner
+                        .previous_action
+                        .as_ref()
+                        .filter(|(a, _)| a.id == id)
+                        .and_then(|(a, _)| a.measurement.clone())
+                })
+        }
+    }
+
+    /// Owner-aware storage of a `calib_hover` job record (never touches `SupervisorLock` in
+    /// `OWNER_EXECUTOR` mode).
+    pub async fn put_hover_job(&self, job: crate::calib_hover::HoverJob) {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            let mut jobs = self
+                .executor_hover_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            jobs.retain(|j| j.id != job.id);
+            jobs.push(job);
+            let n = jobs.len();
+            if n > crate::calib_hover::KEEP_JOBS {
+                jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+            }
+        } else {
+            let mut inner = self.inner().write().await;
+            inner.hover_jobs.retain(|j| j.id != job.id);
+            inner.hover_jobs.push(job);
+            let n = inner.hover_jobs.len();
+            if n > crate::calib_hover::KEEP_JOBS {
+                inner.hover_jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+            }
+        }
+    }
+
+    /// Owner-aware snapshot of stored `calib_hover` jobs (never touches `SupervisorLock` in
+    /// `OWNER_EXECUTOR` mode).
+    pub async fn hover_jobs_snapshot(&self) -> Vec<crate::calib_hover::HoverJob> {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            self.executor_hover_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        } else {
+            self.inner().read().await.hover_jobs.clone()
         }
     }
 
@@ -7967,6 +8815,20 @@ impl ArmSupervisor {
         }
     }
 
+    /// Re-publishes the revision-tagged off-thread [`ActionPrepEnv`] snapshot into [`StateHub`]
+    /// from the Legacy owner lock (no-op in Executor mode, where config mutations update `StateHub`).
+    pub async fn refresh_prep_env(&self) {
+        if self.owner_mode() != OWNER_LEGACY {
+            return;
+        }
+        let inner = self.inner.read().await;
+        if !inner.detached {
+            self.hub.update_prep_env(Arc::new(
+                crate::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner),
+            ));
+        }
+    }
+
     fn check_legacy_under_guard(&self, inner: &SupervisorInner) -> Result<(), ArmError> {
         if !inner.detached {
             Ok(())
@@ -8052,7 +8914,7 @@ impl ArmSupervisor {
                 message: "Cannot transfer ownership while policy runtime is active or loading".into(),
             });
         }
-        if !crate::mit::mit_joints(&guard.config).is_empty() {
+        if crate::mit::mit_joint_mask(&guard.config) != 0 {
             restore_legacy(&mut rollback);
             return Err(ArmError::Rejected {
                 status: 503,
@@ -8469,6 +9331,15 @@ impl ArmSupervisor {
         self.terminals.subscriber_count.load(Ordering::Acquire)
     }
 
+    /// Test-only hook: subscribe to the lossless `TerminalBroadcaster` terminal stream.
+    #[doc(hidden)]
+    pub fn test_subscribe_action_terminals(
+        &self,
+        sink: impl Fn(&ArmObservation) -> bool + Send + Sync + 'static,
+    ) -> TerminalSubscription {
+        self.subscribe_action_terminals(sink)
+    }
+
     #[doc(hidden)]
     pub fn inner(&self) -> &Arc<SupervisorLock<SupervisorInner>> {
         &self.inner
@@ -8497,7 +9368,8 @@ impl ArmSupervisor {
             Err(_) => {
                 if self.owner_mode() == OWNER_EXECUTOR {
                     if let Some(h) = self.executor_handle() {
-                        if let Ok(obs) = h.observation_async().await {
+                        if let Ok(mut obs) = h.observation_async().await {
+                            self.hub.attach_action_measurement(&mut obs);
                             return obs;
                         }
                     }
@@ -8512,7 +9384,8 @@ impl ArmSupervisor {
                 }
                 drop(inner);
                 if let Some(h) = self.executor_handle() {
-                    if let Ok(obs) = h.observation_async().await {
+                    if let Ok(mut obs) = h.observation_async().await {
+                        self.hub.attach_action_measurement(&mut obs);
                         return obs;
                     }
                 }
@@ -8716,6 +9589,19 @@ impl ArmSupervisor {
                 driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
                 if driver.capabilities().load_feedback {
                     inner.loads = vec![f32::NAN; inner.config.dof];
+                }
+                inner.driver_has_torque_feedback = driver.capabilities().torque_feedback;
+                if let Some(pf) = inner
+                    .config
+                    .gripper_index()
+                    .and_then(|g| driver.gripper_pos_force_info().filter(|info| info.joint == g))
+                {
+                    inner.driver_gripper_close_speed_limit =
+                        (pf.close_speed_rad_s.is_finite() && pf.close_speed_rad_s > 0.0)
+                            .then_some(pf.close_speed_rad_s);
+                    inner.driver_gripper_ceiling_torque_estimate = pf
+                        .ceiling_torque_estimate_nm
+                        .filter(|v| v.is_finite() && *v > 0.0);
                 }
                 let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
                 inner.apply_driver_limits(driver.as_ref());
@@ -9438,7 +10324,7 @@ impl ArmSupervisor {
                 dt,
                 generation,
                 keep,
-                Some((body_start, release_deadline)),
+                Some(release_deadline),
             );
             let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;

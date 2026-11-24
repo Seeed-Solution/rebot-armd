@@ -378,7 +378,7 @@ impl SupervisorInner {
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
         }
-        if self.has_mit_motion_blocker() { return Err(SafetyError::MotionBusy); }
+        if self.mit_motion_blocked() { return Err(SafetyError::MotionBusy); }
         self.validate_and_filter_servo_targets(targets, epoch_id)?;
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
@@ -409,7 +409,7 @@ impl SupervisorInner {
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
         }
-        if self.has_mit_motion_blocker() { return Err(SafetyError::MotionBusy); }
+        if self.mit_motion_blocked() { return Err(SafetyError::MotionBusy); }
         self.validate_and_filter_servo_targets(&mut targets, epoch_id)?;
         Err(SafetyError::DimensionMismatch { expected: self.config.dof, received: targets.len() })
     }
@@ -585,6 +585,7 @@ impl SupervisorInner {
                     TickOutput::Expired { .. }
                     | TickOutput::Error { .. }
                     | TickOutput::EstopInhibited { .. }
+                    | TickOutput::ActionDeadlineRefused { .. }
                     | TickOutput::None => {
                         self.tracking.invalidate();
                     }

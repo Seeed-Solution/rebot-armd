@@ -32,8 +32,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::model::ArmObservation;
+use crate::macro_action::{ContactWatch, SubState};
+use crate::model::{ArmObservation, HolderLabel};
 
+use super::broker::{Authority, BootId};
+use super::ids::ArmId;
 use super::triple::{triple_buffer, Consumer, Producer};
 
 /// Publication stamp of a sample (see the module docs).
@@ -45,15 +48,119 @@ pub struct SampleMeta {
     pub valid_until: Instant,
 }
 
-/// Per-joint feedback of a sample; every vector has the profile's dof.
+/// Zero-alloc `Copy` snapshot of live held-object state published per tick.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublishedHeld {
+    pub label: HolderLabel,
+    pub spill_safe: bool,
+}
+
+/// Zero-alloc `Copy` snapshot of the running macro parent and current child status.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PublishedMacroState {
+    pub active_id: u64,
+    pub alive: bool,
+    pub children: u32,
+    pub child_seq: u32,
+    pub child_running: bool,
+    pub child_sub: SubState,
+    pub child_watch: ContactWatch,
+}
+
+impl Default for PublishedMacroState {
+    fn default() -> Self {
+        Self {
+            active_id: 0,
+            alive: false,
+            children: 0,
+            child_seq: 0,
+            child_running: false,
+            child_sub: SubState::Idle,
+            child_watch: ContactWatch::default(),
+        }
+    }
+}
+
+/// Zero-alloc `Copy` owner metadata published every tick alongside `RtSample`, enabling
+/// off-thread prepared-action and macro-orchestrator reads without acquiring `SupervisorLock`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PublishedOwnerMeta {
+    pub arm: ArmId,
+    pub boot: BootId,
+    pub authority: Authority,
+    pub calibration_revision: u64,
+    pub poses_revision: u64,
+    pub sequences_revision: u64,
+    pub grasp_setup_revision: u64,
+    pub gripper_calib_revision: u64,
+    pub power_budget_revision: u64,
+    pub tool_digest_hash: u64,
+    pub motion_active: bool,
+    pub config_inhibited: bool,
+    pub calibration_busy: bool,
+    pub feedback_valid: bool,
+    pub is_torqued: bool,
+    pub pending_rearm: bool,
+    pub pending_normal_unload: bool,
+    pub collision_hold: bool,
+    pub handover_settling: bool,
+    pub gravity_comp_active: bool,
+    pub policy_busy: bool,
+    pub zero_check_persisting: bool,
+    pub torque_or_power_hold: bool,
+    pub held: Option<PublishedHeld>,
+    pub macro_state: PublishedMacroState,
+}
+
+impl Default for PublishedOwnerMeta {
+    fn default() -> Self {
+        Self {
+            arm: ArmId::LOCAL,
+            boot: BootId(0),
+            authority: Authority::default(),
+            calibration_revision: 0,
+            poses_revision: 0,
+            sequences_revision: 0,
+            grasp_setup_revision: 0,
+            gripper_calib_revision: 0,
+            power_budget_revision: 0,
+            tool_digest_hash: 0,
+            motion_active: false,
+            config_inhibited: false,
+            calibration_busy: false,
+            feedback_valid: false,
+            is_torqued: false,
+            pending_rearm: false,
+            pending_normal_unload: false,
+            collision_hold: false,
+            handover_settling: false,
+            gravity_comp_active: false,
+            policy_busy: false,
+            zero_check_persisting: false,
+            torque_or_power_hold: false,
+            held: None,
+            macro_state: PublishedMacroState::default(),
+        }
+    }
+}
+
+/// Per-joint feedback and owner metadata of a sample; every vector has the profile's dof.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RtSample {
     pub positions: Vec<f32>,
     pub velocities: Vec<f32>,
+    /// Commanded joint positions (profile dof) at the end of this tick.
+    pub commanded_positions: Vec<f32>,
+    /// Commanded joint velocities (profile dof) at the end of this tick.
+    pub commanded_velocities: Vec<f32>,
     /// Hardware receive instant of each joint's latest feedback.
     pub feedback_instants: Vec<Option<Instant>>,
     /// Per-joint count of distinct feedback samples.
     pub feedback_seqs: Vec<u64>,
+    /// Per-joint driver RX-queue upper bound timestamps (for multiview receive-progress fence).
+    pub feedback_queue_bounds: Vec<Option<Instant>>,
+    /// Live owner authority, domain revisions, flags, held state, and macro child state.
+    pub owner: PublishedOwnerMeta,
 }
 
 impl RtSample {
@@ -61,8 +168,12 @@ impl RtSample {
         Self {
             positions: Vec::with_capacity(dof),
             velocities: Vec::with_capacity(dof),
+            commanded_positions: Vec::with_capacity(dof),
+            commanded_velocities: Vec::with_capacity(dof),
             feedback_instants: Vec::with_capacity(dof),
             feedback_seqs: Vec::with_capacity(dof),
+            feedback_queue_bounds: Vec::with_capacity(dof),
+            owner: PublishedOwnerMeta::default(),
         }
     }
 
@@ -182,8 +293,12 @@ pub struct StatePublisher {
 pub struct RtInputs<'a> {
     pub positions: &'a [f32],
     pub velocities: &'a [f32],
+    pub commanded_positions: &'a [f32],
+    pub commanded_velocities: &'a [f32],
     pub feedback_instants: &'a [Option<Instant>],
     pub feedback_seqs: &'a [u64],
+    pub feedback_queue_bounds: &'a [Option<Instant>],
+    pub owner: PublishedOwnerMeta,
 }
 
 impl StatePublisher {
@@ -206,8 +321,12 @@ impl StatePublisher {
         if displaced.is_some() { self.hub.tick_frees.fetch_add(1, Ordering::Relaxed); }
         copy_into(&mut slot.rt.positions, rt.positions);
         copy_into(&mut slot.rt.velocities, rt.velocities);
+        copy_into(&mut slot.rt.commanded_positions, rt.commanded_positions);
+        copy_into(&mut slot.rt.commanded_velocities, rt.commanded_velocities);
         copy_into(&mut slot.rt.feedback_instants, rt.feedback_instants);
         copy_into(&mut slot.rt.feedback_seqs, rt.feedback_seqs);
+        copy_into(&mut slot.rt.feedback_queue_bounds, rt.feedback_queue_bounds);
+        slot.rt.owner = rt.owner;
         let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();
@@ -317,6 +436,13 @@ pub struct StateHub {
     /// Pre-sized observation template recorded at executor startup so a contended reader warms
     /// its own `front` slot off-thread before handing it back to the RT producer.
     prewarm_template: OnceLock<Box<ArmObservation>>,
+    /// Revision-tagged slow-changing planning environment published off-thread (never touched
+    /// on `armd-control`; read by off-thread action preparation and macro orchestrators).
+    prep_env: Mutex<Option<Arc<super::requests::actions::ActionPrepEnv>>>,
+    /// Bounded off-RT sidecar store of `measure_multiview` measurement payloads keyed by action
+    /// ID (never touched on `armd-control`; bounded to 16 entries). Attached in [`Self::refresh`]
+    /// to `obs.action` and `obs.previous_action` before any snapshot or terminal is delivered.
+    action_measurements: Mutex<std::collections::HashMap<u64, serde_json::Value>>,
     /// Number of off-RT readers currently waiting to acquire `self.state` inside `latest()`.
     latest_waiters: AtomicUsize,
 }
@@ -339,6 +465,8 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
         prewarm_template: OnceLock::new(),
+        prep_env: Mutex::new(None),
+        action_measurements: Mutex::new(std::collections::HashMap::new()),
         latest_waiters: AtomicUsize::new(0),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
@@ -398,7 +526,9 @@ impl StateHub {
                 // copied, not moved: the slot keeps its memory for the tick to fill again (the
                 // tick neither allocates nor frees observations)
                 if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
-                    let snap = Snapshot { meta, obs: obs.clone(), rt: slot.rt.clone() };
+                    let mut obs = obs.clone();
+                    self.attach_action_measurement(&mut obs);
+                    let snap = Snapshot { meta, obs, rt: slot.rt.clone() };
                     st.latest = Some(Arc::new(snap));
                 }
             }
@@ -444,6 +574,114 @@ impl StateHub {
     }
 
     pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+
+    /// Publishes an updated off-RT revision-tagged planning environment (never called on
+    /// `armd-control`).
+    pub fn update_prep_env(&self, env: Arc<super::requests::actions::ActionPrepEnv>) {
+        *self.prep_env.lock().unwrap_or_else(|e| e.into_inner()) = Some(env);
+    }
+
+    /// Reads the latest published off-RT revision-tagged planning environment.
+    pub fn prep_env(&self) -> Option<Arc<super::requests::actions::ActionPrepEnv>> {
+        self.prep_env.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Records an off-RT measurement payload for action `id` (bounded to 16 entries) and patches
+    /// the cached latest snapshot if it already carries `id` without a measurement. Never called
+    /// on `armd-control`; lock order is strictly `state -> action_measurements` (never nested in
+    /// reverse).
+    pub fn record_action_measurement(&self, id: u64, value: serde_json::Value) {
+        {
+            let mut map = self
+                .action_measurements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.insert(id, value.clone());
+            while map.len() > 16 {
+                if let Some(&oldest) = map.keys().min() {
+                    map.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(latest) = st.latest.as_ref() {
+            let needs_patch = latest
+                .obs
+                .action
+                .as_ref()
+                .is_some_and(|a| a.id == id && a.measurement.is_none())
+                || latest
+                    .obs
+                    .previous_action
+                    .as_ref()
+                    .is_some_and(|a| a.id == id && a.measurement.is_none());
+            if needs_patch {
+                let mut snap = (**latest).clone();
+                if let Some(a) = snap
+                    .obs
+                    .action
+                    .as_mut()
+                    .filter(|a| a.id == id && a.measurement.is_none())
+                {
+                    a.measurement = Some(value.clone());
+                }
+                if let Some(a) = snap
+                    .obs
+                    .previous_action
+                    .as_mut()
+                    .filter(|a| a.id == id && a.measurement.is_none())
+                {
+                    a.measurement = Some(value);
+                }
+                st.latest = Some(Arc::new(snap));
+            }
+        }
+    }
+
+    /// Reads back the off-RT sidecar measurement payload recorded for action `id`, if present.
+    pub fn action_measurement(&self, id: u64) -> Option<serde_json::Value> {
+        self.action_measurements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+    }
+
+    /// Populates `obs.action.measurement` and `obs.previous_action.measurement` from the off-RT
+    /// sidecar store when missing.
+    pub fn attach_action_measurement(&self, obs: &mut ArmObservation) {
+        let need_cur = obs.action.as_ref().is_some_and(|a| a.measurement.is_none());
+        let need_prev = obs
+            .previous_action
+            .as_ref()
+            .is_some_and(|a| a.measurement.is_none());
+        if !need_cur && !need_prev {
+            return;
+        }
+        let map = self
+            .action_measurements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        if let Some(a) = obs.action.as_mut().filter(|a| a.measurement.is_none()) {
+            if let Some(v) = map.get(&a.id) {
+                a.measurement = Some(v.clone());
+            }
+        }
+        if let Some(a) = obs
+            .previous_action
+            .as_mut()
+            .filter(|a| a.measurement.is_none())
+        {
+            if let Some(v) = map.get(&a.id) {
+                a.measurement = Some(v.clone());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -458,7 +696,16 @@ mod tests {
     }
 
     fn inputs<'a>(p: &'a [f32], s: &'a [u64], i: &'a [Option<Instant>]) -> RtInputs<'a> {
-        RtInputs { positions: p, velocities: p, feedback_instants: i, feedback_seqs: s }
+        RtInputs {
+            positions: p,
+            velocities: p,
+            commanded_positions: p,
+            commanded_velocities: p,
+            feedback_instants: i,
+            feedback_seqs: s,
+            feedback_queue_bounds: &[],
+            owner: PublishedOwnerMeta::default(),
+        }
     }
 
     #[test]
@@ -510,7 +757,9 @@ mod tests {
         let now = Instant::now();
         publisher.publish(1, now, now, obs(0.0), RtInputs {
             positions: &[1.0, 2.0, 3.0], velocities: &[0.1, 0.2, 0.3],
+            commanded_positions: &[1.0, 2.0, 3.0], commanded_velocities: &[0.0, 0.0, 0.0],
             feedback_instants: &[Some(now), None, Some(now)], feedback_seqs: &[5, 6, 7],
+            feedback_queue_bounds: &[], owner: PublishedOwnerMeta::default(),
         });
         let (p, v, i, s) = hub.latest().unwrap().rt.arm_feedback(&[0, 2]);
         assert_eq!((p, v, i, s), (vec![1.0, 2.0, 3.0], vec![0.1, 0.3], vec![Some(now), Some(now)], vec![5, 7]));

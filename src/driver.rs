@@ -3975,25 +3975,28 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     #[inline]
     fn ensure_tx_pass(&mut self) -> TickTxPass {
-        if let Some(mut pass) = self.tick_tx {
-            if let Some(cap) = self.tx_release_deadline {
-                pass.deadline = pass.deadline.min(cap);
-                self.tick_tx = Some(pass);
-            }
+        if let Some(pass) = self.tick_tx {
             pass
         } else {
-            let mut deadline = self.now() + self.tx_budget.max_duration;
-            if let Some(cap) = self.tx_release_deadline {
-                deadline = deadline.min(cap);
-            }
+            // Keep `pass.deadline` bound solely to `tx_budget.max_duration` so raising
+            // `tx_release_deadline` from an expired action cutoff back to `drv_release_cap` for
+            // stop/hold/freeze frames is never poisoned by the earlier action cutoff. Every TX
+            // gate combines `pass.deadline` with `self.tx_release_deadline` dynamically via
+            // `effective_tx_pass_deadline`.
             let pass = TickTxPass {
-                deadline,
+                deadline: self.now() + self.tx_budget.max_duration,
                 attempts: 0,
                 backpressured: false,
             };
             self.tick_tx = Some(pass);
             pass
         }
+    }
+
+    #[inline]
+    fn effective_tx_pass_deadline(&self, pass: TickTxPass) -> Instant {
+        self.tx_release_deadline
+            .map_or(pass.deadline, |cap| pass.deadline.min(cap))
     }
 
     #[inline]
@@ -5986,7 +5989,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if sent_any {
             if self.flush_cutoff_exceeded() {
-                self.mark_tx_pass_backpressured();
+                if self.tick_tx.is_some_and(|p| self.now() >= p.deadline) {
+                    self.mark_tx_pass_backpressured();
+                }
                 self.discard_pending_tx_stopped();
                 return Err(TransportError::Timeout.into());
             }
@@ -8630,7 +8635,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                if self.now() >= pass.deadline {
+                if self.now() >= self.effective_tx_pass_deadline(pass) {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
@@ -9334,7 +9339,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                if self.now() >= pass.deadline {
+                if self.now() >= self.effective_tx_pass_deadline(pass) {
                     let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                     self.trip_fence(reason);
                     return Err(ArmDriverError::MitFenceTripped(reason));
@@ -9667,9 +9672,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
         self.tx_release_deadline = deadline;
-        if let (Some(cap), Some(pass)) = (deadline, self.tick_tx.as_mut()) {
-            pass.deadline = pass.deadline.min(cap);
-        }
     }
 
     fn tx_frame_max_age(&self) -> Duration {

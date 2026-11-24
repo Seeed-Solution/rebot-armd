@@ -5,6 +5,8 @@
 
 #[allow(unused_imports)]
 use super::*;
+#[allow(dead_code)]
+type _PlanInputImportKeep = PlanInput;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, LeaseFreeCtx,
     LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
@@ -33,7 +35,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
-        reply: ReplyPolicy::CommandImmediate,
+        reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/action/gripper_zero_check"),
@@ -73,7 +75,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
-        reply: ReplyPolicy::CommandImmediate,
+        reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/action/run_sequence"),
@@ -262,9 +264,8 @@ fn dispatch_teach_lease_free(ctx: LeaseFreeCtx<'_>) {
 
 pub(super) enum ActionStart {
     Started(u64, f64),
-    Plan(PendingPlan),
-    Macro(PendingMacro),
-    Replay(crate::replay::ReplayInput),
+    Plan(Box<PendingPlan>),
+    Macro(Box<PendingMacro>),
     DryRunGrasp(Value),
     Sequence(Box<crate::sequences::RunPlan>),
     CalibHover(Box<crate::calib_hover::HoverPlan>),
@@ -273,32 +274,23 @@ pub(super) enum ActionStart {
     MeasureMultiview(Box<crate::measure_multiview::Plan>),
 }
 
-/// A Cartesian action waiting for its plan (computed outside the lock).
-pub(super) struct PendingPlan {
-    pub(super) request_id: Value,
-    pub(super) kind: &'static str,
-    pub(super) input: PlanInput,
-    pub(super) goal: crate::kinematics::Pose,
-    pub(super) speed: crate::motion::Speed,
-    pub(super) tag: Option<String>,
-    pub(super) opts: crate::motion::PathOpts,
-    /// Same-side approach (`precise: true` / `approach`, src/backlash.rs): settings or the
-    /// reason for a direct motion (None = off).
-    pub(super) approach: Result<crate::backlash::Plan, Option<&'static str>>,
-    /// `path: "joint"`: the IK seeds ([`crate::motion::goal_seeds`]), the `speed_scale` of the joint
-    /// quintic and the same-side approach request (None = off). None: the straight line.
-    pub(super) joint: Option<JointGoal>,
-    /// IK seeds of the goal ([`crate::motion::goal_seeds`]): the joint-space solve of `path: "joint"`,
-    /// and for a straight line the check behind the `path: "joint"` hint of `IK_BRANCH_FLIP`.
-    pub(super) seeds: Vec<[f64; 6]>,
+/// Prepared A6 action kind routed through snapshot capture -> off-lock `prepare_*` ->
+/// single owner-side `install_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingPlanKind {
+    MoveTo,
+    MoveRelative,
+    MoveToPose,
+    Gripper,
+    Replay,
 }
 
-/// `path: "joint"` part of a [`PendingPlan`].
-pub(super) struct JointGoal {
-    pub(super) speed_scale: f64,
-    pub(super) same_side: Option<crate::backlash::Request>,
-    /// Supervisor state the joint quintic is planned from without the lock.
-    pub(super) snapshot: crate::supervisor::JointGoalSnapshot,
+/// A prepared action waiting for off-lock planning from a captured [`ActionSnapshot`].
+pub(super) struct PendingPlan {
+    pub(super) request_id: Value,
+    pub(super) kind: PendingPlanKind,
+    pub(super) snap: crate::rt_core::requests::actions::ActionSnapshot,
+    pub(super) body: Value,
 }
 
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
@@ -326,33 +318,16 @@ impl PlannedMacro {
     /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
     pub(super) fn start(
         self,
-        admitted: crate::supervisor::Admitted<'_>,
+        inner: &mut SupervisorInner,
+        stamp: crate::supervisor::AdmissionStamp,
         supervisor: &Arc<ArmSupervisor>,
         deps: &crate::grasp::GraspDeps,
     ) -> Result<(u64, f64), ArmError> {
-        let stamp = admitted.stamp();
         match self {
             Self::Grasp(planned) => {
-                crate::grasp::begin(admitted, supervisor, deps.source.clone(), planned)
+                crate::grasp::begin_with_stamp(inner, stamp, supervisor, deps.source.clone(), planned)
             }
-            Self::Place(planned) => {
-                let (inner, proof) = admitted.consume()?;
-                let id = inner.begin_macro_inner(
-                    &proof,
-                    "place",
-                    &planned.input,
-                    planned.request.tag.clone(),
-                )?;
-                if planned.orientation_levelled {
-                    inner.update_action(id, |a| {
-                        a.orientation = Some("levelled".into());
-                    });
-                }
-                let duration = crate::place::expected_duration(&planned)
-                    + inner.approach_estimate_s("place_final", planned.request.approach);
-                crate::place::spawn(supervisor.clone(), id, planned, stamp);
-                Ok((id, duration))
-            }
+            Self::Place(planned) => crate::place::begin_with_stamp(inner, stamp, supervisor, planned),
         }
     }
 }
@@ -391,43 +366,34 @@ pub(super) fn prepare_action(
     if !body.is_object() {
         return Err(invalid_command("Command body must be an object"));
     }
-    let (kind, parsed) = match path {
-        "/api/v1/action/move_to" => {
+    match path {
+        "/api/v1/action/move_to"
+        | "/api/v1/action/move_relative"
+        | "/api/v1/action/gripper"
+        | "/api/v1/action/move_to_pose"
+        | "/api/v1/action/replay" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_to", crate::motion::parse_move_to(body))
-        }
-        "/api/v1/action/move_relative" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_relative", crate::motion::parse_move_relative(body))
-        }
-        "/api/v1/action/gripper" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            let mut request = crate::motion::parse_gripper(body).map_err(ArmError::from)?;
-            if let Some(scale) = crate::motion::num(body, "speed_scale").map_err(ArmError::from)? {
-                if !(0.05..=1.0).contains(&scale) {
-                    return Err(ArmError::from(crate::motion::MotionError::InvalidCommand(
-                        "speed_scale must be in [0.05, 1.0]".into(),
-                    ))
-                    .into());
-                }
-                if inner.config.active_tool.commissioning_required && scale > 0.2 + 1e-6 {
-                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                        "gripper (speed_scale {scale:.2} > 0.2)"
-                    )))
-                    .into());
-                }
-                if body.get("speed").is_none_or(Value::is_null) {
-                    request.speed = (2.0 * scale).clamp(0.01, 2.0);
-                }
-            }
-            if body.get("baseline").is_some_and(|v| !v.is_null()) {
-                return Err(invalid_command("baseline is not a gripper action field; calibrate with /api/v1/action/gripper_calibrate"));
-            }
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = SupervisorInner::start_gripper(admitted, request, epoch)?;
-            return Ok(ActionStart::Started(id, duration));
+            let kind = match path {
+                "/api/v1/action/move_to" => PendingPlanKind::MoveTo,
+                "/api/v1/action/move_relative" => PendingPlanKind::MoveRelative,
+                "/api/v1/action/gripper" => PendingPlanKind::Gripper,
+                "/api/v1/action/move_to_pose" => PendingPlanKind::MoveToPose,
+                "/api/v1/action/replay" => PendingPlanKind::Replay,
+                _ => unreachable!(),
+            };
+            let snap = crate::rt_core::requests::actions::ActionSnapshot::from_inner(
+                inner,
+                stamp,
+                std::time::Instant::now()
+                    + crate::rt_core::requests::actions::DEFAULT_ACTION_DEADLINE,
+            );
+            Ok(ActionStart::Plan(Box::new(PendingPlan {
+                request_id: request_id.clone(),
+                kind,
+                snap,
+                body: body.clone(),
+            })))
         }
         "/api/v1/action/gripper_zero_check" => {
             let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
@@ -437,7 +403,7 @@ pub(super) fn prepare_action(
                 epoch,
                 Some((auth.clone(), ws_token.map(str::to_string))),
             )?;
-            return Ok(ActionStart::Started(id, duration));
+            Ok(ActionStart::Started(id, duration))
         }
         "/api/v1/action/grasp" => {
             if body.get("dry_run").and_then(Value::as_bool) == Some(true) {
@@ -445,142 +411,46 @@ pub(super) fn prepare_action(
             }
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Macro(PendingMacro::Grasp(
+            Ok(ActionStart::Macro(Box::new(PendingMacro::Grasp(
                 crate::grasp::prepare(inner, body, epoch)?,
-            )));
+            ))))
         }
         "/api/v1/action/place" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Macro(PendingMacro::Place(
+            Ok(ActionStart::Macro(Box::new(PendingMacro::Place(
                 crate::place::prepare(inner, body, epoch)?,
-            )));
-        }
-        "/api/v1/action/replay" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let request = crate::replay::parse_replay(body).map_err(ArmError::from)?;
-            return Ok(ActionStart::Replay(inner.replay_input(request, epoch)?));
-        }
-        "/api/v1/action/move_to_pose" => {
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = crate::poses::start_action(admitted, body, epoch)?;
-            return Ok(ActionStart::Started(id, duration));
+            ))))
         }
         "/api/v1/action/run_sequence" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Sequence(Box::new(
+            Ok(ActionStart::Sequence(Box::new(
                 crate::sequences::prepare_run(inner, body, epoch)?,
-            )));
+            )))
         }
         crate::calib_hover::PATH => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::CalibHover(Box::new(
+            Ok(ActionStart::CalibHover(Box::new(
                 crate::calib_hover::prepare(inner, body, epoch)?,
-            )));
+            )))
         }
         crate::gripper_calib::CALIBRATE_PATH => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             let tag = crate::motion::tag(body).map_err(ArmError::from)?;
-            return Ok(ActionStart::GripperCalibrate(epoch, tag));
+            Ok(ActionStart::GripperCalibrate(epoch, tag))
         }
         crate::measure_multiview::PATH => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::MeasureMultiview(Box::new(
+            Ok(ActionStart::MeasureMultiview(Box::new(
                 crate::measure_multiview::prepare(inner, body, epoch)?,
-            )));
+            )))
         }
-        _ => return Err(invalid_command("Unknown action")),
-    };
-    let (mut spec, mut speed, tag) = parsed.map_err(ArmError::from)?;
-    let _ = &mut spec;
-    // move_to / move_relative keep their straight line to the goal; `precise: true` (profile
-    // `applies_to` move_to_precise) or `approach: "same_side"` end it with the short segment
-    let precise = crate::motion::flag(body, "precise", false).map_err(ArmError::from)?;
-    let request = crate::backlash::parse_request(body).map_err(ArmError::from)?;
-    let path_mode = crate::motion::parse_path_mode(body).map_err(ArmError::from)?;
-    let same_side = precise || request != crate::backlash::Request::Profile;
-    if path_mode == crate::motion::PathMode::Joint
-        && body.get("speed").is_some_and(|v| !v.is_null())
-    {
-        return Err(invalid_command(
-            "speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)",
-        ));
+        _ => Err(invalid_command("Unknown action")),
     }
-    let linear_speed_scale = if path_mode == crate::motion::PathMode::Linear {
-        if let Some(s) = crate::motion::num(body, "speed_scale").map_err(ArmError::from)? {
-            if !(0.05..=1.0).contains(&s) {
-                return Err(invalid_command("speed_scale must be in [0.05, 1.0]"));
-            }
-            if body.get("speed").is_none_or(Value::is_null) {
-                speed.linear =
-                    (crate::motion::MAX_LINEAR_MPS * s).min(crate::motion::MAX_LINEAR_MPS);
-                speed.angular =
-                    (crate::motion::MAX_ANGULAR_RPS * s).min(crate::motion::MAX_ANGULAR_RPS);
-            }
-            Some(s)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let approach = if same_side && path_mode == crate::motion::PathMode::Linear {
-        inner.approach_plan("move_to_precise", request)
-    } else {
-        Err(None)
-    };
-    let input = inner.plan_input_tcp()?;
-    let (goal, opts) = crate::motion::resolve_goal_opts(&input, &spec);
-    let joint = match path_mode {
-        crate::motion::PathMode::Linear => {
-            if inner.config.active_tool.commissioning_required {
-                let scale_ok = linear_speed_scale.is_none_or(|s| s <= 0.2 + 1e-6);
-                let speed_ok = speed.linear <= 0.2 * crate::motion::MAX_LINEAR_MPS + 1e-6
-                    && speed.angular <= 0.2 * crate::motion::MAX_ANGULAR_RPS + 1e-6;
-                if !scale_ok || !speed_ok {
-                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                        "{kind} (requires speed_scale <= 0.2 or speed <= {:.3} m/s / {:.2} rad/s)",
-                        0.2 * crate::motion::MAX_LINEAR_MPS,
-                        0.2 * crate::motion::MAX_ANGULAR_RPS
-                    )))
-                    .into());
-                }
-            }
-            None
-        }
-        crate::motion::PathMode::Joint => {
-            let speed_scale = crate::poses::speed_scale(body)?;
-            if inner.config.active_tool.commissioning_required && speed_scale > 0.2 + 1e-6 {
-                return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                    "{kind} (speed_scale {speed_scale:.2} > 0.2)"
-                )))
-                .into());
-            }
-            Some(JointGoal {
-                speed_scale,
-                same_side: same_side.then_some(request),
-                snapshot: inner.joint_goal_snapshot(speed_scale),
-            })
-        }
-    };
-    let seeds = crate::motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
-    Ok(ActionStart::Plan(PendingPlan {
-        request_id: request_id.clone(),
-        kind,
-        input,
-        goal,
-        speed,
-        tag,
-        opts,
-        approach,
-        joint,
-        seeds,
-    }))
 }
 
 /// Pending asynchronous action work produced by [`dispatch_action_command`].
@@ -623,15 +493,11 @@ pub(super) fn dispatch_action_command(
             Some(command_ack(inner, &value["request_id"], Some((id, duration))))
         }
         Ok(ActionStart::Plan(plan)) => {
-            pending.plan = Some((plan, local_generation));
+            pending.plan = Some((*plan, local_generation));
             None
         }
         Ok(ActionStart::Macro(m)) => {
-            pending.macro_action = Some((value["request_id"].clone(), m, local_generation));
-            None
-        }
-        Ok(ActionStart::Replay(input)) => {
-            pending.replay = Some((value["request_id"].clone(), input, local_generation));
+            pending.macro_action = Some((value["request_id"].clone(), *m, local_generation));
             None
         }
         Ok(ActionStart::DryRunGrasp(body)) => {
@@ -639,28 +505,20 @@ pub(super) fn dispatch_action_command(
             None
         }
         Ok(ActionStart::Sequence(plan)) => Some(
-            match inner
-                .check_admission(stamp)
-                .map_err(ArmError::from)
-                .and_then(|admitted| crate::sequences::begin(admitted, recv_supervisor, *plan))
-            {
+            match crate::sequences::begin_with_stamp(inner, stamp, recv_supervisor, *plan) {
                 Ok(started) => command_ack(inner, &value["request_id"], Some(started)),
                 Err(error) => command_reject(inner, &value["request_id"], error.into()),
             },
         ),
         Ok(ActionStart::CalibHover(plan)) => Some(
-            match inner
-                .check_admission(stamp)
-                .map_err(ArmError::from)
-                .and_then(|admitted| {
-                    crate::calib_hover::begin(
-                        admitted,
-                        recv_supervisor,
-                        *plan,
-                        recv_calib.upstream.clone(),
-                        crate::calib_hover::jobs_dir(&recv_calib.path),
-                    )
-                }) {
+            match crate::calib_hover::begin_with_stamp(
+                inner,
+                stamp,
+                recv_supervisor,
+                *plan,
+                recv_calib.upstream.clone(),
+                crate::calib_hover::jobs_dir(&recv_calib.path),
+            ) {
                 Ok((id, duration, job_id)) => {
                     let mut ack = command_ack(inner, &value["request_id"], Some((id, duration)));
                     ack["job_id"] = json!(job_id);
@@ -681,17 +539,13 @@ pub(super) fn dispatch_action_command(
             },
         ),
         Ok(ActionStart::MeasureMultiview(plan)) => Some(
-            match inner
-                .check_admission(stamp)
-                .map_err(ArmError::from)
-                .and_then(|admitted| {
-                    crate::measure_multiview::begin(
-                        admitted,
-                        recv_supervisor,
-                        *plan,
-                        recv_deps.source.clone(),
-                    )
-                }) {
+            match crate::measure_multiview::begin_with_stamp(
+                inner,
+                stamp,
+                recv_supervisor,
+                *plan,
+                recv_deps.source.clone(),
+            ) {
                 Ok(started) => command_ack(inner, &value["request_id"], Some(started)),
                 Err(error) => command_reject(inner, &value["request_id"], error.into()),
             },
@@ -712,7 +566,8 @@ pub(super) async fn complete_macro_check(
     recv_generation: &AtomicU64,
     recv_deps: &crate::grasp::GraspDeps,
     worker_closing: &AtomicBool,
-) -> Option<Value> {
+    command_reply_pending: &Arc<AtomicBool>,
+) -> Option<(Value, Option<CommandReplyGateGuard>)> {
     let owner_transferred = || {
         let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
         if let Some(s) = recv_supervisor.hub().latest() {
@@ -724,8 +579,9 @@ pub(super) async fn complete_macro_check(
         return None;
     }
     if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
-        return Some(owner_transferred());
+        return Some((owner_transferred(), None));
     }
+    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let mut inner = recv_supervisor.inner().write().await;
     if worker_closing.load(Ordering::SeqCst) {
         drop(inner);
@@ -733,9 +589,9 @@ pub(super) async fn complete_macro_check(
     }
     if inner.detached {
         drop(inner);
-        return Some(owner_transferred());
+        return Some((owner_transferred(), None));
     }
-    Some(if let Err(err) = inner.preflight_admission(stamp) {
+    let reply = if let Err(err) = inner.preflight_admission(stamp) {
         command_reject(&inner, &request_id, ArmError::from(err).into())
     } else {
         match joined {
@@ -751,21 +607,28 @@ pub(super) async fn complete_macro_check(
                 {
                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                 } else {
-                    match inner
-                        .check_admission(stamp)
-                        .map_err(ArmError::from)
-                        .and_then(|admitted| planned.start(admitted, recv_supervisor, recv_deps))
-                    {
+                    match planned.start(&mut inner, stamp, recv_supervisor, recv_deps) {
                         Ok(started) => command_ack(&inner, &request_id, Some(started)),
                         Err(error) => command_reject(&inner, &request_id, error.into()),
                     }
                 }
             }
         }
-    })
+    };
+    Some((reply, Some(gate)))
 }
 
-/// Complete a Cartesian or `path: "joint"` plan outside the lock and install under the lock.
+#[allow(clippy::large_enum_variant)]
+enum PreparedWsAction {
+    Cartesian(crate::rt_core::requests::actions::PreparedCartesianAction),
+    Joint(crate::rt_core::requests::actions::PreparedJointAction),
+    Gripper(crate::rt_core::requests::actions::PreparedGripperAction),
+    Replay(crate::rt_core::requests::actions::PreparedReplayAction),
+}
+
+/// Complete any prepared A6 action (`move_to`, `move_relative`, `move_to_pose`, `gripper`,
+/// `replay`) outside the lock via `rt_core::requests::actions::prepare_*`, then install under
+/// a short write lock via the single owner-side `install_*` function.
 /// Returns `None` if `worker_closing` requests loop termination; `Some(resp)` otherwise.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn complete_pending_plan(
@@ -776,220 +639,168 @@ pub(super) async fn complete_pending_plan(
     recv_connection: &str,
     recv_generation: &AtomicU64,
     worker_closing: &Arc<AtomicBool>,
-) -> Option<Option<Value>> {
+    command_reply_pending: &Arc<AtomicBool>,
+) -> Option<(Option<Value>, Option<CommandReplyGateGuard>)> {
+    use crate::rt_core::requests::actions as req;
     let PendingPlan {
         request_id,
         kind,
-        input,
-        goal,
-        speed,
-        tag,
-        opts,
-        approach,
-        joint,
-        seeds,
+        snap,
+        body,
     } = plan;
-    if let Some(joint) = joint {
-        // path "joint": IK of the goal only (several seeds) without the lock,
-        // then the move_to_pose quintic, checked under the lock
-        // ... and the quintic's plan, power fit and swept-workspace check, which
-        // the install reuses when the arm and the workspace did not change
-        let JointGoal {
-            speed_scale,
-            same_side,
-            snapshot,
-        } = joint;
-        let cancel = worker_closing.clone();
-        let plan_conn = recv_connection.to_string();
-        let solved = tokio::task::spawn_blocking(move || {
-            maybe_pause_blocking_plan(&plan_conn);
-            if cancel.load(Ordering::Acquire) {
-                return None;
-            }
-            let q = crate::motion::solve_goal_joints(&input, &goal, opts, &seeds);
-            if cancel.load(Ordering::Acquire) {
-                return None;
-            }
-            let prepared = match (&q, same_side) {
-                (Ok(q), None) => crate::supervisor::prepare_quintic(&input, &snapshot, q),
-                _ => None,
-            };
-            if cancel.load(Ordering::Acquire) {
-                return None;
-            }
-            Some((input, q.map(|q| (q, prepared))))
-        })
-        .await;
-        if worker_closing.load(Ordering::SeqCst) {
+    let is_replay = kind == PendingPlanKind::Replay;
+    let cancel = worker_closing.clone();
+    let plan_conn = recv_connection.to_string();
+    let prepared = tokio::task::spawn_blocking(move || {
+        maybe_pause_blocking_plan(&plan_conn);
+        if cancel.load(Ordering::Acquire) {
             return None;
         }
-        let mut inner = recv_supervisor.inner().write().await;
-        if worker_closing.load(Ordering::SeqCst) {
+        let res: Result<PreparedWsAction, (ArmError, bool)> = match kind {
+            PendingPlanKind::MoveTo => req::prepare_move_with_branch_hint(&snap, &body, false)
+                .map(|m| match m {
+                    req::PreparedMoveAction::Cartesian(c) => PreparedWsAction::Cartesian(c),
+                    req::PreparedMoveAction::Joint(j) => PreparedWsAction::Joint(j),
+                }),
+            PendingPlanKind::MoveRelative => req::prepare_move_with_branch_hint(&snap, &body, true)
+                .map(|m| match m {
+                    req::PreparedMoveAction::Cartesian(c) => PreparedWsAction::Cartesian(c),
+                    req::PreparedMoveAction::Joint(j) => PreparedWsAction::Joint(j),
+                }),
+            PendingPlanKind::MoveToPose => req::prepare_saved_pose(&snap, &body)
+                .map(PreparedWsAction::Joint)
+                .map_err(|e| (e, false)),
+            PendingPlanKind::Gripper => {
+                req::prepare_gripper(&snap, &body, crate::supervisor::GripperBaselineCmd::None)
+                    .map(PreparedWsAction::Gripper)
+                    .map_err(|e| (e, false))
+            }
+            PendingPlanKind::Replay => req::prepare_replay(&snap, &body)
+                .map(PreparedWsAction::Replay)
+                .map_err(|e| (e, false)),
+        };
+        if cancel.load(Ordering::Acquire) {
             return None;
         }
-        if inner.detached {
-            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
-            if let Some(s) = recv_supervisor.hub().latest() {
-                r["epoch_id"] = json!(s.obs.epoch_id);
-            }
-            Some(Some(r))
-        } else {
-            if let Some(hook) = inner.before_install_hook.take() {
-                hook(&mut inner);
-            }
-            if let Err(err) = inner.preflight_admission(stamp) {
-                Some(Some(command_reject(
-                    &inner,
-                    &request_id,
-                    ArmError::from(err).into(),
-                )))
-            } else {
-                Some(match solved {
-                    Ok(None) => None,
-                    Err(e) => Some(command_reject(
-                        &inner,
-                        &request_id,
-                        ArmError::Internal(format!("planner task failed: {e}")).into(),
-                    )),
-                    Ok(Some((_, Err(error)))) => {
-                        Some(command_reject(&inner, &request_id, ArmError::from(error).into()))
-                    }
-                    Ok(Some((input, Ok((q, prepared))))) => Some(
-                        if recv_generation.load(Ordering::SeqCst) != generation
-                            || !inner.validate_servo_lease(recv_connection, generation)
-                        {
-                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                        } else {
-                            match inner
-                                .check_admission(stamp)
-                                .map_err(ArmError::from)
-                                .and_then(|admitted| {
-                                    SupervisorInner::install_joint_goal_prepared(
-                                        admitted,
-                                        &input,
-                                        &q,
-                                        speed_scale,
-                                        kind,
-                                        tag,
-                                        same_side,
-                                        prepared,
-                                    )
-                                }) {
-                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                            }
-                        },
-                    ),
-                })
-            }
-        }
-    } else {
-        let cancel = worker_closing.clone();
-        let plan_conn = recv_connection.to_string();
-        let planned = tokio::task::spawn_blocking(move || {
-            maybe_pause_blocking_plan(&plan_conn);
-            if cancel.load(Ordering::Acquire) {
-                return None;
-            }
-            let result = crate::motion::plan_cartesian_opts(&input, goal, speed, opts);
-            if cancel.load(Ordering::Acquire) {
-                return None;
-            }
-            let pre = match (&approach, &result) {
-                (Ok(plan), Ok(direct)) => {
-                    crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, opts)
-                }
-                (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
-                _ => crate::backlash::Pre::Off,
-            };
-            if cancel.load(Ordering::Acquire) {
-                return None;
-            }
-            // a branch flip: would the joint-space move reach the goal (hint)?
-            let joint_goal = match &result {
-                Err(crate::motion::MotionError::IkBranchFlip { .. }) => {
-                    crate::motion::solve_goal_joints(&input, &goal, opts, &seeds).ok()
-                }
-                _ => None,
-            };
-            if cancel.load(Ordering::Acquire) {
-                return None;
-            }
-            Some((
-                input,
-                result
-                    .map(|path| (path, pre, approach.ok()))
-                    .map_err(|e| (e, joint_goal)),
-            ))
-        })
-        .await;
-        if worker_closing.load(Ordering::SeqCst) {
-            return None;
-        }
-        let mut inner = recv_supervisor.inner().write().await;
-        if worker_closing.load(Ordering::SeqCst) {
-            return None;
-        }
-        if inner.detached {
-            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
-            if let Some(s) = recv_supervisor.hub().latest() {
-                r["epoch_id"] = json!(s.obs.epoch_id);
-            }
-            Some(Some(r))
-        } else {
-            if let Some(hook) = inner.before_install_hook.take() {
-                hook(&mut inner);
-            }
-            if let Err(err) = inner.preflight_admission(stamp) {
-                Some(Some(command_reject(
-                    &inner,
-                    &request_id,
-                    ArmError::from(err).into(),
-                )))
-            } else {
-                Some(match planned {
-                    Ok(None) => None,
-                    Err(e) => Some(command_reject(
-                        &inner,
-                        &request_id,
-                        ArmError::Internal(format!("planner task failed: {e}")).into(),
-                    )),
-                    Ok(Some((_, Err((error, joint_goal))))) => {
-                        let mut api: ApiError = ArmError::from(error).into();
-                        if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) {
-                            api.message.push_str(crate::motion::JOINT_PATH_HINT);
-                        }
-                        Some(command_reject(&inner, &request_id, api))
-                    }
-                    Ok(Some((input, Ok((path, pre, approach))))) => Some(
-                        if recv_generation.load(Ordering::SeqCst) != generation
-                            || !inner.validate_servo_lease(recv_connection, generation)
-                        {
-                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                        } else {
-                            match inner
-                                .check_admission(stamp)
-                                .map_err(ArmError::from)
-                                .and_then(|admitted| {
-                                    SupervisorInner::install_path_same_side(
-                                        admitted,
-                                        &input,
-                                        path,
-                                        pre,
-                                        approach.as_ref(),
-                                        kind,
-                                        tag,
-                                    )
-                                }) {
-                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                            }
-                        },
-                    ),
-                })
-            }
-        }
+        Some(res)
+    })
+    .await;
+    if worker_closing.load(Ordering::SeqCst) {
+        return None;
     }
+    // M2: Keep the per-connection reply gate closed from BEFORE acquiring the install lock until
+    // the caller enqueues `command_ack` onto `ordinary_tx` so terminals (e.g. from an immediate
+    // Stop) can never overtake the ACK for gripper / move_to_pose / move_to / replay.
+    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
+    let mut inner = recv_supervisor.inner().write().await;
+    if worker_closing.load(Ordering::SeqCst) {
+        return None;
+    }
+    if inner.detached {
+        let msg = if is_replay {
+            "Ownership transferred to RT executor while checking replay"
+        } else {
+            "Ownership transferred to RT executor while planning"
+        };
+        let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":msg});
+        if let Some(s) = recv_supervisor.hub().latest() {
+            r["epoch_id"] = json!(s.obs.epoch_id);
+        }
+        return Some((Some(r), None));
+    }
+    if let Some(hook) = inner.before_install_hook.take() {
+        hook(&mut inner);
+    }
+    if let Err(err) = inner.preflight_admission(stamp) {
+        return Some((
+            Some(command_reject(
+                &inner,
+                &request_id,
+                ArmError::from(err).into(),
+            )),
+            None,
+        ));
+    }
+    let reply = match prepared {
+        Ok(None) => None,
+        Err(e) => {
+            let label = if is_replay {
+                "replay check task failed"
+            } else {
+                "planner task failed"
+            };
+            Some(command_reject(
+                &inner,
+                &request_id,
+                ArmError::Internal(format!("{label}: {e}")).into(),
+            ))
+        }
+        Ok(Some(Err((error, joint_hint)))) => {
+            let mut api: ApiError = error.into();
+            if joint_hint {
+                api.message.push_str(crate::motion::JOINT_PATH_HINT);
+            }
+            Some(command_reject(&inner, &request_id, api))
+        }
+        Ok(Some(Ok(prepared))) => Some(
+            if recv_generation.load(Ordering::SeqCst) != generation
+                || !inner.validate_servo_lease(recv_connection, generation)
+            {
+                let msg = if is_replay {
+                    "This connection lost the lease while the episode was checked"
+                } else {
+                    "This connection lost the lease while planning"
+                };
+                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":msg, "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+            } else {
+                let ctx = req::OwnerCheckCtx::for_legacy(&inner);
+                let res = match prepared {
+                    PreparedWsAction::Cartesian(c) => {
+                        let s = c.stamp;
+                        req::install_move_cartesian(
+                            &mut inner,
+                            &s,
+                            &ctx,
+                            req::CartesianInstallPayload::Legacy(Box::new(c)),
+                        )
+                    }
+                    PreparedWsAction::Joint(j) => {
+                        let s = j.stamp;
+                        req::install_move_joint(
+                            &mut inner,
+                            &s,
+                            &ctx,
+                            req::JointInstallPayload::Legacy(Box::new(j)),
+                        )
+                    }
+                    PreparedWsAction::Gripper(g) => {
+                        let s = g.stamp;
+                        req::install_gripper(
+                            &mut inner,
+                            &s,
+                            &ctx,
+                            req::GripperInstallPayload::Legacy(Box::new(g)),
+                        )
+                    }
+                    PreparedWsAction::Replay(r) => {
+                        let s = r.stamp;
+                        req::install_replay(
+                            &mut inner,
+                            &s,
+                            &ctx,
+                            req::ReplayInstallPayload::Legacy(Box::new(r)),
+                        )
+                    }
+                };
+                match res {
+                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                }
+            },
+        ),
+    };
+    let keep_gate = reply.is_some().then_some(gate);
+    Some((reply, keep_gate))
 }
 
 /// Spawn a tracked macro planning/preflight task and return its [`MacroCheck`] handle.
@@ -1062,7 +873,8 @@ pub(super) async fn complete_pending_replay(
     recv_connection: &str,
     recv_generation: &AtomicU64,
     worker_closing: &Arc<AtomicBool>,
-) -> Option<Option<Value>> {
+    command_reply_pending: &Arc<AtomicBool>,
+) -> Option<(Option<Value>, Option<CommandReplyGateGuard>)> {
     let cancel = worker_closing.clone();
     let plan_conn = recv_connection.to_string();
     let planned = tokio::task::spawn_blocking(move || {
@@ -1080,6 +892,7 @@ pub(super) async fn complete_pending_replay(
     if worker_closing.load(Ordering::SeqCst) {
         return None;
     }
+    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let mut inner = recv_supervisor.inner().write().await;
     if worker_closing.load(Ordering::SeqCst) {
         return None;
@@ -1089,15 +902,18 @@ pub(super) async fn complete_pending_replay(
         if let Some(s) = recv_supervisor.hub().latest() {
             r["epoch_id"] = json!(s.obs.epoch_id);
         }
-        Some(Some(r))
+        Some((Some(r), None))
     } else if let Err(err) = inner.preflight_admission(stamp) {
-        Some(Some(command_reject(
-            &inner,
-            &request_id,
-            ArmError::from(err).into(),
-        )))
+        Some((
+            Some(command_reject(
+                &inner,
+                &request_id,
+                ArmError::from(err).into(),
+            )),
+            None,
+        ))
     } else {
-        Some(match planned {
+        let reply = match planned {
             Ok(None) => None,
             Err(e) => Some(command_reject(
                 &inner,
@@ -1121,7 +937,9 @@ pub(super) async fn complete_pending_replay(
                     }
                 },
             ),
-        })
+        };
+        let keep_gate = reply.is_some().then_some(gate);
+        Some((reply, keep_gate))
     }
 }
 

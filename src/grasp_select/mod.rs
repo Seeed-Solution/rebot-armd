@@ -105,6 +105,112 @@ pub struct ExecutionPlan {
     pub q_lift: [f64; 6],
 }
 
+/// Ordered macro child step produced from a selected [`ExecutionPlan`] for Phase B execution.
+///
+/// Phase A keeps live `strategy: "adaptive"` refused via [`refuse_execution`] and serves
+/// dry-run selection only. Phase B installs [`SelectedGraspMacro::begin`] as an A7 macro parent
+/// and feeds each [`SelectedMacroStep`] through `MacroCtx` / `InstallChild` without changing
+/// the A7 broker or owner contract.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectedMacroStep {
+    /// Linear TCP sub-motion with optional contact guard (for insertion).
+    MoveTcp {
+        phase: &'static str,
+        goal: Pose,
+        linear_mps: f64,
+        contact: Option<crate::rt_core::ops::ContactGuard>,
+    },
+    /// Gripper open / close sub-motion.
+    Gripper {
+        phase: &'static str,
+        command: crate::motion::GripperCommand,
+        fraction: Option<f64>,
+        grasp: bool,
+    },
+}
+
+/// Phase B handoff bundle translating a selected [`ExecutionPlan`] into an A7
+/// [`crate::rt_core::requests::actions::BeginMacroSpec`] plus its ordered child sequence.
+#[derive(Debug, Clone)]
+pub struct SelectedGraspMacro {
+    pub begin: crate::rt_core::requests::actions::BeginMacroSpec,
+    pub steps: Vec<SelectedMacroStep>,
+    pub expected_duration_s: f64,
+}
+
+impl ExecutionPlan {
+    /// Builds the Phase B A7 macro bundle (`BeginMacroSpec` + ordered `pregrasp` -> `pre_open`
+    /// -> guarded `insert` -> `close` -> `separation` -> `lift` child steps) ready to install
+    /// through the shared A7 macro lifecycle when Phase B enables adaptive execution.
+    pub fn into_macro_plan(
+        &self,
+        prepared_boot: crate::rt_core::broker::BootId,
+        start: &[f32],
+        deadline: Instant,
+        tag: Option<&str>,
+        contact_guard: Option<crate::rt_core::ops::ContactGuard>,
+    ) -> Result<SelectedGraspMacro, &'static str> {
+        use crate::motion::GripperCommand;
+        use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+
+        let mut begin = BeginMacroSpec::new(MacroKind::Grasp, prepared_boot).with_start(start)?;
+        begin.check_workspace_revision = true;
+        begin.macro_deadline = Some(deadline);
+        begin.timeout_code = crate::safety::BoundedText::new("GRASP_TIMEOUT");
+        if let Some(tag) = tag {
+            begin.tag = crate::model::HolderLabel::new(tag);
+        }
+
+        let approach_mps = crate::motion::DEFAULT_LINEAR_MPS;
+        let insert_mps = (crate::motion::DEFAULT_LINEAR_MPS * 0.5).clamp(0.02, 0.15);
+        let steps = vec![
+            SelectedMacroStep::MoveTcp {
+                phase: "pregrasp",
+                goal: self.pregrasp,
+                linear_mps: approach_mps,
+                contact: None,
+            },
+            SelectedMacroStep::Gripper {
+                phase: "pre_open",
+                command: GripperCommand::Open,
+                fraction: None,
+                grasp: false,
+            },
+            SelectedMacroStep::MoveTcp {
+                phase: "insert",
+                goal: self.grasp,
+                linear_mps: insert_mps,
+                contact: contact_guard,
+            },
+            SelectedMacroStep::Gripper {
+                phase: "close",
+                command: GripperCommand::Close,
+                fraction: None,
+                grasp: true,
+            },
+            SelectedMacroStep::MoveTcp {
+                phase: "separation",
+                goal: self.separation,
+                linear_mps: insert_mps,
+                contact: None,
+            },
+            SelectedMacroStep::MoveTcp {
+                phase: "lift",
+                goal: self.lift,
+                linear_mps: approach_mps,
+                contact: None,
+            },
+        ];
+        let move_est = (self.insertion_m / insert_mps).clamp(0.2, 10.0);
+        let expected_duration_s = move_est * 3.0 + 6.0;
+        Ok(SelectedGraspMacro {
+            begin,
+            steps,
+            expected_duration_s,
+        })
+    }
+}
+
 impl Candidate {
     pub fn plan(&self, s: &Snapshot) -> ExecutionPlan {
         ExecutionPlan {
@@ -158,6 +264,22 @@ pub struct Selection {
 impl Selection {
     pub fn reachable(&self) -> bool { self.outcome == Outcome::Selected }
     pub fn selected(&self) -> Option<&Candidate> { (self.outcome == Outcome::Selected).then(|| self.ranked.first()).flatten() }
+
+    /// Phase B hook: converts this selection's winning [`ExecutionPlan`] into a
+    /// [`SelectedGraspMacro`] ready for A7 `BeginMacro` / `InstallChild` execution.
+    /// Returns `None` when the selection did not pick a winner.
+    pub fn phase_b_macro_plan(
+        &self,
+        prepared_boot: crate::rt_core::broker::BootId,
+        start: &[f32],
+        deadline: Instant,
+        tag: Option<&str>,
+        contact_guard: Option<crate::rt_core::ops::ContactGuard>,
+    ) -> Option<Result<SelectedGraspMacro, &'static str>> {
+        self.plan
+            .as_ref()
+            .map(|p| p.into_macro_plan(prepared_boot, start, deadline, tag, contact_guard))
+    }
 }
 
 /// Order of the phases, for the deepest failure.

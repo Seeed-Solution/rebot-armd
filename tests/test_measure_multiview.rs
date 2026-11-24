@@ -108,7 +108,13 @@ fn turned(r: &kinematics::Mat3, axis: usize, angle: f64) -> kinematics::Mat3 {
 impl FakeVision {
     /// Render frame `id` (its noise seed) at joints `q`, the measured joints when None.
     async fn render(&self, id: u64, q: Option<Vec<f32>>) -> Shot {
-        let (q, pose) = {
+        let (q, pose) = if self.sup.owner_mode() == armd::supervisor::OWNER_EXECUTOR {
+            let obs_q = self.sup.get_observation().await.positions;
+            let q = q.unwrap_or(obs_q);
+            let env = self.sup.hub().prep_env().expect("prep_env published");
+            let pose = env.config.arm_model.fk_f32(&q).unwrap();
+            (q, pose)
+        } else {
             let inner = self.sup.inner().read().await;
             let q = q.unwrap_or_else(|| inner.measured_positions.clone());
             let pose = inner.config.arm_model.fk_f32(&q).unwrap();
@@ -240,7 +246,10 @@ impl DetectionSource for FakeVision {
             if let Some(err) = self.gray_fail_queue.lock().unwrap().pop_front() {
                 return Err(err);
             }
-            let away = {
+            let away = if self.sup.owner_mode() == armd::supervisor::OWNER_EXECUTOR {
+                let pos = self.sup.get_observation().await.positions;
+                START.iter().zip(&pos).any(|(a, b)| (a - b).abs() > 1e-3)
+            } else {
                 let inner = self.sup.inner().read().await;
                 START.iter().zip(&inner.measured_positions).any(|(a, b)| (a - b).abs() > 1e-3)
             };
@@ -1699,5 +1708,157 @@ async fn a_move_and_return_between_the_bracket_samples_fails_moved() {
         let msg = a["message"].as_str().unwrap();
         assert!(msg.contains("J4") && msg.contains("limit 2.0"), "{msg}");
         assert_eq!(r.vision.frame.load(Ordering::SeqCst), mm::SNAPSHOT_TRIES as u64, "gray {gray}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r2_m6_executor_and_legacy_multiview_publish_measurement_before_terminal() {
+    // M6: end-to-end 3-view `measure_multiview` through `measure_multiview.rs:2637` on BOTH
+    // Legacy and Executor owners: the delivered terminal observation (`TerminalBroadcaster`),
+    // `sup.observation().await`, and `sup.get_observation().await` must ALL carry
+    // `action.measurement` (height_m within 3 mm of HEIGHT, method == "motion_stereo")
+    // BEFORE the terminal is delivered!
+
+    // 1) Legacy owner
+    {
+        let mut r = rig(ArmConfig::rebot_dm()).await;
+        r.sup.start_dispatcher().unwrap();
+        let delivered = Arc::new(Mutex::new(Vec::<armd::ArmObservation>::new()));
+        let delivered_sink = Arc::clone(&delivered);
+        let _sub = r.sup.test_subscribe_action_terminals(move |obs| {
+            delivered_sink.lock().unwrap().push(obs.clone());
+            true
+        });
+        let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        let id = ack["action_id"].as_u64().unwrap();
+        let a = r.wait(id, 120.0).await;
+        assert_eq!((a["kind"].as_str(), a["state"].as_str()), (Some("measure_multiview"), Some("done")), "{a}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let term_obs = loop {
+            if let Some(obs) = delivered.lock().unwrap().iter().find(|o| o.action.as_ref().is_some_and(|a| a.id == id)).cloned() {
+                break obs;
+            }
+            assert!(Instant::now() < deadline, "legacy terminal observation for {id} not delivered");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let term_m = term_obs
+            .action
+            .as_ref()
+            .and_then(|a| a.measurement.as_ref())
+            .expect("legacy terminal observation must carry action.measurement before delivery");
+        assert_eq!(term_m["method"], "motion_stereo", "{term_m}");
+        let h = term_m["objects"][0]["height_m"].as_f64().unwrap();
+        assert!((h - HEIGHT).abs() < 0.003, "legacy height {h}");
+        let obs = r.sup.observation().await.unwrap();
+        assert_eq!(obs.action.as_ref().and_then(|a| a.measurement.as_ref()), Some(term_m));
+    }
+
+    // 2) Executor owner (live RT executor, detached shell, zero SupervisorLock!)
+    {
+        let mut config = ArmConfig::rebot_dm();
+        config.lease_timeout_ms = 600_000;
+        let (cam, _, look) = geometry(&config);
+        let sup = Arc::new(ArmSupervisor::new(config));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = START.to_vec();
+            inner.measured_positions = START.to_vec();
+            inner.target_positions = START.to_vec();
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            armd::SupervisorInner::enable_torque(a).unwrap();
+            inner.tick(0.02);
+        }
+        sup.start_dispatcher().unwrap();
+        let handle = sup
+            .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(
+                Duration::from_millis(20),
+            ))
+            .await
+            .unwrap();
+        // Attach PR L reply sink hook so begin_executor commits cleanly.
+        let sink_terminals = Arc::new(Mutex::new(Vec::<(u64, armd::rt_core::broker::Outcome)>::new()));
+        let sink_ref = Arc::clone(&sink_terminals);
+        handle.attach_external_reply_sink(Arc::new(move |_cid, reply| {
+            if let armd::rt_core::broker::Reply::Terminal { action, outcome, .. } = reply {
+                sink_ref.lock().unwrap().push((action.0, outcome));
+            }
+            armd::rt_core::broker::DeliveryDecision::Delivered
+        }));
+
+        let delivered = Arc::new(Mutex::new(Vec::<armd::ArmObservation>::new()));
+        let delivered_sink = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            delivered_sink.lock().unwrap().push(obs.clone());
+            true
+        });
+
+        let scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
+        let vision = Arc::new(FakeVision {
+            sup: sup.clone(), cam, scene: Arc::new(scene), hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
+            snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), trigger_delay_ms: AtomicU64::new(0), freeze_snapshot: AtomicBool::new(false),
+            shake_on_snapshot: Mutex::new(None), shake_on_gray_trigger: Mutex::new(None), clock: Mutex::new(None), snapshot: Mutex::new(None), served: Mutex::new(Vec::new()),
+            rot_err: Mutex::new(0.0), markers: Mutex::new(Vec::new()), aruco: AtomicBool::new(false),
+            gray: AtomicBool::new(false), instance_id: Mutex::new("rv-exec-1".into()), gray_ring: Mutex::new(VecDeque::new()),
+            gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
+            gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
+            gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
+            hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false),
+            hold_restart_after: AtomicU64::new(0), release_args: Mutex::new(Vec::new()), hold_clients: Mutex::new(Vec::new()), on_trigger: Mutex::new(None),
+            contours: AtomicBool::new(false),
+        });
+
+        // Wait for first RT tick to publish so ActionSnapshot succeeds.
+        let wait_tick = Instant::now() + Duration::from_secs(5);
+        while sup.hub().published_seq() == 0 {
+            assert!(Instant::now() < wait_tick, "RT executor never published");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 77;
+        let snap = armd::rt_core::requests::actions::ActionSnapshot::capture(
+            &sup,
+            adm,
+            Instant::now() + armd::rt_core::requests::actions::DEFAULT_ACTION_DEADLINE,
+        )
+        .await
+        .unwrap();
+        let plan = mm::prepare_from_snapshot(
+            &snap,
+            &json!({"label": "box", "speed_scale": 0.5}),
+            snap.owner.authority.epoch,
+        )
+        .unwrap();
+        let (id, _) = mm::begin_executor(&sup, adm, plan, vision).await.unwrap();
+
+        // Wait for the terminal observation delivered by `TerminalBroadcaster`!
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let term_obs = loop {
+            if let Some(obs) = delivered.lock().unwrap().iter().find(|o| o.action.as_ref().is_some_and(|a| a.id == id)).cloned() {
+                break obs;
+            }
+            assert!(Instant::now() < deadline, "executor terminal observation for {id} not delivered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let act = term_obs.action.as_ref().expect("terminal action");
+        assert_eq!((act.kind.as_str(), act.state.as_str()), ("measure_multiview", "done"), "{act:?}");
+        let term_m = act
+            .measurement
+            .as_ref()
+            .expect("M6: executor terminal observation MUST carry action.measurement BEFORE delivery");
+        assert_eq!(term_m["method"], "motion_stereo", "{term_m}");
+        assert_eq!(term_m["views"].as_array().unwrap().len(), 3);
+        let h = term_m["objects"][0]["height_m"].as_f64().unwrap();
+        assert!((h - HEIGHT).abs() < 0.003, "executor height {h}");
+
+        // `sup.observation()` and `sup.get_observation()` must ALSO publish the same measurement!
+        let obs = sup.observation().await.unwrap();
+        assert_eq!(obs.action.as_ref().and_then(|a| a.measurement.as_ref()), Some(term_m));
+        let obs2 = sup.get_observation().await;
+        assert_eq!(obs2.action.as_ref().and_then(|a| a.measurement.as_ref()), Some(term_m));
+
+        handle.stop_and_join();
     }
 }

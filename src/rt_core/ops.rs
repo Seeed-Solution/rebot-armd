@@ -56,6 +56,11 @@ pub struct Committed {
 impl Committed {
     fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn for_action(d: &Descriptor, action: Option<ActionId>) -> Self {
+        Self { request: d.stamp.request, action }
+    }
+
     /// The request whose command was committed.
     pub fn request(&self) -> RequestId { self.request }
 
@@ -97,6 +102,9 @@ pub enum Primitive {
     /// [`CoreOps::commit_prepared`] without IK or file I/O. `start` is the commanded position
     /// it was prepared from (checked as for `JointQuintic`); `child` names a macro parent.
     Prepared { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], kind: PathKind, duration_s: f64, power_scale: Option<f64> },
+    /// Prepared action-family command or macro child staged for [`super::requests::actions`] (A6 + A7).
+    #[cfg(not(target_arch = "wasm32"))]
+    Action(super::requests::actions::StagedAction),
 }
 
 /// What a [`Primitive::Prepared`] path is.
@@ -106,11 +114,21 @@ pub enum PathKind {
     /// run over `duration_s` with the quintic time law of a Cartesian path.
     Cartesian,
     /// Recorded samples every `sample_dt` s of recorded time (`duration_s` recorded), played
-    /// at `speed` after an approach quintic from the commanded position to the first sample
-    /// (planned at the commit: no IK). `gripper` false keeps the gripper's command.
+    /// at `speed` after a pre-planned approach quintic (`approach_duration_s`, optional
+    /// `approach_power_scale`) from the commanded position to the first sample (planned,
+    /// power-fitted, and workspace-swept off-thread at prepare time; install verifies start
+    /// position only). `gripper` false keeps the gripper's command.
     /// `tool_digest`: [`tool_digest_hash`] of the active tool the worker checked the
     /// episode's tool provenance against (`TOOL_MISMATCH` at the commit when it changed).
-    Replay { episode: EpisodeRef, speed: f32, gripper: bool, sample_dt: f64, tool_digest: u64 },
+    Replay {
+        episode: EpisodeRef,
+        speed: f32,
+        gripper: bool,
+        sample_dt: f64,
+        approach_duration_s: f64,
+        approach_power_scale: Option<f64>,
+        tool_digest: u64,
+    },
 }
 
 /// FNV-1a hash of a tool configuration digest (no allocation): the prepared replay names the
@@ -189,11 +207,14 @@ impl PreparedPath {
     }
 }
 
-/// One plan slot: the primitive and the prepared path a [`Primitive::Prepared`] reads.
+/// One plan slot: the primitive, the prepared path a [`Primitive::Prepared`] reads, and (for
+/// prepared replays) the exact off-thread fitted & workspace-swept approach quintic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanSlot {
     pub primitive: Primitive,
     pub path: PreparedPath,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub replay_approach: Option<crate::replay::PreparedReplayApproach>,
 }
 
 impl Default for PlanSlot {
@@ -202,22 +223,41 @@ impl Default for PlanSlot {
 }
 
 impl PlanSlot {
-    pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+    pub fn with_path_capacity(n: usize) -> Self {
+        Self {
+            primitive: Primitive::None,
+            path: PreparedPath::with_capacity(n),
+            #[cfg(not(target_arch = "wasm32"))]
+            replay_approach: None,
+        }
+    }
 
     /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
     pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
-    /// Stages a primitive that reads no path (the path is cleared).
+    /// Stages a primitive that reads no path (the path and replay approach are cleared).
     pub fn set(&mut self, p: Primitive) {
         self.primitive = p;
         self.path.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = None;
+        }
     }
 
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
     pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
         self.primitive = Primitive::None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = None;
+        }
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = other.replay_approach;
+        }
         Ok(())
     }
 }
@@ -281,6 +321,8 @@ impl Primitive {
             Self::None | Self::JointQuintic { .. } => None,
             Self::CartesianPath { child, .. } | Self::Gripper { child, .. } | Self::JointQuinticLimited { child, .. } | Self::Replay { child, .. }
             | Self::Prepared { child, .. } => child.as_ref(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Action(a) => a.child(),
         }
     }
 
@@ -311,7 +353,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     // motion and action failures
     "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "INVALID_COMMAND", "INVALID_TARGET", "JUMP_LIMIT", "STEP_LIMIT",
     "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
-    "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
+    "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "HOVER_TIMEOUT", "MEASURE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
     "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
 ];
@@ -552,11 +594,42 @@ pub trait CoreOps {
     ) -> f64 {
         self.advance_output(dt, generation)
     }
+    /// Release-bounded [`Self::advance_output`] carrying a live monotonic clock sampler `now_fn`
+    /// and absolute `release_deadline` so pre-step and transmit-point deadline checks take fresh
+    /// clock reads rather than reusing `Checkpoint::BeforeOutput`.
+    fn advance_output_with_clock(
+        &mut self,
+        dt: f64,
+        generation: u64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        let now = now_fn();
+        self.advance_output_with_deadline(dt, generation, now, release_deadline)
+    }
     /// Publishes the state computed by [`Self::advance_output`] at `timestamp` with `generation`.
     fn publish(&mut self, _timestamp: f64, _generation: u64) {}
     /// Current local monotonic observation timestamp (seconds), used when publishing after
     /// a sub-release transition wake before delivering its terminal.
     fn now_timestamp(&self) -> f64 { 0.0 }
+    /// Commits one action-family broker command (`InstallPrepared`, `BeginMacro`, `InstallChild`, `FinishMacro`).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_action(
+        &mut self,
+        _d: &Descriptor,
+        _cmd: super::requests::actions::ActionCommand,
+        _slot: Option<PlanSlotRef<PlanSlot>>,
+        _ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// True while a macro parent's current child still owns trajectory, settle, or deferred TX.
+    fn macro_child_running(&self, _parent: ActionId) -> bool { false }
+    /// Attaches the broker's lock-free closed-connection bitset for RT commit checks.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_closed_bitset(&mut self, _bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {}
+    /// Synchronizes the core's published [`BootId`] with the owning executor / fixture.
+    fn set_boot_id(&mut self, _boot: BootId) {}
 }
 
 /// Diagnostic fields recorded on the RT thread when an authorized stop arrives during a
@@ -712,7 +785,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
 
 impl SupervisorInner {
     /// The lease valid at `now` (its generation names its holder).
-    fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
+    pub(crate) fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
         self.active_lease.as_ref().filter(|l| now.saturating_duration_since(l.acquired_at) < self.lease_timeout)
     }
 
@@ -789,6 +862,8 @@ impl CoreOps for SupervisorInner {
         match primitive {
             // a prepared path is installed with its slot's samples (`commit_prepared`)
             Primitive::None | Primitive::Prepared { .. } => Err("INVALID_COMMAND"),
+            #[cfg(not(target_arch = "wasm32"))]
+            Primitive::Action(_) => Err("INVALID_COMMAND"),
             // macro children (track E): installed for the running macro named by the ticket;
             // the committed action is the parent (its terminal carries the child count)
             Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => {
@@ -804,7 +879,9 @@ impl CoreOps for SupervisorInner {
                 if n == 0 || n > MAX_DOF {
                     return Err("INVALID_COMMAND");
                 }
-                if !start_matches(&start[..n], &self.commanded_positions) {
+                let mut eff_start = [0.0f32; MAX_DOF];
+                let (eff_dof, _) = self.post_quiesce_commanded_positions(&mut eff_start);
+                if !start_matches(&start[..n], &eff_start[..eff_dof]) {
                     return Err("PLAN_STALE");
                 }
                 self.jog_precheck_static()?;
@@ -858,16 +935,16 @@ impl CoreOps for SupervisorInner {
                 }
                 match child {
                     None => {
-                        let checked = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
-                        let prepared = self.prepared_replay_motion_checked(n, path, checked, duration_s, power_scale, epoch).map_err(static_code)?;
+                        let _ = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
+                        let prepared = self.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch).map_err(static_code)?;
                         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
                     Some(spec) => {
                         self.commit_child_checks(&spec, &start[..n])?;
-                        let checked = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
+                        let _ = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
                         self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                            let prepared = this.prepared_replay_motion_checked(n, path, checked, duration_s, power_scale, epoch)?;
+                            let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
                             let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
                             SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
                         }).map(|parent| Committed::authorized(d, Some(parent)))
@@ -916,22 +993,40 @@ impl CoreOps for SupervisorInner {
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }
-            PathKind::Replay { .. } => {
+            PathKind::Replay { approach_duration_s, approach_power_scale, .. } => {
                 if !start_matches(&start[..n], &self.commanded_positions) {
                     return Err("PLAN_STALE");
                 }
                 match child {
                     None => {
                         let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
-                        let prepared = self.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch).map_err(static_code)?;
+                        let prepared = self.prepared_replay_from_slot_preplanned(
+                            n,
+                            &start[..n],
+                            slot,
+                            checked,
+                            duration_s,
+                            power_scale,
+                            approach_duration_s,
+                            approach_power_scale,
+                        )?;
                         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
                     Some(spec) => {
                         self.commit_child_checks(&spec, &start[..n])?;
                         let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
+                        let prepared = self.prepared_replay_from_slot_preplanned(
+                            n,
+                            &start[..n],
+                            slot,
+                            checked,
+                            duration_s,
+                            power_scale,
+                            approach_duration_s,
+                            approach_power_scale,
+                        )?;
                         self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                            let prepared = this.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch)?;
                             let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
                             SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
                         }).map(|parent| Committed::authorized(d, Some(parent)))
@@ -1152,12 +1247,46 @@ impl CoreOps for SupervisorInner {
         self.tick_control_with_deadline(dt, now, release_deadline)
     }
 
+    fn advance_output_with_clock(
+        &mut self,
+        dt: f64,
+        _generation: u64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        self.tick_control_with_clock(dt, now_fn, release_deadline)
+    }
+
     fn publish(&mut self, timestamp: f64, generation: u64) {
         drop(self.publish_at(timestamp, generation, false));
     }
 
     fn now_timestamp(&self) -> f64 {
         self.now_s()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_action(
+        &mut self,
+        d: &Descriptor,
+        cmd: super::requests::actions::ActionCommand,
+        slot: Option<PlanSlotRef<PlanSlot>>,
+        ctx: &CommitCtx,
+    ) -> Result<Committed, &'static str> {
+        super::requests::actions::commit_action(self, d, cmd, slot, ctx)
+    }
+
+    fn macro_child_running(&self, parent: ActionId) -> bool {
+        SupervisorInner::macro_child_running(self, parent.0)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn attach_closed_bitset(&mut self, bitset: std::sync::Arc<super::requests::actions::ClosedBitset>) {
+        SupervisorInner::attach_closed_bitset(self, bitset);
+    }
+
+    fn set_boot_id(&mut self, boot: BootId) {
+        self.boot_id = boot;
     }
 }
 
@@ -1335,13 +1464,40 @@ impl crate::transport::DriverClock for VirtualClock {
 /// 5. Urgent recheck (`BeforeOutput`), then advance control output (`dt`).
 /// 6. Publish observation and RT inputs.
 /// 7. Deliver terminals (completed transition terminal, then active-action terminal).
+enum ActiveSlot {
+    Standalone(Installed),
+    #[cfg(not(target_arch = "wasm32"))]
+    Macro {
+        parent: Installed,
+        child_plan: Option<super::broker::PlanHandle>,
+    },
+}
+
+impl ActiveSlot {
+    fn action(&self) -> ActionId {
+        match self {
+            Self::Standalone(i) => i.action(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Macro { parent, .. } => parent.action(),
+        }
+    }
+
+    fn into_parts(self) -> (Installed, Option<super::broker::PlanHandle>) {
+        match self {
+            Self::Standalone(i) => (i, None),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Macro { parent, child_plan } => (parent, child_plan),
+        }
+    }
+}
+
 pub struct ReleaseEngine {
     intake: RtIntake<PlanSlot>,
     targets: TargetReader,
     stop: StopRequests,
     urgent_stops: Option<UrgentStopIntake>,
     urgent_replies_flushed: bool,
-    active: Option<Installed>,
+    active: Option<ActiveSlot>,
     /// The driver transition in flight.
     transition: Option<Installed>,
     releases: u64,
@@ -1410,7 +1566,7 @@ impl ReleaseEngine {
 
     pub fn boot(&self) -> BootId { self.intake.boot() }
     pub fn releases(&self) -> u64 { self.releases }
-    pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(Installed::action) }
+    pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(ActiveSlot::action) }
     pub fn transition(&self) -> Option<ActionId> { self.transition.as_ref().map(Installed::action) }
     pub fn reply_overflow(&self) -> u64 { self.intake.reply_overflow() }
     pub fn stop_requests(&self) -> &StopRequests { &self.stop }
@@ -1536,38 +1692,135 @@ impl ReleaseEngine {
         // 3. Urgent recheck + at most one ordinary command
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(core, Checkpoint::BeforeCommit, &mut now_fn, &mut report);
-        let mut superseded_and_ack: Option<(Installed, super::broker::Reply)> = None;
+        let mut superseded_and_ack: Option<(Installed, Outcome, u32, super::broker::Reply)> = None;
+        let mut deferred_ack: Option<super::broker::Reply> = None;
+        let mut retire_after_take: Option<super::broker::PlanHandle> = None;
         if let Some(t) = self.intake.take() {
             let d = *t.descriptor();
+            #[cfg(not(target_arch = "wasm32"))]
+            let is_begin_macro = matches!(d.kind, CommandKind::Action(super::requests::actions::ActionCommand::BeginMacro(_)));
+            #[cfg(target_arch = "wasm32")]
+            let is_begin_macro = false;
+            #[cfg(not(target_arch = "wasm32"))]
+            let is_action_cmd = matches!(d.kind, CommandKind::Action(_));
+            #[cfg(target_arch = "wasm32")]
+            let is_action_cmd = false;
+            #[cfg(not(target_arch = "wasm32"))]
+            let is_child_cmd = matches!(d.kind, CommandKind::Action(super::requests::actions::ActionCommand::InstallChild { .. }));
+            #[cfg(target_arch = "wasm32")]
+            let is_child_cmd = false;
+            let starts_top_action = match d.kind {
+                CommandKind::Install { .. } => true,
+                #[cfg(not(target_arch = "wasm32"))]
+                CommandKind::Action(a) => a.starts_action(),
+                CommandKind::Immediate(_) | CommandKind::Transition(_) => false,
+            };
+            // Provisional read-only capture before Step 3 mutates `core`: if a Step-1 Stop
+            // already ended the prior active action/macro, preserve its exact outcome & children
+            // ONLY if the new command commits (refusal leaves `self.active` untouched).
+            let prior_ended = if starts_top_action {
+                self.active.as_ref().map(ActiveSlot::action).and_then(|old_id| {
+                    core.action_outcome(old_id).map(|o| (o, core.action_children(old_id)))
+                })
+            } else {
+                None
+            };
             let result = match d.kind {
-                CommandKind::Install { .. } => match t.plan() {
-                    None => Err("PLAN_RETIRED"),
-                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
-                        Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
-                        None => Err("PLAN_RETIRED"),
-                    },
-                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
-                },
+                CommandKind::Install { .. } => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let mixed_a7_child = matches!(self.active, Some(ActiveSlot::Macro { .. }))
+                        && t.plan().is_some_and(|p| p.primitive.child().is_some());
+                    #[cfg(target_arch = "wasm32")]
+                    let mixed_a7_child = false;
+                    if mixed_a7_child {
+                        Err("UNSUPPORTED")
+                    } else {
+                        match t.plan() {
+                            None => Err("PLAN_RETIRED"),
+                            Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
+                                Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
+                                None => Err("PLAN_RETIRED"),
+                            },
+                            Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
+                        }
+                    }
+                }
                 CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
                 CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
+                #[cfg(not(target_arch = "wasm32"))]
+                CommandKind::Action(cmd) => {
+                    let slot_res = if cmd.plan().is_some() {
+                        t.plan_ref().map(Some).ok_or("PLAN_RETIRED")
+                    } else {
+                        Ok(None)
+                    };
+                    match slot_res {
+                        Ok(slot_ref) => core.commit_action(&d, cmd, slot_ref, &ctx),
+                        Err(code) => Err(code),
+                    }
+                }
             };
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
-                    let install = matches!(d.kind, CommandKind::Install { .. });
-                    let supersedes = install && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
+                    let supersedes = starts_top_action && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
                     if supersedes {
                         t.ack_deferred(c).map(|(acked, ack_reply)| {
-                            let old = self.active.take().expect("checked active.is_some()");
-                            superseded_and_ack = Some((old, ack_reply));
+                            let old_slot = self.active.take().expect("checked active.is_some()");
+                            let (old_installed, old_child_plan) = old_slot.into_parts();
+                            retire_after_take = old_child_plan;
+                            let (old_outcome, old_children) = prior_ended
+                                .unwrap_or_else(|| (Outcome::Superseded, core.action_children(old_installed.action())));
+                            superseded_and_ack = Some((old_installed, old_outcome, old_children, ack_reply));
                             if let Some(i) = acked.installed {
-                                self.active = Some(i);
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    self.active = Some(if is_begin_macro {
+                                        ActiveSlot::Macro { parent: i, child_plan: None }
+                                    } else {
+                                        ActiveSlot::Standalone(i)
+                                    });
+                                }
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    let _ = is_begin_macro;
+                                    self.active = Some(ActiveSlot::Standalone(i));
+                                }
+                            }
+                            acked.commit_seq
+                        })
+                    } else if is_action_cmd {
+                        t.ack_deferred(c).map(|(acked, ack_reply)| {
+                            deferred_ack = Some(ack_reply);
+                            if is_child_cmd {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if let Some(new_cp) = d.kind.plan() {
+                                    if let Some(ActiveSlot::Macro { child_plan, .. }) = self.active.as_mut() {
+                                        retire_after_take = child_plan.replace(new_cp);
+                                    } else {
+                                        retire_after_take = Some(new_cp);
+                                    }
+                                }
+                            } else if let Some(i) = acked.installed {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    self.active = Some(if is_begin_macro {
+                                        ActiveSlot::Macro { parent: i, child_plan: None }
+                                    } else {
+                                        ActiveSlot::Standalone(i)
+                                    });
+                                }
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    self.active = Some(ActiveSlot::Standalone(i));
+                                }
                             }
                             acked.commit_seq
                         })
                     } else {
+                        let install = matches!(d.kind, CommandKind::Install { .. });
                         t.ack(c).map(|acked| {
                             match acked.installed {
-                                Some(i) if install => self.active = Some(i),
+                                Some(i) if install => self.active = Some(ActiveSlot::Standalone(i)),
                                 Some(i) => self.transition = Some(i),
                                 None => {}
                             }
@@ -1581,6 +1834,9 @@ impl ReleaseEngine {
                 }
             }));
         }
+        if let Some(cp) = retire_after_take {
+            self.intake.retire_plan(cp);
+        }
         // 4. Unconditional urgent recheck + consume at most one latest target
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
         if let Some(f) = self.targets.take() {
@@ -1589,9 +1845,10 @@ impl ReleaseEngine {
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));
         }
-        // 5. Urgent recheck + advance control output
-        let out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
-        let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
+        // 5. Urgent recheck + advance control output (passes live `now_fn` so pre-step and
+        //    transmit-point macro deadline checks always take fresh clock reads).
+        let _out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
+        let timestamp = core.advance_output_with_clock(dt, publish_generation, &mut now_fn, release_deadline);
         // 6. Publish
         core.publish(timestamp, publish_generation);
         // 7. Deliver urgent stop replies and terminals strictly AFTER publish
@@ -1601,13 +1858,28 @@ impl ReleaseEngine {
         if let Some((t, outcome)) = finished_transition {
             self.intake.terminal(t, outcome);
         }
-        if let Some((old, ack_reply)) = superseded_and_ack {
-            self.intake.terminal(old, Outcome::Superseded);
+        if let Some((old, outcome, children, ack_reply)) = superseded_and_ack {
+            self.intake.terminal_with_children(old, outcome, children);
             self.intake.emit_reply(ack_reply);
+        }
+        if let Some(ack_reply) = deferred_ack {
+            self.intake.emit_reply(ack_reply);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ActiveSlot::Macro { parent, child_plan }) = self.active.as_mut() {
+            if child_plan.is_some() && !core.macro_child_running(parent.action()) {
+                if let Some(cp) = child_plan.take() {
+                    self.intake.retire_plan(cp);
+                }
+            }
         }
         if let Some(action) = self.active() {
             if let Some(outcome) = core.action_outcome(action) {
-                let installed = self.active.take().expect("active above");
+                let slot = self.active.take().expect("active above");
+                let (installed, child_plan) = slot.into_parts();
+                if let Some(cp) = child_plan {
+                    self.intake.retire_plan(cp);
+                }
                 let children = core.action_children(action);
                 self.intake.terminal_with_children(installed, outcome, children);
                 report.ended = Some((action, outcome));
@@ -1685,12 +1957,15 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// [`Self::new`] driven by a caller-supplied shared [`VirtualClock`].
     pub fn new_with_clock(
-        core: O,
+        mut core: O,
         boot: BootId,
         caps: Capacities,
         clock: VirtualClock,
     ) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
         let (engine, broker, tw, stop) = ReleaseEngine::new(boot, caps);
+        #[cfg(not(target_arch = "wasm32"))]
+        core.attach_closed_bitset(broker.closed_bitset());
+        core.set_boot_id(boot);
         (Self { core, engine, clock, dt: 0.02 }, broker, tw, stop)
     }
 
@@ -1729,11 +2004,18 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// One release.
     pub fn step(&mut self) -> ReleaseReport {
+        let clock = self.clock.clone();
+        self.step_with_clock(move || clock.now())
+    }
+
+    /// One release using an explicit live clock sampler `now_fn` for all in-release timestamps
+    /// (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`, pre-step, transmit, and post-output),
+    /// while release scheduling/deadline remains anchored to `self.clock`.
+    pub fn step_with_clock(&mut self, now_fn: impl FnMut() -> Instant) -> ReleaseReport {
         let started = self.clock.now();
         let release_deadline = started + Duration::from_secs_f64(self.dt);
         let next_gen = self.engine.releases() + 1;
-        let clock = &self.clock;
-        let mut report = self.engine.step(&mut self.core, || clock.now(), self.dt, release_deadline, next_gen);
+        let mut report = self.engine.step(&mut self.core, now_fn, self.dt, release_deadline, next_gen);
         // Extra sub-release hardware services at a pending transition's wake before the next release
         // (a transition committed in this release is first served at the next one).
         let mut next = report.poll.wake_before(release_deadline);

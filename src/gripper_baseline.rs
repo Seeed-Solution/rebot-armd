@@ -94,6 +94,35 @@ pub struct BaselineData {
     pub ts: Option<u64>,
 }
 
+impl BaselineData {
+    fn table(&self, dir: Direction, slow: bool) -> &Table {
+        match (dir, slow) {
+            (Direction::Close, false) => &self.close_fast,
+            (Direction::Close, true) => &self.close_slow,
+            (Direction::Open, false) => &self.open_fast,
+            (Direction::Open, true) => &self.open_slow,
+        }
+    }
+
+    fn coord(&self, q: f32) -> f32 {
+        let f = (q - self.lo_rad) / (self.hi_rad - self.lo_rad);
+        (f.clamp(0.0, 1.0) * BINS as f32 - 0.5).clamp(0.0, (BINS - 1) as f32)
+    }
+
+    /// Zero-alloc lookup matching [`FreeTorqueBaseline::estimate`].
+    pub fn estimate(&self, q: f32, dir: Direction, speed: f32) -> Option<Estimate> {
+        if !q.is_finite() { return None; }
+        let c = self.coord(q);
+        let slow = speed.abs() < SLOW_BAND_MAX_RAD_S;
+        for (d, s, other) in [(dir, slow, false), (dir, !slow, false), (dir.other(), slow, true), (dir.other(), !slow, true)] {
+            if let Some((m, sp)) = FreeTorqueBaseline::table_at(self.table(d, s), c) {
+                return Some(Estimate { baseline_nm: m, spread_nm: sp, other_direction: other });
+            }
+        }
+        None
+    }
+}
+
 /// Persisted free-motion torque baseline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FreeTorqueBaseline {
@@ -176,6 +205,13 @@ impl MoveSamples {
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
     pub fn iter(&self) -> impl Iterator<Item = &(f32, f32, f32)> { self.buf[..self.len].iter() }
+
+    /// Resets counters in place without reallocating or freeing the backing buffer.
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.stride = 1;
+        self.offered = 0;
+    }
 }
 
 /// One finished, unloaded move offered for learning.
@@ -351,15 +387,7 @@ impl FreeTorqueBaseline {
     /// Baseline at `q` moving in `dir` at |v| `speed`: the matching table, else the other speed
     /// band, else the other direction (with extra margin). None: nothing learned near `q`.
     pub fn estimate(&self, q: f32, dir: Direction, speed: f32) -> Option<Estimate> {
-        if !q.is_finite() { return None; }
-        let c = self.coord(q);
-        let slow = speed.abs() < SLOW_BAND_MAX_RAD_S;
-        for (d, s, other) in [(dir, slow, false), (dir, !slow, false), (dir.other(), slow, true), (dir.other(), !slow, true)] {
-            if let Some((m, sp)) = Self::table_at(self.table(d, s), c) {
-                return Some(Estimate { baseline_nm: m, spread_nm: sp, other_direction: other });
-            }
-        }
-        None
+        self.data_snapshot().estimate(q, dir, speed)
     }
 
     /// Learned moves of a direction (any bin).
@@ -448,6 +476,12 @@ pub const UNCALIBRATED_CLOSE_MARGIN_NM: f32 = 0.25;
 /// opening tables) max(that estimate's threshold, `contact_nm` + UNCALIBRATED_CLOSE_MARGIN_NM),
 /// at most CONTACT_CAP_FRACTION x `cap_nm`. None without `contact_nm` (torque contact off).
 pub fn closing_contact_threshold(b: Option<&FreeTorqueBaseline>, q: f32, speed: f32, contact_nm: Option<f32>, cap_nm: Option<f32>) -> Option<(f32, bool, Option<f32>)> {
+    let snap = b.map(FreeTorqueBaseline::data_snapshot);
+    closing_contact_threshold_data(snap.as_ref(), q, speed, contact_nm, cap_nm)
+}
+
+/// Zero-alloc variant of [`closing_contact_threshold`] over `Copy` [`BaselineData`].
+pub fn closing_contact_threshold_data(b: Option<&BaselineData>, q: f32, speed: f32, contact_nm: Option<f32>, cap_nm: Option<f32>) -> Option<(f32, bool, Option<f32>)> {
     let floor = contact_nm?;
     let e = b.and_then(|b| b.estimate(q, Direction::Close, speed));
     match e {

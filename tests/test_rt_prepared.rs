@@ -114,9 +114,21 @@ fn replay_slot(fx: &Fx, tool_digest: u64) -> PlanSlot {
     }
     let mut s = [0.0; MAX_DOF];
     s[..start.len()].copy_from_slice(&start);
+    slot.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(&start, &start, 0.2, None, true)
+            .unwrap(),
+    );
     slot.primitive = Primitive::Prepared {
         child: None, dof: start.len() as u8, start: s,
-        kind: PathKind::Replay { episode: EpisodeRef::new("ep1").unwrap(), speed: 1.0, gripper: false, sample_dt: 0.02, tool_digest },
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("ep1").unwrap(),
+            speed: 1.0,
+            gripper: false,
+            sample_dt: 0.02,
+            approach_duration_s: 0.2,
+            approach_power_scale: None,
+            tool_digest,
+        },
         duration_s: 1.0, power_scale: None,
     };
     slot
