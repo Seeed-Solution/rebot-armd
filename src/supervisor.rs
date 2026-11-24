@@ -2605,9 +2605,10 @@ impl SupervisorInner {
         dt: f64,
         generation: u64,
         keep: bool,
-        release_bound: Option<(Instant, Instant)>,
+        release_deadline: Option<Instant>,
     ) -> TickPublished {
-        let timestamp = self.tick_control_inner(dt, release_bound);
+        let mut sys_now = Instant::now;
+        let timestamp = self.tick_control_inner(dt, release_deadline, &mut sys_now);
         self.publish_at(timestamp, generation, keep)
     }
 
@@ -4690,21 +4691,50 @@ impl SupervisorInner {
     /// timestamp (the recording sample's). The control loop fills its published sample with
     /// [`Self::fill_observation`] at this timestamp.
     pub fn tick_control(&mut self, dt: f64) -> f64 {
-        self.tick_control_inner(dt, None)
+        let mut sys_now = Instant::now;
+        self.tick_control_inner(dt, None, &mut sys_now)
     }
 
     /// [`Self::tick_control`] bounded by an explicit control release deadline (`now`,
     /// `release_deadline`) so TX start-cutoffs never run past `release_deadline - publish_margin`.
     pub fn tick_control_with_deadline(&mut self, dt: f64, now: Instant, release_deadline: Instant) -> f64 {
-        self.tick_control_inner(dt, Some((now, release_deadline)))
+        let mut fixed_now = move || now;
+        self.tick_control_inner(dt, Some(release_deadline), &mut fixed_now)
     }
 
-    fn tick_control_inner(&mut self, dt: f64, release_bound: Option<(Instant, Instant)>) -> f64 {
+    /// [`Self::tick_control`] bounded by `release_deadline` with a live monotonic clock sampler
+    /// `now_fn` so pre-step and transmit-point macro deadline checks always take fresh clock reads.
+    pub fn tick_control_with_clock(
+        &mut self,
+        dt: f64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        self.tick_control_inner(dt, Some(release_deadline), now_fn)
+    }
+
+    /// Legacy [`Self::tick_control`] with an injected clock sampler (for deterministic tests of
+    /// mid-tick deadline checks without release-deadline capping).
+    #[doc(hidden)]
+    pub fn tick_control_legacy_with_clock(
+        &mut self,
+        dt: f64,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> f64 {
+        self.tick_control_inner(dt, None, now_fn)
+    }
+
+    fn tick_control_inner(
+        &mut self,
+        dt: f64,
+        release_deadline: Option<Instant>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> f64 {
         let applied_tx_cap = if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.lock() {
                 let drv_now = drv.clock_now();
-                let cap = match release_bound {
-                    Some((now, release_deadline)) => self.driver_tx_release_cap(drv_now, now, release_deadline),
+                let cap = match release_deadline {
+                    Some(release_deadline) => self.driver_tx_release_cap(drv_now, now_fn(), release_deadline),
                     None => {
                         let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
                         drv_now + period.saturating_sub(self.tx_release_publish_margin())
@@ -5533,17 +5563,33 @@ impl SupervisorInner {
         self.torque_guard_tick(servo_dt);
         // Supply-current estimate (src/power.rs).
         self.power_tick(servo_dt);
-        // Enforce whole-macro parent deadline FIRST, then contact guard and child deadline,
-        // BEFORE stepping any trajectory or submitting bus targets: an expired parent quiesces to
-        // a stationary hold immediately in THIS tick so no post-deadline motion target is advanced
-        // or transmitted.
+        // Enforce whole-macro parent and child deadlines in ONE function with a FRESH clock read
+        // immediately BEFORE stepping any trajectory or submitting bus targets: an expired parent
+        // or child quiesces to a stationary hold in THIS tick so no post-deadline motion target is
+        // advanced or transmitted. Snapshot the pre-step pose on the stack (zero alloc) so the
+        // transmit-point fresh-clock recheck can roll back if a deadline expires during Step 3.
         if self.macro_run.is_some() {
-            let pre_tick_now = release_bound.map_or_else(Instant::now, |(now, _)| now);
-            if !self.expire_macro_parent(pre_tick_now) {
+            let pre_step_now = now_fn();
+            if !self.enforce_macro_deadlines(pre_step_now) {
                 self.step_macro_contact();
-                self.expire_macro_child(pre_tick_now);
             }
         }
+        let macro_pre_step_hold: Option<actions::MacroPreStepHold> = self.macro_run.as_ref().and_then(|m| {
+            self.active_trajectory
+                .as_ref()
+                .filter(|a| a.action_id == Some(m.id))
+                .map(|a| {
+                    let dof = self.commanded_positions.len().min(crate::rt_core::mailbox::MAX_DOF);
+                    let mut positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+                    positions[..dof].copy_from_slice(&self.commanded_positions[..dof]);
+                    actions::MacroPreStepHold {
+                        action_id: m.id,
+                        is_gripper: matches!(a.reference, Reference::Gripper(_)),
+                        dof,
+                        positions,
+                    }
+                })
+        });
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
@@ -6061,6 +6107,17 @@ impl SupervisorInner {
             let _ = self.mit_hand_back("park");
         }
         self.mit_maybe_activate();
+        // Second fresh-clock macro deadline check immediately at the transmit point: if the parent
+        // or child deadline expired after the pre-step check (including during Step 3), roll back
+        // any stepped macro reference to the pre-step hold pose so no post-deadline target is sent.
+        if self.macro_run.is_some() {
+            let tx_now = now_fn();
+            let rollback = reference_stepped.then_some(macro_pre_step_hold.as_ref()).flatten();
+            if self.enforce_macro_deadlines_inner(tx_now, rollback) {
+                deferred_done = None;
+                reference_stepped = false;
+            }
+        }
         let gravity_output_enabled = self.gravity_output_enabled();
         self.tick_phase(1);
         // Hold only while torque may be active and fresh valid feedback permits output.
@@ -6450,14 +6507,11 @@ impl SupervisorInner {
             self.step_gravity_comp_exit(servo_dt, gravity_stiff_hold_completed);
         }
 
-        let tick_now = release_bound.map_or_else(Instant::now, |(now, _)| now);
+        let tick_now = now_fn();
         if let Some(done) = deferred_done {
             if !self.safety.state().is_stopped() {
                 self.pending_deferred_done = Some(done);
             }
-        }
-        if self.macro_run.is_some() {
-            self.expire_macro_child(tick_now);
         }
         if self.pending_deferred_done.is_some() {
             let current_epoch = self.safety.epoch_id();
@@ -6493,14 +6547,14 @@ impl SupervisorInner {
                         }
                     }
             });
-            let parent_expired_for_sub = matches!(
+            let deadline_expired_for_sub = matches!(
                 self.pending_deferred_done.as_ref().map(|d| d.target),
                 Some(DeferredCompletionTarget::MacroSub { action_id, .. })
-                    if self.macro_run.as_ref().is_some_and(|m| m.id == action_id && m.deadline.is_some_and(|d| tick_now > d))
+                    if self.macro_deadline_elapsed(action_id, tick_now)
             );
             if !done_still_valid {
                 self.pending_deferred_done = None;
-            } else if tick_output_accepted && !parent_expired_for_sub {
+            } else if tick_output_accepted && !deadline_expired_for_sub {
                 if let Some(done) = self.pending_deferred_done.take() {
                     if done.clear_releasing {
                         self.releasing = false;
@@ -9123,7 +9177,7 @@ impl ArmSupervisor {
                 dt,
                 generation,
                 keep,
-                Some((body_start, release_deadline)),
+                Some(release_deadline),
             );
             let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;

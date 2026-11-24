@@ -7,6 +7,15 @@
 use super::*;
 use crate::macro_action::{ChildTicket, ContactGuard, ContactWatch};
 
+/// Stack-only pre-step snapshot captured immediately before Step 3 so the transmit-point
+/// macro deadline recheck can roll back any stepped macro child reference without allocating.
+pub(super) struct MacroPreStepHold {
+    pub(super) action_id: u64,
+    pub(super) is_gripper: bool,
+    pub(super) dof: usize,
+    pub(super) positions: [f32; crate::rt_core::mailbox::MAX_DOF],
+}
+
 impl SupervisorInner {
     /// True on a real/physical driver (non-sim, non-mock) where missing jaw calibration
     /// curves must not fall back to `JawOpening::sim_default()`.
@@ -651,20 +660,97 @@ impl SupervisorInner {
             .is_some_and(|d| now > d + grace)
     }
 
-    /// **Single owner-side whole-macro parent deadline check** (M3): ends the current macro when
-    /// `m.deadline` has passed by entering [`Self::enter_macro_finish_rt`] (which immediately
-    /// quiesces any active child trajectory to a stationary hold). Called pre-output BEFORE
-    /// trajectory stepping and bus TX so an expired parent never advances or transmits another
-    /// child motion target on that tick, and reused as a fallback in `reconcile_action`.
-    pub fn expire_macro_parent(&mut self, now: Instant) -> bool {
-        let Some((id, timeout_code)) = self
-            .macro_run
-            .as_ref()
-            .filter(|m| !m.stop_requested && !m.finishing)
-            .and_then(|m| m.deadline.filter(|d| now > *d).map(|_| (m.id, m.timeout_code)))
-        else {
+    /// True when macro `action_id` has an elapsed parent deadline or elapsed running-child
+    /// deadline at `now` (pure zero-alloc predicate used to guard post-output `MacroSub`
+    /// deferred completion).
+    pub(super) fn macro_deadline_elapsed(&self, action_id: u64, now: Instant) -> bool {
+        self.macro_run.as_ref().is_some_and(|m| {
+            m.id == action_id
+                && !m.stop_requested
+                && !m.finishing
+                && (m.deadline.is_some_and(|d| now > d)
+                    || (m.sub == SubState::Running && m.child.deadline.is_some_and(|d| now > d)))
+        })
+    }
+
+    /// **Single owner-side macro deadline enforcement** (Round 3 M3): checks BOTH the
+    /// whole-macro parent deadline (`m.deadline`, highest priority) and the running child
+    /// deadline (`m.child.deadline`) against a fresh clock sample `now`.
+    ///
+    /// Called with a fresh clock read immediately before Step 3 reference advance and again
+    /// immediately at the transmit point (with `pre_step_rollback` when Step 3 already stepped
+    /// a macro child on this tick, rolling back `commanded_positions` to the stationary hold
+    /// pose so no post-deadline motion target is transmitted), plus as the post-output fallback
+    /// in `reconcile_action`. Returns `true` iff a parent or child deadline expired.
+    pub(super) fn enforce_macro_deadlines_inner(
+        &mut self,
+        now: Instant,
+        pre_step_rollback: Option<&MacroPreStepHold>,
+    ) -> bool {
+        enum MacroExpiry {
+            Parent {
+                id: u64,
+                timeout_code: crate::safety::BoundedText<48>,
+            },
+            Child {
+                id: u64,
+            },
+        }
+        let expiry = self.macro_run.as_ref().and_then(|m| {
+            if m.stop_requested || m.finishing {
+                return None;
+            }
+            if m.deadline.is_some_and(|d| now > d) {
+                return Some(MacroExpiry::Parent {
+                    id: m.id,
+                    timeout_code: m.timeout_code,
+                });
+            }
+            if m.sub == SubState::Running && m.child.deadline.is_some_and(|d| now > d) {
+                return Some(MacroExpiry::Child { id: m.id });
+            }
+            None
+        });
+        let Some(expiry) = expiry else {
             return false;
         };
+        let expired_id = match expiry {
+            MacroExpiry::Parent { id, .. } | MacroExpiry::Child { id } => id,
+        };
+        if let Some(hold) = pre_step_rollback.filter(|h| h.action_id == expired_id) {
+            let n = hold.dof.min(self.commanded_positions.len());
+            self.commanded_positions[..n].copy_from_slice(&hold.positions[..n]);
+            if hold.is_gripper {
+                self.hold_gripper_at_measured();
+                self.releasing = false;
+            }
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+            self.commanded_velocities.fill(0.0);
+            self.commanded_accelerations.fill(0.0);
+            crate::rt_core::scratch::copy_into(&mut self.last_commanded_velocities, &self.commanded_velocities);
+            self.tracking.invalidate();
+            self.gripper_ref_done = false;
+            self.gripper_ref_holding = false;
+            if !self.pending_normal_unload {
+                self.safety.mark_motion_finished();
+            }
+            if self.is_rt_owner() && self.driver.is_some() {
+                if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == expired_id) {
+                    m.hold_pending_bus_accept = true;
+                }
+            }
+        }
+        match expiry {
+            MacroExpiry::Parent { id, timeout_code } => self.finish_expired_macro_parent(id, timeout_code),
+            MacroExpiry::Child { id } => self.finish_expired_macro_child(id),
+        }
+    }
+
+    fn finish_expired_macro_parent(
+        &mut self,
+        id: u64,
+        timeout_code: crate::safety::BoundedText<48>,
+    ) -> bool {
         let code_str = if timeout_code.is_empty() { "TIMEOUT" } else { timeout_code.as_str() };
         self.enter_macro_finish_rt(
             id,
@@ -679,9 +765,45 @@ impl SupervisorInner {
         .is_ok()
     }
 
+    fn finish_expired_macro_child(&mut self, id: u64) -> bool {
+        let _ = self.quiesce_macro_children_rt(id);
+        let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else {
+            return false;
+        };
+        let (code, message) = m.child.timeout.take().unwrap_or_else(|| {
+            (
+                crate::safety::BoundedText::new("TIMEOUT"),
+                crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+            )
+        });
+        m.child.deadline = None;
+        m.sub = SubState::Failed { code, message };
+        true
+    }
+
+    /// Checks BOTH the whole-macro parent deadline and running child deadline at `now` through
+    /// the single [`Self::enforce_macro_deadlines_inner`] path.
+    pub fn enforce_macro_deadlines(&mut self, now: Instant) -> bool {
+        self.enforce_macro_deadlines_inner(now, None)
+    }
+
+    /// Ends the current macro when `m.deadline` has passed by entering
+    /// [`Self::enter_macro_finish_rt`]. Prefer [`Self::enforce_macro_deadlines`] on tick paths.
+    pub fn expire_macro_parent(&mut self, now: Instant) -> bool {
+        let Some((id, timeout_code)) = self
+            .macro_run
+            .as_ref()
+            .filter(|m| !m.stop_requested && !m.finishing)
+            .and_then(|m| m.deadline.filter(|d| now > *d).map(|_| (m.id, m.timeout_code)))
+        else {
+            return false;
+        };
+        self.finish_expired_macro_parent(id, timeout_code)
+    }
+
     /// Ends the running child of the current macro when its deadline passed: the motion
-    /// stops and the child fails with the macro's timeout code (the parent stays running, its
-    /// worker ends it with that code). True when it did.
+    /// stops cleanly to a zero-velocity hold and the child fails with the macro's timeout code
+    /// (the parent stays running, its worker ends it with that code). True when it did.
     pub fn expire_macro_child(&mut self, now: Instant) -> bool {
         let Some(m) = self.macro_run.as_ref() else { return false; };
         if m.stop_requested
@@ -692,21 +814,7 @@ impl SupervisorInner {
         {
             return false;
         }
-        let id = m.id;
-        if self.is_rt_owner() {
-            let _ = self.quiesce_macro_children_rt(id);
-        } else {
-            if self.macro_child_active_or_pending(id) { self.stop_motion(); }
-            if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
-        }
-        let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
-        let (code, message) = m.child.timeout.take().unwrap_or_else(|| (
-            crate::safety::BoundedText::new("TIMEOUT"),
-            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
-        ));
-        m.child.deadline = None;
-        m.sub = SubState::Failed { code, message };
-        true
+        self.finish_expired_macro_child(m.id)
     }
 
     /// The contact guard of the current macro child, once per tick while its motion runs
@@ -1617,12 +1725,12 @@ impl SupervisorInner {
             return;
         }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
-            // Fallback check through the single `expire_macro_parent` entry point (also enforced
-            // pre-output before Step 3/4 in `tick_inner`).
-            if self.expire_macro_parent(now) {
+            // Post-output fallback through the single `enforce_macro_deadlines` entry point
+            // (also enforced with fresh clock reads immediately before Step 3 and again at the
+            // transmit point in `tick_control_inner`).
+            if self.enforce_macro_deadlines(now) && self.macro_run.as_ref().is_none_or(|m| m.finishing) {
                 return;
             }
-            self.expire_macro_child(now);
         }
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let pending_done_for_id = self.pending_deferred_done.as_ref().is_some_and(|d| {

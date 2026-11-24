@@ -4026,3 +4026,460 @@ async fn r3_m4_replay_pose_change_during_planning_refused_never_installs_unswept
         assert!(fx.core.active_trajectory.is_none());
     }
 }
+
+#[derive(Clone)]
+struct RecordingHoldDriver {
+    q: Arc<Mutex<Vec<f32>>>,
+    written: Arc<Mutex<Vec<(Vec<f32>, Vec<f32>)>>>,
+    read_sleep_ms: Arc<std::sync::atomic::AtomicU64>,
+    clock: Option<VirtualClock>,
+}
+
+impl RecordingHoldDriver {
+    fn new(init_q: &[f32], clock: Option<VirtualClock>) -> Self {
+        Self {
+            q: Arc::new(Mutex::new(init_q.to_vec())),
+            written: Arc::new(Mutex::new(Vec::new())),
+            read_sleep_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            clock,
+        }
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.as_ref().map_or_else(Instant::now, VirtualClock::now)
+    }
+
+    fn clear_writes(&self) {
+        self.written.lock().unwrap().clear();
+    }
+
+    fn last_write(&self) -> (Vec<f32>, Vec<f32>) {
+        self.written
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("driver must have recorded at least one write")
+    }
+}
+
+impl armd::driver::ArmDriver for RecordingHoldDriver {
+    fn capabilities(&self) -> armd::driver::DriverCapabilities {
+        armd::driver::DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: true,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        }
+    }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+    fn clock_now(&self) -> Instant { self.now() }
+    fn enable_state(&self) -> armd::driver::EnableState { armd::driver::EnableState::Enabled }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool {
+        self.q.lock().unwrap().len() == dof
+    }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        vec![Some(self.now()); self.q.lock().unwrap().len()]
+    }
+    fn feedback_seqs(&self) -> Vec<u64> {
+        vec![10; self.q.lock().unwrap().len()]
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+        let ms = self.read_sleep_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        let q = self.q.lock().unwrap();
+        Ok(q.iter()
+            .map(|&p| armd::model::JointState {
+                position: p,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 30.0,
+            })
+            .collect())
+    }
+    fn write_joint_targets(&mut self, targets: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
+        let pos: Vec<f32> = targets.iter().map(|t| t.position).collect();
+        let vel: Vec<f32> = targets.iter().map(|t| t.velocity.unwrap_or(0.0)).collect();
+        self.written.lock().unwrap().push((pos, vel));
+        Ok(())
+    }
+    fn write_joint_targets_bounded(
+        &mut self,
+        targets: &[armd::driver::JointTarget],
+    ) -> Result<armd::driver::TxBatchOutcome, armd::driver::ArmDriverError> {
+        let pos: Vec<f32> = targets.iter().map(|t| t.position).collect();
+        let vel: Vec<f32> = targets.iter().map(|t| t.velocity.unwrap_or(0.0)).collect();
+        self.written.lock().unwrap().push((pos, vel));
+        Ok(armd::driver::TxBatchOutcome::Complete)
+    }
+    fn set_torque(&mut self, _enable: bool) -> Result<(), armd::driver::ArmDriverError> { Ok(()) }
+}
+
+fn driven_inner(drv: RecordingHoldDriver) -> SupervisorInner {
+    let mut inner = SupervisorInner::new(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    });
+    inner.lease_enabled = false;
+    inner.driver = Some(Mutex::new(Box::new(drv)));
+    inner.commanded_positions = INSPECT.to_vec();
+    inner.measured_positions = INSPECT.to_vec();
+    inner.target_positions = INSPECT.to_vec();
+    {
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    for _ in 0..3 {
+        inner.tick(DT);
+    }
+    inner
+}
+
+#[test]
+fn r3_m3_deadline_between_before_output_and_check_sends_no_target_both_owners() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use armd::rt_core::ops::Checkpoint;
+
+    // Helper: construct a fresh Executor ReleaseFixture with a running macro parent + joint child
+    // that has already advanced 2 ticks (moving actively along J1 toward +0.40 rad).
+    let setup_executor_moving = |parent_offset_ms: Option<u64>, child_timeout_s: f64| {
+        let clock = VirtualClock::starting_at(Instant::now());
+        let drv = RecordingHoldDriver::new(&INSPECT, Some(clock.clone()));
+        let inner = driven_inner(drv.clone());
+        let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BOOT,
+            Capacities { commands: 8, plans: 4, replies: 32 },
+            clock.clone(),
+        );
+        fx.step();
+        let mut begin = BeginMacroSpec::new(MacroKind::Place, BOOT);
+        let parent_dl = parent_offset_ms.map(|ms| fx.now() + Duration::from_millis(ms));
+        begin.macro_deadline = parent_dl;
+        begin.timeout_code = armd::safety::BoundedText::new("PLACE_TIMEOUT");
+        let r_b = b
+            .submit(
+                ClientId(1),
+                1,
+                auth(&fx),
+                fx.now() + DEFAULT_ACTION_DEADLINE,
+                Submit::Action(ActionSubmit::BeginMacro(begin)),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let parent = fx.active().unwrap();
+        let _ = drain_all(&mut b);
+
+        let snap = snap_of(&fx);
+        let mut target = snap.commanded_positions.clone();
+        target[0] += 0.40;
+        let max_vel: Vec<f32> = snap.env.planning_limits(None).iter().map(|l| l.max_velocity).collect();
+        let c = ChildSpec {
+            ticket: ChildTicket { parent, child_seq: 1 },
+            timeout_s: child_timeout_s,
+            timeout_code: "CHILD_TIMEOUT",
+            contact: None,
+        };
+        let slot = prepare_child_joint_slot(&snap.commanded_positions, &target, &max_vel, 0.2, None, c).unwrap();
+        submit_child(&mut b, ClientId(1), 2, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, BOOT, slot, true).unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let _ = drain_all(&mut b);
+        let rep_mid = fx.step();
+        assert!(rep_mid.ended.is_none());
+        let q_before = fx.core.commanded_positions.clone();
+        assert!(q_before[0] > INSPECT[0] + 1e-4, "child must be moving before expiry test");
+        assert!(fx.core.commanded_velocities[0].abs() > 1e-4, "velocity must be non-zero before expiry");
+        drv.clear_writes();
+        (fx, b, clock, drv, parent, r_b, q_before)
+    };
+
+    // === 1a) Executor: PARENT deadline falls strictly BETWEEN BeforeOutput and pre-step Check #1 ===
+    {
+        // Begin at t0 + 20ms; after begin(+20ms), install(+20ms), mid(+20ms), clock is at t0 + 80ms.
+        // Set parent deadline to +65ms from begin (= t0 + 85ms): still alive at BeforeOutput (t0 + 80ms),
+        // expired at Check #1 (t0 + 88ms > t0 + 85ms), while still well inside release_deadline (t0 + 100ms).
+        let (mut fx, mut b, clock, drv, parent, r_b, q_before) = setup_executor_moving(Some(65), 10.0);
+        let base_now = clock.now();
+        let parent_dl = fx.core.macro_run.as_ref().unwrap().deadline.unwrap();
+        assert!(base_now < parent_dl, "BeforeOutput sample must still be strictly before parent deadline");
+        let after_deadline = parent_dl + Duration::from_millis(3);
+
+        let saw_before_output = Arc::new(AtomicBool::new(false));
+        let post_bo_reads = Arc::new(AtomicUsize::new(0));
+        {
+            let flag = Arc::clone(&saw_before_output);
+            fx.on_checkpoint(move |cp| {
+                if cp == Checkpoint::BeforeOutput {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+        let rep = fx.step_with_clock(|| {
+            if !saw_before_output.load(Ordering::SeqCst) {
+                return base_now;
+            }
+            let idx = post_bo_reads.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                // `BeforeOutput` checkpoint's own sample (`out_ctx.now`): BEFORE deadline!
+                base_now
+            } else {
+                // Every fresh clock read inside `advance_output_with_clock` (including Check #1): AFTER deadline!
+                after_deadline
+            }
+        });
+        assert!(post_bo_reads.load(Ordering::SeqCst) >= 3, "must have taken fresh reads after BeforeOutput");
+        assert_eq!(rep.ended, Some((parent, Outcome::Failed("PLACE_TIMEOUT"))));
+        assert!(
+            (fx.core.commanded_positions[0] - q_before[0]).abs() < 1e-6,
+            "Executor Check #1 must not advance reference after parent deadline: before={} after={}",
+            q_before[0],
+            fx.core.commanded_positions[0]
+        );
+        assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        let (w_pos, w_vel) = drv.last_write();
+        assert!(
+            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
+            "Executor Check #1 must send stationary hold only, got pos={} vel={:?}",
+            w_pos[0],
+            w_vel
+        );
+        let reps = drain_all(&mut b);
+        assert!(reps.iter().any(|(_, r)| matches!(
+            r,
+            Reply::Terminal { request, action, outcome: Outcome::Failed("PLACE_TIMEOUT"), .. }
+                if *request == r_b && *action == parent
+        )));
+    }
+
+    // === 1b) Executor: PARENT deadline falls strictly BETWEEN Check #1 (pre-step) and Check #2 (transmit) ===
+    {
+        let (mut fx, mut b, clock, drv, parent, r_b, q_before) = setup_executor_moving(Some(65), 10.0);
+        let base_now = clock.now();
+        let parent_dl = fx.core.macro_run.as_ref().unwrap().deadline.unwrap();
+        assert!(base_now < parent_dl);
+        let after_deadline = parent_dl + Duration::from_millis(3);
+
+        let saw_before_output = Arc::new(AtomicBool::new(false));
+        let post_bo_reads = Arc::new(AtomicUsize::new(0));
+        {
+            let flag = Arc::clone(&saw_before_output);
+            fx.on_checkpoint(move |cp| {
+                if cp == Checkpoint::BeforeOutput {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+        let rep = fx.step_with_clock(|| {
+            if !saw_before_output.load(Ordering::SeqCst) {
+                return base_now;
+            }
+            let idx = post_bo_reads.fetch_add(1, Ordering::SeqCst);
+            // idx 0 = BeforeOutput, idx 1 = driver_tx_release_cap, idx 2 = Check #1 (pre-step) -> ALL BEFORE deadline!
+            // idx 3 = Check #2 (transmit point), idx 4 = post-output -> AFTER deadline!
+            if idx <= 2 {
+                base_now
+            } else {
+                after_deadline
+            }
+        });
+        assert!(post_bo_reads.load(Ordering::SeqCst) >= 4, "must have run both Check #1 and Check #2");
+        assert_eq!(rep.ended, Some((parent, Outcome::Failed("PLACE_TIMEOUT"))));
+        assert!(
+            (fx.core.commanded_positions[0] - q_before[0]).abs() < 1e-6,
+            "Executor Check #2 must roll back stepped reference to hold pose: before={} after={}",
+            q_before[0],
+            fx.core.commanded_positions[0]
+        );
+        assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        let (w_pos, w_vel) = drv.last_write();
+        assert!(
+            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
+            "Executor Check #2 must transmit stationary hold only (never stepped target), got pos={} vel={:?}",
+            w_pos[0],
+            w_vel
+        );
+        let reps = drain_all(&mut b);
+        assert!(reps.iter().any(|(_, r)| matches!(
+            r,
+            Reply::Terminal { request, action, outcome: Outcome::Failed("PLACE_TIMEOUT"), .. }
+                if *request == r_b && *action == parent
+        )));
+    }
+
+    // === 1c) Executor: CHILD deadline falls between BeforeOutput/Check #1 and Check #2 (parent alive) ===
+    for expire_at_tx_only in [false, true] {
+        // Parent deadline far away (+10s), child timeout = 0.045s (45ms from install):
+        // after install(+20ms) + mid(+20ms) = 40ms elapsed -> 5ms left at BeforeOutput!
+        let (mut fx, _b, clock, drv, parent, _r_b, q_before) = setup_executor_moving(Some(10_000), 0.045);
+        let base_now = clock.now();
+        let child_dl = fx.core.macro_run.as_ref().unwrap().child.deadline.unwrap();
+        assert!(base_now < child_dl, "child must still be before deadline at BeforeOutput");
+        let after_child_dl = child_dl + Duration::from_millis(3);
+
+        let saw_before_output = Arc::new(AtomicBool::new(false));
+        let post_bo_reads = Arc::new(AtomicUsize::new(0));
+        {
+            let flag = Arc::clone(&saw_before_output);
+            fx.on_checkpoint(move |cp| {
+                if cp == Checkpoint::BeforeOutput {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+        let threshold = if expire_at_tx_only { 2 } else { 0 };
+        let rep = fx.step_with_clock(|| {
+            if !saw_before_output.load(Ordering::SeqCst) {
+                return base_now;
+            }
+            let idx = post_bo_reads.fetch_add(1, Ordering::SeqCst);
+            if idx <= threshold { base_now } else { after_child_dl }
+        });
+        assert!(rep.ended.is_none(), "child deadline expiry must leave parent running");
+        assert_eq!(fx.active(), Some(parent));
+        assert!(matches!(
+            fx.core.macro_run.as_ref().map(|m| m.sub),
+            Some(SubState::Failed { code, .. }) if code.as_str() == "CHILD_TIMEOUT"
+        ));
+        assert!(
+            (fx.core.commanded_positions[0] - q_before[0]).abs() < 1e-6,
+            "Executor child expiry (tx_only={expire_at_tx_only}) must not advance reference"
+        );
+        assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        let (w_pos, w_vel) = drv.last_write();
+        assert!(
+            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
+            "Executor child expiry (tx_only={expire_at_tx_only}) must transmit stationary hold only"
+        );
+    }
+
+    // Helper: construct a fresh Legacy SupervisorInner with a running macro parent + joint child.
+    let setup_legacy_moving = |parent_deadline: Option<Instant>, child_deadline: Option<Instant>| {
+        let drv = RecordingHoldDriver::new(&INSPECT, None);
+        let mut inner = driven_inner(drv.clone());
+        let ep = inner.safety.epoch_id();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        let id = SupervisorInner::begin_orchestrated_action(a, "place", None, ep).unwrap();
+        if let Some(m) = inner.macro_run.as_mut() {
+            m.deadline = parent_deadline;
+            m.timeout_code = armd::safety::BoundedText::new("PLACE_TIMEOUT");
+        }
+        let mut target = inner.commanded_positions.clone();
+        target[0] += 0.40;
+        let limits = inner.config.limits.clone();
+        let s2 = inner.current_admission_stamp();
+        let a2 = inner.check_admission(s2).unwrap();
+        SupervisorInner::install_macro_quintic(a2, id, target, &limits).unwrap();
+        if let Some(cdl) = child_deadline {
+            inner.arm_macro_child(id, cdl, "CHILD_TIMEOUT", "child timed out".into());
+        }
+        inner.tick(DT);
+        inner.tick(DT);
+        let q_before = inner.commanded_positions.clone();
+        assert!(q_before[0] > INSPECT[0] + 1e-4, "legacy child must be moving before expiry");
+        assert!(inner.commanded_velocities[0].abs() > 1e-4, "legacy velocity must be non-zero");
+        drv.clear_writes();
+        (inner, drv, id, q_before)
+    };
+
+    // === 2a) Legacy: PARENT deadline before Check #1 AND between Check #1 and Check #2 ===
+    for expire_at_tx_only in [false, true] {
+        let now0 = Instant::now();
+        let parent_dl = now0 + Duration::from_secs(60);
+        let (mut inner, drv, id, q_before) = setup_legacy_moving(Some(parent_dl), None);
+        let before_dl = parent_dl - Duration::from_millis(5);
+        let after_dl = parent_dl + Duration::from_millis(5);
+        let reads = AtomicUsize::new(0);
+        let mut clock_fn = || {
+            let idx = reads.fetch_add(1, Ordering::SeqCst);
+            if expire_at_tx_only && idx == 0 {
+                // Check #1 sees before_dl -> Step 3 steps trajectory; Check #2 (idx == 1) sees after_dl!
+                before_dl
+            } else {
+                after_dl
+            }
+        };
+        inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
+        assert!(
+            reads.load(Ordering::SeqCst) >= if expire_at_tx_only { 3 } else { 2 },
+            "legacy tick must perform fresh clock reads"
+        );
+        assert!(
+            (inner.commanded_positions[0] - q_before[0]).abs() < 1e-6,
+            "Legacy parent expiry (tx_only={expire_at_tx_only}) must not advance reference: before={} after={}",
+            q_before[0],
+            inner.commanded_positions[0]
+        );
+        assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        let (w_pos, w_vel) = drv.last_write();
+        assert!(
+            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
+            "Legacy parent expiry (tx_only={expire_at_tx_only}) must send stationary hold only, got pos={} vel={:?}",
+            w_pos[0],
+            w_vel
+        );
+        let act = inner.last_action.as_ref().expect("finished action record");
+        assert_eq!(act.id, id);
+        assert_eq!(act.state, "failed");
+        assert_eq!(act.code.as_deref(), Some("PLACE_TIMEOUT"));
+    }
+
+    // === 2b) Legacy: CHILD deadline between Check #1 and Check #2 (parent alive, zero coast) ===
+    {
+        let now0 = Instant::now();
+        let parent_dl = now0 + Duration::from_secs(120);
+        let child_dl = now0 + Duration::from_secs(60);
+        let (mut inner, drv, id, q_before) = setup_legacy_moving(Some(parent_dl), Some(child_dl));
+        let before_dl = child_dl - Duration::from_millis(5);
+        let after_dl = child_dl + Duration::from_millis(5);
+        let reads = AtomicUsize::new(0);
+        let mut clock_fn = || {
+            let idx = reads.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 { before_dl } else { after_dl }
+        };
+        inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
+        assert!(inner.macro_alive(id), "child timeout must keep legacy parent alive");
+        assert!(matches!(
+            inner.macro_run.as_ref().map(|m| m.sub),
+            Some(SubState::Failed { code, .. }) if code.as_str() == "CHILD_TIMEOUT"
+        ));
+        assert!(
+            (inner.commanded_positions[0] - q_before[0]).abs() < 1e-6,
+            "Legacy child expiry at Check #2 must roll back with zero braking coast"
+        );
+        assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        let (w_pos, w_vel) = drv.last_write();
+        assert!(
+            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
+            "Legacy child expiry must send stationary hold only"
+        );
+    }
+
+    // === 2c) Legacy: real wall-clock `inner.tick(DT)` where deadline passes during RX read ===
+    {
+        let (mut inner, drv, id, q_before) = setup_legacy_moving(None, None);
+        // Set parent deadline 10ms in the future (still alive when `tick()` starts!), and stall
+        // driver RX read for 30ms so the fresh `Instant::now()` before Step 3 catches expiry.
+        inner.macro_run.as_mut().unwrap().deadline = Some(Instant::now() + Duration::from_millis(10));
+        drv.read_sleep_ms.store(30, Ordering::SeqCst);
+        let obs = inner.tick(DT);
+        assert!(
+            (inner.commanded_positions[0] - q_before[0]).abs() < 1e-6,
+            "Legacy real-clock tick must not advance after mid-tick parent deadline"
+        );
+        assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        let (w_pos, w_vel) = drv.last_write();
+        assert!(
+            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
+            "Legacy real-clock tick must transmit stationary hold only"
+        );
+        assert_eq!(obs.action.as_ref().map(|a| (a.id, a.state.as_str(), a.code.as_deref())), Some((id, "failed", Some("PLACE_TIMEOUT"))));
+    }
+}

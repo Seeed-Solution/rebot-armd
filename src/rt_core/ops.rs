@@ -594,6 +594,19 @@ pub trait CoreOps {
     ) -> f64 {
         self.advance_output(dt, generation)
     }
+    /// Release-bounded [`Self::advance_output`] carrying a live monotonic clock sampler `now_fn`
+    /// and absolute `release_deadline` so pre-step and transmit-point deadline checks take fresh
+    /// clock reads rather than reusing `Checkpoint::BeforeOutput`.
+    fn advance_output_with_clock(
+        &mut self,
+        dt: f64,
+        generation: u64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        let now = now_fn();
+        self.advance_output_with_deadline(dt, generation, now, release_deadline)
+    }
     /// Publishes the state computed by [`Self::advance_output`] at `timestamp` with `generation`.
     fn publish(&mut self, _timestamp: f64, _generation: u64) {}
     /// Current local monotonic observation timestamp (seconds), used when publishing after
@@ -1226,6 +1239,16 @@ impl CoreOps for SupervisorInner {
         self.tick_control_with_deadline(dt, now, release_deadline)
     }
 
+    fn advance_output_with_clock(
+        &mut self,
+        dt: f64,
+        _generation: u64,
+        now_fn: &mut dyn FnMut() -> Instant,
+        release_deadline: Instant,
+    ) -> f64 {
+        self.tick_control_with_clock(dt, now_fn, release_deadline)
+    }
+
     fn publish(&mut self, timestamp: f64, generation: u64) {
         drop(self.publish_at(timestamp, generation, false));
     }
@@ -1814,9 +1837,10 @@ impl ReleaseEngine {
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));
         }
-        // 5. Urgent recheck + advance control output
-        let out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
-        let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
+        // 5. Urgent recheck + advance control output (passes live `now_fn` so pre-step and
+        //    transmit-point macro deadline checks always take fresh clock reads).
+        let _out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
+        let timestamp = core.advance_output_with_clock(dt, publish_generation, &mut now_fn, release_deadline);
         // 6. Publish
         core.publish(timestamp, publish_generation);
         // 7. Deliver urgent stop replies and terminals strictly AFTER publish
@@ -1972,11 +1996,18 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// One release.
     pub fn step(&mut self) -> ReleaseReport {
+        let clock = self.clock.clone();
+        self.step_with_clock(move || clock.now())
+    }
+
+    /// One release using an explicit live clock sampler `now_fn` for all in-release timestamps
+    /// (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`, pre-step, transmit, and post-output),
+    /// while release scheduling/deadline remains anchored to `self.clock`.
+    pub fn step_with_clock(&mut self, now_fn: impl FnMut() -> Instant) -> ReleaseReport {
         let started = self.clock.now();
         let release_deadline = started + Duration::from_secs_f64(self.dt);
         let next_gen = self.engine.releases() + 1;
-        let clock = &self.clock;
-        let mut report = self.engine.step(&mut self.core, || clock.now(), self.dt, release_deadline, next_gen);
+        let mut report = self.engine.step(&mut self.core, now_fn, self.dt, release_deadline, next_gen);
         // Extra sub-release hardware services at a pending transition's wake before the next release
         // (a transition committed in this release is first served at the next one).
         let mut next = report.poll.wake_before(release_deadline);
