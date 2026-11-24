@@ -2525,10 +2525,6 @@ impl ActiveTrajectory {
     }
 }
 
-/// Bounded inline action status message stored on [`ActionStatus::message`] so terminal
-/// action failure and observation publication never heap-allocate `String` on `armd-control`.
-pub type ActionMessage = crate::safety::BoundedText<256>;
-
 /// Status of the most recent action, published in every observation.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
@@ -2539,7 +2535,7 @@ pub struct ActionStatus {
     /// running | done | failed | cancelled
     pub state: crate::model::HolderLabel,
     pub code: Option<crate::model::HolderLabel>,
-    pub message: Option<ActionMessage>,
+    pub message: Option<String>,
     pub progress: f32,
     pub started_at: f64,
     pub finished_at: Option<f64>,

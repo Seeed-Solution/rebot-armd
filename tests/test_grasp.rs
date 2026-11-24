@@ -3022,7 +3022,7 @@ async fn task_requirement_on_a_legacy_provider_and_provider_down() {
         let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", b).await;
         assert_eq!(ack["type"], "command_ack", "{ack}");
         let a = wait_done(&w.rig.sup, ack["action_id"].as_u64().unwrap(), 5.0, |_| {}).await;
-        results.push((a.state, a.code, a.message));
+        results.push((a.state, a.code, a.message.clone()));
     }
     assert_eq!(results[0], results[1]);
     assert_eq!((results[0].0.as_str(), results[0].1.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{results:?}");

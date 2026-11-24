@@ -543,7 +543,7 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, mut plan: HoverPlan, up: crate::a
     let action = inner.last_action.as_ref().filter(|a| a.id == id).cloned();
     job.state = match &result { Ok(()) => "done".into(), Err(Stop::Fail(..)) => "failed".into(), Err(Stop::Cancelled) => "cancelled".into() };
     job.code = action.as_ref().and_then(|a| a.code.as_deref().map(str::to_owned));
-    job.message = action.as_ref().and_then(|a| a.message.as_deref().map(str::to_owned));
+    job.message = action.as_ref().and_then(|a| a.message.clone());
     if let Some(p) = job.points.iter_mut().find(|p| p.state == "pending" && matches!(result, Err(Stop::Cancelled))) {
         // the run was cancelled while this point ran
         p.code = job.code.clone();

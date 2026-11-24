@@ -84,10 +84,27 @@ fn copy_into<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
     dst.extend_from_slice(src);
 }
 
+/// Preallocated per-slot string spare reused across `None <-> Some(String)` action message
+/// transitions so RT publication never allocates or drops heap strings.
+#[derive(Debug, Default)]
+pub struct ObservationSpares {
+    pub action_msg: String,
+}
+
+impl ObservationSpares {
+    pub fn preallocated() -> Self {
+        Self {
+            action_msg: String::with_capacity(256),
+        }
+    }
+}
+
 /// One preallocated slot of the triple buffer.
 struct Slot {
     meta: Option<SampleMeta>,
     obs: Option<ArmObservation>,
+    /// Preallocated string spares reused across state/fault/action transitions (0 alloc on RT).
+    spares: ObservationSpares,
     rt: RtSample,
 }
 
@@ -201,6 +218,19 @@ impl StatePublisher {
     /// `ArmCore::take_observation_buffer`).
     pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
 
+    /// Moves the preallocated string spares out of the back slot (0 alloc).
+    pub fn take_back_spares(&mut self) -> ObservationSpares {
+        std::mem::take(&mut self.producer.back_mut().spares)
+    }
+
+    /// Returns the string spares to the back slot before publishing (0 alloc, 0 drop).
+    pub fn restore_back_spares(&mut self, spares: ObservationSpares) {
+        let slot = self.producer.back_mut();
+        if spares.action_msg.capacity() > slot.spares.action_msg.capacity() {
+            slot.spares.action_msg = spares.action_msg;
+        }
+    }
+
     /// Puts `obs` into the back slot when it is empty (else back to the retire ring; never
     /// freed here when that ring has room). `ArmCore::publish`'s fallback for a displaced
     /// observation, which its encapsulation makes unreachable.
@@ -242,7 +272,12 @@ pub struct StateHub {
 
 /// A publisher for an arm with `dof` joints and its hub.
 pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
-    let slot = || Slot { meta: None, obs: None, rt: RtSample::with_dof(dof) };
+    let slot = || Slot {
+        meta: None,
+        obs: None,
+        spares: ObservationSpares::preallocated(),
+        rt: RtSample::with_dof(dof),
+    };
     let (producer, consumer) = triple_buffer(slot(), slot(), slot());
     let hub = Arc::new(StateHub {
         state: Mutex::new(HubState { consumer, latest: None }),

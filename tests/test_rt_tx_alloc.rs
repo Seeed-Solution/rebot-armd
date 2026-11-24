@@ -70,6 +70,9 @@ enum Mode {
 struct NoAllocDamiaoBus {
     motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>,
     rx: VecDeque<CanFrame>,
+    /// Post-transmit replies promoted to `rx` once `rx` drains empty (models SocketCAN causality
+    /// without heap allocation so post-write probe drains separate pre-probe from post-probe RX).
+    pending_rx: VecDeque<CanFrame>,
     clock: std::sync::Arc<MockClock>,
     mode: Mode,
     tx_count: usize,
@@ -88,6 +91,7 @@ impl NoAllocDamiaoBus {
                 .map(|(i, l)| (i as u16 + 1, *l, 0.0, false, damiao::CTRL_MODE_POS_VEL))
                 .collect(),
             rx: VecDeque::with_capacity(1024),
+            pending_rx: VecDeque::with_capacity(64),
             clock: std::sync::Arc::new(MockClock::new()),
             mode: Mode::Ok,
             tx_count: 0,
@@ -98,7 +102,7 @@ impl NoAllocDamiaoBus {
         }
     }
 
-    fn reply(&mut self, k: usize) {
+    fn build_reply_frame(&self, k: usize) -> CanFrame {
         let (id, l, q, enabled, _) = self.motors[k];
         let p = damiao::float_to_uint(q, l.p_min, l.p_max, 16);
         let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
@@ -113,8 +117,20 @@ impl NoAllocDamiaoBus {
             30,
             30,
         ];
+        CanFrame::new_standard(0x10 + id, &data).unwrap()
+    }
+
+    fn reply(&mut self, k: usize) {
+        let frame = self.build_reply_frame(k);
         if self.rx.len() < self.rx.capacity() {
-            self.rx.push_back(CanFrame::new_standard(0x10 + id, &data).unwrap());
+            self.rx.push_back(frame);
+        }
+    }
+
+    fn reply_pending(&mut self, k: usize) {
+        let frame = self.build_reply_frame(k);
+        if self.pending_rx.len() < self.pending_rx.capacity() {
+            self.pending_rx.push_back(frame);
         }
     }
 
@@ -158,7 +174,7 @@ impl CanTransport for NoAllocDamiaoBus {
             let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             if let Some(k) = find(&self.motors, mid) {
                 match frame.data[2] {
-                    0xCC => self.reply(k),
+                    0xCC => self.reply_pending(k),
                     damiao::REG_READ => {
                         let (_, l, _, _, mode) = self.motors[k];
                         let val = match frame.data[3] {
@@ -216,7 +232,17 @@ impl CanTransport for NoAllocDamiaoBus {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
-        self.rx.pop_front().ok_or(TransportError::WouldBlock)
+        match self.rx.pop_front() {
+            Some(f) => Ok(f),
+            None => {
+                while let Some(f) = self.pending_rx.pop_front() {
+                    if self.rx.len() < self.rx.capacity() {
+                        self.rx.push_back(f);
+                    }
+                }
+                Err(TransportError::WouldBlock)
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {
@@ -237,6 +263,7 @@ impl CanTransport for NoAllocDamiaoBus {
     }
 
     fn supports_bounded_flush(&self) -> bool { true }
+    fn flush_is_noop(&self) -> bool { true }
     fn supports_nonblocking_rt(&self) -> bool { true }
 }
 
@@ -438,8 +465,8 @@ fn safety_and_fenced_mit_failure_paths_do_not_allocate_or_free() {
     });
     d.can_mut().tx_step = Duration::from_millis(45);
     let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
-    assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::Timeout))), "{res:?}");
-    assert_eq!((a, f), (0, 0), "unfenced mid-pass stale drop Timeout touched allocator");
+    assert_eq!(res.unwrap(), TxBatchOutcome::Expired { dropped: 6, pending: 0 });
+    assert_eq!((a, f), (0, 0), "unfenced mid-pass stale drop Expired touched allocator");
 
     d.can_mut().tx_step = Duration::ZERO;
     d.can_mut().flush_err = Some(Mode::EnobufsAfter(0));
@@ -777,4 +804,458 @@ fn budgeted_clear_fault_and_pre_enable_hold_errors_do_not_allocate_or_free() {
     });
     assert!(ok, "expected PosForcePreEnableHoldBudgetExhausted {{ joint: 6 }}");
     assert_eq!((a, f), (0, 0), "pre-enable hold budget exhaustion touched allocator");
+}
+
+#[derive(Clone)]
+struct SharedNoAllocBus(std::sync::Arc<std::sync::Mutex<NoAllocDamiaoBus>>);
+
+impl SharedNoAllocBus {
+    fn new(limits: &[DamiaoLimits]) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(NoAllocDamiaoBus::new(limits))))
+    }
+}
+
+impl CanTransport for SharedNoAllocBus {
+    fn clock(&self) -> Option<std::sync::Arc<dyn DriverClock>> {
+        Some(self.0.lock().unwrap().clock.clone())
+    }
+    fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+        self.0.lock().unwrap().transmit(frame)
+    }
+    fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.0.lock().unwrap().receive()
+    }
+    fn flush(&mut self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().flush()
+    }
+    fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+    fn flush_is_noop(&self) -> bool {
+        true
+    }
+    fn supports_nonblocking_rt(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn bounded_hold_and_zero_offset_paths_do_not_allocate_or_free() {
+    let limits = b601_limits();
+    let targets: Vec<JointTarget> = (0..7).map(|i| JointTarget::position(0.05 * i as f32)).collect();
+
+    // 1. DamiaoArmDriver::write_estop_hold_bounded: Complete, partial Deferred (max_frames = 4),
+    // and Expired (tx_step = 45 ms) — 0 allocs, 0 frees.
+    let bus = NoAllocDamiaoBus::new(&limits);
+    let mut driver = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits.clone())
+        .unwrap();
+    driver.can_mut().push_all_feedback();
+    driver.read_joint_states().unwrap();
+    driver.set_torque(true).expect("enable");
+    driver.set_rt_mode(true);
+    // Warm up thread-local TX metrics once.
+    assert_eq!(driver.write_estop_hold_bounded(&targets).unwrap(), TxBatchOutcome::Complete);
+    reset_tx_metrics();
+
+    // Complete
+    driver.begin_tx_tick();
+    let (res, a, f) = counted(|| driver.write_estop_hold_bounded(&targets));
+    assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
+    assert!(driver.last_hold_tx_sent_any());
+    assert_eq!((a, f), (0, 0), "write_estop_hold_bounded Complete touched allocator");
+
+    // Partial Deferred with max_frames = 4
+    driver.set_tx_budget(TxBudget {
+        max_frames: 4,
+        max_duration: Duration::from_millis(5),
+        frame_max_age: Duration::from_millis(45),
+    });
+    driver.begin_tx_tick();
+    let (res, a, f) = counted(|| driver.write_estop_hold_bounded(&targets));
+    assert_eq!(res.unwrap(), TxBatchOutcome::Deferred { pending: 3 });
+    assert!(driver.last_hold_tx_sent_any());
+    assert_eq!((a, f), (0, 0), "write_estop_hold_bounded Deferred touched allocator");
+
+    // Drain carried-over hold frames cleanly before testing Expired.
+    driver.set_tx_budget(TxBudget {
+        max_frames: 16,
+        max_duration: Duration::from_millis(100),
+        frame_max_age: Duration::from_millis(45),
+    });
+    driver.begin_tx_tick();
+    assert_eq!(driver.write_estop_hold_bounded(&targets).unwrap(), TxBatchOutcome::Complete);
+
+    // Expired with tx_step = 45 ms (frame 0 sends and hits 45 ms age; remaining 6 expire in pass).
+    driver.can_mut().tx_step = Duration::from_millis(45);
+    driver.begin_tx_tick();
+    let (res, a, f) = counted(|| driver.write_estop_hold_bounded(&targets));
+    assert_eq!(res.unwrap(), TxBatchOutcome::Expired { dropped: 6, pending: 0 });
+    assert!(driver.last_hold_tx_sent_any());
+    assert_eq!((a, f), (0, 0), "write_estop_hold_bounded Expired touched allocator");
+
+    // 2. ZeroOffsetDriver with nonzero offsets: warm up once, then verify Complete + Deferred for
+    // both write_joint_targets_bounded and write_estop_hold_bounded — 0 allocs, 0 frees.
+    let shared_bus = SharedNoAllocBus::new(&limits);
+    let mut inner_driver = DamiaoArmDriver::new(shared_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    shared_bus.0.lock().unwrap().push_all_feedback();
+    inner_driver.read_joint_states().unwrap();
+    inner_driver.set_torque(true).expect("enable");
+    inner_driver.set_rt_mode(true);
+    let mut wrapped = armd::joint_zero::ZeroOffsetDriver::new(
+        Box::new(inner_driver),
+        &[0.1, -0.05, 0.02, 0.0, 0.0, 0.0, 0.03],
+    );
+    let mut scratch = Vec::with_capacity(7);
+
+    // Warm up once before counting (read_joint_states_into opens a fresh per-tick TX budget).
+    wrapped.read_joint_states_into(&mut scratch).unwrap();
+    assert_eq!(wrapped.write_joint_targets_bounded(&targets).unwrap(), TxBatchOutcome::Complete);
+    wrapped.read_joint_states_into(&mut scratch).unwrap();
+    assert_eq!(wrapped.write_estop_hold_bounded(&targets).unwrap(), TxBatchOutcome::Complete);
+    reset_tx_metrics();
+
+    // write_joint_targets_bounded: Complete
+    wrapped.read_joint_states_into(&mut scratch).unwrap();
+    let (res, a, f) = counted(|| wrapped.write_joint_targets_bounded(&targets));
+    assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
+    assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_joint_targets_bounded Complete touched allocator");
+
+    // write_joint_targets_bounded: Deferred
+    wrapped.read_joint_states_into(&mut scratch).unwrap();
+    {
+        let mut guard = shared_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(3);
+        guard.tx_count = 0;
+    }
+    let (res, a, f) = counted(|| wrapped.write_joint_targets_bounded(&targets));
+    assert_eq!(res.unwrap(), TxBatchOutcome::Deferred { pending: 4 });
+    assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_joint_targets_bounded Deferred touched allocator");
+
+    // Drain target queue cleanly before hold tests.
+    wrapped.read_joint_states_into(&mut scratch).unwrap();
+    {
+        let mut guard = shared_bus.0.lock().unwrap();
+        guard.mode = Mode::Ok;
+        guard.tx_count = 0;
+    }
+    assert_eq!(wrapped.write_joint_targets_bounded(&targets).unwrap(), TxBatchOutcome::Complete);
+
+    // write_estop_hold_bounded: Complete
+    wrapped.read_joint_states_into(&mut scratch).unwrap();
+    let (res, a, f) = counted(|| wrapped.write_estop_hold_bounded(&targets));
+    assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
+    assert!(wrapped.last_hold_tx_sent_any());
+    assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_estop_hold_bounded Complete touched allocator");
+
+    // write_estop_hold_bounded: Deferred
+    wrapped.read_joint_states_into(&mut scratch).unwrap();
+    {
+        let mut guard = shared_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(3);
+        guard.tx_count = 0;
+    }
+    let (res, a, f) = counted(|| wrapped.write_estop_hold_bounded(&targets));
+    assert_eq!(res.unwrap(), TxBatchOutcome::Deferred { pending: 4 });
+    assert!(wrapped.last_hold_tx_sent_any());
+    assert_eq!((a, f), (0, 0), "ZeroOffsetDriver write_estop_hold_bounded Deferred touched allocator");
+}
+
+#[test]
+fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_alloc() {
+    use armd::gravity_comp::GravityCompPhase;
+    use armd::safety::{FaultCode, FaultReason, SafetyState, TxStallDetail, RETIRED_STATE_CAPACITY};
+
+    let limits = b601_limits();
+    let mk_rt_supervisor = || {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            joint_tracking: None,
+            ..ArmConfig::rebot_dm()
+        };
+        let bus = SharedNoAllocBus::new(&limits);
+        let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap();
+        driver.set_rt_mode(true);
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        inner.set_torque(true).expect("arm");
+        inner.rt_executor_owned = true;
+        inner.safety.set_off_thread_reclaim(true);
+        for _ in 0..5 {
+            let _ = inner.tick_publish(0.02, 1, false);
+            let _ = inner.core.hub().latest();
+        }
+        reset_tx_metrics();
+        (inner, bus)
+    };
+
+    let (mut inner, bus) = mk_rt_supervisor();
+
+    // (a) Steady-state tick_publish(0.02, 1, false) (Complete): 0 allocs, 0 frees.
+    let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    let _ = inner.core.hub().latest();
+    assert_eq!((a, f), (0, 0), "steady-state tick_publish touched allocator");
+
+    // (b) Transient Deferred tick_publish(0.02, 1, false) under Mode::EnobufsAfter(1):
+    // must stay operational (!is_stopped()) with 0 allocs, 0 frees while J5..J7 accumulate
+    // per-motor lack of progress (1, 2, 3 < 4 at 50 Hz) and latch on exact tick 4.
+    {
+        let mut guard = bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(1);
+        guard.tx_count = 0;
+    }
+    let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    let _ = inner.core.hub().latest();
+    assert!(!inner.safety.state().is_stopped(), "transient deferral must not fault: {:?}", inner.safety.state());
+    assert_eq!((a, f), (0, 0), "transient Deferred tick_publish touched allocator");
+
+    // Second and third transient Deferred ticks (streak = 2, 3 < 4 at 50 Hz): still operational, 0 allocs, 0 frees.
+    for tick_idx in 2..=3 {
+        bus.0.lock().unwrap().tx_count = 0;
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        let _ = inner.core.hub().latest();
+        assert!(
+            !inner.safety.state().is_stopped(),
+            "deferred tick {tick_idx} (< min_tx_stall_ticks = 4 at 50 Hz) must stay operational: {:?}",
+            inner.safety.state()
+        );
+        assert_eq!((a, f), (0, 0), "deferred tick {tick_idx} tick_publish touched allocator");
+    }
+
+    // (c) Stall-threshold tick (streak = 4 == ceil(45/20) + 1) latches CAN_TX_STALLED and publishes
+    // non-empty CAN_TX_STALLED message with 0 allocs, 0 frees.
+    bus.0.lock().unwrap().tx_count = 0;
+    let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    assert_eq!((a, f), (0, 0), "CAN_TX_STALLED latch tick_publish touched allocator");
+    assert_eq!(inner.safety.fault().map(|info| info.code), Some(FaultCode::CanTxStalled));
+    let snap = inner.core.hub().latest().expect("published observation after stall");
+    let obs_fault = snap.obs.fault.as_ref().expect("published fault info");
+    assert_eq!(obs_fault.code, FaultCode::CanTxStalled);
+    assert!(!obs_fault.message.is_empty(), "CAN_TX_STALLED observation message must be non-empty");
+    drop(snap);
+
+    // Subsequent stalled tick in Fault (write_estop_hold_bounded under EnobufsAfter(0)): 0 allocs, 0 frees.
+    {
+        let mut guard = bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(0);
+        guard.tx_count = 0;
+    }
+    // Round-2 Item 2 zero-alloc check: empty software queue + fresh feedback + persistent ENOBUFS
+    // -> RT executor clear_fault_executor_bounded runs TX probe, fails with ENOBUFS, 0 allocs/0 frees.
+    {
+        let dl = std::time::Instant::now() + Duration::from_millis(200);
+        let (refused_by_probe, a, f) = counted(|| {
+            matches!(
+                inner.clear_fault_executor_bounded(dl),
+                Err(armd::safety::ClearFaultError::Rejected(armd::safety::ClearRefusal::DriverError(_)))
+            )
+        });
+        assert!(refused_by_probe, "ENOBUFS TX probe must refuse clear_fault_executor_bounded");
+        assert_eq!((a, f), (0, 0), "ENOBUFS TX probe clear refusal touched allocator");
+    }
+    let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    let _ = inner.core.hub().latest();
+    assert!(matches!(inner.safety.state(), SafetyState::Fault(FaultReason::CanTxStalled)));
+    assert_eq!((a, f), (0, 0), "subsequent stalled hold tick_publish touched allocator");
+
+    // Round-2 Item 2 zero-alloc check: when ENOBUFS clears and the queue drains, RT executor
+    // clear_fault_executor_bounded sends the 0xCC TX probe, receives post-probe fresh feedback,
+    // and clears CAN_TX_STALLED to Idle with 0 allocs / 0 frees.
+    {
+        let mut guard = bus.0.lock().unwrap();
+        guard.mode = Mode::Ok;
+        guard.tx_count = 0;
+        guard.push_all_feedback();
+    }
+    let _ = inner.tick_publish(0.02, 1, false);
+    let _ = inner.core.hub().latest();
+    {
+        let dl = std::time::Instant::now() + Duration::from_millis(200);
+        let (cleared_to_idle, a, f) = counted(|| inner.clear_fault_executor_bounded(dl) == Ok(SafetyState::Idle));
+        assert!(cleared_to_idle, "healthy TX probe must clear CAN_TX_STALLED to Idle");
+        assert_eq!((a, f), (0, 0), "healthy TX probe clear_fault_executor_bounded touched allocator");
+    }
+
+    // (d) Off-thread reclamation saturation: fill RETIRED_STATE_CAPACITY (16) retired
+    // fault transitions without draining, leave a non-cached Fault(Other) active, then latch
+    // CanTxStalled via SafetyManager::latch inside counted -> records kind & detail and advances
+    // epoch with 0 allocs / 0 frees without overflowing or dropping the retired fault ring.
+    for _ in 0..RETIRED_STATE_CAPACITY {
+        inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fill".into()));
+        inner.safety.clear_fault_bounded().expect("retire fault arc");
+    }
+    inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("active-full".into()));
+    assert!(inner.safety.retired_state_arcs_full());
+    assert!(!inner.safety.can_accept_fault_transition());
+    let stall_detail = TxStallDetail {
+        queued: 5,
+        dropped: 0,
+        age_ms: 60,
+        limit_ms: 45,
+        consecutive_ticks: 3,
+        is_hold: false,
+    };
+    let ep_before = inner.safety.epoch_id();
+    let (ep_after, a, f) = counted(|| {
+        inner.safety.latch(
+            armd::safety::FaultKind::CanTxStalled,
+            armd::safety::FaultDetail::CanTxStalled(Some(stall_detail)),
+        )
+    });
+    assert_eq!(ep_after, ep_before + 1, "CanTxStalled latch must advance epoch_id");
+    assert!(inner.safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled));
+    assert_eq!(inner.safety.fault_code(), Some(FaultCode::CanTxStalled));
+    assert_eq!(inner.safety.tx_stall_detail(), Some(stall_detail));
+    assert_eq!((a, f), (0, 0), "saturated SafetyManager::latch(CanTxStalled) touched allocator");
+
+    // (e) Active gravity-comp tick on a fresh warmed-up SupervisorInner with DamiaoArmDriver<SharedNoAllocBus>.
+    let (mut gc_inner, _gc_bus) = mk_rt_supervisor();
+    gc_inner.enter_gravity_comp(Default::default()).expect("enter gravity comp");
+    // Advance past ramp_in_s (1.0 s) and warm up one Active tick across all triple-buffer slots.
+    for _ in 0..60 {
+        let _ = gc_inner.tick_publish(0.02, 1, false);
+        let _ = gc_inner.core.hub().latest();
+    }
+    assert!(matches!(
+        gc_inner.gravity_comp.as_ref().map(|g| &g.phase),
+        Some(GravityCompPhase::Active)
+    ));
+    let (published, a, f) = counted(|| gc_inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    let _ = gc_inner.core.hub().latest();
+    assert!(gc_inner.gravity_comp.is_some());
+    assert_eq!((a, f), (0, 0), "Active gravity-comp tick_publish touched allocator");
+
+    // (f) Major 6A: Running jog action stalls into CAN_TX_STALLED (3 deferred ticks), terminates
+    //     the action (`failed` / `CAN_TX_STALLED` with non-empty message) and publishes observation
+    //     — whole release must do 0 allocs, 0 frees!
+    let (mut jog_inner, jog_bus) = mk_rt_supervisor();
+    let epoch = jog_inner.safety.epoch_id();
+    let (_, jog_id, _) = jog_inner
+        .jog_action(vec![0.15, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(epoch), "joint_move")
+        .expect("start jog");
+    // Warm up running action across all 3 triple-buffer slots before counting.
+    for _ in 0..4 {
+        let _ = jog_inner.tick_publish(0.02, 1, false);
+        let _ = jog_inner.core.hub().latest();
+    }
+    assert_eq!(jog_inner.last_action.as_ref().map(|a| (a.id, a.state.as_str())), Some((jog_id, "running")));
+    {
+        let mut guard = jog_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(1);
+        guard.tx_count = 0;
+    }
+    for tick in 1..=4 {
+        jog_bus.0.lock().unwrap().tx_count = 0;
+        let (published, a, f) = counted(|| jog_inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "running-jog deferral/stall tick {tick} touched allocator"
+        );
+    }
+    assert_eq!(jog_inner.safety.fault_code(), Some(FaultCode::CanTxStalled));
+    let snap = jog_inner.core.hub().latest().expect("published observation after jog stall");
+    let act = snap.obs.action.as_ref().expect("published action after jog stall");
+    assert_eq!(act.id, jog_id);
+    assert_eq!(act.state.as_str(), "failed");
+    assert_eq!(act.code.as_deref(), Some("CAN_TX_STALLED"));
+    assert!(
+        act.message.as_deref().is_some_and(|m| m.contains("CAN TX stalled")),
+        "expected CAN TX stalled action message, got {:?}",
+        act.message
+    );
+    drop(snap);
+
+    // (g) Major 6B: Escalating a stopped hold from an existing heap-backed `Fault(Other(String))`
+    //     to `Fault(CanTxStalled)` retires the old state arc and recycles `safety_reason` spare
+    //     with 0 allocs, 0 frees across the whole release.
+    let (mut esc_inner, esc_bus) = mk_rt_supervisor();
+    esc_inner
+        .safety
+        .trigger_fault_coded(FaultCode::Other, FaultReason::Other("existing heap-backed fault".into()));
+    // Warm up the existing heap-backed Fault(Other) across all 3 triple-buffer slots.
+    for _ in 0..4 {
+        let _ = esc_inner.tick_publish(0.02, 1, false);
+        let _ = esc_inner.core.hub().latest();
+    }
+    {
+        let mut guard = esc_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(0);
+        guard.tx_count = 0;
+    }
+    // Advance clock >= 45 ms across ticks so stopped hold escalates from Fault(Other) -> CanTxStalled.
+    for tick in 0..4 {
+        {
+            let mut guard = esc_bus.0.lock().unwrap();
+            guard.clock.advance(Duration::from_millis(20));
+            guard.push_all_feedback();
+            guard.tx_count = 0;
+        }
+        let (published, a, f) = counted(|| esc_inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "Fault(Other) -> CanTxStalled stopped-hold escalation tick {tick} touched allocator"
+        );
+    }
+    assert_eq!(esc_inner.safety.fault_code(), Some(FaultCode::CanTxStalled));
+    assert!(
+        esc_inner.safety.retired_state_arcs_len() >= 1,
+        "prior heap-backed Fault(Other) state arc must be retired off-thread"
+    );
+    let esc_snap = esc_inner.core.hub().latest().expect("published observation after escalation");
+    assert_eq!(esc_snap.obs.safety_state, SafetyState::Fault(FaultReason::CanTxStalled));
+    assert_eq!(esc_snap.obs.fault.as_ref().map(|f| f.code), Some(FaultCode::CanTxStalled));
+    drop(esc_snap);
+
+    // (h) Major 7: Park `unload_settle` populated with accepted stationary samples followed by a
+    //     transient `Deferred` output-gap release clearing `settle.samples` — 0 allocs, 0 frees!
+    let (mut pk_inner, pk_bus) = mk_rt_supervisor();
+    pk_inner.pending_normal_unload = true;
+    // Populate settle history and warm all 3 triple-buffer slots.
+    for _ in 0..6 {
+        let _ = pk_inner.tick_publish(0.02, 1, false);
+        let _ = pk_inner.core.hub().latest();
+    }
+    assert!(
+        pk_inner.unload_settle.as_ref().is_some_and(|s| !s.samples.is_empty()),
+        "unload_settle should hold accepted stationary samples before the output gap"
+    );
+    {
+        let mut guard = pk_bus.0.lock().unwrap();
+        guard.mode = Mode::EnobufsAfter(2);
+        guard.tx_count = 0;
+    }
+    let (published, a, f) = counted(|| pk_inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    assert_eq!(
+        (a, f),
+        (0, 0),
+        "park unload_settle Deferred output-gap release touched allocator"
+    );
+    let settle = pk_inner.unload_settle.as_ref().expect("settle remains active after transient gap");
+    assert_eq!(settle.held_s, 0.0);
+    assert!(settle.samples.is_empty(), "output gap must clear settle samples without freeing");
 }

@@ -774,6 +774,7 @@ pub(crate) struct OffThreadSinks {
     diag_rx: Mutex<Consumer<TickSample>>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
+    reclaim_traj_rx: Mutex<Consumer<crate::motion::ActiveTrajectory>>,
     reclaim_return_tx: Mutex<Producer<Arc<SafetyState>>>,
     /// `(consumer, last_reported_dropped, shutdown_reported_total)` guarded by one mutex so
     /// best-effort warning deltas never race and never reset `stats.safety_log_dropped`.
@@ -820,6 +821,12 @@ impl OffThreadSinks {
                     }
                 }
                 drop(arc);
+            }
+        }
+        {
+            let mut rx = self.reclaim_traj_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(traj) = rx.pop() {
+                drop(traj);
             }
         }
         {
@@ -1274,6 +1281,7 @@ pub(crate) fn spawn_executor(
     let (maint_rep_tx, maint_rep_rx) = RingBuffer::<MaintReply>::new(MAINT_QUEUE_CAPACITY);
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
+    let (reclaim_traj_tx, reclaim_traj_rx) = RingBuffer::<crate::motion::ActiveTrajectory>::new(8);
     let (reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(
         FAULT_ARC_POOL_CAPACITY + FORMATTED_FAULT_ARC_POOL_CAPACITY + JOINT_LIMIT_ARC_POOL_CAPACITY,
     );
@@ -1298,6 +1306,7 @@ pub(crate) fn spawn_executor(
         diag_rx: Mutex::new(diag_rx),
         estop_reg: estop_reg.clone(),
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
+        reclaim_traj_rx: Mutex::new(reclaim_traj_rx),
         reclaim_return_tx: Mutex::new(reclaim_return_tx),
         safety_log_rx: Mutex::new((safety_log_rx, 0, 0)),
         stats: stats.clone(),
@@ -1357,6 +1366,7 @@ pub(crate) fn spawn_executor(
                 estop_ack_tx,
                 estop_overflow_gen,
                 reclaim_state_tx,
+                reclaim_traj_tx,
                 reclaim_return_rx,
                 safety_log_tx,
                 persist_job_tx,
@@ -1442,6 +1452,7 @@ struct ControlState {
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
     stats: Arc<ExecutorStats>,
@@ -1481,9 +1492,9 @@ impl ControlState {
         }
     }
 
-    /// Moves retired fault `Arc<SafetyState>` snapshots and deferred [`SafetyLogEvent`]s off
-    /// `armd-control` into the bounded SPSC rings, and replenishes clean recycled fault slots
-    /// without allocating or dropping on `armd-control`.
+    /// Moves retired fault `Arc<SafetyState>` snapshots, retired `ActiveTrajectory` instances, and
+    /// deferred [`SafetyLogEvent`]s off `armd-control` into the bounded SPSC rings, and replenishes
+    /// clean recycled fault slots without allocating or dropping on `armd-control`.
     fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
         while core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY
             || core.safety.formatted_fault_arc_pool_len() < FORMATTED_FAULT_ARC_POOL_CAPACITY
@@ -1502,6 +1513,13 @@ impl ControlState {
                 break;
             };
             let _ = self.reclaim_state_tx.push(arc);
+            drained = true;
+        }
+        while !self.reclaim_traj_tx.is_full() {
+            let Some(traj) = core.pop_retired_trajectory() else {
+                break;
+            };
+            let _ = self.reclaim_traj_tx.push(traj);
             drained = true;
         }
         let lost_inline = core.safety.advance_log_dropped_forwarded();
@@ -1561,7 +1579,11 @@ impl ControlState {
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
             MaintenanceOp::ClearFault { expected_epoch } => {
                 self.shutdown_committed = false;
-                let res = core.clear_fault_executor_bounded_for_epoch(release_deadline, expected_epoch);
+                let res = core.clear_fault_executor_bounded_for_release(
+                    ctx.now,
+                    release_deadline,
+                    expected_epoch,
+                );
                 if res.is_ok() {
                     *release_flags |= RELEASE_FLAG_CLEAR_OK;
                 } else {
@@ -2482,6 +2504,7 @@ fn control_thread_main(
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
@@ -2548,6 +2571,7 @@ fn control_thread_main(
         estop_ack_tx,
         estop_overflow_gen,
         reclaim_state_tx,
+        reclaim_traj_tx,
         reclaim_return_rx,
         safety_log_tx,
         stats: Arc::clone(&stats),
@@ -2713,19 +2737,9 @@ fn control_thread_main(
                     state.persist_wake.unpark();
                 }
             }
-            // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
-            // drain any E-stop acks / retired states produced during Steps 3-7.
-            state.flush_pending_maint_reply(&core);
-            state.emit_estop_ack_if_advanced(&mut core);
-            state.drain_retired_states(&mut core);
-            if let Some((armed, slot)) = state.hooks.inject_release_alloc_once.as_deref() {
-                if armed.swap(false, Ordering::AcqRel) {
-                    let ptr = Box::into_raw(Box::new(0xB3_u64));
-                    slot.store(ptr, Ordering::Release);
-                    release_flags |= RELEASE_FLAG_INJECT_ALLOC;
-                    stats.last_inject_alloc_release_seq.store(step_num, Ordering::Release);
-                }
-            }
+            // Publish safety/E-stop release_seq markers BEFORE waking maintenance or E-stop
+            // callers so Acquire loads after `trigger_e_stop_checked` / `clear_fault` always
+            // observe the tagged release sequence without racing `armd-control`.
             let kinds_after = core.safety.latched_fault_kinds();
             let newly_set_kinds = kinds_after & !kinds_before;
             if core.safety.latch_count() != latch_count_before || newly_set_kinds != 0 {
@@ -2742,6 +2756,20 @@ fn control_thread_main(
                 release_flags |= RELEASE_FLAG_ESTOP_APPLIED;
                 stats.last_estop_release_seq.store(step_num, Ordering::Release);
             }
+            if let Some((armed, slot)) = state.hooks.inject_release_alloc_once.as_deref() {
+                if armed.load(Ordering::Acquire) {
+                    let ptr = Box::into_raw(Box::new(0xB3_u64));
+                    slot.store(ptr, Ordering::Release);
+                    release_flags |= RELEASE_FLAG_INJECT_ALLOC;
+                    stats.last_inject_alloc_release_seq.store(step_num, Ordering::Release);
+                    armed.store(false, Ordering::Release);
+                }
+            }
+            // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
+            // drain any E-stop acks / retired states produced during Steps 3-7.
+            state.flush_pending_maint_reply(&core);
+            state.emit_estop_ack_if_advanced(&mut core);
+            state.drain_retired_states(&mut core);
             let control_hz = core.config.control_frequency_hz;
             let done = now_inst();
             let allocs = crate::diagnostics::alloc::take();
@@ -3030,16 +3058,26 @@ impl Releases {
     pub fn next_ns(&self) -> u64 { self.next_ns }
 }
 
-/// Runs `step(dt)` at every release until `stop` is set. `dt` is the real time since the
-/// previous step's start (seconds). Allocation free.
-pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, mut step: impl FnMut(f64)) {
+/// Runs `step(dt, release_deadline)` at every scheduled grid release until `stop` is set.
+/// `dt` is the real time since the previous step's start (seconds), and `release_deadline` is
+/// the absolute scheduled grid instant of the next release (`releases.next_ns()` mapped onto
+/// `Instant`, matching `control_thread_main`). Allocation free.
+pub fn run_periodic_with_deadline(
+    period: Duration,
+    stop: &AtomicBool,
+    stats: &ExecutorStats,
+    mut step: impl FnMut(f64, Instant),
+) {
     let mut releases = Releases::start(period);
     let mut last = Instant::now();
     while !stop.load(Ordering::Acquire) {
         sleep_until_ns(releases.next_ns());
         let woke = Instant::now();
-        let skipped = releases.advance(mono_now_ns());
+        let now_ns = mono_now_ns();
+        let skipped = releases.advance(now_ns);
         if skipped > 0 { stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed); }
+        let remaining_ns = releases.next_ns().saturating_sub(now_ns);
+        let release_deadline = woke + Duration::from_nanos(remaining_ns);
         let elapsed = woke - last;
         last = woke;
         if elapsed > LATE_LOG_AFTER {
@@ -3047,8 +3085,14 @@ pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, 
             stats.late.fetch_add(1, Ordering::Release);
         }
         stats.steps.fetch_add(1, Ordering::Relaxed);
-        step(elapsed.as_secs_f64());
+        step(elapsed.as_secs_f64(), release_deadline);
     }
+}
+
+/// Runs `step(dt)` at every release until `stop` is set. `dt` is the real time since the
+/// previous step's start (seconds). Allocation free.
+pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, mut step: impl FnMut(f64)) {
+    run_periodic_with_deadline(period, stop, stats, |dt, _| step(dt));
 }
 
 #[cfg(test)]
@@ -3080,6 +3124,47 @@ mod tests {
         assert_eq!(dts.len(), 5);
         assert!(dts.iter().all(|dt| *dt > 0.0 && *dt < 0.5), "{dts:?}");
         assert_eq!(stats.steps.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn run_periodic_with_deadline_tracks_scheduled_grid_after_overrun() {
+        let period = Duration::from_millis(20);
+        let stop = AtomicBool::new(false);
+        let stats = ExecutorStats::default();
+        let mut step_idx = 0usize;
+        let mut first_deadline: Option<Instant> = None;
+        let mut second_remaining = Duration::MAX;
+        let mut second_deadline: Option<Instant> = None;
+        run_periodic_with_deadline(period, &stop, &stats, |_dt, release_deadline| {
+            let now = Instant::now();
+            step_idx += 1;
+            if step_idx == 1 {
+                first_deadline = Some(release_deadline);
+                // Overrun past the 20 ms grid boundary into the middle of the next slot (+30 ms).
+                std::thread::sleep(Duration::from_millis(30));
+            } else if step_idx == 2 {
+                second_remaining = release_deadline.saturating_duration_since(now);
+                second_deadline = Some(release_deadline);
+                stop.store(true, Ordering::Release);
+            }
+        });
+        let d1 = first_deadline.expect("step 1 deadline");
+        let d2 = second_deadline.expect("step 2 deadline");
+        assert!(
+            second_remaining < Duration::from_millis(16),
+            "late step 2 must keep the scheduled grid deadline (< 16 ms remaining), not started + 20 ms: {second_remaining:?}"
+        );
+        // Step 2's deadline must align to an integer multiple of `period` from step 1's deadline
+        // (within timer/Instant read jitter).
+        let grid_delta = d2.saturating_duration_since(d1);
+        let periods = ((grid_delta.as_nanos() as f64) / (period.as_nanos() as f64)).round();
+        assert!(periods >= 1.0, "expected >= 1 period advance, got {grid_delta:?}");
+        let expected = Duration::from_nanos((periods as u64) * (period.as_nanos() as u64));
+        let phase_err = grid_delta.abs_diff(expected);
+        assert!(
+            phase_err < Duration::from_millis(3),
+            "scheduled grid phase drifted: d1->d2={grid_delta:?}, expected={expected:?}, err={phase_err:?}"
+        );
     }
 
     #[test]
@@ -3177,6 +3262,7 @@ mod tests {
         let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
         let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
         let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
@@ -3205,6 +3291,7 @@ mod tests {
             estop_ack_tx,
             estop_overflow_gen: Arc::new(AtomicU64::new(0)),
             reclaim_state_tx,
+            reclaim_traj_tx,
             reclaim_return_rx,
             safety_log_tx,
             stats: Arc::new(ExecutorStats::default()),

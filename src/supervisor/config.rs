@@ -499,16 +499,32 @@ impl SupervisorInner {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
             a.state = crate::model::HolderLabel::new(terminal_state);
             a.code = Some(crate::model::HolderLabel::new(code));
-            a.message = Some(crate::motion::ActionMessage::new(message));
+            let old_msg = match msg_buf {
+                Some(mut buf) => {
+                    buf.clear();
+                    buf.push_str(message);
+                    a.message.replace(buf)
+                }
+                None => {
+                    if let Some(existing) = a.message.as_mut() {
+                        existing.clear();
+                        existing.push_str(message);
+                        None
+                    } else {
+                        a.message = Some(message.into());
+                        None
+                    }
+                }
+            };
             a.finished_at = Some(now);
-            return (code_buf, msg_buf);
+            return (code_buf, old_msg);
         }
         (code_buf, msg_buf)
     }
 
-    /// In-place terminal update writing inline [`HolderLabel`] `state`/`code` and inline
-    /// [`crate::motion::ActionMessage`] without allocating or freeing on `armd-control`,
-    /// returning `(Some(code), Some(message))` for off-thread reclamation.
+    /// In-place terminal update writing inline [`HolderLabel`] `state`/`code` and moving
+    /// worker-allocated `message` into `ActionStatus` without allocating or freeing on
+    /// `armd-control`, returning `(Some(code), old_msg)` for off-thread reclamation.
     pub(crate) fn fail_zero_check_action_owned(
         &mut self,
         action_id: u64,
@@ -519,9 +535,9 @@ impl SupervisorInner {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
             a.state = crate::model::HolderLabel::new("failed");
             a.code = Some(crate::model::HolderLabel::new(&code));
-            a.message = Some(crate::motion::ActionMessage::new(&message));
+            let old_msg = a.message.replace(message);
             a.finished_at = Some(now);
-            return (Some(code), Some(message));
+            return (Some(code), old_msg);
         }
         (Some(code), Some(message))
     }
