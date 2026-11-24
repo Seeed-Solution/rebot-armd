@@ -2954,6 +2954,7 @@ fn control_thread_main(
 
     let mut releases = Releases::start_at(now_ns_fn(), cfg.period);
     let mut last_release_start = now_inst();
+    let mut last_release_end_ns: Option<u64> = None;
     let mut publish_gen = initial_generation;
     let mut panicked = false;
 
@@ -3280,7 +3281,20 @@ fn control_thread_main(
             }
         };
 
+        let release_end_ns = now_ns_fn();
+        let overrun_skipped = releases.advance_overrun(release_end_ns);
+        if overrun_skipped > 0 {
+            stats.skipped_releases.fetch_add(overrun_skipped, Ordering::Relaxed);
+        }
+        last_release_end_ns = Some(release_end_ns);
+
         if let Err(err) = step_res {
+            if let Some(end_ns) = last_release_end_ns.take() {
+                let final_skipped = releases.missed_at_exit(end_ns);
+                if final_skipped > 0 {
+                    stats.skipped_releases.fetch_add(final_skipped, Ordering::Relaxed);
+                }
+            }
             panicked = true;
             e_stop_latched.store(true, Ordering::SeqCst);
             tracing::error!("RT executor thread panicked during release: {:?}", err);
@@ -3342,6 +3356,14 @@ fn control_thread_main(
                 // Deadline observer already handled timeout logging / exit signaling.
                 break;
             }
+        }
+    }
+
+    // Account any final release overrun that elapsed past `releases.next_ns()` right before loop exit.
+    if let Some(end_ns) = last_release_end_ns.take() {
+        let final_skipped = releases.missed_at_exit(end_ns);
+        if final_skipped > 0 {
+            stats.skipped_releases.fetch_add(final_skipped, Ordering::Relaxed);
         }
     }
 
@@ -3439,6 +3461,16 @@ pub struct Releases {
 }
 
 impl Releases {
+    /// Inclusive count of grid points `first_missed_ns + k * period_ns` that are `<= now_ns`.
+    #[inline]
+    fn missed_since(first_missed_ns: u64, now_ns: u64, period_ns: u64) -> u64 {
+        if now_ns >= first_missed_ns {
+            (now_ns - first_missed_ns) / period_ns + 1
+        } else {
+            0
+        }
+    }
+
     /// First release one period from now.
     pub fn start(period: Duration) -> Self {
         Self::start_at(mono_now_ns(), period)
@@ -3454,17 +3486,48 @@ impl Releases {
     /// the next release is the earliest grid point strictly after `now_ns` (`next_ns + k * period_ns`),
     /// and missed grid points are counted in the returned skip count.
     pub fn advance(&mut self, now_ns: u64) -> u64 {
-        self.next_ns += self.period_ns;
-        if self.next_ns <= now_ns {
-            let skipped = (now_ns - self.next_ns) / self.period_ns + 1;
-            self.next_ns += skipped * self.period_ns;
-            skipped
-        } else {
-            0
-        }
+        self.next_ns = self.next_ns.saturating_add(self.period_ns);
+        let skipped = Self::missed_since(self.next_ns, now_ns, self.period_ns);
+        self.next_ns = self.next_ns.saturating_add(skipped.saturating_mul(self.period_ns));
+        skipped
+    }
+
+    /// Accounts intermediate deadlines strictly missed by an overrun during the release that
+    /// finished at `end_ns`, advancing `next_ns` while keeping `next_ns <= end_ns` so an immediate
+    /// catch-up release still runs if the loop continues without double-counting skips.
+    pub fn advance_overrun(&mut self, end_ns: u64) -> u64 {
+        let second_missed = self.next_ns.saturating_add(self.period_ns);
+        let skipped = Self::missed_since(second_missed, end_ns, self.period_ns);
+        self.next_ns = self.next_ns.saturating_add(skipped.saturating_mul(self.period_ns));
+        skipped
+    }
+
+    /// Accounts all remaining scheduled deadlines at or before `end_ns` when the control loop
+    /// exits after a release ending at `end_ns` (returns `0` when `end_ns < self.next_ns`).
+    pub fn missed_at_exit(&self, end_ns: u64) -> u64 {
+        Self::missed_since(self.next_ns, end_ns, self.period_ns)
     }
 
     pub fn next_ns(&self) -> u64 { self.next_ns }
+}
+
+thread_local! {
+    /// Active `(next_ns, period_ns)` of an in-flight `run_periodic_with_clock` release on this
+    /// thread so explicit panic-exit wrappers (e.g. `src/main.rs` before `process::exit`) and
+    /// unwind guards account the final overrun exactly once.
+    static ACTIVE_PERIODIC_GRID: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Accounts any final overrun skips for the calling thread's in-flight `run_periodic` release
+/// immediately before a panic-exit handler calls `attempt_legacy_panic_disable` / `process::exit`.
+/// Consumes the thread-local grid once so unwind paths cannot double-count.
+pub fn account_periodic_overrun_on_panic_exit(stats: &ExecutorStats) {
+    if let Some((next_ns, period_ns)) = ACTIVE_PERIODIC_GRID.try_with(|c| c.take()).ok().flatten() {
+        let skipped = Releases { period_ns, next_ns }.missed_at_exit(mono_now_ns());
+        if skipped > 0 {
+            stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Runs `step(dt)` at every release until `stop` is set. `dt` is the real time since the
@@ -3485,6 +3548,7 @@ pub fn run_periodic_with_clock(
     let now_ns = || clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
     let mut releases = Releases::start_at(now_ns(), period);
     let mut last = now_inst();
+    let mut last_release_end_ns: Option<u64> = None;
     while !stop.load(Ordering::Acquire) {
         let scheduled_ns = releases.next_ns();
         if let Some(c) = clock {
@@ -3509,7 +3573,40 @@ pub fn run_periodic_with_clock(
         }
         stats.steps.fetch_add(1, Ordering::Relaxed);
         let _lateness_guard = crate::diagnostics::tick::WakeLatenessGuard::enter(wake_lateness_ns);
+        let _ = ACTIVE_PERIODIC_GRID.try_with(|c| c.set(Some((releases.next_ns, releases.period_ns))));
+        struct PeriodicUnwindGridGuard<'a> {
+            stats: &'a ExecutorStats,
+            clock: Option<&'a dyn ExecutorClock>,
+        }
+        impl Drop for PeriodicUnwindGridGuard<'_> {
+            fn drop(&mut self) {
+                if let Some((next_ns, period_ns)) = ACTIVE_PERIODIC_GRID.try_with(|c| c.take()).ok().flatten() {
+                    if std::thread::panicking() {
+                        let end_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
+                        let skipped = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
+                        if skipped > 0 {
+                            self.stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
         step(elapsed.as_secs_f64());
+        let _ = ACTIVE_PERIODIC_GRID.try_with(|c| c.take());
+        drop(_unwind_grid);
+        let end_ns = now_ns();
+        let overrun_skipped = releases.advance_overrun(end_ns);
+        if overrun_skipped > 0 {
+            stats.skipped_releases.fetch_add(overrun_skipped, Ordering::Relaxed);
+        }
+        last_release_end_ns = Some(end_ns);
+    }
+    if let Some(end_ns) = last_release_end_ns.take() {
+        let final_skipped = releases.missed_at_exit(end_ns);
+        if final_skipped > 0 {
+            stats.skipped_releases.fetch_add(final_skipped, Ordering::Relaxed);
+        }
     }
 }
 
@@ -3528,6 +3625,46 @@ mod tests {
         assert_eq!(r.next_ns(), 200);
         assert_eq!(r.advance(220), 1);
         assert_eq!(r.next_ns(), 240);
+    }
+
+    #[test]
+    fn releases_overrun_and_exit_skip_accounting_is_exact_and_never_double_counts() {
+        // Case 1: clean release (ends before next_ns) -> 0 overrun, 0 exit skips.
+        let mut r = Releases { period_ns: 20, next_ns: 20 };
+        assert_eq!(r.advance(20), 0); // next_ns = 40
+        assert_eq!(r.advance_overrun(25), 0);
+        assert_eq!(r.missed_at_exit(25), 0);
+
+        // Case 2: 25ms release on 20ms grid (starts at 20, ends at 45) -> 0 intermediate, 1 at exit.
+        let mut r = Releases { period_ns: 20, next_ns: 20 };
+        assert_eq!(r.advance(20), 0); // next_ns = 40
+        assert_eq!(r.advance_overrun(45), 0);
+        assert_eq!(r.next_ns(), 40);
+        assert_eq!(r.missed_at_exit(45), 1);
+        // Exact boundary end_ns == next_ns also counts 1 at exit.
+        assert_eq!(r.missed_at_exit(40), 1);
+        assert_eq!(r.missed_at_exit(39), 0);
+
+        // Case 3: 12ms release on 5ms grid (starts at 5, ends at 17):
+        // intermediate skip (1) committed immediately at release end, +1 at exit (= 2 total: 10, 15).
+        let mut r = Releases { period_ns: 5, next_ns: 5 };
+        assert_eq!(r.advance(5), 0); // next_ns = 10
+        assert_eq!(r.advance_overrun(17), 1); // 10 left for catch-up? next_ns advances to 15 <= 17
+        assert_eq!(r.next_ns(), 15);
+        assert_eq!(r.missed_at_exit(17), 1); // total 1 + 1 = 2 (10 & 15 both missed on exit)
+        // If loop instead continues immediately at 17: advance(17) adds 0 (no double count!).
+        assert_eq!(r.advance(17), 0);
+        assert_eq!(r.next_ns(), 20);
+
+        // Case 4: 45ms release on 10ms grid (starts at 30, ends at 75):
+        // intermediate skip (3: 50/60/70) committed at release end; continuing adds 0; exit adds 1 (= 4 total).
+        let mut r = Releases { period_ns: 10, next_ns: 30 };
+        assert_eq!(r.advance(30), 0); // next_ns = 40
+        assert_eq!(r.advance_overrun(75), 3);
+        assert_eq!(r.next_ns(), 70);
+        assert_eq!(r.missed_at_exit(75), 1);
+        assert_eq!(r.advance(75), 0);
+        assert_eq!(r.next_ns(), 80);
     }
 
     #[test]

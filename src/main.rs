@@ -627,6 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         runtime.block_on(control_supervisor.control_tick(dt));
                     }));
                     if let Err(e) = tick_res {
+                        armd::rt_core::executor::account_periodic_overrun_on_panic_exit(&loop_stats);
                         control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
                         error!("Control thread panicked during tick: {:?}", e);
                         let outcome = control_supervisor
