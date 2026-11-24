@@ -532,10 +532,11 @@ pub trait CoreOps {
     fn apply_stop_at(&mut self, _generation: u64) {
         self.apply_stop();
     }
-    /// Pops a transition terminal recorded after Step 2 (e.g. an in-flight enable aborted by
-    /// `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`, or Step 5 lease expiry) so Step 7 can
-    /// deliver it strictly after Step 6 publication and strictly before any replacement grant.
-    fn take_ended_transition(&mut self) -> Option<Result<TorqueProgress, &'static str>> {
+    /// Consumes a failed/aborted transition outcome recorded after Step 2 (e.g. an in-flight enable
+    /// aborted by `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`, Step 5 lease expiry, or
+    /// thermal supersede) so Step 6 publishes `torque_transition_pending == false` and Step 7
+    /// delivers the terminal strictly after publication and strictly before lifecycle/grant replies.
+    fn take_aborted_transition(&mut self) -> Option<&'static str> {
         None
     }
     /// Authorizes and applies one bounded urgent [`UrgentStop`] request at the owner.
@@ -1094,9 +1095,9 @@ impl CoreOps for SupervisorInner {
         self.sync_stop_generation(generation);
     }
 
-    fn take_ended_transition(&mut self) -> Option<Result<TorqueProgress, &'static str>> {
-        if self.torque_transition.is_none() && self.core.transition_pending() {
-            self.core.poll_transition()
+    fn take_aborted_transition(&mut self) -> Option<&'static str> {
+        if self.torque_transition.is_none() {
+            self.core.take_aborted_transition()
         } else {
             None
         }
@@ -1592,6 +1593,26 @@ impl ReleaseEngine {
         None
     }
 
+    /// Consumes a mid-release aborted transition (`Err(code)`) at the common pre-publish boundary
+    /// so Step 6 publishes `torque_transition_pending == false` while Step 7 emits the terminal
+    /// strictly AFTER publication and strictly BEFORE lifecycle or replacement-lease replies.
+    fn take_aborted_transition<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        report: &mut ReleaseReport,
+    ) -> Option<(Installed, Outcome)> {
+        if self.transition.is_some() {
+            if let Some(code) = core.take_aborted_transition() {
+                return self.transition.take().map(|t| {
+                    let outcome = Outcome::Failed(code);
+                    report.transition_ended = Some((t.action(), outcome));
+                    (t, outcome)
+                });
+            }
+        }
+        None
+    }
+
     /// Runs one full release on `core`.
     pub fn step<O: CoreOps>(
         &mut self,
@@ -1635,19 +1656,21 @@ impl ReleaseEngine {
         let pre_ctx = self.ctx(now_fn());
         let stopping = pre_commit(core, &pre_ctx);
         if stopping {
+            let ended_transition = finished_transition
+                .or_else(|| self.take_aborted_transition(core, &mut report));
             // Single publication boundary: publish any Step 1-2b state changes (such as an E-stop
-            // or finished transition) strictly BEFORE delivering terminals, maintenance replies,
-            // lifecycle replies, urgent stop replies, or E-stop acknowledgements.
+            // or finished/aborted transition) strictly BEFORE delivering terminals, urgent stop
+            // replies, lifecycle replies, maintenance replies, or E-stop acknowledgements.
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
+            if let Some((t, outcome)) = ended_transition {
+                self.intake.terminal(t, outcome);
+            }
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
             }
             if self.flush_lifecycle_replies() {
                 self.lifecycle_replies_flushed = true;
-            }
-            if let Some((t, outcome)) = finished_transition {
-                self.intake.terminal(t, outcome);
             }
             return report;
         }
@@ -1747,26 +1770,13 @@ impl ReleaseEngine {
         // 5. Urgent recheck + advance control output
         let out_ctx = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
         let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
-        // Consume any earlier in-flight transition aborted during Steps 2b-5 (e.g. by
-        // LeasePreempt, LeaseRelease, Disconnect, or Step 5 expiry) BEFORE Step 6 publication so
-        // the published `OwnerStateSnapshot` coherently reports `torque_transition_pending == false`,
-        // while still deferring Terminal delivery to Step 7 strictly AFTER Step 6 publish and
-        // strictly BEFORE lifecycle replies or any replacement LeaseOutcome::Granted.
-        let post_step2_ended_transition = if finished_transition.is_none()
-            && !transition_installed_this_release
-            && self.transition.is_some()
-        {
-            match core.take_ended_transition() {
-                Some(Ok(TorqueProgress::Done)) => self.transition.take().map(|t| {
-                    report.transition_ended = Some((t.action(), Outcome::Completed));
-                    (t, Outcome::Completed)
-                }),
-                Some(Err(code)) => self.transition.take().map(|t| {
-                    report.transition_ended = Some((t.action(), Outcome::Failed(code)));
-                    (t, Outcome::Failed(code))
-                }),
-                _ => None,
-            }
+        // Consume any transition aborted during Steps 2b-5 (including one installed in Step 3 and
+        // fenced by Disconnect/expiry in Steps 4-5) at the single pre-publish boundary so Step 6
+        // publishes `torque_transition_pending == false`, while Step 7 delivers replies strictly
+        // AFTER publication (and emits a same-release transition's own broker ACK before its
+        // abort Terminal, both strictly BEFORE lifecycle replies).
+        let aborted_transition = if finished_transition.is_none() {
+            self.take_aborted_transition(core, &mut report)
         } else {
             None
         };
@@ -1774,7 +1784,16 @@ impl ReleaseEngine {
         core.publish(timestamp, publish_generation);
         // 7. Deliver aborted/finished transition terminals, urgent stop replies, lifecycle replies,
         //    Step 3 replies, and active-action terminals strictly AFTER publish.
-        if let Some((t, outcome)) = finished_transition.or(post_step2_ended_transition) {
+        if transition_installed_this_release {
+            if let Some((t, outcome)) = aborted_transition {
+                if let Some(ack_reply) = deferred_step3_reply.take() {
+                    self.intake.emit_reply(ack_reply);
+                }
+                self.intake.terminal(t, outcome);
+            } else if let Some((t, outcome)) = finished_transition {
+                self.intake.terminal(t, outcome);
+            }
+        } else if let Some((t, outcome)) = finished_transition.or(aborted_transition) {
             self.intake.terminal(t, outcome);
         }
         if self.flush_urgent_stop_replies() {
@@ -1823,7 +1842,9 @@ impl ReleaseEngine {
         if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
         report.poll = core.poll_transition_wake_for_release(&budget, release_deadline);
-        let finished = self.take_finished_transition(report);
+        let finished = self
+            .take_finished_transition(report)
+            .or_else(|| self.take_aborted_transition(core, report));
         if urgent_applied || lifecycle_pending || finished.is_some() {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);

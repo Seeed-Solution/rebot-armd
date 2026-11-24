@@ -41,11 +41,12 @@ use armd::rt_core::ops::{
     CommitCtx, CoreOps, ReleaseEngine, ReleaseFixture, ServiceBudget, VirtualClock,
 };
 use armd::rt_core::requests::lease::{
-    apply_conn_lifecycle, commit_lease_descriptor, conn_lifecycle_channel,
-    install_broker_heartbeat, install_lease_acquire, install_lease_clear_fault_rt,
-    install_lease_disconnect, install_lease_preempt, prepare_lease_acquire, prepare_lease_preempt,
-    ConnectionHandle, LeaseAcquire, LeaseClearFaultOutcome, LeaseDisconnect, LeaseInstallCtx,
-    LeaseOutcome, LeaseRelease, LeaseRequest, LifecycleCmd,
+    apply_conn_lifecycle, check_torque_owner_preflight, commit_lease_descriptor,
+    conn_lifecycle_channel, install_broker_heartbeat, install_lease_acquire,
+    install_lease_clear_fault_rt, install_lease_disconnect, install_lease_preempt,
+    prepare_lease_acquire, prepare_lease_preempt, ConnectionHandle, LeaseAcquire,
+    LeaseClearFaultOutcome, LeaseDisconnect, LeaseInstallCtx, LeaseOutcome, LeaseRelease,
+    LeaseRequest, LifecycleCmd, OwnerAuthPolicy, TorquePreflightError,
 };
 use armd::supervisor::{MAX_LIVE_CONNECTIONS, OWNER_EXECUTOR};
 use armd::transport::{DriverClock, MockClock, TransportError};
@@ -2313,6 +2314,115 @@ fn in_flight_torque_enable_abort_on_preempt_disconnect_and_expiry() {
             "expected LEASE_LOST terminal on expiry: {replies:?}"
         );
     }
+
+    // (d) Same-release Step 3 TorqueOn fenced by Disconnect at Step 4 (`BeforeTarget`):
+    //     Step 6 MUST publish `torque_transition_pending == false`, and Step 7 MUST emit
+    //     `Ack(req_en)` -> `Terminal(req_en, Failed("DISCONNECTED"))` strictly BEFORE lifecycle
+    //     Disconnect resolves.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.prewarm_rt_buffers();
+        let c1 = ConnectionHandle::from_ws_id(7).unwrap();
+
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(24),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(mclock.clone()),
+        );
+        let exited = Arc::new(AtomicBool::new(false));
+        let (lc_client, lc_intake) = conn_lifecycle_channel(exited);
+        fx.attach_conn_lifecycle(lc_intake);
+
+        let lc_ref = Arc::new(lc_client);
+        let lc_open = lc_ref.clone();
+        let open_th = std::thread::spawn(move || lc_open.open_sync(7));
+        for _ in 0..5 {
+            let _ = fx.step();
+            lc_ref.drain_replies();
+            if open_th.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(open_th.join().unwrap(), Ok(Ok(())));
+
+        let a0 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(7),
+            1,
+            a0,
+            fx.now() + Duration::from_secs(5),
+            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
+                connection: c1,
+                label: armd::model::HolderLabel::new("same_rel_holder"),
+                has_label: true,
+            })),
+        )
+        .unwrap();
+        let _ = fx.step();
+        b.poll(|_, _| true);
+
+        let lc_hook = lc_ref.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_c = fired.clone();
+        fx.on_checkpoint(move |cp| {
+            if cp == armd::rt_core::ops::Checkpoint::BeforeTarget && !fired_c.swap(true, Ordering::SeqCst) {
+                lc_hook.enqueue_disconnect_detached(c1);
+            }
+        });
+
+        let a1 = fx.core.authority(&fx.ctx(fx.now()));
+        let req_en = b
+            .submit(
+                ClientId(7),
+                2,
+                a1,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        let rep = fx.step();
+        assert!(fired.load(Ordering::SeqCst), "BeforeTarget hook must fire in the same release");
+        assert_eq!(
+            rep.transition_ended.map(|(_, o)| o),
+            Some(Outcome::Failed("DISCONNECTED")),
+            "same-release Disconnect must abort and end the Step-3 TorqueOn before Step 6"
+        );
+        let pub_snap = fx.core.core.hub().latest().unwrap();
+        assert!(
+            !pub_snap.owner.torque_transition_pending,
+            "Step 6 published snapshot must report torque_transition_pending == false"
+        );
+        assert_eq!(pub_snap.owner.lease_generation, 0);
+
+        let mut replies = Vec::new();
+        b.poll(|_, r| {
+            replies.push(r);
+            true
+        });
+        let ack_pos = replies
+            .iter()
+            .position(|r| matches!(r, Reply::Ack { request, .. } if *request == req_en))
+            .expect("same-release TorqueOn must emit its broker Ack first");
+        let term_pos = replies
+            .iter()
+            .position(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Failed("DISCONNECTED"), .. } if *request == req_en))
+            .expect("same-release TorqueOn must emit its DISCONNECTED Terminal");
+        assert!(
+            ack_pos < term_pos,
+            "Ack (idx {ack_pos}) must precede Terminal (idx {term_pos}): {replies:?}"
+        );
+    }
 }
 
 // ============================================================================
@@ -2377,8 +2487,11 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
         assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
     }
 
-    // (b) Persistent disable failure exhausts bounded retry cap, latches DisableUnconfirmed,
-    //     and stops spamming the bus on subsequent releases.
+    // (b) Persistent disable failure from a clean non-faulted fenced-enable abort exhausts the
+    //     exact bounded retry cap (1 initial + 8 retries = 9), latches specifically
+    //     `StaticFault::DisableUnconfirmed` ("Torque disable has not been confirmed by fresh
+    //     hardware feedback"), and NEVER restarts even after advancing well past the legacy
+    //     250 ms fallback interval and invoking `request_shutdown`.
     {
         let cfg = ArmConfig {
             lease_timeout_ms: 5_000,
@@ -2387,20 +2500,20 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
         let mclock = MockClock::new();
         let ctrl = Arc::new(L2DriverControl::default());
         ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
-        ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
         ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
         ctrl.fail_disable_begin_remaining.store(100, Ordering::SeqCst);
 
         let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.rt_executor_owned = true;
-        inner.lease_enabled = false;
         inner.prewarm_rt_buffers();
+        let c1 = ConnectionHandle::from_ws_id(1).unwrap();
+        inner.register_live_connection(c1.id()).unwrap();
 
         let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
             inner,
             BootId(32),
-            Capacities { commands: 4, plans: 1, replies: 8 },
+            Capacities { commands: 8, plans: 1, replies: 16 },
             VirtualClock::from_mock_clock(mclock.clone()),
         );
         let a0 = fx.core.authority(&fx.ctx(fx.now()));
@@ -2409,37 +2522,170 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
             1,
             a0,
             fx.now() + Duration::from_secs(5),
+            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
+                connection: c1,
+                label: armd::model::HolderLabel::new("exhaust_holder"),
+                has_label: true,
+            })),
+        )
+        .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let a1 = fx.core.authority(&fx.ctx(fx.now()));
+        assert!(a1.lease_generation >= 1);
+        b.submit(
+            ClientId(1),
+            2,
+            a1,
+            fx.now() + Duration::from_secs(5),
             Submit::Transition(TransitionOp::TorqueOn),
         )
         .unwrap();
-        let _ = fx.step();
-        let _ = fx.step(); // fails enable, starts retry
+        assert!(fx.step().command.unwrap().1.is_ok()); // commits pending TorqueOn (no fault latched)
+        assert_eq!(*fx.core.safety.state(), SafetyState::Idle);
 
-        for _ in 0..30 {
-            let _ = fx.step();
-        }
-        let calls_after_exhaust = ctrl.begin_disable_calls.load(Ordering::SeqCst);
-        assert!(
-            (2..=9).contains(&calls_after_exhaust),
-            "expected bounded retries (1 initial + <= 8 retries), got {calls_after_exhaust}"
+        // Release lease -> aborts in-flight enable cleanly (no prior EnableFailed fault!) and
+        // fires initial disable call #1 via single choke point, which fails and arms retry.
+        b.submit(
+            ClientId(1),
+            3,
+            a1,
+            fx.now() + Duration::from_secs(5),
+            Submit::Lease(LeaseRequest::Release(LeaseRelease {
+                connection: c1,
+                generation: a1.lease_generation,
+            })),
+        )
+        .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
+        assert!(fx.core.disable_pending);
+        assert_eq!(
+            *fx.core.safety.state(),
+            SafetyState::Idle,
+            "no fault may be latched before retries exhaust"
         );
-        assert!(fx.core.disable_pending, "disable_pending must remain true until confirmed");
-        assert!(
-            matches!(fx.core.safety.state(), SafetyState::Fault(r) if format!("{r:?}").contains("DisableUnconfirmed") || fx.core.safety.has_latched_fault()),
-            "exhaustion must latch fault: {:?}",
-            fx.core.safety.state()
-        );
-        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
 
-        // Further stepping must NOT emit any additional disable retries once exhausted.
+        // 20 ms release steps with 25 ms retry spacing => each retry fires every 40 ms
+        // (2 steps): 8 retries take 8 * 40 ms = 320 ms (16 steps) < 500 ms window.
         for _ in 0..20 {
             let _ = fx.step();
         }
         assert_eq!(
             ctrl.begin_disable_calls.load(Ordering::SeqCst),
-            calls_after_exhaust,
-            "exhausted BackgroundDisableRetry must stop issuing retries"
+            9,
+            "expected exact 1 initial + 8 bounded retries = 9 calls on 20 ms timeline"
         );
+        assert!(fx.core.disable_pending, "disable_pending must remain true until confirmed");
+        assert!(
+            matches!(
+                fx.core.safety.state(),
+                SafetyState::Fault(armd::FaultReason::Other(r))
+                    if r == "Torque disable has not been confirmed by fresh hardware feedback"
+            ),
+            "exhaustion must latch exact StaticFault::DisableUnconfirmed, got: {:?}",
+            fx.core.safety.state()
+        );
+        assert!(fx.core.safety.has_latched_fault_code(armd::safety::FaultCode::DriverWriteFailed));
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
+
+        // Advance well past both the 250 ms legacy fallback interval (wall + virtual) and the
+        // 500 ms retry window, and trigger repeated `request_shutdown`: call count MUST stay 9.
+        std::thread::sleep(Duration::from_millis(260));
+        for _ in 0..25 {
+            let _ = fx.step();
+        }
+        assert!(!fx.core.request_shutdown());
+        assert!(!fx.core.request_shutdown());
+        for _ in 0..10 {
+            let _ = fx.step();
+        }
+        assert_eq!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst),
+            9,
+            "exhausted BackgroundDisableRetry must NEVER restart across ticks or shutdown"
+        );
+    }
+
+    // (c) Pending driver disable handshake that never confirms MUST STILL exhaust at
+    //     BACKGROUND_DISABLE_MAX_WINDOW (500 ms) rather than bypassing the deadline forever.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
+        ctrl.allow_disable_confirm.store(false, Ordering::SeqCst);
+
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.prewarm_rt_buffers();
+        let c1 = ConnectionHandle::from_ws_id(2).unwrap();
+        inner.register_live_connection(c1.id()).unwrap();
+
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(33),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(mclock.clone()),
+        );
+        let a0 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(2),
+            1,
+            a0,
+            fx.now() + Duration::from_secs(5),
+            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
+                connection: c1,
+                label: armd::model::HolderLabel::new("stuck_disable_holder"),
+                has_label: true,
+            })),
+        )
+        .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let a1 = fx.core.authority(&fx.ctx(fx.now()));
+        assert!(a1.lease_generation >= 1);
+        b.submit(
+            ClientId(2),
+            2,
+            a1,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        b.submit(
+            ClientId(2),
+            3,
+            a1,
+            fx.now() + Duration::from_secs(5),
+            Submit::Lease(LeaseRequest::Release(LeaseRelease {
+                connection: c1,
+                generation: a1.lease_generation,
+            })),
+        )
+        .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*fx.core.safety.state(), SafetyState::Idle);
+
+        // Advance 30 * 20 ms = 600 ms > 500 ms window while handshake stays Pending.
+        for _ in 0..30 {
+            let _ = fx.step();
+        }
+        assert!(
+            matches!(
+                fx.core.safety.state(),
+                SafetyState::Fault(armd::FaultReason::Other(r))
+                    if r == "Torque disable has not been confirmed by fresh hardware feedback"
+            ),
+            "stuck pending disable handshake must exhaust at 500 ms window, got: {:?}",
+            fx.core.safety.state()
+        );
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -2773,34 +3019,47 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
             let _ = core.poll_hardware(&bn);
         }
 
-        // 4. LeaseClearFault refusals (LeaseLost, EpochMismatch, InvalidRequestId, OperatorRequired, InvalidBody, ClearFailed) -> 0 alloc.
+        // 4. LeaseClearFault & TorquePreflight refusals -> 0 alloc.
         let ep_fault = core.safety.epoch_id();
         let now_f = mclock.now();
         let rd_f = now_f + Duration::from_millis(20);
         assert!(matches!(
-            install_lease_clear_fault_rt(&mut core, c1, g1 + 1, Some(ep_fault), true, None, grant_ok, now_f, rd_f),
+            install_lease_clear_fault_rt(&mut core, c1, g1 + 1, Some(ep_fault), true, None, OwnerAuthPolicy::ClearFault, grant_ok, now_f, rd_f),
             LeaseClearFaultOutcome::LeaseLost { .. }
         ));
         assert!(matches!(
-            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault + 1), true, None, grant_ok, now_f, rd_f),
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault + 1), true, None, OwnerAuthPolicy::ClearFault, grant_ok, now_f, rd_f),
             LeaseClearFaultOutcome::EpochMismatch { consumed_request_id: false, .. }
         ));
         assert!(matches!(
-            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), false, None, grant_ok, now_f, rd_f),
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), false, None, OwnerAuthPolicy::ClearFault, grant_ok, now_f, rd_f),
             LeaseClearFaultOutcome::InvalidRequestId
         ));
         assert!(matches!(
-            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, None, grant_denied, now_f, rd_f),
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, None, OwnerAuthPolicy::ClearFault, grant_denied, now_f, rd_f),
             LeaseClearFaultOutcome::OperatorRequired { .. }
         ));
         assert!(matches!(
-            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, Some("bad"), grant_ok, now_f, rd_f),
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, Some("bad"), OwnerAuthPolicy::ClearFault, grant_ok, now_f, rd_f),
             LeaseClearFaultOutcome::InvalidBody { .. }
         ));
         // ClearFailed because disable_pending is still true -> 0 alloc!
         assert!(matches!(
-            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, None, grant_ok, now_f, rd_f),
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, None, OwnerAuthPolicy::ClearFault, grant_ok, now_f, rd_f),
             LeaseClearFaultOutcome::ClearFailed { .. }
+        ));
+        // Live owner torque preflight (malformed & lease-lost & operator policy) -> 0 alloc!
+        assert!(matches!(
+            check_torque_owner_preflight(&mut core, c1, g1 + 1, Some(ep_fault), true, Some("bad"), OwnerAuthPolicy::None, grant_ok, now_f),
+            Err(TorquePreflightError::LeaseLost { .. })
+        ));
+        assert!(matches!(
+            check_torque_owner_preflight(&mut core, c1, g1, Some(ep_fault), true, Some("bad"), OwnerAuthPolicy::None, grant_ok, now_f),
+            Err(TorquePreflightError::InvalidBody { .. })
+        ));
+        assert!(matches!(
+            check_torque_owner_preflight(&mut core, c1, g1, Some(ep_fault), true, None, OwnerAuthPolicy::Operator(None), grant_denied, now_f),
+            Err(TorquePreflightError::OperatorRequired { .. })
         ));
 
         // Confirm background disable via driver, then LeaseClearFault succeeds -> 0 alloc!
@@ -2822,6 +3081,7 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
             Some(ep_fault),
             true,
             None,
+            OwnerAuthPolicy::ClearFault,
             grant_ok,
             now_f,
             rd_f,
@@ -2894,6 +3154,16 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
             .await["is_torqued"],
             false
         );
+        // Malformed torque body routes via MaintenanceOp::LeaseTorquePreflight -> 0 alloc on RT!
+        assert_eq!(
+            ws_reply(
+                &mut ws,
+                json!({"type": "command", "request_id": 3, "generation": g, "epoch_id": ep0, "path": "/api/v1/torque", "body": {"enable": "not_bool"}}),
+                &["command_reject"],
+            )
+            .await["code"],
+            "INVALID_COMMAND"
+        );
 
         let ep1 = ws_reply(&mut ws, json!({"type": "estop"}), &["epoch_sync"])
             .await["epoch_id"]
@@ -2902,7 +3172,7 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
         assert_eq!(
             ws_reply(
                 &mut ws,
-                json!({"type": "command", "request_id": 3, "generation": g, "epoch_id": ep1, "path": "/api/v1/safety/clear_fault", "body": {}}),
+                json!({"type": "command", "request_id": 4, "generation": g, "epoch_id": ep1, "path": "/api/v1/safety/clear_fault", "body": {}}),
                 &["command_reject"],
             )
             .await["code"],
@@ -2917,11 +3187,32 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
         assert_eq!(
             ws_reply(
                 &mut ws,
-                json!({"type": "command", "request_id": 4, "generation": g, "epoch_id": ep1, "path": "/api/v1/safety/clear_fault", "body": {}}),
+                json!({"type": "command", "request_id": 5, "generation": g, "epoch_id": ep1, "path": "/api/v1/safety/clear_fault", "body": {}}),
                 &["command_ack"],
             )
             .await["safety_state"],
             "Idle"
+        );
+        // Post-disconnect live authority preflight: malformed torque on a disconnected handle
+        // MUST yield LEASE_LOST (not stale-snapshot INVALID_COMMAND) with 0 alloc on RT!
+        let c_disc = ConnectionHandle::from_ws_id(999).unwrap();
+        let bad_after_disc = sup
+            .torque_ws(
+                c_disc,
+                g,
+                Some(ep1),
+                true,
+                6,
+                Err("enable must be boolean"),
+                OwnerAuthPolicy::None,
+                armd::auth::OperatorGrant::DENIED,
+                sup.capture_admission_stamp(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(bad_after_disc, armd::rt_core::requests::lease::TorqueWsOutcome::LeaseLost { .. }),
+            "disconnected handle must fail live authority with LeaseLost, got {bad_after_disc:?}"
         );
 
         let _ = ws.close(None).await;

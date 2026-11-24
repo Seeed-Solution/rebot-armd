@@ -503,16 +503,21 @@ pub const BACKGROUND_DISABLE_RETRY_INTERVAL: Duration = Duration::from_millis(25
 /// Upper time bound for bounded background hardware disable retries before latching a fault.
 pub const BACKGROUND_DISABLE_MAX_WINDOW: Duration = Duration::from_millis(500);
 
-/// Bounded retry state for a background hardware disable whose initial disable attempt failed
-/// or ended unconfirmed without an active driver handshake.
+/// Single executor-owned bounded retry state machine for a background hardware disable whose
+/// initial disable attempt failed or ended unconfirmed.
 ///
 /// Every retry is funneled strictly through the driver's single `begin_torque_budgeted(false, 0)`
 /// (`send(TxKind::Disable, ...)`) choke point so torque-off rest rules apply uniformly.
+/// Once [`Self::Exhausted`] is entered, retries stop permanently until hardware confirms disabled
+/// (`disable_confirmed`) or an explicit recovery action clears the fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BackgroundDisableRetry {
-    pub attempts: u8,
-    pub started_at: Instant,
-    pub next_retry_at: Instant,
+pub(crate) enum BackgroundDisableRetry {
+    Active {
+        attempts: u8,
+        started_at: Instant,
+        next_retry_at: Instant,
+    },
+    Exhausted,
 }
 
 /// Authority tuple captured from [`AdmittedProof`] when a `TorqueTransition::Enable` starts,
@@ -1083,45 +1088,70 @@ impl SupervisorInner {
         (self.measured_positions.clone(), vels, instants, seqs)
     }
 
+    /// Zero-allocation RT executor background disable entry point: routes strictly through the
+    /// driver's single `begin_torque_budgeted(false, 0)` choke point and respects the single
+    /// [`BackgroundDisableRetry`] exhaustion state so exhausted disables never restart.
+    pub(super) fn request_disable_rt(&mut self) -> Result<(), &'static str> {
+        // Supersede any in-flight torque transition before issuing a safety/shutdown disable.
+        if self.torque_transition.take().is_some() {
+            self.core.begin_transition(Err("SUPERSEDED"));
+        }
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            return Err("DISABLE_UNCONFIRMED");
+        }
+        self.disable_requested();
+        let Some(ref d) = self.driver else {
+            self.disable_confirmed();
+            return Ok(());
+        };
+        let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
+        if DisableConfirm::confirmed(&**drv) {
+            drop(drv);
+            self.disable_confirmed();
+            return Ok(());
+        }
+        let res = drv.begin_torque_budgeted(false, 0);
+        let drv_now = drv.clock_now();
+        match res {
+            Ok(progress) => {
+                let confirmed_now = matches!(
+                    progress,
+                    crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
+                ) && DisableConfirm::confirmed(&**drv);
+                drop(drv);
+                if confirmed_now {
+                    self.disable_confirmed();
+                } else {
+                    self.is_torqued = true;
+                    self.arm_background_disable_retry(drv_now);
+                }
+                Ok(())
+            }
+            Err(_) => {
+                drop(drv);
+                self.is_torqued = true;
+                self.arm_background_disable_retry(drv_now);
+                Err("DRIVER_WRITE_FAILED")
+            }
+        }
+    }
+
     /// A successful transport write is not confirmation that torque was removed.
     pub(super) fn request_disable(&mut self) -> Result<(), SafetyError> {
+        if self.rt_executor_owned {
+            return self
+                .request_disable_rt()
+                .map_err(|_| SafetyError::FeedbackUnavailable);
+        }
         // a blocking disable (park, thermal trip, fault path) replaces a transition in flight
         // (the driver's disable replaces its pending enable): that transition ends SUPERSEDED
         if self.torque_transition.take().is_some() { self.core.begin_transition(Err("SUPERSEDED")); }
         self.disable_requested();
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-            if self.rt_executor_owned {
-                let res = drv.begin_torque_budgeted(false, 0);
-                let drv_now = drv.clock_now();
-                let handshake_pending = drv.torque_transition_pending();
-                match res {
-                    Ok(progress) => {
-                        let confirmed_now = matches!(
-                            progress,
-                            crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
-                        ) && DisableConfirm::confirmed(&**drv);
-                        drop(drv);
-                        if confirmed_now {
-                            self.disable_confirmed();
-                        } else {
-                            self.is_torqued = true;
-                            self.arm_background_disable_retry(drv_now);
-                            let _ = handshake_pending;
-                        }
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        drop(drv);
-                        self.is_torqued = true;
-                        self.arm_background_disable_retry(drv_now);
-                        let _ = handshake_pending;
-                        return Err(SafetyError::ClearFaultRejected(format!(
-                            "Torque disable transmission failed: {e}"
-                        )));
-                    }
-                }
-            }
             drv.set_torque(false).map_err(|e| SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")))?;
             let mut confirm = DisableConfirm::start(drv.clock_now());
             while confirm.serve(&mut **drv).is_none() {
@@ -1168,7 +1198,7 @@ impl SupervisorInner {
 
     fn arm_background_disable_retry(&mut self, drv_now: Instant) {
         if self.background_disable_retry.is_none() {
-            self.background_disable_retry = Some(BackgroundDisableRetry {
+            self.background_disable_retry = Some(BackgroundDisableRetry::Active {
                 attempts: 0,
                 started_at: drv_now,
                 next_retry_at: drv_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
@@ -1177,7 +1207,7 @@ impl SupervisorInner {
     }
 
     fn exhaust_background_disable_retry(&mut self) {
-        self.background_disable_retry = None;
+        self.background_disable_retry = Some(BackgroundDisableRetry::Exhausted);
         self.safety.latch(
             crate::safety::FaultKind::Other,
             crate::safety::FaultDetail::Static(crate::safety::StaticFault::DisableUnconfirmed),
@@ -2110,6 +2140,7 @@ impl SupervisorInner {
         self.torque_off_check_rt(false)?;
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
+        self.background_disable_retry = None;
         self.disable_requested();
         let started = match self.driver.as_ref() {
             None => None,
@@ -2206,6 +2237,15 @@ impl SupervisorInner {
             self.disable_confirmed();
             return None;
         }
+        // Once exhausted, never poll or re-issue disable TX again; passive feedback confirmation
+        // above (or an explicit recovery after clear_fault) still clears `disable_pending`.
+        if matches!(
+            self.background_disable_retry,
+            Some(BackgroundDisableRetry::Exhausted)
+        ) {
+            drop(drv);
+            return None;
+        }
 
         if drv.torque_transition_pending() {
             let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
@@ -2216,41 +2256,59 @@ impl SupervisorInner {
             drop(drv);
             if confirmed_now {
                 self.disable_confirmed();
-            } else if !still_pending
-                && !matches!(poll_res, Ok(crate::driver::TorqueProgress::Pending { .. }))
-            {
-                if let Some(retry) = self.background_disable_retry {
-                    if retry.attempts >= BACKGROUND_DISABLE_MAX_RETRIES
-                        || post_now.saturating_duration_since(retry.started_at)
-                            >= BACKGROUND_DISABLE_MAX_WINDOW
-                    {
-                        self.exhaust_background_disable_retry();
-                    } else {
-                        self.background_disable_retry = Some(BackgroundDisableRetry {
-                            attempts: retry.attempts,
-                            started_at: retry.started_at,
-                            next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
-                        });
+            } else {
+                match self.background_disable_retry {
+                    Some(BackgroundDisableRetry::Active {
+                        attempts,
+                        started_at,
+                        ..
+                    }) => {
+                        let window_expired = post_now.saturating_duration_since(started_at)
+                            >= BACKGROUND_DISABLE_MAX_WINDOW;
+                        let finished_unconfirmed = !still_pending
+                            && !matches!(
+                                poll_res,
+                                Ok(crate::driver::TorqueProgress::Pending { .. })
+                            );
+                        if window_expired
+                            || (finished_unconfirmed && attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
+                        {
+                            self.exhaust_background_disable_retry();
+                        } else if finished_unconfirmed {
+                            self.background_disable_retry =
+                                Some(BackgroundDisableRetry::Active {
+                                    attempts,
+                                    started_at,
+                                    next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
+                                });
+                        }
                     }
-                } else {
-                    self.arm_background_disable_retry(post_now);
+                    Some(BackgroundDisableRetry::Exhausted) => {}
+                    None => {
+                        self.arm_background_disable_retry(post_now);
+                    }
                 }
             }
             return rx;
         }
 
-        let Some(retry) = self.background_disable_retry else {
+        let Some(BackgroundDisableRetry::Active {
+            attempts,
+            started_at,
+            next_retry_at,
+        }) = self.background_disable_retry
+        else {
             drop(drv);
             return None;
         };
-        if retry.attempts >= BACKGROUND_DISABLE_MAX_RETRIES
-            || drv_now.saturating_duration_since(retry.started_at) >= BACKGROUND_DISABLE_MAX_WINDOW
+        if attempts >= BACKGROUND_DISABLE_MAX_RETRIES
+            || drv_now.saturating_duration_since(started_at) >= BACKGROUND_DISABLE_MAX_WINDOW
         {
             drop(drv);
             self.exhaust_background_disable_retry();
             return None;
         }
-        if drv_now < retry.next_retry_at || !self.torque_off_when_stopped_hook() {
+        if drv_now < next_retry_at || !self.torque_off_when_stopped_hook() {
             drop(drv);
             return None;
         }
@@ -2271,21 +2329,16 @@ impl SupervisorInner {
             return None;
         }
 
-        let next_attempts = retry.attempts.saturating_add(1);
-        if handshake_pending {
-            self.background_disable_retry = Some(BackgroundDisableRetry {
-                attempts: next_attempts,
-                started_at: retry.started_at,
-                next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
-            });
-        } else if next_attempts >= BACKGROUND_DISABLE_MAX_RETRIES
-            || post_now.saturating_duration_since(retry.started_at) >= BACKGROUND_DISABLE_MAX_WINDOW
+        let next_attempts = attempts.saturating_add(1);
+        let window_expired =
+            post_now.saturating_duration_since(started_at) >= BACKGROUND_DISABLE_MAX_WINDOW;
+        if window_expired || (!handshake_pending && next_attempts >= BACKGROUND_DISABLE_MAX_RETRIES)
         {
             self.exhaust_background_disable_retry();
         } else {
-            self.background_disable_retry = Some(BackgroundDisableRetry {
+            self.background_disable_retry = Some(BackgroundDisableRetry::Active {
                 attempts: next_attempts,
-                started_at: retry.started_at,
+                started_at,
                 next_retry_at: post_now + BACKGROUND_DISABLE_RETRY_INTERVAL,
             });
         }

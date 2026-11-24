@@ -113,6 +113,9 @@ pub(super) enum AuthRequirement {
     /// Always requires an operator session when operator auth is enforced.
     /// Optional label overrides the operation name in `ApiError::operator_required`; `None` uses `path`.
     Operator(Option<&'static str>),
+    /// Owner-side operator authorization policy evaluated live against a lock-free [`OperatorGrant`]
+    /// (shared across legacy lock and RT executor with zero heap allocation).
+    OwnerGrant(crate::rt_core::requests::lease::OwnerAuthPolicy),
     /// Conditional operator privilege evaluated under the supervisor write lock by a family predicate.
     Conditional(fn(&WsAuth, &mut SupervisorInner, &str, &Value, u64) -> Option<ApiError>),
     /// Conditional operator privilege evaluated pre-lock for lease-free commands.
@@ -122,6 +125,18 @@ pub(super) enum AuthRequirement {
 }
 
 impl AuthRequirement {
+    /// Converts a table-declared auth policy into the zero-alloc owner-side policy used by
+    /// `DispatchHandler::CommandAsync` handlers across legacy and RT executor owners.
+    pub(super) fn owner_auth_policy(self) -> Option<crate::rt_core::requests::lease::OwnerAuthPolicy> {
+        use crate::rt_core::requests::lease::OwnerAuthPolicy;
+        match self {
+            Self::None => Some(OwnerAuthPolicy::None),
+            Self::Operator(label) => Some(OwnerAuthPolicy::Operator(label)),
+            Self::OwnerGrant(policy) => Some(policy),
+            Self::Conditional(_) | Self::ConditionalLeaseFree(_) | Self::InHandler => None,
+        }
+    }
+
     /// Enforce operator privilege for an owner-locked command row directly from the table entry.
     pub(super) fn check_owner(
         self,
@@ -138,6 +153,29 @@ impl AuthRequirement {
                     None
                 } else {
                     Some(ApiError::operator_required(label.unwrap_or(path)))
+                }
+            }
+            Self::OwnerGrant(policy) => {
+                use crate::rt_core::requests::lease::{evaluate_owner_auth_policy, OwnerAuthError};
+                match evaluate_owner_auth_policy(
+                    policy,
+                    ws_auth.operator_grant(),
+                    inner,
+                    epoch,
+                    std::time::Instant::now(),
+                    "/api/v1/safety/clear_fault",
+                ) {
+                    Ok(()) => None,
+                    Err(OwnerAuthError::EpochMismatch { expected, received }) => Some(
+                        crate::supervisor::ArmError::Safety(crate::safety::SafetyError::EpochMismatch {
+                            expected,
+                            received,
+                        })
+                        .into(),
+                    ),
+                    Err(OwnerAuthError::OperatorRequired { operation }) => {
+                        Some(ApiError::operator_required(operation))
+                    }
                 }
             }
             Self::Conditional(pred) => pred(ws_auth, inner, path, body, epoch),
@@ -162,7 +200,7 @@ impl AuthRequirement {
                 }
             }
             Self::ConditionalLeaseFree(pred) => pred(ws_auth, path, body),
-            Self::Conditional(_) => {
+            Self::Conditional(_) | Self::OwnerGrant(_) => {
                 unreachable!("lease-free row cannot use an owner-locked auth predicate")
             }
         }
@@ -270,14 +308,17 @@ pub(super) type SessionFuture<'a> = std::pin::Pin<
 
 /// Arguments passed to unified async command handlers (`/api/v1/torque`, `/api/v1/arm`,
 /// `/api/v1/safety/clear_fault`) routed through the active owner (legacy or RT executor).
+///
+/// Both `local_generation` (from `entry.lease`) and `auth_policy` (from `entry.auth`) are enforced
+/// and supplied directly by the dispatcher from the [`DispatchEntry`] row.
 pub(super) struct CommandAsyncCtx<'a> {
     pub(super) supervisor: &'a ArmSupervisor,
     pub(super) value: &'a Value,
     pub(super) stamp: AdmissionStamp,
     pub(super) conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
-    pub(super) recv_generation: &'a AtomicU64,
-    pub(super) recv_client_label: &'a Mutex<Option<String>>,
-    pub(super) ws_auth: &'a WsAuth,
+    pub(super) local_generation: u64,
+    pub(super) auth_policy: crate::rt_core::requests::lease::OwnerAuthPolicy,
+    pub(super) operator: crate::auth::OperatorGrant,
     pub(super) last_ordinary_request: &'a mut Option<u64>,
 }
 
@@ -414,7 +455,16 @@ fn validate_entry(entry: &DispatchEntry) {
                 "CommandAsync handler must use Ordinary/OrdinaryTorqueOrStopExempt admission: {:?}",
                 entry.key
             );
-            assert_eq!(entry.lease, LeaseRequirement::Required, "{:?}", entry.key);
+            assert!(
+                matches!(entry.lease, LeaseRequirement::Required | LeaseRequirement::None),
+                "CommandAsync handler must declare Required or None lease policy: {:?}",
+                entry.key
+            );
+            assert!(
+                entry.auth.owner_auth_policy().is_some(),
+                "CommandAsync handler must declare None, Operator, or OwnerGrant auth policy: {:?}",
+                entry.key
+            );
             assert_eq!(entry.reply, ReplyPolicy::CommandImmediate, "{:?}", entry.key);
         }
         DispatchHandler::LeaseFree(_) => {

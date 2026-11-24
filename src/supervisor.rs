@@ -3687,7 +3687,7 @@ impl SupervisorInner {
         if unknown && self.shutdown_refused_unknown && (!self.is_torqued || self.disable_pending) {
             if self.rt_executor_owned {
                 if self.torque_transition.is_none() {
-                    let _ = self.request_disable();
+                    let _ = self.request_disable_rt();
                 }
             } else {
                 let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
@@ -5492,8 +5492,11 @@ impl SupervisorInner {
 
         // Thermal protection remains active while stopped or shutdown is unconfirmed.
         self.check_thermal_protection(false);
-        // (a torque transition in flight confirms its own disable: `service_torque_transition`)
-        if !self.confirm_background_disable_if_ready()
+        // (a torque transition in flight confirms its own disable: `service_torque_transition`;
+        // under RT executor ownership, Step 2 `service_background_disable` is the sole retry and
+        // exhaustion state machine, so keep the 250 ms periodic fallback strictly legacy-only)
+        if !self.rt_executor_owned
+            && !self.confirm_background_disable_if_ready()
             && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
         {
             if let Err(e) = self.request_disable() {
@@ -8801,57 +8804,86 @@ impl ArmSupervisor {
         request_id_valid: bool,
         parsed_request_id: u64,
         enable: Result<bool, &'static str>,
+        auth_policy: crate::rt_core::requests::lease::OwnerAuthPolicy,
+        operator: crate::auth::OperatorGrant,
         stamp: AdmissionStamp,
     ) -> Result<crate::rt_core::requests::lease::TorqueWsOutcome, ArmError> {
         use crate::rt_core::broker::{Outcome, Reply, TransitionOp};
         use crate::rt_core::requests::lease::{
-            install_torque_off_legacy, install_torque_on_legacy, map_torque_code_to_api_error,
-            prepare_torque, TorqueWsOutcome, DEFAULT_LEASE_REQUEST_DEADLINE,
+            check_torque_owner_preflight, install_torque_off_legacy, install_torque_on_legacy,
+            map_torque_code_to_api_error, prepare_torque, prepare_torque_ws, OwnerAuthPolicy,
+            TorquePreflightError, TorqueWsOutcome, DEFAULT_LEASE_REQUEST_DEADLINE,
         };
-        let mode = self.owner_mode();
-        match mode {
+        let map_preflight_err = |err: TorquePreflightError| -> TorqueWsOutcome {
+            match err {
+                TorquePreflightError::LeaseLost { epoch_id } => {
+                    TorqueWsOutcome::LeaseLost { epoch_id }
+                }
+                TorquePreflightError::EpochMismatch { epoch_id } => {
+                    TorqueWsOutcome::EpochMismatch { epoch_id }
+                }
+                TorquePreflightError::InvalidRequestId => TorqueWsOutcome::InvalidRequestId,
+                TorquePreflightError::OperatorRequired {
+                    operation,
+                    epoch_id,
+                } => TorqueWsOutcome::Rejected {
+                    error: crate::api::rest::ApiError::operator_required(operation),
+                    epoch_id,
+                },
+                TorquePreflightError::MotionBusy { epoch_id } => TorqueWsOutcome::Rejected {
+                    error: crate::api::rest::ApiError(
+                        axum::http::StatusCode::CONFLICT,
+                        "a calibration apply, restore or motor zero is running".into(),
+                        "MOTION_BUSY".into(),
+                    ),
+                    epoch_id,
+                },
+                TorquePreflightError::InvalidBody { message, epoch_id } => {
+                    TorqueWsOutcome::InvalidBody { message, epoch_id }
+                }
+            }
+        };
+        // Off-lock typed preparation shared by both legacy and RT executor owners.
+        let snap = self.fresh_snapshot(None).await?;
+        let now = Instant::now();
+        let deadline = now + DEFAULT_LEASE_REQUEST_DEADLINE;
+        let prep_ws = prepare_torque_ws(
+            &snap.owner,
+            conn,
+            local_generation,
+            supplied_epoch,
+            request_id_valid,
+            parsed_request_id,
+            enable,
+            auth_policy,
+            operator,
+            stamp,
+            now,
+            deadline,
+        )
+        .map_err(|_| observation_unavailable())?;
+
+        match self.owner_mode() {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
                 self.check_legacy_under_guard(&inner)?;
-                let now = Instant::now();
-                let lease_ok = local_generation != 0
-                    && inner.check_client_connection_live(conn.id(), false).is_ok()
-                    && inner.validate_lease_at(conn.as_str(), local_generation, now);
-                if !lease_ok {
-                    return Ok(TorqueWsOutcome::LeaseLost {
-                        epoch_id: inner.safety.epoch_id(),
-                    });
+                if let Err(err) = check_torque_owner_preflight(
+                    &mut inner,
+                    prep_ws.connection,
+                    prep_ws.local_generation,
+                    prep_ws.supplied_epoch,
+                    prep_ws.request_id_valid,
+                    prep_ws.body_error,
+                    prep_ws.auth_policy,
+                    prep_ws.operator,
+                    Instant::now(),
+                ) {
+                    return Ok(map_preflight_err(err));
                 }
-                inner.consume_pending_estop();
-                let epoch = inner.safety.epoch_id();
-                if supplied_epoch != Some(epoch) {
-                    return Ok(TorqueWsOutcome::EpochMismatch { epoch_id: epoch });
-                }
-                if !request_id_valid {
-                    return Ok(TorqueWsOutcome::InvalidRequestId);
-                }
-                if inner.calibration_busy && inner.motor_zero_busy {
-                    return Ok(TorqueWsOutcome::Rejected {
-                        error: crate::api::rest::ApiError(
-                            axum::http::StatusCode::CONFLICT,
-                            "a calibration apply, restore or motor zero is running".into(),
-                            "MOTION_BUSY".into(),
-                        ),
-                        epoch_id: epoch,
-                    });
-                }
-                let enabled = match enable {
-                    Ok(v) => v,
-                    Err(message) => {
-                        return Ok(TorqueWsOutcome::InvalidBody {
-                            message,
-                            epoch_id: epoch,
-                        });
-                    }
-                };
+                let enabled = prep_ws.enable.expect("checked by check_torque_owner_preflight");
                 let res = if enabled {
                     inner
-                        .check_admission(stamp)
+                        .check_admission(prep_ws.stamp)
                         .and_then(install_torque_on_legacy)
                         .map_err(ArmError::from)
                 } else {
@@ -8874,61 +8906,33 @@ impl ArmSupervisor {
                 let Some(handle) = self.executor_handle() else {
                     return Err(executor_unavailable());
                 };
-                let mut snap = self.fresh_snapshot(None).await?;
-                if (!request_id_valid || enable.is_err())
-                    && self.e_stop_latched.load(Ordering::SeqCst)
-                    && !snap.owner.e_stop_latched
-                {
-                    snap = self
-                        .fresh_snapshot(Some(snap.meta.generation.saturating_add(1)))
-                        .await?;
-                }
-                let now = Instant::now();
-                if !request_id_valid || enable.is_err() {
-                    let lease_ok = local_generation != 0
-                        && snap.owner.is_lease_active_at(now)
-                        && snap.owner.lease_generation == local_generation
-                        && (snap.owner.lease_owner_conn_id == 0
-                            || snap.owner.lease_owner_conn_id == conn.id());
-                    if !lease_ok {
-                        return Ok(TorqueWsOutcome::LeaseLost {
-                            epoch_id: snap.obs.epoch_id,
-                        });
-                    }
-                    if supplied_epoch != Some(snap.obs.epoch_id) {
-                        return Ok(TorqueWsOutcome::EpochMismatch {
-                            epoch_id: snap.obs.epoch_id,
-                        });
-                    }
-                    if !request_id_valid {
-                        return Ok(TorqueWsOutcome::InvalidRequestId);
-                    }
-                    if let Err(message) = enable {
-                        return Ok(TorqueWsOutcome::InvalidBody {
-                            message,
-                            epoch_id: snap.obs.epoch_id,
-                        });
+                // Malformed requests or rows carrying an owner auth policy evaluate LIVE owner
+                // authority through the single shared `check_torque_owner_preflight` (never stale
+                // snapshot-only checks), preserving exact legacy/executor precedence parity.
+                if prep_ws.broker.is_none() || prep_ws.auth_policy != OwnerAuthPolicy::None {
+                    let preflight = handle
+                        .lease_torque_preflight_async(
+                            prep_ws.connection,
+                            prep_ws.local_generation,
+                            prep_ws.supplied_epoch,
+                            prep_ws.request_id_valid,
+                            prep_ws.body_error,
+                            prep_ws.auth_policy,
+                            prep_ws.operator,
+                        )
+                        .await
+                        .map_err(ArmError::from)?;
+                    if let Err(err) = preflight {
+                        return Ok(map_preflight_err(err));
                     }
                 }
-                let enabled = enable.expect("checked above");
+                let enabled = prep_ws.enable.expect("checked above");
                 let op = if enabled {
                     TransitionOp::TorqueOn
                 } else {
                     TransitionOp::TorqueOff
                 };
-                let deadline = now + DEFAULT_LEASE_REQUEST_DEADLINE;
-                let mut prep = prepare_torque(
-                    &snap.owner,
-                    conn,
-                    local_generation,
-                    supplied_epoch,
-                    enabled,
-                    parsed_request_id,
-                    stamp,
-                    now,
-                    deadline,
-                )
-                .map_err(|_| observation_unavailable())?;
+                let mut prep = prep_ws.broker.expect("checked above");
 
                 for attempt in 0..2 {
                     let reply = handle
@@ -8949,12 +8953,12 @@ impl ArmSupervisor {
                             let fresh = self.fresh_snapshot(None).await?;
                             prep = prepare_torque(
                                 &fresh.owner,
-                                conn,
-                                local_generation,
-                                supplied_epoch,
+                                prep_ws.connection,
+                                prep_ws.local_generation,
+                                prep_ws.supplied_epoch,
                                 enabled,
-                                parsed_request_id,
-                                stamp,
+                                prep_ws.parsed_request_id,
+                                prep_ws.stamp,
                                 Instant::now(),
                                 deadline,
                             )
@@ -9045,8 +9049,9 @@ impl ArmSupervisor {
 
     /// Unified owner-routed WS `/api/v1/safety/clear_fault` across legacy and RT executor owners.
     ///
-    /// Both owners share the exact same authority, pending-E-stop, live [`OperatorGrant`], and
-    /// `motor_zero_busy` precedence in `requests::lease::install_lease_clear_fault_*`.
+    /// Both owners share the exact same authority, pending-E-stop, live [`OperatorGrant`] policy
+    /// (supplied by the WS dispatch table), and `motor_zero_busy` precedence in
+    /// `requests::lease::install_lease_clear_fault_*`.
     #[allow(clippy::too_many_arguments)]
     pub async fn clear_fault_ws(
         &self,
@@ -9056,6 +9061,7 @@ impl ArmSupervisor {
         request_id_valid: bool,
         body_error: Option<&'static str>,
         mit_recovery: bool,
+        auth_policy: crate::rt_core::requests::lease::OwnerAuthPolicy,
         operator: crate::auth::OperatorGrant,
     ) -> Result<
         Result<crate::rt_core::requests::lease::LeaseClearFaultOutcome, (ArmError, u64)>,
@@ -9074,6 +9080,7 @@ impl ArmSupervisor {
                     request_id_valid,
                     body_error,
                     mit_recovery,
+                    auth_policy,
                     operator,
                     Instant::now(),
                 );
@@ -9090,6 +9097,7 @@ impl ArmSupervisor {
                         supplied_epoch,
                         request_id_valid,
                         body_error,
+                        auth_policy,
                         operator,
                     )
                     .await

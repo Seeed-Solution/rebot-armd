@@ -294,6 +294,17 @@ impl ArmCore {
         Some(p)
     }
 
+    /// Consumes a failed/aborted transition outcome without touching a pending transition or
+    /// synchronous Step-3 `Ok(TorqueProgress::Done)` completion.
+    pub fn take_aborted_transition(&mut self) -> Option<&'static str> {
+        if let Some(Err(code)) = self.transition {
+            self.transition = None;
+            Some(code)
+        } else {
+            None
+        }
+    }
+
     // -- macro terminals ------------------------------------------------------------------
 
     /// Records how a macro action ended (call where the macro finishes, track E).

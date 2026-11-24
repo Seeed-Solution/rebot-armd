@@ -55,53 +55,12 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::CommandAsync(dispatch_clear_fault_async),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Conditional(clear_fault_auth_check),
+        auth: AuthRequirement::OwnerGrant(
+            crate::rt_core::requests::lease::OwnerAuthPolicy::ClearFault,
+        ),
         reply: ReplyPolicy::CommandImmediate,
     },
 ];
-
-fn clear_fault_auth_check(
-    ws_auth: &WsAuth,
-    inner: &mut SupervisorInner,
-    _path: &str,
-    _body: &Value,
-    epoch: u64,
-) -> Option<ApiError> {
-    if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
-        return Some(
-            ArmError::Safety(SafetyError::EpochMismatch {
-                expected: inner.safety.epoch_id(),
-                received: epoch,
-            })
-            .into(),
-        );
-    }
-    if ws_auth.is_operator() {
-        return None;
-    }
-    // Re-check pending E-stop after `ws_auth.is_operator()` (preserving baseline parity when an
-    // atomic E-stop latches concurrently during session-table verification).
-    if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
-        return Some(
-            ArmError::Safety(SafetyError::EpochMismatch {
-                expected: inner.safety.epoch_id(),
-                received: epoch,
-            })
-            .into(),
-        );
-    }
-    if inner.e_stop_latched.load(Ordering::SeqCst) {
-        return Some(ApiError::operator_required("clear_fault (EStop latched)"));
-    }
-    if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
-        && !inner.safety.recoverable()
-    {
-        return Some(ApiError::operator_required(
-            "clear_fault (non-recoverable fault or EStop)",
-        ));
-    }
-    None
-}
 
 fn dispatch_acquire_lease_async<'a>(
     ctx: super::dispatch::SessionDispatchCtx<'a>,
@@ -139,14 +98,14 @@ fn dispatch_release_lease_async<'a>(
     })
 }
 
-async fn current_reject_epoch(supervisor: &ArmSupervisor) -> u64 {
+pub(super) async fn current_reject_epoch(supervisor: &ArmSupervisor) -> u64 {
     supervisor
         .fresh_snapshot(None)
         .await
         .map_or_else(|_| supervisor.estop_epoch(), |s| s.obs.epoch_id)
 }
 
-fn format_command_lease_lost(request_id: &Value, epoch_id: u64) -> Value {
+pub(super) fn format_command_lease_lost(request_id: &Value, epoch_id: u64) -> Value {
     json!({
         "type": "command_reject",
         "request_id": request_id,
@@ -210,7 +169,7 @@ fn format_command_reject_api(request_id: &Value, error: ApiError, epoch_id: u64)
     reply
 }
 
-fn check_local_command_lease(
+pub(super) fn check_local_command_lease(
     value: &Value,
     recv_generation: &AtomicU64,
     recv_client_label: &Mutex<Option<String>>,
@@ -235,11 +194,6 @@ fn dispatch_torque_async<'a>(ctx: CommandAsyncCtx<'a>) -> CommandAsyncFuture<'a>
     Box::pin(async move {
         use crate::rt_core::requests::lease::TorqueWsOutcome;
         let req_id_val = ctx.value.get("request_id").unwrap_or(&Value::Null);
-        let Some(local_generation) =
-            check_local_command_lease(ctx.value, ctx.recv_generation, ctx.recv_client_label)
-        else {
-            return format_command_lease_lost(req_id_val, current_reject_epoch(ctx.supervisor).await);
-        };
         let supplied_epoch = ctx.value.get("epoch_id").and_then(Value::as_u64);
         let parsed_request_id = ctx.value.get("request_id").and_then(Value::as_u64);
         let request_id_valid = parsed_request_id
@@ -255,11 +209,13 @@ fn dispatch_torque_async<'a>(ctx: CommandAsyncCtx<'a>) -> CommandAsyncFuture<'a>
             .supervisor
             .torque_ws(
                 ctx.conn_handle,
-                local_generation,
+                ctx.local_generation,
                 supplied_epoch,
                 request_id_valid,
                 parsed_request_id.unwrap_or(0),
                 enable_res,
+                ctx.auth_policy,
+                ctx.operator,
                 ctx.stamp,
             )
             .await
@@ -311,11 +267,6 @@ fn dispatch_clear_fault_async<'a>(ctx: CommandAsyncCtx<'a>) -> CommandAsyncFutur
     Box::pin(async move {
         use crate::rt_core::requests::lease::LeaseClearFaultOutcome;
         let req_id_val = ctx.value.get("request_id").unwrap_or(&Value::Null);
-        let Some(local_generation) =
-            check_local_command_lease(ctx.value, ctx.recv_generation, ctx.recv_client_label)
-        else {
-            return format_command_lease_lost(req_id_val, current_reject_epoch(ctx.supervisor).await);
-        };
         let supplied_epoch = ctx.value.get("epoch_id").and_then(Value::as_u64);
         let parsed_request_id = ctx.value.get("request_id").and_then(Value::as_u64);
         let request_id_valid = parsed_request_id
@@ -329,18 +280,18 @@ fn dispatch_clear_fault_async<'a>(ctx: CommandAsyncCtx<'a>) -> CommandAsyncFutur
                 Some(_) => (Some("mit_recovery must be \"torque_off_all\""), false),
             },
         };
-        let operator = ctx.ws_auth.operator_grant();
 
         match ctx
             .supervisor
             .clear_fault_ws(
                 ctx.conn_handle,
-                local_generation,
+                ctx.local_generation,
                 supplied_epoch,
                 request_id_valid,
                 body_error,
                 mit_recovery,
-                operator,
+                ctx.auth_policy,
+                ctx.operator,
             )
             .await
         {
@@ -384,20 +335,13 @@ fn dispatch_clear_fault_async<'a>(ctx: CommandAsyncCtx<'a>) -> CommandAsyncFutur
                         format_command_invalid_request_id(req_id_val)
                     }
                     LeaseClearFaultOutcome::OperatorRequired {
-                        estop_latched,
+                        operation,
                         epoch_id,
-                    } => {
-                        let op_label = if estop_latched {
-                            "clear_fault (EStop latched)"
-                        } else {
-                            "clear_fault (non-recoverable fault or EStop)"
-                        };
-                        format_command_reject_api(
-                            req_id_val,
-                            ApiError::operator_required(op_label),
-                            epoch_id,
-                        )
-                    }
+                    } => format_command_reject_api(
+                        req_id_val,
+                        ApiError::operator_required(operation),
+                        epoch_id,
+                    ),
                     LeaseClearFaultOutcome::MotionBusy { epoch_id } => format_command_reject_api(
                         req_id_val,
                         ApiError(

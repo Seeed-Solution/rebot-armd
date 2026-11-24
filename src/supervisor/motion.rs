@@ -475,7 +475,13 @@ impl SupervisorInner {
                         limit: self.config.max_temperature,
                     },
                 );
-                if !self.disable_pending
+                if self.rt_executor_owned {
+                    if !self.disable_pending {
+                        if let Err(code) = self.request_disable_rt() {
+                            tracing::error!(code, "Thermal shutdown not confirmed");
+                        }
+                    }
+                } else if !self.disable_pending
                     || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
                 {
                     if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }

@@ -840,6 +840,16 @@ pub enum MaintenanceOp {
         supplied_epoch: Option<u64>,
         request_id_valid: bool,
         body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
+        operator: crate::auth::OperatorGrant,
+    },
+    LeaseTorquePreflight {
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
         operator: crate::auth::OperatorGrant,
     },
     SetJointZeroOffsets { offsets: Vec<f32> },
@@ -868,6 +878,7 @@ pub enum MaintenanceResult {
     Observation(Box<ArmObservation>),
     FaultCleared(Result<SafetyState, ClearFaultError>),
     LeaseFaultCleared(super::requests::lease::LeaseClearFaultOutcome),
+    LeaseTorquePreflight(Result<u64, super::requests::lease::TorquePreflightError>),
     JointZeroOffsetsSet(Result<(), String>),
     MotorZeroSet(Result<(), String>),
     BaselineTaken(BaselineTakeReply),
@@ -1942,8 +1953,10 @@ impl OffThreadSinks {
         }
         self.maint_client.drain_replies();
         self.urgent_stop_client.drain_replies();
-        self.conn_lifecycle_client.drain_replies();
+        // Preserve owner Step 7 causal ordering off-thread: broker terminals (e.g. an aborted
+        // TorqueOn fenced by Disconnect) resolve strictly BEFORE lifecycle waiters (Disconnect).
         self.broker_dispatcher.drain_replies();
+        self.conn_lifecycle_client.drain_replies();
         {
             let mut ev_rx = self.eviction_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok((ev_conn, ev_gen)) = ev_rx.pop() {
@@ -2358,7 +2371,8 @@ impl RtExecutorHandle {
     }
 
     /// Routes WS `/api/v1/safety/clear_fault` through the single RT owner via
-    /// [`MaintenanceOp::LeaseClearFault`] with live lock-free [`crate::auth::OperatorGrant`].
+    /// [`MaintenanceOp::LeaseClearFault`] with live lock-free [`crate::auth::OperatorGrant`]
+    /// governed by the WS dispatch table's [`super::requests::lease::OwnerAuthPolicy`].
     #[allow(clippy::too_many_arguments)]
     pub async fn lease_clear_fault_async(
         &self,
@@ -2367,6 +2381,7 @@ impl RtExecutorHandle {
         supplied_epoch: Option<u64>,
         request_id_valid: bool,
         body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
         operator: crate::auth::OperatorGrant,
     ) -> Result<super::requests::lease::LeaseClearFaultOutcome, OwnerError> {
         match self
@@ -2376,11 +2391,43 @@ impl RtExecutorHandle {
                 supplied_epoch,
                 request_id_valid,
                 body_error,
+                auth_policy,
                 operator,
             })
             .await?
         {
             MaintenanceResult::LeaseFaultCleared(out) => Ok(out),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    /// Evaluates live owner authority, pending E-stop, operator auth policy, and body/request_id
+    /// precedence on the RT owner for malformed or policy-gated WS `/api/v1/torque` & `/api/v1/arm`
+    /// commands (zero heap allocations on `armd-control`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lease_torque_preflight_async(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        auth_policy: super::requests::lease::OwnerAuthPolicy,
+        operator: crate::auth::OperatorGrant,
+    ) -> Result<Result<u64, super::requests::lease::TorquePreflightError>, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::LeaseTorquePreflight {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                auth_policy,
+                operator,
+            })
+            .await?
+        {
+            MaintenanceResult::LeaseTorquePreflight(res) => Ok(res),
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -3071,6 +3118,7 @@ impl ControlState {
                 supplied_epoch,
                 request_id_valid,
                 body_error,
+                auth_policy,
                 operator,
             } => {
                 let out = super::requests::lease::install_lease_clear_fault_rt(
@@ -3080,6 +3128,7 @@ impl ControlState {
                     supplied_epoch,
                     request_id_valid,
                     body_error,
+                    auth_policy,
                     operator,
                     ctx.now,
                     release_deadline,
@@ -3092,6 +3141,28 @@ impl ControlState {
                 }
                 self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
                 MaintenanceResult::LeaseFaultCleared(out)
+            }
+            MaintenanceOp::LeaseTorquePreflight {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                auth_policy,
+                operator,
+            } => {
+                let res = super::requests::lease::check_torque_owner_preflight(
+                    core,
+                    connection,
+                    lease_generation,
+                    supplied_epoch,
+                    request_id_valid,
+                    body_error,
+                    auth_policy,
+                    operator,
+                    ctx.now,
+                );
+                MaintenanceResult::LeaseTorquePreflight(res)
             }
             MaintenanceOp::SetJointZeroOffsets { offsets } => {
                 let res = if *core.safety.state() != SafetyState::Idle

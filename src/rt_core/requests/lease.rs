@@ -366,6 +366,222 @@ pub fn prepare_lease_disconnect(connection: ConnectionHandle) -> PreparedLeaseDi
     }
 }
 
+/// Single owner-side operator authorization policy driven directly by the WS dispatch table
+/// (`src/api/ws/dispatch.rs`) and evaluated live on the owner (legacy lock or RT executor) with
+/// zero heap allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerAuthPolicy {
+    /// No operator privilege required.
+    None,
+    /// Always requires a live operator session when operator auth is enforced.
+    Operator(Option<&'static str>),
+    /// Clear-fault rule: requires a live operator session when E-stop is latched or safety is in
+    /// a non-recoverable stopped/fault state.
+    ClearFault,
+}
+
+/// Zero-allocation refusal returned by [`evaluate_owner_auth_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerAuthError {
+    EpochMismatch { expected: u64, received: u64 },
+    OperatorRequired { operation: &'static str },
+}
+
+/// Single authoritative owner-side operator authorization evaluator shared by `dispatch.rs`,
+/// legacy WS handlers, and RT executor maintenance/preflight paths (zero heap allocations).
+pub fn evaluate_owner_auth_policy(
+    policy: OwnerAuthPolicy,
+    operator: OperatorGrant,
+    inner: &mut SupervisorInner,
+    epoch: u64,
+    now: Instant,
+    path_label: &'static str,
+) -> Result<(), OwnerAuthError> {
+    match policy {
+        OwnerAuthPolicy::None => Ok(()),
+        OwnerAuthPolicy::Operator(label) => {
+            let check_now = now.max(Instant::now());
+            if operator.is_valid_at(check_now, inner.operator_auth_enforced) {
+                Ok(())
+            } else {
+                Err(OwnerAuthError::OperatorRequired {
+                    operation: label.unwrap_or(path_label),
+                })
+            }
+        }
+        OwnerAuthPolicy::ClearFault => {
+            if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
+                return Err(OwnerAuthError::EpochMismatch {
+                    expected: inner.safety.epoch_id(),
+                    received: epoch,
+                });
+            }
+            let check_now = now.max(Instant::now());
+            if operator.is_valid_at(check_now, inner.operator_auth_enforced) {
+                return Ok(());
+            }
+            if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
+                return Err(OwnerAuthError::EpochMismatch {
+                    expected: inner.safety.epoch_id(),
+                    received: epoch,
+                });
+            }
+            if inner.e_stop_latched.load(Ordering::SeqCst) {
+                return Err(OwnerAuthError::OperatorRequired {
+                    operation: "clear_fault (EStop latched)",
+                });
+            }
+            if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+                && !inner.safety.recoverable()
+            {
+                return Err(OwnerAuthError::OperatorRequired {
+                    operation: "clear_fault (non-recoverable fault or EStop)",
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Zero-allocation refusal returned by [`check_torque_owner_preflight`] on both legacy and RT owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorquePreflightError {
+    LeaseLost { epoch_id: u64 },
+    EpochMismatch { epoch_id: u64 },
+    InvalidRequestId,
+    OperatorRequired { operation: &'static str, epoch_id: u64 },
+    MotionBusy { epoch_id: u64 },
+    InvalidBody { message: &'static str, epoch_id: u64 },
+}
+
+/// Unified off-lock typed preparation for WS `/api/v1/torque` and `/api/v1/arm`, shared by both
+/// legacy and RT executor owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTorqueWs {
+    pub connection: ConnectionHandle,
+    pub local_generation: u64,
+    pub supplied_epoch: Option<u64>,
+    pub request_id_valid: bool,
+    pub parsed_request_id: u64,
+    pub enable: Option<bool>,
+    pub body_error: Option<&'static str>,
+    pub auth_policy: OwnerAuthPolicy,
+    pub operator: OperatorGrant,
+    pub stamp: crate::supervisor::AdmissionStamp,
+    pub broker: Option<PreparedTorque>,
+}
+
+/// Prepares one typed WS torque command off-lock from a published snapshot for both legacy and
+/// executor owners.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_torque_ws(
+    snap: &OwnerStateSnapshot,
+    connection: ConnectionHandle,
+    local_generation: u64,
+    supplied_epoch: Option<u64>,
+    request_id_valid: bool,
+    parsed_request_id: u64,
+    enable: Result<bool, &'static str>,
+    auth_policy: OwnerAuthPolicy,
+    operator: OperatorGrant,
+    stamp: crate::supervisor::AdmissionStamp,
+    now: Instant,
+    deadline: Instant,
+) -> Result<PreparedTorqueWs, LeasePrepareError> {
+    let (enable_opt, body_error) = match enable {
+        Ok(v) => (Some(v), None),
+        Err(msg) => (None, Some(msg)),
+    };
+    let broker = match (request_id_valid, enable_opt) {
+        (true, Some(en)) => Some(prepare_torque(
+            snap,
+            connection,
+            local_generation,
+            supplied_epoch,
+            en,
+            parsed_request_id,
+            stamp,
+            now,
+            deadline,
+        )?),
+        _ => None,
+    };
+    Ok(PreparedTorqueWs {
+        connection,
+        local_generation,
+        supplied_epoch,
+        request_id_valid,
+        parsed_request_id,
+        enable: enable_opt,
+        body_error,
+        auth_policy,
+        operator,
+        stamp,
+        broker,
+    })
+}
+
+/// Single live owner-side preflight for WS `/api/v1/torque` and `/api/v1/arm` (zero heap
+/// allocations), shared by legacy owner installation and RT executor malformed/auth preflight so
+/// live authority (`LiveConnections`, active lease, pending E-stop, epoch, operator policy,
+/// `motor_zero_busy`, body validation) always yields identical error precedence across both owners.
+#[allow(clippy::too_many_arguments)]
+pub fn check_torque_owner_preflight(
+    inner: &mut SupervisorInner,
+    connection: ConnectionHandle,
+    lease_generation: u64,
+    supplied_epoch: Option<u64>,
+    request_id_valid: bool,
+    body_error: Option<&'static str>,
+    auth_policy: OwnerAuthPolicy,
+    operator: OperatorGrant,
+    now: Instant,
+) -> Result<u64, TorquePreflightError> {
+    let lease_ok = lease_generation != 0
+        && inner
+            .check_client_connection_live(connection.id(), false)
+            .is_ok()
+        && inner.validate_lease_at(connection.as_str(), lease_generation, now);
+    if !lease_ok {
+        return Err(TorquePreflightError::LeaseLost {
+            epoch_id: inner.safety.epoch_id(),
+        });
+    }
+    inner.consume_pending_estop();
+    let epoch = inner.safety.epoch_id();
+    if supplied_epoch != Some(epoch) {
+        return Err(TorquePreflightError::EpochMismatch { epoch_id: epoch });
+    }
+    if !request_id_valid {
+        return Err(TorquePreflightError::InvalidRequestId);
+    }
+    if let Err(auth_err) =
+        evaluate_owner_auth_policy(auth_policy, operator, inner, epoch, now, "/api/v1/torque")
+    {
+        return Err(match auth_err {
+            OwnerAuthError::EpochMismatch { expected, .. } => {
+                TorquePreflightError::EpochMismatch { epoch_id: expected }
+            }
+            OwnerAuthError::OperatorRequired { operation } => {
+                TorquePreflightError::OperatorRequired {
+                    operation,
+                    epoch_id: inner.safety.epoch_id(),
+                }
+            }
+        });
+    }
+    if inner.calibration_busy && inner.motor_zero_busy {
+        return Err(TorquePreflightError::MotionBusy { epoch_id: epoch });
+    }
+    if let Some(message) = body_error {
+        return Err(TorquePreflightError::InvalidBody {
+            message,
+            epoch_id: epoch,
+        });
+    }
+    Ok(epoch)
+}
+
 /// Prepared torque transition (`TorqueOn` or `TorqueOff`) built off-thread from a published
 /// [`OwnerStateSnapshot`], carrying the admission-captured [`crate::supervisor::AdmissionStamp`]
 /// so `TorqueOn` consumes A1's `Admitted<'g>` by value and `TorqueOff` keeps its stop-direction exemption.
@@ -619,7 +835,7 @@ pub enum LeaseClearFaultOutcome {
     },
     InvalidRequestId,
     OperatorRequired {
-        estop_latched: bool,
+        operation: &'static str,
         epoch_id: u64,
     },
     MotionBusy {
@@ -671,6 +887,7 @@ fn check_lease_clear_fault_owner_preflight(
     supplied_epoch: Option<u64>,
     request_id_valid: bool,
     body_error: Option<&'static str>,
+    auth_policy: OwnerAuthPolicy,
     operator: OperatorGrant,
     now: Instant,
 ) -> Result<u64, LeaseClearFaultOutcome> {
@@ -696,36 +913,29 @@ fn check_lease_clear_fault_owner_preflight(
     if !request_id_valid {
         return Err(LeaseClearFaultOutcome::InvalidRequestId);
     }
-    if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
-        return Err(LeaseClearFaultOutcome::EpochMismatch {
-            expected: inner.safety.epoch_id(),
-            received: epoch,
-            consumed_request_id: true,
+    if let Err(auth_err) = evaluate_owner_auth_policy(
+        auth_policy,
+        operator,
+        inner,
+        epoch,
+        now,
+        "/api/v1/safety/clear_fault",
+    ) {
+        return Err(match auth_err {
+            OwnerAuthError::EpochMismatch { expected, received } => {
+                LeaseClearFaultOutcome::EpochMismatch {
+                    expected,
+                    received,
+                    consumed_request_id: true,
+                }
+            }
+            OwnerAuthError::OperatorRequired { operation } => {
+                LeaseClearFaultOutcome::OperatorRequired {
+                    operation,
+                    epoch_id: inner.safety.epoch_id(),
+                }
+            }
         });
-    }
-    let check_now = now.max(Instant::now());
-    if !operator.is_valid_at(check_now, inner.operator_auth_enforced) {
-        if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
-            return Err(LeaseClearFaultOutcome::EpochMismatch {
-                expected: inner.safety.epoch_id(),
-                received: epoch,
-                consumed_request_id: true,
-            });
-        }
-        if inner.e_stop_latched.load(Ordering::SeqCst) {
-            return Err(LeaseClearFaultOutcome::OperatorRequired {
-                estop_latched: true,
-                epoch_id: inner.safety.epoch_id(),
-            });
-        }
-        if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
-            && !inner.safety.recoverable()
-        {
-            return Err(LeaseClearFaultOutcome::OperatorRequired {
-                estop_latched: false,
-                epoch_id: inner.safety.epoch_id(),
-            });
-        }
     }
     if inner.calibration_busy && inner.motor_zero_busy {
         return Err(LeaseClearFaultOutcome::MotionBusy {
@@ -750,6 +960,7 @@ pub fn install_lease_clear_fault_rt(
     supplied_epoch: Option<u64>,
     request_id_valid: bool,
     body_error: Option<&'static str>,
+    auth_policy: OwnerAuthPolicy,
     operator: OperatorGrant,
     now: Instant,
     release_deadline: Instant,
@@ -761,6 +972,7 @@ pub fn install_lease_clear_fault_rt(
         supplied_epoch,
         request_id_valid,
         body_error,
+        auth_policy,
         operator,
         now,
     ) {
@@ -799,6 +1011,7 @@ pub fn install_lease_clear_fault_legacy(
     request_id_valid: bool,
     body_error: Option<&'static str>,
     mit_recovery: bool,
+    auth_policy: OwnerAuthPolicy,
     operator: OperatorGrant,
     now: Instant,
 ) -> Result<LeaseClearFaultOutcome, (crate::supervisor::ArmError, u64)> {
@@ -809,6 +1022,7 @@ pub fn install_lease_clear_fault_legacy(
         supplied_epoch,
         request_id_valid,
         body_error,
+        auth_policy,
         operator,
         now,
     ) {
@@ -1824,6 +2038,12 @@ impl ConnLifecycleClient {
         tx: mpsc::SyncSender<Result<LifecycleReply, ConnLifecycleError>>,
     ) -> Result<(), ConnLifecycleError> {
         self.enqueue_disconnect_inner(connection, LifecycleWaiter::Sync(tx))
+    }
+
+    /// Non-blocking fire-and-forget disconnect handoff for drop safety nets and checkpoint hooks.
+    pub fn enqueue_disconnect_detached(&self, connection: ConnectionHandle) {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let _ = self.enqueue_disconnect_inner(connection, LifecycleWaiter::Async(tx));
     }
 
     pub fn open_sync(&self, conn_id: u64) -> Result<Result<(), &'static str>, ConnLifecycleError> {

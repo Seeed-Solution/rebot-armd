@@ -2531,20 +2531,48 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
             // Unified table-bound async command handlers (`/api/v1/torque`, `/api/v1/arm`,
             // `/api/v1/safety/clear_fault`) routed identically across legacy and RT executor.
-            if let Some(DispatchHandler::CommandAsync(handler)) = entry.map(|e| e.handler) {
+            // Both `entry.lease` and `entry.auth` are enforced directly from the dispatch table row.
+            if let Some((lease_req, auth_req, DispatchHandler::CommandAsync(handler))) =
+                entry.map(|e| (e.lease, e.auth, e.handler))
+            {
                 if matches!(
                     owner_mode,
                     crate::supervisor::OWNER_LEGACY | crate::supervisor::OWNER_EXECUTOR
                 ) {
+                    let local_generation = match lease_req {
+                        LeaseRequirement::Required => {
+                            let Some(gen) = lease::check_local_command_lease(
+                                &value,
+                                &recv_generation,
+                                &recv_client_label,
+                            ) else {
+                                let req_id_val = value.get("request_id").unwrap_or(&Value::Null);
+                                let epoch_id = lease::current_reject_epoch(&recv_supervisor).await;
+                                let response =
+                                    lease::format_command_lease_lost(req_id_val, epoch_id);
+                                if !worker_writer.send_ordinary_control(response).await {
+                                    break;
+                                }
+                                continue;
+                            };
+                            gen
+                        }
+                        LeaseRequirement::None => 0,
+                        _ => unreachable!("validate_entry restricts CommandAsync lease policy"),
+                    };
+                    let auth_policy = auth_req
+                        .owner_auth_policy()
+                        .expect("validate_entry restricts CommandAsync auth policy");
+                    let operator = ws_auth.operator_grant();
                     maybe_pause_worker_before_lock(&recv_connection).await;
                     let response = handler(dispatch::CommandAsyncCtx {
                         supervisor: &recv_supervisor,
                         value: &value,
                         stamp,
                         conn_handle: recv_conn_handle,
-                        recv_generation: &recv_generation,
-                        recv_client_label: &recv_client_label,
-                        ws_auth: &ws_auth,
+                        local_generation,
+                        auth_policy,
+                        operator,
                         last_ordinary_request: &mut last_ordinary_request,
                     })
                     .await;
