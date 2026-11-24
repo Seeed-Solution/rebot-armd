@@ -5537,9 +5537,10 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
             let (frames, more) = drv.read_joint_states_budgeted(&mut out, dl, 64).unwrap();
             assert_eq!(frames, 64);
             assert!(more, "drain must report exhaustion");
-            // Zero-RX-budget disable gate MUST REFUSE (fail closed; 0 disable frames)!
+            // L1: Zero-RX-budget disable behind exhausted drain holds the request pending
+            // (`AwaitRestGate`) inside the 1 s lifetime with ZERO CMD_DISABLE frames!
             let started = drv.clock_now();
-            let err = drv
+            let p = drv
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: started,
@@ -5547,18 +5548,18 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                     },
                     0,
                 )
-                .unwrap_err();
+                .expect("L1: exhausted drain must keep stopped disable pending, not fail");
             assert!(
-                matches!(err, ArmDriverError::TorqueOffWouldDrop),
-                "zero-RX-budget disable behind exhausted drain must refuse: {err:?}"
+                matches!(p, TorqueProgress::Pending { .. }),
+                "expected Pending awaiting rest-pose drain, got {p:?}"
             );
         }
         assert_eq!(
             bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
             0,
-            "zero-RX-budget refusal must send ZERO CMD_DISABLE frames"
+            "zero-RX-budget pending behind exhausted drain must send ZERO CMD_DISABLE frames"
         );
-        // Supervisor gate (`may_disable_torque_while_stopped`) must also refuse while not drained!
+        // Supervisor gate (`may_disable_torque_while_stopped`) must still refuse while not drained!
         assert_eq!(
             inner.may_disable_torque_while_stopped(),
             Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
@@ -5566,11 +5567,11 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         );
 
         // Second: bounded pre-disable drain (`max_rx_frames = 4`) also exhausts BEFORE reaching
-        // the queued raised-pose frame -> STILL refuses with ZERO CMD_DISABLE frames!
+        // the queued raised-pose frame -> STILL stays Pending with ZERO CMD_DISABLE frames!
         {
             let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
             let started = drv.clock_now();
-            let err = drv
+            let p = drv
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: started,
@@ -5578,10 +5579,10 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                     },
                     4,
                 )
-                .unwrap_err();
+                .expect("L1: exhausted pre-disable drain must keep stopped disable pending");
             assert!(
-                matches!(err, ArmDriverError::TorqueOffWouldDrop),
-                "exhausted pre-disable drain must refuse: {err:?}"
+                matches!(p, TorqueProgress::Pending { .. }),
+                "expected Pending behind exhausted pre-disable drain, got {p:?}"
             );
         }
         assert_eq!(
@@ -5631,6 +5632,7 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         // completes and fresh post-boundary feedback arrives (within the 1 s lifetime) SUCCEEDS!
         bus.with(|s| {
             s.rx.clear();
+            s.pending.clear();
             s.tx_log.clear();
             s.motors[0].q = 0.0;
             s.push_all_feedback();
@@ -5645,8 +5647,8 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
         });
         {
             let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
-            // Tick 1: 4-frame drain exhausts -> refused (0 CMD_DISABLE frames).
-            let err = drv
+            // Tick 1: 4-frame drain exhausts -> Pending (`AwaitRestGate`, 0 CMD_DISABLE frames).
+            let p1 = drv
                 .begin_disable_torque_budgeted(
                     DisableKind::DisableRequested {
                         started_at: req_started,
@@ -5654,31 +5656,25 @@ fn e2_rest_pose_disable_gate_refuses_queued_raised_pose_behind_exhausted_drain()
                     },
                     4,
                 )
-                .unwrap_err();
-            assert!(matches!(err, ArmDriverError::TorqueOffWouldDrop));
+                .expect("L1: exhausted drain must keep disable pending inside 1 s lifetime");
+            assert!(matches!(p1, TorqueProgress::Pending { .. }));
             assert_eq!(bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(), 0);
 
-            // Tick 2+ (within 1 s lifetime): drain completes, K=3 fresh post-boundary rest samples
-            // spanning >= 20 ms arrive -> ALLOWED!
-            clock.advance(Duration::from_millis(20));
-            let _ = drv.read_joint_states().unwrap();
-            for step in 0..3 {
-                if step > 0 {
-                    clock.advance(Duration::from_millis(10));
+            // Tick 2+ (within 1 s lifetime): polling finishes drain and collects K=3 fresh
+            // post-boundary rest samples spanning >= 20 ms -> transmits all 7 CMD_DISABLE frames!
+            let mut sent_disables = false;
+            for _ in 0..8 {
+                clock.advance(Duration::from_millis(12));
+                let dl = drv.clock_now() + Duration::from_millis(5);
+                let _ = drv
+                    .poll_torque_budgeted(dl, 64)
+                    .expect("L1 retry poll at rest within 1 s lifetime must not fail");
+                if bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count() >= 7 {
+                    sent_disables = true;
+                    break;
                 }
-                bus.with(|s| s.push_all_feedback());
-                let _ = drv.read_joint_states().unwrap();
             }
-            let p = drv
-                .begin_disable_torque_budgeted(
-                    DisableKind::DisableRequested {
-                        started_at: req_started,
-                        rollback: false,
-                    },
-                    0,
-                )
-                .expect("retry after completed drain at rest within 1s lifetime must succeed");
-            assert!(matches!(p, TorqueProgress::Pending { .. }));
+            assert!(sent_disables, "L1 poll must transmit all 7 CMD_DISABLE frames after drain + K=3 rest window");
         }
         assert_eq!(
             bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
@@ -7095,5 +7091,230 @@ fn s2_evidence_window_requires_three_causal_samples_across_all_drivers() {
         drv.transport_mut().provide_rx(&fs_angle_reply(0, 0));
         drv.read_joint_states().unwrap();
         assert_eq!(drv.rest_pose_gate_status(), RestPoseGateStatus::Confirmed, "S2 FashionStar: K=3 spanning >= 20 ms confirms");
+    }
+}
+
+/// L1: An exhausted RX drain or incomplete K=3 rest-pose window keeps a stopped disable request
+/// pending and retries on subsequent RT releases inside the 1 s lifetime. Refuses ONLY on a real
+/// non-rest pose or when the 1 s lifetime expires.
+#[test]
+fn l1_exhausted_drain_retries_and_completes_disable_within_1s_lifetime() {
+    use armd::transport::CanFrame;
+    let junk_frame = CanFrame::new_standard(0x500, &[0u8; 8]).unwrap();
+
+    // 1. 7-motor RT executor bus at rest with an 80-frame burst exhausting Step 2's 64-frame drain:
+    //    `TransitionOp::TorqueOff` stays pending with 0 CMD_DISABLE frames during the exhausted
+    //    release, drains the burst, collects K=3 post-drain rest samples across >= 2 ticks, and
+    //    completes disable (`Outcome::Completed`) well within the 1 s lifetime.
+    {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            for m in &mut s.motors {
+                m.q = 0.0;
+            }
+        });
+        for _ in 0..3 {
+            r.step_with_feedback();
+        }
+        assert_eq!(r.fx.core.may_disable_torque_while_stopped(), Ok(()));
+
+        // Inject an 80-frame burst so Step 2's 64-frame RX budget exhausts (`more = true`).
+        r.bus.with(|s| {
+            s.tx_log.clear();
+            for _ in 0..80 {
+                s.rx.push_back(junk_frame);
+            }
+        });
+        let t0 = r.clock.now();
+        r.submit_transition(TransitionOp::TorqueOff);
+        let first = r.step();
+        assert!(
+            first.command.as_ref().is_some_and(|(_, res)| res.is_ok()),
+            "L1: TorqueOff behind exhausted drain must be accepted as pending, got {first:?}"
+        );
+        assert!(
+            r.fx.core.torque_transition_pending(),
+            "L1: TorqueOff must stay pending while drain + K-window completes"
+        );
+        assert_eq!(
+            spec_count_damiao_disables(&r.bus),
+            0,
+            "L1: ZERO CMD_DISABLE frames allowed while RX drain is still incomplete"
+        );
+
+        // Advance releases inside 1 s: drain finishes, K=3 rest window + K=3 OffConfirmed complete.
+        let mut outcome = first.transition_ended.map(|(_, o)| o);
+        for _ in 0..25 {
+            if outcome.is_some() {
+                break;
+            }
+            let rep = r.step();
+            if let Some((_, o)) = rep.transition_ended {
+                outcome = Some(o);
+                break;
+            }
+        }
+        let elapsed = r.clock.now().saturating_duration_since(t0);
+        assert_eq!(
+            outcome,
+            Some(Outcome::Completed),
+            "L1: 7-motor disable after exhausted burst drain must complete within 1 s (elapsed={elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "L1: disable must finish strictly inside the 1 s lifetime, took {elapsed:?}"
+        );
+        assert!(!r.fx.core.is_torqued);
+        assert!(matches!(r.fx.core.safety.state(), SafetyState::EStop));
+    }
+
+    // 2. Contrast: incomplete K-window (only 1 fresh rest sample so far) ALSO stays pending and
+    //    completes within 1 s once K=3 samples arrive.
+    {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            for m in &mut s.motors {
+                m.q = 0.0;
+            }
+        });
+        // Advance > 100 ms so prior arm-now window resets, observe empty queue, then deliver only 1 sample.
+        r.clock.advance(Duration::from_millis(120));
+        r.step(); // empty RX boundary
+        r.step_with_feedback(); // 1 rest sample only -> K-window incomplete!
+        assert_eq!(
+            r.fx.core.may_disable_torque_while_stopped(),
+            Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+        );
+        r.bus.with(|s| s.tx_log.clear());
+        let t0 = r.clock.now();
+        r.submit_transition(TransitionOp::TorqueOff);
+        let first = r.step();
+        assert!(
+            first.command.as_ref().is_some_and(|(_, res)| res.is_ok()),
+            "L1: incomplete K-window must keep TorqueOff pending, got {first:?}"
+        );
+        assert_eq!(spec_count_damiao_disables(&r.bus), 0, "L1: 0 CMD_DISABLE before K=3 completes");
+        let mut outcome = first.transition_ended.map(|(_, o)| o);
+        for _ in 0..25 {
+            if outcome.is_some() {
+                break;
+            }
+            let rep = r.step();
+            if let Some((_, o)) = rep.transition_ended {
+                outcome = Some(o);
+                break;
+            }
+        }
+        assert_eq!(outcome, Some(Outcome::Completed));
+        assert!(r.clock.now().saturating_duration_since(t0) < Duration::from_secs(1));
+    }
+
+    // 3. Contrast: burst hiding a REAL raised arm (J1 = 0.45 rad) MUST refuse with
+    //    TORQUE_OFF_WOULD_DROP and transmit ZERO CMD_DISABLE frames!
+    {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            for m in &mut s.motors {
+                m.q = 0.0;
+            }
+        });
+        for _ in 0..3 {
+            r.step_with_feedback();
+        }
+        // Arm actually moved to 0.45 rad while an 80-frame burst fills RX.
+        r.bus.with(|s| {
+            s.tx_log.clear();
+            s.motors[0].q = 0.45;
+            for _ in 0..80 {
+                s.rx.push_back(junk_frame);
+            }
+        });
+        r.submit_transition(TransitionOp::TorqueOff);
+        let first = r.step();
+        assert!(first.command.as_ref().is_some_and(|(_, res)| res.is_ok()));
+        let mut outcome = first.transition_ended.map(|(_, o)| o);
+        for _ in 0..10 {
+            if outcome.is_some() {
+                break;
+            }
+            let rep = r.step();
+            if let Some((_, o)) = rep.transition_ended {
+                outcome = Some(o);
+                break;
+            }
+        }
+        assert_eq!(
+            outcome,
+            Some(Outcome::Failed("TORQUE_OFF_WOULD_DROP")),
+            "L1: burst hiding real raised pose must refuse once drained"
+        );
+        assert_eq!(spec_count_damiao_disables(&r.bus), 0, "L1: ZERO CMD_DISABLE frames on raised arm");
+        assert!(r.fx.core.is_torqued);
+    }
+
+    // 4. Contrast: continuous bus flood exhausting every drain until the 1 s lifetime expires
+    //    refuses cleanly with TORQUE_OFF_WOULD_DROP and ZERO CMD_DISABLE frames.
+    {
+        let mut r = ExecRig::new();
+        r.arm_now();
+        r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
+        r.bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            for m in &mut s.motors {
+                m.q = 0.0;
+            }
+        });
+        for _ in 0..3 {
+            r.step_with_feedback();
+        }
+        r.bus.with(|s| {
+            s.tx_log.clear();
+            for _ in 0..80 {
+                s.rx.push_back(junk_frame);
+            }
+        });
+        r.submit_transition(TransitionOp::TorqueOff);
+        let first = r.step();
+        assert!(first.command.as_ref().is_some_and(|(_, res)| res.is_ok()));
+        let mut outcome = first.transition_ended.map(|(_, o)| o);
+        for _ in 0..60 {
+            if outcome.is_some() {
+                break;
+            }
+            r.bus.with(|s| {
+                for _ in 0..80 {
+                    s.rx.push_back(junk_frame);
+                }
+            });
+            let rep = r.step();
+            if let Some((_, o)) = rep.transition_ended {
+                outcome = Some(o);
+                break;
+            }
+        }
+        assert_eq!(
+            outcome,
+            Some(Outcome::Failed("TORQUE_OFF_WOULD_DROP")),
+            "L1: permanently flooded bus must refuse when 1 s lifetime expires"
+        );
+        assert_eq!(spec_count_damiao_disables(&r.bus), 0, "L1: ZERO CMD_DISABLE frames on 1 s expiry");
+        assert!(r.fx.core.is_torqued);
     }
 }

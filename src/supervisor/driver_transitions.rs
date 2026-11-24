@@ -2764,6 +2764,18 @@ impl SupervisorInner {
         self.torque_off_finish_in_place()
     }
 
+    /// True when the driver can keep a stopped disable pending inside its 1 s lifetime while an
+    /// exhausted RX drain or incomplete K=3 rest-pose window completes (L1). Zero heap allocations.
+    fn can_defer_stopped_disable_to_driver(&self) -> bool {
+        self.driver.as_ref().is_some_and(|d| {
+            d.lock().is_ok_and(|drv| {
+                drv.supports_budgeted_disable_await()
+                    && drv.rest_pose_gate_status()
+                        == crate::driver::RestPoseGateStatus::PendingDrainOrWindow
+            })
+        })
+    }
+
     /// Zero-allocation stopped torque-off gate for the RT executor (evaluates
     /// [`Self::may_disable_torque_while_stopped`] once); non-stopped paths fall through to
     /// [`Self::torque_off_check`].
@@ -2777,12 +2789,40 @@ impl SupervisorInner {
             .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))
     }
 
+    /// Zero-allocation stopped torque-off gate for RT budgeted transitions (L1): defers to the
+    /// driver's `AwaitRestGate` when the ONLY blocker is an incomplete RX drain or incomplete K=3
+    /// rest-pose window; immediately refuses non-rest poses, missing rest-pose policies, or
+    /// stale/silent buses.
+    fn torque_off_check_rt_transition(&mut self) -> Result<(), &'static str> {
+        if self.torque_off_stopped() {
+            match self.eval_stopped_torque_off() {
+                Ok(()) => return Ok(()),
+                Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+                    if self.can_defer_stopped_disable_to_driver() =>
+                {
+                    self.last_stopped_torque_off_refusal = None;
+                    return Ok(());
+                }
+                Err(_) => return Err("TORQUE_OFF_WOULD_DROP"),
+            }
+        }
+        self.torque_off_check(false)
+            .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))
+    }
+
     /// The refusals of a torque off: E-stop / fault (rest-pose gated), not at the resting pose.
     fn torque_off_check(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
         if self.torque_off_stopped() {
-            return self
-                .eval_stopped_torque_off()
-                .map_err(|r| r.into_safety_error(&self.config.joint_names));
+            match self.eval_stopped_torque_off() {
+                Ok(()) => return Ok(()),
+                Err(crate::supervisor::StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+                    if self.can_defer_stopped_disable_to_driver() =>
+                {
+                    self.last_stopped_torque_off_refusal = None;
+                    return Ok(());
+                }
+                Err(r) => return Err(r.into_safety_error(&self.config.joint_names)),
+            }
         }
 
         let violation = if stillness_verified { self.resting_pose_static_violation() } else { self.resting_pose_violation() };
@@ -2852,7 +2892,7 @@ impl SupervisorInner {
             return Err("TRANSITION_BUSY");
         }
         self.gravity_comp_servo_busy().map_err(to_code)?;
-        self.torque_off_check_rt()?;
+        self.torque_off_check_rt_transition()?;
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         self.disable_requested();
@@ -2919,6 +2959,9 @@ impl SupervisorInner {
             self.disable_pending = false;
             self.active_disable_kind = None;
             self.last_disable_attempt = None;
+            if self.torque_off_stopped() {
+                let _ = self.eval_stopped_torque_off();
+            }
         }
         let already_stopped = self.torque_off_stopped();
         let detail = (!already_stopped && !refused).then(|| {

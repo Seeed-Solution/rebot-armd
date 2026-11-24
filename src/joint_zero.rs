@@ -281,6 +281,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn rest_pose_gate_status(&self) -> crate::driver::RestPoseGateStatus {
         self.inner.rest_pose_gate_status()
     }
+    fn supports_budgeted_disable_await(&self) -> bool {
+        self.inner.supports_budgeted_disable_await()
+    }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
     fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool { self.inner.feedback_joints_within(joints, max_age) }
     fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {

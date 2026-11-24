@@ -595,9 +595,14 @@ pub enum RestPoseGateStatus {
     /// Completed RX drain and every arm joint has K=3 consecutive causal samples spanning >= 2
     /// control ticks within the rest-pose tolerance.
     Confirmed,
-    /// No arm joint currently disagrees with the rest pose, but either RX drain did not finish
-    /// or at least one arm joint has fewer than K=3 agreeing samples / < 2 ticks span.
-    PendingEvidence,
+    /// No arm joint has been observed outside the rest pose; confirmation is waiting ONLY on
+    /// completing an exhausted RX drain / poisoned line drain OR accumulating the remaining
+    /// K=3 consecutive causal rest-pose samples across >= 2 control ticks. Retryable within
+    /// the 1 s stopped-disable request lifetime (L1).
+    PendingDrainOrWindow,
+    /// RX drain is complete and no arm joint disagrees with rest, yet at least one arm joint
+    /// lacks fresh (<= 100 ms) feedback (silent/stale bus).
+    StaleOrMissing,
     /// Missing rest-pose configuration, non-finite feedback, or a real non-rest pose was observed.
     RefusedNonRest,
 }
@@ -812,6 +817,13 @@ pub trait ArmDriver: Send {
     /// Status of the driver's K=3 causal rest-pose evidence window for `StoppedDisableGate` (S2/L1).
     fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
         RestPoseGateStatus::Confirmed
+    }
+
+    /// True when `begin_disable_torque_budgeted` + `poll_torque_budgeted` can hold a stopped
+    /// disable request pending while an exhausted RX drain or incomplete K=3 rest-pose window
+    /// completes within the 1 s request lifetime (L1).
+    fn supports_budgeted_disable_await(&self) -> bool {
+        false
     }
 
     /// True when `joint` has a verified hold mode capable of receiving stationary hold frames
@@ -1931,7 +1943,8 @@ impl<T: Transport> FeetechArmDriver<T> {
         }
         let now = self.clock_now();
         let caps = self.capabilities();
-        let mut pending = false;
+        let mut missing_fresh = false;
+        let mut window_incomplete = false;
         for &i in arm_joints {
             let Some(s) = self.cached_states.get(i) else {
                 return RestPoseGateStatus::RefusedNonRest;
@@ -1947,18 +1960,22 @@ impl<T: Transport> FeetechArmDriver<T> {
                     return RestPoseGateStatus::RefusedNonRest;
                 }
             } else {
-                pending = true;
+                missing_fresh = true;
             }
             if !self
                 .rest_pose_window
                 .get(i)
                 .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
             {
-                pending = true;
+                window_incomplete = true;
             }
         }
-        if self.line_poisoned || pending {
-            RestPoseGateStatus::PendingEvidence
+        if self.line_poisoned {
+            RestPoseGateStatus::PendingDrainOrWindow
+        } else if missing_fresh {
+            RestPoseGateStatus::StaleOrMissing
+        } else if window_incomplete {
+            RestPoseGateStatus::PendingDrainOrWindow
         } else {
             RestPoseGateStatus::Confirmed
         }
@@ -4044,7 +4061,8 @@ impl<T: Transport> FashionStarArmDriver<T> {
         }
         let now = self.now();
         let caps = self.capabilities();
-        let mut pending = false;
+        let mut missing_fresh = false;
+        let mut window_incomplete = false;
         for &i in arm_joints {
             let Some(s) = self.cached_states.get(i) else {
                 return RestPoseGateStatus::RefusedNonRest;
@@ -4060,18 +4078,20 @@ impl<T: Transport> FashionStarArmDriver<T> {
                     return RestPoseGateStatus::RefusedNonRest;
                 }
             } else {
-                pending = true;
+                missing_fresh = true;
             }
             if !self
                 .rest_pose_window
                 .get(i)
                 .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
             {
-                pending = true;
+                window_incomplete = true;
             }
         }
-        if pending {
-            RestPoseGateStatus::PendingEvidence
+        if missing_fresh {
+            RestPoseGateStatus::StaleOrMissing
+        } else if window_incomplete {
+            RestPoseGateStatus::PendingDrainOrWindow
         } else {
             RestPoseGateStatus::Confirmed
         }
@@ -4955,6 +4975,9 @@ enum TxRefusal {
     StopInhibited,
     /// Step 3/5: `DisableRequested` while stopped refused by Rule A′ (not at rest / stale / no rest pose).
     TorqueOffWouldDrop,
+    /// Step 3/5: `DisableRequested` while stopped is waiting ONLY for an exhausted RX drain or
+    /// incomplete K=3 rest-pose evidence window inside the 1 s request lifetime (L1).
+    DisableWaitEvidence,
     /// Step 3/5: `DisableRequested` while stopped exceeded its 1 s total request lifetime.
     DisableRequestExpired,
     /// Step 4 (pre-build): active MIT deadline fence tripped.
@@ -5253,6 +5276,9 @@ enum DamiaoTorque {
     /// Enable frames sent (or still queued in `unsent_mask` across TX-budgeted polls), awaiting
     /// fresh state-1 feedback from every motor.
     Enable { window: ConfirmWindow, unsent_mask: u32 },
+    /// Stopped disable waiting for an exhausted RX drain or incomplete K=3 rest-pose window
+    /// to complete inside the 1 s request lifetime before transmitting any `CMD_DISABLE` (L1).
+    AwaitRestGate { kind: DisableKind, next_probe_at: Instant },
     /// Disable frames sent, awaiting fresh state-0 feedback from every motor.
     Disable { window: ConfirmWindow, mit_fenced: bool, after_seq: u64, kind: DisableKind },
 }
@@ -5736,7 +5762,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let now = self.now();
         let caps = self.capabilities();
-        let mut pending = self.awaiting_rx_boundary || !self.last_read_drained;
+        let drain_incomplete = self.awaiting_rx_boundary || !self.last_read_drained;
+        let mut missing_fresh = false;
+        let mut window_incomplete = false;
         for &i in arm_joints {
             let Some(s) = self.cached_states.get(i) else {
                 return RestPoseGateStatus::RefusedNonRest;
@@ -5758,18 +5786,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     return RestPoseGateStatus::RefusedNonRest;
                 }
             } else {
-                pending = true;
+                missing_fresh = true;
             }
             if !self
                 .rest_pose_window
                 .get(i)
                 .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
             {
-                pending = true;
+                window_incomplete = true;
             }
         }
-        if pending {
-            RestPoseGateStatus::PendingEvidence
+        if drain_incomplete {
+            RestPoseGateStatus::PendingDrainOrWindow
+        } else if missing_fresh {
+            RestPoseGateStatus::StaleOrMissing
+        } else if window_incomplete {
+            RestPoseGateStatus::PendingDrainOrWindow
         } else {
             RestPoseGateStatus::Confirmed
         }
@@ -5789,10 +5821,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.now().saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(TxRefusal::DisableRequestExpired);
         }
-        if self.evaluate_rest_pose_gate() != RestPoseGateStatus::Confirmed {
-            return Err(TxRefusal::TorqueOffWouldDrop);
+        match self.evaluate_rest_pose_gate() {
+            RestPoseGateStatus::Confirmed => Ok(()),
+            RestPoseGateStatus::PendingDrainOrWindow => Err(TxRefusal::DisableWaitEvidence),
+            RestPoseGateStatus::StaleOrMissing | RestPoseGateStatus::RefusedNonRest => {
+                Err(TxRefusal::TorqueOffWouldDrop)
+            }
         }
-        Ok(())
     }
 
     #[inline]
@@ -6550,7 +6585,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             TxRefusal::DeadlinePassed => ArmDriverError::Transport(TransportError::Timeout),
             TxRefusal::Deferred => ArmDriverError::Transport(TransportError::WouldBlock),
             TxRefusal::StopInhibited | TxRefusal::StopStampChanged => ArmDriverError::EstopInhibited,
-            TxRefusal::TorqueOffWouldDrop => ArmDriverError::TorqueOffWouldDrop,
+            TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence => {
+                ArmDriverError::TorqueOffWouldDrop
+            }
             TxRefusal::DisableRequestExpired => ArmDriverError::DisableRequestExpired,
             TxRefusal::MitFenceTripped(reason) => ArmDriverError::MitFenceTripped(reason),
             TxRefusal::BuildRefused => ArmDriverError::HardwareFault("frame build refused (stale or invalid state)".into()),
@@ -7336,7 +7373,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.discard_pending_tx_stopped();
                     return Err(e.into());
                 }
-                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                     self.discard_pending_tx_stopped();
                     return Err(Self::refusal_to_driver_err(r));
                 }
@@ -8753,7 +8790,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.enable_failed();
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
-                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                     self.torque_hs = None;
                     self.enable_failed();
                     return Err(Self::refusal_to_driver_err(r));
@@ -9168,7 +9205,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
                 self.awaiting_rx_boundary = false;
             }
-            if !matches!(hs, DamiaoTorque::Disable { .. }) {
+            if !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. }) {
                 self.enable_failed();
             }
         }
@@ -9176,11 +9213,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.begin_tx_tick();
         self.refresh_unfinished = 0;
         let prev_awaiting_rx_boundary = self.awaiting_rx_boundary;
-        // E2: Drain RX before checking Rule A′ in `send` so the send-time check sees the freshest
-        // bus feedback. If `max_rx_frames == Some(0)` without a completed prior drain, or if the
-        // drain exhausts without reaching an empty queue, `awaiting_rx_boundary` becomes true and
-        // `send(DisableRequested)` refuses (fail closed; retried next tick within the 1 s
-        // lifetime). Protective disables bypass Rule A′ so thermal/exit cuts are never blocked.
+        // E2/L1: Drain RX before checking Rule A′ in `send` so the send-time check sees the
+        // freshest bus feedback. If `max_rx_frames == Some(0)` without a completed prior drain,
+        // or if the drain exhausts without reaching an empty queue, `awaiting_rx_boundary` becomes
+        // true and `send(DisableRequested)` returns `DisableWaitEvidence`, holding the request
+        // pending (`DamiaoTorque::AwaitRestGate`) to retry on subsequent releases inside the 1 s
+        // lifetime (0 `CMD_DISABLE` frames). Protective disables bypass Rule A′.
         self.awaiting_rx_boundary = match max_rx_frames {
             Some(0) => self.awaiting_rx_boundary || !self.last_read_drained,
             Some(limit) => {
@@ -9192,9 +9230,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             None => !self.drain_rx_before_command(),
         };
+        self.send_disable_frames(kind, prev_awaiting_rx_boundary)
+    }
+
+    /// Transmits `CMD_DISABLE` to every motor through the single choke point `send` and enters
+    /// `DamiaoTorque::Disable`, OR—if every frame was refused solely with `DisableWaitEvidence`
+    /// (incomplete drain or incomplete K=3 rest-pose window inside the 1 s lifetime)—enters
+    /// `DamiaoTorque::AwaitRestGate` with 0 CAN frames transmitted (L1). Zero heap allocations.
+    fn send_disable_frames(
+        &mut self,
+        kind: DisableKind,
+        prev_awaiting_rx_boundary: bool,
+    ) -> Result<TorqueProgress, ArmDriverError> {
         let after_seq = self.rx_seq;
         let cmd_start = self.now();
         let mut sent_any = false;
+        let mut wait_evidence = false;
         let mut refused_err = None;
         let mut other_err = None;
         for idx in 0..self.motor_ids.len() {
@@ -9204,6 +9255,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }) {
                 Ok(_) => {
                     sent_any = true;
+                }
+                Err(TxRefusal::DisableWaitEvidence) => {
+                    wait_evidence = true;
                 }
                 Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
                     if refused_err.is_none() {
@@ -9223,6 +9277,30 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.awaiting_rx_boundary = prev_awaiting_rx_boundary || !self.last_read_drained;
                 return Err(e);
             }
+            if wait_evidence {
+                // L1: incomplete drain or incomplete K=3 rest-pose window — keep request pending
+                // within the 1 s lifetime without transmitting any `CMD_DISABLE` frame.
+                self.awaiting_rx_boundary = prev_awaiting_rx_boundary || !self.last_read_drained;
+                let wake = match kind {
+                    DisableKind::DisableRequested { started_at, .. } => {
+                        let exp = started_at + STOPPED_DISABLE_REQUEST_LIFETIME;
+                        let retry_at = if !self.last_read_drained || self.awaiting_rx_boundary {
+                            // Exhausted RX drain: retry on the next 50 Hz release instead of
+                            // spin-draining multiple sub-release wakes inside one tick (L1).
+                            cmd_start + Duration::from_millis(20)
+                        } else {
+                            cmd_start + EVIDENCE_PROBE_INTERVAL
+                        };
+                        retry_at.min(exp)
+                    }
+                    DisableKind::DisableProtective { .. } => cmd_start,
+                };
+                self.torque_hs = Some(DamiaoTorque::AwaitRestGate {
+                    kind,
+                    next_probe_at: cmd_start,
+                });
+                return Ok(TorqueProgress::Pending { wake });
+            }
         }
         // MIT tracking: once any disable frame is transmitted, discard cached targets so no
         // later recovery can replay one, whatever the disable's outcome (the fence stays
@@ -9230,7 +9308,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
             self.clear_cached_targets();
         }
-        if refused_err.is_none() {
+        if refused_err.is_none() && !wait_evidence {
             self.last_enable_command = Some(cmd_start);
             self.last_enable_command_rx_seq = Some(after_seq);
             self.last_command_was_disable = true;
@@ -9242,6 +9320,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if let Some(e) = refused_err.or(other_err) {
             // A failed or partial write cannot establish the physical power state.
             return Err(e);
+        }
+        if wait_evidence {
+            return Err(ArmDriverError::TorqueOffWouldDrop);
         }
         self.is_enabled = false;
         self.pending_rearm = true;
@@ -9258,6 +9339,108 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             DAMIAO_DISABLE_CONFIRM, &DAMIAO_ENABLE_RETRY_AT);
         let wake = Self::earliest_settle_wake(&self.motor_disable_tx, &self.motor_off_window, 0, poll_start, window.wake());
         self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
+        Ok(TorqueProgress::Pending { wake })
+    }
+
+    /// Services a stopped disable waiting for an exhausted RX drain or incomplete K=3 rest-pose
+    /// window to finish inside the 1 s request lifetime (L1). Transmits only read-only `0x7FF 0xCC`
+    /// status probes until `evaluate_rest_pose_gate() == Confirmed`, refuses immediately on any
+    /// real non-rest pose (`RefusedNonRest`) or 1 s lifetime expiry (`DisableRequestExpired`),
+    /// and invokes `send_disable_frames` once confirmed. Zero heap allocations.
+    fn poll_await_rest_gate(
+        &mut self,
+        kind: DisableKind,
+        mut next_probe_at: Instant,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        let (started_at, rollback) = match kind {
+            DisableKind::DisableRequested { started_at, rollback } => (started_at, rollback),
+            DisableKind::DisableProtective { .. } => {
+                let prev = self.awaiting_rx_boundary;
+                return self.send_disable_frames(kind, prev);
+            }
+        };
+        if self.now().saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        let _ = self.receive_feedback();
+        if !rollback && !self.is_stopped_for_disable() {
+            let prev = self.awaiting_rx_boundary;
+            return self.send_disable_frames(kind, prev);
+        }
+        match self.evaluate_rest_pose_gate() {
+            RestPoseGateStatus::Confirmed => {
+                let prev = self.awaiting_rx_boundary;
+                return self.send_disable_frames(kind, prev);
+            }
+            RestPoseGateStatus::RefusedNonRest => {
+                return Err(ArmDriverError::TorqueOffWouldDrop);
+            }
+            RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {}
+        }
+        let now = self.now();
+        if now.saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        // Once RX is drained, emit spaced read-only `0x7FF 0xCC` probes for arm joints whose
+        // K=3 rest-pose window is not yet confirmed (ensuring remaining RX budget can absorb the
+        // replies without re-exhausting the drain on this tick).
+        if self.last_read_drained && !self.awaiting_rx_boundary && now >= next_probe_at {
+            let mut probe_mask = 0u32;
+            let mut probe_count = 0usize;
+            if let Some(ref gate) = self.stopped_disable_gate {
+                for &i in gate.arm_joint_indices() {
+                    if i < handshake::MAX_MASK_JOINTS
+                        && !self
+                            .rest_pose_window
+                            .get(i)
+                            .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
+                    {
+                        probe_mask |= 1u32 << i;
+                        probe_count += 1;
+                    }
+                }
+            }
+            if probe_count > 0 && self.remaining_rx_frame_limit() > probe_count {
+                let expiry = Deadline { at: started_at + STOPPED_DISABLE_REQUEST_LIFETIME };
+                let mut probed_any = false;
+                for i in handshake::mask_joints(probe_mask) {
+                    let Some(&id) = self.motor_ids.get(i) else { continue };
+                    match self.send(TxKind::DisableProbe, None, Some(expiry), false, |_| {
+                        Some(damiao::build_refresh_frame(id))
+                    }) {
+                        Ok(_) => probed_any = true,
+                        Err(_) => break,
+                    }
+                }
+                if probed_any {
+                    next_probe_at = self.now() + EVIDENCE_PROBE_INTERVAL;
+                    let _ = self.can.flush();
+                    let _ = self.receive_feedback();
+                    match self.evaluate_rest_pose_gate() {
+                        RestPoseGateStatus::Confirmed => {
+                            let prev = self.awaiting_rx_boundary;
+                            return self.send_disable_frames(kind, prev);
+                        }
+                        RestPoseGateStatus::RefusedNonRest => {
+                            return Err(ArmDriverError::TorqueOffWouldDrop);
+                        }
+                        RestPoseGateStatus::PendingDrainOrWindow
+                        | RestPoseGateStatus::StaleOrMissing => {}
+                    }
+                }
+            }
+        }
+        let after = self.now();
+        if after.saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        let exp = started_at + STOPPED_DISABLE_REQUEST_LIFETIME;
+        let wake = if !self.last_read_drained || self.awaiting_rx_boundary {
+            (after + Duration::from_millis(20)).min(exp)
+        } else {
+            next_probe_at.min(exp)
+        };
+        self.torque_hs = Some(DamiaoTorque::AwaitRestGate { kind, next_probe_at });
         Ok(TorqueProgress::Pending { wake })
     }
 
@@ -9363,6 +9546,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     }) {
                         Ok(_) => {
                             sent_any = true;
+                        }
+                        Err(TxRefusal::DisableWaitEvidence) => {
+                            // L1: incomplete drain or K-window during handshake retry — keep pending
+                            // within the 1 s request lifetime instead of aborting.
+                            tracing::debug!("Deferring disable retry for motor {} while drain/K-window completes", id);
                         }
                         Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
                             if refused.is_none() {
@@ -9523,6 +9711,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(DamiaoTorque::Readback(r)) => self.poll_readback(r),
             Some(DamiaoTorque::PreEnableRefresh(refresh)) => self.poll_pre_enable_refresh(refresh),
             Some(DamiaoTorque::Enable { window, unsent_mask }) => self.poll_enable(window, unsent_mask),
+            Some(DamiaoTorque::AwaitRestGate { kind, next_probe_at }) => {
+                self.poll_await_rest_gate(kind, next_probe_at)
+            }
             Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind }) => {
                 self.poll_disable(window, mit_fenced, after_seq, kind)
             }
@@ -9592,6 +9783,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
         self.evaluate_rest_pose_gate()
+    }
+
+    fn supports_budgeted_disable_await(&self) -> bool {
+        true
     }
 
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
@@ -10213,7 +10408,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn torque_transition_pending(&self) -> bool { self.torque_hs.is_some() }
 
     fn abort_enable(&mut self) {
-        if self.torque_hs.as_ref().is_some_and(|hs| !matches!(hs, DamiaoTorque::Disable { .. })) {
+        if self.torque_hs.as_ref().is_some_and(|hs| {
+            !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. })
+        }) {
             if matches!(self.torque_hs, Some(DamiaoTorque::DrainBeforeEnable(_))) {
                 self.awaiting_rx_boundary = false;
             }
@@ -10230,7 +10427,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if first {
             self.refresh_capture = None;
             if let Some(hs) = self.torque_hs.take() {
-                if !matches!(hs, DamiaoTorque::Disable { .. }) {
+                if !matches!(hs, DamiaoTorque::Disable { .. } | DamiaoTorque::AwaitRestGate { .. }) {
                     self.enable_failed();
                 }
             }
@@ -10598,7 +10795,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             self.trip_fence(reason);
                             return Err(ArmDriverError::MitFenceTripped(reason));
                         }
-                        Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                        Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                             return Err(Self::refusal_to_driver_err(r));
                         }
                     }
@@ -10818,7 +11015,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     return Err(e.into());
                 }
                 // Disable-only refusals; a RollbackHold never produces them, but fail closed.
-                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                     self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                     self.discard_pending_hold_tx();
                     return Err(Self::refusal_to_driver_err(r));
@@ -11126,7 +11323,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         self.trip_fence(reason);
                         return Err(ArmDriverError::MitFenceTripped(reason));
                     }
-                    Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                    Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                         return Err(Self::refusal_to_driver_err(r));
                     }
                 }
@@ -11357,7 +11554,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                     return Err(e.into());
                 }
-                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                     self.last_hold_tx_sent_any = sent_any && self.can.flush_is_noop();
                     self.discard_pending_hold_tx();
                     return Err(Self::refusal_to_driver_err(r));
@@ -11615,7 +11812,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             self.trip_fence(reason);
                             return Err(ArmDriverError::MitFenceTripped(reason));
                         }
-                        Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                        Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableWaitEvidence | TxRefusal::DisableRequestExpired)) => {
                             return Err(Self::refusal_to_driver_err(r));
                         }
                     }
@@ -12574,7 +12771,9 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         }
         let now = self.now();
         let caps = self.capabilities();
-        let mut pending = self.awaiting_rx_boundary || !self.last_read_drained;
+        let drain_incomplete = self.awaiting_rx_boundary || !self.last_read_drained;
+        let mut missing_fresh = false;
+        let mut window_incomplete = false;
         for &i in arm_joints {
             let Some(s) = self.cached_states.get(i) else {
                 return RestPoseGateStatus::RefusedNonRest;
@@ -12596,18 +12795,22 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                     return RestPoseGateStatus::RefusedNonRest;
                 }
             } else {
-                pending = true;
+                missing_fresh = true;
             }
             if !self
                 .rest_pose_window
                 .get(i)
                 .is_some_and(|w| w.is_confirmed(now, STOPPED_DISABLE_FEEDBACK_MAX_AGE))
             {
-                pending = true;
+                window_incomplete = true;
             }
         }
-        if pending {
-            RestPoseGateStatus::PendingEvidence
+        if drain_incomplete {
+            RestPoseGateStatus::PendingDrainOrWindow
+        } else if missing_fresh {
+            RestPoseGateStatus::StaleOrMissing
+        } else if window_incomplete {
+            RestPoseGateStatus::PendingDrainOrWindow
         } else {
             RestPoseGateStatus::Confirmed
         }
