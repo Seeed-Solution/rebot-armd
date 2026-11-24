@@ -212,12 +212,29 @@ impl CollisionGuard {
     }
 
     /// Deterministic collision transition used by simulation and WASM. Returns the
-    /// tripped joint (zero based) when a new hold is entered, or `None` otherwise.
+    /// tripped joint (zero based) when a new hold or escalation occurs, or `None` otherwise.
     pub fn step(&mut self, residuals: Option<&[f32; 6]>, dt_s: f64, now_s: f64,
         policy: &CollisionPolicy, operational: bool, supported: &[bool; 6]) -> CollisionStep {
+        self.step_guard(residuals, dt_s, now_s, policy, operational, operational, supported)
+    }
+
+    /// Collision transition separating recoverable protective holds (`hold_allowed`, operational
+    /// states only) from collision escalation detection (`detect_active`, also active while
+    /// torqued in Fault/EStop so escalation routes through `SafetyManager::latch`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_guard(
+        &mut self,
+        residuals: Option<&[f32; 6]>,
+        dt_s: f64,
+        now_s: f64,
+        policy: &CollisionPolicy,
+        hold_allowed: bool,
+        detect_active: bool,
+        supported: &[bool; 6],
+    ) -> CollisionStep {
         let mut out = CollisionStep::default();
         if let Some(mut hold) = self.hold {
-            if !self.enabled || !operational { self.hold = None; self.over = [0; 6]; out.released = true; return out; }
+            if !self.enabled || !hold_allowed { self.hold = None; self.over = [0; 6]; out.released = true; return out; }
             let thresholds: [f32; 6] = std::array::from_fn(|j| policy.thresholds_nm[j] * self.sensitivity.factor());
             let quiet = residuals.is_some_and(|r| (0..6).all(|j| supported[j] || r[j].abs() < policy.clear_ratio * thresholds[j]));
             hold.quiet_s = if quiet { hold.quiet_s + dt_s } else { 0.0 };
@@ -225,7 +242,7 @@ impl CollisionGuard {
             else { self.hold = Some(hold); }
             return out;
         }
-        if !self.enabled || !operational { self.over = [0; 6]; return out; }
+        if !self.enabled || !detect_active { self.over = [0; 6]; return out; }
         let Some(residuals) = residuals else { self.over = [0; 6]; return out; };
         let thresholds: [f32; 6] = std::array::from_fn(|j| policy.thresholds_nm[j] * self.sensitivity.factor());
         let mut worst = None;
@@ -241,7 +258,7 @@ impl CollisionGuard {
             self.over = [0; 6];
             let trips = self.trips_in_window(now_s, policy.escalate_window_s);
             out.escalated = trips > policy.max_auto_resumes;
-            if !out.escalated {
+            if !out.escalated && hold_allowed {
                 self.hold = Some(CollisionHold { joint: j, residual_nm: residuals[j], threshold_nm: thresholds[j], since_s: now_s, quiet_s: 0.0 });
             }
             out.trip = Some((j, residuals[j], thresholds[j]));
@@ -370,9 +387,23 @@ impl SupervisorInner {
 
     pub(crate) fn collision_tick(&mut self, dt: f64) {
         let p = self.collision_policy();
-        let operational = self.is_torqued && self.safety.state().is_operational() && self.gravity_comp.is_none()
-            && !self.disable_pending && !self.pending_rearm;
-        let watching = self.collision.enabled && self.collision_available() && operational && self.unload_settle.is_none();
+        let active_arm = self.is_torqued
+            && self.gravity_comp.is_none()
+            && !self.disable_pending
+            && !self.pending_rearm;
+        let hold_allowed = active_arm && self.safety.state().is_operational();
+        // Detection and escalation remain active while torqued even when another fault or E-stop
+        // is already latched, routing escalation through `SafetyManager::latch`.
+        let detect_active = active_arm
+            && !matches!(
+                self.safety.state(),
+                crate::safety::SafetyState::Booting | crate::safety::SafetyState::Idle
+            )
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::CollisionLatched);
+        let watching = self.collision.enabled
+            && self.collision_available()
+            && detect_active
+            && self.unload_settle.is_none();
         let supported = self.collision_supported_joints();
         let now = self.start_time.elapsed().as_secs_f64();
         let residuals = if self.collision.hold.is_some() {
@@ -380,7 +411,15 @@ impl SupervisorInner {
         } else {
             self.residual_torques.as_ref().filter(|_| watching)
         };
-        let result = self.collision.step(residuals, dt, now, &p, operational, &supported);
+        let result = self.collision.step_guard(
+            residuals,
+            dt,
+            now,
+            &p,
+            hold_allowed,
+            watching,
+            &supported,
+        );
         if result.released {
             tracing::info!("Collision hold ended after quiet period");
         }
