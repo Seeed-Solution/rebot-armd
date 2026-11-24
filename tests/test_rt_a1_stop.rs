@@ -184,13 +184,16 @@ async fn rest_and_ws_estop_and_urgent_stop_with_ordinary_queues_full() {
     drain(&mut ws, 20).await;
 
     // Stopped executor: WS `estop` & `e_stop` return explicit `estop_reject` (503, latched:true, no epoch_id:0).
+    // Open a fresh WS connection because the 70-frame backlog burst above can legitimately saturate
+    // the previous socket's outbound control queue and close it after flushing `epoch_sync`.
     assert_eq!(sup.clear_fault().await.unwrap(), SafetyState::Idle);
     handle.stop_and_join();
-    let fail1 = ws_reply(&mut ws, json!({"type": "estop", "request_id": 77}), &["epoch_sync", "estop_reject"]).await;
+    let (mut ws_stopped, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    let fail1 = ws_reply(&mut ws_stopped, json!({"type": "estop", "request_id": 77}), &["epoch_sync", "estop_reject"]).await;
     assert_eq!((fail1["type"].as_str(), fail1["status"].as_u64(), fail1["code"].as_str(), fail1["latched"].as_bool(), fail1["request_id"].as_u64()),
         (Some("estop_reject"), Some(503), Some("EXECUTOR_STOPPED"), Some(true), Some(77)), "{fail1}");
     assert!(fail1.get("epoch_id").is_none(), "must not synthesize epoch_id=0: {fail1}");
-    let fail2 = ws_reply(&mut ws, json!({"type": "e_stop"}), &["epoch_sync", "estop_reject"]).await;
+    let fail2 = ws_reply(&mut ws_stopped, json!({"type": "e_stop"}), &["epoch_sync", "estop_reject"]).await;
     assert_eq!((fail2["type"].as_str(), fail2["code"].as_str(), fail2["latched"].as_bool()),
         (Some("estop_reject"), Some("EXECUTOR_STOPPED"), Some(true)), "{fail2}");
     assert!(sup.e_stop_latched.load(Ordering::SeqCst));
@@ -3664,4 +3667,79 @@ async fn merge_b3_epoch_mirror_sync_and_i16_gripper_calibrate_admission_and_fifo
         assert_eq!(rej["code"], "STOPPED", "{rej}");
         assert!(sup.inner().read().await.gripper_calibration.is_none());
     }
+}
+
+// 22. Round-6 Item 1: auth-reply saturation signals fatal first, helper exit never aborts the
+//     reader, urgent E-stop still latches while writer is stalled, and writer flushes the urgent
+//     E-stop reply BEFORE the fatal error frame and Close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_reply_saturation_helper_exit_never_aborts_reader_and_flushes_urgent_estop() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws, gen) = controller(addr).await;
+    let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard = WriteHookGuard(conn_id.clone());
+    let ep0 = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep = sup.get_observation().await.epoch_id;
+
+    // Stall the writer inside write_ws_frame_bounded with an ordinary command reply.
+    armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+    send(&mut ws, json!({
+        "type": "command", "request_id": 8000, "generation": gen, "epoch_id": ep,
+        "path": "/api/v1/motion/jog",
+        "body": {"target_positions": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 0.5}
+    })).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1).await;
+
+    // Overflow `auth_tx` (cap 16) + `auth_in_tx` (cap 16) so `auth_task` hits overflow, calls
+    // `trigger_fatal`, and EXITS while `writer_task` is still stalled.
+    for seq in 1..=24u64 {
+        send(&mut ws, json!({"type": "auth", "seq": seq, "token": ""})).await;
+    }
+    // Give `auth_task` plenty of time to drain `auth_in_rx`, hit `auth_tx` Full, and exit.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Reader MUST still be alive (helper exit never aborts reader): urgent E-stop latches immediately.
+    let t0 = Instant::now();
+    send(&mut ws, json!({"type": "estop"})).await;
+    wait_until(Duration::from_millis(120), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+    assert!(t0.elapsed() < Duration::from_millis(120), "E-stop did not latch after auth_task exit");
+    wait_until(Duration::from_secs(1), || {
+        sup.inner().try_read().is_ok_and(|g| *g.safety.state() == SafetyState::EStop)
+    }).await;
+
+    // Unblock writer -> writer flushes urgent E-stop reply BEFORE fatal OUTBOUND_QUEUE_FULL and Close.
+    armd::api::ws::set_test_ws_write_paused(&conn_id, false);
+    let (mut estop_idx, mut fatal_idx, mut close_idx) = (None, None, None);
+    let mut idx = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                seen.push(format!("{idx}:Text({})", v.get("type").and_then(|t| t.as_str()).unwrap_or("obs")));
+                if v["type"] == "epoch_sync" && v["safety_state"] == "EStop" && estop_idx.is_none() {
+                    estop_idx = Some(idx);
+                }
+                if v["type"] == "error" && v["code"] == "OUTBOUND_QUEUE_FULL" && fatal_idx.is_none() {
+                    fatal_idx = Some(idx);
+                }
+                idx += 1;
+            }
+            Ok(Some(Ok(Message::Close(cf)))) => {
+                seen.push(format!("{idx}:Close({cf:?})"));
+                close_idx = Some(idx);
+                break;
+            }
+            _ => break,
+        }
+    }
+    let e = estop_idx.unwrap_or_else(|| panic!("missing urgent E-stop reply before fatal/Close: {seen:?}"));
+    let f = fatal_idx.unwrap_or_else(|| panic!("missing OUTBOUND_QUEUE_FULL fatal frame: {seen:?}"));
+    let c = close_idx.unwrap_or_else(|| panic!("missing Close frame: {seen:?}"));
+    assert!(e < f && f < c, "expected E-stop ({e}) < fatal ({f}) < Close ({c}); frames={seen:?}");
 }

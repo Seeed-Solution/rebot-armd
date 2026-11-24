@@ -608,6 +608,8 @@ impl WsWriterHandle {
     }
 
     /// `auth_ack` send from the off-reader auth task via its dedicated reserved queue.
+    /// On overflow, signals the shared fatal close path (`fatal_triggered = true` before sending
+    /// `FatalClose`) so `writer_task` owns the urgent flush and close without ever aborting the reader.
     async fn send_auth(&self, reply: Value) -> bool {
         if self.is_fatal() {
             return false;
@@ -872,6 +874,8 @@ async fn flush_urgent_then_fatal_and_close(
     connection_id: &str,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     fatal: &FatalClose,
+    fatal_triggered: &AtomicBool,
+    fatal_notify: &tokio::sync::Notify,
     last_wire_epoch: &mut Option<(u64, Option<Value>)>,
     estop_out_rx: &mut mpsc::Receiver<Value>,
     stop_out_rx: &mut mpsc::Receiver<Value>,
@@ -881,6 +885,9 @@ async fn flush_urgent_then_fatal_and_close(
     in_flight_stops: &AtomicUsize,
     urgent_done_notify: &tokio::sync::Notify,
 ) {
+    // Always publish the fatal flag before starting the urgent flush and close.
+    fatal_triggered.store(true, Ordering::Release);
+    fatal_notify.notify_waiters();
     let total_grace = ws_write_timeout(connection_id).min(WS_FATAL_FLUSH_TIMEOUT);
     // Give each urgent reply and the fatal frame its own short bounded budget so a single stalled
     // write never starves subsequent urgent replies, the fatal error frame, or Close.
@@ -1916,6 +1923,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     &writer_connection,
                                     &mut sender,
                                     &FatalClose::outbound_queue_full(),
+                                    &writer_fatal_triggered,
+                                    &writer_fatal_notify,
                                     &mut last_wire_epoch,
                                     &mut estop_out_rx,
                                     &mut stop_out_rx,
@@ -1933,7 +1942,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if e == WriteErr::Timeout {
                                 let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
                                 flush_urgent_then_fatal_and_close(
-                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &writer_connection, &mut sender, &fatal, &writer_fatal_triggered, &writer_fatal_notify, &mut last_wire_epoch,
                                     &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
                                     &mut estop_replies_delivered, &writer_in_flight_estops,
                                     &writer_in_flight_stops, &writer_urgent_notify,
@@ -1953,7 +1962,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 if e == WriteErr::Timeout {
                                     let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
                                     flush_urgent_then_fatal_and_close(
-                                        &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                        &writer_connection, &mut sender, &fatal, &writer_fatal_triggered, &writer_fatal_notify, &mut last_wire_epoch,
                                         &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
                                         &mut estop_replies_delivered, &writer_in_flight_estops,
                                         &writer_in_flight_stops, &writer_urgent_notify,
@@ -1972,7 +1981,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if e == WriteErr::Timeout {
                                 let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
                                 flush_urgent_then_fatal_and_close(
-                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &writer_connection, &mut sender, &fatal, &writer_fatal_triggered, &writer_fatal_notify, &mut last_wire_epoch,
                                     &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
                                     &mut estop_replies_delivered, &writer_in_flight_estops,
                                     &writer_in_flight_stops, &writer_urgent_notify,
@@ -1989,6 +1998,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             &writer_connection,
                             &mut sender,
                             &fatal,
+                            &writer_fatal_triggered,
+                            &writer_fatal_notify,
                             &mut last_wire_epoch,
                             &mut estop_out_rx,
                             &mut stop_out_rx,
@@ -2009,7 +2020,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if e == WriteErr::Timeout {
                                 let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
                                 flush_urgent_then_fatal_and_close(
-                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &writer_connection, &mut sender, &fatal, &writer_fatal_triggered, &writer_fatal_notify, &mut last_wire_epoch,
                                     &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
                                     &mut estop_replies_delivered, &writer_in_flight_estops,
                                     &writer_in_flight_stops, &writer_urgent_notify,
@@ -2030,6 +2041,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     &writer_connection,
                                     &mut sender,
                                     &FatalClose::outbound_queue_full(),
+                                    &writer_fatal_triggered,
+                                    &writer_fatal_notify,
                                     &mut last_wire_epoch,
                                     &mut estop_out_rx,
                                     &mut stop_out_rx,
@@ -2058,7 +2071,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if e == WriteErr::Timeout {
                                 let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
                                 flush_urgent_then_fatal_and_close(
-                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &writer_connection, &mut sender, &fatal, &writer_fatal_triggered, &writer_fatal_notify, &mut last_wire_epoch,
                                     &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
                                     &mut estop_replies_delivered, &writer_in_flight_estops,
                                     &writer_in_flight_stops, &writer_urgent_notify,
@@ -2086,7 +2099,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 if e == WriteErr::Timeout {
                                     let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
                                     flush_urgent_then_fatal_and_close(
-                                        &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                        &writer_connection, &mut sender, &fatal, &writer_fatal_triggered, &writer_fatal_notify, &mut last_wire_epoch,
                                         &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
                                         &mut estop_replies_delivered, &writer_in_flight_estops,
                                         &writer_in_flight_stops, &writer_urgent_notify,
@@ -2109,7 +2122,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 if e == WriteErr::Timeout {
                                     let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
                                     flush_urgent_then_fatal_and_close(
-                                        &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                        &writer_connection, &mut sender, &fatal, &writer_fatal_triggered, &writer_fatal_notify, &mut last_wire_epoch,
                                         &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
                                         &mut estop_replies_delivered, &writer_in_flight_estops,
                                         &writer_in_flight_stops, &writer_urgent_notify,
@@ -2152,7 +2165,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // pruning never stalls urgent E-stop/Stop frame classification in `reader_task`.
     let auth_ws_auth = ws_auth.clone();
     let auth_writer = writer.clone();
-    let mut auth_task = tokio::spawn(async move {
+    let auth_task = tokio::spawn(async move {
         while let Some(value) = auth_in_rx.recv().await {
             let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
             let status = auth_ws_auth.update_token(next_token);
@@ -2176,7 +2189,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let hb_client_label = client_label.clone();
     let hb_slot = heartbeat_slot.clone();
     let hb_writer = writer.clone();
-    let mut heartbeat_task = tokio::spawn(async move {
+    let heartbeat_task = tokio::spawn(async move {
         while let Some(value) = hb_slot.pop().await {
             if hb_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
                 continue;
@@ -2531,7 +2544,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     #[cfg(feature = "policy-runtime")]
     let worker_ws_closed = ws_closed.clone();
     let worker_ws_auth = ws_auth.clone();
-    let mut worker_task = tokio::spawn(async move {
+    let worker_task = tokio::spawn(async move {
         // the operator session of this connection: from the upgrade request, updated by `auth` messages in reader
         let ws_auth = worker_ws_auth;
         let mut last_sequence: Option<u64> = None;
@@ -3632,13 +3645,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
         }
     });
-    enum FirstExit { Writer, Reader, Worker, Heartbeat, Auth }
+    // Only the writer (fatal close after urgent flush, or socket error) and reader (client
+    // EOF / Close frame) drive connection teardown. A helper task (`worker_task`,
+    // `heartbeat_task`, `auth_task`) exiting on reply-queue overflow signals `trigger_fatal`
+    // and NEVER aborts `reader_task` or triggers early teardown.
+    enum FirstExit { Writer, Reader }
     let first_exit = tokio::select! {
         _ = &mut writer_task => FirstExit::Writer,
         _ = &mut reader_task => FirstExit::Reader,
-        _ = &mut worker_task => FirstExit::Worker,
-        _ = &mut heartbeat_task => FirstExit::Heartbeat,
-        _ = &mut auth_task => FirstExit::Auth,
     };
     // Mark connection closing first so any concurrent acquire under the owner lock releases immediately.
     connection_closing.store(true, Ordering::SeqCst);
@@ -3648,18 +3662,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     heartbeat_slot.close();
 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
-    if !matches!(first_exit, FirstExit::Worker) {
-        worker_task.abort();
-        let _ = worker_task.await;
-    }
-    if !matches!(first_exit, FirstExit::Heartbeat) {
-        heartbeat_task.abort();
-        let _ = heartbeat_task.await;
-    }
-    if !matches!(first_exit, FirstExit::Auth) {
-        auth_task.abort();
-        let _ = auth_task.await;
-    }
+    worker_task.abort();
+    let _ = worker_task.await;
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
+    auth_task.abort();
+    let _ = auth_task.await;
     // Set connection-closed under the owner lock immediately at teardown start so no resuming
     // async install (policy/start after deployment lookup, planning, macro) or stale `Admitted`
     // token from this connection can install motion while teardown finishes flushing and joining.
