@@ -705,7 +705,8 @@ impl SupervisorInner {
         self.check_terminal_fifo_for_new_action()?;
         let expected = motion.expected_duration();
         let tag = motion.tag.clone();
-        self.start_replay_motion_inner(proof, first)?;
+        let drives_gripper = motion.gripper && motion.gripper_idx.is_some();
+        self.start_replay_motion_inner(proof, first, drives_gripper)?;
         let id = if log_start { self.begin_action("replay", tag) } else { self.begin_action_rt("replay") };
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
         if let Some(a) = self.last_action.as_mut() {
@@ -735,7 +736,8 @@ impl SupervisorInner {
 
     fn install_macro_replay_motion_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, motion: ReplayMotion, first: &[f32], scales: [Option<f64>; 2]) -> Result<f64, ArmError> {
         let expected = motion.expected_duration();
-        self.start_replay_motion_inner(proof, first)?;
+        let drives_gripper = motion.gripper && motion.gripper_idx.is_some();
+        self.start_replay_motion_inner(proof, first, drives_gripper)?;
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
         let ep: crate::model::HolderLabel = motion.episode_str().into();
         self.update_action(id, |a| {
@@ -751,10 +753,24 @@ impl SupervisorInner {
     #[doc(hidden)]
     pub fn start_replay_motion(admitted: crate::supervisor::Admitted<'_>, first: &[f32]) -> Result<(), ArmError> {
         let (this, proof) = admitted.consume()?;
-        this.start_replay_motion_inner(&proof, first)
+        let moves_gripper = this.config.gripper_index().is_some_and(|g| {
+            first.len() > g
+                && this.commanded_positions.len() > g
+                && (first[g] - this.commanded_positions[g]).abs() > 1e-4
+        });
+        this.start_replay_motion_inner(&proof, first, moves_gripper)
     }
 
-    fn start_replay_motion_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, first: &[f32]) -> Result<(), ArmError> {
+    fn start_replay_motion_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, first: &[f32], drives_gripper: bool) -> Result<(), ArmError> {
+        let moves_gripper = drives_gripper
+            || self.config.gripper_index().is_some_and(|g| {
+                first.len() > g
+                    && self.commanded_positions.len() > g
+                    && (first[g] - self.commanded_positions[g]).abs() > 1e-4
+            });
+        if moves_gripper {
+            self.check_pos_force_gripper_fresh()?;
+        }
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -806,6 +822,9 @@ impl SupervisorInner {
             return Err("PLAN_STALE");
         }
         self.replay_preconditions().map_err(crate::rt_core::ops::static_code)?;
+        if gripper && self.config.gripper_index().is_some() {
+            self.check_pos_force_gripper_fresh_static()?;
+        }
         if crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest) != tool_digest {
             return Err("TOOL_MISMATCH");
         }
@@ -825,6 +844,9 @@ impl SupervisorInner {
             return Err(MotionError::PlanStale("epoch changed while loading the episode".into()).into());
         }
         self.replay_preconditions()?;
+        if gripper && self.config.gripper_index().is_some() {
+            self.check_pos_force_gripper_fresh()?;
+        }
         if crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest) != tool_digest {
             return Err(rejected(409, "TOOL_MISMATCH", format!(
                 "Replay for episode '{}' was prepared for another tool than the active '{}'", episode.as_str(), self.config.active_tool.id)));
@@ -925,6 +947,9 @@ impl SupervisorInner {
             )));
         }
         let gripper_idx = input.gripper_idx;
+        if input.request.gripper && gripper_idx.is_some() {
+            self.check_pos_force_gripper_fresh()?;
+        }
         let hold_gripper = gripper_idx.filter(|_| !input.request.gripper).map(|g| self.commanded_positions[g]);
         let mut first = plan.samples[0].clone();
         if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) { first[g] = h; }

@@ -834,6 +834,9 @@ impl SupervisorInner {
             req.i_am_at_the_arm,
             req.epoch_id,
         )?;
+        if req.mode == PolicyMode::Live && self.config.gripper_index().is_some() {
+            self.check_pos_force_gripper_fresh()?;
+        }
         if req.mode == PolicyMode::Live && !self.policy_live_allowed() {
             if !req.i_am_at_the_arm {
                 return Err(ArmError::Rejected {
@@ -1245,6 +1248,18 @@ impl SupervisorInner {
             }
         }
 
+        if self.config.gripper_index().is_some() {
+            if let Err(err) = self.check_pos_force_gripper_fresh() {
+                self.terminate_policy_run(
+                    "J7_FEEDBACK_STALE",
+                    "failed",
+                    Some("J7_FEEDBACK_STALE"),
+                    Some("Gripper (J7) position-force feedback is stale (> 100 ms)".into()),
+                );
+                return Err(err);
+            }
+        }
+
         if let Err(e) = self.validate_and_filter_servo_targets(targets, epoch_id) {
             let (reason, state, code) = match &e {
                 SafetyError::EStopActive => ("ESTOP", "failed", "ESTOP_ACTIVE"),
@@ -1497,6 +1512,7 @@ pub mod targets {
     const POLICY_CODES: &[&str] = &[
         "POLICY_NOT_ACTIVE", "LEASE_LOST", "BLOCKED_HOLD", "DEPLOYMENT_CHANGED", "OPERATOR_CONFIRMATION_REQUIRED",
         "RELEASE_GATE_REQUIRED", "FEEDBACK_UNCONFIRMED", "STALE_INPUT", "JUMP_LIMIT", "STEP_LIMIT", "QUALIFICATION_REQUIRED",
+        "J7_FEEDBACK_STALE",
     ];
 
     /// The protocol code of a servo error, as `ApiError::from` gives it (no allocation).

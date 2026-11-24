@@ -76,6 +76,7 @@ struct NoAllocDamiaoBus {
     pending_rx: VecDeque<CanFrame>,
     clock: std::sync::Arc<MockClock>,
     mode: Mode,
+    mute_j1: bool,
     mute_j7: bool,
     tx_count: usize,
     tx_step: Duration,
@@ -96,6 +97,7 @@ impl NoAllocDamiaoBus {
             pending_rx: VecDeque::with_capacity(64),
             clock: std::sync::Arc::new(MockClock::new()),
             mode: Mode::Ok,
+            mute_j1: false,
             mute_j7: false,
             tx_count: 0,
             tx_step: Duration::ZERO,
@@ -124,7 +126,7 @@ impl NoAllocDamiaoBus {
     }
 
     fn reply(&mut self, k: usize) {
-        if k == 6 && self.mute_j7 {
+        if (k == 0 && self.mute_j1) || (k == 6 && self.mute_j7) {
             return;
         }
         let frame = self.build_reply_frame(k);
@@ -134,7 +136,7 @@ impl NoAllocDamiaoBus {
     }
 
     fn reply_pending(&mut self, k: usize) {
-        if k == 6 && self.mute_j7 {
+        if (k == 0 && self.mute_j1) || (k == 6 && self.mute_j7) {
             return;
         }
         let frame = self.build_reply_frame(k);
@@ -1848,4 +1850,187 @@ fn rt_j7_exhausted_pool_latch_bounded_clear_and_production_log_forwarding_zero_a
         );
     }
     assert_eq!(inner2.hold_tx_error_suppressed(), 1);
+}
+
+/// Round 5 zero-allocation proof on `armd-control` covering every new Round-5 path:
+/// - **B1**: `MitOwner::Lost` stopped-hold emitting J7 freeze/hold via `write_pos_force_stopped_hold_only()` -> (0, 0).
+/// - **M1**: decode-time live freshness predicate + freeze frame emission -> (0, 0).
+/// - **M2**: stale J1 (`BuildRefused`) + J2 `WouldBlock` streak -> `CAN_TX_STALLED` -> (0, 0).
+/// - **M3**: running `gripper=true` replay terminating with `J7_FEEDBACK_STALE` on stale J7 -> (0, 0).
+#[test]
+fn rt_round5_b1_m1_m2_m3_paths_zero_alloc_and_zero_free() {
+    use armd::mit::MitOwner;
+    use armd::recording::{EpisodeStore, RecordFrame};
+    use armd::replay::{plan_frames, ReplayInput, ReplayRequest};
+    use armd::safety::{FaultCode, FaultReason};
+
+    let limits = b601_limits();
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        joint_tracking: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let bus = SharedNoAllocBus::new(&limits);
+    bus.0.lock().unwrap().motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+    bus.0.lock().unwrap().motors[6].2 = -2.5;
+    let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force drive");
+    let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(grip)
+        .unwrap();
+    driver.read_joint_states().unwrap();
+    driver.read_joint_states().unwrap();
+    driver.check_mapping_ranges();
+    driver.set_rt_mode(true);
+
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit arm");
+        SupervisorInner::enable_torque(admitted).expect("arm pos-force");
+    }
+    inner.rt_executor_owned = true;
+    inner.safety.set_off_thread_reclaim(true);
+
+    // Pre-warm observation triple buffer and start a `gripper=true` replay for M3.
+    let dir = tempfile::tempdir().unwrap();
+    let store = EpisodeStore::new(Some(dir.path().to_path_buf()));
+    for _ in 0..4 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner.tick_publish(0.02, 1, false);
+        let _ = inner.core.hub().latest();
+    }
+    let q0 = inner.commanded_positions.clone();
+    let mut q1 = q0.clone();
+    q1[6] = 0.0;
+    let frames = vec![
+        RecordFrame { timestamp: 0.0, observation_state: q0.clone(), action: q0.clone() },
+        RecordFrame { timestamp: 0.2, observation_state: q0.clone(), action: q0.clone() },
+        RecordFrame { timestamp: 3.0, observation_state: q1.clone(), action: q1 },
+    ];
+    let plan = plan_frames(
+        ReplayInput {
+            request: ReplayRequest {
+                episode: "r5_alloc_ep".into(),
+                speed: 1.0,
+                gripper: true,
+                tag: None,
+                allow_stale: false,
+            },
+            path: dir.path().join("r5_alloc_ep.parquet"),
+            profile_id: inner.config.profile_id.clone(),
+            dof: inner.config.dof,
+            arm_dof: inner.config.arm_dof(),
+            gripper_idx: inner.config.gripper_index(),
+            joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
+            limits: inner.config.limits.clone(),
+            speed_limits: inner.config.limits.clone(),
+            ws: None,
+            arm: inner.config.arm_model.clone(),
+            start: q0,
+            control_hz: inner.config.control_frequency_hz,
+            epoch: inner.safety.epoch_id(),
+            workspace_revision: inner.workspace_revision,
+            power: None,
+            store,
+            zero_offsets: inner.joint_zero_offsets.clone(),
+            tcp_offset: inner.config.tcp_offset,
+            active_tool: inner.config.active_tool.clone(),
+        },
+        &frames,
+    )
+    .expect("plan replay");
+    let (replay_id, _) = {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit replay");
+        SupervisorInner::install_replay(admitted, plan).expect("install replay")
+    };
+    for _ in 0..3 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner.tick_publish(0.02, 1, false);
+        let _ = inner.core.hub().latest();
+    }
+    inner.safety.drain_log_events_off_thread();
+    reset_tx_metrics();
+
+    // 1. M3 + M1: J7 goes stale (> 100 ms) while `gripper=true` replay is running -> terminates
+    //    with `J7_FEEDBACK_STALE` + retires trajectory off-thread + emits freeze frame with (0, 0)!
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.rx.clear();
+        g.pending_rx.clear();
+        g.mute_j7 = true;
+        g.clock.advance(Duration::from_millis(115));
+        g.push_all_feedback();
+    }
+    let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+    assert!(published.kept.is_none());
+    drop(published);
+    assert_eq!((a, f), (0, 0), "M3 running gripper=true replay stale termination touched allocator");
+    assert_eq!(inner.last_action.as_ref().map(|a| a.id), Some(replay_id));
+    assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("J7_FEEDBACK_STALE"));
+    while let Some(retired) = inner.pop_retired_trajectory() {
+        drop(retired);
+    }
+
+    // 2. B1: `MitOwner::Lost` stopped-hold emits J7 freeze frame via `write_pos_force_stopped_hold_only()`
+    //    with strictly (0, 0) allocs/frees!
+    inner.mit.owner = MitOwner::Lost;
+    inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::Other("B1 alloc test".into()));
+    inner.safety.drain_log_events_off_thread();
+    for tick in 0..3 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "B1 MitOwner::Lost J7 freeze tick {tick} touched allocator");
+    }
+
+    // 3. M2: Stale J1 (`BuildRefused`) + J2 `WouldBlock` streak -> `CAN_TX_STALLED` with (0, 0)!
+    inner.mit.owner = MitOwner::Off;
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.mute_j7 = false;
+        g.mute_j1 = true;
+        g.rx.clear();
+        g.pending_rx.clear();
+        g.clock.advance(Duration::from_millis(120));
+        g.push_all_feedback();
+    }
+    let _ = inner.tick_publish(0.02, 1, false);
+    inner.safety.drain_log_events_off_thread();
+    bus.0.lock().unwrap().mode = Mode::WouldBlockAfter(0);
+    let mut stalled = false;
+    for tick in 0..6 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        assert_eq!((a, f), (0, 0), "M2 stale J1 + WouldBlock tick {tick} touched allocator");
+        if inner.safety.has_latched_fault_kind(armd::safety::FaultKind::CanTxStalled) {
+            stalled = true;
+            break;
+        }
+    }
+    assert!(stalled, "M2 stale J1 + WouldBlock must latch CAN_TX_STALLED");
+    assert_eq!(inner.hold_tx_no_progress_ticks()[0], 0);
 }

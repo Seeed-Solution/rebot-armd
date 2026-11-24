@@ -3701,24 +3701,45 @@ impl SupervisorInner {
         Some(self.config.limits.get(g).map_or(raw, |l| raw.clamp(l.min_position, l.max_position)))
     }
 
+    /// True when the active trajectory drives the gripper (`Reference::Gripper`, or
+    /// `Reference::Replay` with `gripper == true` and a configured gripper joint).
+    pub(crate) fn active_reference_drives_gripper(&self) -> bool {
+        match self.active_trajectory.as_ref().map(|a| &a.reference) {
+            Some(Reference::Gripper(_)) => true,
+            Some(Reference::Replay(r)) => r.gripper && r.gripper_idx.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Zero-allocation admission check refusing new gripper targets while active `PosForce` J7
+    /// feedback is stale (`> 100 ms`). Single source of truth wrapped by
+    /// [`Self::check_pos_force_gripper_fresh`].
+    pub(crate) fn check_pos_force_gripper_fresh_static(&self) -> Result<(), &'static str> {
+        if self.is_pos_force_j7_stale() {
+            return Err("J7_FEEDBACK_STALE");
+        }
+        Ok(())
+    }
+
     /// Refuse new gripper targets while active `PosForce` J7 feedback is stale (`> 100 ms`).
     pub(crate) fn check_pos_force_gripper_fresh(&self) -> Result<(), ArmError> {
-        if self.is_pos_force_j7_stale() {
+        if let Err(code) = self.check_pos_force_gripper_fresh_static() {
             return Err(ArmError::Rejected {
                 status: 409,
-                code: "J7_FEEDBACK_STALE".into(),
+                code: code.into(),
                 message: "Gripper (J7) position-force feedback is stale (> 100 ms); new gripper targets are refused until fresh feedback returns".into(),
             });
         }
         Ok(())
     }
 
-    /// Zero-alloc failure of a running or deferred-done gripper action when active `PosForce` J7
-    /// feedback is stale (`> 100 ms`). Snaps `commanded_positions[joint]` / `target_positions[joint]`
-    /// to the last fresh J7 position and ends the gripper action with code `"J7_FEEDBACK_STALE"`.
+    /// Zero-alloc failure of a running or deferred-done gripper action (or `gripper=true` replay)
+    /// when active `PosForce` J7 feedback is stale (`> 100 ms`). Snaps `commanded_positions[joint]`
+    /// and `target_positions[joint]` to the last fresh J7 position and ends the action with code
+    /// `"J7_FEEDBACK_STALE"`.
     fn fail_running_gripper_for_j7_stale_rt(&mut self, joint: usize, deferred: Option<DeferredActionDone>) {
         let freeze_pos = self.pos_force_j7_freeze_position();
-        let active_gripper_id = if self.gripper_reference_active() {
+        let active_gripper_id = if self.active_reference_drives_gripper() {
             let old = self.active_trajectory.take();
             let id = old.as_ref().and_then(|a| a.action_id);
             if let Some(traj) = old {
@@ -5613,8 +5634,30 @@ impl SupervisorInner {
                     }
                 }
                 Reference::Replay(replay) => {
-                    replay.step_into(&ctx, &mut step_buf);
-                    Stepped::Replay(std::mem::take(&mut step_buf), replay.phase_name(), replay.t_s())
+                    if j7_pf_stale_before_step && replay.gripper && replay.gripper_idx.is_some() {
+                        let g = replay.gripper_idx.unwrap();
+                        step_buf.positions.clear();
+                        step_buf.positions.extend_from_slice(&self.commanded_positions);
+                        step_buf.velocities.clear();
+                        step_buf.velocities.resize(self.commanded_velocities.len(), 0.0);
+                        if let Some(fp) = j7_pf_freeze_pos {
+                            if g < step_buf.positions.len() {
+                                step_buf.positions[g] = fp;
+                            }
+                        }
+                        step_buf.progress = last_action_progress;
+                        step_buf.clear_gripper_stall = false;
+                        step_buf.status = StepStatus::Failed {
+                            code: "J7_FEEDBACK_STALE",
+                            message: crate::motion::StepErrorText::new(
+                                "Gripper (J7) position-force feedback became stale (> 100 ms)",
+                            ),
+                        };
+                        Stepped::Replay(std::mem::take(&mut step_buf), replay.phase_name(), replay.t_s())
+                    } else {
+                        replay.step_into(&ctx, &mut step_buf);
+                        Stepped::Replay(std::mem::take(&mut step_buf), replay.phase_name(), replay.t_s())
+                    }
                 }
             };
             // Keep the persistent gripper hold ceiling synchronized with `GripperMotion` (including
@@ -5717,6 +5760,19 @@ impl SupervisorInner {
         // 3.1 Servo streaming (park release / unload settle runs AFTER output acceptance below
         //     so park never advances or cuts torque on a deferred or rejected release).
         if !(self.pending_normal_unload && self.active_trajectory.is_none()) && self.servo_target.is_some() {
+            if j7_pf_stale_before_step {
+                if let Some(g) = self.config.gripper_index() {
+                    if let Some(fp) = j7_pf_freeze_pos {
+                        if let Some(st) = self.servo_target.as_mut().filter(|s| s.len() > g) {
+                            st[g] = fp;
+                        }
+                        if g < self.target_positions.len() {
+                            self.target_positions[g] = fp;
+                        }
+                    }
+                    self.gripper_stream_target = None;
+                }
+            }
             // the target, copied into the scratch (the stream may replace it meanwhile)
             let mut target_buf = std::mem::take(&mut self.scratch.servo_target);
             copy_into(&mut target_buf, self.servo_target.as_deref().unwrap_or(&[]));

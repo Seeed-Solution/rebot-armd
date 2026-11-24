@@ -1610,8 +1610,9 @@ impl SupervisorInner {
         match status {
             StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
-                let is_gripper = matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
-                let clear_releasing = self.releasing && is_gripper;
+                let is_gripper_ref = matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
+                let is_gripper = self.active_reference_drives_gripper();
+                let clear_releasing = self.releasing && is_gripper_ref;
                 let target = if macro_sub {
                     match (action_id, self.macro_run.as_ref().and_then(|m| m.ticket())) {
                         (Some(id), Some(ticket)) => DeferredCompletionTarget::MacroSub { action_id: id, ticket },

@@ -5055,3 +5055,361 @@ fn dual_owner_stale_j1_refusal_never_hides_j2_wouldblock_can_tx_stalled() {
         }
     }
 }
+
+/// Round 5 M3 regression (Legacy + RT Executor):
+/// 1. A running `gripper=true` replay terminates immediately with `J7_FEEDBACK_STALE` when J7
+///    goes stale (> 100 ms, before 250 ms fault) instead of silently freezing, emitting ONLY the
+///    `0x307` freeze frame (`vel_raw == 0` at `last_fresh_pos`).
+/// 2. While J7 is stale (> 100 ms), ALL J7 target producers route through the single admission
+///    check `check_pos_force_gripper_fresh` and refuse with `409 J7_FEEDBACK_STALE`:
+///    - standalone replay (`gripper=true`),
+///    - sequence/macro replay (`gripper=true`),
+///    - macro gripper (`start_macro_gripper`) and macro quintic moving J7 (`install_macro_quintic`),
+///    - policy live start (`begin_policy_run(Live)`) and live policy servo frames (`policy_step`).
+/// 3. No J7 target submitted while stale (including `servo` clamping J7 to freeze_pos while J1–J6
+///    continue) ever reaches the wire after J7 feedback recovers!
+#[test]
+fn dual_owner_stale_j7_gates_replay_sequence_policy_macros_and_never_sends_stale_target_after_recovery() {
+    use armd::recording::{EpisodeStore, RecordFrame};
+    use armd::replay::{plan_frames, ReplayInput, ReplayRequest};
+
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+    let dir = tempfile::tempdir().unwrap();
+    let store = EpisodeStore::new(Some(dir.path().to_path_buf()));
+
+    let make_replay_plan = |inner: &SupervisorInner, gripper: bool, target_j7: f32| {
+        let q0 = inner.commanded_positions.clone();
+        let mut q1 = q0.clone();
+        q1[6] = target_j7;
+        let frames = vec![
+            RecordFrame { timestamp: 0.0, observation_state: q0.clone(), action: q0.clone() },
+            RecordFrame { timestamp: 0.2, observation_state: q0.clone(), action: q0.clone() },
+            RecordFrame { timestamp: 3.0, observation_state: q1.clone(), action: q1 },
+        ];
+        let input = ReplayInput {
+            request: ReplayRequest {
+                episode: "m3_ep".into(),
+                speed: 1.0,
+                gripper,
+                tag: None,
+                allow_stale: false,
+            },
+            path: dir.path().join("m3_ep.parquet"),
+            profile_id: inner.config.profile_id.clone(),
+            dof: inner.config.dof,
+            arm_dof: inner.config.arm_dof(),
+            gripper_idx: inner.config.gripper_index(),
+            joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
+            limits: inner.config.limits.clone(),
+            speed_limits: inner.config.limits.clone(),
+            ws: None,
+            arm: inner.config.arm_model.clone(),
+            start: q0,
+            control_hz: inner.config.control_frequency_hz,
+            epoch: inner.safety.epoch_id(),
+            workspace_revision: inner.workspace_revision,
+            power: None,
+            store: store.clone(),
+            zero_offsets: inner.joint_zero_offsets.clone(),
+            tcp_offset: inner.config.tcp_offset,
+            active_tool: inner.config.active_tool.clone(),
+        };
+        plan_frames(input, &frames).expect("plan replay frames")
+    };
+
+    let assert_j7_stale_reject = |res: Result<(), armd::ArmError>, label: &str| {
+        match res.expect_err(&format!("{label}: expected 409 J7_FEEDBACK_STALE")) {
+            armd::ArmError::Rejected { status: 409, code, .. } => {
+                assert_eq!(code, "J7_FEEDBACK_STALE", "{label}: wrong reject code");
+            }
+            other => panic!("{label}: expected 409 J7_FEEDBACK_STALE, got {other:?}"),
+        }
+    };
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        // Place J7 open at -3.0 rad with fresh feedback.
+        rig.bus.with(|s| {
+            s.motors[6].q = -3.0;
+            s.push_all_feedback();
+        });
+        rig.step();
+        rig.inner_mut().commanded_positions[6] = -3.0;
+        rig.inner_mut().target_positions[6] = -3.0;
+
+        // 1. Start a `gripper=true` replay while J7 is fresh, run several ticks, then mute J7
+        //    past 100 ms (< 250 ms fault): running replay MUST terminate immediately with
+        //    `J7_FEEDBACK_STALE` (not silently freeze), emitting ONLY the 0x307 freeze frame!
+        let plan_running = make_replay_plan(rig.inner(), true, 0.0);
+        let (replay_id, _) = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit replay");
+            SupervisorInner::install_replay(admitted, plan_running).expect("install fresh replay")
+        };
+        for _ in 0..4 {
+            rig.step();
+            assert!(rig.inner().safety.state().is_operational());
+        }
+        assert!(
+            rig.inner().last_action.as_ref().is_some_and(|a| a.id == replay_id && a.is_running()),
+            "{owner:?}: replay should be running before staleness"
+        );
+        let last_fresh_pos = rig.inner().measured_positions[6];
+        assert!(last_fresh_pos < -2.0, "{owner:?}: expected open J7 < -2.0, got {last_fresh_pos}");
+
+        rig.bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[6].mute_feedback = true;
+        });
+        rig.clock.advance(ms(115));
+        rig.bus.clear_log();
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+
+        assert!(
+            rig.inner().safety.state().is_operational(),
+            "{owner:?}: 115 ms staleness must not prematurely latch 250 ms fault"
+        );
+        let ended = rig.inner().last_action.as_ref().expect("finished replay action");
+        assert_eq!(ended.id, replay_id);
+        assert_eq!(ended.state, "failed", "{owner:?}: running gripper=true replay must fail on stale J7");
+        assert_eq!(ended.code.as_deref(), Some("J7_FEEDBACK_STALE"));
+        assert!(
+            rig.inner().active_trajectory.is_none(),
+            "{owner:?}: failed replay must clear active_trajectory"
+        );
+        assert_j7_freeze_frames(
+            &j7_pf_frames(&rig.bus.tx_log()),
+            last_fresh_pos,
+            pf_cur,
+            &format!("{owner:?} running gripper=true replay stale termination"),
+        );
+
+        // 2. While J7 is stale (> 100 ms, Operational), ALL J7 target producers are refused:
+        // (2a) Standalone `install_replay` with `gripper=true` -> 409 J7_FEEDBACK_STALE.
+        let plan_standalone = make_replay_plan(rig.inner(), true, 0.0);
+        let res_standalone = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit standalone replay");
+            SupervisorInner::install_replay(admitted, plan_standalone).map(drop)
+        };
+        assert_j7_stale_reject(res_standalone, &format!("{owner:?} standalone replay gripper=true"));
+
+        // (2b) Sequence/macro replay (`install_macro_replay`), macro gripper (`start_macro_gripper`),
+        //      and macro quintic moving J7 (`install_macro_quintic`) -> ALL 409 J7_FEEDBACK_STALE!
+        let ep_now = rig.inner().safety.epoch_id();
+        let seq_id = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit sequence macro");
+            SupervisorInner::begin_sequence_action(admitted, Some("m3-seq".into()), ep_now)
+                .expect("begin sequence macro")
+        };
+        let plan_macro = make_replay_plan(rig.inner(), true, 0.0);
+        let res_macro_replay = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit macro replay");
+            SupervisorInner::install_macro_replay(admitted, seq_id, plan_macro).map(drop)
+        };
+        assert_j7_stale_reject(res_macro_replay, &format!("{owner:?} sequence macro replay gripper=true"));
+
+        let res_macro_grip = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit macro gripper");
+            SupervisorInner::start_macro_gripper(
+                admitted,
+                seq_id,
+                GripperRequest {
+                    command: GripperCommand::Close,
+                    fraction: None,
+                    grasp: false,
+                    speed: 0.30,
+                    timeout_s: Some(10.0),
+                    tag: None,
+                },
+            )
+            .map(drop)
+        };
+        assert_j7_stale_reject(res_macro_grip, &format!("{owner:?} macro gripper"));
+
+        let res_macro_quintic = {
+            let inner = rig.inner_mut();
+            let mut q_close = inner.commanded_positions.clone();
+            q_close[6] = 0.0;
+            let limits = inner.config.limits.clone();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit macro quintic");
+            SupervisorInner::install_macro_quintic(admitted, seq_id, q_close, &limits).map(drop)
+        };
+        assert_j7_stale_reject(res_macro_quintic, &format!("{owner:?} macro quintic moving J7"));
+
+        // Finish the sequence macro cleanly before testing policy + servo.
+        rig.inner_mut().finish_macro(seq_id, "cancelled", Some("STOPPED"), None, None, None);
+
+        // (2c) Policy live start (`begin_policy_run(Live)`) while J7 is stale -> 409 J7_FEEDBACK_STALE!
+        #[cfg(feature = "policy-runtime")]
+        {
+            use armd::policy_runtime::{PolicyMode, PolicyRunStart};
+            rig.inner_mut().follower = Some("sim".into());
+            rig.inner_mut().lease_enabled = true;
+            let lease_gen = rig.inner_mut().acquire_lease("m3-policy").expect("lease");
+            let ep_pol = rig.inner().safety.epoch_id();
+            let res_begin_pol = {
+                let inner = rig.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).expect("admit policy start");
+                SupervisorInner::begin_policy_run(
+                    admitted,
+                    PolicyRunStart {
+                        epoch_id: ep_pol,
+                        connection_id: "m3-policy".into(),
+                        lease_generation: lease_gen,
+                        policy_id: "m3-pol".into(),
+                        artifact_digest: "0".repeat(64),
+                        backend: "mlp".into(),
+                        mode: PolicyMode::Live,
+                        sim_only: false,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
+                    },
+                )
+                .map(drop)
+            };
+            assert_j7_stale_reject(res_begin_pol, &format!("{owner:?} begin_policy_run(Live) while stale"));
+            rig.inner_mut().lease_enabled = false;
+            rig.inner_mut().follower = None;
+        }
+
+        // (2d) Servo attempting a new J7 target (0.0) while stale holds J7 frozen at last_fresh_pos.
+        {
+            let inner = rig.inner_mut();
+            let mut servo_t = inner.commanded_positions.clone();
+            servo_t[0] += 0.05;
+            servo_t[6] = 0.0;
+            let ep_s = inner.safety.epoch_id();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit servo");
+            SupervisorInner::servo(admitted, servo_t, ep_s).expect("servo J1-J6 continues");
+        }
+        rig.bus.clear_log();
+        rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        rig.step_dt(DT, false);
+        assert_j7_freeze_frames(
+            &j7_pf_frames(&rig.bus.tx_log()),
+            last_fresh_pos,
+            pf_cur,
+            &format!("{owner:?} servo while J7 stale"),
+        );
+
+        // 3. After J7 recovers to fresh feedback, ZERO J7 targets submitted while stale (0.0)
+        //    may reach the wire!
+        rig.bus.with(|s| {
+            s.motors[6].mute_feedback = false;
+            s.motors[6].q = last_fresh_pos;
+            s.push_all_feedback();
+        });
+        rig.bus.clear_log();
+        for tick in 0..5 {
+            rig.step();
+            assert!(
+                rig.inner().safety.state().is_operational(),
+                "{owner:?}: recovery tick {tick} must stay operational: {:?}",
+                rig.inner().safety.fault()
+            );
+        }
+        let recovered_j7 = j7_pf_frames(&rig.bus.tx_log());
+        assert!(!recovered_j7.is_empty(), "{owner:?}: expected J7 0x307 frames after recovery");
+        for f in &recovered_j7 {
+            let p = f32::from_le_bytes(f.data[0..4].try_into().unwrap());
+            assert!(
+                (p - last_fresh_pos).abs() < 1e-2,
+                "{owner:?}: stale-admitted J7 target leaked after recovery: wire pos {p} != {last_fresh_pos}"
+            );
+        }
+
+        // 4. Policy servo frame (`policy_step`) while a live policy run is ALREADY active and J7
+        //    goes stale -> MUST reject with `409 J7_FEEDBACK_STALE`, terminate the run, and NEVER
+        //    send the stale policy J7 target after J7 recovers!
+        #[cfg(feature = "policy-runtime")]
+        {
+            use armd::policy_runtime::{PolicyMode, PolicyRunStart};
+            rig.inner_mut().stop_motion();
+            rig.inner_mut().commanded_velocities.fill(0.0);
+            rig.inner_mut().safety.mark_motion_finished();
+            rig.step();
+            rig.inner_mut().follower = Some("sim".into());
+            rig.inner_mut().lease_enabled = true;
+            let lease_gen = rig.inner_mut().acquire_lease("m3-policy").expect("re-acquire lease");
+            let ep_pol = rig.inner().safety.epoch_id();
+            let pol_id = {
+                let inner = rig.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).expect("admit fresh policy");
+                SupervisorInner::begin_policy_run(
+                    admitted,
+                    PolicyRunStart {
+                        epoch_id: ep_pol,
+                        connection_id: "m3-policy".into(),
+                        lease_generation: lease_gen,
+                        policy_id: "m3-pol-step".into(),
+                        artifact_digest: "0".repeat(64),
+                        backend: "mlp".into(),
+                        mode: PolicyMode::Live,
+                        sim_only: false,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
+                    },
+                )
+                .expect("start fresh policy run")
+            };
+            // J7 goes stale (> 100 ms), then policy sends a frame targeting J7 = last_fresh_pos + 0.05!
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[6].mute_feedback = true;
+            });
+            rig.clock.advance(ms(115));
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+
+            let mut pol_target = rig.inner().measured_positions.clone();
+            pol_target[6] = (last_fresh_pos + 0.05).min(0.0);
+            let res_step = rig.inner_mut().policy_step(pol_id, pol_target, Some(0));
+            assert_j7_stale_reject(res_step, &format!("{owner:?} live policy_step while stale"));
+            assert!(!rig.inner().policy_run_active(), "{owner:?}: policy run must terminate on J7_FEEDBACK_STALE");
+            assert_eq!(
+                rig.inner().last_action.as_ref().and_then(|a| a.code.as_deref()),
+                Some("J7_FEEDBACK_STALE")
+            );
+
+            // Recover J7 and verify the rejected policy J7 target NEVER reaches the wire!
+            rig.bus.with(|s| {
+                s.motors[6].mute_feedback = false;
+                s.motors[6].q = last_fresh_pos;
+                s.push_all_feedback();
+            });
+            rig.bus.clear_log();
+            for _ in 0..4 {
+                rig.step();
+            }
+            for f in j7_pf_frames(&rig.bus.tx_log()) {
+                let p = f32::from_le_bytes(f.data[0..4].try_into().unwrap());
+                assert!(
+                    (p - last_fresh_pos).abs() < 1e-2,
+                    "{owner:?}: rejected policy J7 target leaked after recovery: wire pos {p} != {last_fresh_pos}"
+                );
+            }
+        }
+    }
+}
