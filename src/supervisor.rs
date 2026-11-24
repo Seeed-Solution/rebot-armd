@@ -274,6 +274,13 @@ impl<'g> Admitted<'g> {
         let stamp = self.stamp;
         let inner = self.inner;
         inner.verify_admission_stamp(stamp)?;
+        // Record the A1 admission `(stop_gen, estop_epoch)` directly from the admitted command's
+        // stamp so J7 `Target` intents carry their admission stamp and are never re-stamped later
+        // (and never stamped with `max(local, requested)`).
+        inner.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+            stop_gen: stamp.stop_gen,
+            estop_epoch: stamp.estop_epoch,
+        });
         Ok((inner, AdmittedProof { stamp }))
     }
 }
@@ -1195,6 +1202,14 @@ pub struct SupervisorInner {
     /// Current control tick's J7 `PosForce` intent set by arm/motion/hold paths and consumed
     /// strictly once by the tick epilogue's single J7 emitter (`emit_j7_tick_epilogue`).
     pub(crate) j7_intent: Option<crate::driver::PosForceIntent>,
+    /// Admission `(stop_gen, estop_epoch)` captured directly from the A1 [`AdmissionStamp`] of
+    /// the command that produced the active J7 target. Never re-stamped at output time and never
+    /// stamped with `max(local, requested)`; cleared on stop, E-stop, and torque-off.
+    pub(crate) j7_admitted_stamp: Option<crate::driver::PosForceIntentStamp>,
+    /// Optional deterministic test seam invoked right after `mit.rs` checks
+    /// `urgent_stop_unapplied()` and before J7 intent stamping (`None` in production, 0 alloc).
+    #[doc(hidden)]
+    pub post_stop_check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -1838,6 +1853,8 @@ impl SupervisorInner {
             retired_policy_runs: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
             j7_intent: None,
+            j7_admitted_stamp: None,
+            post_stop_check_hook: None,
         };
         inner.prepare_workspace_eval_bufs();
         inner
@@ -1961,6 +1978,7 @@ impl SupervisorInner {
     /// Advance the stop generation under the owner lock whenever a Stop applies.
     pub fn advance_stop_generation(&mut self) -> u64 {
         self.reset_hold_tx_joint_progress();
+        self.j7_admitted_stamp = None;
         self.stop_gen.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -3394,6 +3412,14 @@ impl SupervisorInner {
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.target_positions[gripper_idx] = motion.target;
+        if self.watchdog_park.is_some() {
+            // Lease-watchdog park owns gripper release independent of client stops; stamp from
+            // local owner state (never `max(local, requested)`).
+            self.j7_admitted_stamp = Some(crate::driver::PosForceIntentStamp {
+                stop_gen: self.stop_gen.load(Ordering::SeqCst),
+                estop_epoch: self.safety.epoch_id(),
+            });
+        }
         self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
         self.park_release = Some(next);
         true
@@ -4020,9 +4046,9 @@ impl SupervisorInner {
         }
     }
 
-    /// Current owner `(stop_gen, estop_epoch)` stamp attached to every J7 [`PosForceIntent`]
-    /// and compared in the single J7 emitter so a pre-STOP / pre-E-stop `Target` is always
-    /// degraded to `Hold` and never re-stamped with a newer generation.
+    /// Current owner `(stop_gen, estop_epoch)` stamp read in the tick epilogue (and used for
+    /// non-target `Hold`/`Stop` intents). NEVER used to stamp a `PosForceIntent::Target`: every
+    /// `Target` carries the A1 [`AdmissionStamp`] captured in `self.j7_admitted_stamp`.
     #[inline]
     pub(crate) fn current_j7_intent_stamp(&self) -> crate::driver::PosForceIntentStamp {
         crate::driver::PosForceIntentStamp {
@@ -6718,6 +6744,7 @@ impl SupervisorInner {
                 let generation = stops.current();
                 if generation != stops.applied() {
                     self.authorized_stop();
+                    self.sync_stop_generation(generation);
                     stops.mark_applied(generation);
                 }
             }

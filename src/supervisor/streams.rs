@@ -1793,7 +1793,11 @@ pub mod targets {
         /// Consume the servo frames of the connection holding lease `lease_generation`
         /// (replaces the authorized stream; requires a single-use [`Admitted`] proof).
         pub fn authorize_servo_stream(admitted: crate::supervisor::Admitted<'_>, lease_generation: u64) -> Result<(), SafetyError> {
+            // Authorizing a stream does not itself produce a J7 target; preserve any existing
+            // J7 admission stamp rather than overwriting it during post-stop policy cleanup.
+            let prev_j7_stamp = admitted.inner.j7_admitted_stamp;
             let (this, proof) = admitted.consume()?;
+            this.j7_admitted_stamp = prev_j7_stamp;
             let stamp = proof.stamp();
             if lease_generation == 0 || stamp.lease_gen != lease_generation {
                 return Err(SafetyError::LeaseLost);

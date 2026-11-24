@@ -858,20 +858,26 @@ impl crate::supervisor::SupervisorInner {
         // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
         // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
         if self.urgent_stop_unapplied() { return TickOutput::None; }
+        if let Some(ref hook) = self.post_stop_check_hook {
+            hook();
+        }
         let is_hold = self.safety.state().is_stopped();
-        // Capture `(stop_gen, estop_epoch)` BEFORE any arm write so a STOP/E-stop arriving during
-        // the arm write always leaves a pre-STOP `Target` visibly stale to the tick epilogue's
-        // single J7 emitter (which degrades it to `Hold` instead of re-stamping it).
-        let intent_stamp = self.current_j7_intent_stamp();
+        // Every J7 `Target` carries the `(stop_gen, estop_epoch)` from the A1 `AdmissionStamp` of
+        // the command that produced it (`self.j7_admitted_stamp`). It is NEVER re-stamped later
+        // and NEVER stamped with `max(local, requested)`, so any STOP accepted after admission —
+        // even right between the `urgent_stop_unapplied()` check above and intent creation — turns
+        // the intent into `Hold` in the tick epilogue's single J7 emitter.
+        let admitted_target_stamp = self.j7_admitted_stamp;
+        let non_target_stamp = self.current_j7_intent_stamp();
         let ff = match self.mit.owner {
             MitOwner::Off => None,
             MitOwner::Lost => {
                 // A tripped MIT fence / cancelled MIT group suppresses ONLY the MIT joints; set
                 // the J7 intent so the tick epilogue's ONE J7 emitter writes the hold/freeze frame.
                 self.j7_intent = Some(if is_hold {
-                    PosForceIntent::stop(intent_stamp)
+                    PosForceIntent::stop(non_target_stamp)
                 } else {
-                    PosForceIntent::hold(intent_stamp)
+                    PosForceIntent::hold(non_target_stamp)
                 });
                 return TickOutput::None;
             }
@@ -881,9 +887,9 @@ impl crate::supervisor::SupervisorInner {
                     // Record J7 Hold/Stop intent so the tick epilogue's ONE J7 emitter still writes
                     // J7's freeze/hold frame while MIT joints remain suppressed.
                     self.j7_intent = Some(if is_hold {
-                        PosForceIntent::stop(intent_stamp)
+                        PosForceIntent::stop(non_target_stamp)
                     } else {
-                        PosForceIntent::hold(intent_stamp)
+                        PosForceIntent::hold(non_target_stamp)
                     });
                     let (now, max_age) = self
                         .driver
@@ -924,7 +930,7 @@ impl crate::supervisor::SupervisorInner {
                 //   and degrades J7 intent to `Stop` so the epilogue still emits a hold/freeze.
                 if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
                     if is_hold {
-                        computed_j7_intent = Some(PosForceIntent::stop(intent_stamp));
+                        computed_j7_intent = Some(PosForceIntent::stop(non_target_stamp));
                     } else if let Some(t) = targets.get_mut(cap.joint) {
                         if !t.velocity.is_some_and(|v| !v.is_finite()) {
                             let ceiling_raw = active_pf_ceiling
@@ -950,19 +956,17 @@ impl crate::supervisor::SupervisorInner {
                             }
                         }
                         if let Err(err) = drv.validate_pos_force_intent_target(t.position, t.velocity, None) {
-                            computed_j7_intent = Some(PosForceIntent::stop(intent_stamp));
+                            computed_j7_intent = Some(PosForceIntent::stop(non_target_stamp));
                             return crate::supervisor::SupervisorInner::tick_output_from_driver_write(
                                 &mut **drv,
                                 false,
                                 Err(err),
                             );
                         }
-                        computed_j7_intent = Some(PosForceIntent::target(
-                            t.position,
-                            t.velocity,
-                            None,
-                            intent_stamp,
-                        ));
+                        computed_j7_intent = Some(match admitted_target_stamp {
+                            Some(stamp) => PosForceIntent::target(t.position, t.velocity, None, stamp),
+                            None => PosForceIntent::hold(non_target_stamp),
+                        });
                     }
                 }
                 let write_res = if is_hold {

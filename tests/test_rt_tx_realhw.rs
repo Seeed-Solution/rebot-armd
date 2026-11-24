@@ -6033,3 +6033,185 @@ fn dual_owner_b1_stop_during_arm_write_degrades_prestamped_j7_target_to_hold() {
         }
     }
 }
+
+/// Round-8 B1: a J7 `Target` intent carries `(stop_gen, estop_epoch)` from the A1 `AdmissionStamp`
+/// of the command that produced it — never re-stamped at output time and never stamped with
+/// `max(local, requested)`. Injecting a STOP right between `mit.rs`'s `urgent_stop_unapplied()`
+/// check and intent stamping on BOTH owners (Legacy and RT Executor, fresh and stale J7, plus
+/// Legacy without attached `StopRequests`) must emit NO target frame after the STOP — only Hold/Freeze.
+#[test]
+fn dual_owner_r8_b1_stop_between_pending_check_and_stamping_sends_no_target() {
+    use armd::rt_core::urgent::StopRequests;
+
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+
+    // 1. Dual-owner (Legacy + RT Executor, fresh + stale J7) with `StopRequests` injected right
+    //    between `mit.rs`'s pending-STOP check and J7 intent stamping.
+    for owner in [Owner::Legacy, Owner::Executor] {
+        for j7_stale in [false, true] {
+            let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            let stops = match &mut rig.owner {
+                RigOwner::Legacy(inner) => {
+                    let s = StopRequests::new();
+                    inner.attach_stop_requests(s.clone());
+                    let gate = inner.estop_gate();
+                    inner.driver.as_ref().unwrap().lock().unwrap().set_estop_gate(gate);
+                    s
+                }
+                RigOwner::Executor { fx, .. } => {
+                    let s = fx.stops().clone();
+                    fx.core.attach_stop_requests(s.clone());
+                    let gate = fx.core.estop_gate();
+                    fx.core.driver.as_ref().unwrap().lock().unwrap().set_estop_gate(gate);
+                    s
+                }
+            };
+            rig.inner_mut().commanded_positions[6] = -2.5;
+            rig.inner_mut().target_positions[6] = -2.5;
+            rig.inner_mut().measured_positions[6] = -2.5;
+            rig.bus.with(|s| {
+                s.motors[6].q = -2.5;
+                s.push_all_feedback();
+            });
+            rig.step();
+
+            // Admit a closing J7 jog at the pre-STOP A1 AdmissionStamp.
+            let stop_gen_before = rig.inner().current_stop_gen();
+            {
+                let inner = rig.inner_mut();
+                let ep = inner.safety.epoch_id();
+                let mut goal = inner.commanded_positions.clone();
+                goal[6] = 0.0;
+                let stamp = inner.current_admission_stamp();
+                assert_eq!(stamp.stop_gen, stop_gen_before);
+                let admitted = inner.check_admission(stamp).expect("admit close jog");
+                SupervisorInner::jog_action(admitted, goal, Some(1.0), Some(ep), "joint_move")
+                    .expect("start J7 close motion");
+            }
+            if j7_stale {
+                rig.bus.with(|s| {
+                    s.rx.clear();
+                    s.pending.clear();
+                    s.motors[6].mute_feedback = true;
+                });
+                rig.clock.advance(ms(115));
+                rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            } else {
+                rig.bus.with(|s| s.push_all_feedback());
+            }
+
+            // Inject STOP right between `if self.urgent_stop_unapplied()` and J7 intent stamping.
+            // Under the old code (`max(local, requested)` at stamping time), this re-stamped the
+            // closing Target with the NEW stop_gen so the epilogue transmitted a closing Target!
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired_cb = fired.clone();
+            let stops_cb = stops.clone();
+            rig.inner_mut().post_stop_check_hook = Some(Arc::new(move || {
+                if !fired_cb.swap(true, Ordering::SeqCst) {
+                    let _ = stops_cb.request();
+                }
+            }));
+
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+            rig.inner_mut().post_stop_check_hook = None;
+
+            assert!(fired.load(Ordering::SeqCst), "{owner:?} stale={j7_stale}: stop hook did not fire");
+            assert!(
+                rig.inner().current_stop_gen() > stop_gen_before,
+                "{owner:?} stale={j7_stale}: STOP must advance stop_gen"
+            );
+            assert_eq!(
+                stops.current(),
+                stops.applied(),
+                "{owner:?} stale={j7_stale}: STOP must be applied in the same tick"
+            );
+
+            let log = rig.bus.tx_log();
+            let j7 = j7_pf_frames(&log);
+            assert_eq!(
+                j7.len(),
+                1,
+                "{owner:?} stale={j7_stale}: expected exact 1 J7 Hold/Freeze frame after STOP: {log:?}"
+            );
+            let pos = f32::from_le_bytes(j7[0].data[0..4].try_into().unwrap());
+            let vel = u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]);
+            let cur = u16::from_le_bytes([j7[0].data[6], j7[0].data[7]]);
+            assert!(
+                (pos - (-2.5)).abs() < 1e-2,
+                "{owner:?} stale={j7_stale}: pre-STOP closing Target leaked! pos={pos} != -2.5"
+            );
+            assert_eq!(
+                vel, 0,
+                "{owner:?} stale={j7_stale}: STOP must degrade Target to vel_raw==0 Hold/Freeze, got {vel}"
+            );
+            assert_eq!(cur, pf_cur);
+
+            // Next tick with no new admission must STILL emit Hold/Freeze (never a Target).
+            rig.bus.clear_log();
+            if j7_stale {
+                rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            } else {
+                rig.bus.with(|s| s.push_all_feedback());
+            }
+            rig.step_dt(DT, false);
+            let j7_next = j7_pf_frames(&rig.bus.tx_log());
+            assert_eq!(j7_next.len(), 1, "{owner:?} stale={j7_stale}: follow-up tick must emit 1 Hold/Freeze");
+            assert_eq!(
+                u16::from_le_bytes([j7_next[0].data[4], j7_next[0].data[5]]),
+                0,
+                "{owner:?} stale={j7_stale}: follow-up tick without new admission must stay Hold/Freeze"
+            );
+        }
+    }
+
+    // 2. Legacy owner WITHOUT attached `StopRequests`: `stop_gen` advances between the pending-STOP
+    //    check and J7 intent stamping -> admission stamp (0) != epilogue current_stamp (1) -> Hold!
+    {
+        let mut rig = DualRig::new_pos_force(Owner::Legacy, base_cfg(), None);
+        rig.inner_mut().commanded_positions[6] = -2.5;
+        rig.inner_mut().target_positions[6] = -2.5;
+        rig.inner_mut().measured_positions[6] = -2.5;
+        rig.bus.with(|s| {
+            s.motors[6].q = -2.5;
+            s.push_all_feedback();
+        });
+        rig.step();
+
+        let stop_gen_arc = rig.inner().stop_gen.clone();
+        let stop_gen_before = rig.inner().current_stop_gen();
+        {
+            let inner = rig.inner_mut();
+            let ep = inner.safety.epoch_id();
+            let mut goal = inner.commanded_positions.clone();
+            goal[6] = 0.0;
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit close jog");
+            SupervisorInner::jog_action(admitted, goal, Some(1.0), Some(ep), "joint_move")
+                .expect("start J7 close motion");
+        }
+        rig.bus.with(|s| s.push_all_feedback());
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_cb = fired.clone();
+        rig.inner_mut().post_stop_check_hook = Some(Arc::new(move || {
+            if !fired_cb.swap(true, Ordering::SeqCst) {
+                stop_gen_arc.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        rig.bus.clear_log();
+        rig.step_dt(DT, false);
+        rig.inner_mut().post_stop_check_hook = None;
+
+        assert!(fired.load(Ordering::SeqCst));
+        assert_eq!(rig.inner().current_stop_gen(), stop_gen_before + 1);
+        let log = rig.bus.tx_log();
+        let j7 = j7_pf_frames(&log);
+        assert_eq!(j7.len(), 1, "Legacy local stop_gen advance must emit 1 Hold: {log:?}");
+        let pos = f32::from_le_bytes(j7[0].data[0..4].try_into().unwrap());
+        let vel = u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]);
+        assert!((pos - (-2.5)).abs() < 1e-2, "pre-STOP target leaked on Legacy: pos={pos}");
+        assert_eq!(vel, 0, "Legacy local stop_gen advance must degrade Target to vel_raw==0 Hold");
+    }
+}
