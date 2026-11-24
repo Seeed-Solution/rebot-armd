@@ -1138,6 +1138,9 @@ pub struct ActivateConfig {
     /// after rename and before activation: owner enters `Reconciling` without mutating state.
     pub revoked_off_thread: Option<&'static str>,
     pub candidate: ConfigCandidate,
+    /// Confirmed durability achieved before activation (`Durability::Durable` after parent-dir
+    /// fsync succeeds, or `Durability::Volatile` when no disk file was written).
+    pub durability: Durability,
     pub expected_workspace_revision: Option<u64>,
     pub expected_poses_revision: Option<u64>,
 }
@@ -1807,6 +1810,7 @@ fn install_activate_config(
         auth,
         revoked_off_thread,
         candidate,
+        durability,
         expected_workspace_revision,
         expected_poses_revision,
     } = req;
@@ -2011,6 +2015,10 @@ fn install_activate_config(
         ConfigCandidate::Calibration(cand) => {
             apply_calibration_candidate_in_place(core, cand, true, retired);
         }
+    }
+
+    if durability == Durability::Durable {
+        let _ = core.core.config_mut().confirm_durable(&reservation);
     }
 
     match ConfigAuthority::activate(core, reservation) {
@@ -2686,17 +2694,31 @@ impl Drop for ReservationGuard {
     }
 }
 
+/// One atomic file mutation inside a [`ConfigWriteOp::Batch`].
+pub enum FileWriteOp {
+    /// Stage `PendingWrite` off-thread (write + file `sync_all()`), then atomically rename into place.
+    Replace(PendingWrite),
+    /// Remove an existing config file on disk if present.
+    Remove(PathBuf),
+}
+
 /// Filesystem operation performed during a unified [`run_config_commit_detailed`] transaction.
+///
+/// Every variant runs its staging, file fsync, rename/unlink, and parent-directory fsync
+/// strictly AFTER [`ReserveConfig`] and strictly BEFORE [`ActivateConfig`].
 pub enum ConfigWriteOp {
     /// Memory-only (volatile) configuration update with no disk file.
     Volatile,
-    /// Stage `PendingWrite` off-thread, then atomically rename into place after reservation + live authority check.
+    /// Stage `PendingWrite` off-thread after reservation, then rename + dir-sync before activation.
     StageAndReplace(PendingWrite),
-    /// Use an already-staged [`StagedWrite`] (staged off-thread before building the proposal).
-    Staged(StagedWrite),
     /// Remove an existing config file on disk (e.g., calibration restore to uncalibrated backup),
     /// using the exact same cancellation-safe reservation + pre-unlink live authority + reconciliation protocol.
     Remove(PathBuf),
+    /// Multi-file atomic commit executed under one reservation (e.g., joint zero writing
+    /// `calibration.json` + stale `poses.json` + stale `gripper_calib.json` together).
+    /// All replacements are staged + file-fsynced before any rename; the first entry is renamed
+    /// first so a failure on it leaves all other files untouched and releases cleanly.
+    Batch(Vec<FileWriteOp>),
 }
 
 impl From<Option<PendingWrite>> for ConfigWriteOp {
@@ -2829,41 +2851,11 @@ where
         expected_poses_revision,
     } = plan;
 
-    enum PreparedDiskOp {
-        Volatile,
-        Staged(StagedWrite),
-        Remove(PathBuf),
-    }
-
-    let disk_op = match write {
-        ConfigWriteOp::Volatile => PreparedDiskOp::Volatile,
-        ConfigWriteOp::Staged(s) => PreparedDiskOp::Staged(s),
-        ConfigWriteOp::Remove(path) => PreparedDiskOp::Remove(path),
-        ConfigWriteOp::StageAndReplace(w) => {
-            let s = tokio::task::spawn_blocking(move || StagedWrite::stage(w.path, w.text))
-                .await
-                .map_err(|e| {
-                    ConfigCommitError::pre_publish(ArmError::Rejected {
-                        status: 500,
-                        code: "PERSIST_FAILED".into(),
-                        message: format!("Failed to persist configuration: {e}"),
-                    })
-                })?
-                .map_err(|e| {
-                    ConfigCommitError::pre_publish(ArmError::Rejected {
-                        status: 500,
-                        code: "PERSIST_FAILED".into(),
-                        message: format!("Failed to persist configuration: {e}"),
-                    })
-                })?;
-            PreparedDiskOp::Staged(s)
-        }
-    };
-
-    let abort_disk = |op: PreparedDiskOp| {
-        if let PreparedDiskOp::Staged(s) = op {
-            s.abort();
-        }
+    let file_ops: Vec<FileWriteOp> = match write {
+        ConfigWriteOp::Volatile => Vec::new(),
+        ConfigWriteOp::StageAndReplace(w) => vec![FileWriteOp::Replace(w)],
+        ConfigWriteOp::Remove(path) => vec![FileWriteOp::Remove(path)],
+        ConfigWriteOp::Batch(ops) => ops,
     };
 
     if let Some(h) = hooks.before_reserve.as_ref() {
@@ -2871,10 +2863,10 @@ where
     }
 
     if let Err((_, err)) = auth_check() {
-        abort_disk(disk_op);
         return Err(ConfigCommitError::pre_publish(err));
     }
 
+    // 1. Reserve domain on the single live owner BEFORE any staging or file mutation.
     let reservation = match sup
         .dispatch_config_request_owned_reliable(ConfigRequest::Reserve(ReserveConfig {
             proposal,
@@ -2887,15 +2879,12 @@ where
     {
         Ok(ConfigReply::Reserved(Ok(r))) => r,
         Ok(ConfigReply::Reserved(Err(e))) => {
-            abort_disk(disk_op);
             return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
         }
         Err(e) => {
-            abort_disk(disk_op);
             return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
         }
         _ => {
-            abort_disk(disk_op);
             return Err(ConfigCommitError::pre_publish(ArmError::Internal(
                 "unexpected config reserve reply".into(),
             )));
@@ -2906,114 +2895,257 @@ where
     let domain = reservation.domain();
     let mut guard = ReservationGuard::new(Arc::clone(&sup), reservation);
 
+    let release_pre_rename = |sup: Arc<ArmSupervisor>, mut guard: ReservationGuard| async move {
+        if let Some(r) = guard.take() {
+            let _ = sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                    reservation: r,
+                }))
+                .await;
+        }
+    };
+
+    // 2. Off-thread stage + file fsync (`StagedWrite::stage`) strictly AFTER reserve.
+    enum StagedOp {
+        Replace(StagedWrite),
+        Remove(PathBuf),
+    }
+    let abort_staged = |ops: Vec<StagedOp>| {
+        for op in ops {
+            if let StagedOp::Replace(s) = op {
+                s.abort();
+            }
+        }
+    };
+
+    let staged_ops: Vec<StagedOp> = if file_ops.is_empty() {
+        Vec::new()
+    } else {
+        let stage_res = tokio::task::spawn_blocking(move || -> Result<Vec<StagedOp>, String> {
+            let mut out = Vec::with_capacity(file_ops.len());
+            for op in file_ops {
+                match op {
+                    FileWriteOp::Replace(w) => match StagedWrite::stage(w.path, w.text) {
+                        Ok(s) => out.push(StagedOp::Replace(s)),
+                        Err(e) => {
+                            for prev in out {
+                                if let StagedOp::Replace(s) = prev {
+                                    s.abort();
+                                }
+                            }
+                            return Err(e);
+                        }
+                    },
+                    FileWriteOp::Remove(p) => out.push(StagedOp::Remove(p)),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("stage task failed: {e}"))
+        .and_then(|r| r);
+
+        match stage_res {
+            Ok(ops) => ops,
+            Err(e) => {
+                release_pre_rename(Arc::clone(&sup), guard).await;
+                tracing::warn!("State file not staged: {e}");
+                return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
+                    status: 500,
+                    code: "PERSIST_FAILED".into(),
+                    message: format!("Failed to persist configuration: {e}"),
+                }));
+            }
+        }
+    };
+
     if let Some(h) = hooks.after_reserve_before_rename.as_ref() {
         h();
     }
 
-    let (dir_sync, post_rename_revoked, disk_published) = match disk_op {
-        PreparedDiskOp::Staged(staged) => {
-            if let Err((_, err)) = auth_check() {
-                staged.abort();
+    // 3. Fresh pre-rename authority recheck (off-thread auth + live owner VerifyAuthority).
+    if let Err((_, err)) = auth_check() {
+        abort_staged(staged_ops);
+        release_pre_rename(Arc::clone(&sup), guard).await;
+        return Err(ConfigCommitError::pre_publish(err));
+    }
+    match sup
+        .dispatch_config_request_owned_reliable(ConfigRequest::VerifyAuthority {
+            domain,
+            grant,
+            proposal,
+            auth,
+            expected_workspace_revision,
+            expected_poses_revision,
+        })
+        .await
+    {
+        Ok(ConfigReply::AuthorityVerified(Ok(()))) => {}
+        Ok(ConfigReply::AuthorityVerified(Err(e))) => {
+            abort_staged(staged_ops);
+            release_pre_rename(Arc::clone(&sup), guard).await;
+            return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
+        }
+        Err(e) => {
+            abort_staged(staged_ops);
+            release_pre_rename(Arc::clone(&sup), guard).await;
+            return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
+        }
+        _ => {
+            abort_staged(staged_ops);
+            release_pre_rename(Arc::clone(&sup), guard).await;
+            return Err(ConfigCommitError::pre_publish(ArmError::Internal(
+                "unexpected authority verification reply".into(),
+            )));
+        }
+    }
+
+    // 4. Rename / unlink files off-thread, then record Persisted(DurableUnconfirmed),
+    //    then parent-directory fsync strictly BEFORE activation.
+    let mut disk_published = false;
+    if !staged_ops.is_empty() {
+        let sim_rename_fail = hooks
+            .fail_rename_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+
+        let rename_outcome = tokio::task::spawn_blocking(move || {
+            let mut dir_syncs: Vec<crate::persist::PendingDirSync> = Vec::with_capacity(staged_ops.len());
+            let mut published_any = false;
+            let mut iter = staged_ops.into_iter();
+            while let Some(op) = iter.next() {
+                match op {
+                    StagedOp::Replace(staged) => {
+                        if sim_rename_fail {
+                            staged.abort();
+                            for rem in iter {
+                                if let StagedOp::Replace(s) = rem {
+                                    s.abort();
+                                }
+                            }
+                            return (published_any, dir_syncs, Err("simulated rename failure".to_string()));
+                        }
+                        match staged.rename_only() {
+                            Ok(ds) => {
+                                published_any = true;
+                                dir_syncs.push(ds);
+                            }
+                            Err(e) => {
+                                for rem in iter {
+                                    if let StagedOp::Replace(s) = rem {
+                                        s.abort();
+                                    }
+                                }
+                                return (published_any, dir_syncs, Err(e));
+                            }
+                        }
+                    }
+                    StagedOp::Remove(path) => match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            published_any = true;
+                            dir_syncs.push(crate::persist::PendingDirSync::for_path(&path));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            for rem in iter {
+                                if let StagedOp::Replace(s) = rem {
+                                    s.abort();
+                                }
+                            }
+                            return (
+                                published_any,
+                                dir_syncs,
+                                Err(format!("remove {}: {e}", path.display())),
+                            );
+                        }
+                    },
+                }
+            }
+            (published_any, dir_syncs, Ok(()))
+        })
+        .await;
+
+        let (published_any, dir_syncs, rename_res) = match rename_outcome {
+            Ok(tuple) => tuple,
+            Err(e) => {
+                // JoinError after spawn_blocking started: conservatively treat as post-publish
+                // reconciling because a rename may have completed before the panic/abort.
+                guard.mark_renamed();
                 if let Some(r) = guard.take() {
+                    if let Ok(ConfigReply::Persisted(Ok(pr))) = sup
+                        .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
+                            PersistedConfig {
+                                reservation: r,
+                                durability: Durability::DurableUnconfirmed,
+                            },
+                        ))
+                        .await
+                    {
+                        let _ = sup
+                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
+                                ReleaseConfig { reservation: pr },
+                            ))
+                            .await;
+                    } else {
+                        let _ = sup
+                            .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                            .await;
+                    }
+                }
+                return Err(ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
+                    status: 500,
+                    code: "PERSIST_FAILED".into(),
+                    message: format!("Failed to persist configuration: rename task failed: {e}"),
+                }));
+            }
+        };
+
+        if published_any {
+            guard.mark_renamed();
+        }
+
+        if let Err(e) = rename_res {
+            tracing::warn!("State file not published: {e}");
+            if !published_any {
+                release_pre_rename(Arc::clone(&sup), guard).await;
+                return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
+                    status: 500,
+                    code: "PERSIST_FAILED".into(),
+                    message: format!("Failed to persist configuration: {e}"),
+                }));
+            }
+            // At least one file was already renamed/removed before a later file in the batch failed:
+            // disk and live state may diverge -> enter Reconciling and keep motion inhibited.
+            if let Some(r) = guard.take() {
+                if let Ok(ConfigReply::Persisted(Ok(pr))) = sup
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
+                        PersistedConfig {
+                            reservation: r,
+                            durability: Durability::DurableUnconfirmed,
+                        },
+                    ))
+                    .await
+                {
                     let _ = sup
                         .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                            ReleaseConfig { reservation: r },
+                            ReleaseConfig { reservation: pr },
                         ))
                         .await;
-                }
-                return Err(ConfigCommitError::pre_publish(err));
-            }
-
-            // Re-verify live owner authority (lease expiry, epoch, stop_gen, deadline,
-            // closed connection, dependency revisions) right at the rename boundary.
-            match sup
-                .dispatch_config_request_owned_reliable(ConfigRequest::VerifyAuthority {
-                    domain,
-                    grant,
-                    proposal,
-                    auth,
-                    expected_workspace_revision,
-                    expected_poses_revision,
-                })
-                .await
-            {
-                Ok(ConfigReply::AuthorityVerified(Ok(()))) => {}
-                Ok(ConfigReply::AuthorityVerified(Err(e))) => {
-                    staged.abort();
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-                }
-                Err(e) => {
-                    staged.abort();
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-                }
-                _ => {
-                    staged.abort();
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(ArmError::Internal(
-                        "unexpected authority verification reply".into(),
-                    )));
+                } else {
+                    let _ = sup
+                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                        .await;
                 }
             }
+            return Err(ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
+                status: 500,
+                code: "PERSIST_FAILED".into(),
+                message: format!("Failed to persist configuration batch after partial rename: {e}; reconciliation required"),
+            }));
+        }
 
-            let sim_rename_fail = hooks
-                .fail_rename_once
-                .as_ref()
-                .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-            let rename_res: Result<crate::persist::PendingDirSync, String> = if sim_rename_fail {
-                staged.abort();
-                Err("simulated rename failure".into())
-            } else {
-                tokio::task::spawn_blocking(move || staged.rename_only())
-                    .await
-                    .map_err(|e| format!("rename task failed: {e}"))
-                    .and_then(|r| r)
-            };
-            let ds = match rename_res {
-                Ok(ds) => ds,
-                Err(e) => {
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    tracing::warn!("State file not published: {e}");
-                    return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
-                        status: 500,
-                        code: "PERSIST_FAILED".into(),
-                        message: format!("Failed to persist configuration: {e}"),
-                    }));
-                }
-            };
-
-            // File is now renamed into place: any failure below MUST reconcile.
-            guard.mark_renamed();
-
-            if let Some(h) = hooks.after_rename_before_activate.as_ref() {
-                h();
-            }
-
+        if published_any {
+            disk_published = true;
             let sim_persisted_fail = hooks
                 .fail_persisted_once
                 .as_ref()
@@ -3062,180 +3194,88 @@ where
             guard = ReservationGuard::new(Arc::clone(&sup), persisted_r);
             guard.mark_renamed();
 
-            let revoked_code = match auth_check() {
-                Ok(()) => None,
-                Err((code, _)) => Some(code),
-            };
-            (Some(ds), revoked_code, true)
-        }
-        PreparedDiskOp::Remove(path) => {
-            if let Err((_, err)) = auth_check() {
-                if let Some(r) = guard.take() {
-                    let _ = sup
-                        .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                            ReleaseConfig { reservation: r },
-                        ))
-                        .await;
-                }
-                return Err(ConfigCommitError::pre_publish(err));
-            }
-
-            // Re-verify live owner authority right before unlinking the file.
-            match sup
-                .dispatch_config_request_owned_reliable(ConfigRequest::VerifyAuthority {
-                    domain,
-                    grant,
-                    proposal,
-                    auth,
-                    expected_workspace_revision,
-                    expected_poses_revision,
+            // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
+            //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
+            //    motion inhibited until reconciliation succeeds.
+            let sim_dir_sync_fail = hooks
+                .fail_dir_sync_once
+                .as_ref()
+                .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+            let dir_sync_res: Result<(), String> = if sim_dir_sync_fail {
+                Err("simulated parent dir fsync failure".into())
+            } else {
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let mut synced_dirs: Vec<PathBuf> = Vec::new();
+                    for ds in dir_syncs {
+                        let dir = ds.dir().to_path_buf();
+                        if synced_dirs.iter().any(|d| d == &dir) {
+                            continue;
+                        }
+                        match ds.sync_parent_dir() {
+                            PublishOutcome::Published => synced_dirs.push(dir),
+                            PublishOutcome::PublishedDurabilityUnconfirmed(w) => return Err(w),
+                        }
+                    }
+                    Ok(())
                 })
                 .await
-            {
-                Ok(ConfigReply::AuthorityVerified(Ok(()))) => {}
-                Ok(ConfigReply::AuthorityVerified(Err(e))) => {
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-                }
-                Err(e) => {
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-                }
-                _ => {
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(ArmError::Internal(
-                        "unexpected authority verification reply".into(),
-                    )));
-                }
-            }
-
-            let path_rm = path.clone();
-            let remove_res = tokio::task::spawn_blocking(move || match std::fs::remove_file(&path_rm) {
-                Ok(()) => Ok(true),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(e) => Err(format!("remove {}: {e}", path_rm.display())),
-            })
-            .await
-            .map_err(|e| format!("remove task failed: {e}"))
-            .and_then(|r| r);
-
-            let removed = match remove_res {
-                Ok(r) => r,
-                Err(e) => {
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
-                        status: 500,
-                        code: "PERSIST_FAILED".into(),
-                        message: format!("Failed to remove configuration file: {e}"),
-                    }));
-                }
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
             };
 
-            if removed {
-                guard.mark_renamed();
-                if let Some(h) = hooks.after_rename_before_activate.as_ref() {
-                    h();
+            if let Err(warn) = dir_sync_res {
+                let r = guard.take().expect("persisted reservation held by guard");
+                let rel = sup
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                        reservation: r,
+                    }))
+                    .await;
+                if !matches!(rel, Ok(ConfigReply::Released(Released::Reconciling))) {
+                    let _ = sup
+                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                        .await;
                 }
-                let r = guard.take().expect("reservation held by guard");
-                let persisted_r = match sup
-                    .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
-                        PersistedConfig {
-                            reservation: r,
-                            durability: Durability::DurableUnconfirmed,
-                        },
-                    ))
-                    .await
-                {
-                    Ok(ConfigReply::Persisted(Ok(r))) => r,
-                    Ok(ConfigReply::Persisted(Err(e))) => {
-                        return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
-                    }
-                    Err(e) => {
-                        return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
-                    }
-                    _ => {
-                        return Err(ConfigCommitError::post_publish_reconciling(
-                            ArmError::Internal("unexpected config persisted reply".into()),
-                        ));
-                    }
-                };
-                guard = ReservationGuard::new(Arc::clone(&sup), persisted_r);
-                guard.mark_renamed();
-                let revoked_code = match auth_check() {
-                    Ok(()) => None,
-                    Err((code, _)) => Some(code),
-                };
-                (
-                    Some(crate::persist::PendingDirSync::for_path(&path)),
-                    revoked_code,
-                    true,
-                )
-            } else {
-                let revoked_code = match auth_check() {
-                    Ok(()) => None,
-                    Err((_, err)) => {
-                        if let Some(r) = guard.take() {
-                            let _ = sup
-                                .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                    ReleaseConfig { reservation: r },
-                                ))
-                                .await;
-                        }
-                        return Err(ConfigCommitError::pre_publish(err));
-                    }
-                };
-                (None, revoked_code, false)
+                tracing::error!(
+                    "Parent directory fsync failed after rename ({warn}); keeping old policy active and entering Reconciling"
+                );
+                return Err(ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
+                    status: 500,
+                    code: "PERSIST_FAILED".into(),
+                    message: format!("Parent directory fsync failed after rename ({warn}); reconciliation required"),
+                }));
+            }
+
+            if let Some(h) = hooks.after_rename_before_activate.as_ref() {
+                h();
             }
         }
-        PreparedDiskOp::Volatile => {
-            let revoked_code = match auth_check() {
-                Ok(()) => None,
-                Err((_, err)) => {
-                    if let Some(r) = guard.take() {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: r },
-                            ))
-                            .await;
-                    }
-                    return Err(ConfigCommitError::pre_publish(err));
-                }
-            };
-            (None, revoked_code, false)
+    }
+
+    // 6. Fresh post-dir-sync authority recheck + atomic activation/publication.
+    let post_rename_revoked = match auth_check() {
+        Ok(()) => None,
+        Err((code, err)) => {
+            if !disk_published {
+                release_pre_rename(Arc::clone(&sup), guard).await;
+                return Err(ConfigCommitError::pre_publish(err));
+            }
+            Some(code)
         }
     };
 
     let reservation = guard.take().expect("reservation held by guard");
+    let durability = if disk_published {
+        Durability::Durable
+    } else {
+        Durability::Volatile
+    };
     let activated = match sup
         .dispatch_config_request_owned_reliable(ConfigRequest::Activate(ActivateConfig {
             reservation,
             auth,
             revoked_off_thread: post_rename_revoked,
             candidate,
+            durability,
             expected_workspace_revision,
             expected_poses_revision,
         }))
@@ -3244,12 +3284,8 @@ where
         Ok(ConfigReply::Activated(Ok(act))) => act,
         Ok(ConfigReply::Activated(Err(e))) => {
             let is_reconciling = matches!(e, ConfigError::Reconciling(_)) || disk_published;
-            if let Some(ref ds) = dir_sync {
-                tracing::error!(
-                    "{} written but not activated: {:?}; reconciling",
-                    ds.target().display(),
-                    e
-                );
+            if disk_published {
+                tracing::error!("Configuration written on disk but not activated: {:?}; reconciling", e);
             }
             return Err(ConfigCommitError {
                 error: e.to_arm_error(),
@@ -3279,40 +3315,12 @@ where
         update_published(cfg, activated);
     });
 
-    if let Some(ds) = dir_sync {
-        let sim_dir_sync_fail = hooks
-            .fail_dir_sync_once
-            .as_ref()
-            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-        let outcome = if sim_dir_sync_fail {
-            PublishOutcome::PublishedDurabilityUnconfirmed("simulated parent dir fsync failure".into())
-        } else {
-            tokio::task::spawn_blocking(move || ds.sync_parent_dir())
-                .await
-                .unwrap_or_else(|e| PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()))
-        };
-        match outcome {
-            PublishOutcome::Published => Ok(ConfigCommitOutcome {
-                activated,
-                persisted: true,
-                durability_confirmed: true,
-                durability_warning: None,
-            }),
-            PublishOutcome::PublishedDurabilityUnconfirmed(w) => Ok(ConfigCommitOutcome {
-                activated,
-                persisted: true,
-                durability_confirmed: false,
-                durability_warning: Some(w),
-            }),
-        }
-    } else {
-        Ok(ConfigCommitOutcome {
-            activated,
-            persisted: false,
-            durability_confirmed: true,
-            durability_warning: None,
-        })
-    }
+    Ok(ConfigCommitOutcome {
+        activated,
+        persisted: disk_published,
+        durability_confirmed: true,
+        durability_warning: None,
+    })
 }
 
 /// Pre-builds an `EvalBufs` off-thread for a given `(ArmModel, WorkspacePolicy, CameraMount, tcp_offset)`.

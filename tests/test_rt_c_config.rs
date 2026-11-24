@@ -1269,13 +1269,14 @@ async fn run_rename_and_dir_sync_failures_test(owner: RtOwner) {
         assert_eq!(rig.hold_state(ConfigDomain::Keepout).await, None);
     }
 
-    // 3b. Dir-sync failure -> active at rev 3, durability_confirmed=false, durability_warning=Some, NOT Reconciling.
+    // 3b. Dir-sync failure -> MUST NOT activate: keeps OLD policy active (rev 2, "old"),
+    //     enters HoldState::Reconciling, keeps motion inhibited, refuses follow-up writes CONFIG_BUSY.
     rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
         fail_dir_sync_once: Some(Arc::new(AtomicBool::new(true))),
         ..Default::default()
     });
     let (plan_ds, pb, rb, eb) = keepout_plan(&rig, &pub1, vec![make_box("ds_warn", 0.3)], 2, 10, rig.lease_gen, true);
-    let out = run_config_commit(
+    let ds_err = armd::rt_core::requests::config::run_config_commit_detailed(
         &rig.sup,
         plan_ds,
         || Ok(()),
@@ -1290,36 +1291,42 @@ async fn run_rename_and_dir_sync_failures_test(owner: RtOwner) {
         },
     )
     .await
-    .expect("dir-sync failure still activates live state");
+    .expect_err("dir-sync failure must not activate and must enter Reconciling");
     rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
-    assert_eq!(out.activated.revision, 3);
-    assert!(out.persisted);
-    assert!(!out.durability_confirmed);
-    assert!(out.durability_warning.as_deref().is_some_and(|w| w.contains("fsync")));
+    assert!(ds_err.disk_published, "rename occurred before dir-sync failure");
+    assert!(ds_err.reconciling, "dir-sync failure must enter Reconciling");
+    assert!(
+        matches!(&ds_err.error, ArmError::Rejected { status: 500, code, .. } if code == "PERSIST_FAILED"),
+        "{ds_err:?}"
+    );
+    // File on disk was renamed, while live policy and PublishedConfig stay at the OLD revision (2, "old").
     assert_eq!(disk_keepout_names(&rig.keepout_path), ["ds_warn"]);
-    assert!(!rig.is_config_inhibited().await);
+    let pub_after_ds = rig.sup.published_config().await.unwrap();
+    assert_eq!(pub_after_ds.keepout.revision, 2, "old policy revision must stay active");
+    let live_names: Vec<String> = pub_after_ds
+        .keepout
+        .runtime_boxes
+        .iter()
+        .map(|b| b.name.clone())
+        .collect();
+    assert_eq!(live_names, ["old"], "old keepout policy must remain active after dir-sync failure");
+    assert!(rig.is_config_inhibited().await, "motion must remain inhibited until reconciliation");
+    assert_eq!(
+        rig.hold_state(ConfigDomain::Keepout).await,
+        Some(HoldState::Reconciling),
+        "dir-sync failure must transition hold to Reconciling"
+    );
 
-    // Next write succeeds cleanly at rev 3 -> 4.
-    let pub2 = rig.sup.published_config().await.unwrap();
-    let (plan_next, pb, rb, eb) = keepout_plan(&rig, &pub2, vec![make_box("after_ds", 0.3)], 3, 10, rig.lease_gen, true);
-    let out2 = run_config_commit(
-        &rig.sup,
-        plan_next,
-        || Ok(()),
-        |cfg, act| {
-            if let Some(ws) = cfg.config.workspace.as_mut() {
-                ws.keepout_boxes = eb;
-            }
-            cfg.keepout.profile = Some(pb);
-            cfg.keepout.runtime_boxes = rb;
-            cfg.keepout.runtime = true;
-            cfg.keepout.revision = act.revision;
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(out2.activated.revision, 4);
-    assert!(out2.durability_confirmed);
+    // Follow-up write while Reconciling is refused CONFIG_BUSY.
+    let (plan_busy, ..) = keepout_plan(&rig, &pub_after_ds, vec![make_box("while_reconciling", 0.3)], 2, 10, rig.lease_gen, true);
+    let busy_err = run_config_commit(&rig.sup, plan_busy, || Ok(()), |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&busy_err, ArmError::Rejected { status: 409, code, .. } if code == "CONFIG_BUSY"),
+        "expected CONFIG_BUSY while Reconciling after dir-sync failure, got {busy_err:?}"
+    );
+    assert!(rig.is_config_inhibited().await);
 
     rig.assert_executor_zero_alloc("rename failure and dir-sync failure");
     drop(_detached_guard);

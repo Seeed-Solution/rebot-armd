@@ -1064,39 +1064,18 @@ async fn commit_prepared_config(
     }
 
     let ingress_deadline = std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
-    let write_op = match write {
-        Some(w) => {
-            let staged_res = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(w.path, w.text))
-                .await
-                .map_err(|e| format!("Failed to persist configuration: {e}"))
-                .and_then(|r| r.map_err(|e| format!("Failed to persist configuration: {e}")));
-            match staged_res {
-                Ok(s) => crate::rt_core::requests::config::ConfigWriteOp::Staged(s),
-                Err(msg) => {
-                    let cur_epoch = current_epoch_off_lock(&sup, epoch);
-                    return off_lock_command_reject(&request_id, cur_epoch, ApiError::persist_failed(msg));
-                }
-            }
-        }
-        None => crate::rt_core::requests::config::ConfigWriteOp::Volatile,
-    };
-
-    // Non-motion WS config writes are not cancelled by `/api/v1/motion/stop` during disk staging,
-    // while preserving the original ingress deadline, epoch, lease_generation, and connection_id;
-    // any stop/lease/epoch/deadline change from Reserve onward is enforced by the live owner.
-    let mut commit_stamp = stamp;
-    commit_stamp.stop_gen = sup.current_stop_gen();
+    let write_op = crate::rt_core::requests::config::ConfigWriteOp::from(write);
     let proposal = crate::rt_core::requests::config::build_config_proposal_with_deadline(
         &sup,
         domain,
         base_revision,
-        commit_stamp,
+        stamp,
         generation,
         ws_rev,
         ingress_deadline,
     );
     let auth = ConfigAuthContext {
-        admission: commit_stamp,
+        admission: stamp,
         lease_holder: Some((HolderLabel::new(&conn), generation)),
     };
 

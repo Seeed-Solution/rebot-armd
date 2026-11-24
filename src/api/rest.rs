@@ -921,23 +921,12 @@ pub async fn post_tool_commissioning_confirm(
     let write = prepared.write.take();
     let confirmed_at_pub = prepared.confirmed_at.clone();
     let ingress_deadline = std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
-    let write_op = match write {
-        Some(w) => {
-            let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(w.path, w.text))
-                .await
-                .map_err(|e| ApiError::persist_failed(format!("Failed to persist configuration: {e}")))?
-                .map_err(|e| ApiError::persist_failed(format!("Failed to persist configuration: {e}")))?;
-            crate::rt_core::requests::config::ConfigWriteOp::Staged(staged)
-        }
-        None => crate::rt_core::requests::config::ConfigWriteOp::Volatile,
-    };
-    let mut commit_admission = admission;
-    commit_admission.stop_gen = supervisor.current_stop_gen();
+    let write_op = crate::rt_core::requests::config::ConfigWriteOp::from(write);
     let proposal = crate::rt_core::requests::config::build_config_proposal_with_deadline(
         &supervisor,
         ConfigDomain::ToolCommissioning,
         prepared.base_revision,
-        commit_admission,
+        admission,
         0,
         pub_cfg.workspace_revision,
         ingress_deadline,
@@ -945,7 +934,7 @@ pub async fn post_tool_commissioning_confirm(
     let plan = ConfigCommitPlan {
         proposal,
         auth: ConfigAuthContext {
-            admission: commit_admission,
+            admission,
             lease_holder: None,
         },
         precheck: ReservePrecheck::ToolCommissioning {

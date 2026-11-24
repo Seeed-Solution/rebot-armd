@@ -1980,14 +1980,7 @@ impl Txn<'_> {
 
         let text = after.calibration.as_ref().map(|c| serde_json::to_string_pretty(c).unwrap_or_default());
         let write_op = match text {
-            Some(t) => {
-                let path = self.deps.path.clone();
-                let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(path, t))
-                    .await
-                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file stage failed: {e}")).at("calibration_file"))?
-                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"))?;
-                ConfigWriteOp::Staged(staged)
-            }
+            Some(t) => ConfigWriteOp::StageAndReplace(crate::persist::PendingWrite::new(self.deps.path.clone(), t)),
             None => ConfigWriteOp::Remove(self.deps.path.clone()),
         };
 
@@ -2089,11 +2082,7 @@ impl Txn<'_> {
         let write_op = match self.deps.setup_path.clone() {
             Some(path) => {
                 let text = crate::grasp::serialize_setup_for_tool(&setup, &pub_cfg.config.active_tool);
-                let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(path, text))
-                    .await
-                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("grasp setup stage failed: {e}")).at("grasp_setup"))?
-                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("grasp setup: {e}")).at("grasp_setup"))?;
-                ConfigWriteOp::Staged(staged)
+                ConfigWriteOp::StageAndReplace(crate::persist::PendingWrite::new(path, text))
             }
             None => ConfigWriteOp::Volatile,
         };
