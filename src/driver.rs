@@ -1957,6 +1957,9 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             .filter_map(|(i, _)| self.servo_ids.get(i).copied())
             .collect();
 
+        // Supervisor callers (`clear_fault_for_epoch` / `clear_fault_executor_bounded`) gate this
+        // `TORQUE_ENABLE = 0` reset through `may_disable_torque_while_stopped` (Rule A′) in
+        // addition to the SO-ARM101 resting-support policy whenever any faulted servo is an arm joint.
         let mut write_err = None;
         for &id in &faulted_ids {
             let pkt = feetech::build_set_torque(id, false);

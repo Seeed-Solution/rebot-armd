@@ -1139,6 +1139,13 @@ pub enum ClearFaultError {
     EStopActive,
     EpochMismatch { expected: u64, received: u64 },
     FeedbackUnavailable,
+    TorqueOffWouldDrop {
+        joint_index: Option<usize>,
+        position: Option<f32>,
+        rest: Option<f32>,
+        tolerance: Option<f32>,
+        reason: &'static str,
+    },
     Rejected(ClearFaultRefusal),
 }
 
@@ -1149,6 +1156,12 @@ impl std::fmt::Display for ClearFaultError {
             Self::EpochMismatch { expected, received } =>
                 write!(f, "Epoch mismatch: expected {expected}, received {received}. Command invalidated by generation change"),
             Self::FeedbackUnavailable => f.write_str("Actuator feedback unavailable: physical angles not received from hardware"),
+            Self::TorqueOffWouldDrop { joint_index: Some(i), position: Some(p), rest: Some(r), tolerance: Some(t), .. } =>
+                write!(f, "Torque stays on: J{} is at {p:.3} rad (rest {r:.3} rad, tolerance {t:.3} rad); the arm would drop. Clear the fault and park, or cut power.", i + 1),
+            Self::TorqueOffWouldDrop { reason: "no_resting_pose", .. } =>
+                f.write_str("Torque stays on: profile has no calibrated resting_pose configured; the arm would drop. Clear the fault and park, or cut power."),
+            Self::TorqueOffWouldDrop { .. } =>
+                f.write_str("Torque stays on: feedback is missing or older than 100 ms, so the rest pose cannot be verified; the arm would drop. Wait for fresh feedback, clear the fault and park, or cut power."),
             Self::Rejected(r) => write!(f, "Cannot clear fault while hardware fault condition persists: {r}"),
         }
     }
@@ -1170,6 +1183,16 @@ impl From<ClearFaultError> for SafetyError {
             ClearFaultError::EStopActive => SafetyError::EStopActive,
             ClearFaultError::EpochMismatch { expected, received } => SafetyError::EpochMismatch { expected, received },
             ClearFaultError::FeedbackUnavailable => SafetyError::FeedbackUnavailable,
+            ClearFaultError::TorqueOffWouldDrop { joint_index, position, rest, reason, .. } => {
+                let message = e.to_string();
+                SafetyError::TorqueOffWouldDrop {
+                    joint: joint_index.map(|i| format!("joint_{}", i + 1)),
+                    position,
+                    rest,
+                    reason: Some(reason.to_string()),
+                    message,
+                }
+            }
             ClearFaultError::Rejected(r) => r.into_safety_error(),
         }
     }

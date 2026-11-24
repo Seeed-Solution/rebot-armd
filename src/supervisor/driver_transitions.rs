@@ -2312,8 +2312,15 @@ impl SupervisorInner {
                 Err(ClearRefusal::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(ClearRefusal::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so transmitting the motor fault reset is now permitted; re-evaluate
-                    // `clear_check` immediately after the reset.
+                    // so transmitting the motor fault reset is now permitted — except when the
+                    // reset itself sends torque-off to an arm joint (e.g. Feetech STS3215), which
+                    // must ALSO pass the single Rule A′ rest-pose decision function.
+                    if needs_resting_check {
+                        if let Err(r) = self.may_disable_torque_while_stopped() {
+                            self.last_stopped_torque_off_refusal = Some(r);
+                            return Err(r.into_safety_error(&self.config.joint_names));
+                        }
+                    }
                     let reset_res = {
                         let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
                         drv.clear_fault()
@@ -2768,7 +2775,15 @@ impl SupervisorInner {
                 Err(R::EStopActive) => return Err(apply_estop_refusal(self)),
                 Err(R::HardwareResetRequired) => {
                     // Explicitly modeled exception: every OTHER recorded kind's condition passed,
-                    // so a budgeted motor reset is now permitted; re-evaluate `clear_check` after.
+                    // so a budgeted motor reset is now permitted — except when the reset itself
+                    // disables an arm joint (e.g. Feetech STS3215), which must ALSO pass the
+                    // single Rule A′ rest-pose decision function (zero alloc).
+                    if needs_resting_check {
+                        if let Err(refusal) = self.may_disable_torque_while_stopped() {
+                            self.last_stopped_torque_off_refusal = Some(refusal);
+                            return Err(refusal.into_clear_fault_error());
+                        }
+                    }
                     let now = Instant::now();
                     if now >= deadline {
                         return Err(E::Rejected(R::BudgetExpired));

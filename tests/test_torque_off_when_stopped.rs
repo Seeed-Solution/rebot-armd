@@ -1317,3 +1317,130 @@ fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_c
         Err(SafetyError::TorqueOffWouldDrop { joint: Some(ref j), .. }) if j == "joint_2"
     ));
 }
+
+#[test]
+fn feetech_fault_reset_routes_through_rest_pose_decision_on_both_owners() {
+    use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+    use armd::model::{JointLimit, JointState, RestingPosePolicy};
+    use std::sync::atomic::AtomicUsize;
+
+    struct ResetDisablesArmDriver {
+        pos: f32,
+        reset_calls: Arc<AtomicUsize>,
+    }
+    impl ArmDriver for ResetDisablesArmDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn has_any_joint_enabled(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(5))] }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            out.clear();
+            out.push(Some(Duration::from_millis(5)));
+        }
+        fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+            dof == 1 && max_age >= Duration::from_millis(5)
+        }
+        fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+            if joints != [0] || out.is_empty() || max_age < Duration::from_millis(5) {
+                return false;
+            }
+            out[0] = self.pos;
+            true
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState { position: self.pos, velocity: 0.0, torque: 0.0, temperature: 30.0 }])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn clear_fault_disables_joints(&self) -> Vec<usize> { vec![0] }
+        fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool { arm_dof > 0 }
+        fn has_hardware_fault(&self) -> bool { true }
+        fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
+            Err(ArmDriverError::HardwareFault("overload".into()))
+        }
+        fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
+            self.reset_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
+            self.reset_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let make_cfg = || {
+        let mut cfg = ArmConfig::default();
+        cfg.dof = 1;
+        cfg.joint_names = vec!["joint_1".into()];
+        cfg.limits = vec![JointLimit::new("joint_1", -3.0, 3.0, 2.0, 5.0)];
+        cfg.home_positions = vec![0.0];
+        cfg.rest_pose_tolerance_rad = 0.05;
+        // Resting-support policy tolerance (0.08 rad) is wider than rest_pose_tolerance_rad (0.05 rad),
+        // so at 0.07 rad the resting-support check passes while Rule A' MUST refuse with TORQUE_OFF_WOULD_DROP.
+        cfg.resting_pose = Some(RestingPosePolicy {
+            positions: Some(vec![0.0]),
+            position_tolerances: vec![0.08],
+            max_total_deviation: 0.16,
+            max_velocity: 0.05,
+            joint_max_velocities: vec![],
+            support_torque_limits: vec![],
+            support_load_limits: vec![],
+            feedback_max_age_ms: 100,
+        });
+        cfg
+    };
+
+    // 1. Legacy clear_fault at 0.07 rad -> refused by Rule A' with TORQUE_OFF_WOULD_DROP, 0 resets sent.
+    let reset_legacy = Arc::new(AtomicUsize::new(0));
+    let mut inner_l = SupervisorInner::new(make_cfg())
+        .with_driver(Box::new(ResetDisablesArmDriver { pos: 0.07, reset_calls: Arc::clone(&reset_legacy) }));
+    inner_l.is_torqued = true;
+    inner_l.measured_positions = vec![0.07];
+    inner_l.measured_velocities = vec![0.0];
+    inner_l.temperatures = vec![30.0];
+    inner_l.safety.trigger_fault_coded(FaultCode::HardwareFault, FaultReason::Other("overload".into()));
+    let err_l = inner_l.clear_fault().unwrap_err();
+    assert!(
+        matches!(err_l, SafetyError::TorqueOffWouldDrop { joint: Some(ref j), .. } if j == "joint_1"),
+        "expected TORQUE_OFF_WOULD_DROP on legacy Feetech reset at 0.07 rad, got {err_l:?}"
+    );
+    assert_eq!(reset_legacy.load(Ordering::SeqCst), 0, "no hardware reset/torque-off may be sent");
+
+    // 2. RT executor clear_fault_executor at 0.07 rad -> refused by Rule A' with TORQUE_OFF_WOULD_DROP, 0 resets sent.
+    let reset_exec = Arc::new(AtomicUsize::new(0));
+    let mut inner_e = SupervisorInner::new(make_cfg())
+        .with_driver(Box::new(ResetDisablesArmDriver { pos: 0.07, reset_calls: Arc::clone(&reset_exec) }));
+    inner_e.is_torqued = true;
+    inner_e.measured_positions = vec![0.07];
+    inner_e.measured_velocities = vec![0.0];
+    inner_e.temperatures = vec![30.0];
+    inner_e.safety.trigger_fault_coded(FaultCode::HardwareFault, FaultReason::Other("overload".into()));
+    let err_e = inner_e.clear_fault_executor(Instant::now() + Duration::from_secs(1)).unwrap_err();
+    assert!(
+        matches!(err_e, SafetyError::TorqueOffWouldDrop { joint: Some(ref j), .. } if j == "joint_1"),
+        "expected TORQUE_OFF_WOULD_DROP on executor Feetech reset at 0.07 rad, got {err_e:?}"
+    );
+    assert_eq!(reset_exec.load(Ordering::SeqCst), 0, "no hardware reset/torque-off may be sent");
+
+    // 3. At 0.02 rad (within 0.05 rad rest tolerance) -> Rule A' allows the reset on both owners.
+    let reset_ok = Arc::new(AtomicUsize::new(0));
+    let mut inner_ok = SupervisorInner::new(make_cfg())
+        .with_driver(Box::new(ResetDisablesArmDriver { pos: 0.02, reset_calls: Arc::clone(&reset_ok) }));
+    inner_ok.is_torqued = true;
+    inner_ok.measured_positions = vec![0.02];
+    inner_ok.measured_velocities = vec![0.0];
+    inner_ok.temperatures = vec![30.0];
+    inner_ok.safety.trigger_fault_coded(FaultCode::HardwareFault, FaultReason::Other("overload".into()));
+    let _ = inner_ok.clear_fault(); // sends reset, asks for fresh post-reset feedback
+    assert_eq!(reset_ok.load(Ordering::SeqCst), 1, "reset must be sent when within rest_pose_tolerance_rad");
+}

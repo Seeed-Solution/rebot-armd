@@ -164,6 +164,17 @@ impl ArmDriver for RestingSupportDriver {
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         self.dof == dof && self.age.is_some_and(|a| a <= max_age)
     }
+    fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+        if joints.is_empty() || out.len() < joints.len() || !self.age.is_some_and(|a| a <= max_age) {
+            return false;
+        }
+        for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+            let Some(&p) = self.positions.get(i) else { return false; };
+            if !p.is_finite() { return false; }
+            *slot = p;
+        }
+        true
+    }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
         out.clear(); let ms = self.age.map(|a| a.as_millis() as u64); for _ in 0..self.dof { out.push(ms); }
     }

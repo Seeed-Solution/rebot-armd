@@ -50,6 +50,35 @@ impl StoppedTorqueOffRefusal {
         }
     }
 
+    /// Zero-allocation conversion into [`crate::safety::ClearFaultError::TorqueOffWouldDrop`]
+    /// for RT executor clear paths whose hardware reset transmits torque-off.
+    pub const fn into_clear_fault_error(self) -> crate::safety::ClearFaultError {
+        let reason = self.reason_code();
+        match self {
+            Self::NoRestingPoseConfigured | Self::StaleOrMissingFeedback => {
+                crate::safety::ClearFaultError::TorqueOffWouldDrop {
+                    joint_index: None,
+                    position: None,
+                    rest: None,
+                    tolerance: None,
+                    reason,
+                }
+            }
+            Self::JointOutsideRest {
+                joint_index,
+                position,
+                rest,
+                tolerance,
+            } => crate::safety::ClearFaultError::TorqueOffWouldDrop {
+                joint_index: Some(joint_index),
+                position: Some(position),
+                rest: Some(rest),
+                tolerance: Some(tolerance),
+                reason,
+            },
+        }
+    }
+
     /// Convert into the protocol-facing [`SafetyError::TorqueOffWouldDrop`] naming the first
     /// offending joint, its position, its rest value, and warning that the arm would drop.
     pub fn into_safety_error(self, joint_names: &[String]) -> SafetyError {
