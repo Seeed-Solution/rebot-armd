@@ -2454,6 +2454,7 @@ fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() 
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.rt_executor_owned = true;
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.prewarm_rt_buffers();
 
         let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
@@ -3522,6 +3523,196 @@ async fn m1_disconnect_fences_lease_first_both_owners_and_transfer_lock_over_500
         };
         assert!(g2 > g1);
         let _ = sup.disconnect_ws_connection(conn2).await;
+        handle.stop_and_join();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m2_raw_broker_rejects_unregistered_client_ids_and_binds_client_to_lease_holder() {
+    use armd::rt_core::ops::Primitive;
+    use armd::rt_core::requests::actions::{ActionSubmit, BeginMacroSpec, MacroKind};
+
+    // (a) Deterministic raw Broker + ReleaseFixture: unregistered non-zero IDs are rejected even
+    //     with `lease_enabled = false` (no `require_registered = false` bypass), and when
+    //     `lease_enabled = true`, raw broker descriptors MUST belong to a registered connection
+    //     AND match the current lease holder (`active_lease_conn_id`), not only `lease_generation`.
+    {
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        });
+        inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new(
+            inner,
+            BootId(61),
+            Capacities { commands: 8, plans: 2, replies: 16 },
+        );
+        let a0 = fx.core.authority(&fx.ctx(fx.now()));
+        let dl = fx.now() + Duration::from_secs(5);
+
+        // Even with lease_enabled = false, unregistered non-zero ClientId(777) MUST be refused.
+        b.submit(ClientId(777), 1, a0, dl, Submit::Immediate(ImmediateOp::TorqueOn))
+            .unwrap();
+        assert_eq!(fx.step().command.unwrap().1, Err("DISCONNECTED"));
+        assert!(!fx.core.is_torqued);
+
+        // Registered ClientId(1) succeeds.
+        b.submit(ClientId(1), 1, a0, dl, Submit::Immediate(ImmediateOp::TorqueOn))
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert!(fx.core.is_torqued);
+    }
+
+    // (b) Live RT executor raw `handle.broker()` attack surface:
+    //     c1 (id=10) holds lease g1; c2 (id=11) is a registered live non-holder; id=999 is
+    //     unregistered; id=0 is zero sentinel.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        }));
+        let handle = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+
+        let c1 = ConnectionHandle::from_ws_id(10).unwrap();
+        let c2 = ConnectionHandle::from_ws_id(11).unwrap();
+        sup.register_ws_connection(c1.id()).await.unwrap();
+        sup.register_ws_connection(c2.id()).await.unwrap();
+        let g1 = match sup.acquire_lease_ws(c1, "m2_holder", 1).await.unwrap() {
+            LeaseOutcome::Granted { generation, .. } => generation,
+            other => panic!("expected lease grant for c1, got {other:?}"),
+        };
+
+        let snap = sup.fresh_snapshot(None).await.unwrap();
+        let valid_auth = Authority {
+            lease_generation: g1,
+            epoch: snap.owner.epoch,
+            stop_generation: snap.owner.stop_generation,
+            config_revision: snap.owner.config_revision,
+            parent_generation: 0,
+        };
+        let dl = Instant::now() + Duration::from_secs(5);
+        let submit_raw = |client: ClientId, seq: u64, what: Submit<'_, armd::rt_core::ops::PlanSlot>| {
+            let req = handle
+                .broker()
+                .lock()
+                .unwrap()
+                .submit(client, seq, valid_auth, dl, what)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut got = None;
+                handle.broker().lock().unwrap().poll(|_, r| {
+                    if r.request() == req {
+                        got = Some(r);
+                    }
+                    true
+                });
+                if let Some(r) = got {
+                    return r;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for raw broker reply");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        // 1. Unregistered ClientId(999) with valid lease_generation g1 MUST fail DISCONNECTED across
+        //    Heartbeat, TorqueOn, TorqueOff, Install, and Action(BeginMacro).
+        assert!(matches!(
+            submit_raw(ClientId(999), 1, Submit::Immediate(ImmediateOp::Heartbeat)),
+            Reply::Refused { code: "DISCONNECTED", .. }
+        ));
+        assert!(matches!(
+            submit_raw(ClientId(999), 2, Submit::Immediate(ImmediateOp::TorqueOn)),
+            Reply::Refused { code: "DISCONNECTED", .. }
+        ));
+        assert!(matches!(
+            submit_raw(ClientId(999), 3, Submit::Immediate(ImmediateOp::TorqueOff)),
+            Reply::Refused { code: "DISCONNECTED", .. }
+        ));
+        let q = [0.0f32; 7];
+        let mut q2 = q;
+        q2[0] = 0.05;
+        let prim = Primitive::joint_quintic(&q, &q2, 0.5).unwrap();
+        assert!(matches!(
+            submit_raw(ClientId(999), 4, Submit::Install(&|s| s.set(prim))),
+            Reply::Refused { code: "DISCONNECTED", .. }
+        ));
+        let macro_spec = BeginMacroSpec {
+            kind: MacroKind::Grasp,
+            prepared_boot: handle.boot(),
+            admission_request_id: 77_001,
+            check_start: false,
+            dof: 7,
+            start: [0.0; armd::rt_core::mailbox::MAX_DOF],
+            check_workspace_revision: false,
+            calibration_revision: None,
+            poses_revision: None,
+            sequences_revision: None,
+            grasp_setup_revision: None,
+            power_budget_revision: None,
+            macro_deadline: None,
+            timeout_code: armd::safety::BoundedText::new("MACRO_TIMEOUT"),
+            orientation_levelled: false,
+            task: armd::model::HolderLabel::new(""),
+            tag: armd::model::HolderLabel::new(""),
+        };
+        assert!(matches!(
+            submit_raw(ClientId(999), 5, Submit::Action(ActionSubmit::BeginMacro(macro_spec))),
+            Reply::Refused { code: "DISCONNECTED", .. }
+        ));
+
+        // 2. Zero ClientId(0) with valid lease_generation g1 MUST fail DISCONNECTED.
+        assert!(matches!(
+            submit_raw(ClientId(0), 1, Submit::Immediate(ImmediateOp::TorqueOn)),
+            Reply::Refused { code: "DISCONNECTED", .. }
+        ));
+
+        // 3. Registered NON-HOLDER ClientId(c2) presenting holder c1's valid generation g1 MUST
+        //    fail LEASE_LOST across Heartbeat, TorqueOn, TorqueOff, Install, and Action!
+        assert!(matches!(
+            submit_raw(ClientId(c2.id()), 1, Submit::Immediate(ImmediateOp::Heartbeat)),
+            Reply::Refused { code: "LEASE_LOST", .. }
+        ));
+        assert!(matches!(
+            submit_raw(ClientId(c2.id()), 2, Submit::Immediate(ImmediateOp::TorqueOn)),
+            Reply::Refused { code: "LEASE_LOST", .. }
+        ));
+        assert!(matches!(
+            submit_raw(ClientId(c2.id()), 3, Submit::Immediate(ImmediateOp::TorqueOff)),
+            Reply::Refused { code: "LEASE_LOST", .. }
+        ));
+        assert!(matches!(
+            submit_raw(ClientId(c2.id()), 4, Submit::Install(&|s| s.set(prim))),
+            Reply::Refused { code: "LEASE_LOST", .. }
+        ));
+        let macro_spec2 = BeginMacroSpec {
+            admission_request_id: 77_002,
+            ..macro_spec
+        };
+        assert!(matches!(
+            submit_raw(ClientId(c2.id()), 5, Submit::Action(ActionSubmit::BeginMacro(macro_spec2))),
+            Reply::Refused { code: "LEASE_LOST", .. }
+        ));
+        assert!(!sup.fresh_snapshot(None).await.unwrap().owner.is_torqued);
+
+        // 4. Registered HOLDER ClientId(c1) with generation g1 commits cleanly!
+        assert!(matches!(
+            submit_raw(ClientId(c1.id()), 1, Submit::Immediate(ImmediateOp::Heartbeat)),
+            Reply::Ack { .. }
+        ));
+        assert!(matches!(
+            submit_raw(ClientId(c1.id()), 2, Submit::Immediate(ImmediateOp::TorqueOn)),
+            Reply::Ack { .. }
+        ));
+        assert!(sup.fresh_snapshot(None).await.unwrap().owner.is_torqued);
+
+        let _ = sup.disconnect_ws_connection(c1).await;
+        let _ = sup.disconnect_ws_connection(c2).await;
         handle.stop_and_join();
     }
 }

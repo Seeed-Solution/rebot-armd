@@ -1727,7 +1727,7 @@ impl BrokerDispatcher {
         if st.exited.load(Ordering::Acquire) {
             return Err(BrokerDispatchError::Stopped);
         }
-        if client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0) {
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
             return Err(BrokerDispatchError::Admit(
                 super::broker::AdmitError::Disconnected,
             ));
@@ -1767,7 +1767,7 @@ impl BrokerDispatcher {
         if st.exited.load(Ordering::Acquire) {
             return Err(BrokerDispatchError::Stopped);
         }
-        if client.0 != 0 && !self.conn_lifecycle.is_slot_open(client.0) {
+        if client.0 == 0 || !self.conn_lifecycle.is_slot_open(client.0) {
             return Err(BrokerDispatchError::Admit(
                 super::broker::AdmitError::Disconnected,
             ));
@@ -2498,6 +2498,9 @@ impl RtExecutorHandle {
         ),
         super::broker::AdmitError,
     > {
+        if client.0 != 0 && !self.shared.conn_lifecycle_client.is_slot_open(client.0) {
+            return Err(super::broker::AdmitError::Disconnected);
+        }
         let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
         broker.reclaim_plans();
         let req_id = broker.submit(

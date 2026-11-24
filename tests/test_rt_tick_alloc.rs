@@ -764,7 +764,9 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
     let stale_boot = BootId::fresh();
     assert_ne!(boot, stale_boot);
 
-    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(supervisor(false), boot, Capacities::default());
+    let mut inner = supervisor(false);
+    inner.register_live_connection(1).unwrap();
+    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(inner, boot, Capacities::default());
     let now = fx.now();
     let deadline = now + Duration::from_secs(30);
     let auth = fx.core.authority(&fx.ctx(now));
@@ -1144,6 +1146,7 @@ fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_all
     warm(&mut inner, 4);
 
     let boot = BootId::fresh();
+    inner.register_live_connection(1).unwrap();
     let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(inner, boot, Capacities::default());
     for _ in 0..4 { fx.step(); }
     let _ = fx.core.core.hub().latest();
@@ -1581,6 +1584,7 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
 
         let mut inner = supervisor(false);
         inner.rt_executor_owned = true;
+        inner.register_live_connection(1).unwrap();
         inner.commanded_positions[g_idx] = -2.0;
         inner.measured_positions[g_idx] = -2.0;
         inner.target_positions[g_idx] = -2.0;

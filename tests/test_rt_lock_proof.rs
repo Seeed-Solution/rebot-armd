@@ -416,6 +416,7 @@ fn control_thread_marked_from_entry_to_exit_independent_of_release_guard() {
             let drv = LifecycleAuditDriver { dof: 7, marks: Arc::clone(&marks) };
             let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
             sup.set_lease_enabled(false).await;
+            sup.register_ws_connection(1).await.unwrap();
             let handle = sup
                 .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
                 .await
@@ -818,6 +819,7 @@ fn production_executor_mock_owner_zero_attempts_while_legacy_writer_held() {
 
             let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
             sup.set_lease_enabled(false).await;
+            sup.register_ws_connection(1).await.unwrap();
             sup.enable_torque(sup.capture_admission_stamp()).await.expect("enable torque on mock arm");
 
             // Lock-free executor-side trigger inside `before_publish`: accumulates `dt`-clamped
@@ -1105,6 +1107,7 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
 
             let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
             sup.set_lease_enabled(false).await;
+            sup.register_ws_connection(1).await.unwrap();
             let handle = sup
                 .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
                 .await
@@ -1276,6 +1279,7 @@ fn production_executor_mock_positive_control_counts_and_catches_try_read_on_armd
 
             let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
             sup.set_lease_enabled(false).await;
+            sup.register_ws_connection(1).await.unwrap();
             sup.enable_torque(sup.capture_admission_stamp()).await.expect("enable torque on mock arm");
 
             let inner_lock = Arc::clone(sup.inner());

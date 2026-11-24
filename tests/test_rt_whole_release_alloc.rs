@@ -484,6 +484,7 @@ async fn positive_controls_detect_exact_ops_in_release_tail_saturated_diag_and_w
     let (drv, _) = WakeDriver::new(7, Duration::from_millis(14), Some(clock.clone()));
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
 
     let rel_probe: Arc<Mutex<Option<TailAllocProbe>>> = Arc::new(Mutex::new(None));
     let wake_probe: Arc<Mutex<Option<TailAllocProbe>>> = Arc::new(Mutex::new(None));
@@ -684,6 +685,7 @@ async fn stalled_consumers_normal_refused_commits_urgent_stop_terminal_retiremen
     // Prepare a valid Cartesian path off-thread BEFORE transferring ownership.
     let (cart_slot, start_pos, init_epoch) = {
         let mut inner = sup.inner().write().await;
+        inner.register_live_connection(1).unwrap();
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
         armd::SupervisorInner::enable_torque(admitted).unwrap();
@@ -1205,6 +1207,7 @@ async fn b3_blocked_torque_transition_failure_zero_alloc() {
     let (drv, fail_next) = WakeDriver::new(7, Duration::from_millis(4), Some(clock.clone()));
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
     let period_ns = 10_000_000u64;
     let handle = sup
         .start_executor_with_hooks(

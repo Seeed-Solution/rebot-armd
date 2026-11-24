@@ -63,6 +63,7 @@ fn sim_inner() -> SupervisorInner {
     for _ in 0..5 {
         inner.tick(DT);
     }
+    inner.register_live_connection(1).unwrap();
     inner
 }
 
@@ -104,6 +105,7 @@ fn fixture_driven() -> (Fx, Broker<PlanSlot>, VirtualClock, TestArm) {
     for _ in 0..5 {
         inner.tick(DT);
     }
+    inner.register_live_connection(1).unwrap();
     let (fx, broker, _tw, _stop) = ReleaseFixture::new_with_clock(
         inner,
         BOOT,
@@ -490,6 +492,8 @@ fn a6_disconnect_before_dequeue_before_commit_and_after_ack() {
     let slot = prep.to_plan_slot(None).unwrap();
 
     // Case 1: disconnect AFTER submit BEFORE dequeue -> refused LEASE_LOST via ClosedBitset, 0 motion.
+    fx.core.register_live_connection(11).unwrap();
+    fx.core.register_live_connection(12).unwrap();
     let c1 = ClientId(11);
     let r1 = submit_slot_prepared(
         &mut b,
@@ -1033,6 +1037,7 @@ fn a7_macro_refused_replacement_leaves_parent_and_child_intact() {
     let _ = drain_all(&mut b);
 
     // Submit a REFUSED replacement (wrong boot) while parent + child are running!
+    fx.core.register_live_connection(2).unwrap();
     let bad_begin = BeginMacroSpec::new(MacroKind::Grasp, BootId(999));
     let mut rep_auth = auth(&fx);
     rep_auth.parent_generation = 0;
@@ -1228,6 +1233,7 @@ async fn a7_dual_owner_macro_ctx_runs_end_to_end_on_live_rt_executor_zero_lock()
         .await
         .unwrap();
     assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+    sup.register_ws_connection(5).await.unwrap();
 
     // Wait for first published snapshot with non-zero boot.
     let mut pub_snap = None;
@@ -1679,6 +1685,7 @@ fn review_b2_forced_finish_and_timeout_under_rejected_bus_holds_jaw_and_refuses_
     });
     inner.lease_enabled = false;
     inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.register_live_connection(1).unwrap();
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
@@ -1690,6 +1697,8 @@ fn review_b2_forced_finish_and_timeout_under_rejected_bus_holds_jaw_and_refuses_
     for _ in 0..3 {
         inner.tick(DT);
     }
+    inner.register_live_connection(1).unwrap();
+    inner.register_live_connection(2).unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
         inner,
         BOOT,
@@ -1937,6 +1946,7 @@ async fn review_b3_live_gripper_zero_check_refreshes_prep_env_for_subsequent_act
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
         .await
         .unwrap();
+    sup.register_ws_connection(1).await.unwrap();
 
     // Wait for zero_check(store_offset=true) to complete and armd-persist to activate + refresh prep_env!
     let wait_dl = Instant::now() + Duration::from_secs(5);
@@ -2141,6 +2151,8 @@ fn review_m1_m2_m3_deadline_precedence_parent_authority_and_single_use_admission
 
     // --- Major 2: Two-client parent authority with leases disabled ---
     assert!(!fx.core.lease_enabled);
+    fx.core.register_live_connection(11).unwrap();
+    fx.core.register_live_connection(22).unwrap();
     let r_b2 = b
         .submit(
             ClientId(11),
@@ -2377,6 +2389,7 @@ fn review_m8_m9_mixed_legacy_child_refused_and_gripper_to_jog_replacement_order(
     });
     inner.lease_enabled = false;
     inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.register_live_connection(1).unwrap();
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
@@ -2534,6 +2547,8 @@ async fn review_m10_reply_router_interleaved_external_and_backpressure() {
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
         .await
         .unwrap();
+    sup.register_ws_connection(99).await.unwrap();
+    sup.register_ws_connection(7).await.unwrap();
     for _ in 0..100 {
         if sup.hub().latest().is_some_and(|s| !s.rt.owner.boot.is_zero()) {
             break;
@@ -2843,6 +2858,9 @@ async fn review_m11_m12_m13_m14_production_adapters_detached_shell_and_same_side
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
         .await
         .unwrap();
+    for id in 31..=36 {
+        sup.register_ws_connection(id).await.unwrap();
+    }
     assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
     // Verify legacy shell rejects lock-path admission (`OWNER_TRANSFERRED`).
     assert!(
@@ -3144,6 +3162,7 @@ async fn r2_m1_executor_macro_refused_503_without_reply_sink_and_commits_with_ho
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
         .await
         .unwrap();
+    sup.register_ws_connection(41).await.unwrap();
     for _ in 0..100 {
         if sup.hub().latest().is_some_and(|s| !s.rt.owner.boot.is_zero()) {
             break;
@@ -3398,6 +3417,7 @@ fn r2_m3_macro_parent_deadline_stops_output_pre_tx_with_no_advance() {
     for _ in 0..3 {
         core.tick(DT);
     }
+    core.register_live_connection(1).unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
         core,
         BOOT,
@@ -3598,6 +3618,8 @@ async fn r2_m6_multiview_measurement_published_before_terminal_on_both_owners() 
             ))
             .await
             .unwrap();
+        sup.register_ws_connection(88).await.unwrap();
+        sup.register_ws_connection(89).await.unwrap();
         let sink_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sink_fired_c = Arc::clone(&sink_fired);
         handle.attach_external_reply_sink(Arc::new(move |_cid, reply| {
@@ -3872,6 +3894,7 @@ async fn r3_m4_replay_pose_change_during_planning_refused_never_installs_unswept
             ))
             .await
             .unwrap();
+        sup.register_ws_connection(91).await.unwrap();
         handle.attach_external_reply_sink(Arc::new(|_cid, _reply| {
             armd::rt_core::broker::DeliveryDecision::Delivered
         }));
@@ -4164,6 +4187,7 @@ fn driven_inner(drv: RecordingHoldDriver) -> SupervisorInner {
     for _ in 0..3 {
         inner.tick(DT);
     }
+    inner.register_live_connection(1).unwrap();
     inner
 }
 
@@ -4665,6 +4689,7 @@ async fn r4_m3_single_effective_cutoff_blocks_tx_critical_section_on_both_owners
             inner.tick(DT);
         }
         assert!(inner.safety.state().is_operational());
+        inner.register_live_connection(1).unwrap();
         bus.clear_log();
         (inner, bus)
     };

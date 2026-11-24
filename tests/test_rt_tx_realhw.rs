@@ -79,6 +79,7 @@ impl DualRig {
 
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.tick(DT);
         let stamp = inner.current_admission_stamp();
         let admitted = inner.check_admission(stamp).unwrap();
@@ -2452,6 +2453,7 @@ impl DualRig {
 
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.lease_enabled = false;
+        inner.register_live_connection(1).unwrap();
         inner.tick(DT);
         {
             let stamp = inner.current_admission_stamp();
@@ -6731,6 +6733,7 @@ fn dual_owner_torque_on_first_0x307_is_zero_vel_hold_at_measured_position() {
                 }
                 Owner::Executor => {
                     inner.rt_executor_owned = true;
+                    inner.register_live_connection(1).unwrap();
                     let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
                         inner,
                         BootId(89),

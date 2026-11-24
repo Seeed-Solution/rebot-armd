@@ -509,6 +509,7 @@ async fn single_bus_writer_no_tokio_entry_and_handoff_gates() {
     let (drv, enforce, threads, tokio_entered, missing_guard, writes, reads) = ThreadAuditDriver::new(7);
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
 
     enforce.store(true, Ordering::Release);
     let handle = sup
@@ -883,6 +884,7 @@ fn exact_release_order_and_unconditional_checkpoints() {
         pending: None,
     }));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
 
     let (mut engine, broker, mut tw, stop) =
@@ -1020,6 +1022,7 @@ fn exact_release_order_and_unconditional_checkpoints() {
                 pending: None,
             }));
             i.lease_enabled = false;
+            i.register_live_connection(1).unwrap();
             i.tick(0.02);
             i
         },
@@ -1134,6 +1137,7 @@ fn single_budgeted_rx_pass_and_zero_rx_torque_begin_and_unsupported_serial() {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
         .with_driver(Box::new(drv));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
 
     // (a) Queue 100 feedback frames -> Step 2 poll caps at 64 frames (`budget_exhausted == true`),
@@ -1346,6 +1350,7 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
     let drv = drv.with_clock(clock.clone());
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
+    sup.register_ws_connection(1).await.unwrap();
     let delay = Arc::new(Mutex::new(None));
     let hooks = PersistTestHooks {
         release_delay_once: Some(delay.clone()),
@@ -1624,6 +1629,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
     let drv_exec = SimArmDriver::connect(&sim_exec.addr, 7).unwrap();
     let sup_exec = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_exec)));
     sup_exec.set_lease_enabled(false).await;
+    sup_exec.register_ws_connection(1).await.unwrap();
     let h_sim = sup_exec
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
         .await
@@ -1673,6 +1679,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
     let cfg = ArmConfig { lease_timeout_ms: 80, ..ArmConfig::rebot_dm() };
     let sup_dm = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(dm)));
     sup_dm.set_lease_enabled(false).await;
+    sup_dm.register_ws_connection(1).await.unwrap();
     let h_dm = sup_dm
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
         .await
@@ -2396,6 +2403,7 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     drv_a.check_mapping_ranges();
     let mut inner_a = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_a));
     inner_a.lease_enabled = false;
+    inner_a.register_live_connection(1).unwrap();
     inner_a.rt_executor_owned = true;
     inner_a.tick(0.02);
 
@@ -2446,6 +2454,7 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     drv_b.check_mapping_ranges();
     let mut inner_b = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_b));
     inner_b.lease_enabled = false;
+    inner_b.register_live_connection(1).unwrap();
     inner_b.rt_executor_owned = true;
     inner_b.tick(0.02);
 
@@ -2495,6 +2504,7 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     });
     let mut inner_c2 = SupervisorInner::new(ArmConfig::rebot_dm());
     inner_c2.lease_enabled = false;
+    inner_c2.register_live_connection(1).unwrap();
     inner_c2.rt_executor_owned = true;
     let mut bus_c2 = CountingBus::new(raw_bus_c2.clone(), Some(clock.clone()));
     bus_c2.estop_on_tx = Some((inner_c2.requested_estop_count.clone(), 3));
@@ -2545,6 +2555,7 @@ fn rt_torque_paths_refuse_blocking_immediate_and_use_budgeted_disable_cleanup() 
 
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.rt_executor_owned = true;
     inner.tick(0.02);
 
@@ -2822,6 +2833,7 @@ fn damiao_mid_retry_and_mode_restore_estop_and_legacy_gravity_comp_exit() {
     });
     let mut inner_r = SupervisorInner::new(ArmConfig::rebot_dm());
     inner_r.lease_enabled = false;
+    inner_r.register_live_connection(1).unwrap();
     inner_r.rt_executor_owned = true;
     let mut bus_r = CountingBus::new(raw_bus_r.clone(), Some(clock.clone()));
     bus_r.estop_on_tx = Some((inner_r.requested_estop_count.clone(), 9)); // 7 initial + 2 retries
@@ -3349,6 +3361,7 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
     drv_wb.check_mapping_ranges();
     let sup_wb = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_wb)));
     sup_wb.set_lease_enabled(false).await;
+    sup_wb.register_ws_connection(1).await.unwrap();
     let h_wb = sup_wb
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(8)))
         .await
@@ -3372,6 +3385,7 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
 fn superseded_install_delivers_terminal_and_ack_strictly_after_publish() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(0.02);
 
@@ -3524,6 +3538,7 @@ async fn zero_alloc_steady_state_wakes_positive_control_commit_shutdown_and_stop
         let drv = SimArmDriver::connect(&sim.addr, 7).unwrap().with_load_only_feedback(load_only);
         let sup_sim = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup_sim.set_lease_enabled(false).await;
+        sup_sim.register_ws_connection(1).await.unwrap();
         let h_sim = sup_sim.start_executor(cfg.clone()).await.unwrap();
         wait_until_async(Duration::from_secs(2), || {
             h_sim.observation().is_ok_and(|o| (o.positions[0] - 0.05).abs() < 1e-3)
@@ -3562,6 +3577,7 @@ async fn zero_alloc_steady_state_wakes_positive_control_commit_shutdown_and_stop
     drv_dm.check_mapping_ranges();
     let sup_dm = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_dm)));
     sup_dm.set_lease_enabled(false).await;
+    sup_dm.register_ws_connection(1).await.unwrap();
     let h_dm = sup_dm.start_executor(cfg.clone()).await.unwrap();
     let req_dm_on = submit_broker_transition(&h_dm, 1, TransitionOp::TorqueOn);
     assert_eq!(wait_broker_terminal(&h_dm, req_dm_on, Duration::from_secs(2)), Outcome::Completed);
@@ -3582,6 +3598,7 @@ async fn zero_alloc_steady_state_wakes_positive_control_commit_shutdown_and_stop
     let (drv_w, ..) = ThreadAuditDriver::new(7);
     let sup_w = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_w)));
     sup_w.set_lease_enabled(false).await;
+    sup_w.register_ws_connection(1).await.unwrap();
     let inject_flag = Arc::new(AtomicBool::new(false));
     let hooks_w = PersistTestHooks {
         inject_wake_alloc_once: Some(inject_flag.clone()),

@@ -316,6 +316,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
         let s = inner.current_admission_stamp();
         let a = inner.check_admission(s).unwrap();
         SupervisorInner::enable_torque(a).unwrap();
+        inner.register_live_connection(1).unwrap();
         inner.tick(0.02);
     }
 
@@ -654,6 +655,7 @@ async fn b2_pr_p_gripper_refusals_missing_torque_feedback_and_zero_quantized_spe
         let s = inner.current_admission_stamp();
         let a = inner.check_admission(s).unwrap();
         SupervisorInner::enable_torque(a).unwrap();
+        inner.register_live_connection(1).unwrap();
         inner.tick(0.02);
     }
     let period_ns = 20_000_000u64;
@@ -750,6 +752,7 @@ async fn b2_pr_p_gripper_refusals_missing_torque_feedback_and_zero_quantized_spe
         let s = inner.current_admission_stamp();
         let a = inner.check_admission(s).unwrap();
         SupervisorInner::enable_torque(a).unwrap();
+        inner.register_live_connection(1).unwrap();
         inner.tick(0.02);
     }
     let mut ec2 = ExecutorConfig::for_tests(Duration::from_nanos(period_ns));
@@ -851,6 +854,7 @@ fn b2_r2_m4_mit_motion_blocker_is_zero_alloc() {
         SupervisorInner::enable_torque(a).unwrap();
     }
     inner.config.joint_tracking = Some(jt);
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
 
     // Run on a dedicated thread so `TimedAlloc` counts ONLY our checked calls, exercising
@@ -1007,6 +1011,7 @@ async fn b2_r2_m4_prepared_replay_approach_planned_off_thread_is_zero_alloc_on_r
         let s = inner.current_admission_stamp();
         let a = inner.check_admission(s).unwrap();
         SupervisorInner::enable_torque(a).unwrap();
+        inner.register_live_connection(1).unwrap();
         inner.tick(0.02);
         let env = armd::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner);
         sup.hub().update_prep_env(Arc::new(env));
@@ -1307,6 +1312,7 @@ fn b2_r2_m5_1000_refused_rt_gripper_installs_preserve_learning_pool_and_are_zero
         SupervisorInner::enable_torque(a).unwrap();
     }
     inner.tick(0.02);
+    inner.register_live_connection(1).unwrap();
     // Prewarm RT buffers before constructing `ReleaseFixture` (which also prewarms `move_samples_spares`).
     inner.prewarm_rt_buffers();
 

@@ -2042,9 +2042,7 @@ impl SupervisorInner {
             return Some("EPOCH_MISMATCH");
         }
         if auth.owner_conn_id != 0
-            && self
-                .check_client_connection_live(auth.owner_conn_id, false)
-                .is_err()
+            && self.check_client_connection_live(auth.owner_conn_id).is_err()
         {
             return Some("DISCONNECTED");
         }
@@ -2056,13 +2054,16 @@ impl SupervisorInner {
             if auth.lease_generation <= fenced_gen {
                 return Some("LEASE_LOST");
             }
-            let lease_matches = self.active_lease.as_ref().is_some_and(|a| {
-                a.generation == auth.lease_generation
-                    && a.generation > fenced_gen
-                    && (self.active_lease_conn_id == 0
-                        || !self.is_connection_closed(self.active_lease_conn_id))
-                    && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
-            });
+            let owner_matches = auth.owner_conn_id == 0
+                || self.active_lease_conn_id == auth.owner_conn_id;
+            let lease_matches = owner_matches
+                && self.active_lease.as_ref().is_some_and(|a| {
+                    a.generation == auth.lease_generation
+                        && a.generation > fenced_gen
+                        && (self.active_lease_conn_id == 0
+                            || !self.is_connection_closed(self.active_lease_conn_id))
+                        && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
+                });
             if !lease_matches {
                 return Some("LEASE_LOST");
             }

@@ -2484,24 +2484,43 @@ impl SupervisorInner {
         self.live_connections.ids[..self.live_connections.len].iter().copied()
     }
 
-    /// Single owner-side connection liveness check for broker commits:
-    /// - `client_id == 0`: non-WS / internal caller -> allowed.
-    /// - `client_id != 0`: always refuses closed IDs (`DISCONNECTED`); when `require_registered`
-    ///   is true (all WS `LeaseRequest` ops), also refuses unknown / unregistered non-zero IDs
-    ///   fail-closed.
-    pub(crate) fn check_client_connection_live(
-        &self,
-        client_id: u64,
-        require_registered: bool,
-    ) -> Result<(), &'static str> {
+    /// Single owner-side connection liveness check (M2):
+    /// - `client_id == 0`: refused (`DISCONNECTED`) whenever leases are enforced; allowed only for
+    ///   non-WS internal/REST paths when `lease_enabled == false`.
+    /// - `client_id != 0`: ALWAYS requires a registered, open (non-closed) connection in
+    ///   `live_connections` (fail-closed `DISCONNECTED`).
+    pub(crate) fn check_client_connection_live(&self, client_id: u64) -> Result<(), &'static str> {
         if client_id == 0 {
+            if self.lease_enabled {
+                return Err("DISCONNECTED");
+            }
             return Ok(());
         }
-        if self.is_connection_closed(client_id) {
+        if self.is_connection_closed(client_id) || !self.live_connections.contains(client_id) {
             return Err("DISCONNECTED");
         }
-        if require_registered && !self.live_connections.contains(client_id) {
-            return Err("DISCONNECTED");
+        Ok(())
+    }
+
+    /// Single owner-side binding of a broker/action descriptor's `ClientId` to the current active
+    /// lease holder (`active_lease_conn_id`), not only `lease_generation` (M2).
+    pub(crate) fn check_descriptor_lease_owner(
+        &self,
+        client_id: u64,
+        lease_generation: u64,
+    ) -> Result<(), &'static str> {
+        if self.lease_enabled {
+            if lease_generation == 0 {
+                return Err("NO_LEASE");
+            }
+            if self.active_lease_conn_id == 0 || self.active_lease_conn_id != client_id {
+                return Err("LEASE_LOST");
+            }
+        } else if lease_generation != 0
+            && self.active_lease_conn_id != 0
+            && self.active_lease_conn_id != client_id
+        {
+            return Err("LEASE_LOST");
         }
         Ok(())
     }

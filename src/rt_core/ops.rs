@@ -845,21 +845,22 @@ impl SupervisorInner {
         })
     }
 
-    /// The stamp checks every commit shares: connection liveness, identity, deadline, current
-    /// authority, and a lease when leases are enforced.
+    /// The stamp checks every commit shares: registered live connection, identity, deadline,
+    /// current authority, and binding `d.stamp.client` to the active lease holder when leases are
+    /// enforced (M2).
     fn check_commit(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
-        self.check_client_connection_live(d.stamp.client.0, false)?;
+        self.check_client_connection_live(d.stamp.client.0)?;
         if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
-        if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        self.check_descriptor_lease_owner(d.stamp.client.0, d.stamp.authority.lease_generation)?;
         Ok(())
     }
 
     /// Stop-direction variant of [`Self::check_commit`]: exempt from `stop_generation` checks
     /// so an authorized Stop never blocks a queued torque disable.
     fn check_commit_stop_direction(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
-        self.check_client_connection_live(d.stamp.client.0, false)?;
+        self.check_client_connection_live(d.stamp.client.0)?;
         if let Some(code) = d.stamp.check_stop_direction(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
-        if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        self.check_descriptor_lease_owner(d.stamp.client.0, d.stamp.authority.lease_generation)?;
         Ok(())
     }
 }

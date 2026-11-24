@@ -539,7 +539,7 @@ pub fn check_torque_owner_preflight(
 ) -> Result<u64, TorquePreflightError> {
     let lease_ok = lease_generation != 0
         && inner
-            .check_client_connection_live(connection.id(), false)
+            .check_client_connection_live(connection.id())
             .is_ok()
         && inner.validate_lease_at(connection.as_str(), lease_generation, now);
     if !lease_ok {
@@ -893,7 +893,7 @@ fn check_lease_clear_fault_owner_preflight(
 ) -> Result<u64, LeaseClearFaultOutcome> {
     let lease_ok = lease_generation != 0
         && inner
-            .check_client_connection_live(connection.id(), false)
+            .check_client_connection_live(connection.id())
             .is_ok()
         && inner.validate_lease_at(connection.as_str(), lease_generation, now);
     if !lease_ok {
@@ -1156,7 +1156,7 @@ fn check_lease_install_authority(
     } else {
         ctx.client.0
     };
-    inner.check_client_connection_live(effective_id, conn.id() != 0)?;
+    inner.check_client_connection_live(effective_id)?;
     if ctx.enforce_single_use {
         inner.consume_single_use_request_id(ctx.request_id)?;
     }
@@ -1474,7 +1474,7 @@ pub fn renew_lease_heartbeat_at(
     if inner.detached {
         return Err("OWNER_TRANSFERRED");
     }
-    inner.check_client_connection_live(client_id, false)?;
+    inner.check_client_connection_live(client_id)?;
     if generation == 0 {
         return Err("NO_LEASE");
     }
@@ -1488,7 +1488,8 @@ pub fn renew_lease_heartbeat_at(
         && active.generation > fenced_gen
         && now.saturating_duration_since(active.acquired_at) < inner.lease_timeout;
     let owner_matches = conn_str.is_none_or(|s| active.client_id == s)
-        && (inner.active_lease_conn_id == 0 || inner.active_lease_conn_id == client_id);
+        && inner.active_lease_conn_id != 0
+        && inner.active_lease_conn_id == client_id;
     if !not_expired || active.generation != generation || !owner_matches {
         return Err("LEASE_LOST");
     }
@@ -1519,7 +1520,7 @@ pub fn install_broker_heartbeat(
     if d.stamp.authority.stop_generation != ctx.stop_generation {
         return Err("STOPPED");
     }
-    inner.check_client_connection_live(d.stamp.client.0, false)?;
+    inner.check_client_connection_live(d.stamp.client.0)?;
     let generation = d.stamp.authority.lease_generation;
     if generation == 0 {
         return Err("NO_LEASE");
@@ -1533,7 +1534,8 @@ pub fn install_broker_heartbeat(
             a.generation == generation
                 && a.generation > fenced_gen
                 && ctx.now.saturating_duration_since(a.acquired_at) < inner.lease_timeout
-                && (inner.active_lease_conn_id == 0 || inner.active_lease_conn_id == d.stamp.client.0)
+                && inner.active_lease_conn_id != 0
+                && inner.active_lease_conn_id == d.stamp.client.0
         });
     if !lease_ok {
         return Err("LEASE_LOST");
@@ -1616,7 +1618,7 @@ pub fn install_legacy_heartbeat(
     }
     // Verify connection is not closed and still owns the active unfenced lease at `now`.
     let lease_valid = inner
-        .check_client_connection_live(connection.id(), false)
+        .check_client_connection_live(connection.id())
         .is_ok()
         && inner.validate_lease_at(connection.as_str(), local_generation, now);
     if !lease_valid {

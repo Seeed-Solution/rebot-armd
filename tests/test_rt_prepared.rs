@@ -22,6 +22,7 @@ type Fx = ReleaseFixture<SupervisorInner>;
 
 fn fixture() -> (Fx, Broker<PlanSlot>) {
     let mut inner = common::sim_at(ArmConfig { collision: None, ..ArmConfig::rebot_dm() }, &INSPECT);
+    inner.register_live_connection(1).unwrap();
     for _ in 0..5 { inner.tick(0.02); }
     let (fx, b, _tw, _stop) = ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 2, replies: 16 });
     (fx, b)
@@ -199,6 +200,7 @@ fn a_prepared_path_or_replay_with_stale_boot_or_overtaken_stop_is_refused() {
     use armd::rt_core::ops::CommitCtx;
 
     let mut inner = common::sim_at(ArmConfig { collision: None, ..ArmConfig::rebot_dm() }, &INSPECT);
+    inner.register_live_connection(1).unwrap();
     for _ in 0..5 { inner.tick(0.02); }
     let live_boot = BootId::fresh();
     let stale_boot = BootId::fresh();

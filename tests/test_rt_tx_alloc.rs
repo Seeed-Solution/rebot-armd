@@ -2093,6 +2093,7 @@ fn rt_r2_stale_j7_refusals_and_r1_epilogue_zero_alloc_and_zero_free() {
 
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
     {
         let stamp = inner.current_admission_stamp();

@@ -795,6 +795,15 @@ pub fn check_action_authority(
         authority: stamp.broker_authority(),
         deadline: stamp.deadline,
     };
+    if stamp.admission.connection_id != 0 {
+        if !inner.is_connection_closed(stamp.admission.connection_id)
+            && !inner.is_connection_live(stamp.admission.connection_id)
+        {
+            return Err(ActionRefusal::new("DISCONNECTED"));
+        }
+    } else if inner.lease_enabled && stamp.admission.lease_gen != 0 {
+        return Err(ActionRefusal::new("DISCONNECTED"));
+    }
     if stamp.admission.estop_epoch != inner.safety.epoch_id()
         && (inner.e_stop_latched.load(Ordering::SeqCst)
             || matches!(inner.safety.state(), SafetyState::EStop))
@@ -807,6 +816,13 @@ pub fn check_action_authority(
     if inner.lease_enabled && stamp.admission.lease_gen == 0 {
         return Err(ActionRefusal::new("NO_LEASE"));
     }
+    if stamp.admission.connection_id != 0 && inner.is_connection_closed(stamp.admission.connection_id)
+    {
+        return Err(ActionRefusal::new("LEASE_LOST"));
+    }
+    inner
+        .check_descriptor_lease_owner(stamp.admission.connection_id, stamp.admission.lease_gen)
+        .map_err(ActionRefusal::new)?;
     if let Some(cal_rev) = stamp.calibration_revision {
         if inner.calibration_revision != cal_rev {
             return Err(ActionRefusal::new("CALIBRATION_CHANGED"));
@@ -842,10 +858,6 @@ pub fn check_action_authority(
     }
     if ctx.require_rt_feedback && !inner.commit_feedback_valid() {
         return Err(ActionRefusal::new("FEEDBACK_STALE"));
-    }
-    if stamp.admission.connection_id != 0 && inner.is_connection_closed(stamp.admission.connection_id)
-    {
-        return Err(ActionRefusal::new("LEASE_LOST"));
     }
     if require_single_use_admission {
         inner
