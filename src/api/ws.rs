@@ -19,6 +19,9 @@ use lease::*;
 mod motion;
 #[allow(unused_imports)]
 use motion::*;
+mod actions;
+#[allow(unused_imports)]
+use actions::*;
 mod policy;
 #[allow(unused_imports)]
 use policy::*;
@@ -388,23 +391,6 @@ fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {
 
 /// Action started by a command: (action id, expected duration in s).
 type Started = Option<(u64, f64)>;
-
-enum ActionStart {
-    Started(u64, f64),
-    Plan(PendingPlan),
-    Macro(PendingMacro),
-    Replay(crate::replay::ReplayInput),
-    DryRunGrasp(Value),
-    Sequence(Box<crate::sequences::RunPlan>),
-    CalibHover(Box<crate::calib_hover::HoverPlan>),
-    /// `gripper_calibrate` (epoch, tag): begun with the supervisor handle at the call site.
-    GripperCalibrate(u64, Option<String>),
-    MeasureMultiview(Box<crate::measure_multiview::Plan>),
-    #[cfg(feature = "policy-runtime")]
-    Policy(Box<PendingPolicyStart>),
-    #[cfg(feature = "policy-runtime")]
-    PolicyStopped(bool),
-}
 
 /// Bounded inbound ordinary message queue capacity per WS connection.
 const ORDINARY_IN_CAPACITY: usize = 64;
@@ -1398,206 +1384,6 @@ async fn deliver_urgent_stop_batch(
     }
 }
 
-// Under the write lock, after lease / epoch / request_id checks.
-#[allow(clippy::too_many_arguments)]
-fn prepare_action(
-    inner: &mut SupervisorInner,
-    stamp: crate::supervisor::AdmissionStamp,
-    path: &str,
-    body: &Value,
-    epoch: u64,
-    request_id: &Value,
-    auth: &crate::auth::OperatorAuth,
-    ws_token: Option<&str>,
-) -> Result<ActionStart, ApiError> {
-    if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
-    let (kind, parsed) = match path {
-        "/api/v1/action/move_to" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_to", crate::motion::parse_move_to(body))
-        }
-        "/api/v1/action/move_relative" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_relative", crate::motion::parse_move_relative(body))
-        }
-        "/api/v1/action/gripper" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            let mut request = crate::motion::parse_gripper(body).map_err(ArmError::from)?;
-            if let Some(scale) = crate::motion::num(body, "speed_scale").map_err(ArmError::from)? {
-                if !(0.05..=1.0).contains(&scale) {
-                    return Err(ArmError::from(crate::motion::MotionError::InvalidCommand(
-                        "speed_scale must be in [0.05, 1.0]".into(),
-                    ))
-                    .into());
-                }
-                if inner.config.active_tool.commissioning_required && scale > 0.2 + 1e-6 {
-                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                        "gripper (speed_scale {scale:.2} > 0.2)"
-                    )))
-                    .into());
-                }
-                if body.get("speed").is_none_or(Value::is_null) {
-                    request.speed = (2.0 * scale).clamp(0.01, 2.0);
-                }
-            }
-            if body.get("baseline").is_some_and(|v| !v.is_null()) {
-                return Err(invalid_command("baseline is not a gripper action field; calibrate with /api/v1/action/gripper_calibrate"));
-            }
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = SupervisorInner::start_gripper(admitted, request, epoch)?;
-            return Ok(ActionStart::Started(id, duration));
-        }
-        "/api/v1/action/gripper_zero_check" => {
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = SupervisorInner::start_gripper_zero_check_with_auth(
-                admitted,
-                body,
-                epoch,
-                Some((auth.clone(), ws_token.map(str::to_string))),
-            )?;
-            return Ok(ActionStart::Started(id, duration));
-        }
-        "/api/v1/action/grasp" => {
-            if body.get("dry_run").and_then(Value::as_bool) == Some(true) {
-                return Ok(ActionStart::DryRunGrasp(body.clone()));
-            }
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?)));
-        }
-        "/api/v1/action/place" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?)));
-        }
-        "/api/v1/action/replay" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let request = crate::replay::parse_replay(body).map_err(ArmError::from)?;
-            return Ok(ActionStart::Replay(inner.replay_input(request, epoch)?));
-        }
-        "/api/v1/action/move_to_pose" => {
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = crate::poses::start_action(admitted, body, epoch)?;
-            return Ok(ActionStart::Started(id, duration));
-        }
-        "/api/v1/action/run_sequence" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?)));
-        }
-        crate::calib_hover::PATH => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?)));
-        }
-        crate::gripper_calib::CALIBRATE_PATH => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let tag = crate::motion::tag(body).map_err(ArmError::from)?;
-            return Ok(ActionStart::GripperCalibrate(epoch, tag));
-        }
-        crate::measure_multiview::PATH => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::MeasureMultiview(Box::new(crate::measure_multiview::prepare(inner, body, epoch)?)));
-        }
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/start" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let request = crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
-            let _ = crate::policy_runtime::compute_policy_deadline(request.max_seconds).map_err(ArmError::from)?;
-            inner.check_policy_start_preconditions_with(
-                request.mode,
-                request.sim_only,
-                request.i_am_at_the_arm,
-                epoch,
-            )?;
-            return Ok(ActionStart::Policy(Box::new(PendingPolicyStart {
-                request,
-                config: inner.config.clone(),
-                epoch,
-                stamp,
-                policy_live_allowed: inner.policy_live_allowed(),
-            })));
-        }
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/stop" => {
-            inner.advance_stop_generation();
-            let stopped = inner.stop_policy_run(None, "STOPPED");
-            return Ok(ActionStart::PolicyStopped(stopped));
-        }
-        _ => return Err(invalid_command("Unknown action")),
-    };
-    let (mut spec, mut speed, tag) = parsed.map_err(ArmError::from)?;
-    let _ = &mut spec;
-    // move_to / move_relative keep their straight line to the goal; `precise: true` (profile
-    // `applies_to` move_to_precise) or `approach: "same_side"` end it with the short segment
-    let precise = crate::motion::flag(body, "precise", false).map_err(ArmError::from)?;
-    let request = crate::backlash::parse_request(body).map_err(ArmError::from)?;
-    let path_mode = crate::motion::parse_path_mode(body).map_err(ArmError::from)?;
-    let same_side = precise || request != crate::backlash::Request::Profile;
-    if path_mode == crate::motion::PathMode::Joint && body.get("speed").is_some_and(|v| !v.is_null()) {
-        return Err(invalid_command("speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)"));
-    }
-    let linear_speed_scale = if path_mode == crate::motion::PathMode::Linear {
-        if let Some(s) = crate::motion::num(body, "speed_scale").map_err(ArmError::from)? {
-            if !(0.05..=1.0).contains(&s) {
-                return Err(invalid_command("speed_scale must be in [0.05, 1.0]"));
-            }
-            if body.get("speed").is_none_or(Value::is_null) {
-                speed.linear = (crate::motion::MAX_LINEAR_MPS * s).min(crate::motion::MAX_LINEAR_MPS);
-                speed.angular = (crate::motion::MAX_ANGULAR_RPS * s).min(crate::motion::MAX_ANGULAR_RPS);
-            }
-            Some(s)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let approach = if same_side && path_mode == crate::motion::PathMode::Linear { inner.approach_plan("move_to_precise", request) } else { Err(None) };
-    let input = inner.plan_input_tcp()?;
-    let (goal, opts) = crate::motion::resolve_goal_opts(&input, &spec);
-    let joint = match path_mode {
-        crate::motion::PathMode::Linear => {
-            if inner.config.active_tool.commissioning_required {
-                let scale_ok = linear_speed_scale.is_none_or(|s| s <= 0.2 + 1e-6);
-                let speed_ok = speed.linear <= 0.2 * crate::motion::MAX_LINEAR_MPS + 1e-6
-                    && speed.angular <= 0.2 * crate::motion::MAX_ANGULAR_RPS + 1e-6;
-                if !scale_ok || !speed_ok {
-                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                        "{kind} (requires speed_scale <= 0.2 or speed <= {:.3} m/s / {:.2} rad/s)",
-                        0.2 * crate::motion::MAX_LINEAR_MPS,
-                        0.2 * crate::motion::MAX_ANGULAR_RPS
-                    )))
-                    .into());
-                }
-            }
-            None
-        }
-        crate::motion::PathMode::Joint => {
-            let speed_scale = crate::poses::speed_scale(body)?;
-            if inner.config.active_tool.commissioning_required && speed_scale > 0.2 + 1e-6 {
-                return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                    "{kind} (speed_scale {speed_scale:.2} > 0.2)"
-                )))
-                .into());
-            }
-            Some(JointGoal {
-                speed_scale,
-                same_side: same_side.then_some(request),
-                snapshot: inner.joint_goal_snapshot(speed_scale),
-            })
-        }
-    };
-    let seeds = crate::motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
-    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach, joint, seeds }))
-}
-
 fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
     let control_mode = if inner.gravity_comp_active() { "gravity_comp" } else { "position" };
     let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":inner.safety.epoch_id(), "safety_state":inner.safety.state(), "is_torqued":inner.is_torqued, "control_mode":control_mode});
@@ -2589,44 +2375,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
                     let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
-                    let owner_transferred = || {
-                        let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
-                        if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                        r
-                    };
-                    let reply = if worker_closing.load(Ordering::SeqCst) {
-                        break;
-                    } else if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
-                        owner_transferred()
-                    } else {
-                        let mut inner = recv_supervisor.inner().write().await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            drop(inner);
-                            break;
-                        } else if inner.detached {
-                            drop(inner);
-                            owner_transferred()
-                        } else {
-                            if let Err(err) = inner.preflight_admission(stamp) {
-                                command_reject(&inner, &request_id, ArmError::from(err).into())
-                            } else {
-                                match joined {
-                                    Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                                    Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
-                                    Ok(Ok(planned)) => {
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| planned.start(admitted, &recv_supervisor, &recv_deps)) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    };
+                    let Some(reply) = actions::complete_macro_check(
+                        request_id,
+                        generation,
+                        stamp,
+                        joined,
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_deps,
+                        &worker_closing,
+                    ).await else { break; };
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                     continue;
                 }
@@ -2648,62 +2407,47 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
             // depth measurement: read-only, no motion, no lease
             if kind == "command" && value.get("path").and_then(Value::as_str) == Some(crate::depth_measure::PATH) {
-                let request_id = value.get("request_id").and_then(Value::as_u64);
-                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-                    let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
-                    continue;
+                if !actions::handle_depth_measure(
+                    value,
+                    &mut last_ordinary_request,
+                    &ws_auth,
+                    &recv_supervisor,
+                    &recv_deps,
+                    &ack_tx,
+                    &worker_tasks,
+                    &worker_writer,
+                ).await {
+                    break;
                 }
-                last_ordinary_request = request_id;
-                if let Some(e) = lease_free_operator_check(&ws_auth, crate::depth_measure::PATH, &value["body"]) {
-                    let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
-                    reply["request_id"] = value["request_id"].clone();
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
-                    continue;
-                }
-                let (sup, source, tx) = (recv_supervisor.clone(), recv_deps.source.clone(), ack_tx.clone());
-                worker_tasks.spawn(async move {
-                    let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
-                    let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
-                });
                 continue;
             }
             // teach commands without a motion lease (episode store; recorder ownership)
             if kind == "command" && crate::teach::is_lease_free(value.get("path").and_then(Value::as_str).unwrap_or("")) {
-                let request_id = value.get("request_id").and_then(Value::as_u64);
-                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-                    let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
-                    continue;
+                if !actions::handle_teach_lease_free(
+                    value,
+                    &mut last_ordinary_request,
+                    &ws_auth,
+                    &recv_supervisor,
+                    &recv_connection,
+                    &recv_client_label,
+                    &ack_tx,
+                    &worker_tasks,
+                    &worker_writer,
+                ).await {
+                    break;
                 }
-                last_ordinary_request = request_id;
-                if let Some(e) = lease_free_operator_check(&ws_auth, value["path"].as_str().unwrap_or(""), &value["body"]) {
-                    let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
-                    reply["request_id"] = value["request_id"].clone();
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
-                    continue;
-                }
-                let caller_label = recv_client_label.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let caller = crate::teach::Caller {
-                    connection: recv_connection.clone(),
-                    client_id: value.get("client_id").and_then(Value::as_str).map(str::to_string).or(caller_label),
-                };
-                let (sup, tx) = (recv_supervisor.clone(), ack_tx.clone());
-                worker_tasks.spawn(async move {
-                    let path = value["path"].as_str().unwrap_or("").to_string();
-                    let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
-                    let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
-                });
                 continue;
             }
             let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
-            let mut pending_plan: Option<(PendingPlan, u64)> = None;
-            let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
-            let mut pending_replay: Option<(Value, crate::replay::ReplayInput, u64)> = None;
-            #[cfg(feature = "policy-runtime")]
-            let mut pending_policy: Option<(Value, PendingPolicyStart, u64, PolicyLoadingGuard)> = None;
-            let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
+            let mut action_pending = actions::ActionPending {
+                plan: None,
+                macro_action: None,
+                replay: None,
+                #[cfg(feature = "policy-runtime")]
+                policy: None,
+                dry_run_grasp: None,
+            };
             let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
@@ -2781,50 +2525,21 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Err(e) => Some(calibration_reject(&value["request_id"], &e)),
                                         };
                                     } else if path.starts_with("/api/v1/action/") {
-                                        let (auth_snap, token_snap) = ws_auth.auth_and_token();
-                                        response = match prepare_action(&mut inner, stamp, path, &value["body"], epoch, &value["request_id"], &auth_snap, token_snap.as_deref()) {
-                                            Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
-                                            Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
-                                            Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
-                                            Ok(ActionStart::Replay(input)) => { pending_replay = Some((value["request_id"].clone(), input, local_generation)); None }
-                                            Ok(ActionStart::DryRunGrasp(body)) => { pending_dry_run_grasp = Some((value["request_id"].clone(), body)); None }
-                                            Ok(ActionStart::Sequence(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::sequences::begin(admitted, &recv_supervisor, *plan)) {
-                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
-                                            Ok(ActionStart::CalibHover(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::calib_hover::begin(admitted, &recv_supervisor, *plan,
-                                                recv_calib.upstream.clone(), crate::calib_hover::jobs_dir(&recv_calib.path))) {
-                                                Ok((id, duration, job_id)) => {
-                                                    let mut ack = command_ack(&inner, &value["request_id"], Some((id, duration)));
-                                                    ack["job_id"] = json!(job_id);
-                                                    ack
-                                                }
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
-                                            Ok(ActionStart::GripperCalibrate(epoch, tag)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::gripper_calib::begin_calibration(admitted, &recv_supervisor, epoch, tag)) {
-                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
-                                            Ok(ActionStart::MeasureMultiview(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::measure_multiview::begin(admitted, &recv_supervisor, *plan, recv_deps.source.clone())) {
-                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
+                                        response = actions::dispatch_action_command(
+                                            &mut inner,
+                                            stamp,
+                                            path,
+                                            &value,
+                                            epoch,
+                                            local_generation,
+                                            &ws_auth,
+                                            &recv_supervisor,
+                                            &recv_deps,
+                                            &recv_calib,
                                             #[cfg(feature = "policy-runtime")]
-                                            Ok(ActionStart::Policy(p)) => {
-                                                inner.policy_loading = true;
-                                                let loading_guard = PolicyLoadingGuard::new(recv_supervisor.clone());
-                                                pending_policy = Some((value["request_id"].clone(), *p, local_generation, loading_guard));
-                                                None
-                                            }
-                                            #[cfg(feature = "policy-runtime")]
-                                            Ok(ActionStart::PolicyStopped(stopped)) => {
-                                                let had_pending = pending_policy_loads.load(Ordering::SeqCst) > 0;
-                                                let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                ack["stopped"] = json!(stopped || had_pending);
-                                                Some(ack)
-                                            }
-                                            Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
-                                        };
+                                            &pending_policy_loads,
+                                            &mut action_pending,
+                                        );
                                     } else if let Some(result) = PreparedConfigWrite::prepare(
                                         &mut inner,
                                         path,
@@ -2889,235 +2604,47 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                 }
 
-                // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
-                // so the control tick is never blocked by it; cancellable between steps and
-                // late results after teardown are ignored before installing anything.
-                if let Some((plan, generation)) = pending_plan.take() {
-                    let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach, joint, seeds } = plan;
-                    if let Some(joint) = joint {
-                        // path "joint": IK of the goal only (several seeds) without the lock,
-                        // then the move_to_pose quintic, checked under the lock
-                        // ... and the quintic's plan, power fit and swept-workspace check, which
-                        // the install reuses when the arm and the workspace did not change
-                        let JointGoal { speed_scale, same_side, snapshot } = joint;
-                        let cancel = worker_closing.clone();
-                        let plan_conn = recv_connection.clone();
-                        let solved = tokio::task::spawn_blocking(move || {
-                            maybe_pause_blocking_plan(&plan_conn);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let q = crate::motion::solve_goal_joints(&input, &goal, opts, &seeds);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let prepared = match (&q, same_side) {
-                                (Ok(q), None) => crate::supervisor::prepare_quintic(&input, &snapshot, q),
-                                _ => None,
-                            };
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            Some((input, q.map(|q| (q, prepared))))
-                        }).await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let mut inner = recv_supervisor.inner().write().await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        if inner.detached {
-                            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
-                            if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                            response = Some(r);
-                        } else {
-                            if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-                            if let Err(err) = inner.preflight_admission(stamp) {
-                                response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
-                            } else {
-                                response = match solved {
-                                    Ok(None) => None,
-                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
-                                    Ok(Some((_, Err(error)))) => Some(command_reject(&inner, &request_id, ArmError::from(error).into())),
-                                    Ok(Some((input, Ok((q, prepared))))) => Some(
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| SupervisorInner::install_joint_goal_prepared(admitted, &input, &q, speed_scale, kind, tag, same_side, prepared)) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                            }
-                                        }
-                                    ),
-                                };
-                            }
-                        }
-                    } else {
-                        let cancel = worker_closing.clone();
-                        let plan_conn = recv_connection.clone();
-                        let planned = tokio::task::spawn_blocking(move || {
-                            maybe_pause_blocking_plan(&plan_conn);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let result = crate::motion::plan_cartesian_opts(&input, goal, speed, opts);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let pre = match (&approach, &result) {
-                                (Ok(plan), Ok(direct)) => crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, opts),
-                                (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
-                                _ => crate::backlash::Pre::Off,
-                            };
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            // a branch flip: would the joint-space move reach the goal (hint)?
-                            let joint_goal = match &result {
-                                Err(crate::motion::MotionError::IkBranchFlip { .. }) => crate::motion::solve_goal_joints(&input, &goal, opts, &seeds).ok(),
-                                _ => None,
-                            };
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            Some((input, result.map(|path| (path, pre, approach.ok())).map_err(|e| (e, joint_goal))))
-                        }).await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let mut inner = recv_supervisor.inner().write().await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        if inner.detached {
-                            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
-                            if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                            response = Some(r);
-                        } else {
-                            if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-                            if let Err(err) = inner.preflight_admission(stamp) {
-                                response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
-                            } else {
-                                response = match planned {
-                                    Ok(None) => None,
-                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
-                                    Ok(Some((_, Err((error, joint_goal))))) => {
-                                        let mut api: ApiError = ArmError::from(error).into();
-                                        if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(crate::motion::JOINT_PATH_HINT); }
-                                        Some(command_reject(&inner, &request_id, api))
-                                    }
-                                    Ok(Some((input, Ok((path, pre, approach))))) => Some(
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| SupervisorInner::install_path_same_side(admitted, &input, path, pre, approach.as_ref(), kind, tag)) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                            }
-                                        }
-                                    ),
-                                };
-                            }
-                        }
-                    }
-                }
-
-                // Macro actions (grasp, place): the first motions are planned without the lock
-                // (feasibility check), then the action begins and the orchestrator task takes over.
-                // The check runs in its own task; its result is taken by the select! above
-                // (lease re-check, then begin), while later ordinary commands stay in the bounded queue.
-                if let Some((request_id, pending, generation)) = pending_macro.take() {
-                    let source = recv_deps.source.clone();
-                    let cancel = worker_closing.clone();
-                    let plan_conn = recv_connection.clone();
-                    let (res_tx, res_rx) = tokio::sync::oneshot::channel();
-                    let abort = worker_tasks.spawn_abortable(async move {
-                        let planned_res = async {
-                            let cancel_blk = cancel.clone();
-                            let mut planned = tokio::task::spawn_blocking(move || {
-                                maybe_pause_blocking_plan(&plan_conn);
-                                if cancel_blk.load(Ordering::Acquire) {
-                                    return Err(ArmError::Safety(SafetyError::Stopped));
-                                }
-                                let out = pending.plan()?;
-                                if cancel_blk.load(Ordering::Acquire) {
-                                    return Err(ArmError::Safety(SafetyError::Stopped));
-                                }
-                                Ok(out)
-                            }).await
-                                .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-                            if cancel.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            // grasp task requirements: checked without the lock, before the action begins
-                            if let PlannedMacro::Grasp(g) = &mut planned { crate::grasp::preflight(source.as_ref(), g).await?; }
-                            if cancel.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            Ok(planned)
-                        }.await;
-                        if !cancel.load(Ordering::Acquire) {
-                            let _ = res_tx.send(planned_res);
-                        }
-                    });
-                    macro_check = Some(MacroCheck {
-                        request_id,
+                if let Some((plan, generation)) = action_pending.plan.take() {
+                    let Some(next) = actions::complete_pending_plan(
+                        plan,
                         generation,
                         stamp,
-                        abort: motion::AbortOnDrop(abort),
-                        rx: res_rx,
-                    });
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_closing,
+                    ).await else { break; };
+                    response = next;
                 }
-                // Replay: the episode is read and checked without the lock; cancellable and late
-                // results after teardown are ignored before installing anything.
-                if let Some((request_id, input, generation)) = pending_replay.take() {
-                    let cancel = worker_closing.clone();
-                    let plan_conn = recv_connection.clone();
-                    let planned = tokio::task::spawn_blocking(move || {
-                        maybe_pause_blocking_plan(&plan_conn);
-                        if cancel.load(Ordering::Acquire) {
-                            return None;
-                        }
-                        let out = crate::replay::plan(input);
-                        if cancel.load(Ordering::Acquire) {
-                            return None;
-                        }
-                        Some(out)
-                    }).await;
-                    if worker_closing.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let mut inner = recv_supervisor.inner().write().await;
-                    if worker_closing.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if inner.detached {
-                        let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while checking replay"});
-                        if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                        response = Some(r);
-                    } else if let Err(err) = inner.preflight_admission(stamp) {
-                        response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
-                    } else {
-                        response = match planned {
-                            Ok(None) => None,
-                            Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("replay check task failed: {e}")).into())),
-                            Ok(Some(Err(error))) => Some(command_reject(&inner, &request_id, error.into())),
-                            Ok(Some(Ok(plan))) => Some(
-                                if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                } else {
-                                    match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| SupervisorInner::install_replay(admitted, plan)) {
-                                        Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                        Err(error) => command_reject(&inner, &request_id, error.into()),
-                                    }
-                                }
-                            ),
-                        };
-                    }
+
+                if let Some((request_id, pending, generation)) = action_pending.macro_action.take() {
+                    macro_check = Some(actions::spawn_macro_check(
+                        request_id,
+                        pending,
+                        generation,
+                        stamp,
+                        &recv_deps,
+                        &worker_closing,
+                        &recv_connection,
+                        &worker_tasks,
+                    ));
+                }
+
+                if let Some((request_id, input, generation)) = action_pending.replay.take() {
+                    let Some(next) = actions::complete_pending_replay(
+                        request_id,
+                        input,
+                        generation,
+                        stamp,
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_closing,
+                    ).await else { break; };
+                    response = next;
                 }
                 #[cfg(feature = "policy-runtime")]
-                if let Some((request_id, pending, generation, loading_guard)) = pending_policy.take() {
+                if let Some((request_id, pending, generation, loading_guard)) = action_pending.policy.take() {
                     let sup = recv_supervisor.clone();
                     let sandbox_c = recv_sandbox.clone();
                     let vision_src = recv_deps.source.clone();
@@ -3351,21 +2878,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         let _ = tx.send(reply).await;
                     });
                 }
-                if let Some((request_id, body)) = pending_dry_run_grasp.take() {
-                    let dry = crate::grasp::dry_run_task(&recv_supervisor, recv_deps.source.as_ref(), &body).await;
-                    let mut ack = {
-                        let inner = recv_supervisor.inner().read().await;
-                        if !inner.detached {
-                            command_ack(&inner, &request_id, None)
-                        } else if let Some(s) = recv_supervisor.hub().latest() {
-                            let control_mode = if s.obs.control_mode == crate::model::ControlMode::GravityComp { "gravity_comp" } else { "position" };
-                            json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":s.obs.epoch_id, "safety_state":s.obs.safety_state, "is_torqued":s.obs.is_torqued, "control_mode":control_mode})
-                        } else {
-                            command_ack(&inner, &request_id, None)
-                        }
-                    };
-                    for (k, v) in dry.fields() { ack[k.as_str()] = v; }
-                    response = Some(ack);
+                if let Some((request_id, body)) = action_pending.dry_run_grasp.take() {
+                    response = Some(actions::complete_dry_run_grasp(request_id, body, &recv_supervisor, &recv_deps).await);
                 }
                 // Calibration apply / restore: its own tracked task (HTTP to rebot-vision, file writes);
                 // this loop goes on (heartbeats, stop) and the reply comes back through ack_tx.
@@ -3400,7 +2914,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             };
                             let _ = job_tx.send(res);
                         });
-                        let _abort_inner = motion::AbortOnDrop(job_abort);
+                        let _abort_inner = actions::AbortOnDrop(job_abort);
                         let result = job_rx.await.unwrap_or_else(|e| {
                             tracing::error!("calibration task failed: {e}");
                             Err(crate::calibration::CalibError::new(500, "INTERNAL", format!("calibration task failed: {e}; check GET /api/v1/calibration and the backups")))
