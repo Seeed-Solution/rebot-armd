@@ -1433,6 +1433,12 @@ impl LiveConnections {
         id != 0 && self.ids[..self.len].contains(&id)
     }
 
+    /// True iff any currently live connection ID lies strictly inside `(lo, hi)`.
+    #[inline]
+    pub(crate) fn any_in_open_range(&self, lo: u64, hi: u64) -> bool {
+        self.ids[..self.len].iter().any(|&id| id > lo && id < hi)
+    }
+
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
@@ -1440,13 +1446,16 @@ impl LiveConnections {
 }
 
 /// Preallocated capacity for [`ClosedConnections`] intervals: with at most `MAX_LIVE_CONNECTIONS`
-/// concurrent open connections, disjoint closed intervals can never exceed `MAX_LIVE_CONNECTIONS + 1`.
+/// concurrent open connections, pigeonhole compaction guarantees `intervals.len() <= MAX_LIVE_CONNECTIONS + 1`
+/// forever without heap growth on RT.
 const CLOSED_CONNECTIONS_PREALLOC: usize = MAX_LIVE_CONNECTIONS + 4;
 
-/// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`).
-/// Bounded by `open_connections + 1` with zero eviction, zero RT allocation, and O(log K) lookup.
+/// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`) above a
+/// monotonic `watermark` (`<= watermark` is always closed). Bounded by `MAX_LIVE_CONNECTIONS + 1`
+/// via live-aware pigeonhole compaction with zero RT allocation and O(log K) lookup.
 #[derive(Debug)]
 pub(crate) struct ClosedConnections {
+    watermark: u64,
     intervals: Vec<(u64, u64)>,
 }
 
@@ -1459,6 +1468,7 @@ impl Default for ClosedConnections {
 impl ClosedConnections {
     pub(crate) fn new() -> Self {
         Self {
+            watermark: 0,
             intervals: Vec::with_capacity(CLOSED_CONNECTIONS_PREALLOC),
         }
     }
@@ -1469,8 +1479,9 @@ impl ClosedConnections {
                 .reserve(CLOSED_CONNECTIONS_PREALLOC - self.intervals.len());
         }
     }
-    pub(crate) fn mark_closed(&mut self, id: u64) {
-        if id == 0 {
+
+    pub(crate) fn mark_closed(&mut self, id: u64, live: &LiveConnections) {
+        if id == 0 || id <= self.watermark {
             return;
         }
         let idx = self
@@ -1488,13 +1499,65 @@ impl ClosedConnections {
             }
             self.intervals[idx] = (new_lo, new_hi);
         } else {
-            self.intervals.insert(idx, (id, id));
+            // Ensure capacity BEFORE inserting: with at most `MAX_LIVE_CONNECTIONS` live IDs,
+            // whenever `intervals.len() >= MAX_LIVE_CONNECTIONS + 1` the pigeonhole principle
+            // guarantees either the prefix gap `(watermark, intervals[0].0)` or an adjacent gap
+            // `(intervals[i].1, intervals[i+1].0)` contains zero live connection IDs.
+            if self.intervals.len() >= CLOSED_CONNECTIONS_PREALLOC {
+                self.compact_against_live(live);
+            }
+            let idx = self
+                .intervals
+                .partition_point(|&(_, end)| end.saturating_add(1) < id);
+            if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
+                let (lo, hi) = self.intervals[idx];
+                self.intervals[idx] = (lo.min(id), hi.max(id));
+            } else {
+                self.intervals.insert(idx, (id, id));
+            }
+        }
+        // Collapse any contiguous prefix directly into `watermark`.
+        while let Some(&(lo, hi)) = self.intervals.first() {
+            if lo <= self.watermark.saturating_add(1) {
+                self.watermark = self.watermark.max(hi);
+                self.intervals.remove(0);
+            } else {
+                break;
+            }
+        }
+        // Keep interval count strictly <= MAX_LIVE_CONNECTIONS + 1 even under external ID gaps.
+        if self.intervals.len() > MAX_LIVE_CONNECTIONS + 1 {
+            self.compact_against_live(live);
+        }
+    }
+
+    fn compact_against_live(&mut self, live: &LiveConnections) {
+        // First fold the lowest interval into `watermark` if no live ID sits below it.
+        if let Some(&(lo, hi)) = self.intervals.first() {
+            if !live.any_in_open_range(self.watermark, lo) {
+                self.watermark = self.watermark.max(hi);
+                self.intervals.remove(0);
+                return;
+            }
+        }
+        // Otherwise merge the first adjacent pair whose gap contains zero live IDs.
+        for i in 0..self.intervals.len().saturating_sub(1) {
+            let (lo0, hi0) = self.intervals[i];
+            let (lo1, hi1) = self.intervals[i + 1];
+            if !live.any_in_open_range(hi0, lo1) {
+                self.intervals[i] = (lo0, hi1);
+                self.intervals.remove(i + 1);
+                return;
+            }
         }
     }
 
     pub(crate) fn is_closed(&self, id: u64) -> bool {
         if id == 0 {
             return false;
+        }
+        if id <= self.watermark {
+            return true;
         }
         let idx = self.intervals.partition_point(|&(_, end)| end < id);
         idx < self.intervals.len() && self.intervals[idx].0 <= id
@@ -1954,7 +2017,8 @@ impl SupervisorInner {
     /// stale [`Admitted`] token from that connection can commit or start motion.
     pub fn mark_connection_closed(&mut self, connection_id: u64) {
         self.live_connections.remove(connection_id);
-        self.closed_connections.mark_closed(connection_id);
+        self.closed_connections
+            .mark_closed(connection_id, &self.live_connections);
     }
 
     /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under the owner lock.
@@ -2047,15 +2111,25 @@ impl SupervisorInner {
     }
 
     /// Clears `active_lease`, recycling its heap buffers back into spares (0 alloc / 0 free on RT).
+    ///
+    /// Invariant (enforced by [`Self::prewarm_observation_slots`] and [`Self::set_active_lease_in_place`]):
+    /// when `active_lease` is `Some`, `lease_client_spare` and `lease_label_spare` are 0-capacity
+    /// `String::new()`, so replacing them performs zero deallocations on `armd-control`.
     pub(crate) fn clear_active_lease_in_place(&mut self) -> Option<u64> {
         let old = self.active_lease.take()?;
         let gen = old.generation;
-        if old.client_id.capacity() >= self.lease_client_spare.capacity() {
+        if self.lease_client_spare.capacity() == 0
+            || (!self.rt_executor_owned
+                && old.client_id.capacity() > self.lease_client_spare.capacity())
+        {
             let mut buf = old.client_id;
             buf.clear();
             self.lease_client_spare = buf;
         }
-        if old.label.capacity() >= self.lease_label_spare.capacity() {
+        if self.lease_label_spare.capacity() == 0
+            || (!self.rt_executor_owned
+                && old.label.capacity() > self.lease_label_spare.capacity())
+        {
             let mut buf = old.label;
             buf.clear();
             self.lease_label_spare = buf;
@@ -2802,15 +2876,9 @@ impl SupervisorInner {
         self.motor_errors.reserve(dof);
         self.gravity_torques.reserve(arm_dof);
         self.closed_connections.reserve_rt();
-        if self.lease_client_spare.capacity() < 64 {
-            self.lease_client_spare.reserve(64 - self.lease_client_spare.len());
-        }
-        if self.lease_label_spare.capacity() < 128 {
-            self.lease_label_spare.reserve(128 - self.lease_label_spare.len());
-        }
-        if self.evicted_conn_spare.capacity() < 64 {
-            self.evicted_conn_spare.reserve(64 - self.evicted_conn_spare.len());
-        }
+        // Exclusive buffer ownership invariant (0 alloc / 0 free on RT):
+        // either the live field holds the preallocated buffer and its spare is 0-capacity `String::new()`,
+        // or the live field is `None` and the spare holds the preallocated buffer.
         if let Some(ref mut a) = self.active_lease {
             if a.client_id.capacity() < 64 {
                 a.client_id.reserve(64 - a.client_id.len());
@@ -2818,11 +2886,26 @@ impl SupervisorInner {
             if a.label.capacity() < 128 {
                 a.label.reserve(128 - a.label.len());
             }
+            self.lease_client_spare = String::new();
+            self.lease_label_spare = String::new();
+        } else {
+            if self.lease_client_spare.capacity() < 64 {
+                self.lease_client_spare
+                    .reserve(64 - self.lease_client_spare.len());
+            }
+            if self.lease_label_spare.capacity() < 128 {
+                self.lease_label_spare
+                    .reserve(128 - self.lease_label_spare.len());
+            }
         }
         if let Some((ref mut c, _)) = self.last_evicted {
             if c.capacity() < 64 {
                 c.reserve(64 - c.len());
             }
+            self.evicted_conn_spare = String::new();
+        } else if self.evicted_conn_spare.capacity() < 64 {
+            self.evicted_conn_spare
+                .reserve(64 - self.evicted_conn_spare.len());
         }
         let tmpl = self.current_observation();
         self.core.try_prewarm_observations(|| {
@@ -3552,11 +3635,12 @@ impl SupervisorInner {
             true
         };
 
+        let arm_joints = self.config.arm_joints();
         let tracking_settled = !self.config.joint_tracking.as_ref().is_some_and(|jt| {
             jt.enabled
                 && self
                     .tracking
-                    .has_residual_lead(&self.commanded_positions, &self.config.arm_joint_indices())
+                    .has_residual_lead(&self.commanded_positions, &arm_joints)
         });
 
         (self.safety.state() == &SafetyState::Armed || self.safety.state() == &SafetyState::Idle)
@@ -4704,7 +4788,8 @@ impl SupervisorInner {
         self.scratch = sc;
 
         // 0.0 Fence an expired lease generation BEFORE gripper/motion/watchdog output runs
-        // (preserves `active_lease = Some(expired)` for expiry telemetry and never cancels a watchdog park).
+        // (preserves `active_lease = Some(expired)` for expiry telemetry, retires expired client
+        // servo/trajectory motion, and preserves any autonomous watchdog park explicitly).
         if let Some(expired_gen) = self
             .active_lease
             .as_ref()
@@ -4714,7 +4799,8 @@ impl SupervisorInner {
             })
             .map(|a| a.generation)
         {
-            self.fence_displaced_lease_generation(expired_gen, false);
+            let stop_client_motion = self.watchdog_park.is_none() && !self.pending_normal_unload;
+            self.fence_displaced_lease_generation(expired_gen, stop_client_motion);
         }
 
         // 0.1 Gripper stall protection state machine
@@ -6891,8 +6977,116 @@ pub struct ArmSupervisor {
     template_obs: ArmObservation,
     /// Shared periodic-loop timing stats attached in Legacy mode (`run_periodic`).
     legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
+    /// Off-thread bounded WS connection slot pool (`MAX_LIVE_CONNECTIONS = 64`), enforcing the
+    /// fail-closed cap before allocating a monotonic connection ID and before touching any owner.
+    ws_slots: Arc<WsConnectionSlotPool>,
     /// Unique identifier for this daemon/supervisor instance (changes across restarts).
     instance_id: String,
+}
+
+static NEXT_WS_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsSlotPhase {
+    Admitted,
+    Open,
+    Closing,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WsSlotEntry {
+    phase: WsSlotPhase,
+    opening: bool,
+}
+
+struct WsConnectionSlotPool {
+    entries: std::sync::Mutex<std::collections::HashMap<u64, WsSlotEntry>>,
+    notify: tokio::sync::Notify,
+}
+
+impl WsConnectionSlotPool {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::with_capacity(
+                MAX_LIVE_CONNECTIONS,
+            )),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn try_claim(&self) -> Result<crate::rt_core::requests::lease::ConnectionHandle, ArmError> {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() >= MAX_LIVE_CONNECTIONS {
+            return Err(ArmError::Rejected {
+                status: 503,
+                code: "TOO_MANY_CONNECTIONS".into(),
+                message: "Maximum live WebSocket connections reached".into(),
+            });
+        }
+        let id = NEXT_WS_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let handle = crate::rt_core::requests::lease::ConnectionHandle::from_ws_id(id)
+            .expect("monotonic WS conn_id >= 1");
+        g.insert(
+            id,
+            WsSlotEntry {
+                phase: WsSlotPhase::Admitted,
+                opening: false,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn begin_open(&self, conn_id: u64) -> bool {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = g.get_mut(&conn_id) else {
+            return false;
+        };
+        if entry.phase != WsSlotPhase::Admitted || entry.opening {
+            return false;
+        }
+        entry.opening = true;
+        true
+    }
+
+    fn finish_open(&self, conn_id: u64, succeeded: bool) {
+        {
+            let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = g.get_mut(&conn_id) {
+                entry.opening = false;
+                if succeeded && entry.phase == WsSlotPhase::Admitted {
+                    entry.phase = WsSlotPhase::Open;
+                }
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn mark_closing(&self, conn_id: u64) -> Option<bool> {
+        let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = g.get_mut(&conn_id)?;
+        entry.phase = WsSlotPhase::Closing;
+        Some(entry.opening)
+    }
+
+    fn is_opening(&self, conn_id: u64) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&conn_id)
+            .is_some_and(|e| e.opening)
+    }
+
+    fn remove(&self, conn_id: u64) {
+        {
+            let mut g = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            g.remove(&conn_id);
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -7085,6 +7279,7 @@ impl ArmSupervisor {
             sinks: Arc::new(std::sync::Mutex::new(None)),
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
+            ws_slots: Arc::new(WsConnectionSlotPool::new()),
             instance_id,
         }
     }
@@ -7836,6 +8031,100 @@ impl ArmSupervisor {
         inner.release_lease(client_id, generation)
     }
 
+    /// Claims one off-thread WS connection slot (`<= MAX_LIVE_CONNECTIONS`) and allocates a
+    /// strictly monotonic connection ID without touching the RT executor. Rejected upgrades
+    /// never increment the connection ID counter (preventing permanent holes in `ClosedConnections`)
+    /// and the budget applies uniformly to every retained socket, including degraded E-stop sockets.
+    pub fn try_claim_ws_slot(
+        &self,
+    ) -> Result<crate::rt_core::requests::lease::ConnectionHandle, ArmError> {
+        self.ws_slots.try_claim()
+    }
+
+    /// Number of currently admitted WS connection slots (including closing slots awaiting owner
+    /// disconnect confirmation).
+    pub fn live_ws_slot_count(&self) -> usize {
+        self.ws_slots.len()
+    }
+
+    /// Registers an already-claimed off-thread WS slot with the active owner (legacy or RT executor).
+    /// Returns `Err(DISCONNECTED)` without touching the owner if teardown already marked the slot closing.
+    pub async fn register_ws_connection_for_slot(&self, conn_id: u64) -> Result<(), ArmError> {
+        if !self.ws_slots.begin_open(conn_id) {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "DISCONNECTED".into(),
+                message: "Connection slot is already closing".into(),
+            });
+        }
+        struct OpenGuard<'a> {
+            pool: &'a WsConnectionSlotPool,
+            conn_id: u64,
+            succeeded: bool,
+        }
+        impl Drop for OpenGuard<'_> {
+            fn drop(&mut self) {
+                self.pool.finish_open(self.conn_id, self.succeeded);
+            }
+        }
+        let mut guard = OpenGuard {
+            pool: &self.ws_slots,
+            conn_id,
+            succeeded: false,
+        };
+        let res = self.register_ws_connection(conn_id).await;
+        if res.is_ok() {
+            guard.succeeded = true;
+        }
+        res
+    }
+
+    /// Completes owner-side disconnect teardown for an admitted WS connection and releases its
+    /// off-thread slot ONLY AFTER owner cleanup finishes (or the executor has permanently stopped).
+    pub async fn finish_ws_connection(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+    ) {
+        let Some(was_opening) = self.ws_slots.mark_closing(conn.id()) else {
+            // Slot already removed (idempotent).
+            return;
+        };
+        if was_opening {
+            // Wait briefly for an in-flight `register_ws_connection_for_slot` to drop/finish so
+            // `Open` and `Disconnect` stay linearized without hanging if the executor is stalled.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+            while self.ws_slots.is_opening(conn.id()) {
+                let notified = self.ws_slots.notify.notified();
+                if !self.ws_slots.is_opening(conn.id()) {
+                    break;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = self.disconnect_ws_connection(conn).await;
+        self.ws_slots.remove(conn.id());
+    }
+
+    /// Durable cancellation-safe Drop fallback for externally aborted WS socket tasks:
+    /// spawns async `finish_ws_connection` on the Tokio runtime when available so contended
+    /// legacy write locks, in-flight `OWNER_TRANSFERRING`, or pending `Open`s never strand a slot.
+    pub fn finish_ws_connection_detached(
+        self: &Arc<Self>,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+    ) {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let sup = Arc::clone(self);
+            rt.spawn(async move {
+                sup.finish_ws_connection(conn).await;
+            });
+            return;
+        }
+        self.disconnect_ws_connection_detached(conn);
+        self.ws_slots.remove(conn.id());
+    }
+
     /// Registers a live WS connection ID (`>= 1`) through the active owner (fail-closed at
     /// [`MAX_LIVE_CONNECTIONS`]). If ownership transfer (`OWNER_TRANSFERRING`) is momentarily
     /// in flight, waits up to a bounded 200 ms window for handoff to settle before registering.
@@ -7929,6 +8218,9 @@ impl ArmSupervisor {
     /// Unified owner-routed WS connection disconnect (same `prepare_lease_disconnect` +
     /// `install_lease_disconnect` split on both legacy and executor; priority lossless channel
     /// on executor, never dropped when the ordinary broker ring is full).
+    ///
+    /// Waits out momentary `OWNER_TRANSFERRING` so mid-handoff teardown always reaches the
+    /// winning owner, and publishes legacy mutations to `StateHub` before dropping the lock.
     pub async fn disconnect_ws_connection(
         &self,
         conn: crate::rt_core::requests::lease::ConnectionHandle,
@@ -7937,11 +8229,23 @@ impl ArmSupervisor {
             install_lease_disconnect, prepare_lease_disconnect, LeaseOutcome,
         };
         let prep = prepare_lease_disconnect(conn);
-        match self.owner_mode() {
+        let settle_deadline = Instant::now() + Duration::from_millis(500);
+        let mode = loop {
+            let m = self.owner_mode();
+            if m != OWNER_TRANSFERRING || Instant::now() >= settle_deadline {
+                break m;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        match mode {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
                 if self.check_legacy_under_guard(&inner).is_ok() {
-                    return install_lease_disconnect(&mut inner, &prep.request, Instant::now());
+                    let out = install_lease_disconnect(&mut inner, &prep.request, Instant::now());
+                    let pub_gen = self.inner.generation();
+                    let ts = inner.now_s();
+                    let _ = inner.publish_at(ts, pub_gen, false);
+                    return out;
                 }
                 drop(inner);
                 if let Some(handle) = self.executor_handle() {
@@ -8071,8 +8375,14 @@ impl ArmSupervisor {
                     deadline: prep.deadline,
                     enforce_single_use: true,
                 };
-                install_lease_acquire(&mut inner, &prep.request, &ctx)
-                    .map_err(Self::map_lease_install_err)
+                let out = install_lease_acquire(&mut inner, &prep.request, &ctx)
+                    .map_err(Self::map_lease_install_err)?;
+                if matches!(out, crate::rt_core::requests::lease::LeaseOutcome::Granted { .. }) {
+                    let pub_gen = self.inner.generation();
+                    let ts = inner.now_s();
+                    let _ = inner.publish_at(ts, pub_gen, false);
+                }
+                Ok(out)
             }
             OWNER_EXECUTOR => {
                 let Some(handle) = self.executor_handle() else {
@@ -8146,8 +8456,14 @@ impl ArmSupervisor {
                     deadline: prep.deadline,
                     enforce_single_use: true,
                 };
-                install_lease_preempt(&mut inner, &prep.request, &ctx)
-                    .map_err(Self::map_lease_install_err)
+                let out = install_lease_preempt(&mut inner, &prep.request, &ctx)
+                    .map_err(Self::map_lease_install_err)?;
+                if matches!(out, crate::rt_core::requests::lease::LeaseOutcome::Granted { .. }) {
+                    let pub_gen = self.inner.generation();
+                    let ts = inner.now_s();
+                    let _ = inner.publish_at(ts, pub_gen, false);
+                }
+                Ok(out)
             }
             OWNER_EXECUTOR => {
                 let Some(handle) = self.executor_handle() else {
@@ -8206,8 +8522,17 @@ impl ArmSupervisor {
                     deadline: prep.deadline,
                     enforce_single_use: true,
                 };
-                install_lease_release(&mut inner, &prep.request, &ctx)
-                    .map_err(Self::map_lease_install_err)
+                let out = install_lease_release(&mut inner, &prep.request, &ctx)
+                    .map_err(Self::map_lease_install_err)?;
+                if matches!(
+                    out,
+                    crate::rt_core::requests::lease::LeaseOutcome::Released { released: true, .. }
+                ) {
+                    let pub_gen = self.inner.generation();
+                    let ts = inner.now_s();
+                    let _ = inner.publish_at(ts, pub_gen, false);
+                }
+                Ok(out)
             }
             OWNER_EXECUTOR => {
                 let Some(handle) = self.executor_handle() else {

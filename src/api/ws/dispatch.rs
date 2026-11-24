@@ -235,11 +235,6 @@ pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) value: &'a Value,
     pub(super) epoch: u64,
     pub(super) local_generation: u64,
-    pub(super) recv_conn_id: u64,
-    pub(super) recv_connection: &'a str,
-    pub(super) recv_generation: &'a AtomicU64,
-    pub(super) recv_client_label: &'a Mutex<Option<String>>,
-    pub(super) worker_closing: &'a AtomicBool,
     pub(super) ws_auth: &'a WsAuth,
     pub(super) recv_supervisor: &'a Arc<ArmSupervisor>,
     pub(super) recv_deps: &'a crate::grasp::GraspDeps,
@@ -247,7 +242,6 @@ pub(super) struct OwnerDispatchCtx<'a> {
     #[cfg(feature = "policy-runtime")]
     pub(super) pending_policy_loads: &'a AtomicUsize,
     pub(super) last_sequence: &'a mut Option<u64>,
-    pub(super) evicted_notify: &'a mut Option<(String, u64)>,
     pub(super) action_pending: &'a mut actions::ActionPending,
     pub(super) pending_config_write: &'a mut Option<(Value, config::PreparedConfigWrite, u64, u64)>,
     pub(super) pending_calibration: &'a mut Option<(Value, calibration::CalibJob, u64, u64, bool)>,
@@ -256,6 +250,23 @@ pub(super) struct OwnerDispatchCtx<'a> {
 /// Boxed future returned by the table-bound unified heartbeat handler.
 pub(super) type HeartbeatFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + 'a>>;
+
+/// Arguments passed to unified async session handlers (`acquire_lease`, `release_lease`).
+pub(super) struct SessionDispatchCtx<'a> {
+    pub(super) supervisor: &'a ArmSupervisor,
+    pub(super) value: &'a Value,
+    pub(super) conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    pub(super) recv_generation: &'a AtomicU64,
+    pub(super) recv_client_label: &'a Mutex<Option<String>>,
+    pub(super) worker_closing: &'a AtomicBool,
+    pub(super) ws_auth: &'a WsAuth,
+    pub(super) last_sequence: &'a mut Option<u64>,
+}
+
+/// Boxed future returned by table-bound unified async session handlers (`acquire_lease`, `release_lease`).
+pub(super) type SessionFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Option<Value>, Option<(String, u64)>)> + Send + 'a>,
+>;
 
 /// Concrete executable handler binding stored in each [`DispatchEntry`].
 #[derive(Clone, Copy)]
@@ -276,6 +287,8 @@ pub(super) enum DispatchHandler {
             &'a Mutex<Option<String>>,
         ) -> HeartbeatFuture<'a>,
     ),
+    /// Unified async session handler (`acquire_lease`, `release_lease`), routed through the active owner.
+    SessionAsync(for<'a> fn(SessionDispatchCtx<'a>) -> SessionFuture<'a>),
     /// Pre-lock lease-free command handler (`depth_measure`, `teach`).
     LeaseFree(fn(LeaseFreeCtx<'_>)),
     /// Owner-locked handler executed under `supervisor.inner().write()`.
@@ -367,6 +380,10 @@ fn validate_entry(entry: &DispatchEntry) {
                 "{:?}",
                 entry.key
             );
+        }
+        DispatchHandler::SessionAsync(_) => {
+            assert_eq!(entry.admission, AdmissionClass::OrdinarySession, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::LeaseReply, "{:?}", entry.key);
         }
         DispatchHandler::LeaseFree(_) => {
             assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);

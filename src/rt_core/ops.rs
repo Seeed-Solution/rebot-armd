@@ -1380,6 +1380,7 @@ pub struct ReleaseEngine {
     urgent_replies_flushed: bool,
     conn_lifecycle: Option<super::requests::lease::ConnLifecycleIntake>,
     lifecycle_replies_flushed: bool,
+    eviction_tx: Option<rtrb::Producer<(super::requests::lease::ConnectionHandle, u64)>>,
     active: Option<Installed>,
     /// The driver transition in flight.
     transition: Option<Installed>,
@@ -1402,6 +1403,7 @@ impl ReleaseEngine {
                 urgent_replies_flushed: false,
                 conn_lifecycle: None,
                 lifecycle_replies_flushed: false,
+                eviction_tx: None,
                 active: None,
                 transition: None,
                 releases: 0,
@@ -1423,6 +1425,16 @@ impl ReleaseEngine {
     /// drained at Step 1, every checkpoint, and sub-release wakes, with replies flushed after Step 6 publish.
     pub fn attach_conn_lifecycle(&mut self, intake: super::requests::lease::ConnLifecycleIntake) {
         self.conn_lifecycle = Some(intake);
+    }
+
+    /// Attaches the bounded post-publication lease eviction notification ring (0 RT allocs) so
+    /// committed preemptions deliver `lease_lost(reason: "preempted")` to the evictee even if the
+    /// preempting requester disconnects before receiving its own `Reply::Lease`.
+    pub fn attach_eviction_tx(
+        &mut self,
+        tx: rtrb::Producer<(super::requests::lease::ConnectionHandle, u64)>,
+    ) {
+        self.eviction_tx = Some(tx);
     }
 
     pub fn has_pending_lifecycle_replies(&self) -> bool {
@@ -1621,6 +1633,7 @@ impl ReleaseEngine {
         let ctx = self.checkpoint(core, Checkpoint::BeforeCommit, &mut now_fn, &mut report);
         let mut superseded_and_ack: Option<(Installed, super::broker::Reply)> = None;
         let mut deferred_step3_reply: Option<super::broker::Reply> = None;
+        let mut deferred_eviction: Option<(super::requests::lease::ConnectionHandle, u64)> = None;
         if let Some(t) = self.intake.take() {
             let d = *t.descriptor();
             match d.kind {
@@ -1628,6 +1641,14 @@ impl ReleaseEngine {
                     let result = core.commit_lease(&d, req, &ctx);
                     report.command = Some((d.stamp.request, match result {
                         Ok(outcome) => {
+                            if let super::requests::lease::LeaseOutcome::Granted {
+                                evicted_connection: Some(ev_conn),
+                                evicted_generation: ev_gen,
+                                ..
+                            } = outcome
+                            {
+                                deferred_eviction = Some((ev_conn, ev_gen));
+                            }
                             let (commit_seq, reply) = t.ack_lease_deferred(outcome);
                             deferred_step3_reply = Some(reply);
                             Ok(commit_seq)
@@ -1719,6 +1740,11 @@ impl ReleaseEngine {
         }
         if let Some(reply) = deferred_step3_reply {
             self.intake.emit_reply(reply);
+        }
+        if let Some(eviction) = deferred_eviction {
+            if let Some(tx) = self.eviction_tx.as_mut() {
+                let _ = tx.push(eviction);
+            }
         }
         if let Some(action) = self.active() {
             if let Some(outcome) = core.action_outcome(action) {

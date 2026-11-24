@@ -582,17 +582,6 @@ pub fn install_lease_preempt(
         }
     }
 
-    inner.cancel_watchdog_park_for_new_lease(conn);
-    #[cfg(feature = "policy-runtime")]
-    if inner.policy_run.is_some() {
-        inner.terminate_policy_run(
-            "LEASE_LOST",
-            "cancelled",
-            Some("LEASE_LOST"),
-            Some("Control lease preempted".into()),
-        );
-    }
-
     let confirmed_hardware_disabled = match &inner.driver {
         None => {
             !inner.is_torqued
@@ -626,8 +615,27 @@ pub fn install_lease_preempt(
     let needs_stop = !(confirmed_hardware_disabled
         || inner.safety.state().is_stopped()
         || inner.is_fully_settled_armed_hold());
+
+    // Final commit-point live authorization check strictly AFTER all read-only preflight
+    // (including driver lock inspection) and IMMEDIATELY BEFORE the first owner mutation.
+    let commit_now = ctx.now.max(Instant::now());
+    if !req.operator.is_valid_at(commit_now, inner.operator_auth_enforced) {
+        return Ok(LeaseOutcome::OperatorRequired);
+    }
+
+    inner.cancel_watchdog_park_for_new_lease(conn);
+    #[cfg(feature = "policy-runtime")]
+    if inner.policy_run.is_some() {
+        inner.terminate_policy_run(
+            "LEASE_LOST",
+            "cancelled",
+            Some("LEASE_LOST"),
+            Some("Control lease preempted".into()),
+        );
+    }
+
     if needs_stop {
-        inner.handover_settling_since = Some(ctx.now);
+        inner.handover_settling_since = Some(commit_now);
     } else {
         inner.handover_settling_since = None;
     }
@@ -639,10 +647,10 @@ pub fn install_lease_preempt(
 
     inner.lease_generation_counter += 1;
     let gen = inner.lease_generation_counter;
-    inner.set_active_lease_in_place(req.connection.id(), conn, label, gen, ctx.now);
-    inner.last_heartbeat = ctx.now;
+    inner.set_active_lease_in_place(req.connection.id(), conn, label, gen, commit_now);
+    inner.last_heartbeat = commit_now;
     let (evicted_connection, evicted_generation) = if let Some((ev_handle, ev_gen)) = evicted {
-        inner.last_preemption = Some(ctx.now);
+        inner.last_preemption = Some(commit_now);
         inner.set_last_evicted_in_place(ev_handle.as_str(), ev_gen);
         (Some(ev_handle), ev_gen)
     } else {
@@ -687,9 +695,13 @@ pub fn install_lease_release(
         });
     };
 
-    // Fence and stop active motion FIRST when valid (an expired lease is dropped without
-    // cancelling an autonomous watchdog park).
-    inner.fence_displaced_lease_generation(req.generation, valid);
+    // Fence and stop active motion when valid OR when this release first observes expiry while
+    // no autonomous watchdog park is active (preserving any running watchdog park explicitly).
+    let stop_client_motion = valid
+        || (inner.fenced_lease_generation < req.generation
+            && inner.watchdog_park.is_none()
+            && !inner.pending_normal_unload);
+    inner.fence_displaced_lease_generation(req.generation, stop_client_motion);
     let _ = inner.clear_active_lease_in_place();
     #[cfg(feature = "policy-runtime")]
     if inner.policy_run.is_some() {
@@ -746,7 +758,11 @@ pub fn install_lease_disconnect(
         };
     };
 
-    inner.fence_displaced_lease_generation(gen, valid);
+    let stop_client_motion = valid
+        || (inner.fenced_lease_generation < gen
+            && inner.watchdog_park.is_none()
+            && !inner.pending_normal_unload);
+    inner.fence_displaced_lease_generation(gen, stop_client_motion);
     let _ = inner.clear_active_lease_in_place();
     #[cfg(feature = "policy-runtime")]
     if inner.policy_run.is_some() {
@@ -1302,34 +1318,33 @@ impl ConnLifecycleClient {
         waiter: LifecycleWaiter,
     ) -> Result<(), ConnLifecycleError> {
         let conn_id = connection.id();
+        if conn_id == 0 {
+            return Err(ConnLifecycleError::InvalidConnection);
+        }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.drain_replies();
         if g.closed || g.exited.load(Ordering::Acquire) {
             return Err(ConnLifecycleError::Stopped);
         }
-        if conn_id != 0 {
-            match g.slots.get_mut(&conn_id) {
-                Some(state @ SlotState::Open) => {
-                    *state = SlotState::Closing;
-                }
-                Some(SlotState::Closing) => {
-                    return Err(ConnLifecycleError::AlreadyClosed);
-                }
-                None => {
-                    // Unregistered slot: allow disconnect only if ring has headroom.
-                    if g.req_tx.slots() == 0 {
-                        return Err(ConnLifecycleError::TooManyConnections);
-                    }
-                }
+        // Restrict reserved priority ring capacity strictly to registered open slots so
+        // unregistered callers can never consume disconnect credits, and only commit `Closing`
+        // AFTER the ring push succeeds.
+        match g.slots.get(&conn_id) {
+            Some(SlotState::Open) => {}
+            Some(SlotState::Closing) | None => {
+                return Err(ConnLifecycleError::AlreadyClosed);
             }
         }
-        g.next_seq += 1;
-        let seq = g.next_seq;
+        let seq = g.next_seq + 1;
         if g.req_tx
             .push(LifecycleCmd::Disconnect { seq, connection })
             .is_err()
         {
             return Err(ConnLifecycleError::TooManyConnections);
+        }
+        g.next_seq = seq;
+        if let Some(state) = g.slots.get_mut(&conn_id) {
+            *state = SlotState::Closing;
         }
         g.waiters.insert(seq, waiter);
         Ok(())

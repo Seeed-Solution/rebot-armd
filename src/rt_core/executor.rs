@@ -1834,6 +1834,7 @@ pub(crate) struct OffThreadSinks {
     urgent_stop_client: Arc<UrgentStopClient>,
     conn_lifecycle_client: Arc<super::requests::lease::ConnLifecycleClient>,
     broker_dispatcher: Arc<BrokerDispatcher>,
+    eviction_rx: Mutex<Consumer<(super::requests::lease::ConnectionHandle, u64)>>,
     offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
 }
 
@@ -1935,6 +1936,12 @@ impl OffThreadSinks {
         self.urgent_stop_client.drain_replies();
         self.conn_lifecycle_client.drain_replies();
         self.broker_dispatcher.drain_replies();
+        {
+            let mut ev_rx = self.eviction_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok((ev_conn, ev_gen)) = ev_rx.pop() {
+                crate::api::ws::notify_evicted_connection(ev_conn.as_str(), ev_gen);
+            }
+        }
         if self.persist_worker_exited.load(Ordering::Acquire) {
             let mut rx = self.persist_rep_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(rep) = rx.pop() {
@@ -2576,6 +2583,9 @@ pub(crate) fn spawn_executor(
         super::requests::lease::conn_lifecycle_channel(exited.clone());
     conn_lifecycle_client.seed_live_connections(core.live_connection_ids());
     engine.attach_conn_lifecycle(conn_lifecycle_intake);
+    let (eviction_tx, eviction_rx) =
+        RingBuffer::<(super::requests::lease::ConnectionHandle, u64)>::new(32);
+    engine.attach_eviction_tx(eviction_tx);
     let conn_lifecycle_client = Arc::new(conn_lifecycle_client);
     let broker = Arc::new(Mutex::new(broker));
     let broker_dispatcher = Arc::new(BrokerDispatcher::new(
@@ -2606,6 +2616,7 @@ pub(crate) fn spawn_executor(
         urgent_stop_client: urgent_stop_client.clone(),
         conn_lifecycle_client: conn_lifecycle_client.clone(),
         broker_dispatcher: broker_dispatcher.clone(),
+        eviction_rx: Mutex::new(eviction_rx),
         offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
     });
 

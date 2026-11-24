@@ -30,7 +30,7 @@ use armd::rt_core::broker::{
     AdmitError, Authority, Capacities, ClientId, Descriptor, ImmediateOp, Stamp, Submit,
 };
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks, RtExecutorHandle};
-use armd::rt_core::mailbox::{StreamId, TargetFrame};
+use armd::rt_core::mailbox::TargetFrame;
 use armd::rt_core::ops::{CommitCtx, ReleaseEngine};
 use armd::rt_core::requests::lease::{
     apply_conn_lifecycle, commit_lease_descriptor, install_broker_heartbeat, install_lease_acquire,
@@ -678,6 +678,25 @@ async fn executor_full_broker_ring_disconnect_before_ack_and_fencing() {
         lease_timeout_ms: 5_000,
         ..ArmConfig::rebot_dm()
     }));
+    let conn_id = 501u64;
+    let conn = ConnectionHandle::from_ws_id(conn_id).unwrap();
+    // Register connection, acquire lease g1, enable torque, and authorize its servo stream
+    // before handing ownership to the RT executor (proving a working authorized stream first).
+    sup.register_ws_connection(conn_id).await.unwrap();
+    let g1 = match sup.acquire_lease_ws(conn, "full_ring_holder", 1).await.unwrap() {
+        LeaseOutcome::Granted { generation, .. } => generation,
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    {
+        let mut inner = sup.inner().write().await;
+        let s1 = inner.current_admission_stamp();
+        let a1 = inner.check_admission(s1).unwrap();
+        SupervisorInner::enable_torque(a1).unwrap();
+        let s2 = inner.current_admission_stamp();
+        let a2 = inner.check_admission(s2).unwrap();
+        SupervisorInner::authorize_servo_stream(a2, g1).unwrap();
+    }
+
     let delay = Arc::new(Mutex::new(None));
     let ecfg = ExecutorConfig {
         capacities: Capacities {
@@ -699,13 +718,41 @@ async fn executor_full_broker_ring_disconnect_before_ack_and_fencing() {
         .unwrap();
     wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
 
-    let conn_id = 501u64;
-    let conn = ConnectionHandle::from_ws_id(conn_id).unwrap();
-    sup.register_ws_connection(conn_id).await.unwrap();
-    let g1 = match sup.acquire_lease_ws(conn, "full_ring_holder", 1).await.unwrap() {
-        LeaseOutcome::Granted { generation, .. } => generation,
-        other => panic!("expected Granted, got {other:?}"),
-    };
+    let servo_sid = armd::supervisor::targets::servo_stream(g1);
+    let snap0 = sup.fresh_snapshot(None).await.unwrap();
+    let now0 = Instant::now();
+    let mut auth0 = snap0.owner.authority_at(now0);
+    auth0.lease_generation = g1;
+    let mut q_ok = [0.0f32; 8];
+    for (dst, &src) in q_ok.iter_mut().zip(snap0.obs.commanded_positions.iter()).take(7) {
+        *dst = src;
+    }
+    q_ok[0] += 0.01;
+    handle.target_writer().lock().unwrap().submit(TargetFrame {
+        arm: snap0.owner.arm,
+        boot: snap0.owner.boot,
+        stream: servo_sid,
+        seq: 1,
+        authority: auth0,
+        policy_generation: 0,
+        input_at: now0,
+        vision_at: None,
+        vision_frame_id: None,
+        deadline: now0 + Duration::from_secs(5),
+        dof: 7,
+        q: q_ok,
+        replaceable: true,
+    });
+    let mut saw_pre_ok = false;
+    wait_until(Duration::from_secs(1), || {
+        handle.target_writer().lock().unwrap().outcomes(|o| {
+            if o.seq == 1 && o.result.is_ok() {
+                saw_pre_ok = true;
+            }
+        });
+        saw_pre_ok
+    })
+    .await;
 
     // Pause one release so we can fill the broker command ring 4/4 before the RT drains it.
     *delay.lock().unwrap() = Some(Duration::from_millis(90));
@@ -741,12 +788,13 @@ async fn executor_full_broker_ring_disconnect_before_ack_and_fencing() {
     );
     assert_eq!(overflow, Err(AdmitError::CommandsFull));
 
-    // Also submit a TargetFrame stamped with g1 that MUST be fenced/refused by disconnect.
+    // Submit a second TargetFrame (seq=2) on the same authorized stream that MUST be fenced/refused by disconnect.
+    q_ok[0] += 0.01;
     let tgt_frame = TargetFrame {
         arm: snap.owner.arm,
         boot: snap.owner.boot,
-        stream: StreamId(1),
-        seq: 1,
+        stream: servo_sid,
+        seq: 2,
         authority: auth,
         policy_generation: 0,
         input_at: now,
@@ -754,7 +802,7 @@ async fn executor_full_broker_ring_disconnect_before_ack_and_fencing() {
         vision_frame_id: None,
         deadline,
         dof: 7,
-        q: [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        q: q_ok,
         replaceable: true,
     };
     handle.target_writer().lock().unwrap().submit(tgt_frame);
@@ -770,30 +818,46 @@ async fn executor_full_broker_ring_disconnect_before_ack_and_fencing() {
         "priority disconnect must succeed even when broker command ring is 100% full"
     );
 
-    // Every pending task wakes cleanly (no hang) and broker outstanding() + live slots reclaim to 0.
+    // Every pending task wakes cleanly with an error (retired on disconnect, no hang) and broker
+    // outstanding() + live slots reclaim to 0.
     for t in pending_tasks {
-        let _ = tokio::time::timeout(Duration::from_secs(2), t).await.unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(2), t)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(res.is_err(), "disconnected waiter must terminate with Err, got {res:?}");
     }
     wait_until(Duration::from_secs(2), || {
         handle.broker().lock().unwrap().outstanding() == 0 && handle.live_connection_slots() == 0
     })
     .await;
 
-    // TargetFrame stamped with displaced generation g1 was rejected (not accepted as Ok).
-    let mut saw_target_refused = false;
+    // TargetFrame seq=2 stamped with displaced generation g1 was refused (stream revoked / lease lost).
+    let mut refused_code: Option<&'static str> = None;
     wait_until(Duration::from_secs(1), || {
         handle.target_writer().lock().unwrap().outcomes(|o| {
-            if o.seq == 1 && o.result.is_err() {
-                saw_target_refused = true;
+            if o.seq == 2 {
+                if let Err(r) = o.result {
+                    refused_code = Some(r.code);
+                }
             }
         });
-        saw_target_refused
+        refused_code.is_some()
     })
     .await;
+    assert!(
+        matches!(refused_code, Some("LEASE_LOST" | "NO_LEASE" | "STREAM_REVOKED")),
+        "expected lease/stream revocation refusal for seq=2, got {refused_code:?}"
+    );
 
     // Published snapshot shows no active lease and fenced generation >= g1.
     let after = sup.fresh_snapshot(None).await.unwrap();
     assert!(!after.owner.is_lease_active_at(Instant::now()));
+    assert!(
+        after.owner.fenced_lease_generation >= g1,
+        "fenced_lease_generation ({}) must be >= g1 ({g1})",
+        after.owner.fenced_lease_generation
+    );
 
     // A fresh connection can immediately register and acquire g2 > g1.
     let conn2 = ConnectionHandle::from_ws_id(502).unwrap();
@@ -1250,4 +1314,173 @@ async fn zero_alloc_rt_l1_paths_with_tracing_subscriber_enabled() {
     );
     assert_eq!(sup.inner().control_thread_attempts(), 0);
     handle.stop_and_join();
+}
+
+// ============================================================================
+// 8. L1 review regressions:
+//    - Expired lease stops active servo motion even when servo recently refreshed last_heartbeat
+//    - Newly upgraded WS socket latches urgent E-stop immediately while executor is stalled
+//    - Transferred active lease cleared on RT does 0 frees; 100 churn cycles on ClosedConnections do 0 allocs
+//    - Evictee still receives lease_lost(reason: "preempted") when preemptor disconnects immediately
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l1_review_regressions_expiry_motion_stalled_estop_churn_transfer_free_and_eviction() {
+    ensure_tracing_subscriber();
+
+    // (a) Blocker #1: expired lease retires active servo target even if `last_heartbeat` was just refreshed.
+    {
+        let mut core = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 80,
+            ..ArmConfig::rebot_dm()
+        });
+        let g = core.acquire_lease("connection:exp-servo").unwrap();
+        let stamp = core.current_admission_stamp();
+        let admitted = core.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
+        let target = vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // Sleep almost to expiry, submit valid servo frame (refreshes last_heartbeat without renewing lease).
+        std::thread::sleep(Duration::from_millis(60));
+        let ep = core.safety.epoch_id();
+        let s2 = core.current_admission_stamp();
+        let a2 = core.check_admission(s2).unwrap();
+        SupervisorInner::servo(a2, target, ep).unwrap();
+        assert!(core.servo_target.is_some());
+        // Cross lease_timeout (80ms) while last_heartbeat is only ~35ms old (< 80ms watchdog!).
+        std::thread::sleep(Duration::from_millis(35));
+        core.tick(0.02);
+        assert!(
+            core.servo_target.is_none(),
+            "expired lease must retire active servo target immediately at Step 0.0 fence (gen={g})"
+        );
+    }
+
+    // (b) Blocker #2: newly upgraded WS socket latches urgent E-stop immediately while executor is stalled.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        }));
+        let addr = serve_with_auth(sup.clone(), OperatorAuth::disabled()).await;
+        let delay = Arc::new(Mutex::new(None));
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(5)),
+                PersistTestHooks {
+                    release_delay_once: Some(delay.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+
+        // Stall the RT release loop for 400ms so owner-side `Open` cannot complete during this window.
+        *delay.lock().unwrap() = Some(Duration::from_millis(400));
+        wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
+
+        let t0 = Instant::now();
+        let mut ws_fresh = connect_ws(addr, "").await;
+        send(&mut ws_fresh, json!({"type": "estop"})).await;
+        wait_until(Duration::from_millis(120), || {
+            sup.e_stop_latched.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(180),
+            "fresh WS socket must latch E-stop without waiting for stalled executor Open: {:?}",
+            t0.elapsed()
+        );
+        drop(ws_fresh);
+        handle.stop_and_join();
+    }
+
+    // (c) Major #2 + Major #3: transferred active lease cleared on RT does 0 frees, AND 100 churn cycles
+    //     with 63 open connections + gaps on ClosedConnections do 0 RT allocs/frees!
+    {
+        armd::diagnostics::alloc::time_this_thread();
+        let mut core = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        });
+        // Acquire a lease BEFORE handoff (legacy phase), then prewarm for RT transfer!
+        let _g0 = core.acquire_lease("connection:transferred-holder").unwrap();
+        core.rt_executor_owned = true;
+        core.prewarm_rt_buffers();
+        for id in 1..=63u64 {
+            core.register_live_connection(id).unwrap();
+        }
+        let now = Instant::now();
+        let _ = armd::diagnostics::alloc::take();
+
+        // Clear the transferred active lease on RT -> MUST do 0 frees / 0 allocs!
+        let _ = install_lease_disconnect(
+            &mut core,
+            &LeaseDisconnect {
+                connection: ConnectionHandle::try_new(0, "connection:transferred-holder").unwrap(),
+            },
+            now,
+        );
+        assert_eq!(
+            armd::diagnostics::alloc::take().calls,
+            0,
+            "clearing transferred active lease on RT must do 0 allocs/frees"
+        );
+
+        // 100 churn cycles of accept 64th (with non-contiguous IDs!) then close 64th -> 0 allocs!
+        for k in 0..100u64 {
+            let id = 100 + k * 2; // deliberate gaps every cycle
+            core.register_live_connection(id).unwrap();
+            core.mark_connection_closed(id);
+        }
+        assert_eq!(
+            armd::diagnostics::alloc::take().calls,
+            0,
+            "100 connection churn cycles with gaps must do 0 RT allocs/frees"
+        );
+    }
+
+    // (d) Major #8: committed preemption still delivers lease_lost(reason: "preempted") to evictee
+    //     even if the preemptor immediately disconnects!
+    {
+        let (sup, addr, handle) = setup_mode(
+            ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            },
+            OperatorAuth::disabled(),
+            true,
+        )
+        .await;
+        let handle = handle.unwrap();
+        let mut ws_holder = connect_ws(addr, "").await;
+        let g1 = ws_reply(
+            &mut ws_holder,
+            json!({"type": "acquire_lease", "client_id": "victim"}),
+            &["lease_granted"],
+        )
+        .await["generation"]
+            .as_u64()
+            .unwrap();
+
+        let mut ws_preemptor = connect_ws(addr, "").await;
+        // Wait for preemptor's slot to finish owner registration before preempting & dropping immediately.
+        wait_until(Duration::from_secs(2), || handle.live_connection_slots() == 2).await;
+        send(
+            &mut ws_preemptor,
+            json!({"type": "acquire_lease", "client_id": "hit_and_run", "force": true}),
+        )
+        .await;
+        // Wait briefly for the preempt request to reach the RT executor, then drop preemptor socket!
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        drop(ws_preemptor);
+
+        let lost = next_of(&mut ws_holder, &["lease_lost"]).await;
+        assert_eq!(lost["generation"], g1);
+        assert_eq!(lost["reason"], "preempted");
+
+        drop(ws_holder);
+        handle.stop_and_join();
+        drop(sup);
+    }
 }
