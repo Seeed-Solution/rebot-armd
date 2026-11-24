@@ -24,6 +24,7 @@ pub(crate) struct CandidateDriverLimits {
     min: [f32; crate::rt_core::mailbox::MAX_DOF],
     max: [f32; crate::rt_core::mailbox::MAX_DOF],
     vel: [f32; crate::rt_core::mailbox::MAX_DOF],
+    raw_pos: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
 }
 
 /// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
@@ -598,6 +599,9 @@ impl SupervisorInner {
         trigger_fault: bool,
     ) {
         self.driver_config_error = None;
+        for (i, slot) in self.cached_driver_pos_limits.iter_mut().enumerate() {
+            *slot = pos_limits.get(i).copied().flatten();
+        }
         let mut candidate = self.config.clone();
 
         for (i, limit) in candidate.limits.iter_mut().enumerate() {
@@ -761,7 +765,15 @@ impl SupervisorInner {
         };
         let mut lo = lim.min_position;
         let mut hi = lim.max_position;
-        if let Some(d) = self.driver.as_ref() {
+        if self.rt_executor_owned {
+            if let Some((d_min, d_max)) = self.cached_driver_pos_limits.get(g_idx).copied().flatten() {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        } else if let Some(d) = self.driver.as_ref() {
             let drv = d
                 .lock()
                 .map_err(|_| BoundedText::new("driver unavailable while validating gripper calibration"))?;
@@ -930,6 +942,7 @@ impl SupervisorInner {
             min: cand_min,
             max: cand_max,
             vel: cand_vel,
+            raw_pos: pos_limits,
         })
     }
 
@@ -940,6 +953,7 @@ impl SupervisorInner {
             self.config.limits[i].min_position = cand.min[i];
             self.config.limits[i].max_position = cand.max[i];
             self.config.limits[i].max_velocity = cand.vel[i];
+            self.cached_driver_pos_limits[i] = cand.raw_pos[i];
         }
         if let Some(prev) = self.driver_config_error.take() {
             if self.retired_driver_config_error.is_none() {

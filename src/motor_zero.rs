@@ -267,11 +267,11 @@ pub fn check_executor(
         return Err(CalibError::new(400, "UNSUPPORTED", format!("motor zero is not supported by this driver; use method \"software\" ({})",
             tool.support.notes.join("; "))));
     }
-    if method == "motor" && pub_cfg.has_driver {
+    if pub_cfg.has_driver {
         return Err(CalibError::new(
             503,
             "EXECUTOR_CAPABILITY_UNSUPPORTED",
-            "hardware motor zero requires synchronous CAN register I/O unsupported under the RT executor",
+            "hardware motor/software zero requires synchronous driver access unsupported under the RT executor",
         ));
     }
     if method == "software" && !tool.software {
@@ -315,6 +315,13 @@ pub fn check_restore_executor(
         .filter(|n| !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .ok_or_else(|| invalid("backup must be the name of a software zero backup (GET /api/v1/calibration backups)"))?.to_string();
     if body.as_object().is_some_and(|o| o.keys().any(|k| k != "backup")) { return Err(invalid("only the field backup is allowed")); }
+    if pub_cfg.has_driver {
+        return Err(CalibError::new(
+            503,
+            "EXECUTOR_CAPABILITY_UNSUPPORTED",
+            "hardware joint zero restore requires synchronous driver access unsupported under the RT executor",
+        ));
+    }
     if pub_cfg.config.zero_reference.is_none() { return Err(CalibError::new(400, "UNSUPPORTED", "the joint zero needs a profile zero_reference")); }
     if pub_cfg.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply, restore or zero is running")); }
     state_checks_obs(obs)?;
@@ -393,8 +400,26 @@ fn zero_entry_pub(
 /// The real run (after [`check`]; the caller holds the busy flags and clears them afterwards).
 pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
     if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
-        return run_executor(sup, deps, req).await;
+        return run_executor(sup, deps, req, None).await;
     }
+    run_legacy(sup, deps, req, check).await
+}
+
+/// Authority-bound run for WS/Executor calibration jobs carrying ingress [`CalibCommitAuth`].
+pub async fn run_with_auth(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    req: MotorZeroRequest,
+    check: &LeaseCheck,
+    auth: &crate::calibration::CalibCommitAuth,
+) -> Result<Value, CalibError> {
+    if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
+        return run_executor(sup, deps, req, Some(auth)).await;
+    }
+    run_legacy(sup, deps, req, check).await
+}
+
+async fn run_legacy(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
     if req.method.as_deref() == Some("software") { return run_software(sup, deps, req, check).await; }
     let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // 1. readings, then disable every motor (official sequence), torque stays off
@@ -575,8 +600,26 @@ pub fn check_restore(inner: &SupervisorInner, body: &Value) -> Result<String, Ca
 /// invalidates like a zero.
 pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: String, check: &LeaseCheck) -> Result<Value, CalibError> {
     if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
-        return restore_executor(sup, deps, name).await;
+        return restore_executor(sup, deps, name, None).await;
     }
+    restore_legacy(sup, deps, name, check).await
+}
+
+/// Authority-bound restore for WS/Executor calibration jobs carrying ingress [`CalibCommitAuth`].
+pub async fn restore_with_auth(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    name: String,
+    check: &LeaseCheck,
+    auth: &crate::calibration::CalibCommitAuth,
+) -> Result<Value, CalibError> {
+    if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
+        return restore_executor(sup, deps, name, Some(auth)).await;
+    }
+    restore_legacy(sup, deps, name, check).await
+}
+
+async fn restore_legacy(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: String, check: &LeaseCheck) -> Result<Value, CalibError> {
     let dir = deps.backup_dir.join(&name);
     let manifest: Value = std::fs::read_to_string(dir.join("manifest.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
         .ok_or_else(|| CalibError::new(404, "BACKUP_NOT_FOUND", format!("backup {name}: no manifest.json")))?;
@@ -607,16 +650,135 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: Str
     Ok(json!({"restored": name, "backup": backup.display().to_string(), "offsets_before": old, "offsets_after": new, "invalidated": inv}))
 }
 
-/// Executor-mode motor/software zero (never acquires `SupervisorLock`; fails closed on hardware motor zero).
+fn check_executor_auth(
+    sup: &ArmSupervisor,
+    auth: Option<&crate::calibration::CalibCommitAuth>,
+    step: &'static str,
+) -> Result<(), CalibError> {
+    let Some(a) = auth else { return Ok(()); };
+    if let Err((_, e)) = (a.off_thread_check)() {
+        return Err(e.at(step));
+    }
+    if Instant::now() > a.deadline {
+        return Err(CalibError::new(409, "DEADLINE_EXPIRED", "motor zero command deadline expired").at(step));
+    }
+    if sup.estop_epoch() != a.admission.estop_epoch {
+        return Err(CalibError::new(
+            409,
+            "EPOCH_MISMATCH",
+            "The epoch changed during motor zero (stop or e-stop)",
+        )
+        .at(step));
+    }
+    if sup.current_stop_gen() != a.admission.stop_gen {
+        return Err(CalibError::new(
+            409,
+            "STOPPED",
+            "An authorized stop intervened during motor zero",
+        )
+        .at(step));
+    }
+    Ok(())
+}
+
+async fn dispatch_set_joint_zero_offsets_executor(
+    sup: &Arc<ArmSupervisor>,
+    offsets: Vec<f32>,
+    auth: Option<&crate::calibration::CalibCommitAuth>,
+) -> Result<(), CalibError> {
+    use crate::rt_core::requests::config::{ConfigAuthContext, ConfigReply, ConfigRequest};
+    let applied = offsets.clone();
+    let precomputed_floor = sup
+        .published_config_hub()
+        .precompute_effective_floor_for_offsets(&offsets);
+    let auth_ctx = auth.map(|a| ConfigAuthContext {
+        admission: a.admission,
+        lease_holder: a.lease_holder,
+    });
+    let expected_stop_gen = auth.map(|a| a.admission.stop_gen);
+    let deadline = auth.map(|a| a.deadline);
+    let job_token = auth.and_then(|a| a.job_token);
+    match sup
+        .dispatch_config_request_owned_reliable(ConfigRequest::SetJointZeroOffsets {
+            offsets,
+            precomputed_floor,
+            auth: auth_ctx,
+            expected_stop_gen,
+            deadline,
+            job_token,
+        })
+        .await
+    {
+        Ok(ConfigReply::JointZeroOffsetsSet(Ok(()))) => {
+            sup.published_config_hub().apply_joint_zero_offsets(&applied);
+            Ok(())
+        }
+        Ok(ConfigReply::JointZeroOffsetsSet(Err(e))) => Err(e.to_calib_error()),
+        Err(e) => Err(e.to_calib_error()),
+        _ => Err(CalibError::new(500, "INTERNAL", "unexpected SetJointZeroOffsets reply")),
+    }
+}
+
+async fn dispatch_set_motor_zero_executor(
+    sup: &Arc<ArmSupervisor>,
+    joint: usize,
+    auth: Option<&crate::calibration::CalibCommitAuth>,
+) -> Result<(), CalibError> {
+    use crate::rt_core::requests::config::{ConfigAuthContext, ConfigReply, ConfigRequest};
+    let auth_ctx = auth.map(|a| ConfigAuthContext {
+        admission: a.admission,
+        lease_holder: a.lease_holder,
+    });
+    let expected_stop_gen = auth.map(|a| a.admission.stop_gen);
+    let deadline = auth.map(|a| a.deadline);
+    let job_token = auth.and_then(|a| a.job_token);
+    match sup
+        .dispatch_config_request_owned_reliable(ConfigRequest::SetMotorZero {
+            joint,
+            auth: auth_ctx,
+            expected_stop_gen,
+            deadline,
+            job_token,
+        })
+        .await
+    {
+        Ok(ConfigReply::MotorZeroSet(Ok(()))) => Ok(()),
+        Ok(ConfigReply::MotorZeroSet(Err(e))) => Err(e.to_calib_error()),
+        Err(e) => Err(e.to_calib_error()),
+        _ => Err(CalibError::new(500, "INTERNAL", "unexpected SetMotorZero reply")),
+    }
+}
+
+/// Probe writability of `calibration.json`'s parent directory before mutating live offsets so
+/// unwritable calibration paths fail closed with zero live-state mutation.
+async fn verify_calib_path_writable(path: &std::path::Path) -> Result<(), CalibError> {
+    let p = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let probe = crate::persist::StagedWrite::stage(p, String::new())?;
+        probe.abort();
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration path probe failed: {e}; nothing was changed")))?
+    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration path not writable: {e}; nothing was changed")))
+}
+
+/// Executor-mode motor/software zero (never acquires `SupervisorLock`; fails closed on hardware
+/// driver access, carries job-bound authority to every owner mutation, and propagates persistence errors).
 async fn run_executor(
     sup: &Arc<ArmSupervisor>,
     deps: &CalibrationDeps,
     req: MotorZeroRequest,
+    auth: Option<&crate::calibration::CalibCommitAuth>,
 ) -> Result<Value, CalibError> {
     let pub_cfg = sup.published_config().await.map_err(|e| CalibError::new(503, "CONFIG_UNAVAILABLE", e.to_string()))?;
-    let Some(handle) = sup.executor_handle() else {
-        return Err(CalibError::new(503, "EXECUTOR_UNAVAILABLE", "RT executor is unavailable"));
-    };
+    if pub_cfg.has_driver {
+        return Err(CalibError::new(
+            503,
+            "EXECUTOR_CAPABILITY_UNSUPPORTED",
+            "hardware motor/software zero requires synchronous driver access unsupported under the RT executor",
+        ));
+    }
     let latest_obs = || {
         sup.hub()
             .latest()
@@ -630,6 +792,7 @@ async fn run_executor(
         let t0 = Instant::now();
         let (mut sum, mut lo, mut hi, mut count) = (vec![0.0f64; n], vec![f32::INFINITY; n], vec![f32::NEG_INFINITY; n], 0u32);
         while t0.elapsed() < crate::joint_zero::SOFTWARE_CAPTURE || count == 0 {
+            check_executor_auth(sup, auth, "capture")?;
             let obs = latest_obs()?;
             state_checks_obs(&obs)?;
             let q = readings_obs(&pub_cfg, &obs)?;
@@ -650,20 +813,19 @@ async fn run_executor(
         if let Some(j) = req.joints.iter().find(|&&j| f64::from(new[j].abs()) > crate::joint_zero::MAX_OFFSET_RAD) {
             return Err(CalibError::new(409, "MOTOR_ZERO_FAR", format!("J{} would need a joint zero offset of {:.1} deg; nothing was changed", j + 1, f64::from(new[*j]).to_degrees())));
         }
+        check_executor_auth(sup, auth, "backup")?;
+        verify_calib_path_writable(&deps.path).await?;
         let backup = write_zero_backup(deps, "software_zero", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}; nothing was changed")))?;
         let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+        check_executor_auth(sup, auth, "apply")?;
         crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, "software").await?;
-        handle
-            .set_joint_zero_offsets_async(new.clone())
-            .await
-            .map_err(|e| CalibError::new(503, "EXECUTOR_STOPPED", format!("{e:?}")))?
-            .map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))?;
+        dispatch_set_joint_zero_offsets_executor(sup, new.clone(), auth).await.map_err(|e| e.at("apply"))?;
         let rows = verify_executor(sup, &req, &before, &r).await;
         let verified = rows.iter().all(|r| r["verified"] == json!(true));
         let zeroed: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
         let changes: Vec<f32> = req.joints.iter().map(|&j| r[j] - before[j]).collect();
         let entry = zero_entry_pub(&pub_cfg, &new, "software");
-        let inv = crate::calibration::invalidate_after_zero(sup, deps, &zeroed, &changes, "software", entry).await;
+        let inv = crate::calibration::invalidate_after_zero_strict(sup, deps, &zeroed, &changes, "software", entry).await?;
         let log = write_log(deps, &started, &req, &before, &rows, if verified { "verified" } else { "unverified" }, &inv).await;
         let mut out = json!({"joints": rows, "invalidated": inv, "log": log, "zero_method": "software", "persist": "calibration_file", "persist_verified": true,
             "torque": "off", "backup": backup.display().to_string(), "offsets_before": old, "offsets_after": new});
@@ -676,14 +838,8 @@ async fn run_executor(
         return Ok(out);
     }
 
-    if pub_cfg.has_driver {
-        return Err(CalibError::new(
-            503,
-            "EXECUTOR_CAPABILITY_UNSUPPORTED",
-            "hardware motor zero requires synchronous CAN register I/O unsupported under the RT executor",
-        ));
-    }
     let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    check_executor_auth(sup, auth, "disable")?;
     let obs0 = latest_obs()?;
     state_checks_obs(&obs0)?;
     let before = readings_obs(&pub_cfg, &obs0)?;
@@ -696,17 +852,10 @@ async fn run_executor(
     for (k, &j) in req.joints.iter().enumerate() {
         if k > 0 { tokio::time::sleep(COMMAND_SPACING).await; }
         let res = async {
-            handle
-                .set_motor_zero_async(j)
-                .await
-                .map_err(|e| CalibError::new(503, "EXECUTOR_STOPPED", format!("{e:?}")))?
-                .map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", format!("J{}: {e}", j + 1)))?;
+            check_executor_auth(sup, auth, "set_zero")?;
+            dispatch_set_motor_zero_executor(sup, j, auth).await?;
             off[j] = -r[j];
-            handle
-                .set_joint_zero_offsets_async(off.clone())
-                .await
-                .map_err(|e| CalibError::new(503, "EXECUTOR_STOPPED", format!("{e:?}")))?
-                .map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", format!("J{} offset: {e}", j + 1)))
+            dispatch_set_joint_zero_offsets_executor(sup, off.clone(), auth).await
         }.await;
         match res {
             Ok(()) => sent.push(j),
@@ -719,7 +868,7 @@ async fn run_executor(
     let zeroed: Vec<usize> = sent.iter().map(|j| j + 1).collect();
     let changes: Vec<f32> = sent.iter().map(|j| r[*j] - before[*j]).collect();
     let entry = zero_entry_pub(&pub_cfg, &off, "motor");
-    let inv = crate::calibration::invalidate_after_zero(sup, deps, &zeroed, &changes, "motor", entry).await;
+    let inv = crate::calibration::invalidate_after_zero_strict(sup, deps, &zeroed, &changes, "motor", entry).await?;
     let result = if failure.is_some() { "partial" } else if verified { "verified" } else { "unverified" };
     let log = write_log(deps, &started, &req, &before, &rows, result, &inv).await;
     if let Some(mut e) = failure {
@@ -759,11 +908,21 @@ async fn verify_executor(sup: &ArmSupervisor, req: &MotorZeroRequest, before: &[
     }
 }
 
-async fn restore_executor(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: String) -> Result<Value, CalibError> {
+async fn restore_executor(
+    sup: &Arc<ArmSupervisor>,
+    deps: &CalibrationDeps,
+    name: String,
+    auth: Option<&crate::calibration::CalibCommitAuth>,
+) -> Result<Value, CalibError> {
     let pub_cfg = sup.published_config().await.map_err(|e| CalibError::new(503, "CONFIG_UNAVAILABLE", e.to_string()))?;
-    let Some(handle) = sup.executor_handle() else {
-        return Err(CalibError::new(503, "EXECUTOR_UNAVAILABLE", "RT executor is unavailable"));
-    };
+    if pub_cfg.has_driver {
+        return Err(CalibError::new(
+            503,
+            "EXECUTOR_CAPABILITY_UNSUPPORTED",
+            "hardware joint zero restore requires synchronous driver access unsupported under the RT executor",
+        ));
+    }
+    check_executor_auth(sup, auth, "restore")?;
     let dir = deps.backup_dir.join(&name);
     let manifest: Value = std::fs::read_to_string(dir.join("manifest.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
         .ok_or_else(|| CalibError::new(404, "BACKUP_NOT_FOUND", format!("backup {name}: no manifest.json")))?;
@@ -780,17 +939,16 @@ async fn restore_executor(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name
     if let Some(z) = &target { z.validate(Some(n)).map_err(|e| invalid(format!("backup {name}: {e}")))?; }
     let old = pub_cfg.joint_zero_offsets.clone();
     let changed: Vec<usize> = (0..old.len()).filter(|&j| old.get(j) != new.get(j)).map(|j| j + 1).collect();
+    check_executor_auth(sup, auth, "backup")?;
+    verify_calib_path_writable(&deps.path).await?;
     let backup = write_zero_backup(deps, "joint_zero_restore", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}; nothing was changed")))?;
+    check_executor_auth(sup, auth, "apply")?;
     crate::calibration::invalidate_mit_before_zero(sup, deps, &changed, "restored").await?;
-    handle
-        .set_joint_zero_offsets_async(new.clone())
-        .await
-        .map_err(|e| CalibError::new(503, "EXECUTOR_STOPPED", format!("{e:?}")))?
-        .map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))?;
+    dispatch_set_joint_zero_offsets_executor(sup, new.clone(), auth).await.map_err(|e| e.at("apply"))?;
     let joints: Vec<usize> = (0..new.len()).filter(|&j| old[j] != new[j]).collect();
     let changes: Vec<f32> = joints.iter().map(|&j| old[j] - new[j]).collect();
     let entry = Some(target.filter(|z| !z.is_zero()));
-    let inv = crate::calibration::invalidate_after_zero(sup, deps, &joints.iter().map(|j| j + 1).collect::<Vec<_>>(), &changes, "restored", entry).await;
+    let inv = crate::calibration::invalidate_after_zero_strict(sup, deps, &joints.iter().map(|j| j + 1).collect::<Vec<_>>(), &changes, "restored", entry).await?;
     Ok(json!({"restored": name, "backup": backup.display().to_string(), "offsets_before": old, "offsets_after": new, "invalidated": inv}))
 }
 

@@ -130,6 +130,10 @@ pub struct CollisionObservation {
     pub trips_in_window: u32,
     pub enabled: bool,
     pub sensitivity: Sensitivity,
+    /// Config revision at which this observation was produced (omitted from wire JSON; used to
+    /// prevent mixed-revision REST collision snapshots).
+    #[serde(skip)]
+    pub config_revision: u64,
 }
 
 /// The protective stop in force.
@@ -343,6 +347,7 @@ impl SupervisorInner {
             trips_in_window: self.collision.trips_in_window(now, p.escalate_window_s),
             enabled: true,
             sensitivity: self.collision.sensitivity,
+            config_revision: self.collision.revision,
         })
     }
 

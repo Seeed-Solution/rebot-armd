@@ -144,7 +144,9 @@ pub(super) fn calibration_job(
         if let Some(reply) = dry {
             return Ok(CalibStart::Reply(reply));
         }
+        let token = crate::rt_core::requests::config::next_calib_job_token();
         inner.calibration_busy = true;
+        inner.calibration_busy_token = Some(token);
         inner.motor_zero_busy = true;
         return Ok(CalibStart::Job(CalibJob::MotorZero(req), true));
     }
@@ -154,12 +156,16 @@ pub(super) fn calibration_job(
     }
     if path == crate::mit::QUALIFICATION_PATH {
         let file = inner.mit_qualification_check(body)?;
+        let token = crate::rt_core::requests::config::next_calib_job_token();
         inner.calibration_busy = true;
+        inner.calibration_busy_token = Some(token);
         return Ok(CalibStart::Job(CalibJob::MitQualification(Box::new(file)), true));
     }
     if path == crate::motor_zero::RESTORE_PATH {
         let name = crate::motor_zero::check_restore(inner, body)?;
+        let token = crate::rt_core::requests::config::next_calib_job_token();
         inner.calibration_busy = true;
+        inner.calibration_busy_token = Some(token);
         inner.motor_zero_busy = true;
         return Ok(CalibStart::Job(CalibJob::JointZeroRestore(name), true));
     }
@@ -182,7 +188,9 @@ pub(super) fn calibration_job(
     };
     let busy = !matches!(&job, CalibJob::Apply(r) if r.dry_run);
     if busy {
+        let token = crate::rt_core::requests::config::next_calib_job_token();
         inner.calibration_busy = true;
+        inner.calibration_busy_token = Some(token);
     }
     Ok(CalibStart::Job(job, busy))
 }
@@ -272,15 +280,16 @@ pub(super) async fn dispatch_executor_calibration_command(
         if let Some(reply) = dry {
             return Some(fields_ack(&request_id, reply));
         }
-        if let Err(e) = set_calibration_busy_owner(recv_supervisor, true, true, None).await {
-            return Some(calibration_reject(&request_id, &e));
-        }
-        spawn_calibration_job(
+        let guard = match acquire_calibration_busy_owner(recv_supervisor, true, None).await {
+            Ok(g) => g,
+            Err(e) => return Some(calibration_reject(&request_id, &e)),
+        };
+        spawn_calibration_job_with_guard(
             request_id,
             CalibJob::MotorZero(req),
             local_generation,
             epoch,
-            true,
+            Some(guard),
             stamp,
             conn_id,
             recv_supervisor,
@@ -318,15 +327,16 @@ pub(super) async fn dispatch_executor_calibration_command(
             Ok(n) => n,
             Err(e) => return Some(calibration_reject(&request_id, &e)),
         };
-        if let Err(e) = set_calibration_busy_owner(recv_supervisor, true, true, None).await {
-            return Some(calibration_reject(&request_id, &e));
-        }
-        spawn_calibration_job(
+        let guard = match acquire_calibration_busy_owner(recv_supervisor, true, None).await {
+            Ok(g) => g,
+            Err(e) => return Some(calibration_reject(&request_id, &e)),
+        };
+        spawn_calibration_job_with_guard(
             request_id,
             CalibJob::JointZeroRestore(name),
             local_generation,
             epoch,
-            true,
+            Some(guard),
             stamp,
             conn_id,
             recv_supervisor,
@@ -361,10 +371,9 @@ pub(super) async fn dispatch_executor_calibration_command(
         (CalibJob::Restore(body.clone()), true, false)
     };
 
-    if busy {
-        if let Err(e) = set_calibration_busy_owner(
+    let guard = if busy {
+        match acquire_calibration_busy_owner(
             recv_supervisor,
-            true,
             false,
             Some(CalibBeginCheck {
                 check_grasp: true,
@@ -373,7 +382,8 @@ pub(super) async fn dispatch_executor_calibration_command(
         )
         .await
         {
-            return Some(calibration_reject(&request_id, &e));
+            Ok(g) => Some(g),
+            Err(e) => return Some(calibration_reject(&request_id, &e)),
         }
     } else {
         // Dry-run still requires grasp setup & non-busy/idle checks via PublishedConfig.
@@ -402,14 +412,15 @@ pub(super) async fn dispatch_executor_calibration_command(
                 &crate::calibration::CalibError::new(400, "UNSUPPORTED", "This profile has no grasp setup"),
             ));
         }
-    }
+        None
+    };
 
-    spawn_calibration_job(
+    spawn_calibration_job_with_guard(
         request_id,
         job,
         local_generation,
         epoch,
-        busy,
+        guard,
         stamp,
         conn_id,
         recv_supervisor,
@@ -423,31 +434,48 @@ pub(super) async fn dispatch_executor_calibration_command(
     None
 }
 
-async fn set_calibration_busy_owner(
+async fn acquire_calibration_busy_owner(
     sup: &Arc<ArmSupervisor>,
-    busy: bool,
     motor_zero: bool,
     check_begin: Option<CalibBeginCheck>,
-) -> Result<(), crate::calibration::CalibError> {
-    match sup
-        .dispatch_config_request(ConfigRequest::SetCalibrationBusy {
-            busy,
-            motor_zero,
-            check_begin,
-        })
-        .await
-    {
-        Ok(ConfigReply::CalibrationBusySet(Ok(_))) => {
-            sup.published_config_hub()
-                .update(|cfg| cfg.calibration_busy = busy);
-            Ok(())
-        }
-        Ok(ConfigReply::CalibrationBusySet(Err(e))) => Err(e.to_calib_error()),
-        Err(e) => Err(e.to_calib_error()),
-        _ => Err(crate::calibration::CalibError::new(
+) -> Result<crate::calibration::BusyGuard, crate::calibration::CalibError> {
+    let job_token = crate::rt_core::requests::config::next_calib_job_token();
+    let sup_w = Arc::clone(sup);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Run acquisition inside a detached task so caller cancellation between enqueue and reply
+    // still constructs and drops `BusyGuard` cleanly, never stranding `calibration_busy`.
+    tokio::spawn(async move {
+        let res = match sup_w
+            .dispatch_config_request(ConfigRequest::SetCalibrationBusy {
+                busy: true,
+                motor_zero,
+                job_token,
+                check_begin,
+            })
+            .await
+        {
+            Ok(ConfigReply::CalibrationBusySet(Ok(_))) => {
+                sup_w
+                    .published_config_hub()
+                    .update(|cfg| cfg.calibration_busy = true);
+                Ok(crate::calibration::BusyGuard::new_with_token(sup_w, job_token))
+            }
+            Ok(ConfigReply::CalibrationBusySet(Err(e))) => Err(e.to_calib_error()),
+            Err(e) => Err(e.to_calib_error()),
+            _ => Err(crate::calibration::CalibError::new(
+                500,
+                "INTERNAL",
+                "unexpected calibration busy reply",
+            )),
+        };
+        let _ = tx.send(res);
+    });
+    match rx.await {
+        Ok(res) => res,
+        Err(_) => Err(crate::calibration::CalibError::new(
             500,
             "INTERNAL",
-            "unexpected calibration busy reply",
+            "calibration busy acquisition task aborted",
         )),
     }
 }
@@ -460,6 +488,42 @@ pub(super) fn spawn_calibration_job(
     generation: u64,
     epoch: u64,
     busy: bool,
+    stamp: AdmissionStamp,
+    conn_id: u64,
+    recv_supervisor: &Arc<ArmSupervisor>,
+    recv_calib: &crate::calibration::CalibrationDeps,
+    recv_connection: &str,
+    recv_generation: &Arc<AtomicU64>,
+    ack_tx: &mpsc::Sender<Value>,
+    ws_auth: &WsAuth,
+    worker_tasks: &ConnectionTasks,
+) {
+    let guard = busy.then(|| crate::calibration::BusyGuard::new(recv_supervisor.clone()));
+    spawn_calibration_job_with_guard(
+        request_id,
+        job,
+        generation,
+        epoch,
+        guard,
+        stamp,
+        conn_id,
+        recv_supervisor,
+        recv_calib,
+        recv_connection,
+        recv_generation,
+        ack_tx,
+        ws_auth,
+        worker_tasks,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_calibration_job_with_guard(
+    request_id: Value,
+    job: CalibJob,
+    generation: u64,
+    epoch: u64,
+    guard: Option<crate::calibration::BusyGuard>,
     mut stamp: AdmissionStamp,
     conn_id: u64,
     recv_supervisor: &Arc<ArmSupervisor>,
@@ -473,6 +537,8 @@ pub(super) fn spawn_calibration_job(
     stamp.connection_id = conn_id;
     stamp.lease_gen = generation;
     stamp.estop_epoch = epoch;
+    let job_token = guard.as_ref().map(|g| g.job_token()).filter(|&t| t != 0);
+    let ingress_deadline = std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
 
     let (sup, calib, conn, gen_now, tx) = (
         recv_supervisor.clone(),
@@ -539,9 +605,9 @@ pub(super) fn spawn_calibration_job(
                 }
                 Ok(())
             }),
+            job_token,
+            deadline: ingress_deadline,
         };
-        // the busy flag is released by the guard, also when the job panics
-        let guard = busy.then(|| crate::calibration::BusyGuard::new(sup.clone()));
         let job_sup = sup.clone();
         let (job_tx, job_rx) = tokio::sync::oneshot::channel();
         let job_abort = tasks_c.spawn_abortable(async move {
@@ -553,10 +619,10 @@ pub(super) fn spawn_calibration_job(
                     crate::calibration::restore_with_auth(&job_sup, &calib, &body, &check, &auth).await
                 }
                 CalibJob::MotorZero(req) => {
-                    crate::motor_zero::run(&job_sup, &calib, req, &check).await
+                    crate::motor_zero::run_with_auth(&job_sup, &calib, req, &check, &auth).await
                 }
                 CalibJob::JointZeroRestore(name) => {
-                    crate::motor_zero::restore(&job_sup, &calib, name, &check).await
+                    crate::motor_zero::restore_with_auth(&job_sup, &calib, name, &check, &auth).await
                 }
                 CalibJob::MitQualification(file) => {
                     crate::mit::store_qualification(&job_sup, &calib, *file, &check).await

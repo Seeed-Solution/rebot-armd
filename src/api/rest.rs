@@ -849,10 +849,16 @@ pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<R
 /// `GET /api/v1/safety/collision`: effective collision guard config (scaled thresholds).
 pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Response, ApiError> {
     let pub_cfg = supervisor.published_config().await?;
-    let live_active = supervisor
-        .hub()
-        .latest()
-        .map(|s| s.obs.collision.is_some_and(|c| c.active));
+    let live_active = if !pub_cfg.collision_enabled {
+        Some(false)
+    } else {
+        supervisor.hub().latest().and_then(|s| {
+            s.obs
+                .collision
+                .filter(|c| c.config_revision == pub_cfg.collision_revision)
+                .map(|c| c.active)
+        })
+    };
     Ok(Json(pub_cfg.collision_config(live_active)).into_response())
 }
 
@@ -891,8 +897,8 @@ pub async fn post_tool_commissioning_confirm(
     use crate::model::HolderLabel;
     use crate::rt_core::config_iface::ConfigDomain;
     use crate::rt_core::requests::config::{
-        build_config_proposal, capture_config_admission, run_config_commit, ConfigAuthContext,
-        ConfigCandidate, ConfigCommitPlan, ReservePrecheck,
+        capture_config_admission, run_config_commit, ConfigAuthContext, ConfigCandidate,
+        ConfigCommitPlan, ReservePrecheck,
     };
     let Json(body) = payload.map_err(|e| {
         ApiError(
@@ -914,18 +920,32 @@ pub async fn post_tool_commissioning_confirm(
     active_tool.commissioning_required = false;
     let write = prepared.write.take();
     let confirmed_at_pub = prepared.confirmed_at.clone();
-    let proposal = build_config_proposal(
+    let ingress_deadline = std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
+    let write_op = match write {
+        Some(w) => {
+            let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(w.path, w.text))
+                .await
+                .map_err(|e| ApiError::persist_failed(format!("Failed to persist configuration: {e}")))?
+                .map_err(|e| ApiError::persist_failed(format!("Failed to persist configuration: {e}")))?;
+            crate::rt_core::requests::config::ConfigWriteOp::Staged(staged)
+        }
+        None => crate::rt_core::requests::config::ConfigWriteOp::Volatile,
+    };
+    let mut commit_admission = admission;
+    commit_admission.stop_gen = supervisor.current_stop_gen();
+    let proposal = crate::rt_core::requests::config::build_config_proposal_with_deadline(
         &supervisor,
         ConfigDomain::ToolCommissioning,
         prepared.base_revision,
-        admission,
+        commit_admission,
         0,
         pub_cfg.workspace_revision,
+        ingress_deadline,
     );
     let plan = ConfigCommitPlan {
         proposal,
         auth: ConfigAuthContext {
-            admission,
+            admission: commit_admission,
             lease_holder: None,
         },
         precheck: ReservePrecheck::ToolCommissioning {
@@ -937,13 +957,14 @@ pub async fn post_tool_commissioning_confirm(
             tool_config_digest: HolderLabel::new(&prepared.tool_config_digest),
             confirmed_at: prepared.confirmed_at,
         },
-        write,
-        refresh_commit_window_after_stage: true,
+        write: write_op,
+        expected_workspace_revision: None,
+        expected_poses_revision: None,
     };
     let outcome = run_config_commit(
         &supervisor,
         plan,
-        || {
+        move || {
             if auth.is_enforced() && !auth.is_operator(token.as_deref()) {
                 Err((
                     "OPERATOR_REQUIRED",
@@ -957,7 +978,7 @@ pub async fn post_tool_commissioning_confirm(
                 Ok(())
             }
         },
-        |cfg, act| {
+        move |cfg, act| {
             cfg.config.active_tool.commissioning_required = false;
             cfg.tool_commissioning_confirmed_at = Some(confirmed_at_pub);
             cfg.tool_commissioning_revision = act.revision;

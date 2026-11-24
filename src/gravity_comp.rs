@@ -344,7 +344,7 @@ impl SupervisorInner {
     }
 
     /// Zero-allocation RT exit from gravity compensation (does not trace or write synchronously on RT).
-    pub(crate) fn exit_gravity_comp_rt(&mut self, code: &'static str, message: &'static str) {
+    pub(crate) fn exit_gravity_comp_rt(&mut self, code: &'static str, message: &str) {
         let Some(run) = self.gravity_comp.as_mut() else { return; };
         if !run.phase.floating() { return; }
         let measured = arm6(&self.measured_positions);
@@ -592,41 +592,79 @@ impl SupervisorInner {
         self.gravity_comp_targets_array()
     }
 
-    fn gravity_comp_exit_cause(&mut self, dt: f64) -> Option<(&'static str, String)> {
+    fn gravity_comp_exit_cause(&mut self, dt: f64) -> Option<(&'static str, crate::model::HolderLabel)> {
+        use crate::model::HolderLabel;
+        let fmt_label = |f: &mut dyn FnMut(&mut crate::safety::BoundedText<128>)| -> HolderLabel {
+            let mut buf = crate::safety::BoundedText::<128>::new("");
+            f(&mut buf);
+            HolderLabel::new(buf.as_str())
+        };
         let run = self.gravity_comp.as_ref()?;
         let policy = &run.policy;
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
-            return Some(("ESTOP", "E-stop".into()));
+            return Some(("ESTOP", HolderLabel::new("E-stop")));
         }
         match self.safety.state() {
-            SafetyState::Fault(FaultReason::BusLoss) => return Some(("BUS_LOSS", "CAN feedback lost".into())),
-            SafetyState::Fault(FaultReason::WatchdogTimeout) => return Some(("WATCHDOG", "Lease watchdog".into())),
-            SafetyState::Fault(r) => return Some(("FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
+            SafetyState::Fault(FaultReason::BusLoss) => return Some(("BUS_LOSS", HolderLabel::new("CAN feedback lost"))),
+            SafetyState::Fault(FaultReason::WatchdogTimeout) => return Some(("WATCHDOG", HolderLabel::new("Lease watchdog"))),
+            SafetyState::Fault(r) => {
+                let msg = match r {
+                    FaultReason::Other(m) => HolderLabel::new(m.as_str()),
+                    _ => HolderLabel::new("Fault"),
+                };
+                return Some(("FAULT", msg));
+            }
             _ => {}
         }
-        if !self.is_torqued || self.disable_pending { return Some(("TORQUE_LOST", "Torque is off".into())); }
+        if !self.is_torqued || self.disable_pending {
+            return Some(("TORQUE_LOST", HolderLabel::new("Torque is off")));
+        }
         if let Some(d) = &self.driver {
             let enabled = d.lock().is_ok_and(|drv| !drv.capabilities().enable_feedback || drv.enable_state() == EnableState::Enabled);
-            if !enabled { return Some(("TORQUE_LOST", "Motors no longer report enabled".into())); }
+            if !enabled {
+                return Some(("TORQUE_LOST", HolderLabel::new("Motors no longer report enabled")));
+            }
         }
         if self.lease_enabled {
             if self.last_heartbeat.elapsed() > self.lease_timeout {
-                return Some(("WATCHDOG", format!("No heartbeat for {} ms", self.lease_timeout.as_millis())));
+                let ms = self.lease_timeout.as_millis();
+                return Some((
+                    "WATCHDOG",
+                    fmt_label(&mut |b| {
+                        let _ = core::fmt::write(b, format_args!("No heartbeat for {ms} ms"));
+                    }),
+                ));
             }
             let generation = self.active_lease.as_ref().map(|l| l.generation);
             if generation != run.lease_generation || !self.is_lease_active() || self.handover_settling_since.is_some() {
-                return Some(("LEASE_LOST", "Control lease lost, released or taken over".into()));
+                return Some(("LEASE_LOST", HolderLabel::new("Control lease lost, released or taken over")));
             }
         }
         if !self.feedback_numeric_valid || !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
-            return Some(("FEEDBACK_STALE", format!("Feedback older than {} ms", policy.feedback_max_age_ms)));
+            let max_ms = policy.feedback_max_age_ms;
+            return Some((
+                "FEEDBACK_STALE",
+                fmt_label(&mut |b| {
+                    let _ = core::fmt::write(b, format_args!("Feedback older than {max_ms} ms"));
+                }),
+            ));
         }
-        if let Some(msg) = self.gravity_comp_near_limit(policy) { return Some(("GRAVITY_COMP_JOINT_LIMIT", msg.to_string())); }
+        if let Some(msg) = self.gravity_comp_near_limit(policy) {
+            return Some(("GRAVITY_COMP_JOINT_LIMIT", HolderLabel::new(msg.as_str())));
+        }
         if run.phase == GravityCompPhase::RampIn {
             if let Some((i, d)) = (0..ARM).map(|i| (i, (self.measured_positions[i] - run.entry_pose[i]).abs()))
                 .find(|(_, d)| !d.is_finite() || *d > policy.ramp_max_deviation_rad) {
-                return Some(("GRAVITY_COMP_SAG", format!(
-                    "Joint {} moved {d:.3} rad during the ramp-in (limit {} rad): the model does not hold the arm", i + 1, policy.ramp_max_deviation_rad)));
+                let lim = policy.ramp_max_deviation_rad;
+                return Some((
+                    "GRAVITY_COMP_SAG",
+                    fmt_label(&mut |b| {
+                        let _ = core::fmt::write(
+                            b,
+                            format_args!("Joint {} moved {d:.3} rad during the ramp-in (limit {lim} rad): the model does not hold the arm", i + 1),
+                        );
+                    }),
+                ));
             }
         }
         // Speed: reported velocity, and the position difference over the tick (independent
@@ -652,9 +690,17 @@ impl SupervisorInner {
         match fastest {
             Some((i, speed, limit)) => {
                 run.overspeed_count += 1;
-                if run.overspeed_count >= overspeed_ticks {
-                    return Some(("GRAVITY_COMP_OVERSPEED", format!(
-                        "Joint {} at {speed:.2} rad/s for {} ticks (limit {limit} rad/s)", i + 1, run.overspeed_count)));
+                let count = run.overspeed_count;
+                if count >= overspeed_ticks {
+                    return Some((
+                        "GRAVITY_COMP_OVERSPEED",
+                        fmt_label(&mut |b| {
+                            let _ = core::fmt::write(
+                                b,
+                                format_args!("Joint {} at {speed:.2} rad/s for {count} ticks (limit {limit} rad/s)", i + 1),
+                            );
+                        }),
+                    ));
                 }
             }
             None => run.overspeed_count = 0,
@@ -671,7 +717,11 @@ impl SupervisorInner {
         match phase {
             GravityCompPhase::RampIn | GravityCompPhase::Active => {
                 if let Some((code, message)) = self.gravity_comp_exit_cause(dt) {
-                    self.exit_gravity_comp_inner(code, message, false);
+                    if self.rt_executor_owned {
+                        self.exit_gravity_comp_rt(code, message.as_str());
+                    } else {
+                        self.exit_gravity_comp_inner(code, message.as_str(), false);
+                    }
                     return;
                 }
                 let model = {
@@ -679,7 +729,11 @@ impl SupervisorInner {
                     self.gravity_comp_model_torque(&run.policy, run.scale)
                 };
                 let Some(model) = model else {
-                    self.exit_gravity_comp_inner("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed", false);
+                    if self.rt_executor_owned {
+                        self.exit_gravity_comp_rt("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed");
+                    } else {
+                        self.exit_gravity_comp_inner("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed", false);
+                    }
                     return;
                 };
                 let measured = arm6(&self.measured_positions);

@@ -21,9 +21,9 @@ use crate::motion::MotionError;
 use crate::persist::PendingWrite;
 use crate::rt_core::config_iface::ConfigDomain;
 use crate::rt_core::requests::config::{
-    build_config_proposal, gravity_comp_command, prepare_eval_bufs_off_thread, run_config_commit,
-    ConfigAuthContext, ConfigCandidate, ConfigCommitPlan, ConfigReply, ConfigRequest,
-    PublishedConfig, ReservePrecheck,
+    gravity_comp_command, prepare_eval_bufs_off_thread, run_config_commit, ConfigAuthContext,
+    ConfigCandidate, ConfigCommitPlan, ConfigReply, ConfigRequest, PublishedConfig,
+    ReservePrecheck,
 };
 use crate::supervisor::AdmissionStamp;
 
@@ -1063,9 +1063,40 @@ async fn commit_prepared_config(
         }
     }
 
-    let proposal = build_config_proposal(&sup, domain, base_revision, stamp, generation, ws_rev);
+    let ingress_deadline = std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
+    let write_op = match write {
+        Some(w) => {
+            let staged_res = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(w.path, w.text))
+                .await
+                .map_err(|e| format!("Failed to persist configuration: {e}"))
+                .and_then(|r| r.map_err(|e| format!("Failed to persist configuration: {e}")));
+            match staged_res {
+                Ok(s) => crate::rt_core::requests::config::ConfigWriteOp::Staged(s),
+                Err(msg) => {
+                    let cur_epoch = current_epoch_off_lock(&sup, epoch);
+                    return off_lock_command_reject(&request_id, cur_epoch, ApiError::persist_failed(msg));
+                }
+            }
+        }
+        None => crate::rt_core::requests::config::ConfigWriteOp::Volatile,
+    };
+
+    // Non-motion WS config writes are not cancelled by `/api/v1/motion/stop` during disk staging,
+    // while preserving the original ingress deadline, epoch, lease_generation, and connection_id;
+    // any stop/lease/epoch/deadline change from Reserve onward is enforced by the live owner.
+    let mut commit_stamp = stamp;
+    commit_stamp.stop_gen = sup.current_stop_gen();
+    let proposal = crate::rt_core::requests::config::build_config_proposal_with_deadline(
+        &sup,
+        domain,
+        base_revision,
+        commit_stamp,
+        generation,
+        ws_rev,
+        ingress_deadline,
+    );
     let auth = ConfigAuthContext {
-        admission: stamp,
+        admission: commit_stamp,
         lease_holder: Some((HolderLabel::new(&conn), generation)),
     };
 
@@ -1220,13 +1251,19 @@ async fn commit_prepared_config(
         ),
     };
 
+    let expected_workspace_revision = match &candidate {
+        ConfigCandidate::Keepout { .. } => Some(ws_rev),
+        ConfigCandidate::GraspSetup { ws_eval_bufs: Some(_), .. } => Some(ws_rev),
+        _ => None,
+    };
     let plan = ConfigCommitPlan {
         proposal,
         auth,
         precheck,
         candidate,
-        write,
-        refresh_commit_window_after_stage: true,
+        write: write_op,
+        expected_workspace_revision,
+        expected_poses_revision: None,
     };
 
     // Snapshot pose_name / pose_id before moving `meta` into the publish closure for IN_USE enrichment.
@@ -1234,13 +1271,17 @@ async fn commit_prepared_config(
         AckMeta::PosesDelete { pose_name, pose_id, .. } => Some((pose_name.clone(), pose_id.clone())),
         _ => None,
     };
-    let mut ack_fields: Option<Vec<(&'static str, Value)>> = None;
+    let ack_fields: Arc<std::sync::Mutex<Option<Vec<(&'static str, Value)>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let ack_fields_cb = Arc::clone(&ack_fields);
+    let ws_auth_cb = ws_auth.clone();
+    let gen_now_cb = Arc::clone(&gen_now);
 
     let res = run_config_commit(
         &sup,
         plan,
-        || {
-            if !ws_auth.is_operator() {
+        move || {
+            if !ws_auth_cb.is_operator() {
                 return Err((
                     "OPERATOR_REQUIRED",
                     ArmError::Rejected {
@@ -1250,7 +1291,7 @@ async fn commit_prepared_config(
                     },
                 ));
             }
-            if gen_now.load(Ordering::SeqCst) != generation {
+            if gen_now_cb.load(Ordering::SeqCst) != generation {
                 return Err((
                     "LEASE_LOST",
                     ArmError::Rejected {
@@ -1262,7 +1303,7 @@ async fn commit_prepared_config(
             }
             Ok(())
         },
-        |cfg, act| {
+        move |cfg, act| {
             cfg.workspace_revision = act.workspace_revision;
             let fields = match meta {
                 AckMeta::Keepout {
@@ -1310,6 +1351,7 @@ async fn commit_prepared_config(
                     cfg.config.gripper_policy = Some(policy.clone());
                     cfg.gripper_calib_offset = offset_rad;
                     cfg.gripper_calib_jaw_opening = Some(jaw_opening);
+                    cfg.gripper_calib_invalid = false;
                     cfg.gripper_calib_stale = None;
                     cfg.gripper_calib_revision = act.revision;
                     vec![
@@ -1359,10 +1401,12 @@ async fn commit_prepared_config(
                     ]
                 }
             };
-            ack_fields = Some(fields);
+            *ack_fields_cb.lock().unwrap_or_else(|e| e.into_inner()) = Some(fields);
         },
     )
     .await;
+
+    let ack_fields = ack_fields.lock().unwrap_or_else(|e| e.into_inner()).take();
 
     match res {
         Ok(outcome) => {

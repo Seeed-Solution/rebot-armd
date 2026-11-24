@@ -900,9 +900,14 @@ pub struct SupervisorInner {
     /// A calibration apply / restore transaction is running: motion commands are refused
     /// (MOTION_BUSY) and other configuration writes too (CONFIG_BUSY).
     pub calibration_busy: bool,
+    /// Monotonic job token owning `calibration_busy` so stale/raced cleanup never clears a newer job.
+    pub(crate) calibration_busy_token: Option<u64>,
     /// A motor zero runs (`crate::motor_zero`, with `calibration_busy`): torque on and
     /// clear_fault are refused too.
     pub motor_zero_busy: bool,
+    /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
+    /// RT gripper calibration validation never acquires the driver mutex on `armd-control`.
+    pub(crate) cached_driver_pos_limits: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
     /// `calibration.json` was rejected at startup (message; cleared by a successful apply / restore).
     pub calibration_load_error: Option<String>,
     /// Joint zero offsets in effect (motor - joint, rad, one per joint; calibration.json
@@ -1708,7 +1713,9 @@ impl SupervisorInner {
             floor_source: "profile",
             hover_jobs: Vec::new(),
             calibration_busy: false,
+            calibration_busy_token: None,
             motor_zero_busy: false,
+            cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
             joint_zero_offsets: vec![0.0; dof],
             zero_convention: Default::default(),
@@ -6917,10 +6924,18 @@ impl ArmSupervisor {
             });
         }
         if let Some(ref d) = guard.driver {
+            let mut cached_pos = [None; crate::rt_core::mailbox::MAX_DOF];
+            let dof = guard.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
             let cap_res = match d.lock() {
-                Ok(drv) => drv.supports_rt_executor(),
+                Ok(drv) => {
+                    for (i, slot) in cached_pos.iter_mut().take(dof).enumerate() {
+                        *slot = drv.position_limits(i);
+                    }
+                    drv.supports_rt_executor()
+                }
                 Err(_) => Err("driver mutex poisoned"),
             };
+            guard.cached_driver_pos_limits = cached_pos;
             if let Err(reason) = cap_res {
                 restore_legacy(&mut rollback);
                 return Err(ArmError::Rejected {
@@ -7012,10 +7027,17 @@ impl ArmSupervisor {
         &self,
     ) -> Result<Arc<crate::rt_core::requests::config::PublishedConfig>, ArmError> {
         match self.owner_mode() {
-            OWNER_EXECUTOR => self
-                .published_config
-                .latest()
-                .ok_or_else(crate::rt_core::requests::config::config_unavailable),
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(crate::rt_core::requests::config::config_unavailable());
+                };
+                if handle.is_exited() {
+                    return Err(crate::rt_core::requests::config::config_unavailable());
+                }
+                self.published_config
+                    .latest()
+                    .ok_or_else(crate::rt_core::requests::config::config_unavailable)
+            }
             OWNER_LEGACY => {
                 let current_gen = self.inner.generation();
                 let (cached, cached_gen) = self.published_config.latest_with_gen();
@@ -7026,6 +7048,12 @@ impl ArmSupervisor {
                 if inner.detached {
                     drop(inner);
                     if self.owner_mode() == OWNER_EXECUTOR {
+                        let Some(handle) = self.executor_handle() else {
+                            return Err(crate::rt_core::requests::config::config_unavailable());
+                        };
+                        if handle.is_exited() {
+                            return Err(crate::rt_core::requests::config::config_unavailable());
+                        }
                         return self
                             .published_config
                             .latest()
@@ -7033,13 +7061,10 @@ impl ArmSupervisor {
                     }
                     return Err(crate::rt_core::requests::config::config_unavailable());
                 }
-                let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
                 let gen = self.inner.generation();
+                let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
                 drop(inner);
-                self.published_config.publish(snap, gen);
-                self.published_config
-                    .latest()
-                    .ok_or_else(crate::rt_core::requests::config::config_unavailable)
+                Ok(self.published_config.publish_if_newer(snap, gen))
             }
             _ => Err(crate::rt_core::requests::config::config_unavailable()),
         }
@@ -7096,6 +7121,94 @@ impl ArmSupervisor {
                 ex.reply.take().ok_or(ConfigError::OwnerStopped)
             }
             _ => Err(ConfigError::OwnerStopped),
+        }
+    }
+
+    /// Dispatches a `ConfigRequest` that must survive transient `MaintenanceOp` queue
+    /// backpressure (used for `Persisted`, `Activate`, `Release`, `VerifyAuthority`,
+    /// `CalibrationRevert`, and `SetCalibrationBusy(false)` cleanup).
+    ///
+    /// Retries `ConfigError::OwnerQueueFull` with short bounded backoff while the owner is
+    /// still alive; returns immediately on any non-backpressure outcome or `OwnerStopped`.
+    pub async fn dispatch_config_request_reliable(
+        &self,
+        mut build_req: impl FnMut() -> crate::rt_core::requests::config::ConfigRequest,
+    ) -> Result<
+        crate::rt_core::requests::config::ConfigReply,
+        crate::rt_core::requests::config::ConfigError,
+    > {
+        use crate::rt_core::requests::config::ConfigError;
+        let mut backoff_ms = 1u64;
+        loop {
+            match self.dispatch_config_request(build_req()).await {
+                Err(ConfigError::OwnerQueueFull) => {
+                    if self.owner_mode() == OWNER_EXECUTOR
+                        && self.executor_handle().is_none_or(|h| h.is_exited())
+                    {
+                        return Err(ConfigError::OwnerStopped);
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(10);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Dispatches a one-shot non-Clone `ConfigRequest` (e.g., carrying a unique `Reservation`
+    /// token or `ConfigCandidate`) with guaranteed retry across transient `OwnerQueueFull`.
+    /// When the executor queue is full, `MaintClient::call_config_retryable_async` returns the
+    /// exact untouched `ConfigRequest` so ownership is never lost.
+    pub async fn dispatch_config_request_owned_reliable(
+        &self,
+        mut req: crate::rt_core::requests::config::ConfigRequest,
+    ) -> Result<
+        crate::rt_core::requests::config::ConfigReply,
+        crate::rt_core::requests::config::ConfigError,
+    > {
+        use crate::rt_core::requests::config::{
+            handle_config_exchange, ConfigError, ConfigExchange,
+        };
+        let mut backoff_ms = 1u64;
+        loop {
+            match self.owner_mode() {
+                OWNER_EXECUTOR => {
+                    let Some(handle) = self.executor_handle() else {
+                        return Err(ConfigError::OwnerStopped);
+                    };
+                    if handle.is_exited() {
+                        return Err(ConfigError::OwnerStopped);
+                    }
+                    match handle.call_config_try_async(req).await {
+                        Ok(reply) => return Ok(reply),
+                        Err((returned_req, crate::rt_core::executor::OwnerError::QueueFull)) => {
+                            req = returned_req;
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(10);
+                        }
+                        Err((_, _)) => return Err(ConfigError::OwnerStopped),
+                    }
+                }
+                OWNER_LEGACY => {
+                    let mut ex = ConfigExchange::new(req);
+                    let mut inner = self.inner.write().await;
+                    if inner.detached {
+                        drop(inner);
+                        req = ex.req.take().expect("request still present");
+                        continue;
+                    }
+                    let ctx = crate::rt_core::ops::CommitCtx {
+                        arm: inner.core.id(),
+                        boot: crate::rt_core::broker::BootId::process(),
+                        now: Instant::now(),
+                        stop_generation: inner.current_stop_gen(),
+                    };
+                    handle_config_exchange(&mut inner, &ctx, &mut ex);
+                    drop(inner);
+                    return ex.reply.take().ok_or(ConfigError::OwnerStopped);
+                }
+                _ => return Err(ConfigError::OwnerStopped),
+            }
         }
     }
 

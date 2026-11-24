@@ -865,8 +865,8 @@ pub enum MaintenanceResult {
     PlanningSnapshot(PlanningSnapshot),
     Observation(Box<ArmObservation>),
     FaultCleared(Result<SafetyState, ClearFaultError>),
-    JointZeroOffsetsSet(Result<(), String>),
-    MotorZeroSet(Result<(), String>),
+    JointZeroOffsetsSet(Result<(), &'static str>),
+    MotorZeroSet(Result<(), &'static str>),
     BaselineTaken(BaselineTakeReply),
     BaselineStored(bool),
     BaselineDirtyMarked,
@@ -1055,6 +1055,38 @@ impl MaintClient {
             match tokio::time::timeout(Duration::from_millis(2), &mut rx).await {
                 Ok(Ok(res)) => return res,
                 Ok(Err(_)) => return Err(OwnerError::Stopped),
+                Err(_) => self.drain_replies(),
+            }
+        }
+    }
+
+    async fn call_try_async(
+        &self,
+        op: MaintenanceOp,
+    ) -> Result<MaintenanceResult, (MaintenanceOp, OwnerError)> {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.drain_replies();
+            if g.closed || g.exited.load(Ordering::Acquire) || g.req_tx.is_abandoned() {
+                return Err((op, OwnerError::Stopped));
+            }
+            if g.in_flight >= MAINT_QUEUE_CAPACITY || g.req_tx.is_full() {
+                return Err((op, OwnerError::QueueFull));
+            }
+            let id = g.next_id;
+            g.next_id += 1;
+            if let Err(rtrb::PushError::Full(req)) = g.req_tx.push(MaintRequest { id, op }) {
+                return Err((req.op, OwnerError::QueueFull));
+            }
+            g.in_flight += 1;
+            g.waiters.insert(id, MaintWaiter::Async(tx));
+        }
+        loop {
+            match tokio::time::timeout(Duration::from_millis(2), &mut rx).await {
+                Ok(Ok(Ok(res))) => return Ok(res),
+                Ok(Ok(Err(e))) => return Err((MaintenanceOp::ShutdownReady, e)),
+                Ok(Err(_)) => return Err((MaintenanceOp::ShutdownReady, OwnerError::Stopped)),
                 Err(_) => self.drain_replies(),
             }
         }
@@ -1478,6 +1510,13 @@ enum PersistCmd {
         unused_policy: Option<GripperPolicy>,
         unused_jaw: Option<JawOpening>,
     },
+    Persisted {
+        action_id: u64,
+        reservation: Reservation,
+        durability: Durability,
+        code_buf: String,
+        msg_buf: String,
+    },
     Activate {
         action_id: u64,
         reservation: Reservation,
@@ -1488,6 +1527,7 @@ enum PersistCmd {
         new_jaw: Option<JawOpening>,
         durability: Durability,
         warning: Option<String>,
+        operator_revoked: bool,
         code_buf: String,
         msg_buf: String,
     },
@@ -1498,6 +1538,12 @@ enum PersistReply {
         reservation: Option<Reservation>,
         policy: Option<GripperPolicy>,
         returned_jaw: Option<JawOpening>,
+        _returned_code: Option<String>,
+        _returned_msg: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
+    Persisted {
+        reservation: Option<Reservation>,
         _returned_code: Option<String>,
         _returned_msg: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
@@ -2035,7 +2081,7 @@ impl RtExecutorHandle {
                 if r.is_ok() {
                     self.shared.published_config.apply_joint_zero_offsets(&applied);
                 }
-                Ok(r)
+                Ok(r.map_err(String::from))
             }
             _ => Err(OwnerError::Protocol),
         }
@@ -2058,7 +2104,7 @@ impl RtExecutorHandle {
                 if r.is_ok() {
                     self.shared.published_config.apply_joint_zero_offsets(&applied);
                 }
-                Ok(r)
+                Ok(r.map_err(String::from))
             }
             _ => Err(OwnerError::Protocol),
         }
@@ -2066,14 +2112,14 @@ impl RtExecutorHandle {
 
     pub fn set_motor_zero(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
         match self.call_maintenance(MaintenanceOp::SetMotorZero { joint })? {
-            MaintenanceResult::MotorZeroSet(r) => Ok(r),
+            MaintenanceResult::MotorZeroSet(r) => Ok(r.map_err(String::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub async fn set_motor_zero_async(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
         match self.call_maintenance_async(MaintenanceOp::SetMotorZero { joint }).await? {
-            MaintenanceResult::MotorZeroSet(r) => Ok(r),
+            MaintenanceResult::MotorZeroSet(r) => Ok(r.map_err(String::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -2097,6 +2143,38 @@ impl RtExecutorHandle {
         match self.call_maintenance_async(MaintenanceOp::Config(ex)).await? {
             MaintenanceResult::Config(mut ex) => ex.reply.take().ok_or(OwnerError::Protocol),
             _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    /// Like [`Self::call_config_async`], but if the maintenance queue is full before enqueue,
+    /// returns the untouched `ConfigRequest` (preserving linear `Reservation` tokens for retry).
+    pub async fn call_config_try_async(
+        &self,
+        req: super::requests::config::ConfigRequest,
+    ) -> Result<super::requests::config::ConfigReply, (super::requests::config::ConfigRequest, OwnerError)> {
+        let ex = super::requests::config::ConfigExchange::new(req);
+        match self.shared.maint_client.call_try_async(MaintenanceOp::Config(ex)).await {
+            Ok(MaintenanceResult::Config(mut ex)) => ex
+                .reply
+                .take()
+                .ok_or((
+                    super::requests::config::ConfigRequest::CalibrationClearLoadError,
+                    OwnerError::Protocol,
+                )),
+            Ok(_) => Err((
+                super::requests::config::ConfigRequest::CalibrationClearLoadError,
+                OwnerError::Protocol,
+            )),
+            Err((MaintenanceOp::Config(mut ex), err)) => Err((
+                ex.req
+                    .take()
+                    .unwrap_or(super::requests::config::ConfigRequest::CalibrationClearLoadError),
+                err,
+            )),
+            Err((_, err)) => Err((
+                super::requests::config::ConfigRequest::CalibrationClearLoadError,
+                err,
+            )),
         }
     }
 
@@ -2686,7 +2764,7 @@ impl ControlState {
                     || core.disable_pending
                     || core.active_trajectory.is_some()
                 {
-                    Err("Arm must be Idle with torque off and no active trajectory to set joint zero offsets".into())
+                    Err("Arm must be Idle with torque off and no active trajectory to set joint zero offsets")
                 } else {
                     match core.set_joint_zero_offsets_in_place(&mut offsets, precomputed_floor) {
                         Ok(retired) => {
@@ -2701,14 +2779,14 @@ impl ControlState {
             }
             MaintenanceOp::SetMotorZero { joint } => {
                 let res = if core.driver.is_some() {
-                    Err("UNSUPPORTED: motor zero requires legacy path when hardware driver is attached".into())
+                    Err("UNSUPPORTED: motor zero requires legacy path when hardware driver is attached")
                 } else if *core.safety.state() != SafetyState::Idle
                     || core.is_torqued
                     || core.disable_pending
                 {
-                    Err("Arm must be Idle with torque off to set motor zero".into())
+                    Err("Arm must be Idle with torque off to set motor zero")
                 } else {
-                    core.set_motor_zero(joint)
+                    core.set_motor_zero_in_place(joint)
                 };
                 MaintenanceResult::MotorZeroSet(res)
             }
@@ -2965,6 +3043,16 @@ impl ControlState {
                     _returned_code: Some(code),
                     _returned_msg: Some(message),
                     _returned_warning: None,
+                    _returned_probe: self.take_reply_probe(),
+                },
+                PersistCmd::Persisted {
+                    code_buf,
+                    msg_buf,
+                    ..
+                } => PersistReply::Persisted {
+                    reservation: None,
+                    _returned_code: Some(code_buf),
+                    _returned_msg: Some(msg_buf),
                     _returned_probe: self.take_reply_probe(),
                 },
                 PersistCmd::Activate {
@@ -3387,6 +3475,61 @@ impl ControlState {
                     core,
                 );
             }
+            PersistCmd::Persisted {
+                action_id,
+                reservation,
+                durability,
+                code_buf,
+                msg_buf,
+            } => {
+                let simulated_err = self
+                    .hooks
+                    .fail_persisted_once
+                    .as_ref()
+                    .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+                let persisted_res = if simulated_err {
+                    Err("SIMULATED_PERSISTED_ERR")
+                } else {
+                    ConfigAuthority::persisted(core, &reservation, durability)
+                };
+                if persisted_res.is_ok() {
+                    let probe = self.take_reply_probe();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Persisted {
+                            reservation: Some(reservation),
+                            _returned_code: Some(code_buf),
+                            _returned_msg: Some(msg_buf),
+                            _returned_probe: probe,
+                        },
+                        core,
+                    );
+                } else {
+                    self.persist_granted = None;
+                    let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                    core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                    if core.zero_check_persisting == Some(action_id) {
+                        core.zero_check_persisting = None;
+                    }
+                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
+                        action_id,
+                        "failed",
+                        "PERSIST_FAILED",
+                        "Failed to record post-rename persistence state; reconciling required",
+                        Some(code_buf),
+                        Some(msg_buf),
+                    );
+                    let probe = self.take_reply_probe();
+                    self.push_persist_reply_or_retain(
+                        PersistReply::Persisted {
+                            reservation: None,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_probe: probe,
+                        },
+                        core,
+                    );
+                }
+            }
             PersistCmd::Activate {
                 action_id,
                 reservation,
@@ -3397,19 +3540,34 @@ impl ControlState {
                 new_jaw,
                 durability,
                 warning,
+                operator_revoked,
                 code_buf,
                 msg_buf,
             } => {
                 self.persist_granted = None;
-                let simulated_err = self
-                    .hooks
-                    .fail_persisted_once
-                    .as_ref()
-                    .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-                let persisted_res = if simulated_err {
-                    Err("SIMULATED_PERSISTED_ERR")
+                let already_persisted = core
+                    .core
+                    .config_held(ConfigDomain::GripperCalibration)
+                    .is_some_and(|h| {
+                        h.grant == Some(reservation.grant())
+                            && matches!(
+                                h.state,
+                                crate::rt_core::config_iface::HoldState::PersistedAwaitingActivation { .. }
+                            )
+                    });
+                let persisted_res = if already_persisted {
+                    Ok(())
                 } else {
-                    ConfigAuthority::persisted(core, &reservation, durability)
+                    let simulated_err = self
+                        .hooks
+                        .fail_persisted_once
+                        .as_ref()
+                        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+                    if simulated_err {
+                        Err("SIMULATED_PERSISTED_ERR")
+                    } else {
+                        ConfigAuthority::persisted(core, &reservation, durability)
+                    }
                 };
                 if persisted_res.is_err() {
                     // Persistence #5: disk may already have been renamed — unconditionally force
@@ -3457,7 +3615,7 @@ impl ControlState {
                     || self.stop_requests.current() != self.stop_requests.applied();
                 let stopped = core.safety.state().is_stopped() || urgent_pending;
 
-                if still_persisting && action_running && lease_ok && rev_ok && !stopped {
+                if still_persisting && action_running && lease_ok && rev_ok && !stopped && !operator_revoked {
                     let (old_policy, old_jaw) = core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
                     if !matches!(ConfigAuthority::activate(core, reservation), Activated::Active { .. }) {
                         let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
@@ -3484,6 +3642,8 @@ impl ControlState {
                     // Post-rename revocation: keep live state/revision unchanged and enter Reconciling.
                     let code = if stopped {
                         "STOPPED"
+                    } else if operator_revoked {
+                        "OPERATOR_REQUIRED"
                     } else if !lease_ok {
                         "LEASE_LOST"
                     } else if !rev_ok {
@@ -3775,6 +3935,32 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
+            // Record Persisted(DurableUnconfirmed) immediately after rename_only() so
+            // ConfigAuthority enters PersistedAwaitingActivation (inhibiting motion) before
+            // parent-directory sync runs.
+            if !push_cmd(
+                &mut cmd_tx,
+                PersistCmd::Persisted {
+                    action_id: job.action_id,
+                    reservation,
+                    durability: Durability::DurableUnconfirmed,
+                    code_buf: String::with_capacity(64),
+                    msg_buf: String::with_capacity(160),
+                },
+                &persist_stop,
+                &control_exited,
+            ) {
+                break;
+            }
+            let reservation = match wait_reply(&rep_rx, &persist_stop, &control_exited) {
+                Some(PersistReply::Persisted { reservation: Some(r), .. }) => r,
+                _ => {
+                    drop(new_policy);
+                    drop(new_jaw);
+                    if hooks.exit_after_first_job { break; }
+                    continue;
+                }
+            };
             let outcome = match hooks.dir_sync_override.as_ref() {
                 Some(f) => dir_sync.sync_with(|dir| f(dir)),
                 None => dir_sync.sync_parent_dir(),
@@ -3787,6 +3973,13 @@ fn spawn_persist_worker(
                 // Simulated worker crash/disconnect after rename without pushing Activate.
                 break;
             }
+            // Re-verify operator authorization after dir_sync immediately before Activate so
+            // operator lock/expiry during a slow fsync cannot activate (enters Reconciling).
+            let operator_revoked = !job
+                .ctx
+                .operator_auth
+                .as_ref()
+                .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
             let pub_policy = new_policy.clone();
             let pub_jaw = new_jaw.clone();
             let _ = push_cmd(
@@ -3801,6 +3994,7 @@ fn spawn_persist_worker(
                     new_jaw,
                     durability,
                     warning,
+                    operator_revoked,
                     code_buf: String::with_capacity(64),
                     msg_buf: String::with_capacity(160),
                 },
