@@ -1096,6 +1096,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | `DATASET_NOT_FOUND`, `SEQUENCE_NOT_FOUND` | 404 |
 | `RECORDER_BUSY {owner}`, `RECORDER_NOT_OWNER {owner}`, `IN_USE {sequences}`, `DATA_STALE`, `DATASET_EXISTS`, `DATASET_NOT_EMPTY`, `SEQUENCE_CONFLICT {rev}`, `SEQUENCE_EXISTS`, `SEQUENCE_RUNNING`, `POSE_EXISTS` (teach v1) | 409 |
 | `MOTION_BUSY`, `PLAN_STALE`, `COLLISION_HOLD` | 409 |
+| `TORQUE_OFF_WOULD_DROP` (torque disable requested in `EStop` or `Fault` while an arm joint is outside `rest_pose_tolerance_rad`, default `0.05` rad, of the rest pose or feedback is missing/older than `100 ms`; message names the first offending joint, position and rest value; no override / 停止状态下断力矩时机械臂关节超出收纳位容差 `rest_pose_tolerance_rad`（默认 `0.05` rad）或反馈缺失/超过 `100 ms`，消息含首个超差关节及角度，无强制绕过) | 409 |
 | `ARM_MOVING` (depth measurement while the arm moves) | 409 |
 | `DETECTION_UNAVAILABLE` (depth measurement: trigger failed / no frame) | 503 / 504 |
 | `CONFIG_BUSY`, `VISION_CALIBRATION_UNSUPPORTED`, `KINEMATICS_ARMED` (camera calibration; see [Camera calibration](#camera-calibration-wizard--相机标定向导)) | 409 |

@@ -295,6 +295,22 @@ In Fault or EStop with torque on, when every motor again reports fresh feedback 
 
 Fault 或 EStop 且力矩开启时，若所有电机重新报告新鲜反馈（250 ms 内）且驱动使能状态为 Disabled（达妙：所有新鲜反馈 / 0xCC 刷新应答状态为 0，`DamiaoArmDriver::enable_state`），armd 记录电机已断力矩：`is_torqued` = false，重新使能需走完整使能握手，运动停止并令指令 = 实测。Fault 保持到 `clear_fault`；之后 `clear_fault` 保持断力矩，使能照常。记一行 warn 日志。起因：2026-11-12 电机在 BusLoss 后以 Disabled 恢复，armd 仍报告 `is_torqued: true`。代码：`SupervisorInner::sync_torque_state_after_stop`（`src/supervisor.rs`）。重力补偿期间（其退出流程负责电机模式）或待确认卸力时不应用。电机恢复为 Enabled 时行为不变（力矩开启，Fault 保持）。未锁存 Fault / EStop 时的 Disabled 报告不在此处改变 `is_torqued`；机械臂下落会锁存跟踪误差 Fault，之后本规则生效。
 
+## Torque-off while stopped (E-stop / Fault) / 停止状态下断力矩（急停 / 故障）
+
+In `EStop` or `Fault`, a torque-disable request (`/api/v1/torque` / `/api/v1/arm` with `enable: false`, SDK `set_torque(false)`, RT `TransitionOp::TorqueOff` / `ImmediateOp::TorqueOff`, and the cockpit) is evaluated by one decision function (`SupervisorInner::may_disable_torque_while_stopped`, `src/supervisor/torque_off.rs`) on both the legacy and RT executor owners:
+
+- **Allowed at the rest pose only:** every arm joint (J1..J6 on 6/7-DOF arms, excluding the gripper) must be within `rest_pose_tolerance_rad` (profile field, default `0.05` rad) of the profile's rest pose (`resting_pose.positions` or `home_positions`), using measured positions from feedback no older than `100 ms`. Stale, invalid, or missing feedback counts as not at rest.
+- **Refused away from the rest pose (`409 TORQUE_OFF_WOULD_DROP`):** the reply names the first arm joint outside tolerance with its measured position and rest position and states that the arm would drop (or states that feedback is stale/missing). Measured on the B601-DM (2026-11-21): at a raised pose, J3 gravity torque is ~6.7 N·m against ±1.2 N·m static friction (and J2 is larger), so removing torque drops the arm; at the folded rest pose nothing drops.
+- **No override:** there is no `force` parameter and no operator bypass. Unknown fields (such as `force: true`) never bypass this rule. Away from the rest pose, the only ways to remove torque are clearing the fault normally and parking, or cutting power.
+- **Latch and disable semantics:** disabling torque while stopped never clears the `Fault` or `EStop` latch (`safety_state` remains `EStop` or `Fault`, `is_torqued` becomes `false`; a later `clear_fault` follows the normal rules). The disable uses the normal `TxKind::Disable` path (exempt from the stop gate and TX budget), with fresh hardware confirmation and sticky `disable_pending` rules; the reply waits for confirmation as usual.
+
+在 `EStop` 或 `Fault` 状态下，断力矩请求（WS `/api/v1/torque`、`/api/v1/arm` 带 `enable: false`、SDK `set_torque(false)`、RT `TransitionOp::TorqueOff` / `ImmediateOp::TorqueOff` 及驾驶舱）在旧版与 RT 执行器两条路径上均经同一判定函数（`SupervisorInner::may_disable_torque_while_stopped`，`src/supervisor/torque_off.rs`）处理：
+
+- **仅在收纳位允许：** 所有机械臂关节（6/7 轴机械臂的 J1..J6，不含夹爪）须在 profile 收纳位（`resting_pose.positions` 或 `home_positions`）的 `rest_pose_tolerance_rad`（profile 字段，默认 `0.05` rad）以内，且依据不超过 `100 ms` 的实测反馈；反馈过期、无效或缺失均按未处于收纳位处理。
+- **离开收纳位时拒绝（`409 TORQUE_OFF_WOULD_DROP`）：** 错误消息给出首个超差关节名称、当前实测角度与收纳位角度，并说明断力矩会导致机械臂下坠（反馈过期或缺失时说明无法验证收纳位）。B601-DM 实测（2026-11-21）：抬起位姿下 J3 重力矩约 6.7 N·m（静摩擦 ±1.2 N·m），J2 更大，断力矩会下坠；折叠收纳位不会下坠。
+- **无强制绕过：** 不存在 `force` 标志或操作员旁路；请求携带未知字段（如 `force: true`）仍按同一规则拒绝。机械臂离开收纳位时，只有按正常流程清除故障后停靠收纳，或切断电源，才能撤去力矩。
+- **锁存与失能语义：** 停止状态下关闭力矩绝不清除 `Fault` 或 `EStop` 锁存（`safety_state` 保持 `EStop` 或 `Fault`，`is_torqued` 变为 `false`；后续 `clear_fault` 遵循常规规则）。失能走常规 `TxKind::Disable` 路径（豁免停止门禁与 TX 预算），保持新鲜硬件确认与粘性 `disable_pending` 规则，应答等待确认后再返回。
+
 ## Safety self-description / 安全自描述
 
 `GET /api/v1/safety/describe` (no lease; capability `safety_describe`) returns the limits, stops and faults of the running armd as JSON. Code: `src/safety_describe.rs`. Every value is read from the loaded profile, the runtime keep-out and collision settings, or the constant the control code uses (`BUS_LOSS_TIMEOUT`, `CONTROL_DEADLINE`, `PREEMPT_COOLDOWN`, `THERMAL_CLEAR_MARGIN_C`, `WATCHDOG_PARK_*`, `UNLOAD_SETTLE_HOLD`, `MAX_LINEAR_MPS`, `MAX_ANGULAR_RPS`); `tests/test_safety_describe.rs` checks them against those sources. Strings are fixed English identifiers or sentences; clients translate them.
