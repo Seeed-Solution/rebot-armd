@@ -35,7 +35,6 @@ use crate::diagnostics::tick::{
     RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
 };
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
-use crate::persist::{PublishOutcome, StagedWrite};
 use crate::safety::{
     ClearFaultError, FaultKind, SafetyError, SafetyLogEvent, SafetyState, FAULT_ARC_POOL_CAPACITY,
     FORMATTED_FAULT_ARC_POOL_CAPACITY, JOINT_LIMIT_ARC_POOL_CAPACITY, SAFETY_LOG_CAPACITY,
@@ -3722,265 +3721,345 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
-            // 1. Reserve strictly BEFORE serialization and staging.
-            let lease_owner_inline = job.lease_owner;
-            let payload_probe = hooks
-                .payload_drop_probe
-                .as_ref()
-                .and_then(|p| p.lock().ok().and_then(|mut g| g.take()));
-            if !push_cmd(
-                &mut cmd_tx,
-                PersistCmd::Reserve {
-                    action_id: job.action_id,
-                    base_revision: job.base_revision,
-                    lease_owner: lease_owner_inline,
-                    estop_epoch: job.estop_epoch,
-                    stop_gen: job.stop_gen,
-                    deadline: job.deadline,
-                    new_policy: candidate_policy,
-                    jaw_opening: job.ctx.jaw_opening.clone(),
-                    probe: payload_probe,
-                    code_buf: String::with_capacity(64),
-                    msg_buf: String::with_capacity(160),
-                },
-                &persist_stop,
-                &control_exited,
-            ) {
-                break;
-            }
-            let Some(PersistReply::Reserved {
-                reservation,
-                policy,
-                returned_jaw,
-                _returned_code,
-                _returned_msg,
-                _returned_probe,
-            }) = wait_reply(&rep_rx, &persist_stop, &control_exited)
-            else {
-                break;
+            let mut backend = ExecutorPersistBackend {
+                cmd_tx: &mut cmd_tx,
+                rep_rx: &rep_rx,
+                published_config: &published_config,
+                persist_stop: &persist_stop,
+                control_exited: &control_exited,
+                hooks: &hooks,
+                job,
+                candidate_policy: Some(candidate_policy),
+                new_policy: None,
+                new_jaw: None,
+                reservation: None,
+                proposal: None,
+                auth: None,
             };
-            drop(_returned_code);
-            drop(_returned_msg);
-            drop(_returned_probe);
-            let ((reservation, proposal, auth), new_policy, new_jaw) = match (reservation, policy) {
-                (Some(rpa), Some(new_policy)) => (rpa, new_policy, returned_jaw),
-                (_, returned_policy) => {
-                    drop(returned_policy);
-                    drop(returned_jaw);
-                    if hooks.exit_after_first_job { break; }
-                    continue;
-                }
-            };
-
-            // 2. Off-thread serialize + stage + file fsync strictly AFTER reserve.
-            let write = job.ctx.serialize_write(job.offset_rad);
-            let staged = match StagedWrite::stage(write.path, write.text) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = push_cmd(
-                        &mut cmd_tx,
-                        PersistCmd::Abort {
-                            action_id: job.action_id,
-                            reservation,
-                            code: "PERSIST_FAILED".into(),
-                            message: format!("Failed to stage gripper calibration: {e}"),
-                            unused_policy: Some(new_policy),
-                            unused_jaw: new_jaw,
-                        },
-                        &persist_stop,
-                        &control_exited,
-                    );
-                    if !hooks.leave_final_reply_queued {
-                        let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                    }
-                    if hooks.exit_after_first_job { break; }
-                    continue;
-                }
-            };
-
-            if hooks.after_grant_before_rename.as_ref().is_some_and(|h| h()) {
-                // Simulated worker crash/disconnect before rename (reservation dropped with worker).
-                staged.abort();
-                break;
-            }
-
-            // 3. Fresh pre-rename operator auth + live owner authority recheck BEFORE rename.
-            let auth_still_ok = job
-                .ctx
-                .operator_auth
-                .as_ref()
-                .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-            if !auth_still_ok {
-                staged.abort();
-                let _ = push_cmd(
-                    &mut cmd_tx,
-                    PersistCmd::Abort {
-                        action_id: job.action_id,
-                        reservation,
-                        code: "OPERATOR_REQUIRED".into(),
-                        message: "Operator session expired or locked before gripper calibration persisted".into(),
-                        unused_policy: Some(new_policy),
-                        unused_jaw: new_jaw,
-                    },
-                    &persist_stop,
-                    &control_exited,
-                );
-                if !hooks.leave_final_reply_queued {
-                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                }
-                if hooks.exit_after_first_job { break; }
-                continue;
-            }
-            if !push_cmd(
-                &mut cmd_tx,
-                PersistCmd::VerifyAuthority {
-                    action_id: job.action_id,
-                    reservation,
-                    proposal,
-                    auth,
-                    base_revision: job.base_revision,
-                    code_buf: String::with_capacity(64),
-                    msg_buf: String::with_capacity(160),
-                },
-                &persist_stop,
-                &control_exited,
-            ) {
-                staged.abort();
-                break;
-            }
-            let reservation = match wait_reply(&rep_rx, &persist_stop, &control_exited) {
-                Some(PersistReply::Verified { reservation: Some(r), .. }) => r,
-                _ => {
-                    staged.abort();
-                    drop(new_policy);
-                    drop(new_jaw);
-                    if hooks.exit_after_first_job { break; }
-                    continue;
-                }
-            };
-
-            // 4a. Rename off-thread.
-            let dir_sync = match staged.rename_only() {
-                Ok(ds) => ds,
-                Err(e) => {
-                    let _ = push_cmd(
-                        &mut cmd_tx,
-                        PersistCmd::Abort {
-                            action_id: job.action_id,
-                            reservation,
-                            code: "PERSIST_FAILED".into(),
-                            message: format!("Failed to rename gripper calibration: {e}"),
-                            unused_policy: Some(new_policy),
-                            unused_jaw: new_jaw,
-                        },
-                        &persist_stop,
-                        &control_exited,
-                    );
-                    if !hooks.leave_final_reply_queued {
-                        let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                    }
-                    if hooks.exit_after_first_job { break; }
-                    continue;
-                }
-            };
-
-            // 4b. Record Persisted(DurableUnconfirmed) immediately after rename_only().
-            if !push_cmd(
-                &mut cmd_tx,
-                PersistCmd::Persisted {
-                    action_id: job.action_id,
-                    reservation,
-                    code_buf: String::with_capacity(64),
-                    msg_buf: String::with_capacity(160),
-                },
-                &persist_stop,
-                &control_exited,
-            ) {
-                break;
-            }
-            let reservation = match wait_reply(&rep_rx, &persist_stop, &control_exited) {
-                Some(PersistReply::Persisted { reservation: Some(r), .. }) => r,
-                _ => {
-                    drop(new_policy);
-                    drop(new_jaw);
-                    if hooks.exit_after_first_job { break; }
-                    continue;
-                }
-            };
-
-            // 5. Parent-directory fsync strictly BEFORE activation. Any failure enters Reconciling
-            //    and keeps the old policy active with motion inhibited.
-            let outcome = match hooks.dir_sync_override.as_ref() {
-                Some(f) => dir_sync.sync_with(|dir| f(dir)),
-                None => dir_sync.sync_parent_dir(),
-            };
-            if let PublishOutcome::PublishedDurabilityUnconfirmed(warn) = outcome {
-                let _ = push_cmd(
-                    &mut cmd_tx,
-                    PersistCmd::DirSyncFailed {
-                        action_id: job.action_id,
-                        reservation,
-                        warning: warn,
-                        unused_policy: Some(new_policy),
-                        unused_jaw: new_jaw,
-                        msg_buf: String::with_capacity(160),
-                    },
-                    &persist_stop,
-                    &control_exited,
-                );
-                if !hooks.leave_final_reply_queued {
-                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                }
-                if hooks.exit_after_first_job { break; }
-                continue;
-            }
-
-            if hooks.after_rename_before_activate.as_ref().is_some_and(|h| h()) {
-                // Simulated worker crash/disconnect after rename + dir-sync without pushing Activate.
-                break;
-            }
-
-            // 6. Fresh post-dir-sync operator auth recheck + live owner Activate.
-            let operator_revoked = !job
-                .ctx
-                .operator_auth
-                .as_ref()
-                .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-            let pub_policy = new_policy.clone();
-            let pub_jaw = new_jaw.clone();
-            let _ = push_cmd(
-                &mut cmd_tx,
-                PersistCmd::Activate {
-                    action_id: job.action_id,
-                    reservation,
-                    proposal,
-                    auth,
-                    base_revision: job.base_revision,
-                    offset_rad: job.offset_rad,
-                    new_policy,
-                    new_jaw,
-                    operator_revoked,
-                    code_buf: String::with_capacity(64),
-                    msg_buf: String::with_capacity(160),
-                },
-                &persist_stop,
-                &control_exited,
-            );
-            if !hooks.leave_final_reply_queued {
-                if let Some(PersistReply::Activated { .. }) = wait_reply(&rep_rx, &persist_stop, &control_exited) {
-                    published_config.apply_zero_check_commit(
-                        job.offset_rad,
-                        pub_policy,
-                        pub_jaw,
-                        job.base_revision + 1,
-                    );
-                }
-            }
-            if hooks.exit_after_first_job {
+            let res = super::requests::config::run_common_commit_sync(&mut backend);
+            if matches!(res, Err(super::requests::config::ZeroCheckCommitStop::WorkerDisconnected))
+                || hooks.exit_after_first_job
+            {
                 break;
             }
         }
     })
+}
+
+struct ExecutorPersistBackend<'a> {
+    cmd_tx: &'a mut Producer<PersistCmd>,
+    rep_rx: &'a Arc<Mutex<Consumer<PersistReply>>>,
+    published_config: &'a Arc<super::requests::config::PublishedConfigHub>,
+    persist_stop: &'a Arc<AtomicBool>,
+    control_exited: &'a Arc<AtomicBool>,
+    hooks: &'a PersistTestHooks,
+    job: PendingZeroCheckPersist,
+    candidate_policy: Option<GripperPolicy>,
+    new_policy: Option<GripperPolicy>,
+    new_jaw: Option<JawOpening>,
+    reservation: Option<Reservation>,
+    proposal: Option<ConfigProposal>,
+    auth: Option<super::requests::config::ConfigAuthContext>,
+}
+
+impl ExecutorPersistBackend<'_> {
+    fn push_cmd(&mut self, cmd: PersistCmd) -> bool {
+        let mut pending = Some(cmd);
+        while let Some(c) = pending.take() {
+            if self.persist_stop.load(Ordering::Acquire)
+                || self.control_exited.load(Ordering::Acquire)
+                || self.cmd_tx.is_abandoned()
+            {
+                return false;
+            }
+            match self.cmd_tx.push(c) {
+                Ok(()) => return true,
+                Err(rtrb::PushError::Full(c)) => {
+                    pending = Some(c);
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+            }
+        }
+        true
+    }
+
+    fn wait_reply(&self) -> Option<PersistReply> {
+        loop {
+            if let Ok(rep) = self.rep_rx.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+                return Some(rep);
+            }
+            if self.persist_stop.load(Ordering::Acquire) || self.control_exited.load(Ordering::Acquire) {
+                return None;
+            }
+            thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn op_auth_ok(&self) -> bool {
+        self.job
+            .ctx
+            .operator_auth
+            .as_ref()
+            .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()))
+    }
+}
+
+impl super::requests::config::CommonCommitWorker for ExecutorPersistBackend<'_> {
+    type Ok = ();
+    type Err = super::requests::config::ZeroCheckCommitStop;
+    const RUN_BLOCKING_ON_TOKIO: bool = false;
+
+    fn dir_sync_override(&self) -> Option<super::requests::config::DirSyncOverride> {
+        self.hooks.dir_sync_override.clone()
+    }
+
+    async fn reserve(&mut self) -> Result<(), Self::Err> {
+        use super::requests::config::ZeroCheckCommitStop;
+        let new_policy = self
+            .candidate_policy
+            .take()
+            .expect("candidate_policy validated before reserve");
+        let payload_probe = self
+            .hooks
+            .payload_drop_probe
+            .as_ref()
+            .and_then(|p| p.lock().ok().and_then(|mut g| g.take()));
+        if !self.push_cmd(PersistCmd::Reserve {
+            action_id: self.job.action_id,
+            base_revision: self.job.base_revision,
+            lease_owner: self.job.lease_owner,
+            estop_epoch: self.job.estop_epoch,
+            stop_gen: self.job.stop_gen,
+            deadline: self.job.deadline,
+            new_policy,
+            jaw_opening: self.job.ctx.jaw_opening.clone(),
+            probe: payload_probe,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        }) {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        }
+        let Some(PersistReply::Reserved {
+            reservation,
+            policy,
+            returned_jaw,
+            _returned_code,
+            _returned_msg,
+            _returned_probe,
+        }) = self.wait_reply()
+        else {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        };
+        drop(_returned_code);
+        drop(_returned_msg);
+        drop(_returned_probe);
+        match (reservation, policy) {
+            (Some((r, p, a)), Some(pol)) => {
+                self.reservation = Some(r);
+                self.proposal = Some(p);
+                self.auth = Some(a);
+                self.new_policy = Some(pol);
+                self.new_jaw = returned_jaw;
+                Ok(())
+            }
+            (_, returned_policy) => {
+                drop(returned_policy);
+                drop(returned_jaw);
+                Err(ZeroCheckCommitStop::Aborted)
+            }
+        }
+    }
+
+    async fn prepare_write_after_reserve(
+        &mut self,
+    ) -> Result<Option<crate::persist::PendingWrite>, Self::Err> {
+        Ok(Some(self.job.ctx.serialize_write(self.job.offset_rad)))
+    }
+
+    fn after_reserve_before_rename(&mut self) -> bool {
+        self.hooks
+            .after_grant_before_rename
+            .as_ref()
+            .is_some_and(|h| h())
+    }
+
+    async fn verify_authority_before_rename(&mut self) -> Result<(), Self::Err> {
+        use super::requests::config::ZeroCheckCommitStop;
+        if !self.op_auth_ok() {
+            if let Some(reservation) = self.reservation.take() {
+                let unused_policy = self.new_policy.take();
+                let unused_jaw = self.new_jaw.take();
+                let _ = self.push_cmd(PersistCmd::Abort {
+                    action_id: self.job.action_id,
+                    reservation,
+                    code: "OPERATOR_REQUIRED".into(),
+                    message: "Operator session expired or locked before gripper calibration persisted"
+                        .into(),
+                    unused_policy,
+                    unused_jaw,
+                });
+                if !self.hooks.leave_final_reply_queued {
+                    let _ = self.wait_reply();
+                }
+            }
+            return Err(ZeroCheckCommitStop::Aborted);
+        }
+        let reservation = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal held");
+        let auth = self.auth.expect("auth held");
+        if !self.push_cmd(PersistCmd::VerifyAuthority {
+            action_id: self.job.action_id,
+            reservation,
+            proposal,
+            auth,
+            base_revision: self.job.base_revision,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        }) {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        }
+        match self.wait_reply() {
+            Some(PersistReply::Verified { reservation: Some(r), .. }) => {
+                self.reservation = Some(r);
+                Ok(())
+            }
+            Some(_) => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::Aborted)
+            }
+            None => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::WorkerDisconnected)
+            }
+        }
+    }
+
+    async fn mark_persisted(&mut self) -> Result<(), Self::Err> {
+        use super::requests::config::ZeroCheckCommitStop;
+        let reservation = self.reservation.take().expect("reservation held");
+        if !self.push_cmd(PersistCmd::Persisted {
+            action_id: self.job.action_id,
+            reservation,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        }) {
+            return Err(ZeroCheckCommitStop::WorkerDisconnected);
+        }
+        match self.wait_reply() {
+            Some(PersistReply::Persisted { reservation: Some(r), .. }) => {
+                self.reservation = Some(r);
+                Ok(())
+            }
+            Some(_) => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::Aborted)
+            }
+            None => {
+                drop(self.new_policy.take());
+                drop(self.new_jaw.take());
+                Err(ZeroCheckCommitStop::WorkerDisconnected)
+            }
+        }
+    }
+
+    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
+        use super::requests::config::ZeroCheckCommitStop;
+        if let Some(reservation) = self.reservation.take() {
+            let unused_policy = self.new_policy.take();
+            let unused_jaw = self.new_jaw.take();
+            let _ = self.push_cmd(PersistCmd::DirSyncFailed {
+                action_id: self.job.action_id,
+                reservation,
+                warning: warn,
+                unused_policy,
+                unused_jaw,
+                msg_buf: String::with_capacity(160),
+            });
+            if !self.hooks.leave_final_reply_queued {
+                let _ = self.wait_reply();
+            }
+        }
+        ZeroCheckCommitStop::Aborted
+    }
+
+    fn after_rename_before_activate(&mut self) -> bool {
+        self.hooks
+            .after_rename_before_activate
+            .as_ref()
+            .is_some_and(|h| h())
+    }
+
+    async fn activate_and_publish(&mut self, _disk_published: bool) -> Result<Self::Ok, Self::Err> {
+        let operator_revoked = !self.op_auth_ok();
+        let reservation = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal held");
+        let auth = self.auth.expect("auth held");
+        let new_policy = self.new_policy.take().expect("new_policy held");
+        let new_jaw = self.new_jaw.take();
+        let pub_policy = new_policy.clone();
+        let pub_jaw = new_jaw.clone();
+        let _ = self.push_cmd(PersistCmd::Activate {
+            action_id: self.job.action_id,
+            reservation,
+            proposal,
+            auth,
+            base_revision: self.job.base_revision,
+            offset_rad: self.job.offset_rad,
+            new_policy,
+            new_jaw,
+            operator_revoked,
+            code_buf: String::with_capacity(64),
+            msg_buf: String::with_capacity(160),
+        });
+        if !self.hooks.leave_final_reply_queued {
+            if let Some(PersistReply::Activated { .. }) = self.wait_reply() {
+                self.published_config.apply_zero_check_commit(
+                    self.job.offset_rad,
+                    pub_policy,
+                    pub_jaw,
+                    self.job.base_revision + 1,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn release_pre_rename(&mut self) {
+        // Owner already released the reservation inside VerifyAuthority / Abort if taken.
+        drop(self.new_policy.take());
+        drop(self.new_jaw.take());
+    }
+
+    async fn abort_pre_rename_fs(&mut self, phase: &'static str, err: String) -> Self::Err {
+        use super::requests::config::ZeroCheckCommitStop;
+        if let Some(reservation) = self.reservation.take() {
+            let unused_policy = self.new_policy.take();
+            let unused_jaw = self.new_jaw.take();
+            let _ = self.push_cmd(PersistCmd::Abort {
+                action_id: self.job.action_id,
+                reservation,
+                code: "PERSIST_FAILED".into(),
+                message: format!("Failed to {phase} gripper calibration: {err}"),
+                unused_policy,
+                unused_jaw,
+            });
+            if !self.hooks.leave_final_reply_queued {
+                let _ = self.wait_reply();
+            }
+        }
+        ZeroCheckCommitStop::Aborted
+    }
+
+    async fn reconcile_rename_join_error(&mut self, _err: String) -> Self::Err {
+        super::requests::config::ZeroCheckCommitStop::Aborted
+    }
+
+    fn worker_disconnected_err(&mut self) -> Self::Err {
+        super::requests::config::ZeroCheckCommitStop::WorkerDisconnected
+    }
 }
 
 /// RAII allocation-counting window for one whole release or one sub-release wake.

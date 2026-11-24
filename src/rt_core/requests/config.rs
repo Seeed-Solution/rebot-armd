@@ -2307,6 +2307,660 @@ where
         .map_err(|e| e.error)
 }
 
+/// Optional parent-directory fsync override used by deterministic executor tests.
+pub(crate) type DirSyncOverride = Arc<dyn Fn(&std::path::Path) -> std::io::Result<()> + Send + Sync>;
+
+/// Owner-transport adapter driving the ONE common commit worker ([`execute_common_commit`])
+/// for every PR C config family (`run_config_commit_worker`) AND `gripper_zero_check(store_offset=true)`
+/// on BOTH `RtOwner::Legacy` (async + sync) and `RtOwner::Executor` (`armd-persist`).
+pub(crate) trait CommonCommitWorker: Send {
+    type Ok: Send;
+    type Err: Send;
+
+    /// When `true`, blocking filesystem steps (`StagedWrite::stage`, `rename_only`,
+    /// `sync_parent_dir`) run on `tokio::task::spawn_blocking`; when `false` (dedicated blocking
+    /// thread `armd-persist` or synchronous unit tests), they execute directly inline.
+    const RUN_BLOCKING_ON_TOKIO: bool;
+
+    fn before_reserve(&mut self) {}
+    fn should_fail_rename_once(&self) -> bool {
+        false
+    }
+    fn should_fail_dir_sync_once(&self) -> bool {
+        false
+    }
+    fn dir_sync_override(&self) -> Option<DirSyncOverride> {
+        None
+    }
+    /// Step 1: Reserve domain on the single live owner strictly BEFORE any serialization or staging.
+    fn reserve(&mut self) -> impl std::future::Future<Output = Result<(), Self::Err>> + Send;
+    /// Step 1b: Serialize / produce `Option<PendingWrite>` (and pin replay episodes for `Sequences`)
+    /// strictly AFTER `reserve()` succeeded.
+    fn prepare_write_after_reserve(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<PendingWrite>, Self::Err>> + Send;
+    /// Optional pre-rename hook; returning `true` simulates worker disconnect (without Release).
+    fn after_reserve_before_rename(&mut self) -> bool {
+        false
+    }
+    /// Step 3: Fresh pre-rename off-thread auth + live owner authority recheck.
+    fn verify_authority_before_rename(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), Self::Err>> + Send;
+    /// Called immediately after `rename_only()` succeeds (before `mark_persisted`).
+    fn on_renamed(&mut self) {}
+    /// Step 4b: Record `Persisted(DurableUnconfirmed)` on the live owner immediately after rename.
+    fn mark_persisted(&mut self) -> impl std::future::Future<Output = Result<(), Self::Err>> + Send;
+    /// Step 5 error: Parent-directory fsync failed after rename -> enter `Reconciling`, NO Activate.
+    fn reconcile_after_dir_sync_failure(
+        &mut self,
+        warn: String,
+    ) -> impl std::future::Future<Output = Self::Err> + Send;
+    /// Optional post-dir-sync hook; returning `true` simulates worker disconnect (without Activate).
+    fn after_rename_before_activate(&mut self) -> bool {
+        false
+    }
+    /// Step 6: Fresh post-dir-sync authority recheck + atomic activation + `PublishedConfigHub` update.
+    fn activate_and_publish(
+        &mut self,
+        disk_published: bool,
+    ) -> impl std::future::Future<Output = Result<Self::Ok, Self::Err>> + Send;
+    /// Pre-rename release (`Cleared`) after a failure in `prepare_write_after_reserve` or `verify_authority_before_rename`.
+    fn release_pre_rename(&mut self) -> impl std::future::Future<Output = ()> + Send;
+    /// Pre-rename filesystem error (`stage` or `rename_only` failed before publishing): release `Cleared` and build `Err`.
+    fn abort_pre_rename_fs(
+        &mut self,
+        phase: &'static str,
+        err: String,
+    ) -> impl std::future::Future<Output = Self::Err> + Send;
+    /// Blocking rename task panicked/joined with error after starting: enter `Reconciling` and build `Err`.
+    fn reconcile_rename_join_error(
+        &mut self,
+        err: String,
+    ) -> impl std::future::Future<Output = Self::Err> + Send;
+    /// Returned when a test hook simulates worker disconnect before rename or before activate.
+    fn worker_disconnected_err(&mut self) -> Self::Err;
+}
+
+async fn run_fs_step<T: Send + 'static>(
+    use_tokio: bool,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    if use_tokio {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(f())
+    }
+}
+
+/// THE ONE common commit worker for EVERY config family and `gripper_zero_check(store_offset=true)`
+/// on BOTH `RtOwner::Legacy` and `RtOwner::Executor`.
+///
+/// Enforces the mandatory ordering in one single place:
+/// `reserve -> off-thread serialize + stage + file fsync -> authority recheck ->
+///  rename -> parent-directory fsync -> authority recheck -> activate/publish`.
+///
+/// - Any failure before `rename` aborts staging and releases (`Cleared`); live state is untouched.
+/// - Any failure at or after `rename` (including parent-directory fsync failure) skips activation,
+///   keeps the old policy active, and enters `Reconciling` with motion inhibited.
+pub(crate) async fn execute_common_commit<W: CommonCommitWorker>(
+    w: &mut W,
+) -> Result<W::Ok, W::Err> {
+    w.before_reserve();
+
+    // 1. Reserve domain on the single live owner strictly BEFORE serialization or staging.
+    w.reserve().await?;
+
+    // 1b. Produce serialized write (and pin sequence replay episodes) under the granted reservation.
+    let pending_write = match w.prepare_write_after_reserve().await {
+        Ok(pw) => pw,
+        Err(err) => {
+            w.release_pre_rename().await;
+            return Err(err);
+        }
+    };
+
+    // 2. Off-thread stage + file fsync (`StagedWrite::stage`) strictly AFTER reserve.
+    let staged_opt: Option<StagedWrite> = match pending_write {
+        None => None,
+        Some(pw) => {
+            let stage_res = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                StagedWrite::stage(pw.path, pw.text)
+            })
+            .await
+            .map_err(|e| format!("stage task failed: {e}"))
+            .and_then(|r| r);
+            match stage_res {
+                Ok(staged) => Some(staged),
+                Err(e) => {
+                    tracing::warn!("State file not staged: {e}");
+                    return Err(w.abort_pre_rename_fs("stage", e).await);
+                }
+            }
+        }
+    };
+
+    if w.after_reserve_before_rename() {
+        if let Some(staged) = staged_opt {
+            staged.abort();
+        }
+        return Err(w.worker_disconnected_err());
+    }
+
+    // 3. Fresh pre-rename off-thread auth + live owner authority recheck.
+    if let Err(err) = w.verify_authority_before_rename().await {
+        if let Some(staged) = staged_opt {
+            staged.abort();
+        }
+        w.release_pre_rename().await;
+        return Err(err);
+    }
+
+    // 4. Rename off-thread, mark Persisted(DurableUnconfirmed), then parent-directory fsync
+    //    strictly BEFORE activation.
+    let mut disk_published = false;
+    if let Some(staged) = staged_opt {
+        let sim_rename_fail = w.should_fail_rename_once();
+        let rename_outcome = run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+            if sim_rename_fail {
+                staged.abort();
+                return Err("simulated rename failure".to_string());
+            }
+            staged.rename_only()
+        })
+        .await;
+
+        let dir_sync = match rename_outcome {
+            Ok(Ok(ds)) => {
+                w.on_renamed();
+                ds
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("State file not published: {e}");
+                return Err(w.abort_pre_rename_fs("rename", e).await);
+            }
+            Err(e) => {
+                return Err(w.reconcile_rename_join_error(e).await);
+            }
+        };
+
+        disk_published = true;
+
+        // 4b. Mark Persisted(DurableUnconfirmed) immediately after rename.
+        w.mark_persisted().await?;
+
+        // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
+        //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
+        //    motion inhibited until reconciliation succeeds.
+        let dir_sync_res: Result<(), String> = if w.should_fail_dir_sync_once() {
+            Err("simulated parent dir fsync failure".into())
+        } else {
+            let override_fn = w.dir_sync_override();
+            run_fs_step(W::RUN_BLOCKING_ON_TOKIO, move || {
+                let outcome = match override_fn {
+                    Some(f) => dir_sync.sync_with(|dir| f(dir)),
+                    None => dir_sync.sync_parent_dir(),
+                };
+                match outcome {
+                    PublishOutcome::Published => Ok(()),
+                    PublishOutcome::PublishedDurabilityUnconfirmed(warn) => Err(warn),
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
+        };
+
+        if let Err(warn) = dir_sync_res {
+            tracing::error!(
+                "Parent directory fsync failed after rename ({warn}); keeping old policy active and entering Reconciling"
+            );
+            return Err(w.reconcile_after_dir_sync_failure(warn).await);
+        }
+
+        if w.after_rename_before_activate() {
+            return Err(w.worker_disconnected_err());
+        }
+    }
+
+    // 6. Fresh post-dir-sync authority recheck + atomic activation + PublishedConfigHub update.
+    w.activate_and_publish(disk_published).await
+}
+
+/// Synchronously drives [`execute_common_commit`] to completion for dedicated blocking workers
+/// (`armd-persist` OS thread on Executor and non-deferred `SupervisorInner` legacy tests).
+pub(crate) fn run_common_commit_sync<W: CommonCommitWorker>(w: &mut W) -> Result<W::Ok, W::Err> {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut fut = std::pin::pin!(execute_common_commit(w));
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(res) => res,
+        Poll::Pending => unreachable!("sync CommonCommitWorker backend returned Poll::Pending"),
+    }
+}
+
+struct ConfigCommitBackend<FAuth, FPub> {
+    sup: Arc<ArmSupervisor>,
+    hooks: ConfigCommitTestHooks,
+    proposal: ConfigProposal,
+    auth: ConfigAuthContext,
+    precheck: Option<ReservePrecheck>,
+    candidate: Option<ConfigCandidate>,
+    pending_write: Option<PendingWrite>,
+    expected_workspace_revision: Option<u64>,
+    expected_poses_revision: Option<u64>,
+    replay_episode_refs: Vec<(usize, String)>,
+    auth_check: FAuth,
+    update_published: Option<FPub>,
+    guard: Option<ReservationGuard>,
+    grant: Option<GrantId>,
+    domain: ConfigDomain,
+    episode_pin_guard: Option<crate::recording::store::EpisodePinGuard>,
+}
+
+impl<FAuth, FPub> CommonCommitWorker for ConfigCommitBackend<FAuth, FPub>
+where
+    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send,
+    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send,
+{
+    type Ok = ConfigCommitOutcome;
+    type Err = ConfigCommitError;
+    const RUN_BLOCKING_ON_TOKIO: bool = true;
+
+    fn before_reserve(&mut self) {
+        if let Some(h) = self.hooks.before_reserve.as_ref() {
+            h();
+        }
+    }
+
+    fn should_fail_rename_once(&self) -> bool {
+        self.hooks
+            .fail_rename_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+    }
+
+    fn should_fail_dir_sync_once(&self) -> bool {
+        self.hooks
+            .fail_dir_sync_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+    }
+
+    async fn reserve(&mut self) -> Result<(), Self::Err> {
+        if let Err((_, err)) = (self.auth_check)() {
+            return Err(ConfigCommitError::pre_publish(err));
+        }
+        let precheck = self.precheck.take().expect("precheck taken once in reserve");
+        let reservation = match self
+            .sup
+            .dispatch_config_request_owned_reliable(ConfigRequest::Reserve(ReserveConfig {
+                proposal: self.proposal,
+                auth: self.auth,
+                precheck,
+                expected_workspace_revision: self.expected_workspace_revision,
+                expected_poses_revision: self.expected_poses_revision,
+            }))
+            .await
+        {
+            Ok(ConfigReply::Reserved(Ok(r))) => r,
+            Ok(ConfigReply::Reserved(Err(e))) => {
+                return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
+            }
+            Err(e) => {
+                return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
+            }
+            _ => {
+                return Err(ConfigCommitError::pre_publish(ArmError::Internal(
+                    "unexpected config reserve reply".into(),
+                )));
+            }
+        };
+        self.grant = Some(reservation.grant());
+        self.domain = reservation.domain();
+        self.guard = Some(ReservationGuard::new(Arc::clone(&self.sup), reservation));
+        Ok(())
+    }
+
+    async fn prepare_write_after_reserve(&mut self) -> Result<Option<PendingWrite>, Self::Err> {
+        // For `Sequences` saves referencing replay episodes, atomically verify existence and pin
+        // them in `EpisodeStore` right under the granted `Sequences` reservation so concurrent
+        // episode deletion is refused with 409 IN_USE and an already-deleted episode aborts
+        // cleanly with 422 SEQUENCE_REF_MISSING.
+        if !self.replay_episode_refs.is_empty() {
+            let store = self.sup.episode_store().await;
+            match store.pin_episodes_for_sequence(&self.replay_episode_refs) {
+                Ok(pg) => self.episode_pin_guard = Some(pg),
+                Err((step, ep_id)) => {
+                    return Err(ConfigCommitError::pre_publish(ArmError::detailed(
+                        422,
+                        "SEQUENCE_REF_MISSING",
+                        format!("step {step}: no episode '{ep_id}'"),
+                        json!({"step": step}),
+                    )));
+                }
+            }
+        }
+        Ok(self.pending_write.take())
+    }
+
+    fn after_reserve_before_rename(&mut self) -> bool {
+        if let Some(h) = self.hooks.after_reserve_before_rename.as_ref() {
+            h();
+        }
+        false
+    }
+
+    async fn verify_authority_before_rename(&mut self) -> Result<(), Self::Err> {
+        if let Err((_, err)) = (self.auth_check)() {
+            return Err(ConfigCommitError::pre_publish(err));
+        }
+        let grant = self.grant.expect("reservation granted before verify");
+        match self
+            .sup
+            .dispatch_config_request_owned_reliable(ConfigRequest::VerifyAuthority {
+                domain: self.domain,
+                grant,
+                proposal: self.proposal,
+                auth: self.auth,
+                expected_workspace_revision: self.expected_workspace_revision,
+                expected_poses_revision: self.expected_poses_revision,
+            })
+            .await
+        {
+            Ok(ConfigReply::AuthorityVerified(Ok(()))) => Ok(()),
+            Ok(ConfigReply::AuthorityVerified(Err(e))) => {
+                Err(ConfigCommitError::pre_publish(e.to_arm_error()))
+            }
+            Err(e) => Err(ConfigCommitError::pre_publish(e.to_arm_error())),
+            _ => Err(ConfigCommitError::pre_publish(ArmError::Internal(
+                "unexpected authority verification reply".into(),
+            ))),
+        }
+    }
+
+    fn on_renamed(&mut self) {
+        if let Some(g) = self.guard.as_mut() {
+            g.mark_renamed();
+        }
+    }
+
+    async fn mark_persisted(&mut self) -> Result<(), Self::Err> {
+        let sim_persisted_fail = self
+            .hooks
+            .fail_persisted_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+        let r = self
+            .guard
+            .as_mut()
+            .and_then(|g| g.take())
+            .expect("reservation held by guard");
+        if sim_persisted_fail {
+            if let Some(pg) = self.episode_pin_guard.take() {
+                pg.keep_pinned_for_reconcile();
+            }
+            if let Ok(ConfigReply::Persisted(Ok(pr))) = self
+                .sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(PersistedConfig {
+                    reservation: r,
+                    durability: Durability::DurableUnconfirmed,
+                }))
+                .await
+            {
+                let _ = self
+                    .sup
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                        reservation: pr,
+                    }))
+                    .await;
+            }
+            return Err(ConfigCommitError::post_publish_reconciling(
+                ConfigError::Reconciling("SIMULATED_PERSISTED_ERR").to_arm_error(),
+            ));
+        }
+        let persisted_r = match self
+            .sup
+            .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(PersistedConfig {
+                reservation: r,
+                durability: Durability::DurableUnconfirmed,
+            }))
+            .await
+        {
+            Ok(ConfigReply::Persisted(Ok(r))) => r,
+            Ok(ConfigReply::Persisted(Err(e))) => {
+                if let Some(pg) = self.episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+                return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
+            }
+            Err(e) => {
+                if let Some(pg) = self.episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+                return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
+            }
+            _ => {
+                if let Some(pg) = self.episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+                return Err(ConfigCommitError::post_publish_reconciling(
+                    ArmError::Internal("unexpected config persisted reply".into()),
+                ));
+            }
+        };
+        let mut g = ReservationGuard::new(Arc::clone(&self.sup), persisted_r);
+        g.mark_renamed();
+        self.guard = Some(g);
+        Ok(())
+    }
+
+    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
+        if let Some(pg) = self.episode_pin_guard.take() {
+            pg.keep_pinned_for_reconcile();
+        }
+        if let Some(r) = self.guard.as_mut().and_then(|g| g.take()) {
+            let rel = self
+                .sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                    reservation: r,
+                }))
+                .await;
+            if !matches!(rel, Ok(ConfigReply::Released(Released::Reconciling))) {
+                let domain = self.domain;
+                let _ = self
+                    .sup
+                    .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                    .await;
+            }
+        }
+        ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
+            status: 500,
+            code: "PERSIST_FAILED".into(),
+            message: format!("Parent directory fsync failed after rename ({warn}); reconciliation required"),
+        })
+    }
+
+    fn after_rename_before_activate(&mut self) -> bool {
+        if let Some(h) = self.hooks.after_rename_before_activate.as_ref() {
+            h();
+        }
+        false
+    }
+
+    async fn activate_and_publish(&mut self, disk_published: bool) -> Result<Self::Ok, Self::Err> {
+        let post_rename_revoked = match (self.auth_check)() {
+            Ok(()) => None,
+            Err((code, err)) => {
+                if !disk_published {
+                    self.release_pre_rename().await;
+                    return Err(ConfigCommitError::pre_publish(err));
+                }
+                Some(code)
+            }
+        };
+        let reservation = self
+            .guard
+            .as_mut()
+            .and_then(|g| g.take())
+            .expect("reservation held by guard");
+        let candidate = self.candidate.take().expect("candidate taken once in activate");
+        let durability = if disk_published {
+            Durability::Durable
+        } else {
+            Durability::Volatile
+        };
+        let activated = match self
+            .sup
+            .dispatch_config_request_owned_reliable(ConfigRequest::Activate(ActivateConfig {
+                reservation,
+                auth: self.auth,
+                revoked_off_thread: post_rename_revoked,
+                candidate,
+                durability,
+                expected_workspace_revision: self.expected_workspace_revision,
+                expected_poses_revision: self.expected_poses_revision,
+            }))
+            .await
+        {
+            Ok(ConfigReply::Activated(Ok(act))) => act,
+            Ok(ConfigReply::Activated(Err(e))) => {
+                let is_reconciling = matches!(e, ConfigError::Reconciling(_)) || disk_published;
+                if is_reconciling {
+                    if let Some(pg) = self.episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
+                }
+                if disk_published {
+                    tracing::error!(
+                        "Configuration written on disk but not activated: {:?}; reconciling",
+                        e
+                    );
+                }
+                return Err(ConfigCommitError {
+                    error: e.to_arm_error(),
+                    disk_published,
+                    reconciling: is_reconciling,
+                });
+            }
+            Err(e) => {
+                if disk_published {
+                    if let Some(pg) = self.episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
+                }
+                return Err(ConfigCommitError {
+                    error: e.to_arm_error(),
+                    disk_published,
+                    reconciling: disk_published,
+                });
+            }
+            _ => {
+                if disk_published {
+                    if let Some(pg) = self.episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
+                }
+                return Err(ConfigCommitError {
+                    error: ArmError::Internal("unexpected config activate reply".into()),
+                    disk_published,
+                    reconciling: disk_published,
+                });
+            }
+        };
+
+        // Publish committed sequence revision BEFORE dropping `episode_pin_guard` so concurrent
+        // episode deletes linearize cleanly with the newly active `SequenceFile`.
+        if self.domain == ConfigDomain::Sequences {
+            self.sup.set_sequences_revision(activated.revision);
+        }
+
+        let update_published = self
+            .update_published
+            .take()
+            .expect("update_published called once");
+        self.sup.published_config_hub().update(|cfg| {
+            cfg.workspace_revision = activated.workspace_revision;
+            update_published(cfg, activated);
+        });
+        drop(self.episode_pin_guard.take());
+
+        Ok(ConfigCommitOutcome {
+            activated,
+            persisted: disk_published,
+            durability_confirmed: true,
+            durability_warning: None,
+        })
+    }
+
+    async fn release_pre_rename(&mut self) {
+        drop(self.episode_pin_guard.take());
+        if let Some(r) = self.guard.as_mut().and_then(|g| g.take()) {
+            let _ = self
+                .sup
+                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
+                    reservation: r,
+                }))
+                .await;
+        }
+    }
+
+    async fn abort_pre_rename_fs(&mut self, _phase: &'static str, err: String) -> Self::Err {
+        self.release_pre_rename().await;
+        ConfigCommitError::pre_publish(ArmError::Rejected {
+            status: 500,
+            code: "PERSIST_FAILED".into(),
+            message: format!("Failed to persist configuration: {err}"),
+        })
+    }
+
+    async fn reconcile_rename_join_error(&mut self, err: String) -> Self::Err {
+        if let Some(pg) = self.episode_pin_guard.take() {
+            pg.keep_pinned_for_reconcile();
+        }
+        if let Some(g) = self.guard.as_mut() {
+            g.mark_renamed();
+            if let Some(r) = g.take() {
+                if let Ok(ConfigReply::Persisted(Ok(pr))) = self
+                    .sup
+                    .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
+                        PersistedConfig {
+                            reservation: r,
+                            durability: Durability::DurableUnconfirmed,
+                        },
+                    ))
+                    .await
+                {
+                    let _ = self
+                        .sup
+                        .dispatch_config_request_owned_reliable(ConfigRequest::Release(
+                            ReleaseConfig { reservation: pr },
+                        ))
+                        .await;
+                } else {
+                    let domain = self.domain;
+                    let _ = self
+                        .sup
+                        .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
+                        .await;
+                }
+            }
+        }
+        ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
+            status: 500,
+            code: "PERSIST_FAILED".into(),
+            message: format!("Failed to persist configuration: rename task failed: {err}"),
+        })
+    }
+
+    fn worker_disconnected_err(&mut self) -> Self::Err {
+        ConfigCommitError::pre_publish(ArmError::Internal("config commit worker disconnected".into()))
+    }
+}
+
 async fn run_config_commit_worker<FAuth, FPub>(
     sup: Arc<ArmSupervisor>,
     plan: ConfigCommitPlan,
@@ -2314,8 +2968,8 @@ async fn run_config_commit_worker<FAuth, FPub>(
     update_published: FPub,
 ) -> Result<ConfigCommitOutcome, ConfigCommitError>
 where
-    FAuth: Fn() -> Result<(), (&'static str, ArmError)>,
-    FPub: FnOnce(&mut PublishedConfig, ConfigActivated),
+    FAuth: Fn() -> Result<(), (&'static str, ArmError)> + Send,
+    FPub: FnOnce(&mut PublishedConfig, ConfigActivated) + Send,
 {
     let hooks = sup.config_commit_test_hooks();
     let cw_lock = sup.config_write_lock();
@@ -2362,423 +3016,30 @@ where
         }
     }
 
-    let pending_write: Option<PendingWrite> = match write {
+    let pending_write = match write {
         ConfigWriteOp::Volatile => None,
         ConfigWriteOp::StageAndReplace(w) => Some(w),
     };
-
-    if let Some(h) = hooks.before_reserve.as_ref() {
-        h();
-    }
-
-    if let Err((_, err)) = auth_check() {
-        return Err(ConfigCommitError::pre_publish(err));
-    }
-
-    // 1. Reserve domain on the single live owner BEFORE any staging or file mutation.
-    let reservation = match sup
-        .dispatch_config_request_owned_reliable(ConfigRequest::Reserve(ReserveConfig {
-            proposal,
-            auth,
-            precheck,
-            expected_workspace_revision,
-            expected_poses_revision,
-        }))
-        .await
-    {
-        Ok(ConfigReply::Reserved(Ok(r))) => r,
-        Ok(ConfigReply::Reserved(Err(e))) => {
-            return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-        }
-        Err(e) => {
-            return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-        }
-        _ => {
-            return Err(ConfigCommitError::pre_publish(ArmError::Internal(
-                "unexpected config reserve reply".into(),
-            )));
-        }
+    let domain = proposal.domain;
+    let mut backend = ConfigCommitBackend {
+        sup,
+        hooks,
+        proposal,
+        auth,
+        precheck: Some(precheck),
+        candidate: Some(candidate),
+        pending_write,
+        expected_workspace_revision,
+        expected_poses_revision,
+        replay_episode_refs,
+        auth_check,
+        update_published: Some(update_published),
+        guard: None,
+        grant: None,
+        domain,
+        episode_pin_guard: None,
     };
-
-    let grant = reservation.grant();
-    let domain = reservation.domain();
-    let mut guard = ReservationGuard::new(Arc::clone(&sup), reservation);
-
-    let release_pre_rename = |sup: Arc<ArmSupervisor>, mut guard: ReservationGuard| async move {
-        if let Some(r) = guard.take() {
-            let _ = sup
-                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
-                    reservation: r,
-                }))
-                .await;
-        }
-    };
-
-    // 1b. For `Sequences` saves referencing replay episodes, atomically verify existence and pin
-    //     them in `EpisodeStore` right under the granted `Sequences` reservation (before staging,
-    //     hooks, or rename) so concurrent episode deletion is refused with 409 IN_USE and an
-    //     already-deleted episode aborts cleanly with 422 SEQUENCE_REF_MISSING.
-    let mut episode_pin_guard: Option<crate::recording::store::EpisodePinGuard> =
-        if !replay_episode_refs.is_empty() {
-            let store = sup.episode_store().await;
-            match store.pin_episodes_for_sequence(&replay_episode_refs) {
-                Ok(pg) => Some(pg),
-                Err((step, ep_id)) => {
-                    release_pre_rename(Arc::clone(&sup), guard).await;
-                    return Err(ConfigCommitError::pre_publish(ArmError::detailed(
-                        422,
-                        "SEQUENCE_REF_MISSING",
-                        format!("step {step}: no episode '{ep_id}'"),
-                        json!({"step": step}),
-                    )));
-                }
-            }
-        } else {
-            None
-        };
-
-    // 2. Off-thread stage + file fsync (`StagedWrite::stage`) strictly AFTER reserve.
-    let staged_opt: Option<StagedWrite> = match pending_write {
-        None => None,
-        Some(w) => {
-            let stage_res = tokio::task::spawn_blocking(move || StagedWrite::stage(w.path, w.text))
-                .await
-                .map_err(|e| format!("stage task failed: {e}"))
-                .and_then(|r| r);
-            match stage_res {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    release_pre_rename(Arc::clone(&sup), guard).await;
-                    tracing::warn!("State file not staged: {e}");
-                    return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
-                        status: 500,
-                        code: "PERSIST_FAILED".into(),
-                        message: format!("Failed to persist configuration: {e}"),
-                    }));
-                }
-            }
-        }
-    };
-
-    if let Some(h) = hooks.after_reserve_before_rename.as_ref() {
-        h();
-    }
-
-    // 3. Fresh pre-rename authority recheck (off-thread auth + live owner VerifyAuthority).
-    if let Err((_, err)) = auth_check() {
-        if let Some(s) = staged_opt {
-            s.abort();
-        }
-        release_pre_rename(Arc::clone(&sup), guard).await;
-        return Err(ConfigCommitError::pre_publish(err));
-    }
-    match sup
-        .dispatch_config_request_owned_reliable(ConfigRequest::VerifyAuthority {
-            domain,
-            grant,
-            proposal,
-            auth,
-            expected_workspace_revision,
-            expected_poses_revision,
-        })
-        .await
-    {
-        Ok(ConfigReply::AuthorityVerified(Ok(()))) => {}
-        Ok(ConfigReply::AuthorityVerified(Err(e))) => {
-            if let Some(s) = staged_opt {
-                s.abort();
-            }
-            release_pre_rename(Arc::clone(&sup), guard).await;
-            return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-        }
-        Err(e) => {
-            if let Some(s) = staged_opt {
-                s.abort();
-            }
-            release_pre_rename(Arc::clone(&sup), guard).await;
-            return Err(ConfigCommitError::pre_publish(e.to_arm_error()));
-        }
-        _ => {
-            if let Some(s) = staged_opt {
-                s.abort();
-            }
-            release_pre_rename(Arc::clone(&sup), guard).await;
-            return Err(ConfigCommitError::pre_publish(ArmError::Internal(
-                "unexpected authority verification reply".into(),
-            )));
-        }
-    }
-
-    // 4. Rename off-thread, then record Persisted(DurableUnconfirmed),
-    //    then parent-directory fsync strictly BEFORE activation.
-    let mut disk_published = false;
-    if let Some(staged) = staged_opt {
-        let sim_rename_fail = hooks
-            .fail_rename_once
-            .as_ref()
-            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-
-        let rename_outcome = tokio::task::spawn_blocking(move || {
-            if sim_rename_fail {
-                staged.abort();
-                return Err("simulated rename failure".to_string());
-            }
-            staged.rename_only()
-        })
-        .await;
-
-        let dir_sync = match rename_outcome {
-            Ok(Ok(ds)) => {
-                guard.mark_renamed();
-                ds
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("State file not published: {e}");
-                release_pre_rename(Arc::clone(&sup), guard).await;
-                return Err(ConfigCommitError::pre_publish(ArmError::Rejected {
-                    status: 500,
-                    code: "PERSIST_FAILED".into(),
-                    message: format!("Failed to persist configuration: {e}"),
-                }));
-            }
-            Err(e) => {
-                // JoinError after spawn_blocking started: conservatively treat as post-publish
-                // reconciling because a rename may have completed before the panic/abort.
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-                guard.mark_renamed();
-                if let Some(r) = guard.take() {
-                    if let Ok(ConfigReply::Persisted(Ok(pr))) = sup
-                        .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
-                            PersistedConfig {
-                                reservation: r,
-                                durability: Durability::DurableUnconfirmed,
-                            },
-                        ))
-                        .await
-                    {
-                        let _ = sup
-                            .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                                ReleaseConfig { reservation: pr },
-                            ))
-                            .await;
-                    } else {
-                        let _ = sup
-                            .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
-                            .await;
-                    }
-                }
-                return Err(ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
-                    status: 500,
-                    code: "PERSIST_FAILED".into(),
-                    message: format!("Failed to persist configuration: rename task failed: {e}"),
-                }));
-            }
-        };
-
-        disk_published = true;
-        let sim_persisted_fail = hooks
-            .fail_persisted_once
-            .as_ref()
-            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-        let r = guard.take().expect("reservation held by guard");
-        if sim_persisted_fail {
-            if let Some(pg) = episode_pin_guard.take() {
-                pg.keep_pinned_for_reconcile();
-            }
-            if let Ok(ConfigReply::Persisted(Ok(r))) = sup
-                .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
-                    PersistedConfig {
-                        reservation: r,
-                        durability: Durability::DurableUnconfirmed,
-                    },
-                ))
-                .await
-            {
-                let _ = sup
-                    .dispatch_config_request_owned_reliable(ConfigRequest::Release(
-                        ReleaseConfig { reservation: r },
-                    ))
-                    .await;
-            }
-            return Err(ConfigCommitError::post_publish_reconciling(
-                ConfigError::Reconciling("SIMULATED_PERSISTED_ERR").to_arm_error(),
-            ));
-        }
-        let persisted_r = match sup
-            .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(PersistedConfig {
-                reservation: r,
-                durability: Durability::DurableUnconfirmed,
-            }))
-            .await
-        {
-            Ok(ConfigReply::Persisted(Ok(r))) => r,
-            Ok(ConfigReply::Persisted(Err(e))) => {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-                return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
-            }
-            Err(e) => {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-                return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
-            }
-            _ => {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-                return Err(ConfigCommitError::post_publish_reconciling(
-                    ArmError::Internal("unexpected config persisted reply".into()),
-                ));
-            }
-        };
-        guard = ReservationGuard::new(Arc::clone(&sup), persisted_r);
-        guard.mark_renamed();
-
-        // 5. Parent-directory fsync strictly AFTER rename and strictly BEFORE activation.
-        //    A failure here MUST NOT activate the new policy; it enters Reconciling and keeps
-        //    motion inhibited until reconciliation succeeds.
-        let sim_dir_sync_fail = hooks
-            .fail_dir_sync_once
-            .as_ref()
-            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-        let dir_sync_res: Result<(), String> = if sim_dir_sync_fail {
-            Err("simulated parent dir fsync failure".into())
-        } else {
-            tokio::task::spawn_blocking(move || match dir_sync.sync_parent_dir() {
-                PublishOutcome::Published => Ok(()),
-                PublishOutcome::PublishedDurabilityUnconfirmed(w) => Err(w),
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r)
-        };
-
-        if let Err(warn) = dir_sync_res {
-            if let Some(pg) = episode_pin_guard.take() {
-                pg.keep_pinned_for_reconcile();
-            }
-            let r = guard.take().expect("persisted reservation held by guard");
-            let rel = sup
-                .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
-                    reservation: r,
-                }))
-                .await;
-            if !matches!(rel, Ok(ConfigReply::Released(Released::Reconciling))) {
-                let _ = sup
-                    .dispatch_config_request_reliable(|| ConfigRequest::ForceReconcile(domain))
-                    .await;
-            }
-            tracing::error!(
-                "Parent directory fsync failed after rename ({warn}); keeping old policy active and entering Reconciling"
-            );
-            return Err(ConfigCommitError::post_publish_reconciling(ArmError::Rejected {
-                status: 500,
-                code: "PERSIST_FAILED".into(),
-                message: format!("Parent directory fsync failed after rename ({warn}); reconciliation required"),
-            }));
-        }
-
-        if let Some(h) = hooks.after_rename_before_activate.as_ref() {
-            h();
-        }
-    }
-
-    // 6. Fresh post-dir-sync authority recheck + atomic activation/publication.
-    let post_rename_revoked = match auth_check() {
-        Ok(()) => None,
-        Err((code, err)) => {
-            if !disk_published {
-                release_pre_rename(Arc::clone(&sup), guard).await;
-                return Err(ConfigCommitError::pre_publish(err));
-            }
-            Some(code)
-        }
-    };
-
-    let reservation = guard.take().expect("reservation held by guard");
-    let durability = if disk_published {
-        Durability::Durable
-    } else {
-        Durability::Volatile
-    };
-    let activated = match sup
-        .dispatch_config_request_owned_reliable(ConfigRequest::Activate(ActivateConfig {
-            reservation,
-            auth,
-            revoked_off_thread: post_rename_revoked,
-            candidate,
-            durability,
-            expected_workspace_revision,
-            expected_poses_revision,
-        }))
-        .await
-    {
-        Ok(ConfigReply::Activated(Ok(act))) => act,
-        Ok(ConfigReply::Activated(Err(e))) => {
-            let is_reconciling = matches!(e, ConfigError::Reconciling(_)) || disk_published;
-            if is_reconciling {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-            }
-            if disk_published {
-                tracing::error!("Configuration written on disk but not activated: {:?}; reconciling", e);
-            }
-            return Err(ConfigCommitError {
-                error: e.to_arm_error(),
-                disk_published,
-                reconciling: is_reconciling,
-            });
-        }
-        Err(e) => {
-            if disk_published {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-            }
-            return Err(ConfigCommitError {
-                error: e.to_arm_error(),
-                disk_published,
-                reconciling: disk_published,
-            });
-        }
-        _ => {
-            if disk_published {
-                if let Some(pg) = episode_pin_guard.take() {
-                    pg.keep_pinned_for_reconcile();
-                }
-            }
-            return Err(ConfigCommitError {
-                error: ArmError::Internal("unexpected config activate reply".into()),
-                disk_published,
-                reconciling: disk_published,
-            });
-        }
-    };
-
-    // Publish committed sequence revision BEFORE dropping `episode_pin_guard` so concurrent
-    // episode deletes linearize cleanly with the newly active `SequenceFile`.
-    if domain == ConfigDomain::Sequences {
-        sup.set_sequences_revision(activated.revision);
-    }
-
-    // Update PublishedConfigHub off-thread immediately after owner activation.
-    sup.published_config_hub().update(|cfg| {
-        cfg.workspace_revision = activated.workspace_revision;
-        update_published(cfg, activated);
-    });
-    drop(episode_pin_guard);
-
-    Ok(ConfigCommitOutcome {
-        activated,
-        persisted: disk_published,
-        durability_confirmed: true,
-        durability_warning: None,
-    })
+    execute_common_commit(&mut backend).await
 }
 
 // ============================================================================
@@ -3164,11 +3425,295 @@ pub(crate) fn zero_check_owner_activate(
     }
 }
 
-/// Legacy `tick_shared` async worker for `gripper_zero_check(store_offset=true)` routed through
-/// the exact common commit ordering:
-/// `reserve -> off-thread serialize + stage + file fsync -> fresh owner authority recheck ->
-/// rename -> parent-directory fsync (failure -> Reconciling) -> fresh owner authority recheck ->
-/// activate/publish`.
+/// Control outcome returned by [`CommonCommitWorker`] adapters for `gripper_zero_check(store_offset=true)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZeroCheckCommitStop {
+    /// Failed/aborted cleanly or entered `Reconciling`; worker loop may continue to next job.
+    Aborted,
+    /// Dedicated worker thread disconnected or stopped; worker loop must exit immediately.
+    WorkerDisconnected,
+}
+
+fn zero_check_op_auth_ok(ctx: &crate::supervisor::ZeroCheckPersistContext) -> bool {
+    ctx.operator_auth
+        .as_ref()
+        .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()))
+}
+
+struct LegacyZeroCheckBackend {
+    sup_inner: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>,
+    published_config: Arc<PublishedConfigHub>,
+    hooks: ConfigCommitTestHooks,
+    job: crate::supervisor::PendingZeroCheckPersist,
+    candidate_policy: Option<GripperPolicy>,
+    reservation: Option<Reservation>,
+    proposal: Option<ConfigProposal>,
+    auth: Option<ConfigAuthContext>,
+}
+
+impl CommonCommitWorker for LegacyZeroCheckBackend {
+    type Ok = ();
+    type Err = ZeroCheckCommitStop;
+    const RUN_BLOCKING_ON_TOKIO: bool = true;
+
+    fn before_reserve(&mut self) {
+        if let Some(h) = self.hooks.before_reserve.as_ref() {
+            h();
+        }
+    }
+
+    fn should_fail_rename_once(&self) -> bool {
+        self.hooks
+            .fail_rename_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+    }
+
+    fn should_fail_dir_sync_once(&self) -> bool {
+        self.hooks
+            .fail_dir_sync_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+    }
+
+    async fn reserve(&mut self) -> Result<(), Self::Err> {
+        let req_seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+        let policy = self
+            .candidate_policy
+            .as_ref()
+            .expect("candidate_policy validated before reserve");
+        let mut inner = self.sup_inner.write().await;
+        if inner.detached {
+            return Err(ZeroCheckCommitStop::Aborted);
+        }
+        let ctx = CommitCtx {
+            arm: inner.core.id(),
+            boot: BootId::process(),
+            now: Instant::now(),
+            stop_generation: inner.current_stop_gen(),
+        };
+        match zero_check_owner_reserve(
+            &mut inner,
+            &ctx,
+            self.job.action_id,
+            self.job.base_revision,
+            self.job.lease_owner,
+            self.job.estop_epoch,
+            self.job.stop_gen,
+            self.job.deadline,
+            policy,
+            req_seq,
+            Some(String::with_capacity(64)),
+            Some(String::with_capacity(160)),
+        ) {
+            Ok((r, p, a, _, _)) => {
+                self.reservation = Some(r);
+                self.proposal = Some(p);
+                self.auth = Some(a);
+                Ok(())
+            }
+            Err(_) => Err(ZeroCheckCommitStop::Aborted),
+        }
+    }
+
+    async fn prepare_write_after_reserve(&mut self) -> Result<Option<PendingWrite>, Self::Err> {
+        Ok(Some(self.job.ctx.serialize_write(self.job.offset_rad)))
+    }
+
+    fn after_reserve_before_rename(&mut self) -> bool {
+        if let Some(h) = self.hooks.after_reserve_before_rename.as_ref() {
+            h();
+        }
+        false
+    }
+
+    async fn verify_authority_before_rename(&mut self) -> Result<(), Self::Err> {
+        if !zero_check_op_auth_ok(&self.job.ctx) {
+            let mut inner = self.sup_inner.write().await;
+            if let Some(r) = self.reservation.take() {
+                let _ = ConfigAuthority::release(&mut *inner, r);
+            }
+            if inner.zero_check_persisting == Some(self.job.action_id) {
+                inner.zero_check_persisting = None;
+            }
+            let _ = inner.fail_zero_check_action_owned(
+                self.job.action_id,
+                "OPERATOR_REQUIRED".into(),
+                "Operator session expired or locked before gripper calibration persisted".into(),
+            );
+            return Err(ZeroCheckCommitStop::Aborted);
+        }
+        let r = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal recorded");
+        let auth = self.auth.expect("auth recorded");
+        let mut inner = self.sup_inner.write().await;
+        if inner.detached {
+            return Err(ZeroCheckCommitStop::Aborted);
+        }
+        let ctx = CommitCtx {
+            arm: inner.core.id(),
+            boot: BootId::process(),
+            now: Instant::now(),
+            stop_generation: inner.current_stop_gen(),
+        };
+        match zero_check_owner_verify_authority(
+            &mut inner,
+            &ctx,
+            self.job.action_id,
+            r,
+            &proposal,
+            &auth,
+            self.job.base_revision,
+            Some(String::with_capacity(64)),
+            Some(String::with_capacity(160)),
+        ) {
+            Ok((r, _, _)) => {
+                self.reservation = Some(r);
+                Ok(())
+            }
+            Err(_) => Err(ZeroCheckCommitStop::Aborted),
+        }
+    }
+
+    async fn mark_persisted(&mut self) -> Result<(), Self::Err> {
+        let sim_persisted_fail = self
+            .hooks
+            .fail_persisted_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+        let r = self.reservation.take().expect("reservation held");
+        let mut inner = self.sup_inner.write().await;
+        match zero_check_owner_persisted(
+            &mut inner,
+            self.job.action_id,
+            r,
+            sim_persisted_fail,
+            Some(String::with_capacity(64)),
+            Some(String::with_capacity(160)),
+        ) {
+            Ok((r, _, _)) => {
+                self.reservation = Some(r);
+                Ok(())
+            }
+            Err(_) => Err(ZeroCheckCommitStop::Aborted),
+        }
+    }
+
+    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
+        if let Some(r) = self.reservation.take() {
+            let mut inner = self.sup_inner.write().await;
+            let _ = zero_check_owner_reconcile_dir_sync_failed(
+                &mut inner,
+                self.job.action_id,
+                r,
+                warn,
+                Some(String::with_capacity(160)),
+            );
+        }
+        ZeroCheckCommitStop::Aborted
+    }
+
+    fn after_rename_before_activate(&mut self) -> bool {
+        if let Some(h) = self.hooks.after_rename_before_activate.as_ref() {
+            h();
+        }
+        false
+    }
+
+    async fn activate_and_publish(&mut self, _disk_published: bool) -> Result<Self::Ok, Self::Err> {
+        let operator_revoked = !zero_check_op_auth_ok(&self.job.ctx);
+        let r = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal recorded");
+        let auth = self.auth.expect("auth recorded");
+        let policy = self.candidate_policy.take().expect("candidate_policy held");
+        let pub_policy = policy.clone();
+        let pub_jaw = self.job.ctx.jaw_opening.clone();
+        let jaw = self.job.ctx.jaw_opening.take();
+        let activated_ok = {
+            let mut inner = self.sup_inner.write().await;
+            if inner.detached {
+                return Err(ZeroCheckCommitStop::Aborted);
+            }
+            let ctx = CommitCtx {
+                arm: inner.core.id(),
+                boot: BootId::process(),
+                now: Instant::now(),
+                stop_generation: inner.current_stop_gen(),
+            };
+            zero_check_owner_activate(
+                &mut inner,
+                &ctx,
+                self.job.action_id,
+                r,
+                &proposal,
+                &auth,
+                self.job.base_revision,
+                self.job.offset_rad,
+                policy,
+                jaw,
+                operator_revoked,
+                Some(String::with_capacity(64)),
+                Some(String::with_capacity(160)),
+            )
+            .is_ok()
+        };
+        if activated_ok {
+            self.published_config.apply_zero_check_commit(
+                self.job.offset_rad,
+                pub_policy,
+                pub_jaw,
+                self.job.base_revision + 1,
+            );
+        }
+        Ok(())
+    }
+
+    async fn release_pre_rename(&mut self) {
+        if let Some(r) = self.reservation.take() {
+            let mut inner = self.sup_inner.write().await;
+            let _ = ConfigAuthority::release(&mut *inner, r);
+        }
+    }
+
+    async fn abort_pre_rename_fs(&mut self, _phase: &'static str, err: String) -> Self::Err {
+        let mut inner = self.sup_inner.write().await;
+        if let Some(r) = self.reservation.take() {
+            let _ = ConfigAuthority::release(&mut *inner, r);
+        }
+        if inner.zero_check_persisting == Some(self.job.action_id) {
+            inner.zero_check_persisting = None;
+        }
+        let _ = inner.fail_zero_check_action_owned(
+            self.job.action_id,
+            "PERSIST_FAILED".into(),
+            format!("Failed to persist gripper calibration: {err}"),
+        );
+        ZeroCheckCommitStop::Aborted
+    }
+
+    async fn reconcile_rename_join_error(&mut self, err: String) -> Self::Err {
+        let mut inner = self.sup_inner.write().await;
+        if let Some(r) = self.reservation.take() {
+            let _ = zero_check_owner_persisted(
+                &mut inner,
+                self.job.action_id,
+                r,
+                true,
+                Some(String::with_capacity(64)),
+                Some(String::with_capacity(160)),
+            );
+        }
+        tracing::error!("Legacy zero_check rename task failed: {err}");
+        ZeroCheckCommitStop::Aborted
+    }
+
+    fn worker_disconnected_err(&mut self) -> Self::Err {
+        ZeroCheckCommitStop::WorkerDisconnected
+    }
+}
+
+/// Legacy `tick_shared` async entry point for `gripper_zero_check(store_offset=true)`:
+/// executes through the ONE common commit worker ([`execute_common_commit`]).
 pub(crate) async fn run_legacy_zero_check_commit(
     sup_inner: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>,
     cw_lock: Arc<tokio::sync::Mutex<()>>,
@@ -3177,12 +3722,7 @@ pub(crate) async fn run_legacy_zero_check_commit(
     job: crate::supervisor::PendingZeroCheckPersist,
 ) {
     let _cw = cw_lock.lock().await;
-    let check_op_auth = |ctx: &crate::supervisor::ZeroCheckPersistContext| -> bool {
-        ctx.operator_auth
-            .as_ref()
-            .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()))
-    };
-    if !check_op_auth(&job.ctx) {
+    if !zero_check_op_auth_ok(&job.ctx) {
         let mut inner = sup_inner.write().await;
         if inner.zero_check_persisting == Some(job.action_id) {
             inner.zero_check_persisting = None;
@@ -3217,262 +3757,230 @@ pub(crate) async fn run_legacy_zero_check_commit(
             return;
         }
     };
+    let mut backend = LegacyZeroCheckBackend {
+        sup_inner,
+        published_config,
+        hooks,
+        job,
+        candidate_policy: Some(candidate_policy),
+        reservation: None,
+        proposal: None,
+        auth: None,
+    };
+    let _ = execute_common_commit(&mut backend).await;
+}
 
-    if let Some(h) = hooks.before_reserve.as_ref() {
-        h();
-    }
+struct SyncZeroCheckBackend<'a> {
+    core: &'a mut SupervisorInner,
+    action_id: u64,
+    offset_rad: f32,
+    base_revision: u64,
+    lease_owner: Option<(HolderLabel, u64)>,
+    estop_epoch: u64,
+    stop_gen: u64,
+    deadline: Instant,
+    ctx_box: Box<crate::supervisor::ZeroCheckPersistContext>,
+    candidate_policy: Option<GripperPolicy>,
+    reservation: Option<Reservation>,
+    proposal: Option<ConfigProposal>,
+    auth: Option<ConfigAuthContext>,
+}
 
-    // 1. Reserve strictly BEFORE serialization and staging.
-    let req_seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-    let (reservation, proposal, auth) = {
-        let mut inner = sup_inner.write().await;
-        if inner.detached {
-            return;
-        }
-        let ctx = CommitCtx {
-            arm: inner.core.id(),
+impl CommonCommitWorker for SyncZeroCheckBackend<'_> {
+    type Ok = ();
+    type Err = ZeroCheckCommitStop;
+    const RUN_BLOCKING_ON_TOKIO: bool = false;
+
+    async fn reserve(&mut self) -> Result<(), Self::Err> {
+        let req_seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+        let policy = self
+            .candidate_policy
+            .as_ref()
+            .expect("candidate_policy validated before reserve");
+        let commit_ctx = CommitCtx {
+            arm: self.core.core.id(),
             boot: BootId::process(),
             now: Instant::now(),
-            stop_generation: inner.current_stop_gen(),
+            stop_generation: self.stop_gen,
         };
         match zero_check_owner_reserve(
-            &mut inner,
-            &ctx,
-            job.action_id,
-            job.base_revision,
-            job.lease_owner,
-            job.estop_epoch,
-            job.stop_gen,
-            job.deadline,
-            &candidate_policy,
+            self.core,
+            &commit_ctx,
+            self.action_id,
+            self.base_revision,
+            self.lease_owner,
+            self.estop_epoch,
+            self.stop_gen,
+            self.deadline,
+            policy,
             req_seq,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         ) {
-            Ok((r, p, a, _, _)) => (r, p, a),
-            Err(_) => return,
-        }
-    };
-
-    // 2. Off-thread serialize + stage + file fsync strictly AFTER reserve.
-    let write = job.ctx.serialize_write(job.offset_rad);
-    let staged_res = tokio::task::spawn_blocking(move || StagedWrite::stage(write.path, write.text))
-        .await
-        .map_err(|e| format!("stage task failed: {e}"))
-        .and_then(|r| r);
-    let staged = match staged_res {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
-            let mut inner = sup_inner.write().await;
-            let _ = ConfigAuthority::release(&mut *inner, reservation);
-            if inner.zero_check_persisting == Some(job.action_id) {
-                inner.zero_check_persisting = None;
+            Ok((r, p, a, _, _)) => {
+                self.reservation = Some(r);
+                self.proposal = Some(p);
+                self.auth = Some(a);
+                Ok(())
             }
-            let _ = inner.fail_zero_check_action_owned(
-                job.action_id,
-                "PERSIST_FAILED".into(),
-                format!("Failed to persist gripper calibration: {e}"),
+            Err(_) => Err(ZeroCheckCommitStop::Aborted),
+        }
+    }
+
+    async fn prepare_write_after_reserve(&mut self) -> Result<Option<PendingWrite>, Self::Err> {
+        Ok(Some(self.ctx_box.serialize_write(self.offset_rad)))
+    }
+
+    async fn verify_authority_before_rename(&mut self) -> Result<(), Self::Err> {
+        if !zero_check_op_auth_ok(&self.ctx_box) {
+            if let Some(r) = self.reservation.take() {
+                let _ = ConfigAuthority::release(self.core, r);
+            }
+            if self.core.zero_check_persisting == Some(self.action_id) {
+                self.core.zero_check_persisting = None;
+            }
+            let _ = self.core.fail_zero_check_action_owned(
+                self.action_id,
+                "OPERATOR_REQUIRED".into(),
+                "Operator session expired or locked before gripper calibration persisted".into(),
             );
-            return;
+            return Err(ZeroCheckCommitStop::Aborted);
         }
-    };
-
-    if let Some(h) = hooks.after_reserve_before_rename.as_ref() {
-        h();
-    }
-
-    // 3. Fresh pre-rename operator auth + live owner authority recheck.
-    if !check_op_auth(&job.ctx) {
-        staged.abort();
-        let mut inner = sup_inner.write().await;
-        let _ = ConfigAuthority::release(&mut *inner, reservation);
-        if inner.zero_check_persisting == Some(job.action_id) {
-            inner.zero_check_persisting = None;
-        }
-        let _ = inner.fail_zero_check_action_owned(
-            job.action_id,
-            "OPERATOR_REQUIRED".into(),
-            "Operator session expired or locked before gripper calibration persisted".into(),
-        );
-        return;
-    }
-    let reservation = {
-        let mut inner = sup_inner.write().await;
-        if inner.detached {
-            staged.abort();
-            return;
-        }
-        let ctx = CommitCtx {
-            arm: inner.core.id(),
+        let r = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal recorded");
+        let auth = self.auth.expect("auth recorded");
+        let verify_ctx = CommitCtx {
+            arm: self.core.core.id(),
             boot: BootId::process(),
             now: Instant::now(),
-            stop_generation: inner.current_stop_gen(),
+            stop_generation: self.core.current_stop_gen(),
         };
         match zero_check_owner_verify_authority(
-            &mut inner,
-            &ctx,
-            job.action_id,
-            reservation,
+            self.core,
+            &verify_ctx,
+            self.action_id,
+            r,
             &proposal,
             &auth,
-            job.base_revision,
+            self.base_revision,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         ) {
-            Ok((r, _, _)) => r,
-            Err(_) => {
-                staged.abort();
-                return;
+            Ok((r, _, _)) => {
+                self.reservation = Some(r);
+                Ok(())
             }
+            Err(_) => Err(ZeroCheckCommitStop::Aborted),
         }
-    };
+    }
 
-    // 4a. Rename off-thread.
-    let sim_rename_fail = hooks
-        .fail_rename_once
-        .as_ref()
-        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-    let rename_res = if sim_rename_fail {
-        staged.abort();
-        Err("simulated rename failure".to_string())
-    } else {
-        tokio::task::spawn_blocking(move || staged.rename_only())
-            .await
-            .map_err(|e| format!("rename task failed: {e}"))
-            .and_then(|r| r)
-    };
-    let dir_sync = match rename_res {
-        Ok(ds) => ds,
-        Err(e) => {
-            tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
-            let mut inner = sup_inner.write().await;
-            let _ = ConfigAuthority::release(&mut *inner, reservation);
-            if inner.zero_check_persisting == Some(job.action_id) {
-                inner.zero_check_persisting = None;
-            }
-            let _ = inner.fail_zero_check_action_owned(
-                job.action_id,
-                "PERSIST_FAILED".into(),
-                format!("Failed to persist gripper calibration: {e}"),
-            );
-            return;
-        }
-    };
-
-    // 4b. Mark Persisted(DurableUnconfirmed) immediately after rename.
-    let sim_persisted_fail = hooks
-        .fail_persisted_once
-        .as_ref()
-        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-    let reservation = {
-        let mut inner = sup_inner.write().await;
+    async fn mark_persisted(&mut self) -> Result<(), Self::Err> {
+        let r = self.reservation.take().expect("reservation held");
         match zero_check_owner_persisted(
-            &mut inner,
-            job.action_id,
-            reservation,
-            sim_persisted_fail,
+            self.core,
+            self.action_id,
+            r,
+            false,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
         ) {
-            Ok((r, _, _)) => r,
-            Err(_) => return,
+            Ok((r, _, _)) => {
+                self.reservation = Some(r);
+                Ok(())
+            }
+            Err(_) => Err(ZeroCheckCommitStop::Aborted),
         }
-    };
-
-    // 5. Parent-directory fsync strictly BEFORE activation. Failure enters Reconciling!
-    let sim_dir_sync_fail = hooks
-        .fail_dir_sync_once
-        .as_ref()
-        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-    let outcome = if sim_dir_sync_fail {
-        PublishOutcome::PublishedDurabilityUnconfirmed("simulated parent dir fsync failure".into())
-    } else {
-        tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
-            .await
-            .unwrap_or_else(|e| PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()))
-    };
-    if let PublishOutcome::PublishedDurabilityUnconfirmed(warn) = outcome {
-        let mut inner = sup_inner.write().await;
-        let _ = zero_check_owner_reconcile_dir_sync_failed(
-            &mut inner,
-            job.action_id,
-            reservation,
-            warn,
-            Some(String::with_capacity(160)),
-        );
-        return;
     }
 
-    if let Some(h) = hooks.after_rename_before_activate.as_ref() {
-        h();
+    async fn reconcile_after_dir_sync_failure(&mut self, warn: String) -> Self::Err {
+        if let Some(r) = self.reservation.take() {
+            let _ = zero_check_owner_reconcile_dir_sync_failed(
+                self.core,
+                self.action_id,
+                r,
+                warn,
+                Some(String::with_capacity(160)),
+            );
+        }
+        ZeroCheckCommitStop::Aborted
     }
 
-    // 6. Fresh post-dir-sync authority recheck + atomic activation + PublishedConfigHub update.
-    let operator_revoked = !check_op_auth(&job.ctx);
-    let pub_policy = candidate_policy.clone();
-    let pub_jaw = job.ctx.jaw_opening.clone();
-    let activated_ok = {
-        let mut inner = sup_inner.write().await;
-        if inner.detached {
-            return;
-        }
-        let ctx = CommitCtx {
-            arm: inner.core.id(),
+    async fn activate_and_publish(&mut self, _disk_published: bool) -> Result<Self::Ok, Self::Err> {
+        let operator_revoked = !zero_check_op_auth_ok(&self.ctx_box);
+        let r = self.reservation.take().expect("reservation held");
+        let proposal = self.proposal.expect("proposal recorded");
+        let auth = self.auth.expect("auth recorded");
+        let policy = self.candidate_policy.take().expect("candidate_policy held");
+        let jaw = self.ctx_box.jaw_opening.take();
+        let act_ctx = CommitCtx {
+            arm: self.core.core.id(),
             boot: BootId::process(),
             now: Instant::now(),
-            stop_generation: inner.current_stop_gen(),
+            stop_generation: self.core.current_stop_gen(),
         };
-        zero_check_owner_activate(
-            &mut inner,
-            &ctx,
-            job.action_id,
-            reservation,
+        let _ = zero_check_owner_activate(
+            self.core,
+            &act_ctx,
+            self.action_id,
+            r,
             &proposal,
             &auth,
-            job.base_revision,
-            job.offset_rad,
-            candidate_policy,
-            job.ctx.jaw_opening,
+            self.base_revision,
+            self.offset_rad,
+            policy,
+            jaw,
             operator_revoked,
             Some(String::with_capacity(64)),
             Some(String::with_capacity(160)),
-        )
-        .is_ok()
-    };
-    if activated_ok {
-        published_config.apply_zero_check_commit(
-            job.offset_rad,
-            pub_policy,
-            pub_jaw,
-            job.base_revision + 1,
         );
+        Ok(())
+    }
+
+    async fn release_pre_rename(&mut self) {
+        if let Some(r) = self.reservation.take() {
+            let _ = ConfigAuthority::release(self.core, r);
+        }
+    }
+
+    async fn abort_pre_rename_fs(&mut self, _phase: &'static str, err: String) -> Self::Err {
+        if let Some(r) = self.reservation.take() {
+            let _ = ConfigAuthority::release(self.core, r);
+        }
+        if self.core.zero_check_persisting == Some(self.action_id) {
+            self.core.zero_check_persisting = None;
+        }
+        let _ = self.core.fail_zero_check_action_owned(
+            self.action_id,
+            "PERSIST_FAILED".into(),
+            format!("Failed to persist gripper calibration: {err}"),
+        );
+        ZeroCheckCommitStop::Aborted
+    }
+
+    async fn reconcile_rename_join_error(&mut self, _err: String) -> Self::Err {
+        ZeroCheckCommitStop::Aborted
+    }
+
+    fn worker_disconnected_err(&mut self) -> Self::Err {
+        ZeroCheckCommitStop::WorkerDisconnected
     }
 }
 
 /// Synchronous legacy fallback when `defer_zero_check_persist == false` (bare `SupervisorInner`
-/// tests): runs the exact same common commit state machine (`reserve -> serialize + stage +
-/// file fsync -> fresh authority recheck -> rename -> persisted -> parent-dir fsync (failure ->
-/// Reconciling) -> fresh authority recheck -> activate`).
+/// tests): executes through the ONE common commit worker ([`run_common_commit_sync`]).
 pub(crate) fn commit_zero_check_sync(
     core: &mut SupervisorInner,
     action_id: u64,
     offset_rad: f32,
     ctx_box: Box<crate::supervisor::ZeroCheckPersistContext>,
 ) {
-    let check_op_auth = |c: &crate::supervisor::ZeroCheckPersistContext| -> bool {
-        c.operator_auth
-            .as_ref()
-            .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()))
-    };
-    // Hold action as running under `zero_check_persisting` so every owner primitive runs identically.
     if let Some(a) = core.last_action.as_mut().filter(|a| a.id == action_id) {
         a.state = HolderLabel::new("running");
         a.finished_at = None;
     }
     core.zero_check_persisting = Some(action_id);
 
-    if !check_op_auth(&ctx_box) {
+    if !zero_check_op_auth_ok(&ctx_box) {
         core.zero_check_persisting = None;
         let _ = core.fail_zero_check_action_owned(
             action_id,
@@ -3510,156 +4018,22 @@ pub(crate) fn commit_zero_check_sync(
     let estop_epoch = core.safety.epoch_id();
     let stop_gen = core.current_stop_gen();
     let deadline = Instant::now() + CONFIG_PROPOSAL_BUDGET;
-    let req_seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-    let commit_ctx = CommitCtx {
-        arm: core.core.id(),
-        boot: BootId::process(),
-        now: Instant::now(),
-        stop_generation: stop_gen,
-    };
-
-    // 1. Reserve strictly BEFORE serialization and staging.
-    let (reservation, proposal, auth) = match zero_check_owner_reserve(
+    let mut backend = SyncZeroCheckBackend {
         core,
-        &commit_ctx,
         action_id,
+        offset_rad,
         base_revision,
         lease_owner,
         estop_epoch,
         stop_gen,
         deadline,
-        &candidate_policy,
-        req_seq,
-        Some(String::with_capacity(64)),
-        Some(String::with_capacity(160)),
-    ) {
-        Ok((r, p, a, _, _)) => (r, p, a),
-        Err(_) => return,
+        ctx_box,
+        candidate_policy: Some(candidate_policy),
+        reservation: None,
+        proposal: None,
+        auth: None,
     };
-
-    // 2. Serialize + stage + file fsync strictly AFTER reserve.
-    let write = ctx_box.serialize_write(offset_rad);
-    let staged = match StagedWrite::stage(write.path, write.text) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
-            let _ = ConfigAuthority::release(core, reservation);
-            if core.zero_check_persisting == Some(action_id) {
-                core.zero_check_persisting = None;
-            }
-            let _ = core.fail_zero_check_action_owned(
-                action_id,
-                "PERSIST_FAILED".into(),
-                format!("Failed to persist gripper calibration: {e}"),
-            );
-            return;
-        }
-    };
-
-    // 3. Fresh pre-rename operator auth + live owner authority recheck.
-    if !check_op_auth(&ctx_box) {
-        staged.abort();
-        let _ = ConfigAuthority::release(core, reservation);
-        if core.zero_check_persisting == Some(action_id) {
-            core.zero_check_persisting = None;
-        }
-        let _ = core.fail_zero_check_action_owned(
-            action_id,
-            "OPERATOR_REQUIRED".into(),
-            "Operator session expired or locked before gripper calibration persisted".into(),
-        );
-        return;
-    }
-    let verify_ctx = CommitCtx {
-        arm: core.core.id(),
-        boot: BootId::process(),
-        now: Instant::now(),
-        stop_generation: core.current_stop_gen(),
-    };
-    let reservation = match zero_check_owner_verify_authority(
-        core,
-        &verify_ctx,
-        action_id,
-        reservation,
-        &proposal,
-        &auth,
-        base_revision,
-        Some(String::with_capacity(64)),
-        Some(String::with_capacity(160)),
-    ) {
-        Ok((r, _, _)) => r,
-        Err(_) => {
-            staged.abort();
-            return;
-        }
-    };
-
-    // 4a. Rename.
-    let dir_sync = match staged.rename_only() {
-        Ok(ds) => ds,
-        Err(e) => {
-            tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
-            let _ = ConfigAuthority::release(core, reservation);
-            if core.zero_check_persisting == Some(action_id) {
-                core.zero_check_persisting = None;
-            }
-            let _ = core.fail_zero_check_action_owned(
-                action_id,
-                "PERSIST_FAILED".into(),
-                format!("Failed to persist gripper calibration: {e}"),
-            );
-            return;
-        }
-    };
-
-    // 4b. Mark Persisted(DurableUnconfirmed).
-    let reservation = match zero_check_owner_persisted(
-        core,
-        action_id,
-        reservation,
-        false,
-        Some(String::with_capacity(64)),
-        Some(String::with_capacity(160)),
-    ) {
-        Ok((r, _, _)) => r,
-        Err(_) => return,
-    };
-
-    // 5. Parent-directory fsync strictly BEFORE activation. Failure enters Reconciling.
-    if let PublishOutcome::PublishedDurabilityUnconfirmed(warn) = dir_sync.sync_parent_dir() {
-        let _ = zero_check_owner_reconcile_dir_sync_failed(
-            core,
-            action_id,
-            reservation,
-            warn,
-            Some(String::with_capacity(160)),
-        );
-        return;
-    }
-
-    // 6. Fresh post-dir-sync authority recheck + atomic activation.
-    let operator_revoked = !check_op_auth(&ctx_box);
-    let act_ctx = CommitCtx {
-        arm: core.core.id(),
-        boot: BootId::process(),
-        now: Instant::now(),
-        stop_generation: core.current_stop_gen(),
-    };
-    let _ = zero_check_owner_activate(
-        core,
-        &act_ctx,
-        action_id,
-        reservation,
-        &proposal,
-        &auth,
-        base_revision,
-        offset_rad,
-        candidate_policy,
-        ctx_box.jaw_opening,
-        operator_revoked,
-        Some(String::with_capacity(64)),
-        Some(String::with_capacity(160)),
-    );
+    let _ = run_common_commit_sync(&mut backend);
 }
 
 /// Pre-builds an `EvalBufs` off-thread for a given `(ArmModel, WorkspacePolicy, CameraMount, tcp_offset)`.
