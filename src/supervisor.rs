@@ -21,7 +21,7 @@ use crate::motion::{
 
 // supervisor leaf modules (armd 1.6 RT-core foundation)
 mod driver_transitions;
-mod config;
+pub(crate) mod config;
 mod motion;
 mod streams;
 mod actions;
@@ -968,6 +968,8 @@ pub struct SupervisorInner {
     pub handover_settling_since: Option<Instant>,
     /// Running gravity-compensation session (`src/gravity_comp.rs`).
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
+    /// Retired gravity-compensation session waiting for off-thread drop (never dropped on RT).
+    pub(crate) retired_gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
     pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
     /// Keep-out source and file (`src/keepout.rs`).
     pub keepout: crate::keepout::Keepout,
@@ -1744,6 +1746,7 @@ impl SupervisorInner {
             last_evicted: None,
             handover_settling_since: None,
             gravity_comp: None,
+            retired_gravity_comp: None,
             gravity_comp_last_exit: None,
             keepout: crate::keepout::Keepout::default(),
             poses: crate::poses::PoseStore::default(),
@@ -1991,7 +1994,7 @@ impl SupervisorInner {
         Ok(())
     }
 
-    fn is_stamp_consumed(&self, request_id: u64) -> bool {
+    pub(crate) fn is_stamp_consumed(&self, request_id: u64) -> bool {
         if request_id == 0 {
             return true;
         }
@@ -2003,7 +2006,7 @@ impl SupervisorInner {
         }
     }
 
-    fn record_consumed_stamp(&mut self, request_id: u64) {
+    pub(crate) fn record_consumed_stamp(&mut self, request_id: u64) {
         if request_id == 0 {
             return;
         }
@@ -6518,6 +6521,10 @@ pub struct ArmSupervisor {
     obs_waits: AtomicU64,
     obs_unavailable: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Off-RT published configuration snapshot for REST readers and off-thread prepare (never touched on RT).
+    published_config: Arc<crate::rt_core::requests::config::PublishedConfigHub>,
+    /// Test-only hooks for deterministic config-commit failure injection across both owners.
+    config_commit_hooks: std::sync::Mutex<crate::rt_core::requests::config::ConfigCommitTestHooks>,
     /// Single-owner slot (`Legacy` -> `Transferring` -> `Executor` | `Failed`).
     /// Lock order: always `self.inner` before `self.owner`.
     owner: std::sync::Mutex<OwnerSlot>,
@@ -6692,6 +6699,7 @@ impl ArmSupervisor {
         inner.lease_gen_mirror = lease_gen_mirror.clone();
         inner.terminals = Some(Arc::clone(&terminals));
         let template_obs = inner.current_observation();
+        let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
@@ -6722,6 +6730,13 @@ impl ArmSupervisor {
             obs_waits: AtomicU64::new(0),
             obs_unavailable: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            published_config: Arc::new(crate::rt_core::requests::config::PublishedConfigHub::new(
+                initial_pub_cfg,
+                0,
+            )),
+            config_commit_hooks: std::sync::Mutex::new(
+                crate::rt_core::requests::config::ConfigCommitTestHooks::default(),
+            ),
             owner: std::sync::Mutex::new(OwnerSlot::Legacy),
             owner_mode: AtomicU8::new(OWNER_LEGACY),
             executor_base_gen: AtomicU64::new(0),
@@ -6924,6 +6939,10 @@ impl ArmSupervisor {
         guard.prepare_workspace_eval_bufs();
 
         let initial_gen = self.inner.generation();
+        self.published_config.publish(
+            crate::rt_core::requests::config::PublishedConfig::from_inner(&guard),
+            initial_gen,
+        );
         let shell = SupervisorInner::detached_shell(
             &guard.config,
             self.e_stop_latched.clone(),
@@ -6938,6 +6957,7 @@ impl ArmSupervisor {
             cfg,
             initial_gen,
             Arc::clone(&self.config_write_mutex),
+            Arc::clone(&self.published_config),
             Arc::clone(&self.estop_reg),
             Arc::clone(&self.tick_stats),
             Arc::clone(&self.control_sched),
@@ -6964,6 +6984,7 @@ impl ArmSupervisor {
                 Err(ArmError::Internal(msg))
             }
             Err((None, msg)) => {
+                self.published_config.set_available(false);
                 {
                     let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
                     *slot = OwnerSlot::Failed;
@@ -6980,11 +7001,137 @@ impl ArmSupervisor {
         Arc::clone(&self.config_write_mutex)
     }
 
-    pub async fn set_operator_auth_enforced(&self, enforced: bool) {
-        let mut inner = self.inner.write().await;
-        if self.check_legacy_under_guard(&inner).is_ok() {
-            inner.operator_auth_enforced = enforced;
+    pub fn published_config_hub(&self) -> &Arc<crate::rt_core::requests::config::PublishedConfigHub> {
+        &self.published_config
+    }
+
+    /// Returns the latest published configuration snapshot without touching `SupervisorLock`
+    /// in `OWNER_EXECUTOR` mode. Fails closed with `503 CONFIG_UNAVAILABLE` if ownership is
+    /// transitioning or failed.
+    pub async fn published_config(
+        &self,
+    ) -> Result<Arc<crate::rt_core::requests::config::PublishedConfig>, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => self
+                .published_config
+                .latest()
+                .ok_or_else(crate::rt_core::requests::config::config_unavailable),
+            OWNER_LEGACY => {
+                let current_gen = self.inner.generation();
+                let (cached, cached_gen) = self.published_config.latest_with_gen();
+                if cached_gen == current_gen {
+                    return Ok(cached);
+                }
+                let inner = self.inner.read().await;
+                if inner.detached {
+                    drop(inner);
+                    if self.owner_mode() == OWNER_EXECUTOR {
+                        return self
+                            .published_config
+                            .latest()
+                            .ok_or_else(crate::rt_core::requests::config::config_unavailable);
+                    }
+                    return Err(crate::rt_core::requests::config::config_unavailable());
+                }
+                let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
+                let gen = self.inner.generation();
+                drop(inner);
+                self.published_config.publish(snap, gen);
+                self.published_config
+                    .latest()
+                    .ok_or_else(crate::rt_core::requests::config::config_unavailable)
+            }
+            _ => Err(crate::rt_core::requests::config::config_unavailable()),
         }
+    }
+
+    /// Routes one [`ConfigRequest`] through the active single owner (`Legacy` write lock or
+    /// `Executor` `MaintenanceOp::Config`) using the identical owner-side handler.
+    pub async fn dispatch_config_request(
+        &self,
+        req: crate::rt_core::requests::config::ConfigRequest,
+    ) -> Result<
+        crate::rt_core::requests::config::ConfigReply,
+        crate::rt_core::requests::config::ConfigError,
+    > {
+        use crate::rt_core::executor::OwnerError;
+        use crate::rt_core::requests::config::{
+            handle_config_exchange, ConfigError, ConfigExchange,
+        };
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(ConfigError::OwnerStopped);
+                };
+                handle.call_config_async(req).await.map_err(|e| match e {
+                    OwnerError::QueueFull => ConfigError::OwnerQueueFull,
+                    _ => ConfigError::OwnerStopped,
+                })
+            }
+            OWNER_LEGACY => {
+                let mut ex = ConfigExchange::new(req);
+                let mut inner = self.inner.write().await;
+                if inner.detached {
+                    drop(inner);
+                    let req = ex.req.take().expect("request still present");
+                    if self.owner_mode() == OWNER_EXECUTOR {
+                        let Some(handle) = self.executor_handle() else {
+                            return Err(ConfigError::OwnerStopped);
+                        };
+                        return handle.call_config_async(req).await.map_err(|e| match e {
+                            OwnerError::QueueFull => ConfigError::OwnerQueueFull,
+                            _ => ConfigError::OwnerStopped,
+                        });
+                    }
+                    return Err(ConfigError::OwnerStopped);
+                }
+                let ctx = crate::rt_core::ops::CommitCtx {
+                    arm: inner.core.id(),
+                    boot: crate::rt_core::broker::BootId::process(),
+                    now: Instant::now(),
+                    stop_generation: inner.current_stop_gen(),
+                };
+                handle_config_exchange(&mut inner, &ctx, &mut ex);
+                drop(inner);
+                ex.reply.take().ok_or(ConfigError::OwnerStopped)
+            }
+            _ => Err(ConfigError::OwnerStopped),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_config_commit_test_hooks(
+        &self,
+        hooks: crate::rt_core::requests::config::ConfigCommitTestHooks,
+    ) {
+        *self
+            .config_commit_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = hooks;
+    }
+
+    #[doc(hidden)]
+    pub fn config_commit_test_hooks(
+        &self,
+    ) -> crate::rt_core::requests::config::ConfigCommitTestHooks {
+        self.config_commit_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub async fn set_operator_auth_enforced(&self, enforced: bool) {
+        if self.owner_mode() == OWNER_LEGACY {
+            let mut inner = self.inner.write().await;
+            if self.check_legacy_under_guard(&inner).is_ok() {
+                inner.operator_auth_enforced = enforced;
+            }
+        }
+        let legacy_gen = (self.owner_mode() == OWNER_LEGACY).then(|| self.inner.generation());
+        self.published_config.update(
+            |cfg| cfg.operator_auth_enforced = enforced,
+            legacy_gen,
+        );
     }
 
     /// Every tick's observation, forwarded by the dispatcher thread (started here when it

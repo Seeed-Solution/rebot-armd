@@ -629,7 +629,7 @@ impl SupervisorInner {
     pub fn active_calibration_digest_str(&self) -> &str { &self.calibration_digest }
 
     #[cfg(feature = "policy-runtime")]
-    fn calibration_digest_of(c: Option<&crate::calibration::CalibrationFile>) -> String {
+    pub(crate) fn calibration_digest_of(c: Option<&crate::calibration::CalibrationFile>) -> String {
         match c {
             None => crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
             Some(cal) => {

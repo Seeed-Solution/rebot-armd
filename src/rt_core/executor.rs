@@ -70,7 +70,8 @@ const OFFLOAD_RECLAIM_CAPACITY: usize = MAINT_QUEUE_CAPACITY
     + RECLAIM_STATE_CAPACITY
     + URGENT_STOP_CAPACITY
     + RECLAIM_TRAJ_CAPACITY
-    + 4;
+    + 4
+    + 2;
 
 /// Startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -847,6 +848,7 @@ pub enum MaintenanceOp {
         mark_dirty: bool,
     },
     MarkBaselineDirty,
+    Config(Box<super::requests::config::ConfigExchange>),
     #[doc(hidden)]
     ProbeOwnedPayload { payload: Box<dyn Any + Send> },
 }
@@ -865,6 +867,8 @@ pub enum MaintenanceResult {
     BaselineTaken(BaselineTakeReply),
     BaselineStored(bool),
     BaselineDirtyMarked,
+    Config(Box<super::requests::config::ConfigExchange>),
+    StoppedWithConfig(Box<super::requests::config::ConfigExchange>),
     ProbeReturned,
     Stopped,
 }
@@ -920,7 +924,9 @@ impl MaintClientInner {
             drop(reply.returned_baseline);
             if let Some(waiter) = self.waiters.remove(&reply.id) {
                 let res = match reply.result {
-                    MaintenanceResult::Stopped => Err(OwnerError::Stopped),
+                    MaintenanceResult::Stopped | MaintenanceResult::StoppedWithConfig(_) => {
+                        Err(OwnerError::Stopped)
+                    }
                     other => Ok(other),
                 };
                 waiter.deliver(res);
@@ -1501,6 +1507,14 @@ enum PersistReply {
         _returned_warning: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
     },
+    Activated {
+        _returned_policy: Option<GripperPolicy>,
+        _returned_jaw: Option<JawOpening>,
+        _returned_code: Option<String>,
+        _returned_msg: Option<String>,
+        _returned_warning: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
 }
 
 /// Dedicated bounded lock-free SPSC off-thread reclamation & deferred-log ring drained
@@ -1512,6 +1526,7 @@ enum OffloadReclaim {
     PersistReply(PersistReply),
     PersistJob(PendingZeroCheckPersist, Option<Box<dyn Any + Send>>),
     ZeroCheckCtx(Box<crate::supervisor::ZeroCheckPersistContext>),
+    GravityCompRun(crate::gravity_comp::GravityCompRun),
     Probe(Box<dyn Any + Send>),
     SafetyState(Arc<SafetyState>),
     RetiredStop(RetiredStopPayloads),
@@ -1750,6 +1765,8 @@ struct RtExecutorShared {
     persist_park_thread: Thread,
     clock: Option<Arc<dyn ExecutorClock>>,
     baseline_identity: BaselineIdentity,
+    boot: BootId,
+    published_config: Arc<super::requests::config::PublishedConfigHub>,
 }
 
 impl RtExecutorShared {
@@ -1880,6 +1897,7 @@ impl RtExecutorHandle {
     pub fn stop_requests(&self) -> &StopRequests { &self.shared.stop_requests }
     pub fn stats(&self) -> &Arc<ExecutorStats> { &self.shared.stats }
     pub fn executor_thread_id(&self) -> ThreadId { self.shared.executor_thread_id }
+    pub fn boot(&self) -> BootId { self.shared.boot }
     pub fn is_exited(&self) -> bool { self.shared.exited.load(Ordering::Acquire) }
     pub fn baseline_identity(&self) -> &BaselineIdentity { &self.shared.baseline_identity }
     #[doc(hidden)]
@@ -2001,8 +2019,27 @@ impl RtExecutorHandle {
     }
 
     pub fn set_joint_zero_offsets(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
+        let applied = offsets.clone();
         match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets { offsets })? {
-            MaintenanceResult::JointZeroOffsetsSet(r) => Ok(r),
+            MaintenanceResult::JointZeroOffsetsSet(r) => {
+                if r.is_ok() {
+                    self.shared.published_config.apply_joint_zero_offsets(&applied);
+                }
+                Ok(r)
+            }
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn set_joint_zero_offsets_async(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
+        let applied = offsets.clone();
+        match self.call_maintenance_async(MaintenanceOp::SetJointZeroOffsets { offsets }).await? {
+            MaintenanceResult::JointZeroOffsetsSet(r) => {
+                if r.is_ok() {
+                    self.shared.published_config.apply_joint_zero_offsets(&applied);
+                }
+                Ok(r)
+            }
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -2010,6 +2047,35 @@ impl RtExecutorHandle {
     pub fn set_motor_zero(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
         match self.call_maintenance(MaintenanceOp::SetMotorZero { joint })? {
             MaintenanceResult::MotorZeroSet(r) => Ok(r),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn set_motor_zero_async(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
+        match self.call_maintenance_async(MaintenanceOp::SetMotorZero { joint }).await? {
+            MaintenanceResult::MotorZeroSet(r) => Ok(r),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub fn call_config(
+        &self,
+        req: super::requests::config::ConfigRequest,
+    ) -> Result<super::requests::config::ConfigReply, OwnerError> {
+        let ex = super::requests::config::ConfigExchange::new(req);
+        match self.call_maintenance(MaintenanceOp::Config(ex))? {
+            MaintenanceResult::Config(mut ex) => ex.reply.take().ok_or(OwnerError::Protocol),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
+    pub async fn call_config_async(
+        &self,
+        req: super::requests::config::ConfigRequest,
+    ) -> Result<super::requests::config::ConfigReply, OwnerError> {
+        let ex = super::requests::config::ConfigExchange::new(req);
+        match self.call_maintenance_async(MaintenanceOp::Config(ex)).await? {
+            MaintenanceResult::Config(mut ex) => ex.reply.take().ok_or(OwnerError::Protocol),
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -2124,6 +2190,7 @@ pub(crate) fn spawn_executor(
     cfg: ExecutorConfig,
     initial_generation: u64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    published_config: Arc<super::requests::config::PublishedConfigHub>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
     tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
@@ -2198,6 +2265,7 @@ pub(crate) fn spawn_executor(
         persist_cmd_tx,
         persist_rep_rx.clone(),
         config_write_mutex,
+        Arc::clone(&published_config),
         persist_stop.clone(),
         exited.clone(),
         persist_worker_exited.clone(),
@@ -2322,6 +2390,8 @@ pub(crate) fn spawn_executor(
         persist_park_thread,
         clock: hooks.clock.clone(),
         baseline_identity,
+        boot: cfg.boot,
+        published_config,
     });
     Ok((RtExecutorHandle { shared }, sinks))
 }
@@ -2439,6 +2509,9 @@ impl ControlState {
         while let Some(ctx) = core.pop_retired_zero_check_ctx() {
             let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
         }
+        if let Some(run) = core.retired_gravity_comp.take() {
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
+        }
     }
 
     /// Moves retired fault `Arc<SafetyState>` snapshots, retired heap motion payloads, retired
@@ -2487,6 +2560,12 @@ impl ControlState {
             };
             let _ = self.offload_reclaim_tx.push(OffloadReclaim::ZeroCheckCtx(ctx));
             drained = true;
+        }
+        if !self.offload_reclaim_tx.is_full() {
+            if let Some(run) = core.retired_gravity_comp.take() {
+                let _ = self.offload_reclaim_tx.push(OffloadReclaim::GravityCompRun(run));
+                drained = true;
+            }
         }
         let lost_inline = core.safety.advance_log_dropped_forwarded();
         if lost_inline > 0 {
@@ -2665,6 +2744,10 @@ impl ControlState {
                 core.gripper_baseline_dirty = true;
                 MaintenanceResult::BaselineDirtyMarked
             }
+            MaintenanceOp::Config(mut ex) => {
+                super::requests::config::handle_config_exchange(core, ctx, &mut ex);
+                MaintenanceResult::Config(ex)
+            }
             MaintenanceOp::ProbeOwnedPayload { payload } => {
                 returned_probe = Some(payload);
                 MaintenanceResult::ProbeReturned
@@ -2701,13 +2784,18 @@ impl ControlState {
 
     fn drain_maintenance_stopped(&mut self) {
         if let Some(reply) = self.pending_maint_reply.take() {
-            let returned_pending = match reply.result {
-                MaintenanceResult::BaselineTaken(taken) if !taken.moves.is_empty() => Some(taken.moves),
-                _ => reply.returned_pending,
+            let (result, returned_pending) = match reply.result {
+                MaintenanceResult::BaselineTaken(taken) if !taken.moves.is_empty() => {
+                    (MaintenanceResult::Stopped, Some(taken.moves))
+                }
+                MaintenanceResult::Config(ex) | MaintenanceResult::StoppedWithConfig(ex) => {
+                    (MaintenanceResult::StoppedWithConfig(ex), reply.returned_pending)
+                }
+                _ => (MaintenanceResult::Stopped, reply.returned_pending),
             };
             self.push_maint_reply_or_offload(MaintReply {
                 id: reply.id,
-                result: MaintenanceResult::Stopped,
+                result,
                 returned_offsets: reply.returned_offsets,
                 returned_probe: reply.returned_probe,
                 returned_driver_config_error: reply.returned_driver_config_error,
@@ -2716,16 +2804,27 @@ impl ControlState {
             });
         }
         while let Ok(req) = self.maint_req_rx.pop() {
-            let (returned_offsets, returned_probe, returned_pending, returned_baseline) = match req.op {
-                MaintenanceOp::SetJointZeroOffsets { offsets } => (Some(offsets), None, None, None),
-                MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload), None, None),
-                MaintenanceOp::TakeBaselinePending { fresh_pending, .. } => (None, None, Some(fresh_pending), None),
-                MaintenanceOp::StoreBaseline { baseline, .. } => (None, None, None, Some(baseline)),
-                _ => (None, None, None, None),
+            let (result, returned_offsets, returned_probe, returned_pending, returned_baseline) = match req.op {
+                MaintenanceOp::SetJointZeroOffsets { offsets } => {
+                    (MaintenanceResult::Stopped, Some(offsets), None, None, None)
+                }
+                MaintenanceOp::ProbeOwnedPayload { payload } => {
+                    (MaintenanceResult::Stopped, None, Some(payload), None, None)
+                }
+                MaintenanceOp::TakeBaselinePending { fresh_pending, .. } => {
+                    (MaintenanceResult::Stopped, None, None, Some(fresh_pending), None)
+                }
+                MaintenanceOp::StoreBaseline { baseline, .. } => {
+                    (MaintenanceResult::Stopped, None, None, None, Some(baseline))
+                }
+                MaintenanceOp::Config(ex) => {
+                    (MaintenanceResult::StoppedWithConfig(ex), None, None, None, None)
+                }
+                _ => (MaintenanceResult::Stopped, None, None, None, None),
             };
             self.push_maint_reply_or_offload(MaintReply {
                 id: req.id,
-                result: MaintenanceResult::Stopped,
+                result,
                 returned_offsets,
                 returned_probe,
                 returned_driver_config_error: None,
@@ -3342,7 +3441,7 @@ impl ControlState {
                     // Return unused scratch strings + any displaced warning/policy/jaw off-thread.
                     let probe = self.take_reply_probe();
                     self.push_persist_reply_or_retain(
-                        PersistReply::Done {
+                        PersistReply::Activated {
                             _returned_policy: old_policy,
                             _returned_jaw: old_jaw,
                             _returned_code: Some(code_buf),
@@ -3406,6 +3505,7 @@ fn spawn_persist_worker(
     mut cmd_tx: Producer<PersistCmd>,
     rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    published_config: Arc<super::requests::config::PublishedConfigHub>,
     persist_stop: Arc<AtomicBool>,
     control_exited: Arc<AtomicBool>,
     persist_worker_exited: Arc<AtomicBool>,
@@ -3658,6 +3758,8 @@ fn spawn_persist_worker(
                 // Simulated worker crash/disconnect after rename without pushing Activate.
                 break;
             }
+            let pub_policy = new_policy.clone();
+            let pub_jaw = new_jaw.clone();
             let _ = push_cmd(
                 &mut cmd_tx,
                 PersistCmd::Activate {
@@ -3677,7 +3779,14 @@ fn spawn_persist_worker(
                 &control_exited,
             );
             if !hooks.leave_final_reply_queued {
-                let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                if let Some(PersistReply::Activated { .. }) = wait_reply(&rep_rx, &persist_stop, &control_exited) {
+                    published_config.apply_zero_check_commit(
+                        job.offset_rad,
+                        pub_policy,
+                        pub_jaw,
+                        job.base_revision + 1,
+                    );
+                }
             }
             if hooks.exit_after_first_job {
                 break;

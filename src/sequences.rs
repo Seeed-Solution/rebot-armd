@@ -126,6 +126,18 @@ pub struct SequenceStore {
 impl SequenceStore {
     pub fn get(&self, id: &str) -> Option<&Sequence> { self.file.sequences.iter().find(|s| s.id == id) }
 
+    /// Zero-allocation check whether any stored or pinned running sequence references pose `id`.
+    pub fn is_pose_in_use(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        self.file.sequences.iter().any(|s| s.pose_ids().any(|p| p == id))
+            || self
+                .pins
+                .as_ref()
+                .is_some_and(|p| p.pose_ids.iter().any(|x| x == id))
+    }
+
     /// Ids of the sequences that reference pose `id` (and the running one when it pinned it).
     pub fn using_pose(&self, id: &str) -> Vec<String> {
         let mut out: Vec<String> = self.file.sequences.iter().filter(|s| s.pose_ids().any(|p| p == id)).map(|s| s.id.clone()).collect();

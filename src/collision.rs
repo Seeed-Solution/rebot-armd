@@ -199,6 +199,12 @@ impl CollisionGuard {
         Self { enabled: policy.enabled, ..Self::default() }
     }
 
+    /// Clears any active collision hold and consecutive-tick counters (zero allocation).
+    pub(crate) fn clear_hold(&mut self) {
+        self.hold = None;
+        self.over = [0; 6];
+    }
+
     fn record_trip(&mut self, now: f64) {
         self.trips[self.trip_count % MAX_TRIP_HISTORY] = now;
         self.trip_count += 1;

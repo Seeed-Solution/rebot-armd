@@ -1,0 +1,2509 @@
+//! Owner-side configuration commit requests (stage 3 A8 / PR C).
+//!
+//! All configuration writes (WS `PreparedConfigWrite`, calibration commit paths,
+//! REST `post_tool_commissioning_confirm`) and published configuration readers flow
+//! through this module on both `RtOwner::Legacy` and `RtOwner::Executor`:
+//!
+//! - Preparation, serialization, staging (`StagedWrite::stage`), atomic rename
+//!   (`StagedWrite::rename_only`), and parent-directory fsync (`sync_parent_dir`)
+//!   always run OFF the control thread and OFF `SupervisorLock`.
+//! - Owner mutations run through [`ReserveConfig`], [`PersistedConfig`],
+//!   [`ActivateConfig`], and [`ReleaseConfig`] carried inside a single
+//!   preallocated `Box<ConfigExchange>` so `armd-control` performs zero heap
+//!   allocations and zero heap frees across reserve, persist, activate, release,
+//!   and failure paths.
+//! - Authority rechecks reuse A1's [`AdmissionStamp`], [`ClosedConnections`], and
+//!   [`ConsumedStamps`] through one single entry point ([`check_config_authority`]).
+//! - Pre-rename failure aborts staging and releases the hold (`Released::Cleared`).
+//!   Post-rename failure moves the hold to `HoldState::Reconciling` so live state
+//!   stays unchanged and motion stays inhibited.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::calibration::{
+    CalibError, CalibrationFile, CalibrationStale,
+};
+use crate::chain::{ArmModel, EvalBufs};
+use crate::collision::{CollisionConfig, CollisionPolicy, Sensitivity};
+use crate::grasp::GraspSetup;
+use crate::gripper_calib::GripperCalibrationResponse;
+use crate::keepout::{Keepout, KeepoutState, SourcedBox};
+use crate::model::{
+    ArmConfig, CalibrationToolInfo, CalibrationTools, CameraMount, Capabilities,
+    GraspWidthCheck, GripperCalibrationTool, GripperPolicy, HolderLabel, JawOpening,
+    KeepoutBox, MotorZeroSupport, MotorZeroTool,
+};
+use crate::motion::MotionError;
+use crate::persist::{PendingWrite, PublishOutcome, StagedWrite};
+use crate::poses::{NamedPose, PoseList, PoseStore, PoseTcp};
+use crate::recording::store::EpisodeStore;
+use crate::rt_core::broker::{Authority, BootId, ClientId, RequestId, Stamp};
+use crate::rt_core::config_iface::{
+    Activated, CandidateId, ConfigAuthority, ConfigDomain, ConfigProposal, Durability,
+    Released, Reservation, Reserved,
+};
+use crate::rt_core::ids::ArmId;
+use crate::rt_core::ops::{CommitCtx, CoreOps};
+use crate::safety::BoundedText;
+use crate::sequences::{Sequence, SequenceFile, SequenceStore, Step};
+use crate::supervisor::{
+    AdmissionStamp, ArmError, ArmSupervisor, SupervisorInner,
+    OWNER_EXECUTOR, OWNER_LEGACY,
+};
+use crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
+
+static NEXT_CONFIG_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+// ============================================================================
+// Published configuration snapshot (off-RT readers + off-thread prepare)
+// ============================================================================
+
+/// Immutable off-RT snapshot of configuration and startup capabilities.
+///
+/// Updated off-thread before ownership transfer (`start_executor_with_hooks`) and
+/// after every committed config, calibration, zero-check, or joint-zero mutation.
+/// Never locked or mutated on `armd-control`.
+#[derive(Clone)]
+pub struct PublishedConfig {
+    pub config: ArmConfig,
+    pub follower: Option<String>,
+    pub keepout: Keepout,
+    pub collision_enabled: bool,
+    pub collision_sensitivity: Sensitivity,
+    pub collision_runtime: bool,
+    pub collision_path: Option<PathBuf>,
+    pub collision_revision: u64,
+    pub collision_active: bool,
+    pub collision_torque_feedback: bool,
+    pub base_gripper_policy: Option<GripperPolicy>,
+    pub gripper_calib_path: Option<PathBuf>,
+    pub gripper_calib_offset: Option<f32>,
+    pub gripper_calib_jaw_opening: Option<JawOpening>,
+    pub gripper_calib_stale: Option<CalibrationStale>,
+    pub gripper_calib_revision: u64,
+    pub poses: PoseStore,
+    pub sequences: SequenceStore,
+    pub episodes: EpisodeStore,
+    pub grasp_setup_revision: u64,
+    pub tool_commissioning_path: Option<PathBuf>,
+    pub tool_commissioning_confirmed_at: Option<String>,
+    pub tool_commissioning_revision: u64,
+    pub calibration: Option<CalibrationFile>,
+    pub calibration_revision: u64,
+    pub calibration_busy: bool,
+    pub calibration_load_error: Option<String>,
+    pub profile_floor_z_m: Option<f32>,
+    pub floor_source: &'static str,
+    pub workspace_revision: u64,
+    pub joint_zero_offsets: Vec<f32>,
+    pub zero_convention: crate::joint_zero::ZeroConvention,
+    pub operator_auth_enforced: bool,
+    pub has_driver: bool,
+    pub driver_torque_feedback: bool,
+    pub driver_temperature_feedback: bool,
+    pub driver_supports_automatic_unload: bool,
+    pub driver_motor_current_cap: Option<Value>,
+    pub driver_motor_zero_support: MotorZeroSupport,
+    pub driver_config_error: Option<String>,
+    pub gravity_compensated: bool,
+    pub gravity_comp_supported: bool,
+    pub torque_guard_thresholds: Vec<Option<f32>>,
+    pub effective_planned_close_speed: f64,
+    pub policy_live_allowed: bool,
+    pub fallback_measured_positions: Vec<f32>,
+}
+
+impl PublishedConfig {
+    /// Captures a complete configuration snapshot from `inner` off the RT thread.
+    pub fn from_inner(inner: &SupervisorInner) -> Self {
+        let driver_torque_feedback = inner
+            .driver
+            .as_ref()
+            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        let driver_temperature_feedback = inner
+            .driver
+            .as_ref()
+            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
+        let driver_motor_current_cap = inner
+            .driver
+            .as_ref()
+            .and_then(|d| d.lock().ok().and_then(|drv| drv.motor_current_cap()))
+            .and_then(|cap| serde_json::to_value(cap).ok());
+        Self {
+            config: inner.config.clone(),
+            follower: inner.follower.clone(),
+            keepout: inner.keepout.clone(),
+            collision_enabled: inner.collision.enabled,
+            collision_sensitivity: inner.collision.sensitivity,
+            collision_runtime: inner.collision.runtime,
+            collision_path: inner.collision.path.clone(),
+            collision_revision: inner.collision.revision,
+            collision_active: inner.collision.hold.is_some(),
+            collision_torque_feedback: inner.collision.torque_feedback,
+            base_gripper_policy: inner.base_gripper_policy.clone(),
+            gripper_calib_path: inner.gripper_calib_path.clone(),
+            gripper_calib_offset: inner.gripper_calib_offset,
+            gripper_calib_jaw_opening: inner.gripper_calib_jaw_opening.clone(),
+            gripper_calib_stale: inner.gripper_calib_stale.clone(),
+            gripper_calib_revision: inner.gripper_calib_revision,
+            poses: inner.poses.clone(),
+            sequences: inner.sequences.clone(),
+            episodes: inner.episodes.clone(),
+            grasp_setup_revision: inner.grasp_setup_revision,
+            tool_commissioning_path: inner.tool_commissioning_path.clone(),
+            tool_commissioning_confirmed_at: inner.tool_commissioning_confirmed_at.clone(),
+            tool_commissioning_revision: inner.tool_commissioning_revision,
+            calibration: inner.calibration.clone(),
+            calibration_revision: inner.calibration_revision,
+            calibration_busy: inner.calibration_busy,
+            calibration_load_error: inner.calibration_load_error.clone(),
+            profile_floor_z_m: inner.profile_floor_z_m,
+            floor_source: inner.floor_source,
+            workspace_revision: inner.workspace_revision,
+            joint_zero_offsets: inner.joint_zero_offsets.clone(),
+            zero_convention: inner.zero_convention,
+            operator_auth_enforced: inner.operator_auth_enforced,
+            has_driver: inner.driver.is_some(),
+            driver_torque_feedback,
+            driver_temperature_feedback,
+            driver_supports_automatic_unload: inner.supports_automatic_unload(),
+            driver_motor_current_cap,
+            driver_motor_zero_support: inner.motor_zero_support(),
+            driver_config_error: inner.driver_config_error.clone(),
+            gravity_compensated: inner.gravity_compensated,
+            gravity_comp_supported: inner.gravity_comp_support().is_ok(),
+            torque_guard_thresholds: inner.torque_guard_thresholds(),
+            effective_planned_close_speed: inner.effective_planned_close_speed(),
+            policy_live_allowed: inner.policy_live_allowed(),
+            fallback_measured_positions: inner.measured_positions.clone(),
+        }
+    }
+
+    pub fn profile_keepout(&self) -> Vec<KeepoutBox> {
+        self.keepout.profile.clone().unwrap_or_else(|| {
+            self.config
+                .workspace
+                .as_ref()
+                .map(|ws| ws.keepout_boxes.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    pub fn keepout_state(&self) -> KeepoutState {
+        let tag = |b: &KeepoutBox, source| SourcedBox {
+            name: b.name.clone(),
+            min_m: b.min_m,
+            max_m: b.max_m,
+            source,
+        };
+        let boxes = self
+            .profile_keepout()
+            .iter()
+            .map(|b| tag(b, "profile"))
+            .chain(self.keepout.runtime_boxes.iter().map(|b| tag(b, "runtime")))
+            .collect();
+        KeepoutState {
+            boxes,
+            source: if self.keepout.runtime { "runtime" } else { "profile" },
+            revision: self.keepout.revision,
+        }
+    }
+
+    pub fn workspace_policy(&self) -> Option<(&crate::model::WorkspacePolicy, &CameraMount)> {
+        self.config.kinematics?;
+        self.config.workspace.as_ref().map(|ws| (ws, &self.config.camera_mount))
+    }
+
+    pub fn collision_policy(&self) -> CollisionPolicy {
+        self.config.collision.unwrap_or_default()
+    }
+
+    pub fn collision_available(&self) -> bool {
+        self.config.gravity_model.is_some()
+            && self.config.arm_dof() == 6
+            && matches!(self.config.dof, 6 | 7)
+            && self.collision_torque_feedback
+    }
+
+    pub fn collision_thresholds(&self) -> [f32; 6] {
+        let p = self.collision_policy();
+        let f = self.collision_sensitivity.factor();
+        std::array::from_fn(|j| p.thresholds_nm[j] * f)
+    }
+
+    pub fn collision_config(&self, live_active: Option<bool>) -> CollisionConfig {
+        let p = self.collision_policy();
+        CollisionConfig {
+            available: self.collision_available(),
+            enabled: self.collision_enabled,
+            sensitivity: self.collision_sensitivity,
+            thresholds_nm: self.collision_thresholds(),
+            profile_thresholds_nm: p.thresholds_nm,
+            persist_ticks: p.persist_ticks,
+            clear_ratio: p.clear_ratio,
+            resume_after_s: p.resume_after_s,
+            max_auto_resumes: p.max_auto_resumes,
+            escalate_window_s: p.escalate_window_s,
+            source: if self.collision_runtime { "runtime" } else { "profile" },
+            active: live_active.unwrap_or(self.collision_active),
+            revision: self.collision_revision,
+        }
+    }
+
+    pub fn gripper_calibration_response(&self) -> GripperCalibrationResponse {
+        let policy = self.config.gripper_policy.clone();
+        let calibrated = policy.as_ref().is_some_and(|p| p.is_calibrated());
+        let jaw_opening = policy.as_ref().and_then(|p| p.jaw_opening.clone());
+        GripperCalibrationResponse {
+            offset_rad: self.gripper_calib_offset,
+            jaw_opening,
+            calibrated,
+            policy,
+            ts: None,
+            stale: self.gripper_calib_stale.clone(),
+            revision: self.gripper_calib_revision,
+        }
+    }
+
+    pub fn tool_commissioning_response(&self) -> Value {
+        json!({
+            "active_tool": self.config.active_tool,
+            "commissioning_required": self.config.active_tool.commissioning_required,
+            "confirmed_at": self.tool_commissioning_confirmed_at,
+            "revision": self.tool_commissioning_revision,
+        })
+    }
+
+    pub fn joint_names(&self) -> Vec<String> {
+        self.config.limits.iter().map(|l| l.name.clone()).collect()
+    }
+
+    pub fn grasp_setup(&self) -> Option<GraspSetup> {
+        if !self.config.has_cartesian_with_gripper()
+            || self.config.kinematics.is_none()
+            || self.config.gripper_policy.is_none()
+        {
+            return None;
+        }
+        let mut s = self.config.grasp.clone()?;
+        s.camera_tilt_deg = f64::from(self.config.camera_mount.tilt_deg);
+        Some(s)
+    }
+
+    pub fn grasp_width_check(&self, max_grasp_width_m: f64) -> Option<GraspWidthCheck> {
+        self.config
+            .gripper_policy
+            .as_ref()
+            .map(|p| crate::model::check_grasp_width(p, max_grasp_width_m, self.gripper_calib_invalid()))
+    }
+
+    pub fn gripper_calib_invalid(&self) -> bool {
+        // Off-thread published config tracks valid committed calibrations; startup errors clear on commit.
+        false
+    }
+
+    pub fn camera_calibrated(&self) -> bool {
+        self.calibration
+            .as_ref()
+            .is_some_and(|c| c.camera_mount.q_end_cam.is_some())
+    }
+
+    pub fn pose_tcp(&self, q: &[f32]) -> Option<PoseTcp> {
+        self.config.kinematics?;
+        let pose = self.config.tcp_pose_f32(q)?;
+        Some(PoseTcp {
+            position: pose.p,
+            rpy: crate::kinematics::r_to_rpy(&pose.r),
+        })
+    }
+
+    pub fn recompute_pose_tcp_for(&self, arm_model: &ArmModel, p: &NamedPose) -> Option<PoseTcp> {
+        let cfg_pid = self.config.profile_id.as_ref();
+        let pose_pid = p.profile_id.as_ref().or(self.poses.list.profile_id.as_ref());
+        if let (Some(pp), Some(cp)) = (pose_pid, cfg_pid) {
+            if pp != cp {
+                return None;
+            }
+        }
+        let pose_arm_dof = p.arm_dof.or(self.poses.list.arm_dof);
+        if self.config.arm_dof() == 5 && pose_arm_dof.is_none() {
+            return None;
+        }
+        if pose_arm_dof.is_some_and(|ad| ad != self.config.arm_dof()) {
+            return None;
+        }
+        if p.gripper_joint.is_some_and(|gj| Some(gj) != self.config.gripper_index()) {
+            return None;
+        }
+        if let Some(ref jn) = p.joint_names {
+            let cfg_jn = self.joint_names();
+            if jn != &cfg_jn {
+                return None;
+            }
+        }
+        if p.positions.len() != self.config.dof {
+            return None;
+        }
+        for (v, l) in p.positions.iter().zip(&self.config.limits) {
+            if !v.is_finite() || *v < l.min_position || *v > l.max_position {
+                return None;
+            }
+        }
+        self.config.kinematics?;
+        let mut tmp_cfg = self.config.clone();
+        tmp_cfg.arm_model = arm_model.clone();
+        let pose = tmp_cfg.tcp_pose_f32(&p.positions)?;
+        Some(PoseTcp {
+            position: pose.p,
+            rpy: crate::kinematics::r_to_rpy(&pose.r),
+        })
+    }
+
+    pub fn poses_response(&self) -> Value {
+        let default_joint_names = self
+            .poses
+            .list
+            .joint_names
+            .clone()
+            .unwrap_or_else(|| self.joint_names());
+        let poses: Vec<Value> = self
+            .poses
+            .list
+            .poses
+            .iter()
+            .map(|p| crate::poses::pose_response_value(p, &default_joint_names))
+            .collect();
+        let mut obj = serde_json::Map::new();
+        if let Some(profile_id) = &self.poses.list.profile_id {
+            obj.insert("profile_id".into(), Value::String(profile_id.clone()));
+        }
+        if let Some(arm_dof) = self.poses.list.arm_dof {
+            obj.insert("arm_dof".into(), json!(arm_dof));
+        }
+        if let Some(gripper_joint) = self.poses.list.gripper_joint {
+            obj.insert("gripper_joint".into(), json!(gripper_joint));
+        }
+        obj.insert(
+            "joint_names".into(),
+            json!(self.poses.list.joint_names.as_ref().unwrap_or(&default_joint_names)),
+        );
+        obj.insert("poses".into(), Value::Array(poses));
+        obj.insert("revision".into(), json!(self.poses.revision));
+        Value::Object(obj)
+    }
+
+    pub fn sequence_view(&self, s: &Sequence) -> Value {
+        let mut stale = Vec::new();
+        let mut missing = Vec::new();
+        for (i, step) in s.steps.iter().enumerate() {
+            match step {
+                Step::Pose { pose_id, .. } => match self.poses.by_id(pose_id) {
+                    None => missing.push(i),
+                    Some(p) if p.stale.is_some() => stale.push(i),
+                    _ => {}
+                },
+                Step::Replay { episode_id, .. } => match self.episodes.get(episode_id) {
+                    None => missing.push(i),
+                    Some(e) if e.joint_zero.stale_against(&self.joint_zero_offsets) => stale.push(i),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        let mut v = serde_json::to_value(s).unwrap_or_default();
+        v["stale_steps"] = json!(stale);
+        v["missing_steps"] = json!(missing);
+        v["running"] = json!(self.sequences.pins.as_ref().is_some_and(|p| p.sequence_id == s.id));
+        v
+    }
+
+    pub fn capabilities(&self) -> Capabilities {
+        let mut caps = Capabilities::from_config(&self.config);
+        caps.gravity_comp = self.gravity_comp_supported;
+        caps.collision_guard &= self.driver_torque_feedback;
+        caps.torque_guard &= self.driver_torque_feedback;
+        caps.power_budget &= self.driver_torque_feedback;
+        caps.auto_yaw = self.config.arm_dof() == 5;
+        #[cfg(feature = "policy-runtime")]
+        if let Some(ref mut pr) = caps.policy_runtime {
+            pr.modes = if self.policy_live_allowed {
+                vec!["shadow".to_string(), "live_sim".to_string()]
+            } else {
+                vec!["shadow".to_string(), "live_gated".to_string()]
+            };
+        }
+        caps.calibration_tools = Some(self.calibration_tools_with(&caps));
+        if let Some(t) = caps.teach.as_mut() {
+            t.episodes = self.episodes.enabled();
+        }
+        caps
+    }
+
+    pub fn calibration_tools(&self) -> CalibrationTools {
+        self.calibration_tools_with(&Capabilities::from_config(&self.config))
+    }
+
+    pub fn calibration_tools_with(&self, caps: &Capabilities) -> CalibrationTools {
+        let no_grasp = "this profile has no grasp setup (the camera calibration needs one)";
+        let kin_reason = if self.config.arm_model.chain().is_some() {
+            "this profile uses a URDF chain; the kinematic correction applies to the built-in model only"
+        } else {
+            no_grasp
+        };
+        let mut support = self.driver_motor_zero_support.clone();
+        let (motor, software) = (support.supported, self.config.zero_reference.is_some());
+        let methods: Vec<String> = [(software, "software"), (motor, "motor")]
+            .into_iter()
+            .filter(|(ok, _)| *ok)
+            .map(|(_, m)| m.to_string())
+            .collect();
+        if software && !motor {
+            support = MotorZeroSupport {
+                supported: true,
+                notes: support
+                    .reason
+                    .take()
+                    .map(|r| vec![format!("motor zero: {r}")])
+                    .unwrap_or_default(),
+                ..Default::default()
+            };
+        }
+        let any = motor || software;
+        let motor_zero = MotorZeroTool {
+            joints: if any { (1..=self.config.dof).collect() } else { Vec::new() },
+            requires: if any {
+                ["lease", "torque_off", "no_action", "no_fault"]
+                    .map(String::from)
+                    .to_vec()
+            } else {
+                Vec::new()
+            },
+            max_offset_deg: crate::model::MOTOR_ZERO_MAX_OFFSET_DEG,
+            verify_mrad: crate::model::MOTOR_ZERO_VERIFY_MRAD,
+            invalidates: if any {
+                ["kinematics", "camera", "poses", "gripper_calibration"]
+                    .map(String::from)
+                    .to_vec()
+            } else {
+                Vec::new()
+            },
+            zero_pose: self.config.zero_pose.clone(),
+            motor,
+            software,
+            methods,
+            support,
+        };
+        let policy = self
+            .config
+            .gripper_policy
+            .as_ref()
+            .filter(|_| self.config.gripper_index().is_some());
+        let gripper = GripperCalibrationTool {
+            supported: policy.is_some(),
+            zero_check: policy.is_some_and(|p| p.zero_check_supported),
+            calibration: policy.is_some(),
+            reason: policy
+                .is_none()
+                .then(|| "this profile has no gripper joint with a gripper policy".to_string()),
+        };
+        CalibrationTools {
+            camera: CalibrationToolInfo::new(caps.calibration_apply, Vec::new(), no_grasp),
+            kinematics: CalibrationToolInfo::new(caps.calibration_kinematics, vec![2, 3, 4, 5], kin_reason),
+            motor_zero,
+            gripper,
+        }
+    }
+
+    pub fn watchdog_effect(&self) -> &'static str {
+        if self.config.resting_pose.is_some() && self.driver_supports_automatic_unload {
+            "park_then_torque_off"
+        } else {
+            "hold_and_fault"
+        }
+    }
+
+    pub fn refresh_effective_floor_in_place(&mut self) {
+        let Some(profile) = self.profile_floor_z_m else {
+            return;
+        };
+        let (_, fp) = crate::calibration::file_fingerprints(
+            self.calibration.as_ref(),
+            &self.config.camera_mount,
+            &self.joint_zero_offsets,
+            Some(&self.config.active_tool.config_digest),
+        );
+        let legacy_fp = crate::calibration::legacy_file_fingerprint(
+            self.calibration.as_ref(),
+            &self.config.camera_mount,
+            &self.joint_zero_offsets,
+        );
+        let (floor, source, _) = crate::calibration::effective_floor_for_with_legacy(
+            profile,
+            self.calibration.as_ref(),
+            &fp,
+            Some(&legacy_fp),
+            &self.config.active_tool,
+        );
+        self.floor_source = source;
+        if let Some(ws) = self.config.workspace.as_mut() {
+            if ws.floor_z_m != floor {
+                ws.floor_z_m = floor;
+            }
+        }
+    }
+}
+
+struct PublishedConfigSlot {
+    config: Arc<PublishedConfig>,
+    legacy_lock_gen: u64,
+}
+
+/// Off-RT published configuration store shared by REST readers, off-thread prepare,
+/// commit orchestrators, and `armd-persist` (`zero_check`). Never touched on `armd-control`.
+pub struct PublishedConfigHub {
+    slot: RwLock<PublishedConfigSlot>,
+    available: AtomicBool,
+}
+
+impl PublishedConfigHub {
+    pub fn new(initial: PublishedConfig, legacy_lock_gen: u64) -> Self {
+        Self {
+            slot: RwLock::new(PublishedConfigSlot {
+                config: Arc::new(initial),
+                legacy_lock_gen,
+            }),
+            available: AtomicBool::new(true),
+        }
+    }
+
+    pub fn latest(&self) -> Option<Arc<PublishedConfig>> {
+        if !self.available.load(Ordering::Acquire) {
+            return None;
+        }
+        let g = self.slot.read().unwrap_or_else(|e| e.into_inner());
+        Some(Arc::clone(&g.config))
+    }
+
+    pub fn latest_with_gen(&self) -> (Arc<PublishedConfig>, u64) {
+        let g = self.slot.read().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(&g.config), g.legacy_lock_gen)
+    }
+
+    pub fn set_available(&self, available: bool) {
+        self.available.store(available, Ordering::Release);
+    }
+
+    pub fn publish(&self, next: PublishedConfig, legacy_lock_gen: u64) {
+        let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
+        g.config = Arc::new(next);
+        g.legacy_lock_gen = legacy_lock_gen;
+        self.available.store(true, Ordering::Release);
+    }
+
+    pub fn update(&self, mutate: impl FnOnce(&mut PublishedConfig), legacy_lock_gen: Option<u64>) {
+        let mut g = self.slot.write().unwrap_or_else(|e| e.into_inner());
+        let mut next = (*g.config).clone();
+        mutate(&mut next);
+        g.config = Arc::new(next);
+        if let Some(gen) = legacy_lock_gen {
+            g.legacy_lock_gen = gen;
+        }
+        self.available.store(true, Ordering::Release);
+    }
+
+    /// Updates published gripper calibration state off-thread after `armd-persist`
+    /// activates a `gripper_zero_check(store_offset=true)` write.
+    pub fn apply_zero_check_commit(
+        &self,
+        offset_rad: f32,
+        policy: GripperPolicy,
+        jaw_opening: Option<JawOpening>,
+        new_revision: u64,
+    ) {
+        self.update(
+            |cfg| {
+                if cfg.base_gripper_policy.is_none() {
+                    cfg.base_gripper_policy = cfg.config.gripper_policy.clone();
+                }
+                cfg.config.gripper_policy = Some(policy);
+                cfg.gripper_calib_offset = Some(offset_rad);
+                if jaw_opening.is_some() {
+                    cfg.gripper_calib_jaw_opening = jaw_opening;
+                }
+                cfg.gripper_calib_revision = new_revision;
+            },
+            None,
+        );
+    }
+
+    /// Updates published joint-zero offsets off-thread after `SetJointZeroOffsets` succeeds.
+    pub fn apply_joint_zero_offsets(&self, offsets: &[f32]) {
+        self.update(
+            |cfg| {
+                let changed = cfg.joint_zero_offsets.as_slice() != offsets;
+                if changed {
+                    cfg.calibration_revision += 1;
+                }
+                if cfg.joint_zero_offsets.len() > 5
+                    && offsets.len() > 5
+                    && cfg.joint_zero_offsets[5] != offsets[5]
+                {
+                    cfg.zero_convention = Default::default();
+                }
+                cfg.joint_zero_offsets = offsets.to_vec();
+                if changed {
+                    cfg.refresh_effective_floor_in_place();
+                }
+            },
+            None,
+        );
+    }
+}
+
+/// 503 `CONFIG_UNAVAILABLE`: published configuration state is unavailable.
+pub fn config_unavailable() -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "CONFIG_UNAVAILABLE".into(),
+        message: "Published configuration state is unavailable while ownership is transitioning or failed".into(),
+    }
+}
+
+/// 503 `EXECUTOR_CAPABILITY_UNSUPPORTED`: fail-closed refusal for hardware mutations
+/// unsupported on the RT executor thread.
+pub fn executor_capability_unsupported(detail: &str) -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_CAPABILITY_UNSUPPORTED".into(),
+        message: detail.into(),
+    }
+}
+
+// ============================================================================
+// Stack-only RT errors (0 alloc on armd-control)
+// ============================================================================
+
+/// Allocation-free refusal produced on `armd-control` and formatted into
+/// `ArmError` / `CalibError` strictly off-thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    RevisionMismatch { expected: u64, current: u64 },
+    Busy(&'static str),
+    Unsupported(&'static str),
+    MotionBusy { subject: &'static str, reason: &'static str },
+    InvalidCommand(&'static str),
+    DriverLimitRejected(BoundedText<256>),
+    PoseInUse,
+    SequenceRefMissing { step: usize, is_pose: bool },
+    SequenceRunning,
+    PlanStale(&'static str),
+    LeaseLost,
+    EpochMismatch { current_epoch: u64 },
+    Stopped,
+    StampConsumed,
+    WrongTarget,
+    DeadlineExpired,
+    ConnectionClosed,
+    Reconciling(&'static str),
+    NotHeld,
+    ExecutorCapabilityUnsupported(&'static str),
+    GravityCompRejected {
+        code: BoundedText<48>,
+        message: BoundedText<256>,
+    },
+    CalibPrecondition {
+        status: u16,
+        code: &'static str,
+        message: &'static str,
+    },
+    OwnerStopped,
+    OwnerQueueFull,
+}
+
+impl ConfigError {
+    pub fn to_arm_error(&self) -> ArmError {
+        match self {
+            Self::RevisionMismatch { expected, current } => ArmError::PolicyRevisionMismatch {
+                expected: *expected,
+                current: *current,
+            },
+            Self::Busy(msg) => ArmError::Rejected {
+                status: 409,
+                code: "CONFIG_BUSY".into(),
+                message: (*msg).into(),
+            },
+            Self::Unsupported(msg) => MotionError::Unsupported((*msg).into()).into(),
+            Self::MotionBusy { subject, reason } => {
+                MotionError::MotionBusy(format!("{subject} cannot change while {reason}")).into()
+            }
+            Self::InvalidCommand(msg) => MotionError::InvalidCommand((*msg).into()).into(),
+            Self::DriverLimitRejected(msg) => MotionError::InvalidCommand(msg.as_str().into()).into(),
+            Self::PoseInUse => ArmError::Rejected {
+                status: 409,
+                code: "IN_USE".into(),
+                message: "Pose is referenced by a sequence".into(),
+            },
+            Self::SequenceRefMissing { step, is_pose } => ArmError::detailed(
+                422,
+                "SEQUENCE_REF_MISSING",
+                format!(
+                    "step {step}: referenced {} no longer exists",
+                    if *is_pose { "pose" } else { "episode" }
+                ),
+                json!({ "step": step }),
+            ),
+            Self::SequenceRunning => ArmError::Rejected {
+                status: 409,
+                code: "SEQUENCE_RUNNING".into(),
+                message: "the sequence is running; stop it first".into(),
+            },
+            Self::PlanStale(msg) => MotionError::PlanStale((*msg).into()).into(),
+            Self::LeaseLost | Self::ConnectionClosed => ArmError::Rejected {
+                status: 409,
+                code: "LEASE_LOST".into(),
+                message: "This connection lost the lease while persisting configuration".into(),
+            },
+            Self::EpochMismatch { .. } => ArmError::Rejected {
+                status: 409,
+                code: "EPOCH_MISMATCH".into(),
+                message: "Command epoch is no longer current".into(),
+            },
+            Self::Stopped => ArmError::Rejected {
+                status: 409,
+                code: "STOPPED".into(),
+                message: "configuration change overtaken by an authorized stop".into(),
+            },
+            Self::StampConsumed => ArmError::Rejected {
+                status: 409,
+                code: "STAMP_CONSUMED".into(),
+                message: "configuration admission stamp was already consumed".into(),
+            },
+            Self::WrongTarget => ArmError::Rejected {
+                status: 409,
+                code: "WRONG_TARGET".into(),
+                message: "configuration proposal targets another arm or stale boot identity".into(),
+            },
+            Self::DeadlineExpired => ArmError::Rejected {
+                status: 409,
+                code: "DEADLINE_EXPIRED".into(),
+                message: "configuration proposal deadline expired before reservation".into(),
+            },
+            Self::Reconciling(code) => ArmError::Rejected {
+                status: 409,
+                code: (*code).into(),
+                message: format!(
+                    "configuration persisted on disk but activation failed ({code}); reconciling required"
+                ),
+            },
+            Self::NotHeld => ArmError::Internal("configuration operation attempted without active reservation".into()),
+            Self::ExecutorCapabilityUnsupported(msg) => executor_capability_unsupported(msg),
+            Self::GravityCompRejected { code, message } => {
+                let status = match code.as_str() {
+                    "UNSUPPORTED" | "GRAVITY_MODEL_UNAVAILABLE" => 422,
+                    "NOT_ARMED" => 412,
+                    "INVALID_COMMAND" => 400,
+                    _ => 409,
+                };
+                ArmError::Rejected {
+                    status,
+                    code: code.as_str().into(),
+                    message: message.as_str().into(),
+                }
+            }
+            Self::CalibPrecondition { status, code, message } => ArmError::Rejected {
+                status: *status,
+                code: (*code).into(),
+                message: (*message).into(),
+            },
+            Self::OwnerStopped => ArmError::Rejected {
+                status: 503,
+                code: "EXECUTOR_STOPPED".into(),
+                message: "RT executor stopped before completing configuration request".into(),
+            },
+            Self::OwnerQueueFull => ArmError::Rejected {
+                status: 503,
+                code: "BACKLOG_FULL".into(),
+                message: "RT executor maintenance queue is full".into(),
+            },
+        }
+    }
+
+    pub fn to_calib_error(&self) -> CalibError {
+        match self {
+            Self::RevisionMismatch { expected, current } => {
+                let mut err = CalibError::new(
+                    409,
+                    "POLICY_REVISION_MISMATCH",
+                    format!("Policy revision mismatch: expected {expected}, current {current}"),
+                );
+                err.extra.insert("current_revision".into(), json!(current));
+                err
+            }
+            Self::Busy(msg) => CalibError::new(409, "CONFIG_BUSY", *msg),
+            Self::Unsupported(msg) => CalibError::new(400, "UNSUPPORTED", *msg),
+            Self::MotionBusy { subject, reason } => {
+                CalibError::new(409, "MOTION_BUSY", format!("{subject} cannot change while {reason}"))
+            }
+            Self::LeaseLost | Self::ConnectionClosed => CalibError::new(
+                409,
+                "LEASE_LOST",
+                "This connection lost the lease during the calibration",
+            ),
+            Self::EpochMismatch { .. } => CalibError::new(
+                409,
+                "EPOCH_MISMATCH",
+                "The epoch changed during the calibration (stop or e-stop)",
+            ),
+            Self::Stopped => CalibError::new(
+                409,
+                "STOPPED",
+                "An authorized stop intervened during the calibration",
+            ),
+            Self::CalibPrecondition { status, code, message } => CalibError::new(*status, code, *message),
+            Self::ExecutorCapabilityUnsupported(msg) => {
+                CalibError::new(503, "EXECUTOR_CAPABILITY_UNSUPPORTED", *msg)
+            }
+            Self::Reconciling(code) => CalibError::new(
+                409,
+                code,
+                format!("calibration persisted on disk but activation failed ({code}); reconciling required"),
+            ),
+            other => match other.to_arm_error() {
+                ArmError::Rejected { status, code, message } => CalibError::new(status, &code, message),
+                ArmError::PolicyRevisionMismatch { expected, current } => {
+                    let mut err = CalibError::new(
+                        409,
+                        "POLICY_REVISION_MISMATCH",
+                        format!("Policy revision mismatch: expected {expected}, current {current}"),
+                    );
+                    err.extra.insert("current_revision".into(), json!(current));
+                    err
+                }
+                e => CalibError::new(500, "INTERNAL", e.to_string()),
+            },
+        }
+    }
+}
+
+// ============================================================================
+// Single-entry-point authority check (reuses A1 AdmissionStamp/ClosedConnections/ConsumedStamps)
+// ============================================================================
+
+/// Caller authority context carried from ingress through staging, reservation, and activation.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigAuthContext {
+    pub admission: AdmissionStamp,
+    /// `Some((connection_id_label, lease_generation))` when a WS lease is required;
+    /// `None` for lease-free REST writes (`POST /api/v1/tool/commissioning/confirm`).
+    pub lease_holder: Option<(HolderLabel, u64)>,
+}
+
+/// Single authority check for `ReserveConfig` and `ActivateConfig`.
+///
+/// Reuses A1's `AdmissionStamp`, `ClosedConnections`, and `ConsumedStamps` alongside
+/// `ConfigProposal::check` (`arm`, `boot`, `deadline`, `stop_generation`, `epoch`,
+/// `lease_generation`) with zero heap allocations.
+pub(crate) fn check_config_authority(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    proposal: &ConfigProposal,
+    auth: &ConfigAuthContext,
+    enforce_unused_stamp: bool,
+) -> Result<(), ConfigError> {
+    if proposal.stamp.boot.is_zero() || ctx.boot.is_zero() {
+        return Err(ConfigError::WrongTarget);
+    }
+    if auth.admission.connection_id != 0 && core.is_connection_closed(auth.admission.connection_id) {
+        return Err(ConfigError::ConnectionClosed);
+    }
+    if core.estop_request_unapplied() {
+        return Err(ConfigError::EpochMismatch {
+            current_epoch: core.safety.epoch_id(),
+        });
+    }
+    if core.urgent_stop_unapplied() {
+        return Err(ConfigError::Stopped);
+    }
+    let current = core.authority(ctx);
+    if let Some(code) = proposal.check(ctx.arm, ctx.boot, ctx.now, &current) {
+        return Err(match code {
+            "WRONG_TARGET" => ConfigError::WrongTarget,
+            "DEADLINE_EXPIRED" => ConfigError::DeadlineExpired,
+            "STOPPED" => ConfigError::Stopped,
+            "EPOCH_MISMATCH" => ConfigError::EpochMismatch {
+                current_epoch: current.epoch,
+            },
+            "LEASE_LOST" => ConfigError::LeaseLost,
+            _ => ConfigError::WrongTarget,
+        });
+    }
+    if let Some((conn, gen)) = auth.lease_holder {
+        if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
+            return Err(ConfigError::LeaseLost);
+        }
+    }
+    if enforce_unused_stamp && core.is_stamp_consumed(auth.admission.request_id) {
+        return Err(ConfigError::StampConsumed);
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Request, Candidate, Reply, and Exchange payloads (zero-alloc/zero-free on RT)
+// ============================================================================
+
+/// Domain-specific precheck executed atomically on the owner inside [`ReserveConfig`].
+pub enum ReservePrecheck {
+    Keepout,
+    Collision { enabling: bool },
+    GripperCalibration { candidate_policy: Option<GripperPolicy> },
+    PosesSave,
+    PosesDelete { deleting_pose_id: HolderLabel },
+    Sequences {
+        steps: Option<Vec<Step>>,
+        deleting_sequence_id: Option<HolderLabel>,
+    },
+    GraspSetup { new_camera_tilt_deg: f32 },
+    ToolCommissioning {
+        tool_id: HolderLabel,
+        tool_config_digest: HolderLabel,
+    },
+    Calibration {
+        kin_changes: bool,
+        allow_during_calibration_busy: bool,
+    },
+}
+
+/// Pre-built candidate payload swapped into `SupervisorInner` in-place during [`ActivateConfig`].
+pub enum ConfigCandidate {
+    Keepout {
+        profile_boxes: Vec<KeepoutBox>,
+        runtime_boxes: Vec<KeepoutBox>,
+        effective_boxes: Vec<KeepoutBox>,
+        ws_eval_bufs: EvalBufs,
+    },
+    Collision {
+        enabled: Option<bool>,
+        sensitivity: Option<Sensitivity>,
+    },
+    GripperCalibration {
+        offset_rad: Option<f32>,
+        policy: GripperPolicy,
+        jaw_opening: Option<JawOpening>,
+        clear_stale: bool,
+    },
+    Poses {
+        next_list: PoseList,
+    },
+    Sequences {
+        next_file: SequenceFile,
+    },
+    GraspSetup {
+        setup: GraspSetup,
+        ws_eval_bufs: Option<EvalBufs>,
+    },
+    ToolCommissioning {
+        tool_id: HolderLabel,
+        tool_config_digest: HolderLabel,
+        confirmed_at: String,
+    },
+    Calibration(Box<CalibrationCandidate>),
+}
+
+/// Pre-built calibration live-state payload (zero heap alloc/free on RT swap).
+pub struct CalibrationCandidate {
+    pub calibration: Option<CalibrationFile>,
+    pub camera_mount: CameraMount,
+    pub kin_changed: bool,
+    pub arm_model: Option<ArmModel>,
+    pub pose_tcps: Option<Vec<(String, Option<PoseTcp>)>>,
+    pub effective_floor: Option<(f32, &'static str)>,
+    pub ws_eval_bufs: Option<EvalBufs>,
+    #[cfg(feature = "policy-runtime")]
+    pub calibration_digest: String,
+    pub require_kinematics_disarmed: bool,
+}
+
+/// Pre-built zero-invalidation live payload (swapped in-place on RT).
+pub struct ZeroInvalidationCandidate {
+    pub file_changes: bool,
+    pub calibration: Option<CalibrationFile>,
+    pub arm_model_uncorrected: Option<ArmModel>,
+    pub pose_tcps: Option<Vec<(String, Option<PoseTcp>)>>,
+    pub effective_floor: Option<(f32, &'static str)>,
+    pub ws_eval_bufs: Option<EvalBufs>,
+    #[cfg(feature = "policy-runtime")]
+    pub calibration_digest: Option<String>,
+    pub next_poses: Option<PoseList>,
+    pub gripper_stale: Option<CalibrationStale>,
+    pub reset_gripper_baseline: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CalibBeginCheck {
+    pub check_grasp: bool,
+    pub check_kinematics_armed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CalibBeginSnapshot {
+    pub is_torqued: bool,
+    pub epoch_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZeroInvalidatedReply {
+    pub poses_revision: u64,
+    pub gripper_calib_revision: u64,
+    pub calibration_revision: u64,
+    pub workspace_revision: u64,
+}
+
+/// Reserve `proposal.domain` at `proposal.expected_revision` after authority + domain prechecks.
+pub struct ReserveConfig {
+    pub proposal: ConfigProposal,
+    pub auth: ConfigAuthContext,
+    pub precheck: ReservePrecheck,
+}
+
+/// Mark a granted reservation renamed on disk (`Reserved` -> `PersistedAwaitingActivation`).
+pub struct PersistedConfig {
+    pub reservation: Reservation,
+    pub durability: Durability,
+}
+
+/// Activate a held reservation (volatile or persisted) by swapping `candidate` in-place.
+pub struct ActivateConfig {
+    pub reservation: Reservation,
+    pub auth: ConfigAuthContext,
+    /// Non-None if off-thread operator auth or connection lease generation was revoked
+    /// after rename and before activation: owner enters `Reconciling` without mutating state.
+    pub revoked_off_thread: Option<&'static str>,
+    pub candidate: ConfigCandidate,
+}
+
+/// Release a held reservation (`Cleared` before rename; `Reconciling` after rename).
+pub struct ReleaseConfig {
+    pub reservation: Reservation,
+}
+
+/// Owner-routed gravity compensation request (mock zero-alloc; hardware driver fails closed in Executor).
+pub enum GravityCompOp {
+    Enter {
+        admission: AdmissionStamp,
+        lease_holder: Option<(HolderLabel, u64)>,
+        policy: Option<crate::model::GravityCompPolicy>,
+        scale: Option<f32>,
+        damping_kd: Option<[f32; 6]>,
+    },
+    Exit {
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GravityCompReply {
+    pub active: bool,
+    pub epoch_id: u64,
+    pub is_torqued: bool,
+}
+
+/// Outcome of a successful [`ActivateConfig`].
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigActivated {
+    pub revision: u64,
+    pub durability: Durability,
+    pub workspace_revision: u64,
+    pub epoch_id: u64,
+    pub is_torqued: bool,
+}
+
+/// All owner-side configuration and companion maintenance requests routed via `MaintenanceOp::Config`.
+pub enum ConfigRequest {
+    Reserve(ReserveConfig),
+    Persisted(PersistedConfig),
+    Activate(ActivateConfig),
+    Release(ReleaseConfig),
+    SetCalibrationBusy {
+        busy: bool,
+        motor_zero: bool,
+        check_begin: Option<CalibBeginCheck>,
+    },
+    CalibrationRevert {
+        before: Box<CalibrationCandidate>,
+    },
+    CalibrationClearLoadError,
+    InvalidateAfterZero(Box<ZeroInvalidationCandidate>),
+    SampleTableCapture,
+    GravityComp(GravityCompOp),
+}
+
+/// Reply produced on the owner and read off-thread from `ConfigExchange`.
+pub enum ConfigReply {
+    Reserved(Result<Reservation, ConfigError>),
+    Persisted(Result<Reservation, ConfigError>),
+    Activated(Result<ConfigActivated, ConfigError>),
+    Released(Released),
+    CalibrationBusySet(Result<CalibBeginSnapshot, ConfigError>),
+    CalibrationReverted,
+    CalibrationLoadErrorCleared,
+    ZeroInvalidated(ZeroInvalidatedReply),
+    TableCaptureSampled(Result<([f32; 8], usize), ConfigError>),
+    GravityCompDone(Result<GravityCompReply, ConfigError>),
+}
+
+/// Displaced or unused heap payloads carried back inside the SAME `Box<ConfigExchange>`
+/// and dropped strictly off-thread (zero `dealloc` on `armd-control`).
+#[derive(Default)]
+pub struct ConfigRetiredPayloads {
+    pub keepout_profile: Option<Vec<KeepoutBox>>,
+    pub keepout_runtime: Option<Vec<KeepoutBox>>,
+    pub keepout_effective: Option<Vec<KeepoutBox>>,
+    pub eval_bufs: Option<EvalBufs>,
+    pub gripper_policy: Option<GripperPolicy>,
+    pub jaw_opening: Option<JawOpening>,
+    pub gripper_stale: Option<CalibrationStale>,
+    pub pose_list: Option<PoseList>,
+    pub sequence_file: Option<SequenceFile>,
+    pub steps: Option<Vec<Step>>,
+    pub grasp_setup: Option<GraspSetup>,
+    pub string_a: Option<String>,
+    pub string_b: Option<String>,
+    pub calibration_file: Option<CalibrationFile>,
+    pub arm_model: Option<ArmModel>,
+    pub pose_tcps: Option<Vec<(String, Option<PoseTcp>)>>,
+    pub calib_candidate: Option<Box<CalibrationCandidate>>,
+    pub zero_inv_candidate: Option<Box<ZeroInvalidationCandidate>>,
+    pub gravity_comp_policy: Option<crate::model::GravityCompPolicy>,
+    pub unused_candidate: Option<ConfigCandidate>,
+    pub gripper_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
+}
+
+/// Single heap allocation carrying a config request into `armd-control` and its reply +
+/// retired heap payloads back out so `armd-control` executes 0 allocs and 0 deallocs.
+pub struct ConfigExchange {
+    pub req: Option<ConfigRequest>,
+    pub reply: Option<ConfigReply>,
+    pub retired: ConfigRetiredPayloads,
+}
+
+impl ConfigExchange {
+    pub fn new(req: ConfigRequest) -> Box<Self> {
+        Box::new(Self {
+            req: Some(req),
+            reply: None,
+            retired: ConfigRetiredPayloads::default(),
+        })
+    }
+}
+
+// ============================================================================
+// Owner-side handlers (zero-alloc / zero-free on armd-control)
+// ============================================================================
+
+/// Executes one [`ConfigExchange`] in-place on the single owner (`SupervisorInner`).
+/// Called identically by `armd-control` (`MaintenanceOp::Config`) and Legacy (`SupervisorLock`).
+pub(crate) fn handle_config_exchange(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    ex: &mut ConfigExchange,
+) {
+    let Some(req) = ex.req.take() else {
+        return;
+    };
+    let reply = match req {
+        ConfigRequest::Reserve(r) => ConfigReply::Reserved(install_reserve_config(core, ctx, r, &mut ex.retired)),
+        ConfigRequest::Persisted(p) => ConfigReply::Persisted(install_persisted_config(core, p)),
+        ConfigRequest::Activate(a) => ConfigReply::Activated(install_activate_config(core, ctx, a, &mut ex.retired)),
+        ConfigRequest::Release(r) => ConfigReply::Released(ConfigAuthority::release(core, r.reservation)),
+        ConfigRequest::SetCalibrationBusy { busy, motor_zero, check_begin } => {
+            ConfigReply::CalibrationBusySet(install_set_calibration_busy(core, busy, motor_zero, check_begin))
+        }
+        ConfigRequest::CalibrationRevert { before } => {
+            install_calibration_revert(core, before, &mut ex.retired);
+            ConfigReply::CalibrationReverted
+        }
+        ConfigRequest::CalibrationClearLoadError => {
+            ex.retired.string_a = core.calibration_load_error.take();
+            ConfigReply::CalibrationLoadErrorCleared
+        }
+        ConfigRequest::InvalidateAfterZero(cand) => {
+            ConfigReply::ZeroInvalidated(install_invalidate_after_zero(core, cand, &mut ex.retired))
+        }
+        ConfigRequest::SampleTableCapture => ConfigReply::TableCaptureSampled(install_sample_table_capture(core)),
+        ConfigRequest::GravityComp(op) => {
+            ConfigReply::GravityCompDone(install_gravity_comp(core, ctx, op, &mut ex.retired))
+        }
+    };
+    ex.reply = Some(reply);
+}
+
+fn check_kinematics_armed_static(core: &SupervisorInner) -> Result<(), ConfigError> {
+    let running = core.last_action.as_ref().is_some_and(|a| a.is_running()) || core.macro_run.is_some();
+    if core.is_torqued || running {
+        let message = if running {
+            "the kinematic correction can change only with torque off and no action running (an action is running); park or disable torque first"
+        } else {
+            "the kinematic correction can change only with torque off and no action running (torque is on); park or disable torque first"
+        };
+        return Err(ConfigError::CalibPrecondition {
+            status: 409,
+            code: "KINEMATICS_ARMED",
+            message,
+        });
+    }
+    Ok(())
+}
+
+fn run_reserve_precheck(
+    core: &SupervisorInner,
+    precheck: ReservePrecheck,
+    retired: &mut ConfigRetiredPayloads,
+) -> Result<(), ConfigError> {
+    match precheck {
+        ReservePrecheck::Keepout => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+            }
+            if core.workspace_policy().is_none() {
+                return Err(ConfigError::Unsupported(
+                    "Keep-out boxes need a profile with kinematics and a workspace",
+                ));
+            }
+            if let Some(reason) = core.workspace_change_blocker_static() {
+                return Err(ConfigError::MotionBusy {
+                    subject: "keep-out boxes",
+                    reason,
+                });
+            }
+            Ok(())
+        }
+        ReservePrecheck::Collision { enabling } => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+            }
+            if enabling && !core.collision_available() {
+                return Err(ConfigError::Unsupported(
+                    "The collision guard needs a profile gravity model and a driver that reports torque",
+                ));
+            }
+            Ok(())
+        }
+        ReservePrecheck::GripperCalibration { candidate_policy } => {
+            let check_res = (|| {
+                if core.calibration_busy || core.zero_check_persisting.is_some() {
+                    return Err(ConfigError::Busy("another calibration operation is running"));
+                }
+                if core.config.gripper_policy.is_none() {
+                    return Err(ConfigError::Unsupported("Gripper calibration requires a gripper policy"));
+                }
+                if let Some(ref gp) = candidate_policy {
+                    if core.driver.is_some() || core.driver_config_error.is_some() {
+                        core.validate_gripper_policy_against_driver_bounded(gp)
+                            .map_err(ConfigError::DriverLimitRejected)?;
+                    }
+                }
+                Ok(())
+            })();
+            retired.gripper_policy = candidate_policy;
+            check_res
+        }
+        ReservePrecheck::PosesSave => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+            }
+            Ok(())
+        }
+        ReservePrecheck::PosesDelete { deleting_pose_id } => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+            }
+            if !deleting_pose_id.is_empty() && core.sequences.is_pose_in_use(deleting_pose_id.as_str()) {
+                return Err(ConfigError::PoseInUse);
+            }
+            Ok(())
+        }
+        ReservePrecheck::Sequences {
+            steps,
+            deleting_sequence_id,
+        } => {
+            let check_res = (|| {
+                if core.calibration_busy {
+                    return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+                }
+                if let Some(ref steps) = steps {
+                    for (i, step) in steps.iter().enumerate() {
+                        if let Step::Pose { pose_id, .. } = step {
+                            if core.poses.by_id(pose_id).is_none() {
+                                return Err(ConfigError::SequenceRefMissing { step: i, is_pose: true });
+                            }
+                        }
+                    }
+                }
+                if let Some(del_id) = deleting_sequence_id {
+                    if core
+                        .sequences
+                        .pins
+                        .as_ref()
+                        .is_some_and(|p| p.sequence_id == del_id.as_str())
+                        && core.sequences.get(del_id.as_str()).is_some()
+                    {
+                        return Err(ConfigError::SequenceRunning);
+                    }
+                }
+                Ok(())
+            })();
+            retired.steps = steps;
+            check_res
+        }
+        ReservePrecheck::GraspSetup { new_camera_tilt_deg } => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+            }
+            if new_camera_tilt_deg != core.config.camera_mount.tilt_deg {
+                if let Some(reason) = core.workspace_change_blocker_static() {
+                    return Err(ConfigError::MotionBusy {
+                        subject: "camera_tilt_deg",
+                        reason,
+                    });
+                }
+            }
+            Ok(())
+        }
+        ReservePrecheck::ToolCommissioning {
+            tool_id,
+            tool_config_digest,
+        } => {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+            }
+            if core.config.active_tool.id != tool_id.as_str()
+                || core.config.active_tool.config_digest != tool_config_digest.as_str()
+            {
+                return Err(ConfigError::PlanStale("active tool changed before commissioning confirm"));
+            }
+            Ok(())
+        }
+        ReservePrecheck::Calibration {
+            kin_changes,
+            allow_during_calibration_busy,
+        } => {
+            if !allow_during_calibration_busy && core.calibration_busy {
+                return Err(ConfigError::Busy("a camera calibration apply or restore is running"));
+            }
+            if kin_changes {
+                check_kinematics_armed_static(core)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn install_reserve_config(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    req: ReserveConfig,
+    retired: &mut ConfigRetiredPayloads,
+) -> Result<Reservation, ConfigError> {
+    let ReserveConfig {
+        proposal,
+        auth,
+        precheck,
+    } = req;
+    // Always retire any heap payload inside `precheck` even if authority or revision check fails.
+    let auth_res = check_config_authority(core, ctx, &proposal, &auth, true);
+    if let Err(err) = auth_res {
+        retire_precheck_payloads(precheck, retired);
+        return Err(err);
+    }
+    let current_rev = ConfigAuthority::revision(core, proposal.domain);
+    if proposal.expected_revision != current_rev {
+        retire_precheck_payloads(precheck, retired);
+        return Err(ConfigError::RevisionMismatch {
+            expected: proposal.expected_revision,
+            current: current_rev,
+        });
+    }
+    run_reserve_precheck(core, precheck, retired)?;
+    match ConfigAuthority::reserve(core, &proposal, ctx) {
+        Reserved::Granted(reservation) => {
+            core.record_consumed_stamp(auth.admission.request_id);
+            Ok(reservation)
+        }
+        Reserved::Refused { code: "REVISION_MISMATCH", current } => Err(ConfigError::RevisionMismatch {
+            expected: proposal.expected_revision,
+            current,
+        }),
+        Reserved::Refused { code: "CONFIG_BUSY", .. } => {
+            Err(ConfigError::Busy("another configuration change is being activated or reconciled"))
+        }
+        Reserved::Refused { code: "EPOCH_MISMATCH", .. } => Err(ConfigError::EpochMismatch {
+            current_epoch: core.safety.epoch_id(),
+        }),
+        Reserved::Refused { code: "LEASE_LOST", .. } => Err(ConfigError::LeaseLost),
+        Reserved::Refused { code: "STOPPED", .. } => Err(ConfigError::Stopped),
+        Reserved::Refused { code: "DEADLINE_EXPIRED", .. } => Err(ConfigError::DeadlineExpired),
+        Reserved::Refused { .. } => Err(ConfigError::WrongTarget),
+    }
+}
+
+fn retire_precheck_payloads(precheck: ReservePrecheck, retired: &mut ConfigRetiredPayloads) {
+    match precheck {
+        ReservePrecheck::GripperCalibration { candidate_policy } => {
+            retired.gripper_policy = candidate_policy;
+        }
+        ReservePrecheck::Sequences { steps, .. } => {
+            retired.steps = steps;
+        }
+        _ => {}
+    }
+}
+
+fn install_persisted_config(
+    core: &mut SupervisorInner,
+    req: PersistedConfig,
+) -> Result<Reservation, ConfigError> {
+    let domain = req.reservation.domain();
+    match ConfigAuthority::persisted(core, &req.reservation, req.durability) {
+        Ok(()) => Ok(req.reservation),
+        Err(code) => {
+            // Persistence #5: disk rename already occurred; unconditionally force Reconciling.
+            let active_rev = ConfigAuthority::revision(core, domain);
+            core.core.config_mut().force_reconcile(domain, active_rev);
+            Err(ConfigError::Reconciling(code))
+        }
+    }
+}
+
+fn fail_activation(
+    core: &mut SupervisorInner,
+    reservation: Reservation,
+    code: &'static str,
+    candidate: ConfigCandidate,
+    retired: &mut ConfigRetiredPayloads,
+) -> ConfigError {
+    retired.unused_candidate = Some(candidate);
+    let domain = reservation.domain();
+    match core.core.config_mut().activation_failed(reservation, code) {
+        Activated::Reconciling { code } => ConfigError::Reconciling(code),
+        Activated::Refused { code, reservation } => {
+            let _ = ConfigAuthority::release(core, reservation);
+            match code {
+                "LEASE_LOST" => ConfigError::LeaseLost,
+                "EPOCH_MISMATCH" => ConfigError::EpochMismatch {
+                    current_epoch: core.safety.epoch_id(),
+                },
+                "STOPPED" => ConfigError::Stopped,
+                "CONNECTION_CLOSED" => ConfigError::ConnectionClosed,
+                "MOTION_BUSY" => ConfigError::MotionBusy {
+                    subject: "configuration",
+                    reason: "motion started before activation",
+                },
+                "KINEMATICS_ARMED" => ConfigError::CalibPrecondition {
+                    status: 409,
+                    code: "KINEMATICS_ARMED",
+                    message: "the kinematic correction can change only with torque off and no action running",
+                },
+                other => ConfigError::Busy(other),
+            }
+        }
+        Activated::Active { .. } => {
+            let active_rev = ConfigAuthority::revision(core, domain);
+            core.core.config_mut().force_reconcile(domain, active_rev);
+            ConfigError::Reconciling(code)
+        }
+    }
+}
+
+fn install_activate_config(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    req: ActivateConfig,
+    retired: &mut ConfigRetiredPayloads,
+) -> Result<ConfigActivated, ConfigError> {
+    let ActivateConfig {
+        reservation,
+        auth,
+        revoked_off_thread,
+        candidate,
+    } = req;
+    let domain = reservation.domain();
+    let expected_from = reservation.from();
+
+    if core
+        .core
+        .config_held(domain)
+        .is_none_or(|h| h.grant != Some(reservation.grant()))
+    {
+        retired.unused_candidate = Some(candidate);
+        let _ = ConfigAuthority::release(core, reservation);
+        return Err(ConfigError::NotHeld);
+    }
+
+    if let Some(code) = revoked_off_thread {
+        return Err(fail_activation(core, reservation, code, candidate, retired));
+    }
+
+    // Re-verify authority at activation (without re-checking deadline or stamp consumption).
+    let recheck_proposal = ConfigProposal {
+        domain,
+        expected_revision: expected_from,
+        candidate: reservation.candidate(),
+        stamp: Stamp {
+            // Activation may legitimately follow a disk rename that ran near the reserve deadline.
+            deadline: ctx.now + Duration::from_secs(1),
+            ..*reservation.stamp()
+        },
+    };
+    if let Err(err) = check_config_authority(core, ctx, &recheck_proposal, &auth, false) {
+        let code = match err {
+            ConfigError::LeaseLost => "LEASE_LOST",
+            ConfigError::ConnectionClosed => "CONNECTION_CLOSED",
+            ConfigError::EpochMismatch { .. } => "EPOCH_MISMATCH",
+            ConfigError::Stopped => "STOPPED",
+            _ => "AUTHORITY_REVOKED",
+        };
+        return Err(fail_activation(core, reservation, code, candidate, retired));
+    }
+
+    let current_rev = ConfigAuthority::revision(core, domain);
+    if current_rev != expected_from {
+        return Err(fail_activation(core, reservation, "REVISION_MISMATCH", candidate, retired));
+    }
+
+    // Domain-specific post-rename invariant rechecks before swapping live state.
+    let domain_ok: Result<(), &'static str> = match &candidate {
+        ConfigCandidate::Keepout { .. } => {
+            if core.workspace_policy().is_none() {
+                Err("UNSUPPORTED")
+            } else if core.workspace_change_blocker_static().is_some() {
+                Err("MOTION_BUSY")
+            } else {
+                Ok(())
+            }
+        }
+        ConfigCandidate::Collision { enabled, .. } => {
+            if *enabled == Some(true) && !core.collision_available() {
+                Err("UNSUPPORTED")
+            } else {
+                Ok(())
+            }
+        }
+        ConfigCandidate::GripperCalibration { policy, .. } => {
+            if core.config.gripper_policy.is_none() {
+                Err("UNSUPPORTED")
+            } else if (core.driver.is_some() || core.driver_config_error.is_some())
+                && core.validate_gripper_policy_against_driver_bounded(policy).is_err()
+            {
+                Err("INVALID_CALIBRATION")
+            } else {
+                Ok(())
+            }
+        }
+        ConfigCandidate::GraspSetup { setup, .. } => {
+            if setup.camera_tilt_deg as f32 != core.config.camera_mount.tilt_deg
+                && core.workspace_change_blocker_static().is_some()
+            {
+                Err("MOTION_BUSY")
+            } else {
+                Ok(())
+            }
+        }
+        ConfigCandidate::ToolCommissioning {
+            tool_id,
+            tool_config_digest,
+            ..
+        } => {
+            if core.config.active_tool.id != tool_id.as_str()
+                || core.config.active_tool.config_digest != tool_config_digest.as_str()
+            {
+                Err("PLAN_STALE")
+            } else {
+                Ok(())
+            }
+        }
+        ConfigCandidate::Calibration(cand) => {
+            if cand.require_kinematics_disarmed && check_kinematics_armed_static(core).is_err() {
+                Err("KINEMATICS_ARMED")
+            } else {
+                Ok(())
+            }
+        }
+        ConfigCandidate::Poses { .. } | ConfigCandidate::Sequences { .. } => Ok(()),
+    };
+    if let Err(code) = domain_ok {
+        return Err(fail_activation(core, reservation, code, candidate, retired));
+    }
+
+    // Infallible zero-alloc, zero-free in-place swap into SupervisorInner.
+    match candidate {
+        ConfigCandidate::Keepout {
+            profile_boxes,
+            runtime_boxes,
+            effective_boxes,
+            ws_eval_bufs,
+        } => {
+            if let Some(ws) = core.config.workspace.as_mut() {
+                retired.keepout_effective = Some(std::mem::replace(&mut ws.keepout_boxes, effective_boxes));
+            } else {
+                retired.keepout_effective = Some(effective_boxes);
+            }
+            retired.keepout_profile = core.keepout.profile.replace(profile_boxes);
+            retired.keepout_runtime = Some(std::mem::replace(&mut core.keepout.runtime_boxes, runtime_boxes));
+            core.keepout.runtime = true;
+            core.workspace_revision += 1;
+            core.servo_ws_min_depths = None;
+            core.keepout.revision += 1;
+            retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, ws_eval_bufs));
+        }
+        ConfigCandidate::Collision { enabled, sensitivity } => {
+            if let Some(e) = enabled {
+                core.collision.enabled = e;
+            }
+            if !core.collision.enabled {
+                core.collision.clear_hold();
+            }
+            if let Some(s) = sensitivity {
+                core.collision.sensitivity = s;
+            }
+            core.collision.runtime = true;
+            core.collision.revision += 1;
+        }
+        ConfigCandidate::GripperCalibration {
+            offset_rad,
+            policy,
+            jaw_opening,
+            clear_stale,
+        } => {
+            let old_policy = core.config.gripper_policy.replace(policy);
+            if core.base_gripper_policy.is_none() {
+                core.base_gripper_policy = old_policy;
+            } else {
+                retired.gripper_policy = old_policy;
+            }
+            core.gripper_calib_offset = offset_rad;
+            if let Some(jo) = jaw_opening {
+                retired.jaw_opening = core.gripper_calib_jaw_opening.replace(jo);
+            }
+            core.gripper_calib_invalid = false;
+            if clear_stale {
+                retired.gripper_stale = core.gripper_calib_stale.take();
+            }
+            core.gripper_calib_revision += 1;
+        }
+        ConfigCandidate::Poses { next_list } => {
+            retired.pose_list = Some(std::mem::replace(&mut core.poses.list, next_list));
+            core.poses.revision += 1;
+        }
+        ConfigCandidate::Sequences { next_file } => {
+            retired.sequence_file = Some(std::mem::replace(&mut core.sequences.file, next_file));
+            core.sequences.revision += 1;
+        }
+        ConfigCandidate::GraspSetup { setup, ws_eval_bufs } => {
+            let tilt = setup.camera_tilt_deg as f32;
+            if core.config.camera_mount.tilt_deg != tilt {
+                core.workspace_revision += 1;
+                core.servo_ws_min_depths = None;
+            }
+            core.config.camera_mount.tilt_deg = tilt;
+            retired.grasp_setup = core.config.grasp.replace(setup);
+            if let Some(bufs) = ws_eval_bufs {
+                retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+            }
+            core.grasp_setup_revision += 1;
+        }
+        ConfigCandidate::ToolCommissioning { confirmed_at, .. } => {
+            core.config.active_tool.commissioning_required = false;
+            retired.string_a = core.tool_commissioning_confirmed_at.replace(confirmed_at);
+            core.tool_commissioning_revision += 1;
+        }
+        ConfigCandidate::Calibration(cand) => {
+            apply_calibration_candidate_in_place(core, cand, true, retired);
+        }
+    }
+
+    match ConfigAuthority::activate(core, reservation) {
+        Activated::Active { revision, durability } => Ok(ConfigActivated {
+            revision,
+            durability,
+            workspace_revision: core.workspace_revision,
+            epoch_id: core.safety.epoch_id(),
+            is_torqued: core.is_torqued,
+        }),
+        Activated::Refused { code, reservation } => {
+            let _ = ConfigAuthority::release(core, reservation);
+            Err(ConfigError::Busy(code))
+        }
+        Activated::Reconciling { code } => Err(ConfigError::Reconciling(code)),
+    }
+}
+
+fn apply_calibration_candidate_in_place(
+    core: &mut SupervisorInner,
+    mut cand: Box<CalibrationCandidate>,
+    advance_calib_revision: bool,
+    retired: &mut ConfigRetiredPayloads,
+) {
+    let mut workspace_bumped = false;
+    if cand.kin_changed {
+        if let Some(new_model) = cand.arm_model.take() {
+            retired.arm_model = Some(std::mem::replace(&mut core.config.arm_model, new_model));
+            workspace_bumped = true;
+        }
+        if let Some(tcps) = cand.pose_tcps.take() {
+            for (pose, (id, tcp)) in core.poses.list.poses.iter_mut().zip(tcps.iter()) {
+                if pose.id == *id {
+                    pose.tcp = tcp.clone();
+                }
+            }
+            retired.pose_tcps = Some(tcps);
+        }
+    }
+    if core.config.camera_mount != cand.camera_mount {
+        workspace_bumped = true;
+    }
+    core.config.camera_mount = cand.camera_mount.clone();
+    let tilt = f64::from(core.config.camera_mount.tilt_deg);
+    if let Some(g) = core.config.grasp.as_mut() {
+        g.camera_tilt_deg = tilt;
+    }
+    retired.calibration_file = std::mem::replace(&mut core.calibration, cand.calibration.take());
+    #[cfg(feature = "policy-runtime")]
+    {
+        let new_digest = std::mem::take(&mut cand.calibration_digest);
+        retired.string_a = Some(std::mem::replace(&mut core.calibration_digest, new_digest));
+    }
+    if let Some((floor, source)) = cand.effective_floor {
+        core.floor_source = source;
+        if let Some(ws) = core.config.workspace.as_mut() {
+            if ws.floor_z_m != floor {
+                ws.floor_z_m = floor;
+                workspace_bumped = true;
+            }
+        }
+    }
+    if workspace_bumped {
+        core.workspace_revision += 1;
+        core.servo_ws_min_depths = None;
+    }
+    if let Some(bufs) = cand.ws_eval_bufs.take() {
+        retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+    }
+    if advance_calib_revision {
+        core.calibration_revision += 1;
+    }
+    // Keep the Box<CalibrationCandidate> shell alive until off-thread drop (0 dealloc on RT).
+    retired.calib_candidate = Some(cand);
+}
+
+fn install_set_calibration_busy(
+    core: &mut SupervisorInner,
+    busy: bool,
+    motor_zero: bool,
+    check_begin: Option<CalibBeginCheck>,
+) -> Result<CalibBeginSnapshot, ConfigError> {
+    if busy {
+        if let Some(chk) = check_begin {
+            if core.calibration_busy {
+                return Err(ConfigError::Busy("a calibration apply or restore is running"));
+            }
+            if let Some(reason) = core.workspace_change_blocker_static() {
+                return Err(ConfigError::MotionBusy {
+                    subject: "the camera calibration",
+                    reason,
+                });
+            }
+            if chk.check_grasp
+                && (core.config.grasp.is_none()
+                    || !core.config.has_cartesian_with_gripper()
+                    || core.config.kinematics.is_none()
+                    || core.config.gripper_policy.is_none())
+            {
+                return Err(ConfigError::Unsupported("This profile has no grasp setup"));
+            }
+            if chk.check_kinematics_armed {
+                check_kinematics_armed_static(core)?;
+            }
+        } else if core.calibration_busy {
+            return Err(ConfigError::Busy("a calibration apply, restore or zero is running"));
+        }
+        core.calibration_busy = true;
+        if motor_zero {
+            core.motor_zero_busy = true;
+        }
+    } else {
+        core.calibration_busy = false;
+        core.motor_zero_busy = false;
+    }
+    Ok(CalibBeginSnapshot {
+        is_torqued: core.is_torqued,
+        epoch_id: core.safety.epoch_id(),
+    })
+}
+
+fn install_calibration_revert(
+    core: &mut SupervisorInner,
+    before: Box<CalibrationCandidate>,
+    retired: &mut ConfigRetiredPayloads,
+) {
+    apply_calibration_candidate_in_place(core, before, true, retired);
+}
+
+fn install_invalidate_after_zero(
+    core: &mut SupervisorInner,
+    mut cand: Box<ZeroInvalidationCandidate>,
+    retired: &mut ConfigRetiredPayloads,
+) -> ZeroInvalidatedReply {
+    let mut workspace_bumped = false;
+    if let Some(uncorrected) = cand.arm_model_uncorrected.take() {
+        if uncorrected.correction() != core.config.arm_model.correction() {
+            retired.arm_model = Some(std::mem::replace(&mut core.config.arm_model, uncorrected));
+            core.calibration_revision += 1;
+            workspace_bumped = true;
+            if let Some(tcps) = cand.pose_tcps.take() {
+                for (pose, (id, tcp)) in core.poses.list.poses.iter_mut().zip(tcps.iter()) {
+                    if pose.id == *id {
+                        pose.tcp = tcp.clone();
+                    }
+                }
+                retired.pose_tcps = Some(tcps);
+            }
+        } else {
+            retired.arm_model = Some(uncorrected);
+        }
+    }
+    if cand.file_changes {
+        retired.calibration_file = std::mem::replace(&mut core.calibration, cand.calibration.take());
+        #[cfg(feature = "policy-runtime")]
+        if let Some(new_digest) = cand.calibration_digest.take() {
+            retired.string_a = Some(std::mem::replace(&mut core.calibration_digest, new_digest));
+        }
+    }
+    if let Some((floor, source)) = cand.effective_floor {
+        core.floor_source = source;
+        if let Some(ws) = core.config.workspace.as_mut() {
+            if ws.floor_z_m != floor {
+                ws.floor_z_m = floor;
+                workspace_bumped = true;
+            }
+        }
+    }
+    if workspace_bumped {
+        core.workspace_revision += 1;
+        core.servo_ws_min_depths = None;
+    }
+    if let Some(bufs) = cand.ws_eval_bufs.take() {
+        retired.eval_bufs = Some(std::mem::replace(&mut core.ws_eval_bufs, bufs));
+    }
+    if let Some(next_poses) = cand.next_poses.take() {
+        retired.pose_list = Some(std::mem::replace(&mut core.poses.list, next_poses));
+        core.poses.revision += 1;
+    }
+    if cand.reset_gripper_baseline {
+        retired.gripper_baseline = core.gripper_baseline.take();
+        core.gripper_baseline_pending.clear();
+        core.gripper_baseline_dirty = false;
+        core.gripper_baseline_generation += 1;
+    }
+    if let Some(stale) = cand.gripper_stale.take() {
+        retired.gripper_stale = core.gripper_calib_stale.replace(stale);
+        core.gripper_calib_revision += 1;
+    }
+    retired.zero_inv_candidate = Some(cand);
+    ZeroInvalidatedReply {
+        poses_revision: core.poses.revision,
+        gripper_calib_revision: core.gripper_calib_revision,
+        calibration_revision: core.calibration_revision,
+        workspace_revision: core.workspace_revision,
+    }
+}
+
+fn install_sample_table_capture(core: &SupervisorInner) -> Result<([f32; 8], usize), ConfigError> {
+    if let Err(msg) = core.check_table_capture_stillness_static() {
+        return Err(ConfigError::InvalidCommand(msg));
+    }
+    let len = core.measured_positions.len();
+    if len > 8 {
+        return Err(ConfigError::Unsupported("table_z_from_tcp supports at most 8 joints"));
+    }
+    let mut pos = [0.0f32; 8];
+    pos[..len].copy_from_slice(&core.measured_positions);
+    Ok((pos, len))
+}
+
+fn install_gravity_comp(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    op: GravityCompOp,
+    retired: &mut ConfigRetiredPayloads,
+) -> Result<GravityCompReply, ConfigError> {
+    match op {
+        GravityCompOp::Enter {
+            admission,
+            lease_holder,
+            policy,
+            scale,
+            damping_kd,
+        } => {
+            if core.rt_executor_owned && core.driver.is_some() {
+                retired.gravity_comp_policy = policy;
+                return Err(ConfigError::ExecutorCapabilityUnsupported(
+                    "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
+                ));
+            }
+            if let Some((conn, gen)) = lease_holder {
+                if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
+                    retired.gravity_comp_policy = policy;
+                    return Err(ConfigError::LeaseLost);
+                }
+            }
+            let admitted = match core.check_admission(admission) {
+                Ok(a) => a,
+                Err(e) => {
+                    retired.gravity_comp_policy = policy;
+                    return Err(match e {
+                        crate::safety::SafetyError::StampAlreadyConsumed => ConfigError::StampConsumed,
+                        crate::safety::SafetyError::LeaseLost => ConfigError::LeaseLost,
+                        crate::safety::SafetyError::Stopped => ConfigError::Stopped,
+                        crate::safety::SafetyError::EpochMismatch { .. } => ConfigError::EpochMismatch {
+                            current_epoch: core.safety.epoch_id(),
+                        },
+                        _ => ConfigError::Stopped,
+                    });
+                }
+            };
+            match SupervisorInner::enter_gravity_comp_rt(admitted, policy, scale, damping_kd) {
+                Ok(unused_policy) => {
+                    retired.gravity_comp_policy = unused_policy;
+                    Ok(GravityCompReply {
+                        active: core.gravity_comp_active(),
+                        epoch_id: core.safety.epoch_id(),
+                        is_torqued: core.is_torqued,
+                    })
+                }
+                Err((reason, unused_policy)) => {
+                    retired.gravity_comp_policy = unused_policy;
+                    Err(ConfigError::GravityCompRejected {
+                        code: reason.code,
+                        message: reason.message,
+                    })
+                }
+            }
+        }
+        GravityCompOp::Exit { code, message } => {
+            if core.rt_executor_owned && core.driver.is_some() {
+                return Err(ConfigError::ExecutorCapabilityUnsupported(
+                    "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
+                ));
+            }
+            core.exit_gravity_comp_rt(code, message);
+            Ok(GravityCompReply {
+                active: core.gravity_comp_active(),
+                epoch_id: core.safety.epoch_id(),
+                is_torqued: core.is_torqued,
+            })
+        }
+    }
+}
+
+// ============================================================================
+// Off-thread orchestrator (shared by BOTH RtOwner::Legacy and RtOwner::Executor)
+// ============================================================================
+
+/// Builds a [`ConfigProposal`] stamped with live boot identity, monotonic deadline,
+/// and the caller's ingress [`AdmissionStamp`].
+pub fn build_config_proposal(
+    sup: &ArmSupervisor,
+    domain: ConfigDomain,
+    expected_revision: u64,
+    admission: AdmissionStamp,
+    lease_generation: u64,
+    workspace_revision: u64,
+) -> ConfigProposal {
+    let seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let boot = sup
+        .executor_handle()
+        .map_or_else(BootId::process, |h| h.boot());
+    let now = Instant::now();
+    ConfigProposal {
+        domain,
+        expected_revision,
+        candidate: CandidateId(seq),
+        stamp: Stamp {
+            arm: ArmId::LOCAL,
+            boot,
+            request: RequestId(seq),
+            client: ClientId(admission.connection_id),
+            client_seq: seq,
+            authority: Authority {
+                lease_generation,
+                epoch: admission.estop_epoch,
+                stop_generation: admission.stop_gen,
+                config_revision: workspace_revision,
+                parent_generation: 0,
+            },
+            deadline: now + CONFIG_PROPOSAL_BUDGET,
+        },
+    }
+}
+
+/// Captures a config-commit [`AdmissionStamp`] reflecting both `stop_gen` and any live
+/// executor `StopRequests` generation without acquiring `SupervisorLock`.
+pub fn capture_config_admission(
+    sup: &ArmSupervisor,
+    connection_id: u64,
+    lease_gen: u64,
+    epoch_override: Option<u64>,
+) -> AdmissionStamp {
+    let mut stamp = sup.capture_admission_stamp();
+    if let Some(h) = sup.executor_handle() {
+        stamp.stop_gen = stamp.stop_gen.max(h.stop_requests().current());
+    }
+    stamp.connection_id = connection_id;
+    stamp.lease_gen = lease_gen;
+    if let Some(ep) = epoch_override {
+        stamp.estop_epoch = ep;
+    }
+    stamp
+}
+
+/// Optional test hooks injected on [`ArmSupervisor`] to deterministically exercise
+/// rename failures, dir-sync failures, and mid-transaction revocations on both owners.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct ConfigCommitTestHooks {
+    pub before_reserve: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_reserve_before_rename: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_rename_before_activate: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub fail_rename_once: Option<Arc<AtomicBool>>,
+    pub fail_dir_sync_once: Option<Arc<AtomicBool>>,
+    pub fail_persisted_once: Option<Arc<AtomicBool>>,
+}
+
+/// RAII guard for a granted [`Reservation`] held off-thread across disk rename/activation.
+///
+/// If dropped early (cancelled future, panic, or early return):
+/// - before rename (`renamed == false`): releases the hold (`Released::Cleared`);
+/// - after rename (`renamed == true`): forces `PersistedConfig` + `ReleaseConfig` so
+///   the hold enters `Reconciling` and motion stays inhibited.
+pub struct ReservationGuard {
+    sup: Arc<ArmSupervisor>,
+    reservation: Option<Reservation>,
+    renamed: bool,
+}
+
+impl ReservationGuard {
+    pub fn new(sup: Arc<ArmSupervisor>, reservation: Reservation) -> Self {
+        Self {
+            sup,
+            reservation: Some(reservation),
+            renamed: false,
+        }
+    }
+
+    pub fn mark_renamed(&mut self) {
+        self.renamed = true;
+    }
+
+    pub fn take(&mut self) -> Option<Reservation> {
+        self.reservation.take()
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let sup = Arc::clone(&self.sup);
+        let renamed = self.renamed;
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    if renamed {
+                        let res = sup
+                            .dispatch_config_request(ConfigRequest::Persisted(PersistedConfig {
+                                reservation,
+                                durability: Durability::DurableUnconfirmed,
+                            }))
+                            .await;
+                        if let Ok(ConfigReply::Persisted(Ok(r))) = res {
+                            let _ = sup
+                                .dispatch_config_request(ConfigRequest::Release(ReleaseConfig {
+                                    reservation: r,
+                                }))
+                                .await;
+                        }
+                    } else {
+                        let _ = sup
+                            .dispatch_config_request(ConfigRequest::Release(ReleaseConfig { reservation }))
+                            .await;
+                    }
+                });
+            }
+            Err(_) => {
+                // Synchronous fallback outside a Tokio runtime (unit tests).
+                if sup.owner_mode() == OWNER_EXECUTOR {
+                    if let Some(h) = sup.executor_handle() {
+                        if renamed {
+                            if let Ok(ConfigReply::Persisted(Ok(r))) =
+                                h.call_config(ConfigRequest::Persisted(PersistedConfig {
+                                    reservation,
+                                    durability: Durability::DurableUnconfirmed,
+                                }))
+                            {
+                                let _ = h.call_config(ConfigRequest::Release(ReleaseConfig {
+                                    reservation: r,
+                                }));
+                            }
+                        } else {
+                            let _ = h.call_config(ConfigRequest::Release(ReleaseConfig {
+                                reservation,
+                            }));
+                        }
+                    }
+                } else if sup.owner_mode() == OWNER_LEGACY {
+                    let mut inner = sup.inner().blocking_write();
+                    if !inner.detached {
+                        let ctx = CommitCtx {
+                            arm: inner.core.id(),
+                            boot: BootId::process(),
+                            now: Instant::now(),
+                            stop_generation: inner.current_stop_gen(),
+                        };
+                        if renamed {
+                            let mut ex = ConfigExchange::new(ConfigRequest::Persisted(PersistedConfig {
+                                reservation,
+                                durability: Durability::DurableUnconfirmed,
+                            }));
+                            handle_config_exchange(&mut inner, &ctx, &mut ex);
+                            if let Some(ConfigReply::Persisted(Ok(r))) = ex.reply.take() {
+                                let mut rel = ConfigExchange::new(ConfigRequest::Release(ReleaseConfig {
+                                    reservation: r,
+                                }));
+                                handle_config_exchange(&mut inner, &ctx, &mut rel);
+                            }
+                        } else {
+                            let mut rel = ConfigExchange::new(ConfigRequest::Release(ReleaseConfig {
+                                reservation,
+                            }));
+                            handle_config_exchange(&mut inner, &ctx, &mut rel);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Inputs to the unified off-thread two-phase config commit orchestrator.
+pub struct ConfigCommitPlan {
+    pub proposal: ConfigProposal,
+    pub auth: ConfigAuthContext,
+    pub precheck: ReservePrecheck,
+    pub candidate: ConfigCandidate,
+    pub write: Option<PendingWrite>,
+}
+
+/// Outcome of [`run_config_commit`].
+#[derive(Debug, Clone)]
+pub struct ConfigCommitOutcome {
+    pub activated: ConfigActivated,
+    pub persisted: bool,
+    pub durability_confirmed: bool,
+    pub durability_warning: Option<String>,
+}
+
+/// Unified off-thread two-phase config commit orchestrator for BOTH `Legacy` and `Executor`.
+///
+/// Sequence:
+/// 1. Hold `config_write_lock` (off owner lock).
+/// 2. If `plan.write` is `Some`: `StagedWrite::stage` in `spawn_blocking`.
+/// 3. Verify `auth_check()` (operator session + connection lease gen) off-thread.
+/// 4. Send `ReserveConfig` to owner; wrap grant in [`ReservationGuard`].
+/// 5. If staged:
+///    a. Re-verify `auth_check()` before rename (fail -> abort + `ReleaseConfig` -> `Cleared`).
+///    b. `staged.rename_only()` in `spawn_blocking` (fail -> `ReleaseConfig` -> `Cleared`).
+///    c. `guard.mark_renamed()`; send `PersistedConfig(DurableUnconfirmed)` to owner.
+///    d. Re-verify `auth_check()` after rename (fail -> pass `revoked_off_thread` to `ActivateConfig` -> `Reconciling`).
+/// 6. Send `ActivateConfig` to owner (swaps candidate in-place with 0 alloc/free).
+/// 7. Apply `update_published(&mut PublishedConfig)` off-thread.
+/// 8. If renamed: run `dir_sync.sync_parent_dir()` in `spawn_blocking`.
+pub async fn run_config_commit<FAuth, FPub>(
+    sup: &Arc<ArmSupervisor>,
+    plan: ConfigCommitPlan,
+    auth_check: FAuth,
+    update_published: FPub,
+) -> Result<ConfigCommitOutcome, ArmError>
+where
+    FAuth: Fn() -> Result<(), (&'static str, ArmError)>,
+    FPub: FnOnce(&mut PublishedConfig, ConfigActivated),
+{
+    let hooks = sup.config_commit_test_hooks();
+    let cw_lock = sup.config_write_lock();
+    let _cw = cw_lock.lock().await;
+
+    let ConfigCommitPlan {
+        proposal,
+        auth,
+        precheck,
+        candidate,
+        write,
+    } = plan;
+
+    let staged = if let Some(w) = write {
+        let s = tokio::task::spawn_blocking(move || StagedWrite::stage(w.path, w.text))
+            .await
+            .map_err(|e| ArmError::Rejected {
+                status: 500,
+                code: "PERSIST_FAILED".into(),
+                message: format!("Failed to persist configuration: {e}"),
+            })?
+            .map_err(|e| ArmError::Rejected {
+                status: 500,
+                code: "PERSIST_FAILED".into(),
+                message: format!("Failed to persist configuration: {e}"),
+            })?;
+        Some(s)
+    } else {
+        None
+    };
+
+    if let Some(h) = hooks.before_reserve.as_ref() {
+        h();
+    }
+
+    if let Err((_, err)) = auth_check() {
+        if let Some(s) = staged {
+            s.abort();
+        }
+        return Err(err);
+    }
+
+    let reservation = match sup
+        .dispatch_config_request(ConfigRequest::Reserve(ReserveConfig {
+            proposal,
+            auth,
+            precheck,
+        }))
+        .await
+    {
+        Ok(ConfigReply::Reserved(Ok(r))) => r,
+        Ok(ConfigReply::Reserved(Err(e))) => {
+            if let Some(s) = staged {
+                s.abort();
+            }
+            return Err(e.to_arm_error());
+        }
+        Err(e) => {
+            if let Some(s) = staged {
+                s.abort();
+            }
+            return Err(e.to_arm_error());
+        }
+        _ => {
+            if let Some(s) = staged {
+                s.abort();
+            }
+            return Err(ArmError::Internal("unexpected config reserve reply".into()));
+        }
+    };
+
+    let mut guard = ReservationGuard::new(Arc::clone(sup), reservation);
+
+    if let Some(h) = hooks.after_reserve_before_rename.as_ref() {
+        h();
+    }
+
+    let (dir_sync, post_rename_revoked) = if let Some(staged) = staged {
+        if let Err((_, err)) = auth_check() {
+            staged.abort();
+            if let Some(r) = guard.take() {
+                let _ = sup
+                    .dispatch_config_request(ConfigRequest::Release(ReleaseConfig { reservation: r }))
+                    .await;
+            }
+            return Err(err);
+        }
+
+        let sim_rename_fail = hooks
+            .fail_rename_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+        let rename_res: Result<crate::persist::PendingDirSync, String> = if sim_rename_fail {
+            staged.abort();
+            Err("simulated rename failure".into())
+        } else {
+            tokio::task::spawn_blocking(move || staged.rename_only())
+                .await
+                .map_err(|e| format!("rename task failed: {e}"))
+                .and_then(|r| r)
+        };
+        let ds = match rename_res {
+            Ok(ds) => ds,
+            Err(e) => {
+                if let Some(r) = guard.take() {
+                    let _ = sup
+                        .dispatch_config_request(ConfigRequest::Release(ReleaseConfig {
+                            reservation: r,
+                        }))
+                        .await;
+                }
+                tracing::warn!("State file not published: {e}");
+                return Err(ArmError::Rejected {
+                    status: 500,
+                    code: "PERSIST_FAILED".into(),
+                    message: format!("Failed to persist configuration: {e}"),
+                });
+            }
+        };
+
+        // File is now renamed into place: any failure below MUST reconcile.
+        guard.mark_renamed();
+
+        if let Some(h) = hooks.after_rename_before_activate.as_ref() {
+            h();
+        }
+
+        let sim_persisted_fail = hooks
+            .fail_persisted_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+        let r = guard.take().expect("reservation held by guard");
+        if sim_persisted_fail {
+            // Force Reconciling on owner via PersistedConfig -> ReleaseConfig.
+            if let Ok(ConfigReply::Persisted(Ok(r))) = sup
+                .dispatch_config_request(ConfigRequest::Persisted(PersistedConfig {
+                    reservation: r,
+                    durability: Durability::DurableUnconfirmed,
+                }))
+                .await
+            {
+                let _ = sup
+                    .dispatch_config_request(ConfigRequest::Release(ReleaseConfig {
+                        reservation: r,
+                    }))
+                    .await;
+            }
+            return Err(ConfigError::Reconciling("SIMULATED_PERSISTED_ERR").to_arm_error());
+        }
+        let persisted_r = match sup
+            .dispatch_config_request(ConfigRequest::Persisted(PersistedConfig {
+                reservation: r,
+                durability: Durability::DurableUnconfirmed,
+            }))
+            .await
+        {
+            Ok(ConfigReply::Persisted(Ok(r))) => r,
+            Ok(ConfigReply::Persisted(Err(e))) => return Err(e.to_arm_error()),
+            Err(e) => return Err(e.to_arm_error()),
+            _ => return Err(ArmError::Internal("unexpected config persisted reply".into())),
+        };
+        guard = ReservationGuard::new(Arc::clone(sup), persisted_r);
+        guard.mark_renamed();
+
+        let revoked_code = match auth_check() {
+            Ok(()) => None,
+            Err((code, _)) => Some(code),
+        };
+        (Some(ds), revoked_code)
+    } else {
+        let revoked_code = match auth_check() {
+            Ok(()) => None,
+            Err((_, err)) => {
+                if let Some(r) = guard.take() {
+                    let _ = sup
+                        .dispatch_config_request(ConfigRequest::Release(ReleaseConfig {
+                            reservation: r,
+                        }))
+                        .await;
+                }
+                return Err(err);
+            }
+        };
+        (None, revoked_code)
+    };
+
+    let reservation = guard.take().expect("reservation held by guard");
+    let activated = match sup
+        .dispatch_config_request(ConfigRequest::Activate(ActivateConfig {
+            reservation,
+            auth,
+            revoked_off_thread: post_rename_revoked,
+            candidate,
+        }))
+        .await
+    {
+        Ok(ConfigReply::Activated(Ok(act))) => act,
+        Ok(ConfigReply::Activated(Err(e))) => {
+            if let Some(ref ds) = dir_sync {
+                tracing::error!(
+                    "{} written but not activated: {:?}; reconciling",
+                    ds.target().display(),
+                    e
+                );
+            }
+            return Err(e.to_arm_error());
+        }
+        Err(e) => return Err(e.to_arm_error()),
+        _ => return Err(ArmError::Internal("unexpected config activate reply".into())),
+    };
+
+    // Update PublishedConfigHub off-thread immediately after owner activation.
+    let legacy_gen = (sup.owner_mode() == OWNER_LEGACY).then(|| sup.inner().generation());
+    sup.published_config_hub()
+        .update(|cfg| update_published(cfg, activated), legacy_gen);
+
+    if let Some(ds) = dir_sync {
+        let sim_dir_sync_fail = hooks
+            .fail_dir_sync_once
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+        let outcome = if sim_dir_sync_fail {
+            PublishOutcome::PublishedDurabilityUnconfirmed("simulated parent dir fsync failure".into())
+        } else {
+            tokio::task::spawn_blocking(move || ds.sync_parent_dir())
+                .await
+                .unwrap_or_else(|e| PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()))
+        };
+        match outcome {
+            PublishOutcome::Published => Ok(ConfigCommitOutcome {
+                activated,
+                persisted: true,
+                durability_confirmed: true,
+                durability_warning: None,
+            }),
+            PublishOutcome::PublishedDurabilityUnconfirmed(w) => Ok(ConfigCommitOutcome {
+                activated,
+                persisted: true,
+                durability_confirmed: false,
+                durability_warning: Some(w),
+            }),
+        }
+    } else {
+        Ok(ConfigCommitOutcome {
+            activated,
+            persisted: false,
+            durability_confirmed: true,
+            durability_warning: None,
+        })
+    }
+}
+
+/// Pre-builds an `EvalBufs` off-thread for a given `(ArmModel, WorkspacePolicy, CameraMount, tcp_offset)`.
+pub fn prepare_eval_bufs_off_thread(
+    arm_model: &ArmModel,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &CameraMount,
+    tcp_offset: [f64; 3],
+) -> EvalBufs {
+    let mut bufs = EvalBufs::default();
+    bufs.prepare_for(arm_model, ws, cam, tcp_offset);
+    bufs
+}

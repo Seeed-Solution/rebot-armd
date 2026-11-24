@@ -46,6 +46,8 @@ pub mod mailbox;
 pub mod config_iface;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ops;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod requests;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use core::{ArmCore, FeedbackState, MacroTerminal, ObservationBuffer};

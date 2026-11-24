@@ -28,31 +28,24 @@ impl SupervisorInner {
         self.table_still_anchor_positions.clear();
     }
 
-    pub fn check_table_capture_stillness(&self) -> Result<(), ArmError> {
+    /// Zero-allocation stillness check backing [`Self::check_table_capture_stillness`].
+    pub(crate) fn check_table_capture_stillness_static(&self) -> Result<(), &'static str> {
         if !self.feedback_numeric_valid {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires valid joint feedback".into(),
-            ).into());
+            return Err("table_z_from_tcp requires valid joint feedback");
         }
         if self.driver.is_some() && !self.hardware_feedback_fresh(Duration::from_millis(250)) {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires fresh joint feedback".into(),
-            ).into());
+            return Err("table_z_from_tcp requires fresh joint feedback");
         }
         if self.active_trajectory.is_some()
             || self.servo_target.is_some()
             || self.commanded_velocities.iter().any(|v| v.abs() > 1e-3)
         {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires the arm to be stationary".into(),
-            ).into());
+            return Err("table_z_from_tcp requires the arm to be stationary");
         }
         if self.measured_velocities.len() != self.config.dof
             || self.measured_velocities.iter().any(|v| !v.is_finite() || v.abs() > 0.02)
         {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires measured joint velocities <= 0.02 rad/s".into(),
-            ).into());
+            return Err("table_z_from_tcp requires measured joint velocities <= 0.02 rad/s");
         }
         if self.driver.is_some() || self.still_window_ever_moved {
             let settled = if self.driver.is_some() {
@@ -75,12 +68,15 @@ impl SupervisorInner {
                         .all(|(m, a)| m.is_finite() && (m - a).abs() <= UNLOAD_STILL_POSITION_SPAN_RAD)
             };
             if !settled {
-                return Err(MotionError::InvalidCommand(
-                    "table_z_from_tcp requires the arm to remain still for at least 0.2 s with fresh distinct hardware samples".into(),
-                ).into());
+                return Err("table_z_from_tcp requires the arm to remain still for at least 0.2 s with fresh distinct hardware samples");
             }
         }
         Ok(())
+    }
+
+    pub fn check_table_capture_stillness(&self) -> Result<(), ArmError> {
+        self.check_table_capture_stillness_static()
+            .map_err(|msg| MotionError::InvalidCommand(msg.into()).into())
     }
 
     /// Start a new action record; a running one is cancelled as SUPERSEDED.

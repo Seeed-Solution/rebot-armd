@@ -745,6 +745,53 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation check whether a candidate `GripperPolicy` satisfies both profile and
+    /// driver hardware position limits without mutating `self`.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_gripper_policy_against_driver_bounded(
+        &self,
+        gp: &crate::model::GripperPolicy,
+    ) -> Result<(), crate::safety::BoundedText<256>> {
+        use crate::safety::BoundedText;
+        let Some(g_idx) = self.config.gripper_index() else {
+            return Err(BoundedText::new("Gripper calibration requires a gripper joint"));
+        };
+        let Some(lim) = self.config.limits.get(g_idx) else {
+            return Err(BoundedText::new("Gripper calibration requires gripper joint limits"));
+        };
+        let mut lo = lim.min_position;
+        let mut hi = lim.max_position;
+        if let Some(d) = self.driver.as_ref() {
+            let drv = d
+                .lock()
+                .map_err(|_| BoundedText::new("driver unavailable while validating gripper calibration"))?;
+            if let Some((d_min, d_max)) = drv.position_limits(g_idx) {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new("Driver position limits for gripper joint are invalid"));
+                }
+                lo = lo.max(d_min);
+                hi = hi.min(d_max);
+            }
+        }
+        if self.driver_config_error.is_some() && self.driver.is_none() {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("Driver limit configuration error prevents gripper calibration")));
+        }
+        let in_lim = |v: f32| v.is_finite() && v >= lo && v <= hi;
+        if !(in_lim(gp.closed_rad)
+            && in_lim(gp.open_rad)
+            && gp.jaw_opening.as_ref().is_none_or(|jo| jo.points.iter().all(|&[q, _]| in_lim(q))))
+        {
+            return Err(BoundedText::new(
+                "Driver limits violated config invariants: Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)",
+            ));
+        }
+        Ok(())
+    }
+
     /// Pure read-only validation of driver position/velocity limits into bounded stack storage
     /// (zero allocations, zero mutations to `self`).
     #[allow(clippy::result_large_err)] // inline bounded text avoids RT heap allocation
