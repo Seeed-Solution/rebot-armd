@@ -2109,16 +2109,16 @@ impl SupervisorInner {
                     }
                     return Err(refusal.into_safety_error());
                 }
-                // MIT expiry recovery disables every motor on the bus. Unless every arm joint
-                // (J1..J6) is already disabled or its own watchdog has already expired
-                // (`status == 0 || status >= 8`), this is an operator torque-off request and must
-                // pass the single Rule A′ rest-pose decision with no override.
-                let arm_joints = self.config.arm_joints();
-                let all_arm_already_disabled = !arm_joints.is_empty()
-                    && arm_joints
-                        .iter()
-                        .all(|&i| st.get(i).copied().is_some_and(|c| c == 0 || c >= 8));
-                if !all_arm_already_disabled {
+                // MIT expiry recovery disables every motor on the bus. Unless fresh feedback shows
+                // EVERY motor the recovery disables is already disabled (`0`) or has tripped its
+                // own measured command-timeout watchdog (`0xD`), this is an operator torque-off
+                // request and must pass the single Rule A′ rest-pose decision with no override.
+                // Other motor fault codes (e.g. `0x8` overvoltage, `0xE` overload) do NOT bypass
+                // the rest-pose check.
+                let all_motors_watchdog_expired_or_disabled = !st.is_empty()
+                    && st.len() == self.config.dof
+                    && st.iter().all(|&c| c == 0 || c == 0xD);
+                if !all_motors_watchdog_expired_or_disabled {
                     self.eval_stopped_torque_off()
                         .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
                 }
@@ -2148,7 +2148,10 @@ impl SupervisorInner {
                     }
                 }
                 commit_probed_limits(self);
-                return self.mit_expiry_recovery_for_epoch(expected_epoch, all_arm_already_disabled);
+                return self.mit_expiry_recovery_for_epoch(
+                    expected_epoch,
+                    all_motors_watchdog_expired_or_disabled,
+                );
             }
         }
 

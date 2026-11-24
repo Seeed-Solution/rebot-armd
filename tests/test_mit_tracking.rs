@@ -1430,18 +1430,78 @@ fn mit_expiry_recovery_refused_away_from_rest_with_torque_off_would_drop_no_over
     assert!(inner.is_torqued);
 }
 
-/// Torque-off round 2, item 1 exception: when every arm motor's own watchdog has already expired
-/// (or is already disabled) in fresh feedback, MIT expiry recovery may proceed even away from rest
-/// because turning torque off changes nothing physically.
+/// Torque-off round 3, item 1: when fresh feedback shows EVERY motor the recovery disables is
+/// already disabled (`0`) or has tripped its measured command-timeout watchdog (`0xD`), MIT
+/// expiry recovery may proceed even away from rest because turning torque off changes nothing
+/// physically. Non-watchdog fault codes (e.g. `0x8` overvoltage) MUST NOT bypass the rest check.
 #[test]
-fn mit_expiry_recovery_proceeds_raised_when_all_arm_motors_already_expired_or_disabled() {
+fn mit_expiry_recovery_proceeds_raised_when_all_motors_already_expired_0xd_or_disabled_and_refuses_0x8() {
+    // 1. Status 0x8 (overvoltage) on a motor at a raised pose MUST be refused with TORQUE_OFF_WOULD_DROP.
+    {
+        let (mut inner, bus, _clock) = expired_after_loss();
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.motors[1].q = 0.35;
+            for (j, m) in s.motors.iter_mut().enumerate() {
+                m.enabled = false;
+                m.state_override = Some(if j == 2 { 0x8 } else { 0xD });
+            }
+            s.push_all_feedback();
+        });
+        inner.tick(DT);
+        let epoch_before = inner.safety.epoch_id();
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                armd::ArmError::Safety(armd::safety::SafetyError::TorqueOffWouldDrop {
+                    joint: Some(ref j),
+                    ..
+                }) if j == "joint_2"
+            ),
+            "status 0x8 (overvoltage) at a raised pose must be refused with TORQUE_OFF_WOULD_DROP, got {err:?}"
+        );
+        assert_eq!(recovery_commands(&bus.tx_log()), 0, "no disable or clear-error frame may be sent for 0x8");
+        assert_eq!(inner.safety.epoch_id(), epoch_before);
+    }
+
+    // 2. If any motor that recovery disables (including J7) is still enabled (1), raised recovery
+    //    MUST still go through the rest-pose check and refuse.
+    {
+        let (mut inner, bus, _clock) = expired_after_loss();
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.motors[1].q = 0.35;
+            for j in 0..6 {
+                s.motors[j].enabled = false;
+                s.motors[j].state_override = Some(0xD);
+            }
+            s.motors[6].enabled = true;
+            s.motors[6].state_override = Some(1);
+            s.push_all_feedback();
+        });
+        inner.tick(DT);
+        bus.clear_log();
+        let err = inner.clear_fault_confirmed(true).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                armd::ArmError::Safety(armd::safety::SafetyError::TorqueOffWouldDrop { .. })
+            ),
+            "enabled J7 means not every motor is already 0/0xD; expected TORQUE_OFF_WOULD_DROP, got {err:?}"
+        );
+        assert_eq!(recovery_commands(&bus.tx_log()), 0);
+    }
+
+    // 3. Every motor (all 7 motors) already disabled (0) or watchdog-expired (0xD) -> proceeds raised.
     let (mut inner, bus, clock) = expired_after_loss();
     bus.with(|s| {
         s.follow_commands = false;
         s.motors[1].q = 0.35;
-        for j in 0..6 {
-            s.motors[j].enabled = false;
-            s.motors[j].state_override = Some(if j % 2 == 0 { 0xD } else { 0 });
+        for (j, m) in s.motors.iter_mut().enumerate() {
+            m.enabled = false;
+            m.state_override = Some(if j % 2 == 0 { 0xD } else { 0 });
         }
         s.push_all_feedback();
     });
@@ -1461,7 +1521,7 @@ fn mit_expiry_recovery_proceeds_raised_when_all_arm_motors_already_expired_or_di
     }
     assert!(
         matches!(cleared, Some(armd::SafetyState::Idle)),
-        "MIT recovery must proceed when all arm motors are already expired/disabled, got: {:?}",
+        "MIT recovery must proceed when every motor is already 0/0xD, got: {:?}",
         inner.clear_fault_confirmed(true)
     );
     assert!(!inner.is_torqued);

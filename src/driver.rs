@@ -6804,8 +6804,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         // 2. no cached frame may ever be replayed; then the disable of every motor.
         // Callers (`SupervisorInner::clear_fault_for_epoch` / `mit_expiry_recovery_for_epoch`)
-        // gate this through `may_disable_torque_while_stopped` unless every arm motor is already
-        // disabled or its own watchdog has already expired (`status == 0 || status >= 8`).
+        // gate this through `may_disable_torque_while_stopped` unless every motor the recovery
+        // disables is already disabled (`0`) or has tripped its own command-timeout watchdog (`0xD`).
         self.clear_cached_targets();
         let res = self.set_torque(false);
         let boundary = self

@@ -1114,7 +1114,7 @@ impl crate::supervisor::SupervisorInner {
     pub(crate) fn mit_expiry_recovery_for_epoch(
         &mut self,
         expected_epoch: Option<u64>,
-        all_arm_already_disabled: bool,
+        all_motors_watchdog_expired_or_disabled: bool,
     ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
         use crate::driver::EnableState;
         use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
@@ -1136,7 +1136,7 @@ impl crate::supervisor::SupervisorInner {
             }
             return Err(refusal.into_safety_error());
         }
-        if !all_arm_already_disabled {
+        if !all_motors_watchdog_expired_or_disabled {
             self.eval_stopped_torque_off()
                 .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
         }
