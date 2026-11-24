@@ -3213,7 +3213,12 @@ async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
 fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_next_call() {
     let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
-    driver.set_confirmed_enable_state(EnableState::Enabled);
+    let en_read = feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1);
+    let en_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    driver.transport_mut().stage_reply(&en_read, &[0xFF, 0xFF, 1, 3, 0x00, 1, en_cs]);
+    driver.refresh_enable_state().unwrap();
+    driver.transport_mut().clear_write_responses();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
     driver.set_read_poll_count(8);
     driver.last_enable_poll = Some(driver.clock_now());
 
@@ -3268,7 +3273,12 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
 fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
     let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
-    driver.set_confirmed_enable_state(EnableState::Enabled);
+    let en_read = feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1);
+    let en_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    driver.transport_mut().stage_reply(&en_read, &[0xFF, 0xFF, 1, 3, 0x00, 1, en_cs]);
+    driver.refresh_enable_state().unwrap();
+    driver.transport_mut().clear_write_responses();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
     driver.last_enable_poll = Some(driver.clock_now());
 
     let build_resp = |id: u8| -> Vec<u8> {
@@ -3516,7 +3526,12 @@ fn test_feetech_cross_tick_reassembly_with_active_torque_and_echo_drain() {
     let mut driver = FeetechArmDriver::new(mock, vec![1])
         .with_calibrated(true)
         .with_tx_echo(Some(false));
-    driver.set_confirmed_enable_state(EnableState::Enabled);
+    let en_read = feetech::build_read(1, feetech::REG_TORQUE_ENABLE, 1);
+    let en_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    driver.transport_mut().stage_reply(&en_read, &[0xFF, 0xFF, 1, 3, 0x00, 1, en_cs]);
+    driver.refresh_enable_state().unwrap();
+    driver.transport_mut().clear_write_responses();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
 
     let build_resp_pos = |id: u8, pos_steps: u16| -> Vec<u8> {
         let pos = pos_steps.to_le_bytes();

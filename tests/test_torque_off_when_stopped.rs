@@ -2128,10 +2128,9 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Enable rollback (BOTH previously-disabled AND Unknown prior state) × {AtRest, Raised, Stale}
-    //    Round 6 (Decision 1): EVERY enable rollback goes through `DisableRequested { rollback: true }`
-    //    with NO already-off bypass — allowed ONLY at rest from fresh feedback; refused raised/stale
-    //    with 0 disables, torque held, and recoverable `ENABLE_ROLLBACK_HELD` fault.
+    // 4. Failed enable (BOTH previously-disabled AND Unknown prior state) × {AtRest, Raised, Stale}
+    //    §2 / §4 / §5: Failed enable NEVER rolls back automatically at any pose (0 disable frames),
+    //    enters `FailedHold` with measured-position holds, and latches non-recoverable `ENABLE_FAILED`.
     // -------------------------------------------------------------------------
     for prior_all_off in [false, true] {
         for pose in ALL_POSES {
@@ -2151,9 +2150,9 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             inner.lease_enabled = false;
 
             // Set arm pose and prior enable state:
-            // - prior_all_off = true: all 7 motors freshly report state 0 -> EnableState::Disabled.
+            // - prior_all_off = true: verified disable transaction -> EnableState::Disabled.
             // - prior_all_off = false: J1..J6 freshly report status 0x8 and J7 is silent -> Unknown.
-            // Both MUST follow the exact same `DisableRequested { rollback: true }` rule!
+            // Both MUST enter `FailedHold` + `ENABLE_FAILED` with ZERO automatic rollback!
             let target_q = if pose == PoseCase::Raised { 0.40 } else { 0.0 };
             bus.with(|s| {
                 s.follow_commands = false;
@@ -2174,12 +2173,12 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             });
             {
                 let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
-                drv.read_joint_states().unwrap();
-                let st = drv.enable_state();
                 if prior_all_off {
-                    assert_eq!(st, EnableState::Disabled);
+                    drv.set_torque(false).unwrap();
+                    assert_eq!(drv.enable_state(), EnableState::Disabled);
                 } else {
-                    assert_eq!(st, EnableState::Unknown);
+                    drv.read_joint_states().unwrap();
+                    assert_eq!(drv.enable_state(), EnableState::Unknown);
                 }
             }
 
@@ -2532,13 +2531,13 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     }
 }
 
-/// Round 5 item 2: partial enable at a raised pose followed by an enable-finish error (both
+/// Partial enable at a raised pose followed by a post-enable validation failure (both
 /// `read_res.is_err()` and `!is_feedback_valid() / enable_state != Enabled` branches while
-/// safety is still `Idle`) MUST gate rollback via `DisableRequested { rollback: true }`:
-/// 0 disable frames transmitted to the enabled motors, motors remain holding, and a recoverable
-/// `EnableFailed` fault explains it.
+/// safety is still `Idle`) MUST route through the unified reducer's `FailedHold` transition:
+/// 0 disable frames transmitted, motors remain holding at measured poses, and non-recoverable
+/// `ENABLE_FAILED` is latched.
 #[test]
-fn partial_enable_at_raised_pose_then_enable_error_refuses_rollback_holds_and_latches_recoverable_fault() {
+fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_non_recoverable_enable_failed() {
     use armd::driver::{ArmDriverError, DisableKind, JointTarget, StoppedDisableGate};
     use armd::model::JointState;
     use std::sync::atomic::AtomicBool;
@@ -2632,10 +2631,9 @@ fn partial_enable_at_raised_pose_then_enable_error_refuses_rollback_holds_and_la
         fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
             if enabled && self.post_enable_armed {
                 // Partially enable J1..J6 via the real Damiao handshake (J7 stays silent) so
-                // motors 1..6 are physically enabled (`0x1`) at the raised pose and
-                // `last_enable_write_seq[0..6]` is recorded, then return `Ok(())` so
-                // `SupervisorInner::set_torque(true)` enters `enable_finish_inner` while
-                // `safety.state()` is STILL `Idle`!
+                // motors 1..6 are physically enabled (`0x1`) at the raised pose with causal
+                // per-motor evidence recorded, then return `Ok(())` so the unified enable reducer
+                // enters `step_enable_validate` while `safety.state()` is STILL `Idle`.
                 let _ = self.inner.begin_torque(true)?;
                 self.bus.with(|s| {
                     for j in 0..6 {
@@ -2762,7 +2760,7 @@ fn partial_enable_at_raised_pose_then_enable_error_refuses_rollback_holds_and_la
             "observation fault.recoverable must be false"
         );
         assert!(
-            fault.message.contains("J1:on/held") && fault.message.contains("J7:unk/unheld(no_fresh_fb)"),
+            fault.message.contains("J1:on/queued") && fault.message.contains("J7:unk/unheld(no_fresh_fb)"),
             "ENABLE_FAILED message must include per-joint torque and hold status: {}",
             fault.message
         );
@@ -3008,6 +3006,15 @@ fn stopped_reconciliation_never_trusts_pre_write_off_feedback_after_deferred_or_
             for m in &mut s.motors {
                 m.q = 0.40;
                 m.enabled = false;
+            }
+            s.push_all_feedback();
+        });
+        dm.read_joint_states().unwrap();
+        // Establish causal OffConfirmed on all 7 motors via a verified disable transaction before
+        // the deferred enable attempt (spec §1 / B-03: startup 0x0 never seeds OffConfirmed).
+        dm.set_torque(false).unwrap();
+        bus.with(|s| {
+            for m in &mut s.motors {
                 m.drop_torque_frames = 10; // keep motors reporting 0x0 on enable frames
             }
             s.push_all_feedback();
@@ -3212,6 +3219,9 @@ fn robstride_clear_fault_routes_through_rest_pose_gate_and_refuses_raised() {
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.0.lock().unwrap().receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.0.lock().unwrap().receive_timestamped()
         }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.0.lock().unwrap().flush()
@@ -3463,11 +3473,6 @@ fn spec_b1_queued_0x0_after_deferred_or_retried_damiao_enable_never_confirms_off
             .unwrap();
         dm.read_joint_states().unwrap();
         dm.check_mapping_ranges();
-        dm.set_tx_budget(TxBudget {
-            max_frames: 1,
-            max_duration: Duration::from_millis(10),
-            ..TxBudget::default()
-        });
         bus.with(|s| {
             s.follow_commands = false;
             s.immediate_replies = true;
@@ -3476,11 +3481,25 @@ fn spec_b1_queued_0x0_after_deferred_or_retried_damiao_enable_never_confirms_off
             for (j, m) in s.motors.iter_mut().enumerate() {
                 m.q = pose[j];
                 m.enabled = false;
-                m.drop_torque_frames = 10;
             }
             s.push_all_feedback();
         });
         dm.read_joint_states().unwrap();
+        // B-03: unsolicited startup 0x0 without a verified disable transaction stays Unknown.
+        assert_eq!(dm.enable_state(), EnableState::Unknown);
+        // Establish prior OffConfirmed explicitly via a verified disable transaction.
+        dm.set_torque(false).unwrap();
+        assert_eq!(dm.enable_state(), EnableState::Disabled);
+        bus.with(|s| {
+            for m in &mut s.motors {
+                m.drop_torque_frames = 10;
+            }
+        });
+        dm.set_tx_budget(TxBudget {
+            max_frames: 1,
+            max_duration: Duration::from_millis(10),
+            ..TxBudget::default()
+        });
 
         let mut inner = SupervisorInner::new(ArmConfig {
             lease_timeout_ms: 600_000,
@@ -3523,8 +3542,10 @@ fn spec_b1_queued_0x0_after_deferred_or_retried_damiao_enable_never_confirms_off
         for j in 2..7 {
             assert_eq!(ev[j], MotorTorqueEvidence::OffConfirmed, "J{} never reached transport so stays OffConfirmed", j + 1);
         }
-        assert_eq!(inner.joint_hold_status()[0], JointHoldStatus::Held);
-        assert_eq!(inner.joint_hold_status()[1], JointHoldStatus::Held);
+        // Under 1 frame/tick TX budget, one of J1/J2 transmitted in tick 2 while the other is
+        // queued for next tick — both transmitted across ticks 1-2 (verified in hold_frames below).
+        assert!(matches!(inner.joint_hold_status()[0], JointHoldStatus::Held | JointHoldStatus::Queued));
+        assert!(matches!(inner.joint_hold_status()[1], JointHoldStatus::Held | JointHoldStatus::Queued));
         for j in 2..7 {
             assert_eq!(inner.joint_hold_status()[j], JointHoldStatus::SkippedOff);
         }
@@ -3575,9 +3596,20 @@ fn spec_b1_queued_0x0_after_deferred_or_retried_damiao_enable_never_confirms_off
         .with_driver(Box::new(dm));
         inner.lease_enabled = false;
 
+        bus.clear_log();
         let err = inner.set_torque(true).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        // m-02: prove retries actually fired (at least initial + 1 retry for motor 1).
+        let j1_enable_attempts = bus
+            .tx_log()
+            .iter()
+            .filter(|f| f.id == 1 && f.data == armd::protocol::damiao::CMD_ENABLE)
+            .count();
+        assert!(
+            j1_enable_attempts >= 2,
+            "expected initial + retried CMD_ENABLE for motor 1, saw {j1_enable_attempts}"
+        );
 
         // Decode fresh unsolicited 0x0 for all 7 motors after the retried enable failed.
         clock.advance(Duration::from_millis(5));
@@ -3628,6 +3660,9 @@ fn spec_b2_feetech_failed_enable_holds_at_measured_positions_never_old_cached_co
         fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
             self.0.lock().unwrap().flush()
         }
+        fn clear_input_buffer(&mut self) {
+            self.0.lock().unwrap().clear_input_buffer();
+        }
         fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
             armd::transport::Transport::clock(&*self.0.lock().unwrap())
         }
@@ -3639,18 +3674,27 @@ fn spec_b2_feetech_failed_enable_holds_at_measured_positions_never_old_cached_co
     let old_cmd_steps: [u16; 6] = [2048, 2600, 1700, 2300, 1800, 2048];
     let moved_steps: [u16; 6] = [2150, 2450, 1820, 2250, 1920, 2048];
 
+    // M-11: destructive `clear_input_buffer` (NOT `new_preserving`); stage replies strictly on
+    // exact protocol requests so readback ordering is genuinely exercised.
     let serial_inner = Arc::new(std::sync::Mutex::new(
-        MockTransport::new_preserving().with_clock(clock.clone()),
+        MockTransport::new().with_clock(clock.clone()),
     ));
+    let sync_pos_req_1 =
+        armd::protocol::feetech::build_sync_read(&servo_ids[..3], armd::protocol::feetech::REG_PRESENT_POSITION_L, 8)
+            .unwrap();
+    let sync_pos_req_2 =
+        armd::protocol::feetech::build_sync_read(&servo_ids[3..], armd::protocol::feetech::REG_PRESENT_POSITION_L, 8)
+            .unwrap();
+    {
+        let mut ser = serial_inner.lock().unwrap();
+        ser.stage_reply(&sync_pos_req_1, &feetech_feedback_bytes(&servo_ids[..3], &moved_steps[..3]));
+        ser.stage_reply(&sync_pos_req_2, &feetech_feedback_bytes(&servo_ids[3..], &moved_steps[3..]));
+    }
     let mut drv = FeetechArmDriver::new(SharedSerial(Arc::clone(&serial_inner)), servo_ids.clone())
         .with_calibrated(true)
         .with_tx_echo(Some(false))
         .with_gripper_index(Some(5));
     // First read at pose C (moved by hand) while supervisor commanded_positions holds old pose B.
-    serial_inner
-        .lock()
-        .unwrap()
-        .provide_rx(&feetech_feedback_bytes(&servo_ids, &moved_steps));
     drv.read_joint_states().unwrap();
     let _ = serial_inner.lock().unwrap().take_tx();
 
@@ -3661,18 +3705,21 @@ fn spec_b2_feetech_failed_enable_holds_at_measured_positions_never_old_cached_co
         inner.target_positions[j] = inner.commanded_positions[j];
     }
 
-    // Attempt set_torque(true):
+    // Attempt set_torque(true): stage exact per-servo REG_TORQUE_ENABLE readback replies:
     // - Servos 1..3 read back 1 (OnConfirmed)
     // - Servo 4 returns unexpected 0x05 -> Unknown
     // - Servos 5..6 read back 0 (OffConfirmed)
-    let mut rb_rx = Vec::new();
-    rb_rx.extend_from_slice(&feetech_reg_u8_resp(1, 1));
-    rb_rx.extend_from_slice(&feetech_reg_u8_resp(2, 1));
-    rb_rx.extend_from_slice(&feetech_reg_u8_resp(3, 1));
-    rb_rx.extend_from_slice(&feetech_reg_u8_resp(4, 5));
-    rb_rx.extend_from_slice(&feetech_reg_u8_resp(5, 0));
-    rb_rx.extend_from_slice(&feetech_reg_u8_resp(6, 0));
-    serial_inner.lock().unwrap().provide_rx(&rb_rx);
+    {
+        let mut ser = serial_inner.lock().unwrap();
+        for (id, val) in [(1u8, 1u8), (2, 1), (3, 1), (4, 5), (5, 0), (6, 0)] {
+            let req = armd::protocol::feetech::build_read(
+                id,
+                armd::protocol::feetech::REG_TORQUE_ENABLE,
+                1,
+            );
+            ser.stage_reply(&req, &feetech_reg_u8_resp(id, val));
+        }
+    }
 
     let err = inner.set_torque(true).unwrap_err();
     assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
@@ -3696,6 +3743,27 @@ fn spec_b2_feetech_failed_enable_holds_at_measured_positions_never_old_cached_co
             MotorTorqueEvidence::OffConfirmed,
         ]
     );
+    // M-07: Before the first hold pass transmits, eligible joints are `Queued` (never prematurely `Held`).
+    assert_eq!(
+        inner.joint_hold_status(),
+        &[
+            JointHoldStatus::Queued,
+            JointHoldStatus::Queued,
+            JointHoldStatus::Queued,
+            JointHoldStatus::Queued,
+            JointHoldStatus::SkippedOff,
+            JointHoldStatus::SkippedOff,
+        ]
+    );
+
+    // Corrupt `commanded_positions` again with old pose B to prove hold servicing NEVER reads it.
+    for j in 0..6 {
+        inner.commanded_positions[j] = calib.steps_to_rad(i32::from(old_cmd_steps[j]));
+    }
+    clock.advance(Duration::from_millis(10));
+    let _ = serial_inner.lock().unwrap().take_tx();
+    inner.tick(0.02);
+
     assert_eq!(
         inner.joint_hold_status(),
         &[
@@ -3707,19 +3775,6 @@ fn spec_b2_feetech_failed_enable_holds_at_measured_positions_never_old_cached_co
             JointHoldStatus::SkippedOff,
         ]
     );
-
-    // Corrupt `commanded_positions` again with old pose B to prove hold servicing NEVER reads it.
-    for j in 0..6 {
-        inner.commanded_positions[j] = calib.steps_to_rad(i32::from(old_cmd_steps[j]));
-    }
-    clock.advance(Duration::from_millis(10));
-    serial_inner
-        .lock()
-        .unwrap()
-        .provide_rx(&feetech_feedback_bytes(&servo_ids, &moved_steps));
-    let _ = serial_inner.lock().unwrap().take_tx();
-    inner.tick(0.02);
-
     let hold_tx = serial_inner.lock().unwrap().take_tx();
     let sync_writes = parse_feetech_sync_write_goal_steps(&hold_tx);
     assert_eq!(sync_writes.len(), 1, "expected exactly 1 SYNC_WRITE hold packet, got {sync_writes:?}");
@@ -3825,8 +3880,8 @@ fn spec_b3_damiao_pos_force_gripper_cleared_mode_verification_does_not_veto_arm_
     assert_eq!(fault.code, FaultCode::EnableFailed);
     assert!(!fx.core.safety.recoverable());
     assert!(
-        fault.message.contains("J1:on/held") && fault.message.contains("J7:unk/unheld(no_mode)"),
-        "ENABLE_FAILED must report J1..J6 held and J7 unheld(no_mode): {}",
+        fault.message.contains("J1:on/queued") && fault.message.contains("J7:unk/unheld(no_mode)"),
+        "ENABLE_FAILED must report J1..J6 queued before first hold TX and J7 unheld(no_mode): {}",
         fault.message
     );
     assert_eq!(fx.core.motor_torque_evidence()[0..6], [MotorTorqueEvidence::OnConfirmed; 6]);
@@ -3837,10 +3892,20 @@ fn spec_b3_damiao_pos_force_gripper_cleared_mode_verification_does_not_veto_arm_
     // Tick while in FailedHold with fresh feedback on all 7 joints:
     // J1..J6 MUST all receive POS_VEL hold frames (`0x101..=0x106`) at their exact measured poses;
     // J7 (`0x307` / `0x107` / `0x007`) MUST receive ZERO frames and NEVER veto J1..J6!
+    let epoch_before_hold = fx.core.safety.epoch_id();
     clock.advance(Duration::from_millis(10));
     bus.with(|s| s.push_all_feedback());
     bus.clear_log();
     fx.step();
+
+    assert_eq!(fx.core.joint_hold_status()[0..6], [JointHoldStatus::Held; 6]);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before_hold, "live hold update must not bump epoch");
+    let live_fault = fx.core.current_observation().fault.expect("live observation fault expected");
+    assert!(
+        live_fault.message.contains("J1:on/held") && live_fault.message.contains("J7:unk/unheld(no_mode)"),
+        "live observation fault must update to J1:on/held after hold TX: {}",
+        live_fault.message
+    );
 
     let tx = bus.tx_log();
     let arm_holds: Vec<_> = tx.iter().filter(|f| f.id >= 0x101 && f.id <= 0x106).collect();
@@ -3910,34 +3975,41 @@ fn spec_m1_m2_delayed_rt_failure_and_feetech_internal_failure_both_enter_failed_
         assert!(!r.fx.core.safety.recoverable());
         assert!(!fault.recoverable);
         assert!(
-            fault.message.contains("J1:on/held") && fault.message.contains("J4:unk/held"),
+            fault.message.contains("J1:on/queued") && fault.message.contains("J4:unk/queued"),
             "M1 fault must contain per-joint torque & hold status: {}",
             fault.message
         );
     }
 
-    // (M2) Feetech-internal failure (servo 3 fails readback while servos 1..2 on and 4..6 off).
+    // (M2) Feetech-internal failure (servo 3 fails readback while servos 1..2 on and 4..6 off),
+    // using destructive `clear_input_buffer` and exact request-matched readback replies (M-11).
     {
         let clock = MockClock::new();
-        let mock = MockTransport::new_preserving().with_clock(clock.clone());
+        let mut mock = MockTransport::new().with_clock(clock.clone());
         let servo_ids: Vec<u8> = (1..=6).collect();
+        let steps = [2048u16, 2300, 1950, 2048, 2048, 2048];
+        let sync_pos_req_1 =
+            armd::protocol::feetech::build_sync_read(&servo_ids[..3], armd::protocol::feetech::REG_PRESENT_POSITION_L, 8)
+                .unwrap();
+        let sync_pos_req_2 =
+            armd::protocol::feetech::build_sync_read(&servo_ids[3..], armd::protocol::feetech::REG_PRESENT_POSITION_L, 8)
+                .unwrap();
+        mock.stage_reply(&sync_pos_req_1, &feetech_feedback_bytes(&servo_ids[..3], &steps[..3]));
+        mock.stage_reply(&sync_pos_req_2, &feetech_feedback_bytes(&servo_ids[3..], &steps[3..]));
+        for (id, val) in [(1u8, 1u8), (2, 1), (3, 9), (4, 0), (5, 0), (6, 0)] {
+            let req = armd::protocol::feetech::build_read(
+                id,
+                armd::protocol::feetech::REG_TORQUE_ENABLE,
+                1,
+            );
+            mock.stage_reply(&req, &feetech_reg_u8_resp(id, val));
+        }
         let mut drv = FeetechArmDriver::new(mock, servo_ids.clone())
             .with_calibrated(true)
             .with_tx_echo(Some(false))
             .with_gripper_index(Some(5));
-        let steps = [2048u16, 2300, 1950, 2048, 2048, 2048];
-        drv.transport_mut().provide_rx(&feetech_feedback_bytes(&servo_ids, &steps));
         drv.read_joint_states().unwrap();
         let _ = drv.transport_mut().take_tx();
-
-        let mut rb_rx = Vec::new();
-        rb_rx.extend_from_slice(&feetech_reg_u8_resp(1, 1));
-        rb_rx.extend_from_slice(&feetech_reg_u8_resp(2, 1));
-        rb_rx.extend_from_slice(&feetech_reg_u8_resp(3, 9)); // invalid -> Unknown
-        rb_rx.extend_from_slice(&feetech_reg_u8_resp(4, 0));
-        rb_rx.extend_from_slice(&feetech_reg_u8_resp(5, 0));
-        rb_rx.extend_from_slice(&feetech_reg_u8_resp(6, 0));
-        drv.transport_mut().provide_rx(&rb_rx);
 
         let mut inner = SupervisorInner::new(feetech_6dof_config()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
@@ -3950,8 +4022,8 @@ fn spec_m1_m2_delayed_rt_failure_and_feetech_internal_failure_both_enter_failed_
         assert!(!inner.safety.recoverable());
         assert!(!fault.recoverable);
         assert!(
-            fault.message.contains("J1:on/held")
-                && fault.message.contains("J3:unk/held")
+            fault.message.contains("J1:on/queued")
+                && fault.message.contains("J3:unk/queued")
                 && fault.message.contains("J4:off/skip"),
             "M2 fault must contain per-joint torque & hold status: {}",
             fault.message
@@ -3967,6 +4039,20 @@ fn spec_m1_m2_delayed_rt_failure_and_feetech_internal_failure_both_enter_failed_
                 MotorTorqueEvidence::OffConfirmed,
             ]
         );
+        assert_eq!(
+            inner.joint_hold_status(),
+            &[
+                JointHoldStatus::Queued,
+                JointHoldStatus::Queued,
+                JointHoldStatus::Queued,
+                JointHoldStatus::SkippedOff,
+                JointHoldStatus::SkippedOff,
+                JointHoldStatus::SkippedOff,
+            ]
+        );
+        // Service one tick -> servos 1..3 transmit & flush -> status transitions Queued -> Held.
+        clock.advance(Duration::from_millis(10));
+        inner.tick(0.02);
         assert_eq!(
             inner.joint_hold_status(),
             &[
@@ -4035,52 +4121,105 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         assert!(drv.pending_tx_len_total() > 0, "J3..J7 holds should be queued in hold queue");
     }
 
-    // Make J3 silent while keeping J1, J2, J4..J7 continuously fresh (refreshing every 30 ms
-    // across 120 ms so J3 crosses > 100 ms stale while J1 never goes stale!) AND drifting J1's
-    // measured position slightly (+0.03 rad).
+    // M-12: Specifically queue J3's hold frame at t=85 ms (age=85 ms <= 100 ms, TX age=0 ms < 45 ms),
+    // then advance 20 ms to t=105 ms so J3 crosses the 100 ms freshness boundary while its queued
+    // hold is only 20 ms old (cannot expire by the 45 ms TX frame age limit!). Assert J3's queued
+    // hold is dropped and emits ZERO 0x103 frames on that VERY FIRST stale pass while peers send.
     bus.with(|s| {
         s.motors[2].silent = true;
         s.motors[0].q = initial_pose[0] + 0.03; // drifts while still fresh -> captured hold MUST stay fixed!
     });
-    // First 3 steps of 30 ms keep J1,J2,J4..J7 continuously fresh while J3 ages past 100 ms.
-    for _ in 0..4 {
-        clock.advance(Duration::from_millis(30));
+    // Step 1: advance to t=+45 ms (J3 age = 45 ms <= 100 ms), tick so J3..J4 transmit and J1..J2/J5..J7 rotate.
+    // Keep advancing until J3 is specifically NOT transmitted on a tick right before 100 ms (t=+85 ms),
+    // meaning J3 is guaranteed freshly queued in `pending_hold_tx` with TX age = 0 ms at t=+85 ms.
+    clock.advance(Duration::from_millis(35)); // J3 age = 35 ms
+    bus.with(|s| {
+        for j in [0, 1, 3, 4, 5, 6] {
+            s.push_feedback(j);
+        }
+    });
+    inner.tick(0.02);
+    clock.advance(Duration::from_millis(35)); // J3 age = 70 ms
+    bus.with(|s| {
+        for j in [0, 1, 3, 4, 5, 6] {
+            s.push_feedback(j);
+        }
+    });
+    inner.tick(0.02);
+    clock.advance(Duration::from_millis(15)); // J3 age = 85 ms <= 100 ms
+    bus.with(|s| {
+        for j in [0, 1, 3, 4, 5, 6] {
+            s.push_feedback(j);
+        }
+    });
+    bus.clear_log();
+    inner.tick(0.02);
+    // At t=+85 ms, J3 is either still queued (`Queued`, TX age 0..15 ms) or just transmitted; if it
+    // just transmitted on that tick, run one more 5 ms tick (J3 age = 90 ms) so J3 is freshly
+    // re-queued at the back of the 2-frame/tick queue with TX age = 0 ms!
+    if inner.joint_hold_status()[2] == JointHoldStatus::Held {
+        clock.advance(Duration::from_millis(5)); // J3 age = 90 ms <= 100 ms
         bus.with(|s| {
-            for j in 0..7 {
-                if j != 2 {
-                    s.push_feedback(j);
-                }
+            for j in [0, 1, 3, 4, 5, 6] {
+                s.push_feedback(j);
             }
         });
         inner.tick(0.02);
     }
-    // Now J3 is > 120 ms stale while J1,J2,J4..J7 are fresh: run 4 ticks to verify ZERO 0x103
-    // frames transmit and J1 still holds its original captured `initial_pose[0]`.
+    assert_eq!(
+        inner.joint_hold_status()[2],
+        JointHoldStatus::Queued,
+        "J3 hold must be specifically queued right before crossing the 100 ms freshness boundary"
+    );
+    let pending_before_stale = inner.driver.as_ref().unwrap().lock().unwrap().pending_tx_len_total();
+    assert!(pending_before_stale > 0);
+
+    // Cross the 100 ms freshness boundary by advancing 20 ms (J3 age = 105..110 ms > 100 ms, while
+    // J3's queued hold TX age is only 20 ms < 45 ms). Do NOT discard the trace of this first stale pass!
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| {
+        for j in [0, 1, 3, 4, 5, 6] {
+            s.push_feedback(j);
+        }
+    });
     bus.clear_log();
-    for _ in 0..4 {
+    inner.tick(0.02);
+
+    assert_eq!(
+        inner.joint_hold_status()[2],
+        JointHoldStatus::UnheldNoFreshFeedback,
+        "stale J3 must be reported UnheldNoFreshFeedback on the very first stale pass"
+    );
+    let first_stale_tx = bus.tx_log();
+    assert!(
+        first_stale_tx.iter().all(|f| f.id != 0x103),
+        "queued J3 hold must be dropped with ZERO 0x103 TX on the very first stale pass: {first_stale_tx:?}"
+    );
+    assert!(
+        first_stale_tx.iter().any(|f| f.id >= 0x101 && f.id <= 0x107 && f.id != 0x103),
+        "eligible peers must still transmit on the first stale pass: {first_stale_tx:?}"
+    );
+
+    // Run 3 more 10 ms ticks so every eligible peer (including J1) rotates through the 2-frame/tick
+    // budget while J3 stays silent, proving J1's captured hold stayed fixed at `initial_pose[0]`.
+    for _ in 0..3 {
         clock.advance(Duration::from_millis(10));
         bus.with(|s| {
-            for j in 0..7 {
-                if j != 2 {
-                    s.push_feedback(j);
-                }
+            for j in [0, 1, 3, 4, 5, 6] {
+                s.push_feedback(j);
             }
         });
         inner.tick(0.02);
     }
 
-    assert_eq!(
-        inner.joint_hold_status()[2],
-        JointHoldStatus::UnheldNoFreshFeedback,
-        "stale J3 must be reported UnheldNoFreshFeedback"
-    );
+    assert_eq!(inner.joint_hold_status()[2], JointHoldStatus::UnheldNoFreshFeedback);
     for j in [0, 1, 3, 4, 5, 6] {
-        assert_eq!(inner.joint_hold_status()[j], JointHoldStatus::Held);
+        assert!(matches!(inner.joint_hold_status()[j], JointHoldStatus::Held | JointHoldStatus::Queued));
     }
     let tx_stale = bus.tx_log();
     assert!(
         tx_stale.iter().all(|f| f.id != 0x103),
-        "stale J3 must drop its queued hold and send ZERO 0x103 frames: {tx_stale:?}"
+        "stale J3 must send ZERO 0x103 frames across all stale passes: {tx_stale:?}"
     );
     let j1_frame = tx_stale.iter().find(|f| f.id == 0x101).expect("J1 hold frame expected");
     assert!(
@@ -4104,7 +4243,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
         inner.tick(0.02);
     }
 
-    assert_eq!(inner.joint_hold_status()[2], JointHoldStatus::Held);
+    assert!(matches!(inner.joint_hold_status()[2], JointHoldStatus::Held | JointHoldStatus::Queued));
     let j3_frame = bus
         .tx_log()
         .into_iter()
@@ -4225,42 +4364,717 @@ fn spec_7_failed_enable_at_rest_pose_does_not_roll_back_automatically() {
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::Disarmed);
     }
 
-    // Part B: Feetech failed enable at exact rest pose (2048 steps = 0.0 rad, fresh feedback).
+    // Part B: Feetech failed enable at exact rest pose (2048 steps = 0.0 rad, fresh feedback),
+    // retaining a shared transport recorder with destructive `clear_input_buffer` to prove ZERO
+    // `TORQUE_ENABLE=0` wire packets during both failure and subsequent service ticks (M-11, M-13).
     {
+        #[derive(Clone)]
+        struct RecSerial(Arc<std::sync::Mutex<MockTransport>>);
+        impl armd::transport::Transport for RecSerial {
+            fn write(&mut self, buf: &[u8]) -> Result<usize, armd::transport::TransportError> {
+                self.0.lock().unwrap().write(buf)
+            }
+            fn write_all(&mut self, buf: &[u8]) -> Result<(), armd::transport::TransportError> {
+                self.0.lock().unwrap().write_all(buf)
+            }
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
+                self.0.lock().unwrap().read(buf)
+            }
+            fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+                self.0.lock().unwrap().flush()
+            }
+            fn clear_input_buffer(&mut self) {
+                self.0.lock().unwrap().clear_input_buffer();
+            }
+            fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+                armd::transport::Transport::clock(&*self.0.lock().unwrap())
+            }
+        }
+
         let clock = MockClock::new();
-        let mock = MockTransport::new_preserving().with_clock(clock.clone());
         let servo_ids: Vec<u8> = (1..=6).collect();
-        let mut drv = FeetechArmDriver::new(mock, servo_ids.clone())
+        let serial = Arc::new(std::sync::Mutex::new(
+            MockTransport::new().with_clock(clock.clone()),
+        ));
+        let sync_pos_req_1 = armd::protocol::feetech::build_sync_read(
+            &servo_ids[..3],
+            armd::protocol::feetech::REG_PRESENT_POSITION_L,
+            8,
+        )
+        .unwrap();
+        let sync_pos_req_2 = armd::protocol::feetech::build_sync_read(
+            &servo_ids[3..],
+            armd::protocol::feetech::REG_PRESENT_POSITION_L,
+            8,
+        )
+        .unwrap();
+        {
+            let mut ser = serial.lock().unwrap();
+            ser.stage_reply(&sync_pos_req_1, &feetech_feedback_bytes(&servo_ids[..3], &[2048u16; 3]));
+            ser.stage_reply(&sync_pos_req_2, &feetech_feedback_bytes(&servo_ids[3..], &[2048u16; 3]));
+            for id in 1..=6u8 {
+                let req = armd::protocol::feetech::build_read(
+                    id,
+                    armd::protocol::feetech::REG_TORQUE_ENABLE,
+                    1,
+                );
+                ser.stage_reply(&req, &feetech_reg_u8_resp(id, u8::from(id == 1)));
+            }
+        }
+        let mut drv = FeetechArmDriver::new(RecSerial(Arc::clone(&serial)), servo_ids.clone())
             .with_calibrated(true)
             .with_tx_echo(Some(false))
             .with_gripper_index(Some(5));
-        drv.transport_mut()
-            .provide_rx(&feetech_feedback_bytes(&servo_ids, &[2048u16; 6]));
         drv.read_joint_states().unwrap();
-        let _ = drv.transport_mut().take_tx();
-
-        // Servo 1 confirms on, servos 2..6 confirm off -> enable fails at rest.
-        let mut rb_rx = Vec::new();
-        rb_rx.extend_from_slice(&feetech_reg_u8_resp(1, 1));
-        for id in 2..=6u8 {
-            rb_rx.extend_from_slice(&feetech_reg_u8_resp(id, 0));
-        }
-        drv.transport_mut().provide_rx(&rb_rx);
+        let _ = serial.lock().unwrap().take_tx();
 
         let mut inner = SupervisorInner::new(feetech_6dof_config()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
 
         let err = inner.set_torque(true).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
+        let fail_tx = serial.lock().unwrap().take_tx();
+        assert_eq!(
+            spec_count_feetech_torque_off_writes(&fail_tx),
+            0,
+            "Feetech failed enable at rest pose must send ZERO TORQUE_ENABLE=0 wire packets"
+        );
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
         assert!(inner.is_torqued && !inner.disable_pending);
         assert_eq!(inner.safety.fault().map(|f| f.code), Some(FaultCode::EnableFailed));
         assert!(!inner.safety.recoverable());
-        // Verify driver had 0 REG_TORQUE_ENABLE = 0 packets written during failed enable.
-        // (Servo 1 stayed OnConfirmed; servos 2..6 stayed OffConfirmed.)
         assert_eq!(
             inner.motor_torque_evidence()[0],
             armd::driver::MotorTorqueEvidence::OnConfirmed
         );
+        // Service subsequent FailedHold ticks -> STILL zero TORQUE_ENABLE=0 packets on the wire.
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(10));
+            inner.tick(0.02);
+        }
+        let hold_tx = serial.lock().unwrap().take_tx();
+        assert_eq!(
+            spec_count_feetech_torque_off_writes(&hold_tx),
+            0,
+            "Feetech FailedHold service ticks at rest must send ZERO TORQUE_ENABLE=0 wire packets"
+        );
+    }
+}
+
+/// Review Blockers B-01, B-02, B-03 regression:
+/// - B-03: Startup unsolicited `0x0` feedback keeps Damiao `Unknown` until a verified disable.
+/// - B-01: Pre-disable untimestamped `0x0` injected between pre-drain and `CMD_DISABLE` NEVER
+///   confirms `OffConfirmed` (regular disable, retry, and `panic_disable_step`).
+/// - B-02: Pre-enable `state=1` decoded before a deferred first `CMD_ENABLE` OR injected right
+///   before a deferred/retried `CMD_ENABLE` NEVER confirms `OnConfirmed`/`Armed`.
+#[test]
+fn review_b01_b02_b03_damiao_causal_evidence_rejects_pre_tx_and_startup_frames() {
+    use armd::driver::{
+        DamiaoArmDriver, EnableState, MotorTorqueEvidence, TorqueOutcome, TorqueProgress, TxBudget,
+    };
+    use armd::transport::CanFrame;
+
+    let make_fb = |id: u16, state: u8| {
+        let lim = limits()[usize::from(id - 1)];
+        let p = armd::protocol::damiao::float_to_uint(0.25, lim.p_min, lim.p_max, 16);
+        let v = armd::protocol::damiao::float_to_uint(0.0, lim.v_min, lim.v_max, 12);
+        let t = armd::protocol::damiao::float_to_uint(0.0, lim.t_min, lim.t_max, 12);
+        let data = [
+            (state << 4) | (id as u8 & 0x0f),
+            (p >> 8) as u8,
+            p as u8,
+            (v >> 4) as u8,
+            (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+            t as u8,
+            30,
+            30,
+        ];
+        CanFrame::new_standard(0x10 + id, &data).unwrap()
+    };
+
+    // B-03: Unsolicited startup 0x0 from all 7 motors stays Unknown until verified disable.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.enabled = false;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        assert_eq!(drv.enable_state(), EnableState::Unknown);
+        let mut ev = [MotorTorqueEvidence::OnConfirmed; 7];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::Unknown; 7]);
+
+        drv.set_torque(false).unwrap();
+        assert_eq!(drv.enable_state(), EnableState::Disabled);
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::OffConfirmed; 7]);
+    }
+
+    // B-01: Pre-disable untimestamped 0x0 injected right before CMD_DISABLE (between pre-drain
+    // and transmit) must NEVER confirm OffConfirmed on regular disable, retry, or panic_disable_step.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.tx_lost = true; // CMD_DISABLE never reaches motors -> zero genuine post-disable replies
+            for m in &mut s.motors {
+                m.enabled = true;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+
+        // Inject fake pre-disable state-0 frames right as the first CMD_DISABLE hits transmit().
+        bus.with(|s| {
+            for id in 1..=7u16 {
+                s.inject_on_next_tx.push(make_fb(id, 0));
+            }
+        });
+        let p = drv.begin_torque(false).unwrap();
+        assert!(matches!(p, TorqueProgress::Pending { .. }));
+        let mut ev = [MotorTorqueEvidence::OnConfirmed; 7];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::Unknown; 7], "pre-disable 0x0 must never confirm OffConfirmed");
+        assert_eq!(drv.enable_state(), EnableState::Unknown);
+
+        // Also inject fake pre-disable 0x0 right before the retry CMD_DISABLE at +25 ms -> STILL Unknown!
+        let mut outcome = None;
+        for step in 0..20 {
+            if step == 5 {
+                bus.with(|s| {
+                    for id in 1..=7u16 {
+                        s.inject_on_next_tx.push(make_fb(id, 0));
+                    }
+                });
+            }
+            clock.advance(Duration::from_millis(10));
+            match drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+                TorqueProgress::Done(o) => {
+                    outcome = Some(o);
+                    break;
+                }
+                TorqueProgress::Pending { .. } => {}
+            }
+        }
+        assert_eq!(outcome, Some(TorqueOutcome::Unconfirmed));
+        assert_eq!(drv.enable_state(), EnableState::Unknown);
+
+        // Same attack against `panic_disable_step`: injected pre-TX 0x0 must leave all 7 unconfirmed!
+        bus.with(|s| {
+            for id in 1..=7u16 {
+                s.inject_on_next_tx.push(make_fb(id, 0));
+            }
+        });
+        let remaining = drv
+            .panic_disable_step(true, clock.now() + Duration::from_millis(20))
+            .expect("panic_disable_step supported")
+            .unwrap();
+        assert_eq!(remaining.len(), 7, "pre-TX 0x0 must not satisfy panic_disable_step: {remaining:?}");
+        assert_eq!(drv.enable_state(), EnableState::Unknown);
+    }
+
+    // B-02: State-1 injected BEFORE deferred J2's first CMD_ENABLE and BEFORE a retried CMD_ENABLE
+    // must NEVER confirm OnConfirmed or allow the handshake to report Confirmed.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.enabled = false;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
+        drv.set_tx_budget(TxBudget {
+            max_frames: 1,
+            max_duration: Duration::from_millis(10),
+            ..TxBudget::default()
+        });
+        // Motor 2 drops all enable frames (never actually enables on wire).
+        bus.with(|s| {
+            s.motors[1].drop_torque_frames = 10;
+            s.push_all_feedback();
+        });
+        drv.read_joint_states().unwrap();
+
+        // Tick 1: only motor 1's CMD_ENABLE transmits; motors 2..7 are deferred (`unsent_mask != 0`).
+        assert!(matches!(drv.begin_torque(true).unwrap(), TorqueProgress::Pending { .. }));
+
+        // Inject untimestamped state=1 for J2 BOTH before poll_torque decodes RX AND via
+        // `inject_on_next_tx` right before J2's deferred first CMD_ENABLE reaches transport!
+        bus.with(|s| {
+            s.rx.push_back(make_fb(2, 1));
+            s.inject_on_next_tx.push(make_fb(2, 1));
+        });
+        clock.advance(Duration::from_millis(5));
+        assert!(matches!(
+            drv.poll_torque(clock.now() + Duration::from_millis(5)).unwrap(),
+            TorqueProgress::Pending { .. }
+        ));
+        let mut ev = [MotorTorqueEvidence::Unknown; 7];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(
+            ev[1],
+            MotorTorqueEvidence::Unknown,
+            "pre-write state=1 must NEVER confirm deferred J2 as OnConfirmed"
+        );
+
+        // Drive remaining motors through enable + retries, injecting another untimestamped state=1
+        // right before J2's retry write: handshake MUST expire EnableTimeout (never Confirmed).
+        let mut timed_out = false;
+        for step in 0..40 {
+            if step == 10 {
+                bus.with(|s| s.inject_on_next_tx.push(make_fb(2, 1)));
+            }
+            clock.advance(Duration::from_millis(5));
+            match drv.poll_torque(clock.now() + Duration::from_millis(5)) {
+                Ok(TorqueProgress::Pending { .. }) => {}
+                Ok(TorqueProgress::Done(o)) => {
+                    panic!("deferred/retried J2 with only pre-TX state=1 must never confirm: {o:?}");
+                }
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+        assert!(timed_out, "handshake must fail when J2 only saw pre-TX state=1 frames");
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev[1], MotorTorqueEvidence::Unknown);
+    }
+}
+
+/// Review Blocker B-04 regression: Mid-batch E-stop after motor 1's enable write on BOTH
+/// FashionStar and RobStride MUST immediately abort remaining enable writes (0 later enable
+/// packets), route through the shared failure transition to `FailedHold` + `ENABLE_FAILED`,
+/// and preserve `SafetyState::EStop`.
+#[test]
+fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_enables() {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use armd::driver::{FashionStarArmDriver, RobStrideArmDriver};
+    use armd::transport::{CanFrame, CanTransport, MockTransport, Transport};
+
+    // Part A: FashionStar mid-batch E-stop after servo 1 enable write -> 0 enable writes to servos 2..6.
+    {
+        struct EstopAfterFirstWriteSerial {
+            inner: MockTransport,
+            enable_writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+            servo1_enable: Vec<u8>,
+            estop_req: Arc<AtomicU64>,
+            estop_flag: Arc<AtomicBool>,
+            tripped: bool,
+        }
+        impl Transport for EstopAfterFirstWriteSerial {
+            fn write(&mut self, buf: &[u8]) -> Result<usize, armd::transport::TransportError> {
+                let is_enable = (1..=6u8).any(|id| buf == armd::protocol::fashionstar::build_set_torque(id, true).as_slice());
+                if is_enable {
+                    self.enable_writes.lock().unwrap().push(buf.to_vec());
+                }
+                let res = self.inner.write(buf);
+                // Trip E-stop right after servo 1's torque-enable packet is written.
+                if !self.tripped && buf == self.servo1_enable.as_slice() {
+                    self.tripped = true;
+                    self.estop_flag.store(true, Ordering::SeqCst);
+                    self.estop_req.fetch_add(1, Ordering::SeqCst);
+                }
+                res
+            }
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
+                self.inner.read(buf)
+            }
+            fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+                self.inner.flush()
+            }
+            fn clear_input_buffer(&mut self) {
+                self.inner.clear_input_buffer();
+            }
+        }
+
+        let enable_writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut inner = SupervisorInner::new(ArmConfig {
+            dof: 6,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::default()
+        });
+        inner.lease_enabled = false;
+        let serial = EstopAfterFirstWriteSerial {
+            inner: MockTransport::new(),
+            enable_writes: Arc::clone(&enable_writes),
+            servo1_enable: armd::protocol::fashionstar::build_set_torque(1, true),
+            estop_req: inner.requested_estop_count.clone(),
+            estop_flag: inner.e_stop_latched.clone(),
+            tripped: false,
+        };
+        let drv = FashionStarArmDriver::new(serial, vec![1, 2, 3, 4, 5, 6]);
+        inner = inner.with_driver(Box::new(drv));
+        enable_writes.lock().unwrap().clear();
+
+        let err = inner.set_torque(true).unwrap_err();
+        assert!(matches!(err, SafetyError::EStopActive), "expected EStopActive, got {err:?}");
+        assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert!(inner.e_stop_latched.load(Ordering::SeqCst), "E-stop latch flag must be preserved");
+        assert!(
+            inner.safety.has_latched_fault_kind(armd::safety::FaultKind::Estop),
+            "E-stop fault kind must be preserved"
+        );
+        assert!(inner.safety.has_latched_fault_code(FaultCode::EnableFailed));
+        let sent = enable_writes.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "mid-batch E-stop after FashionStar servo 1 must send 0 further enable packets: {sent:?}"
+        );
+    }
+
+    // Part B: RobStride mid-batch E-stop after motor 1 enable frame -> 0 enable frames to motors 2..6.
+    {
+        struct EstopAfterFirstEnableCan {
+            tx: Arc<std::sync::Mutex<Vec<CanFrame>>>,
+            estop_req: Arc<AtomicU64>,
+            estop_flag: Arc<AtomicBool>,
+            tripped: bool,
+        }
+        impl CanTransport for EstopAfterFirstEnableCan {
+            fn transmit(&mut self, frame: &CanFrame) -> Result<(), armd::transport::TransportError> {
+                self.tx.lock().unwrap().push(*frame);
+                let comm_type = (frame.id >> 24) & 0x1F;
+                if !self.tripped && comm_type == 3 {
+                    self.tripped = true;
+                    self.estop_flag.store(true, Ordering::SeqCst);
+                    self.estop_req.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<CanFrame, armd::transport::TransportError> {
+                Err(armd::transport::TransportError::WouldBlock)
+            }
+            fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+                Ok(())
+            }
+        }
+
+        let tx = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut inner = SupervisorInner::new(ArmConfig {
+            dof: 6,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::default()
+        });
+        inner.lease_enabled = false;
+        let can = EstopAfterFirstEnableCan {
+            tx: Arc::clone(&tx),
+            estop_req: inner.requested_estop_count.clone(),
+            estop_flag: inner.e_stop_latched.clone(),
+            tripped: false,
+        };
+        let drv = RobStrideArmDriver::new(can, vec![1, 2, 3, 4, 5, 6]);
+        inner = inner.with_driver(Box::new(drv));
+        tx.lock().unwrap().clear();
+
+        let err = inner.set_torque(true).unwrap_err();
+        assert!(matches!(err, SafetyError::EStopActive), "expected EStopActive, got {err:?}");
+        assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert!(inner.e_stop_latched.load(Ordering::SeqCst), "E-stop latch flag must be preserved");
+        assert!(
+            inner.safety.has_latched_fault_kind(armd::safety::FaultKind::Estop),
+            "E-stop fault kind must be preserved"
+        );
+        assert!(inner.safety.has_latched_fault_code(FaultCode::EnableFailed));
+        let sent_enables: Vec<_> = tx
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| ((f.id >> 24) & 0x1F) == 3)
+            .copied()
+            .collect();
+        assert_eq!(
+            sent_enables.len(),
+            1,
+            "mid-batch E-stop after RobStride motor 1 must send 0 further enable frames: {sent_enables:?}"
+        );
+    }
+}
+
+/// Review Majors M-01, M-06, M-07, M-08, M-09, M-11 regression:
+/// - M-01: Unverified Damiao arm joint (`joint_modes[i] == None`) gets 0 hold frames & `UnheldNoVerifiedMode`.
+/// - M-06: `StopPolicy::ThermalTrip` interrupts in-flight enable cleanly via reducer (preserving ThermalTrip + EnableFailed).
+/// - M-07: Live observation `ENABLE_FAILED` updates without epoch bump and survives subsequent `HardwareFault`.
+/// - M-08 / M-11: Feetech late 1-byte reply after timed-out read stays `Unknown` until `PING` barrier; duplicate 1-byte reply -> `Unknown`.
+/// - M-09: Feedback continuity gap > 100 ms with resumed feedback before next tick recaptures the new measured position.
+#[test]
+fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recapture() {
+    use armd::driver::{
+        DamiaoArmDriver, EnableState, FeetechArmDriver, JointHoldStatus, MotorTorqueEvidence,
+    };
+    use armd::rt_core::broker::{BootId, Capacities, ClientId, Submit, TransitionOp};
+    use armd::rt_core::ops::{CoreOps, ReleaseFixture};
+    use armd::transport::MockTransport;
+
+    // M-01 + M-07 + M-09 on Damiao FailedHold:
+    {
+        let (mut inner, bus, clock) = make_driver_rig();
+        let pose = [0.10f32, 0.30, -0.20, 0.25, -0.15, 0.12, 0.0];
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = pose[i];
+                m.enabled = false;
+            }
+            // Motor 7 drops enable so enable fails into FailedHold; motors 1..6 enable.
+            s.motors[6].drop_torque_frames = 10;
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+
+        // M-01: When an arm joint's mode is unverified (`joint_modes[2] == None` after a failed
+        // mode write on J3), `joint_hold_mode_verified(2)` MUST be false and
+        // `write_measured_hold_masked` MUST emit ZERO frames (`0x103` or `0x003`) for J3 while
+        // still holding verified peers!
+        {
+            let m01_clock = MockClock::new();
+            let m01_bus = FakeBus::with_clock(&limits(), m01_clock.clone());
+            m01_bus.with(|s| {
+                s.immediate_replies = true;
+                for (i, m) in s.motors.iter_mut().enumerate() {
+                    m.q = pose[i];
+                }
+                s.push_all_feedback();
+            });
+            let mut m01_drv = DamiaoArmDriver::new(m01_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(limits())
+                .unwrap();
+            // Simulate J3 in unexpected CTRL_MODE = MIT (1) during range check -> leaves
+            // `joint_modes[2] == None` while peers remain verified `PosVel` (exact M-01 trigger!).
+            m01_bus.with(|s| {
+                s.motors[2].regs.insert(
+                    armd::protocol::damiao::RID_CTRL_MODE,
+                    armd::protocol::damiao::CTRL_MODE_MIT.to_le_bytes(),
+                );
+            });
+            m01_drv.check_mapping_ranges();
+            assert!(
+                !m01_drv.joint_hold_mode_verified(2),
+                "M-01: arm joint with joint_modes[2] == None must NOT be hold-mode verified"
+            );
+            m01_bus.with(|s| s.push_all_feedback());
+            m01_drv.read_joint_states().unwrap();
+            let hold_t: Vec<_> = pose.iter().map(|&p| armd::driver::JointTarget::position(p)).collect();
+            m01_bus.clear_log();
+            let rep = m01_drv.write_measured_hold_masked(0b0111_1111, &hold_t).unwrap();
+            assert_eq!(rep.joint_status[2], JointHoldStatus::UnheldNoVerifiedMode);
+            assert_eq!(rep.joint_status[1], JointHoldStatus::Held);
+            let j3_tx: Vec<_> = m01_bus
+                .tx_log()
+                .into_iter()
+                .filter(|f| f.id == 0x103 || f.id == 0x003)
+                .collect();
+            assert!(
+                j3_tx.is_empty(),
+                "M-01: unverified J3 must receive ZERO POS_VEL or MIT hold frames: {j3_tx:?}"
+            );
+        }
+
+        // Trigger FailedHold via blocking set_torque(true).
+        let err = inner.set_torque(true).unwrap_err();
+        assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
+        assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        // Enable timed out after 150 ms (> 100 ms hold freshness) so initial status is unheld(no_fresh_fb).
+        assert_eq!(inner.joint_hold_status()[1], JointHoldStatus::UnheldNoFreshFeedback);
+        let epoch_at_latch = inner.safety.epoch_id();
+
+        // M-07: Tick transmits hold at pose[1] = 0.30 -> live observation fault updates to `held`
+        // with ZERO epoch bump!
+        clock.advance(Duration::from_millis(10));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        assert_eq!(inner.joint_hold_status()[1], JointHoldStatus::Held);
+        assert_eq!(inner.safety.epoch_id(), epoch_at_latch, "live hold status update must not bump epoch");
+        let obs_fault = inner.current_observation().fault.expect("live ENABLE_FAILED expected");
+        assert_eq!(obs_fault.code, FaultCode::EnableFailed);
+        assert!(
+            obs_fault.message.contains("J2:on/held"),
+            "live ENABLE_FAILED must update from queued to held: {}",
+            obs_fault.message
+        );
+        let j2_before_gap: Vec<f32> = bus
+            .tx_log()
+            .into_iter()
+            .filter(|f| f.id == 0x102)
+            .map(|f| decode_damiao_pos_vel_pos(&f))
+            .collect();
+        assert!(!j2_before_gap.is_empty());
+        assert!((j2_before_gap[0] - 0.30).abs() < 2e-3, "initial hold must be 0.30: {j2_before_gap:?}");
+
+        // M-09: Unobserved > 100 ms gap (120 ms) with NO intermediate tick, J2 moves to 0.55 and
+        // feedback resumes: first tick drains RX and establishes a fresh empty-queue bound (sending
+        // 0 stale 0.30 frames!), then fresh post-empty feedback at 0.55 recaptures 0.55 (NOT 0.30)!
+        clock.advance(Duration::from_millis(120));
+        bus.with(|s| {
+            s.motors[1].q = 0.55;
+            s.push_all_feedback();
+        });
+        bus.clear_log();
+        inner.tick(0.02);
+        let j2_stale_bound: Vec<f32> = bus
+            .tx_log()
+            .into_iter()
+            .filter(|f| f.id == 0x102)
+            .map(|f| decode_damiao_pos_vel_pos(&f))
+            .collect();
+        assert!(
+            j2_stale_bound.is_empty(),
+            "M-09: stale empty-queue bound after 120 ms gap must not emit stale 0.30 hold: {j2_stale_bound:?}"
+        );
+        clock.advance(Duration::from_millis(5));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        let j2_after_gap: Vec<f32> = bus
+            .tx_log()
+            .into_iter()
+            .filter(|f| f.id == 0x102)
+            .map(|f| decode_damiao_pos_vel_pos(&f))
+            .collect();
+        assert!(!j2_after_gap.is_empty(), "J2 must transmit recaptured hold after continuity break");
+        assert!(
+            (j2_after_gap[0] - 0.55).abs() < 2e-3,
+            "M-09: >100 ms gap with resumed feedback must recapture 0.55, not old 0.30: {j2_after_gap:?}"
+        );
+
+        // M-07: Subsequent HardwareFault latching into FaultKind::Other must NOT clobber EnableFailed detail!
+        inner.safety.latch(
+            armd::safety::FaultKind::Other,
+            armd::safety::FaultDetail::formatted(FaultCode::HardwareFault, |b| b.push_str("later hw fault")),
+        );
+        assert!(inner.safety.has_latched_fault_code(FaultCode::EnableFailed));
+        let post_hw_fault = inner.current_observation().fault.expect("ENABLE_FAILED must remain preserved");
+        assert_eq!(post_hw_fault.code, FaultCode::EnableFailed);
+    }
+
+    // M-06: ThermalTrip during an in-flight RT enable cancels cleanly through the reducer,
+    // preserving ThermalTrip + EnableFailed and running protective disable.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.q = 0.35;
+                m.enabled = false;
+                m.drop_torque_frames = 10; // keep TorqueOn pending
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.tick(0.02);
+
+        let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(
+            inner,
+            BootId(88),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+        );
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            auth,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert!(fx.core.torque_transition_pending(), "enable must be in flight before thermal trip");
+
+        bus.clear_log();
+        fx.core.apply_stop_policy(StopPolicy::ThermalTrip);
+        assert!(
+            fx.core.safety.has_latched_fault_kind(armd::safety::FaultKind::ThermalTrip),
+            "ThermalTrip latch must be preserved"
+        );
+        assert!(
+            fx.core.safety.has_latched_fault_code(FaultCode::EnableFailed),
+            "M-06: ThermalTrip interrupting in-flight enable must record ENABLE_FAILED via reducer"
+        );
+        assert!(
+            spec_count_damiao_disables(&bus) >= 7,
+            "M-06: ThermalTrip protective disable frames must still be transmitted"
+        );
+    }
+
+    // M-08 + M-11: Feetech late 1-byte reply after timed-out read MUST NOT promote to OffConfirmed/OnConfirmed
+    // until a 0-byte PING barrier clears the FIFO; duplicate back-to-back 1-byte reply -> Unknown.
+    {
+        let clock = MockClock::new();
+        let mock = MockTransport::new().with_clock(clock.clone());
+        let mut drv = FeetechArmDriver::new(mock, vec![1])
+            .with_calibrated(true)
+            .with_tx_echo(Some(false));
+
+        // 1. Timeout on REG_TORQUE_ENABLE read arms `unmatched_1b_read[0] = true`.
+        let st1 = drv.refresh_enable_state().unwrap();
+        assert_eq!(st1, EnableState::Unknown);
+        let mut ev = [MotorTorqueEvidence::OnConfirmed; 1];
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::Unknown]);
+
+        // 2. Next refresh has ONLY a late 1-byte `0` reply queued (no 0-byte PING reply):
+        //    PING barrier MUST time out and reject the late 1-byte reply -> stays Unknown!
+        let ping_req = armd::protocol::feetech::build_ping(1);
+        let read_req = armd::protocol::feetech::build_read(1, armd::protocol::feetech::REG_TORQUE_ENABLE, 1);
+        let late_off = feetech_reg_u8_resp(1, 0);
+        drv.transport_mut().stage_reply(&ping_req, &late_off);
+        drv.transport_mut().stage_reply(&read_req, &late_off);
+        let st2 = drv.refresh_enable_state().unwrap();
+        assert_eq!(st2, EnableState::Unknown, "late 1-byte reply without PING barrier must stay Unknown");
+        drv.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::Unknown]);
+
+        // 3. Now stage late 1-byte `0` followed by 0-byte PING reply on PING, plus genuine `1` on
+        //    REG_TORQUE_ENABLE: PING barrier drains the late `0`, then readback confirms OnConfirmed!
+        let ping_cs = armd::protocol::feetech::calculate_checksum(1, 2, 0x00, &[]);
+        let ping_ok = [0xFF, 0xFF, 1, 2, 0x00, ping_cs];
+        let mut ping_with_late = late_off.clone();
+        ping_with_late.extend_from_slice(&ping_ok);
+        let mock2 = MockTransport::new().with_clock(clock.clone());
+        let mut drv2 = FeetechArmDriver::new(mock2, vec![1])
+            .with_calibrated(true)
+            .with_tx_echo(Some(false));
+        let _ = drv2.refresh_enable_state().unwrap(); // arm unmatched_1b_read[0]
+        drv2.transport_mut().stage_reply(&ping_req, &ping_with_late);
+        drv2.transport_mut().stage_reply(&read_req, &feetech_reg_u8_resp(1, 1));
+        let st3 = drv2.refresh_enable_state().unwrap();
+        assert_eq!(st3, EnableState::Enabled, "after PING FIFO barrier, genuine 1 confirms Enabled");
+        drv2.motor_torque_evidence_into(&mut ev);
+        assert_eq!(ev, [MotorTorqueEvidence::OnConfirmed]);
     }
 }

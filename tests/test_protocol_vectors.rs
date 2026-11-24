@@ -859,10 +859,12 @@ fn test_e2e_damiao_over_slcan_mock_serial() {
     let slcan = SlcanTransport::new(mock_serial);
     let mut arm = DamiaoArmDriver::new(slcan, vec![1]);
 
-    // Configure post-enable motor 1 feedback with state=1 (enabled)
+    // Configure post-enable motor 1 feedback with state=1 (enabled) for both CMD_ENABLE and
+    // the causal post-empty-queue 0x7FF 0xCC refresh probe.
     // Motor 1 feedback: CAN ID 0x11, DLC 8, data[0] = 0x11 (enabled, motor_id=1)
     // In SLCAN format: t01181100000000002823\r
     arm.can_mut().inner_mut().respond_to_write(b"t0018FFFFFFFFFFFFFFFC\r", b"t01181100000000002823\r");
+    arm.can_mut().inner_mut().respond_to_write(b"t7FF80100CC0000000000\r", b"t01181100000000002823\r");
 
     // Command arm torque
     arm.set_torque(true).unwrap();

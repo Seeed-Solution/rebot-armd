@@ -2065,6 +2065,13 @@ fn enable_transition_polling_and_clear_fault_probe_obey_release_margin_cap() {
     let mut rig = DualRig::new(Owner::Executor, base_cfg(), None);
     // Start from torque off (Idle) so we can exercise an enable handshake under late releases.
     rig.inner_mut().set_torque(false).expect("torque off before enable test");
+    for _ in 0..4 {
+        if !rig.inner().disable_pending {
+            break;
+        }
+        rig.step();
+    }
+    assert!(!rig.inner().disable_pending, "disable must confirm before late TorqueOn test");
     rig.bus.with(|s| {
         s.tx_step = ms(1);
         s.tx_spike_every = 0;

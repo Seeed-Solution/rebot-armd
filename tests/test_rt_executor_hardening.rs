@@ -148,6 +148,7 @@ impl CanTransport for FaultInjectBus {
         r
     }
     fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
     fn flush(&mut self) -> Result<(), TransportError> {
         self.flush_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.flush()
@@ -806,8 +807,8 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     fresh.read_joint_states().unwrap();
     assert_eq!(
         fresh.enable_state(),
-        EnableState::Disabled,
-        "state-0 feedback from every motor after startup confirms Disabled"
+        EnableState::Unknown,
+        "unsolicited startup state-0 feedback without verified disable must stay Unknown"
     );
 
     // On a frozen MockClock, pre-disable state-0 feedback must NOT satisfy enable_state() after begin_torque(false).
@@ -821,7 +822,11 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
         .with_joint_limits(dm_limits())
         .unwrap();
     frozen_drv.read_joint_states().unwrap();
-    assert_eq!(frozen_drv.enable_state(), EnableState::Disabled);
+    assert_eq!(
+        frozen_drv.enable_state(),
+        EnableState::Unknown,
+        "unsolicited startup 0x0 without a verified disable transaction must stay Unknown"
+    );
     let _ = frozen_drv.begin_torque(false).unwrap();
     assert_eq!(
         frozen_drv.enable_state(),
@@ -1670,10 +1675,11 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
     assert_eq!(drv.enable_state(), EnableState::Enabled);
     drv.set_mit_deadline_fence(Some(Duration::from_millis(500)), Duration::from_millis(200));
 
-    // Inject pre-disable state-0 feedback at the current frozen virtual timestamp, then stop
-    // immediate replies so `begin_torque(false)` gets zero post-command replies at the same `t`.
+    // Inject pre-disable state-0 feedback at the current frozen virtual timestamp, then drop TX
+    // replies (`tx_lost = true`) so `begin_torque(false)` gets zero post-command replies at `t`.
     bus.with(|s| {
         s.immediate_replies = false;
+        s.tx_lost = true;
         for m in &mut s.motors {
             m.enabled = false;
         }
@@ -1719,6 +1725,9 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
     // Now start disable again and provide genuine post-command state-0 feedback on the same
     // frozen timestamp: `rx_seq` advances past the command boundary, confirming disable and
     // releasing the MIT fence!
+    bus.with(|s| {
+        s.tx_lost = false;
+    });
     let _ = drv.begin_torque(false).unwrap();
     bus.with(|s| s.push_all_feedback());
     let p_ok = drv.poll_torque(clock.now() + Duration::from_millis(50)).unwrap();
@@ -1727,9 +1736,9 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
     drv.set_joint_modes(&[JointMode::Position; 7], &hold)
         .expect("confirmed post-command disable must release MIT fence");
 
-    // (b) Stale disabled feedback (virtual clock advances past 250 ms with silent CAN bus):
-    // `enable_state()` MUST become `Unknown` even with `!is_enabled`, and `shutdown_ready()`
-    // / `request_shutdown()` MUST refuse until current state-0 feedback returns!
+    // (b) Startup unsolicited 0x0 feedback stays Unknown until a verified disable transaction
+    // confirms OffConfirmed; once confirmed Disabled by a verified disable transaction,
+    // `shutdown_ready()` and `request_shutdown()` succeed.
     let clock2 = MockClock::new();
     let bus2 = FakeBus::with_clock(&dm_limits(), clock2.clone());
     bus2.with(|s| {
@@ -1740,28 +1749,25 @@ async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
         .with_joint_limits(dm_limits())
         .unwrap();
     drv2.read_joint_states().unwrap();
-    assert_eq!(drv2.enable_state(), EnableState::Disabled);
+    assert_eq!(
+        drv2.enable_state(),
+        EnableState::Unknown,
+        "startup unsolicited 0x0 must remain Unknown until a verified disable transaction"
+    );
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
     sup.set_lease_enabled(false).await;
-    assert!(sup.shutdown_ready().await, "current state-0 feedback confirms shutdown_ready");
-
-    // Advance virtual clock past 250 ms without any new CAN frames -> stale feedback -> Unknown!
-    clock2.advance(Duration::from_millis(300));
     assert!(
         !sup.shutdown_ready().await,
-        "stale disabled Damiao feedback (>250 ms) must make enable_state Unknown and refuse shutdown_ready"
+        "unsolicited startup 0x0 without verified disable must refuse shutdown_ready"
     );
-    assert!(
-        !sup.request_shutdown().await.unwrap(),
-        "request_shutdown must refuse stale disabled Damiao feedback"
-    );
-
-    // Fresh state-0 feedback restores Disabled and shutdown_ready!
-    bus2.with(|s| s.push_all_feedback());
+    // Verified disable transaction establishes causal OffConfirmed -> Disabled -> shutdown_ready.
     {
         let inner = sup.inner().read().await;
         let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
-        drv.read_joint_states().unwrap();
+        let _ = drv.begin_torque(false).unwrap();
+        bus2.with(|s| s.push_all_feedback());
+        let p = drv.poll_torque(clock2.now() + Duration::from_millis(50)).unwrap();
+        assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
         assert_eq!(drv.enable_state(), EnableState::Disabled);
     }
     assert!(sup.shutdown_ready().await);
@@ -2012,6 +2018,9 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
         }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
@@ -2516,7 +2525,10 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
             self.inner.transmit(frame)
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
-            match self.inner.receive() {
+            self.receive_timestamped().map(|(f, _)| f)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            match self.inner.receive_timestamped() {
                 Ok(f) => {
                     self.rx_dequeued.fetch_add(1, Ordering::SeqCst);
                     Ok(f)

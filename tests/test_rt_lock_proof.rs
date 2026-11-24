@@ -1059,6 +1059,10 @@ impl CanTransport for TracingBus {
         self.inner.receive()
     }
 
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+        self.inner.receive_timestamped()
+    }
+
     fn flush(&mut self) -> Result<(), TransportError> {
         self.inner.flush()
     }

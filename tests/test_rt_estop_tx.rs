@@ -34,7 +34,7 @@ struct Shared {
 /// (POS_VEL 0x100 + id, POS_FORCE 0x300 + id) and raises the E-stop request on its trigger.
 struct Bus {
     motors: Vec<(u16, DamiaoLimits, f32, bool)>,
-    rx: VecDeque<CanFrame>,
+    rx: VecDeque<(CanFrame, Option<std::time::Instant>)>,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -54,7 +54,7 @@ impl Bus {
         let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
         let data = [(u8::from(enabled) << 4) | (id as u8 & 0x0f), (p >> 8) as u8, p as u8, (v >> 4) as u8,
             (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8, t as u8, 30, 30];
-        self.rx.push_back(CanFrame::new_standard(0x10 + id, &data).unwrap());
+        self.rx.push_back((CanFrame::new_standard(0x10 + id, &data).unwrap(), Some(std::time::Instant::now())));
     }
 }
 
@@ -86,6 +86,10 @@ impl CanTransport for Bus {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
         let fire = self.shared.lock().unwrap().trigger == Trigger::OnReceive;
         if fire {
             self.shared.lock().unwrap().trigger = Trigger::Off;

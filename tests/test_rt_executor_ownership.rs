@@ -342,6 +342,11 @@ impl CanTransport for CountingBus {
         self.inner.receive()
     }
 
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+        self.rx_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.receive_timestamped()
+    }
+
     fn flush(&mut self) -> Result<(), TransportError> {
         if self.stall_flush.load(Ordering::Acquire) {
             if let Some(c) = &self.clock {
@@ -2313,6 +2318,7 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
         .with_joint_limits(dm_limits())
         .unwrap();
     drv_a.read_joint_states().unwrap();
+    drv_a.set_torque(false).unwrap();
     drv_a.check_mapping_ranges();
     let mut inner_a = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_a));
     inner_a.lease_enabled = false;

@@ -175,7 +175,9 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     let raised_fault = r_raised.fx.core.safety.fault().expect("ENABLE_FAILED fault expected");
     assert_eq!(raised_fault.code, armd::FaultCode::EnableFailed);
     assert!(!r_raised.fx.core.safety.recoverable(), "ENABLE_FAILED must be non-recoverable");
-    assert!(raised_fault.message.contains("J4:unk/held"), "missing per-joint status: {}", raised_fault.message);
+    assert!(raised_fault.message.contains("J4:unk/queued"), "missing initial per-joint status: {}", raised_fault.message);
+    let live_fault = r_raised.fx.core.current_observation().fault.expect("live observation fault expected");
+    assert!(live_fault.message.contains("J4:unk/held"), "missing live post-hold per-joint status: {}", live_fault.message);
 
     // 3. Rest pose with non-confirming motor: STILL NO automatic rollback (0 disables), enters
     //    FailedHold + non-recoverable `ENABLE_FAILED`; a later explicit TorqueOff at rest

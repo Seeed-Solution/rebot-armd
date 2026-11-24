@@ -64,6 +64,7 @@ struct Motor {
     id: u16,
     q: f32,
     enabled: bool,
+    fault_state: Option<u8>,
     limits: DamiaoLimits,
 }
 
@@ -73,7 +74,7 @@ impl Motor {
         let p = damiao::float_to_uint(self.q, l.p_min, l.p_max, 16);
         let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
         let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
-        let state = u8::from(self.enabled);
+        let state = self.fault_state.unwrap_or(u8::from(self.enabled));
         let data = [
             (state << 4) | (self.id as u8 & 0x0f),
             (p >> 8) as u8,
@@ -90,16 +91,17 @@ impl Motor {
 
 struct BusState {
     motors: [Motor; 7],
-    rx: VecDeque<CanFrame>,
+    rx: VecDeque<(CanFrame, Option<std::time::Instant>)>,
     clock: Arc<MockClock>,
     tx_would_block: bool,
     silent_disable: bool,
+    drop_enable_mask: u8,
 }
 
 impl BusState {
     fn push_all_feedback(&mut self) {
         for m in &self.motors {
-            self.rx.push_back(m.feedback_frame());
+            self.rx.push_back((m.feedback_frame(), None));
         }
     }
 }
@@ -119,6 +121,7 @@ impl ZeroAllocBus {
             id: (i + 1) as u16,
             q: 0.0,
             enabled: false,
+            fault_state: None,
             limits: limits[i],
         });
         Self(Arc::new(Mutex::new(BusState {
@@ -127,6 +130,7 @@ impl ZeroAllocBus {
             clock,
             tx_would_block: false,
             silent_disable: false,
+            drop_enable_mask: 0,
         })))
     }
 
@@ -147,35 +151,42 @@ impl CanTransport for ZeroAllocBus {
             return Err(TransportError::WouldBlock);
         }
         let silent_disable = s.silent_disable;
+        let drop_enable_mask = s.drop_enable_mask;
+        let now = s.clock.now();
         if frame.id == 0x7FF && frame.data[2] == 0xCC {
             let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             if let Some(f) = (!silent_disable)
                 .then(|| s.motors.iter().find(|m| m.id == id).map(Motor::feedback_frame))
                 .flatten()
             {
-                s.rx.push_back(f);
+                s.rx.push_back((f, Some(now)));
             }
             return Ok(());
         }
-        if let Some(m) = s.motors.iter_mut().find(|m| u32::from(m.id) == frame.id) {
+        if let Some((idx, m)) = s.motors.iter_mut().enumerate().find(|(_, m)| u32::from(m.id) == frame.id) {
             if frame.data == damiao::CMD_ENABLE {
-                m.enabled = true;
-                let f = m.feedback_frame();
-                s.rx.push_back(f);
+                if (drop_enable_mask & (1 << idx)) == 0 {
+                    m.enabled = true;
+                    let f = m.feedback_frame();
+                    s.rx.push_back((f, Some(now)));
+                }
             } else if frame.data == damiao::CMD_DISABLE && !silent_disable {
                 m.enabled = false;
                 let f = m.feedback_frame();
-                s.rx.push_back(f);
+                s.rx.push_back((f, Some(now)));
             }
             return Ok(());
         }
         if let Some(m) = s.motors.iter().find(|m| u32::from(m.id) + 0x100 == frame.id) {
             let f = m.feedback_frame();
-            s.rx.push_back(f);
+            s.rx.push_back((f, Some(now)));
         }
         Ok(())
     }
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
         self.0
             .lock()
             .unwrap()
@@ -490,4 +501,157 @@ fn stopped_torque_off_confirm_timeout_zero_alloc() {
         (0, 0),
         "confirmation timeout while already stopped must allocate 0"
     );
+}
+
+/// Review M-05 regression: RT enable failures (enable timeout AND motor hardware fault 0x0A)
+/// and subsequent `FailedHold` hold ticks (including repeated `check_hardware_status` while the
+/// motor fault persists) MUST perform strictly 0 heap allocations and 0 frees.
+#[test]
+fn rt_enable_failure_with_motor_fault_and_failed_hold_ticks_zero_alloc() {
+    let build_disarmed = |q_j2: f32| {
+        let clock = Arc::new(MockClock::new());
+        let bus = ZeroAllocBus::new(clock.clone());
+        let limits: Vec<DamiaoLimits> = ArmConfig::rebot_dm()
+            .damiao_ranges
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect();
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        bus.with(|s| {
+            s.motors[1].q = q_j2;
+            s.push_all_feedback();
+        });
+        drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.safety.set_off_thread_reclaim(true);
+        inner.tick(0.02);
+
+        let (mut fx, b, _tw, _stop) = ReleaseFixture::new(
+            inner,
+            BOOT,
+            Capacities { commands: 8, plans: 1, replies: 16 },
+        );
+        // Warm up steady-state observation triple-buffer slots before counting allocations.
+        for _ in 0..4 {
+            bus.with(|s| s.push_all_feedback());
+            fx.step();
+            clock.advance(RELEASE);
+        }
+        (fx, b, bus, clock)
+    };
+
+    // Case A: Enable timeout (J4 drops enable frames) -> FailedHold + ENABLE_FAILED + hold ticks: (0, 0).
+    {
+        let (mut fx, mut b, bus, clock) = build_disarmed(0.35);
+        bus.with(|s| {
+            s.drop_enable_mask = 1 << 3;
+            s.push_all_feedback();
+        });
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            auth,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+
+        let mut total_a = 0u64;
+        let mut total_f = 0u64;
+        let mut ended = None;
+        for _ in 0..25 {
+            bus.with(|s| s.push_all_feedback());
+            let (rep, a, f) = counted(|| fx.step());
+            total_a += a;
+            total_f += f;
+            clock.advance(RELEASE);
+            if let Some((_, o)) = rep.transition_ended {
+                ended = Some(o);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(Outcome::Failed("ENABLE_FAILED")));
+        assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert_eq!(fx.core.safety.fault().map(|f| f.code), Some(FaultCode::EnableFailed));
+        assert!(!fx.core.safety.recoverable());
+        assert_eq!((total_a, total_f), (0, 0), "RT enable timeout into FailedHold must allocate 0");
+
+        for _ in 0..5 {
+            bus.with(|s| s.push_all_feedback());
+            let (_, a, f) = counted(|| fx.step());
+            clock.advance(RELEASE);
+            assert_eq!((a, f), (0, 0), "FailedHold hold tick after enable timeout must allocate 0");
+        }
+    }
+
+    // Case B: Motor hardware fault (0x0A overcurrent on J3) during RT enable -> FailedHold +
+    // subsequent hold ticks with persistent 0x0A fault status: strictly (0, 0) allocs/frees!
+    // (Pre-warm observation triple-buffer `motor_errors` slots with the pre-existing motor fault
+    // before submitting `TorqueOn` so the allocator guard isolates the RT enable failure +
+    // `check_hardware_status` + `FailedHold` hold path.)
+    {
+        let (mut fx, mut b, bus, clock) = build_disarmed(0.35);
+        bus.with(|s| {
+            s.motors[2].fault_state = Some(0x0A);
+        });
+        for _ in 0..4 {
+            bus.with(|s| s.push_all_feedback());
+            fx.step();
+            clock.advance(RELEASE);
+        }
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            auth,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+
+        let mut total_a = 0u64;
+        let mut total_f = 0u64;
+        let mut ended = None;
+        for _ in 0..25 {
+            bus.with(|s| s.push_all_feedback());
+            let (rep, a, f) = counted(|| fx.step());
+            total_a += a;
+            total_f += f;
+            clock.advance(RELEASE);
+            if let Some((_, o)) = rep.transition_ended {
+                ended = Some(o);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(Outcome::Failed("ENABLE_FAILED")));
+        assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+        assert_eq!(fx.core.safety.fault().map(|f| f.code), Some(FaultCode::EnableFailed));
+        assert!(!fx.core.safety.recoverable());
+        assert_eq!(
+            (total_a, total_f),
+            (0, 0),
+            "RT motor-fault enable failure into FailedHold must allocate 0"
+        );
+
+        for _ in 0..5 {
+            bus.with(|s| s.push_all_feedback());
+            let (_, a, f) = counted(|| fx.step());
+            clock.advance(RELEASE);
+            assert_eq!(
+                (a, f),
+                (0, 0),
+                "FailedHold hold tick with persistent motor fault must allocate 0"
+            );
+        }
+    }
 }

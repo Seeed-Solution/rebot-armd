@@ -955,6 +955,9 @@ fn mode_handover_hold_backpressure_past_100ms_sends_no_stale_hold() {
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
         }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
         }
@@ -2392,6 +2395,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             Ok(())
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 
@@ -4019,6 +4023,7 @@ async fn calibration_close_at_raw_29_is_sent_as_raw_29() {
             Ok(())
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 

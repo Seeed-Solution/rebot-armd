@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use armd::api::{create_router_full, proxy::DetectorUpstream};
 use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
@@ -53,7 +53,7 @@ enum TxRule {
 struct VirtualBusState {
     motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>, // (id, limits, q, enabled, ctrl_mode)
     motor_faults: Vec<u8>, // non-zero overrides feedback state nibble (e.g. 0x0A overcurrent)
-    rx: VecDeque<CanFrame>,
+    rx: VecDeque<(CanFrame, Option<Instant>)>,
     tx_log: Vec<CanFrame>,
     tx_accepted: Vec<CanFrame>,
     tx_script: VecDeque<(TxRule, Duration)>,
@@ -124,12 +124,20 @@ impl VirtualBusState {
             30,
             30,
         ];
-        self.rx.push_back(CanFrame::new_standard(0x10 + id, &data).unwrap());
+        self.rx.push_back((CanFrame::new_standard(0x10 + id, &data).unwrap(), Some(self.clock.now())));
+    }
+
+    fn push_unsolicited_feedback(&mut self, i: usize) {
+        let before = self.rx.len();
+        self.push_feedback(i);
+        for slot in self.rx.range_mut(before..) {
+            slot.1 = None;
+        }
     }
 
     fn push_all_feedback(&mut self) {
         for i in 0..self.motors.len() {
-            self.push_feedback(i);
+            self.push_unsolicited_feedback(i);
         }
     }
 
@@ -156,7 +164,7 @@ impl VirtualBusState {
                             &[lo, hi, damiao::REG_READ, rid, val[0], val[1], val[2], val[3]],
                         )
                         .unwrap();
-                        self.rx.push_back(reply);
+                        self.rx.push_back((reply, Some(self.clock.now())));
                     }
                     damiao::REG_WRITE => {
                         let val = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
@@ -169,7 +177,7 @@ impl VirtualBusState {
                             &[lo, hi, damiao::REG_WRITE, rid, val[0], val[1], val[2], val[3]],
                         )
                         .unwrap();
-                        self.rx.push_back(reply);
+                        self.rx.push_back((reply, Some(self.clock.now())));
                     }
                     _ => {}
                 }
@@ -277,6 +285,10 @@ impl CanTransport for VirtualBus {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
         self.0
             .lock()
             .unwrap()
@@ -1980,10 +1992,12 @@ fn enable_and_retry_frames_obey_tx_budget_across_polls() {
         clock.advance(ms(1));
         match d.poll_torque(clock.now() + ms(5)).expect("poll_torque under max_frames=1") {
             armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed) => {
+                let sent = bus.with(|s| s.tx_log.clone());
                 assert!(
-                    bus.with(|s| s.tx_log.len()) <= 1,
+                    sent.len() <= 1,
                     "step {step} exceeded max_frames=1"
                 );
+                total_enables += sent.iter().filter(|f| f.data == damiao::CMD_ENABLE).count();
                 confirmed = true;
                 break;
             }
@@ -2331,8 +2345,10 @@ fn gravity_comp_recovery_rebuilds_mit_frame_fresh_and_refuses_stale() {
     assert!((wire_kd - 0.8).abs() < 0.05, "expected preserved kd ~0.8, got {wire_kd}");
     assert!((wire_t - 1.5).abs() < 0.05, "expected preserved torque ~1.5, got {wire_t}");
 
-    // Advance another 60 ms (feedback age = 110 ms > 100 ms freshness limit) with silent motors:
+    // Advance another 60 ms (feedback age = 110 ms > 100 ms freshness limit) with silent motors
+    // (drop the synchronous mock reply to the t = 50 ms recovery frame so the motor truly stayed silent):
     // recovery MUST fail closed and send ZERO MIT frames for J4.
+    bus.with(|s| s.rx.clear());
     clock.advance(ms(60));
     bus.clear();
     d.read_joint_states().unwrap();
@@ -2357,6 +2373,7 @@ fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pe
             .with_joint_limits(limits)
             .unwrap();
         driver.read_joint_states().unwrap();
+        driver.set_torque(false).unwrap();
         let cfg = ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() };
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
         inner.lease_enabled = false;
@@ -2513,6 +2530,7 @@ fn confirmed_handover_and_mit_fresh_status_obey_per_send_stop_gate_and_tx_budget
             r
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 
@@ -2797,6 +2815,7 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
             r
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
     }
 
@@ -2840,7 +2859,7 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
     }
     assert!(saw_enable_batch, "expected initial J7 CMD_ENABLE while J7 feedback is still fresh");
     // Drop the 0x307 feedback reply too if still sitting in RX so J7 stays aged from t=0.
-    vbus.with(|s| s.rx.retain(|f| f.id != 0x17));
+    vbus.with(|s| s.rx.retain(|(f, _)| f.id != 0x17));
     // Advance +76 ms (past the 75 ms retry point and past 100 ms J7 feedback age, still < 150 ms enable confirm).
     clock2.advance(ms(76));
     vbus.clear();
@@ -3644,6 +3663,7 @@ fn cutoff_elapsing_during_send_build_refuses_submission_without_transmitting() {
         fn clock(&self) -> Option<Arc<dyn DriverClock>> { Some(Arc::clone(&self.clock)) }
         fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> { self.inner.transmit(frame) }
         fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> { self.inner.receive_timestamped() }
         fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
         fn supports_bounded_flush(&self) -> bool { true }
         fn flush_is_noop(&self) -> bool { true }

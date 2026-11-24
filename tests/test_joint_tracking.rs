@@ -1708,6 +1708,15 @@ fn tracking_damiao_recovery_suspends_compensated_writes() {
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.0.lock().unwrap().rx_queue.pop_front().ok_or(TransportError::WouldBlock)
         }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.0
+                .lock()
+                .unwrap()
+                .rx_queue
+                .pop_front()
+                .map(|f| (f, Some(std::time::Instant::now())))
+                .ok_or(TransportError::WouldBlock)
+        }
         fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
     }
 
@@ -2028,6 +2037,9 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.inner.receive_timestamped()
         }
         fn flush(&mut self) -> Result<(), TransportError> {
             if self.fail_flush_after_mode_write && self.mode_write_seen {
@@ -2962,6 +2974,9 @@ fn damiao_recovery_tx_failure_not_recorded_as_sent() {
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.inner.receive()
         }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
         fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
         }
@@ -3057,6 +3072,15 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
         }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
             self.0.lock().unwrap().rx.pop_front().ok_or(TransportError::WouldBlock)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            self.0
+                .lock()
+                .unwrap()
+                .rx
+                .pop_front()
+                .map(|f| (f, Some(std::time::Instant::now())))
+                .ok_or(TransportError::WouldBlock)
         }
         fn flush(&mut self) -> Result<(), TransportError> {
             Ok(())

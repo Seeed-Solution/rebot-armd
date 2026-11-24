@@ -148,6 +148,10 @@ pub fn decode_mit(data: &[u8; 8], l: &DamiaoLimits) -> MotorCmd {
 pub struct FakeBusState {
     pub motors: Vec<FakeMotor>,
     pub rx: VecDeque<CanFrame>,
+    /// Per-entry optional arrival timestamps aligned with `rx`: `Some(ts)` ONLY for genuine
+    /// synchronous replies produced by `handle(frame)` when `immediate_replies == true`, and
+    /// `None` for every pre-seeded, injected, or asynchronous (`immediate_replies == false`) frame.
+    rx_timestamps: VecDeque<Option<Instant>>,
     /// Replies to transmitted frames: they reach `rx` only after the receive queue was observed
     /// empty once after the transmit (a reply never precedes its request on the wire).
     pub pending: VecDeque<CanFrame>,
@@ -374,6 +378,7 @@ impl FakeBus {
         Self(Arc::new(Mutex::new(FakeBusState {
             motors,
             rx: VecDeque::with_capacity(256),
+            rx_timestamps: VecDeque::with_capacity(256),
             pending: VecDeque::with_capacity(256),
             inject_on_next_tx: Vec::with_capacity(32),
             inject_on_reg_write: Vec::with_capacity(32),
@@ -465,6 +470,14 @@ impl CanTransport for FakeBus {
             state.rx.extend(state.inject_on_reg_write.drain(..));
         }
         if !s.tx_lost {
+            // Sync untimestamped metadata for any pre-seeded or injected frames ahead of this TX.
+            while s.rx_timestamps.len() < s.rx.len() {
+                s.rx_timestamps.push_back(None);
+            }
+            let rx_len = s.rx.len();
+            if s.rx_timestamps.len() > rx_len {
+                s.rx_timestamps.truncate(rx_len);
+            }
             let before = s.rx.len();
             s.handle(frame);
             if !s.immediate_replies && s.rx.len() > before {
@@ -473,11 +486,19 @@ impl CanTransport for FakeBus {
                 tmp.extend(s.rx.drain(before..));
                 for f in tmp.drain(..) { s.pending.push_back(f); }
                 s.scratch_frames = tmp;
+            } else if s.immediate_replies && s.rx.len() > before {
+                let reply_ts = s.now().unwrap_or_else(Instant::now);
+                for _ in before..s.rx.len() {
+                    s.rx_timestamps.push_back(Some(reply_ts));
+                }
             }
         }
         Ok(())
     }
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
         let mut s = self.0.lock().unwrap();
         s.run_watchdogs();
         if let Some(now) = s.now() {
@@ -496,14 +517,24 @@ impl CanTransport for FakeBus {
                 s.scratch_delayed = delayed;
             }
         }
+        while s.rx_timestamps.len() < s.rx.len() {
+            s.rx_timestamps.push_back(None);
+        }
+        let rx_len = s.rx.len();
+        if s.rx_timestamps.len() > rx_len {
+            s.rx_timestamps.truncate(rx_len);
+        }
         match s.rx.pop_front() {
             Some(f) => {
+                let ts = s.rx_timestamps.pop_front().flatten();
                 if let Some(c) = &s.clock { c.advance(s.rx_step); }
-                Ok(f)
+                Ok((f, ts))
             }
             None => {
+                s.rx_timestamps.clear();
                 while let Some(f) = s.pending.pop_front() {
                     s.rx.push_back(f);
+                    s.rx_timestamps.push_back(None);
                 }
                 Err(TransportError::WouldBlock)
             }

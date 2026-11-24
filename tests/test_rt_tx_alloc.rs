@@ -69,10 +69,10 @@ enum Mode {
 /// Pre-allocated Damiao CAN bus fake (zero allocations during `transmit` and `receive`).
 struct NoAllocDamiaoBus {
     motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>,
-    rx: VecDeque<CanFrame>,
+    rx: VecDeque<(CanFrame, Option<std::time::Instant>)>,
     /// Post-transmit replies promoted to `rx` once `rx` drains empty (models SocketCAN causality
     /// without heap allocation so post-write probe drains separate pre-probe from post-probe RX).
-    pending_rx: VecDeque<CanFrame>,
+    pending_rx: VecDeque<(CanFrame, Option<std::time::Instant>)>,
     clock: std::sync::Arc<MockClock>,
     mode: Mode,
     tx_count: usize,
@@ -123,20 +123,23 @@ impl NoAllocDamiaoBus {
     fn reply(&mut self, k: usize) {
         let frame = self.build_reply_frame(k);
         if self.rx.len() < self.rx.capacity() {
-            self.rx.push_back(frame);
+            self.rx.push_back((frame, Some(self.clock.now())));
         }
     }
 
     fn reply_pending(&mut self, k: usize) {
         let frame = self.build_reply_frame(k);
         if self.pending_rx.len() < self.pending_rx.capacity() {
-            self.pending_rx.push_back(frame);
+            self.pending_rx.push_back((frame, Some(self.clock.now())));
         }
     }
 
     fn push_all_feedback(&mut self) {
         for k in 0..self.motors.len() {
-            self.reply(k);
+            let frame = self.build_reply_frame(k);
+            if self.rx.len() < self.rx.capacity() {
+                self.rx.push_back((frame, None));
+            }
         }
     }
 }
@@ -186,13 +189,14 @@ impl CanTransport for NoAllocDamiaoBus {
                         };
                         let [lo, hi] = mid.to_le_bytes();
                         if self.rx.len() < self.rx.capacity() {
-                            self.rx.push_back(
+                            self.rx.push_back((
                                 CanFrame::new_standard(
                                     0x10 + mid,
                                     &[lo, hi, damiao::REG_READ, frame.data[3], val[0], val[1], val[2], val[3]],
                                 )
                                 .unwrap(),
-                            );
+                                Some(self.clock.now()),
+                            ));
                         }
                     }
                     damiao::REG_WRITE => {
@@ -202,13 +206,14 @@ impl CanTransport for NoAllocDamiaoBus {
                         }
                         let [lo, hi] = mid.to_le_bytes();
                         if self.rx.len() < self.rx.capacity() {
-                            self.rx.push_back(
+                            self.rx.push_back((
                                 CanFrame::new_standard(
                                     0x10 + mid,
                                     &[lo, hi, damiao::REG_WRITE, frame.data[3], val[0], val[1], val[2], val[3]],
                                 )
                                 .unwrap(),
-                            );
+                                Some(self.clock.now()),
+                            ));
                         }
                     }
                     _ => {}
@@ -232,6 +237,10 @@ impl CanTransport for NoAllocDamiaoBus {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        self.receive_timestamped().map(|(f, _)| f)
+    }
+
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
         match self.rx.pop_front() {
             Some(f) => Ok(f),
             None => {
@@ -790,7 +799,7 @@ fn budgeted_clear_fault_and_pre_enable_hold_errors_do_not_allocate_or_free() {
         &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, val[0], val[1], val[2], val[3]],
     )
     .unwrap();
-    d_pf.can_mut().rx.push_back(reply);
+    d_pf.can_mut().rx.push_back((reply, None));
     d_pf.can_mut().push_all_feedback();
     d_pf.set_tx_budget(TxBudget {
         max_frames: 0,
@@ -824,6 +833,9 @@ impl CanTransport for SharedNoAllocBus {
     }
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
         self.0.lock().unwrap().receive()
+    }
+    fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+        self.0.lock().unwrap().receive_timestamped()
     }
     fn flush(&mut self) -> Result<(), TransportError> {
         self.0.lock().unwrap().flush()

@@ -477,6 +477,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     bus.with(|s| { s.immediate_replies = true; s.push_all_feedback(); });
     let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(dm_limits()).unwrap();
     drv.read_joint_states().unwrap();
+    drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv));
     inner.lease_enabled = false;
@@ -1638,6 +1639,7 @@ fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
         .with_joint_limits(limits.clone())
         .unwrap();
     drv.read_joint_states().unwrap();
+    drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
 
     let mut jt = JointTrackingConfig::rebot_dm();
@@ -2006,6 +2008,12 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::TxQueueFull { .. } => "TxQueueFull",
             ArmDriverError::TorqueOffWouldDrop => "TorqueOffWouldDrop",
             ArmDriverError::DisableRequestExpired => "DisableRequestExpired",
+            ArmDriverError::RangeCheckUnverified => "RangeCheckUnverified",
+            ArmDriverError::RangeCheckMismatch => "RangeCheckMismatch",
+            ArmDriverError::RxDrainTimeout => "RxDrainTimeout",
+            ArmDriverError::EnableTimeout { .. } => "EnableTimeout",
+            ArmDriverError::MotorHardwareFault { .. } => "MotorHardwareFault",
+            ArmDriverError::DisableMitFenceUnconfirmed => "DisableMitFenceUnconfirmed",
         }
     }
 
@@ -2059,6 +2067,16 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         ArmDriverError::TxQueueFull { queued: 30, new: 7, capacity: 32 },
         ArmDriverError::TorqueOffWouldDrop,
         ArmDriverError::DisableRequestExpired,
+        ArmDriverError::RangeCheckUnverified,
+        ArmDriverError::RangeCheckMismatch,
+        ArmDriverError::RxDrainTimeout,
+        ArmDriverError::EnableTimeout {
+            feedback_valid: true,
+            statuses: [1, 1, 0, 1, 1, 1, 1, 0],
+            dof: 7,
+        },
+        ArmDriverError::MotorHardwareFault { joint: 2, motor_id: 3, status: 0x08 },
+        ArmDriverError::DisableMitFenceUnconfirmed,
     ];
     #[cfg(unix)]
     {
@@ -2263,6 +2281,7 @@ fn clear_check_runs_before_motor_reset_on_legacy_and_executor_paths() {
             .with_joint_limits(limits.clone())
             .unwrap();
         drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut cfg = ArmConfig::rebot_dm();
         cfg.max_temperature = 75.0;
@@ -2408,6 +2427,7 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
             .with_joint_limits(limits.clone())
             .unwrap();
         drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
 
         let mut jt = JointTrackingConfig::rebot_dm();
@@ -2545,6 +2565,7 @@ fn clear_evidence_stale_temp_resets_cooldown_expired_lease_clears_and_joint_limi
         .with_joint_limits(limits.clone())
         .unwrap();
     drv.read_joint_states().unwrap();
+    drv.set_torque(false).unwrap();
     drv.check_mapping_ranges();
     let mut cfg = ArmConfig::rebot_dm();
     cfg.max_temperature = 75.0;
@@ -2853,6 +2874,7 @@ fn thermal_cooldown_restarts_across_unobserved_stale_gap_without_tick() {
             .with_joint_limits(limits)
             .unwrap();
         drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
         let mut cfg = ArmConfig::rebot_dm();
         cfg.max_temperature = 75.0;
@@ -3184,6 +3206,7 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             .with_joint_limits(limits.clone())
             .unwrap();
         drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
         drv.check_mapping_ranges();
 
         let mut jt = JointTrackingConfig::rebot_dm();
