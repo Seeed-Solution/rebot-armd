@@ -284,9 +284,21 @@ pub struct ExecutorStats {
     pub last_clear_release_seq: AtomicU64,
     /// Release sequence (`TickSample::release_seq`) of the most recent injected test allocation on `armd-control`.
     pub last_inject_alloc_release_seq: AtomicU64,
+    /// Optional lock-free tick ring attached in legacy mode (`attach_legacy_loop_stats`) so
+    /// `run_periodic_with_clock` publishes each legacy sample once at release completion.
+    legacy_tick_ring: std::sync::OnceLock<Arc<crate::diagnostics::tick::LockFreeTickStats>>,
 }
 
 impl ExecutorStats {
+    /// Attaches the supervisor's [`LockFreeTickStats`] ring for legacy single-completion publication.
+    pub(crate) fn attach_legacy_tick_ring(&self, ring: Arc<crate::diagnostics::tick::LockFreeTickStats>) {
+        let _ = self.legacy_tick_ring.set(ring);
+    }
+
+    #[inline]
+    pub(crate) fn has_legacy_tick_ring(&self) -> bool {
+        self.legacy_tick_ring.get().is_some()
+    }
     /// Classifies raw wakeup lateness (`actual_release_start - scheduled_release`, ns), updates
     /// the cumulative `> 1 / 5 / 10 ms` counters atomically (zero allocation), and returns the
     /// saturating microsecond value for `TickSample::wake_lateness_us`.
@@ -796,6 +808,9 @@ pub struct PersistTestHooks {
     pub fail_init: Option<bool>,
     /// Injects a one-shot sleep inside the next release body (tests overrun + `skipped_releases`).
     pub release_delay_once: Option<Arc<Mutex<Option<Duration>>>>,
+    /// Injects a one-shot sleep strictly AFTER StateHub publication, `tick_us` end mark,
+    /// `UsageMark::now()`, and the first dispatcher wake (tests full `release_us` tail coverage).
+    pub post_publish_delay_once: Option<Arc<Mutex<Option<Duration>>>>,
     /// Optional deterministic clock for testing release cadence, skipped releases, and sub-release wakes.
     pub clock: Option<Arc<dyn ExecutorClock>>,
     /// Pauses `armd-persist` while `true` (tests persistence queue saturation).
@@ -2796,7 +2811,8 @@ impl Drop for WholeReleaseAllocGuard<'_> {
             if delta.total() > 0 {
                 self.stats.release_allocs.record(delta);
             }
-            self.stats.completed_releases.fetch_add(1, Ordering::Release);
+            // Note: `completed_releases` is Release-incremented at the single release-completion
+            // point after Window 2, diagnostic enqueue, tail probe, and overrun accounting.
         }
     }
 }
@@ -2951,10 +2967,10 @@ fn control_thread_main(
     let mut panicked = false;
 
     // Compile-time check: only `Copy` state crosses from Window 1 (whole release) into Window 2
-    // (sub-release wakes), ensuring zero uncounted destruction across the boundary.
+    // (sub-release wakes) and the single release-completion point, ensuring zero uncounted destruction.
     const _: () = {
         const fn assert_copy<T: Copy>() {}
-        assert_copy::<(super::ops::ReleaseReport, Instant, u64)>();
+        assert_copy::<(TickSample, Option<(super::ops::ReleaseReport, Instant, u64)>)>();
     };
 
     while !control_stop.load(Ordering::Acquire) {
@@ -2970,12 +2986,14 @@ fn control_thread_main(
         let actual_ns = now_ns_fn();
         let release_start = now_inst();
         let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
+        let wake_lateness_us;
+        let step_num;
 
         // ---- Window 1: Whole release (disjoint from sub-release wakes) ----
         let release_res = {
             // Declared FIRST -> drops LAST, after catch_unwind and ALL release locals drop!
             let _alloc_scope = WholeReleaseAllocGuard::enter(&stats, false);
-            let wake_lateness_us = stats.record_wake_lateness_ns(wake_lateness_ns);
+            wake_lateness_us = stats.record_wake_lateness_ns(wake_lateness_ns);
             let usage_start = UsageMark::now();
             let skipped = releases.advance(actual_ns);
             if skipped > 0 {
@@ -2987,7 +3005,7 @@ fn control_thread_main(
                 stats.last_late_us.store(elapsed.as_micros() as u64, Ordering::Relaxed);
                 stats.late.fetch_add(1, Ordering::Release);
             }
-            let step_num = stats.steps.fetch_add(1, Ordering::Relaxed) + 1;
+            step_num = stats.steps.fetch_add(1, Ordering::Relaxed) + 1;
             let dt = elapsed.as_secs_f64();
             let next_release_ns = releases.next_ns();
             let remaining_ns = next_release_ns.saturating_sub(now_ns_fn());
@@ -2995,7 +3013,7 @@ fn control_thread_main(
             publish_gen += 1;
 
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                || -> Option<(super::ops::ReleaseReport, Instant, u64)> {
+                || -> Option<(TickSample, Option<(super::ops::ReleaseReport, Instant, u64)>)> {
                     let _guard = ReleaseGuard::enter();
                     assert!(
                         tokio::runtime::Handle::try_current().is_err(),
@@ -3143,6 +3161,7 @@ fn control_thread_main(
 
                     let sample = TickSample {
                         tick_us: crate::diagnostics::tick::us(done.saturating_duration_since(release_start)),
+                        release_us: 0, // Stamped once at the single release-completion point.
                         wait_us: 0,
                         lock_us: crate::diagnostics::tick::us(done.saturating_duration_since(body_start)),
                         post_us: 0,
@@ -3180,26 +3199,29 @@ fn control_thread_main(
                         maint_req_id,
                         release_flags,
                     };
-                    if diag_tx.push(sample).is_err() {
-                        stats.diag_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // Wake dispatcher immediately after Window 1 publication/drain work (preserving
+                    // pre-Window-2 service latency for observations, acks, and safety logs).
                     hub.wake();
 
-                    // Positive-control tail probe (strictly AFTER `diag_tx.push` and `hub.wake()`);
-                    // `_tail_local` drops at release-scope exit BEFORE `_alloc_scope` drops.
-                    let _tail_local = state.run_tail_alloc_probe(&state.hooks.inject_release_tail_once);
                     let next_wake = report.poll.wake_before(release_deadline);
                     drop(_guard);
-                    next_wake.map(|_| (report, release_deadline, next_release_ns))
+                    Some((sample, next_wake.map(|_| (report, release_deadline, next_release_ns))))
                 },
             ))
         };
 
         // ---- Window 2: Disjoint sub-release transition wakes before `next_release_ns` ----
+        let mut wake_sleep_ns: u64 = 0;
+        let mut step_sample: Option<TickSample> = None;
         let step_res: Result<(), Box<dyn Any + Send>> = match release_res {
             Err(err) => Err(err),
             Ok(None) => Ok(()),
-            Ok(Some((mut report, release_deadline, next_release_ns))) => {
+            Ok(Some((sample, None))) => {
+                step_sample = Some(sample);
+                Ok(())
+            }
+            Ok(Some((sample, Some((mut report, release_deadline, next_release_ns))))) => {
+                step_sample = Some(sample);
                 let mut wakes = 0u32;
                 let mut next_wake = report.poll.wake_before(release_deadline);
                 let mut wake_err: Option<Box<dyn Any + Send>> = None;
@@ -3209,12 +3231,20 @@ fn control_thread_main(
                     }
                     let now = now_inst();
                     if wake > now {
-                        let wake_ns = now_ns_fn().saturating_add(
+                        let sleep_start = now_ns_fn();
+                        let wake_ns = sleep_start.saturating_add(
                             wake.saturating_duration_since(now)
                                 .as_nanos()
                                 .min(u128::from(u64::MAX)) as u64,
                         );
-                        sleep_until(wake_ns.min(next_release_ns));
+                        let target_wake_ns = wake_ns.min(next_release_ns);
+                        sleep_until(target_wake_ns);
+                        let sleep_end = now_ns_fn();
+                        // Subtract only intended scheduled wait; any OS wake jitter/overrun stays in `release_us`.
+                        let scheduled_wait = target_wake_ns
+                            .saturating_sub(sleep_start)
+                            .min(sleep_end.saturating_sub(sleep_start));
+                        wake_sleep_ns = wake_sleep_ns.saturating_add(scheduled_wait);
                     }
                     if control_stop.load(Ordering::Acquire) {
                         break;
@@ -3273,12 +3303,51 @@ fn control_thread_main(
             }
         };
 
+        // ---- Single release-completion point (covers Window 1 + Window 2 + post-publish tail) ----
+        let tail_alloc_start = crate::diagnostics::alloc::snapshot_counts();
+        if let Some(delay) = state
+            .hooks
+            .post_publish_delay_once
+            .as_ref()
+            .and_then(|d| d.lock().ok().and_then(|mut g| g.take()))
+        {
+            sleep_dur(delay);
+        }
+        let pre_diag_end_ns = now_ns_fn();
+        let pre_diag_release_ns = pre_diag_end_ns
+            .saturating_sub(actual_ns)
+            .saturating_sub(wake_sleep_ns);
+        if step_sample.is_some() || step_res.is_err() {
+            let mut sample = step_sample.unwrap_or(TickSample {
+                tick_us: crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns),
+                release_us: 0,
+                wake_lateness_us,
+                release_seq: step_num,
+                safety_epoch: core.safety.epoch_id(),
+                ..Default::default()
+            });
+            sample.release_us = crate::diagnostics::tick::ns_to_us_u32(pre_diag_release_ns);
+            if diag_tx.push(sample).is_err() {
+                stats.diag_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            hub.wake();
+        }
+        // Positive-control tail probe (strictly AFTER `diag_tx.push` and `hub.wake()`);
+        // `_tail_local` drops before `tail_alloc_delta` is recorded and `completed_releases` advances.
+        {
+            let _tail_local = state.run_tail_alloc_probe(&state.hooks.inject_release_tail_once);
+        }
         let release_end_ns = now_ns_fn();
         let overrun_skipped = releases.advance_overrun(release_end_ns);
         if overrun_skipped > 0 {
             stats.skipped_releases.fetch_add(overrun_skipped, Ordering::Relaxed);
         }
         last_release_end_ns = Some(release_end_ns);
+        let tail_alloc_delta = crate::diagnostics::alloc::snapshot_counts().delta_since(tail_alloc_start);
+        if tail_alloc_delta.total() > 0 {
+            stats.release_allocs.record(tail_alloc_delta);
+        }
+        stats.completed_releases.fetch_add(1, Ordering::Release);
 
         if let Err(err) = step_res {
             if let Some(end_ns) = last_release_end_ns.take() {
@@ -3564,17 +3633,29 @@ pub fn run_periodic_with_clock(
             stats.late.fetch_add(1, Ordering::Release);
         }
         stats.steps.fetch_add(1, Ordering::Relaxed);
-        let _lateness_guard = crate::diagnostics::tick::WakeLatenessGuard::enter(wake_lateness_ns);
+        let _lateness_guard = crate::diagnostics::tick::WakeLatenessGuard::enter_periodic(
+            wake_lateness_ns,
+            stats.has_legacy_tick_ring(),
+        );
         let _ = ACTIVE_PERIODIC_GRID.try_with(|c| c.set(Some((releases.next_ns, releases.period_ns))));
         struct PeriodicUnwindGridGuard<'a> {
             stats: &'a ExecutorStats,
             clock: Option<&'a dyn ExecutorClock>,
+            actual_ns: u64,
         }
         impl Drop for PeriodicUnwindGridGuard<'_> {
             fn drop(&mut self) {
                 if let Some((next_ns, period_ns)) = ACTIVE_PERIODIC_GRID.try_with(|c| c.take()).ok().flatten() {
                     if std::thread::panicking() {
                         let end_ns = self.clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
+                        if let Some(mut sample) = crate::diagnostics::tick::take_periodic_sample() {
+                            sample.release_us = crate::diagnostics::tick::ns_to_us_u32(
+                                end_ns.saturating_sub(self.actual_ns),
+                            );
+                            if let Some(ring) = self.stats.legacy_tick_ring.get() {
+                                let _ = ring.record(&sample);
+                            }
+                        }
                         let skipped = Releases { period_ns, next_ns }.missed_at_exit(end_ns);
                         if skipped > 0 {
                             self.stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
@@ -3583,10 +3664,21 @@ pub fn run_periodic_with_clock(
                 }
             }
         }
-        let _unwind_grid = PeriodicUnwindGridGuard { stats, clock };
+        let _unwind_grid = PeriodicUnwindGridGuard { stats, clock, actual_ns };
         step(elapsed.as_secs_f64());
         let _ = ACTIVE_PERIODIC_GRID.try_with(|c| c.take());
         drop(_unwind_grid);
+        // Single legacy release-completion point: stamp full `release_us` and publish the prepared
+        // sample once into `LockFreeTickStats` before measuring `end_ns` for overrun accounting.
+        if let Some(mut sample) = crate::diagnostics::tick::take_periodic_sample() {
+            let pre_pub_ns = now_ns();
+            sample.release_us = crate::diagnostics::tick::ns_to_us_u32(
+                pre_pub_ns.saturating_sub(actual_ns),
+            );
+            if let Some(ring) = stats.legacy_tick_ring.get() {
+                let _ = ring.record(&sample);
+            }
+        }
         let end_ns = now_ns();
         let overrun_skipped = releases.advance_overrun(end_ns);
         if overrun_skipped > 0 {

@@ -21,11 +21,17 @@ pub const WAKE_LATENESS_1MS_NS: u64 = 1_000_000;
 pub const WAKE_LATENESS_5MS_NS: u64 = 5_000_000;
 pub const WAKE_LATENESS_10MS_NS: u64 = 10_000_000;
 
+/// Converts nanoseconds to saturating microseconds (`u32`).
+#[inline]
+pub fn ns_to_us_u32(ns: u64) -> u32 {
+    (ns / 1_000).min(u64::from(u32::MAX)) as u32
+}
+
 /// Converts raw wakeup lateness (`actual_release_start - scheduled_release`, ns) to saturating
 /// microseconds and strict threshold flags (`> 1 ms`, `> 5 ms`, `> 10 ms` on raw nanoseconds).
 #[inline]
 pub fn classify_wake_lateness_ns(lateness_ns: u64) -> (u32, bool, bool, bool) {
-    let us = (lateness_ns / 1_000).min(u64::from(u32::MAX)) as u32;
+    let us = ns_to_us_u32(lateness_ns);
     (
         us,
         lateness_ns > WAKE_LATENESS_1MS_NS,
@@ -36,29 +42,50 @@ pub fn classify_wake_lateness_ns(lateness_ns: u64) -> (u32, bool, bool, bool) {
 
 thread_local! {
     static CURRENT_WAKE_LATENESS_NS: Cell<u64> = const { Cell::new(0) };
+    static PERIODIC_DEFER_SAMPLE_PUBLISH: Cell<bool> = const { Cell::new(false) };
+    static PENDING_PERIODIC_SAMPLE: Cell<Option<TickSample>> = const { Cell::new(None) };
 }
 
-/// Scoped thread-local handoff carrying raw wakeup lateness (ns) from `run_periodic` into
-/// `ArmSupervisor::tick_shared` on the same OS thread; restores the prior value on drop
-/// (including panic unwinds and early returns).
+/// Scoped thread-local handoff carrying raw wakeup lateness (ns) and periodic single-completion
+/// sample handoff between `run_periodic_with_clock` and `ArmSupervisor::tick_shared` on the same
+/// OS thread; restores the prior values on drop (including panic unwinds and early returns).
 pub struct WakeLatenessGuard {
-    prev: u64,
+    prev_lateness: u64,
+    prev_defer_publish: bool,
+    prev_pending_sample: Option<TickSample>,
 }
 
 impl WakeLatenessGuard {
     #[inline]
     pub fn enter(lateness_ns: u64) -> Self {
-        let prev = CURRENT_WAKE_LATENESS_NS
+        Self::enter_periodic(lateness_ns, false)
+    }
+
+    #[inline]
+    pub fn enter_periodic(lateness_ns: u64, defer_sample_publish: bool) -> Self {
+        let prev_lateness = CURRENT_WAKE_LATENESS_NS
             .try_with(|c| c.replace(lateness_ns))
             .unwrap_or(0);
-        Self { prev }
+        let prev_defer_publish = PERIODIC_DEFER_SAMPLE_PUBLISH
+            .try_with(|c| c.replace(defer_sample_publish))
+            .unwrap_or(false);
+        let prev_pending_sample = PENDING_PERIODIC_SAMPLE
+            .try_with(|c| c.replace(None))
+            .unwrap_or(None);
+        Self {
+            prev_lateness,
+            prev_defer_publish,
+            prev_pending_sample,
+        }
     }
 }
 
 impl Drop for WakeLatenessGuard {
     #[inline]
     fn drop(&mut self) {
-        let _ = CURRENT_WAKE_LATENESS_NS.try_with(|c| c.set(self.prev));
+        let _ = CURRENT_WAKE_LATENESS_NS.try_with(|c| c.set(self.prev_lateness));
+        let _ = PERIODIC_DEFER_SAMPLE_PUBLISH.try_with(|c| c.set(self.prev_defer_publish));
+        let _ = PENDING_PERIODIC_SAMPLE.try_with(|c| c.set(self.prev_pending_sample.take()));
     }
 }
 
@@ -68,6 +95,31 @@ pub fn take_current_wake_lateness_ns() -> u64 {
     CURRENT_WAKE_LATENESS_NS
         .try_with(|c| c.replace(0))
         .unwrap_or(0)
+}
+
+/// Returns `true` when the calling thread is inside a `run_periodic` release whose completion
+/// point owns publishing the completed `TickSample` with full `release_us`.
+#[inline]
+pub fn periodic_defers_sample_publish() -> bool {
+    PERIODIC_DEFER_SAMPLE_PUBLISH
+        .try_with(Cell::get)
+        .unwrap_or(false)
+}
+
+/// Stashes the calling thread's prepared legacy `TickSample` so `run_periodic_with_clock`
+/// stamps its full `release_us` and publishes it once at release completion.
+#[inline]
+pub fn stash_periodic_sample(sample: TickSample) {
+    let _ = PENDING_PERIODIC_SAMPLE.try_with(|c| c.set(Some(sample)));
+}
+
+/// Takes the calling thread's stashed legacy `TickSample` at periodic release completion.
+#[inline]
+pub fn take_periodic_sample() -> Option<TickSample> {
+    PENDING_PERIODIC_SAMPLE
+        .try_with(|c| c.take())
+        .ok()
+        .flatten()
 }
 
 /// Outcome of one CAN `transmit` attempt recorded in the tick's TX diagnostics.
@@ -319,11 +371,15 @@ pub const RELEASE_FLAG_INJECT_ALLOC: u32 = 1 << 4;
 pub const RELEASE_FLAG_THERMAL_TRIP: u32 = 1 << 5;
 pub const RELEASE_FLAG_WATCHDOG_LATCH: u32 = 1 << 6;
 
-/// One tick, µs. Serialized as the breakdown of `max_tick` / `max_lock`.
+/// One tick, µs. Serialized as the breakdown of `max_tick` / `max_release` / `max_lock`.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct TickSample {
-    /// Whole `ArmSupervisor::tick` call.
+    /// Whole `ArmSupervisor::tick` / executor body call (kept for backward compatibility).
     pub tick_us: u32,
+    /// Full release duration measured on the control thread from wake (right after lateness
+    /// sampling) through control, TX, usage collection, publication, dispatcher wake, cleanup,
+    /// and stats publication preparation, µs.
+    pub release_us: u32,
     /// Waiting for the supervisor write lock.
     pub wait_us: u32,
     /// Holding the supervisor write lock.
@@ -507,6 +563,8 @@ pub struct TickSnapshot {
     pub window: usize,
     /// Whole `ArmSupervisor::tick` call: lock wait, tick body and telemetry broadcast.
     pub tick_us: Percentiles,
+    /// Full release duration on the control thread from wake through all release work, µs.
+    pub release_us: Percentiles,
     /// Time the supervisor write lock was held by the tick.
     pub lock_us: Percentiles,
     /// Ticks since start whose `dt` exceeded two control periods.
@@ -544,8 +602,10 @@ pub struct TickSnapshot {
     pub writer_acquire_us: Percentiles,
     /// The tick's lock hold split into phases.
     pub lock_phases: LockPhasePercentiles,
-    /// The slowest tick in the window, all phases.
+    /// The slowest tick in the window (`tick_us`), all phases.
     pub max_tick: Option<TickBreakdown>,
+    /// The slowest full release in the window (`release_us`), all phases.
+    pub max_release: Option<TickBreakdown>,
     /// The tick with the longest lock hold in the window, all phases.
     pub max_lock: Option<TickBreakdown>,
     /// The tick with the largest summed CAN TX send wall time in the window.
@@ -799,6 +859,7 @@ struct AtomicTickSlot {
     /// 1-based monotonic sample sequence stored in this slot.
     sample_seq: AtomicU64,
     tick_us: AtomicU32,
+    release_us: AtomicU32,
     wait_us: AtomicU32,
     lock_us: AtomicU32,
     post_us: AtomicU32,
@@ -854,6 +915,7 @@ struct AtomicTickSlot {
 struct RawTickSlot {
     sample_seq: u64,
     tick_us: u32,
+    release_us: u32,
     wait_us: u32,
     lock_us: u32,
     post_us: u32,
@@ -879,6 +941,7 @@ impl AtomicTickSlot {
     fn store_relaxed(&self, sample_seq: u64, s: &TickSample) {
         self.sample_seq.store(sample_seq, Ordering::Relaxed);
         self.tick_us.store(s.tick_us, Ordering::Relaxed);
+        self.release_us.store(s.release_us, Ordering::Relaxed);
         self.wait_us.store(s.wait_us, Ordering::Relaxed);
         self.lock_us.store(s.lock_us, Ordering::Relaxed);
         self.post_us.store(s.post_us, Ordering::Relaxed);
@@ -932,6 +995,7 @@ impl AtomicTickSlot {
         RawTickSlot {
             sample_seq: self.sample_seq.load(Ordering::Relaxed),
             tick_us: self.tick_us.load(Ordering::Relaxed),
+            release_us: self.release_us.load(Ordering::Relaxed),
             wait_us: self.wait_us.load(Ordering::Relaxed),
             lock_us: self.lock_us.load(Ordering::Relaxed),
             post_us: self.post_us.load(Ordering::Relaxed),
@@ -995,6 +1059,7 @@ impl RawTickSlot {
             self.sample_seq,
             TickSample {
                 tick_us: self.tick_us,
+                release_us: self.release_us,
                 wait_us: self.wait_us,
                 lock_us: self.lock_us,
                 post_us: self.post_us,
@@ -1044,6 +1109,17 @@ pub struct LockFreeTickStats {
     reader_window_retries: AtomicU64,
     reader_lapped_snapshots: AtomicU64,
     writer_contention_drops: AtomicU64,
+}
+
+impl std::fmt::Debug for LockFreeTickStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockFreeTickStats")
+            .field("write_seq", &self.write_seq.load(Ordering::Relaxed))
+            .field("reader_retries", &self.reader_retries())
+            .field("reader_lapped_snapshots", &self.reader_lapped_snapshots())
+            .field("writer_contention_drops", &self.writer_contention_drops())
+            .finish()
+    }
 }
 
 impl Default for LockFreeTickStats {
@@ -1298,6 +1374,7 @@ impl TickWindow {
         TickSnapshot {
             window: self.rows.len(),
             tick_us: self.col(|r| r.tick_us),
+            release_us: self.col(|r| r.release_us),
             lock_us: self.col(|r| r.lock_us),
             late_count: self.late_count,
             since_boot_ticks: self.ticks,
@@ -1326,6 +1403,7 @@ impl TickWindow {
                 publish_us: self.col(|r| r.phases.publish_us),
             },
             max_tick: self.max_by(|r| r.tick_us),
+            max_release: self.max_by(|r| r.release_us),
             max_lock: self.max_by(|r| r.lock_us),
             max_tx: self.max_by(|r| r.usage.tx_send_us),
             tx: TxDiagnostics {
@@ -1530,6 +1608,7 @@ mod tests {
         for i in 1..=(TICK_WINDOW as u32 + 150) {
             let sample = TickSample {
                 tick_us: i * 3,
+                release_us: i * 3 + 50,
                 wait_us: if i % 25 == 0 { 400 } else { 0 },
                 lock_us: i * 2,
                 post_us: 15,

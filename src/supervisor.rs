@@ -4679,8 +4679,10 @@ impl ArmSupervisor {
     }
 
     /// Attaches the legacy periodic control loop's [`ExecutorStats`] so `GET /api/v1/diagnostics/tick`
-    /// reports `skipped_releases` and cumulative wake-lateness threshold counts in Legacy mode.
+    /// reports `skipped_releases`, monotonic release peaks/thresholds, and single-completion publication
+    /// into [`LockFreeTickStats`] in Legacy mode.
     pub fn attach_legacy_loop_stats(&self, stats: Arc<crate::rt_core::executor::ExecutorStats>) {
+        stats.attach_legacy_tick_ring(Arc::clone(&self.tick_stats));
         *self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats);
     }
 
@@ -5930,8 +5932,9 @@ impl ArmSupervisor {
                 released_before_lock_us: signed(locked, r.released),
             }
         };
-        let sample = crate::diagnostics::tick::TickSample {
+        let mut sample = crate::diagnostics::tick::TickSample {
             tick_us: us(done - started),
+            release_us: 0,
             wait_us: us(wait),
             lock_us: us(lock_held),
             post_us: us(done - released),
@@ -5961,7 +5964,14 @@ impl ArmSupervisor {
             maint_req_id: 0,
             release_flags: 0,
         };
-        let _ = self.tick_stats.record(&sample);
+        if crate::diagnostics::tick::periodic_defers_sample_publish() {
+            // Single-completion point in `run_periodic_with_clock` will stamp full `release_us`
+            // (covering wake through `block_on` return and stats publication) and record once.
+            crate::diagnostics::tick::stash_periodic_sample(sample);
+        } else {
+            sample.release_us = us(started.elapsed());
+            let _ = self.tick_stats.record(&sample);
+        }
         obs
     }
 
