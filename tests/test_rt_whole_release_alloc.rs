@@ -374,6 +374,21 @@ fn pause_hub(sup: &Arc<ArmSupervisor>) -> (mpsc::SyncSender<()>, thread::JoinHan
     (rel_tx, jh)
 }
 
+fn wait_for_dispatcher_blocked_on_hub(sup: &Arc<ArmSupervisor>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if sup.hub().latest_waiters() >= 1 {
+            return;
+        }
+        sup.hub().wake();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        sup.hub().latest_waiters() >= 1,
+        "timed out waiting for armd-dispatch to block on StateHub::latest() after {timeout:?}"
+    );
+}
+
 fn drain_broker(handle: &RtExecutorHandle) -> Vec<Reply> {
     let mut out = Vec::new();
     handle.broker().lock().unwrap().poll(|_, r| {
@@ -534,6 +549,10 @@ async fn positive_controls_detect_exact_ops_in_release_tail_saturated_diag_and_w
     // (b) Positive control WHILE `diag_tx` (cap 256) is saturated and dropping samples:
     // cumulative counters outside the droppable ring MUST still record exact counts!
     let (rel_hub, hub_jh) = pause_hub(&sup);
+    // Prime one clean release and wait until `armd-dispatch` has exited `drain_sinks()` and
+    // blocked on `hub.latest()`, so it cannot drain `diag_rx` partway through the burst.
+    clock.run_steps(period_ns, 1);
+    wait_for_dispatcher_blocked_on_hub(&sup, Duration::from_secs(5));
     clock.run_steps(period_ns, DIAG_RING_CAPACITY as u64 + 20);
     let dropped_before = handle.stats().diag_dropped.load(Ordering::Relaxed);
     assert!(dropped_before >= 10, "expected diag_dropped >= 10, got {dropped_before}");
