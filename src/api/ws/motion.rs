@@ -6,20 +6,70 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::dispatch::{
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
+    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+};
+
+pub(super) const ENTRIES: &[DispatchEntry] = &[
+    DispatchEntry {
+        key: DispatchKey::frame(FrameKind::Preset),
+        handler: DispatchHandler::Owner(dispatch_preset),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::PresetReply,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/motion/jog"),
+        handler: DispatchHandler::Owner(dispatch_motion_command),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/motion/home"),
+        handler: DispatchHandler::Owner(dispatch_motion_command),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/motion/unload"),
+        handler: DispatchHandler::Owner(dispatch_motion_command),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/mode/gravity_comp"),
+        handler: DispatchHandler::Owner(dispatch_motion_command),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+];
+
+fn dispatch_preset(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    Some(handle_preset(ctx.inner, ctx.stamp, ctx.value, ctx.epoch))
+}
+
+fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    let result = execute_command(ctx.inner, ctx.stamp, ctx.path, &ctx.value["body"], ctx.epoch);
+    Some(match result {
+        Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
+        Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+    })
+}
 
 // The caller holds the same write lock used to verify lease and epoch.
 pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervisor::AdmissionStamp, path: &str, body: &Value, epoch: u64) -> Result<Started, ApiError> {
     validate_command_body_common(body).map_err(invalid_command)?;
     match path {
-        "/api/v1/torque" | "/api/v1/arm" => {
-            return lease::execute_torque_command(inner, stamp, body);
-        }
-        "/api/v1/safety/clear_fault" => {
-            return lease::execute_clear_fault(inner, body, epoch);
-        }
-        "/api/v1/motion/servo" => {
-            return servo::execute_servo_command(inner, stamp, body, epoch);
-        }
         "/api/v1/motion/jog" => {
             let speed_scale = crate::motion::num(body, "speed_scale").map_err(ArmError::from)?;
             let target_positions = positions(body.get("target_positions"))?;

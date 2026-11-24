@@ -4,6 +4,113 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::dispatch::{
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
+    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+};
+
+pub(super) const ENTRIES: &[DispatchEntry] = &[
+    DispatchEntry {
+        key: DispatchKey::frame(FrameKind::Heartbeat),
+        handler: DispatchHandler::Owner(dispatch_heartbeat_inline),
+        admission: AdmissionClass::Heartbeat,
+        lease: LeaseRequirement::RequiredAllowZeroGeneration,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::SilentOrLossOrEpochSync,
+    },
+    DispatchEntry {
+        key: DispatchKey::frame(FrameKind::AcquireLease),
+        handler: DispatchHandler::Owner(dispatch_acquire_lease),
+        admission: AdmissionClass::OrdinarySession,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Conditional,
+        reply: ReplyPolicy::LeaseReply,
+    },
+    DispatchEntry {
+        key: DispatchKey::frame(FrameKind::ReleaseLease),
+        handler: DispatchHandler::Owner(dispatch_release_lease),
+        admission: AdmissionClass::OrdinarySession,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::LeaseReply,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/torque"),
+        handler: DispatchHandler::Owner(dispatch_torque),
+        admission: AdmissionClass::OrdinaryTorqueOrStopExempt,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/arm"),
+        handler: DispatchHandler::Owner(dispatch_torque),
+        admission: AdmissionClass::OrdinaryTorqueOrStopExempt,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/safety/clear_fault"),
+        handler: DispatchHandler::Owner(dispatch_clear_fault),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Conditional,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+];
+
+fn dispatch_acquire_lease(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    let (resp, evicted) = handle_acquire_lease(
+        ctx.inner,
+        ctx.value,
+        ctx.recv_conn_id,
+        ctx.recv_connection,
+        ctx.recv_generation,
+        ctx.recv_client_label,
+        ctx.worker_closing,
+        ctx.ws_auth,
+        ctx.last_sequence,
+    );
+    *ctx.evicted_notify = evicted;
+    resp
+}
+
+fn dispatch_release_lease(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    Some(handle_release_lease(
+        ctx.inner,
+        ctx.recv_connection,
+        ctx.local_generation,
+        ctx.recv_generation,
+        ctx.recv_client_label,
+    ))
+}
+
+fn dispatch_heartbeat_inline(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    handle_heartbeat_inline(ctx.inner, ctx.recv_connection, ctx.epoch)
+}
+
+fn dispatch_torque(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    let body = &ctx.value["body"];
+    let result = validate_command_body_common(body)
+        .map_err(invalid_command)
+        .and_then(|()| execute_torque_command(ctx.inner, ctx.stamp, body));
+    Some(match result {
+        Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
+        Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+    })
+}
+
+fn dispatch_clear_fault(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    let body = &ctx.value["body"];
+    let result = validate_command_body_common(body)
+        .map_err(invalid_command)
+        .and_then(|()| execute_clear_fault(ctx.inner, body, ctx.epoch));
+    Some(match result {
+        Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
+        Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+    })
+}
 
 /// Torque disable (`/api/v1/torque` or `/api/v1/arm` with `enable: false`) is a stop-direction
 /// action: an ordinary Stop must never cancel or drain it from the queue.

@@ -5,6 +5,72 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::dispatch::{
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
+    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+};
+
+pub(super) const ENTRIES: &[DispatchEntry] = &[
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/calibration/apply"),
+        handler: DispatchHandler::Owner(dispatch_calibration_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/calibration/restore"),
+        handler: DispatchHandler::Owner(dispatch_calibration_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::motor_zero::PATH),
+        handler: DispatchHandler::Owner(dispatch_calibration_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::motor_zero::RESTORE_PATH),
+        handler: DispatchHandler::Owner(dispatch_calibration_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::mit::TIMEOUT_PATH),
+        handler: DispatchHandler::Owner(dispatch_calibration_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::mit::QUALIFICATION_PATH),
+        handler: DispatchHandler::Owner(dispatch_calibration_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+];
+
+fn dispatch_calibration_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    dispatch_calibration_command(
+        ctx.inner,
+        ctx.path,
+        ctx.value,
+        ctx.local_generation,
+        ctx.epoch,
+        ctx.pending_calibration,
+    )
+}
 
 /// A calibration command checked under the lock.
 pub(super) enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value), MotorZero(crate::motor_zero::MotorZeroRequest), JointZeroRestore(String),
@@ -69,15 +135,6 @@ pub(super) fn calibration_reject(request_id: &Value, e: &crate::calibration::Cal
     let mut reply = json!({"type":"command_reject", "request_id":request_id});
     for (k, v) in e.reply_fields() { reply[k] = v; }
     reply
-}
-
-pub(super) fn is_calibration_path(path: &str) -> bool {
-    path == "/api/v1/calibration/apply"
-        || path == "/api/v1/calibration/restore"
-        || path == crate::motor_zero::PATH
-        || path == crate::motor_zero::RESTORE_PATH
-        || path == crate::mit::TIMEOUT_PATH
-        || path == crate::mit::QUALIFICATION_PATH
 }
 
 /// Dispatch a calibration command under the supervisor write lock.

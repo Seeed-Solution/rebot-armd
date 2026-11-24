@@ -4,17 +4,58 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::dispatch::{
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
+    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+};
+
+pub(super) const ENTRIES: &[DispatchEntry] = &[
+    DispatchEntry {
+        key: DispatchKey::frame(FrameKind::Servo),
+        handler: DispatchHandler::Owner(dispatch_servo_frame),
+        admission: AdmissionClass::OrdinaryServo,
+        lease: LeaseRequirement::RequiredExplicitGeneration,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::ServoRejectOnly,
+    },
+    DispatchEntry {
+        key: DispatchKey::frame(FrameKind::ImplicitServo),
+        handler: DispatchHandler::Owner(dispatch_servo_frame),
+        admission: AdmissionClass::OrdinaryServo,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::ServoRejectOnly,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/motion/servo"),
+        handler: DispatchHandler::Owner(dispatch_servo_command),
+        admission: AdmissionClass::OrdinaryServo,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+];
+
+fn dispatch_servo_frame(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    handle_servo_frame(ctx.inner, ctx.stamp, ctx.value, ctx.epoch, ctx.last_sequence)
+}
+
+fn dispatch_servo_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    let body = &ctx.value["body"];
+    let result = validate_command_body_common(body)
+        .map_err(invalid_command)
+        .and_then(|()| execute_servo_command(ctx.inner, ctx.stamp, body, ctx.epoch));
+    Some(match result {
+        Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
+        Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+    })
+}
 
 /// Explicit `type: "servo"` or `mode: "cartesian_joint_stream"` frames that require an explicit
 /// `generation` field before falling through to generic lease checks.
 pub(super) fn is_explicit_or_cartesian_servo(kind: &str, value: &Value) -> bool {
     kind == "servo"
         || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream")
-}
-
-/// Any frame matching explicit servo, `cartesian_joint_stream`, or implicit `positions` servo.
-pub(super) fn is_servo_frame(kind: &str, value: &Value) -> bool {
-    is_explicit_or_cartesian_servo(kind, value) || value.get("positions").is_some()
 }
 
 /// Pre-lease missing-generation check for explicit / cartesian-stream servo frames.

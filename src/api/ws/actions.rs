@@ -5,6 +5,260 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::dispatch::{
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, LeaseFreeCtx,
+    LeaseFreeOutcome, LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+};
+
+pub(super) const ENTRIES: &[DispatchEntry] = &[
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/move_to"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/move_relative"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/gripper"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/gripper_zero_check"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Conditional,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/grasp"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::RequiredExceptDryRun,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/place"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/replay"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/move_to_pose"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/run_sequence"),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Conditional,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::calib_hover::PATH),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::gripper_calib::CALIBRATE_PATH),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::measure_multiview::PATH),
+        handler: DispatchHandler::Owner(dispatch_action_entry),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+    DispatchEntry {
+        key: DispatchKey::command(crate::depth_measure::PATH),
+        handler: DispatchHandler::LeaseFree(dispatch_depth_measure),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/record/start"),
+        handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/record/stop"),
+        handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Conditional,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/episodes/update"),
+        handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/episodes/delete"),
+        handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/datasets/create"),
+        handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/datasets/delete"),
+        handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::None,
+        auth: AuthRequirement::Operator,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+];
+
+fn dispatch_action_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    dispatch_action_command(
+        ctx.inner,
+        ctx.stamp,
+        ctx.path,
+        ctx.value,
+        ctx.epoch,
+        ctx.local_generation,
+        ctx.ws_auth,
+        ctx.recv_supervisor,
+        ctx.recv_deps,
+        ctx.recv_calib,
+        ctx.action_pending,
+    )
+}
+
+fn dispatch_depth_measure(ctx: LeaseFreeCtx<'_>) -> LeaseFreeOutcome {
+    let request_id = ctx.value.get("request_id").and_then(Value::as_u64);
+    if request_id.is_none()
+        || ctx
+            .last_ordinary_request
+            .is_some_and(|last| request_id.unwrap() <= last)
+    {
+        return LeaseFreeOutcome::RejectImmediate(
+            json!({"type":"command_reject", "request_id":ctx.value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}),
+        );
+    }
+    *ctx.last_ordinary_request = request_id;
+    if let Some(error) =
+        lease_free_operator_check(ctx.ws_auth, crate::depth_measure::PATH, &ctx.value["body"])
+    {
+        return LeaseFreeOutcome::RejectWithEpoch {
+            error,
+            request_id: ctx.value["request_id"].clone(),
+        };
+    }
+    let (sup, source, tx) = (
+        ctx.recv_supervisor.clone(),
+        ctx.recv_deps.source.clone(),
+        ctx.ack_tx.clone(),
+    );
+    let value = ctx.value;
+    ctx.worker_tasks.spawn(async move {
+        let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
+        let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
+    });
+    LeaseFreeOutcome::Spawned
+}
+
+fn dispatch_teach_lease_free(ctx: LeaseFreeCtx<'_>) -> LeaseFreeOutcome {
+    let request_id = ctx.value.get("request_id").and_then(Value::as_u64);
+    if request_id.is_none()
+        || ctx
+            .last_ordinary_request
+            .is_some_and(|last| request_id.unwrap() <= last)
+    {
+        return LeaseFreeOutcome::RejectImmediate(
+            json!({"type":"command_reject", "request_id":ctx.value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}),
+        );
+    }
+    *ctx.last_ordinary_request = request_id;
+    if let Some(error) = lease_free_operator_check(
+        ctx.ws_auth,
+        ctx.value["path"].as_str().unwrap_or(""),
+        &ctx.value["body"],
+    ) {
+        return LeaseFreeOutcome::RejectWithEpoch {
+            error,
+            request_id: ctx.value["request_id"].clone(),
+        };
+    }
+    let caller_label = ctx
+        .recv_client_label
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let caller = crate::teach::Caller {
+        connection: ctx.recv_connection.to_string(),
+        client_id: ctx
+            .value
+            .get("client_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(caller_label),
+    };
+    let (sup, tx) = (ctx.recv_supervisor.clone(), ctx.ack_tx.clone());
+    let value = ctx.value;
+    ctx.worker_tasks.spawn(async move {
+        let path = value["path"].as_str().unwrap_or("").to_string();
+        let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
+        let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
+    });
+    LeaseFreeOutcome::Spawned
+}
 
 pub(super) enum ActionStart {
     Started(u64, f64),
@@ -17,10 +271,6 @@ pub(super) enum ActionStart {
     /// `gripper_calibrate` (epoch, tag): begun with the supervisor handle at the call site.
     GripperCalibrate(u64, Option<String>),
     MeasureMultiview(Box<crate::measure_multiview::Plan>),
-    #[cfg(feature = "policy-runtime")]
-    Policy(Box<PendingPolicyStart>),
-    #[cfg(feature = "policy-runtime")]
-    PolicyStopped(bool),
 }
 
 /// A Cartesian action waiting for its plan (computed outside the lock).
@@ -244,16 +494,6 @@ pub(super) fn prepare_action(
                 crate::measure_multiview::prepare(inner, body, epoch)?,
             )));
         }
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/start" => {
-            return Ok(ActionStart::Policy(Box::new(policy::prepare_policy_start(
-                inner, stamp, body, epoch,
-            )?)));
-        }
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/stop" => {
-            return Ok(ActionStart::PolicyStopped(policy::prepare_policy_stop(inner)));
-        }
         _ => return Err(invalid_command("Unknown action")),
     };
     let (mut spec, mut speed, tag) = parsed.map_err(ArmError::from)?;
@@ -366,7 +606,6 @@ pub(super) fn dispatch_action_command(
     recv_supervisor: &Arc<ArmSupervisor>,
     recv_deps: &crate::grasp::GraspDeps,
     recv_calib: &crate::calibration::CalibrationDeps,
-    #[cfg(feature = "policy-runtime")] pending_policy_loads: &AtomicUsize,
     pending: &mut ActionPending,
 ) -> Option<Value> {
     let (auth_snap, token_snap) = ws_auth.auth_and_token();
@@ -457,20 +696,6 @@ pub(super) fn dispatch_action_command(
                 Err(error) => command_reject(inner, &value["request_id"], error.into()),
             },
         ),
-        #[cfg(feature = "policy-runtime")]
-        Ok(ActionStart::Policy(p)) => {
-            inner.policy_loading = true;
-            let loading_guard = PolicyLoadingGuard::new(recv_supervisor.clone());
-            pending.policy = Some((value["request_id"].clone(), *p, local_generation, loading_guard));
-            None
-        }
-        #[cfg(feature = "policy-runtime")]
-        Ok(ActionStart::PolicyStopped(stopped)) => Some(policy::format_policy_stop_ack(
-            inner,
-            &value["request_id"],
-            stopped,
-            pending_policy_loads,
-        )),
         Err(error) => Some(command_reject(inner, &value["request_id"], error)),
     }
 }
@@ -927,95 +1152,4 @@ pub(super) async fn complete_dry_run_grasp(
         ack[k.as_str()] = v;
     }
     ack
-}
-
-/// Handle lease-free `/api/v1/grasp/measure` (depth measurement).
-/// Returns `false` if the outbound writer closed and the worker loop should break.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_depth_measure(
-    value: Value,
-    last_ordinary_request: &mut Option<u64>,
-    ws_auth: &WsAuth,
-    recv_supervisor: &Arc<ArmSupervisor>,
-    recv_deps: &crate::grasp::GraspDeps,
-    ack_tx: &mpsc::Sender<Value>,
-    worker_tasks: &ConnectionTasks,
-    worker_writer: &WsWriterHandle,
-) -> bool {
-    let request_id = value.get("request_id").and_then(Value::as_u64);
-    if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-        let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-        return worker_writer.send_ordinary_control(reply).await;
-    }
-    *last_ordinary_request = request_id;
-    if let Some(e) = lease_free_operator_check(ws_auth, crate::depth_measure::PATH, &value["body"]) {
-        let mut reply = rejection(
-            e,
-            "command_reject",
-            recv_supervisor.inner().read().await.safety.epoch_id(),
-        );
-        reply["request_id"] = value["request_id"].clone();
-        return worker_writer.send_ordinary_control(reply).await;
-    }
-    let (sup, source, tx) = (
-        recv_supervisor.clone(),
-        recv_deps.source.clone(),
-        ack_tx.clone(),
-    );
-    worker_tasks.spawn(async move {
-        let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
-        let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
-    });
-    true
-}
-
-/// Handle lease-free teach commands (`crate::teach::is_lease_free`).
-/// Returns `false` if the outbound writer closed and the worker loop should break.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_teach_lease_free(
-    value: Value,
-    last_ordinary_request: &mut Option<u64>,
-    ws_auth: &WsAuth,
-    recv_supervisor: &Arc<ArmSupervisor>,
-    recv_connection: &str,
-    recv_client_label: &Mutex<Option<String>>,
-    ack_tx: &mpsc::Sender<Value>,
-    worker_tasks: &ConnectionTasks,
-    worker_writer: &WsWriterHandle,
-) -> bool {
-    let request_id = value.get("request_id").and_then(Value::as_u64);
-    if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-        let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-        return worker_writer.send_ordinary_control(reply).await;
-    }
-    *last_ordinary_request = request_id;
-    if let Some(e) = lease_free_operator_check(
-        ws_auth,
-        value["path"].as_str().unwrap_or(""),
-        &value["body"],
-    ) {
-        let mut reply = rejection(
-            e,
-            "command_reject",
-            recv_supervisor.inner().read().await.safety.epoch_id(),
-        );
-        reply["request_id"] = value["request_id"].clone();
-        return worker_writer.send_ordinary_control(reply).await;
-    }
-    let caller_label = recv_client_label.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let caller = crate::teach::Caller {
-        connection: recv_connection.to_string(),
-        client_id: value
-            .get("client_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or(caller_label),
-    };
-    let (sup, tx) = (recv_supervisor.clone(), ack_tx.clone());
-    worker_tasks.spawn(async move {
-        let path = value["path"].as_str().unwrap_or("").to_string();
-        let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
-        let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
-    });
-    true
 }

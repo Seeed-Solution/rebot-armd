@@ -5,6 +5,80 @@
 
 #[allow(unused_imports)]
 use super::*;
+#[cfg(feature = "policy-runtime")]
+use super::dispatch::{
+    AdmissionClass, AuthRequirement, DispatchHandler, DispatchKey, LeaseRequirement,
+    OwnerDispatchCtx, ReplyPolicy,
+};
+use super::dispatch::DispatchEntry;
+
+#[cfg(feature = "policy-runtime")]
+pub(super) const ENTRIES: &[DispatchEntry] = &[
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/policy/start"),
+        handler: DispatchHandler::Owner(dispatch_policy_start),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::Conditional,
+        reply: ReplyPolicy::CommandDeferred,
+    },
+    DispatchEntry {
+        key: DispatchKey::command("/api/v1/action/policy/stop"),
+        handler: DispatchHandler::Owner(dispatch_policy_stop),
+        admission: AdmissionClass::Ordinary,
+        lease: LeaseRequirement::Required,
+        auth: AuthRequirement::None,
+        reply: ReplyPolicy::CommandImmediate,
+    },
+];
+
+#[cfg(not(feature = "policy-runtime"))]
+pub(super) const ENTRIES: &[DispatchEntry] = &[];
+
+#[cfg(feature = "policy-runtime")]
+fn dispatch_policy_start(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    let body = &ctx.value["body"];
+    if !body.is_object() {
+        return Some(command_reject(
+            ctx.inner,
+            &ctx.value["request_id"],
+            invalid_command("Command body must be an object"),
+        ));
+    }
+    match prepare_policy_start(ctx.inner, ctx.stamp, body, ctx.epoch) {
+        Ok(pending) => {
+            ctx.inner.policy_loading = true;
+            let loading_guard = PolicyLoadingGuard::new(ctx.recv_supervisor.clone());
+            ctx.action_pending.policy = Some((
+                ctx.value["request_id"].clone(),
+                pending,
+                ctx.local_generation,
+                loading_guard,
+            ));
+            None
+        }
+        Err(error) => Some(command_reject(ctx.inner, &ctx.value["request_id"], error)),
+    }
+}
+
+#[cfg(feature = "policy-runtime")]
+fn dispatch_policy_stop(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    let body = &ctx.value["body"];
+    if !body.is_object() {
+        return Some(command_reject(
+            ctx.inner,
+            &ctx.value["request_id"],
+            invalid_command("Command body must be an object"),
+        ));
+    }
+    let stopped = prepare_policy_stop(ctx.inner);
+    Some(format_policy_stop_ack(
+        ctx.inner,
+        &ctx.value["request_id"],
+        stopped,
+        ctx.pending_policy_loads,
+    ))
+}
 
 #[cfg(feature = "policy-runtime")]
 pub(super) struct PendingPolicyStart {

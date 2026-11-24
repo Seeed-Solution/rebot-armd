@@ -13,7 +13,51 @@
 
 #[allow(unused_imports)]
 use super::*;
+use super::dispatch::{
+    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey,
+    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+};
 use crate::rt_core::config_iface::{ConfigDomain, Durability};
+
+macro_rules! config_entry {
+    ($path:expr) => {
+        DispatchEntry {
+            key: DispatchKey::command($path),
+            handler: DispatchHandler::Owner(dispatch_config_entry),
+            admission: AdmissionClass::Ordinary,
+            lease: LeaseRequirement::Required,
+            auth: AuthRequirement::Operator,
+            reply: ReplyPolicy::CommandDeferred,
+        }
+    };
+}
+
+pub(super) const ENTRIES: &[DispatchEntry] = &[
+    config_entry!("/api/v1/workspace/keepout"),
+    config_entry!("/api/v1/safety/collision"),
+    config_entry!("/api/v1/gripper/calibration"),
+    config_entry!("/api/v1/poses/save"),
+    config_entry!("/api/v1/poses/delete"),
+    config_entry!("/api/v1/poses/rename"),
+    config_entry!("/api/v1/sequences/save"),
+    config_entry!("/api/v1/sequences/delete"),
+    config_entry!("/api/v1/grasp/setup"),
+    config_entry!("/api/v1/tool/commissioning/confirm"),
+];
+
+fn dispatch_config_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
+    try_dispatch_config_write(
+        ctx.inner,
+        ctx.path,
+        ctx.value,
+        ctx.recv_deps.setup_path.as_ref(),
+        ctx.ws_auth.is_enforced(),
+        ctx.local_generation,
+        ctx.epoch,
+        ctx.pending_config_write,
+    )
+    .expect("registered config path")
+}
 
 /// Atomic persist-before-commit config write (Step 1 prepared under lock, Step 2 staged to
 /// disk without lock under `config_write_lock`, Step 3 prechecked + published + committed under lock).
