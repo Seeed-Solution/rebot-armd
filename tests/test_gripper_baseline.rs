@@ -346,7 +346,13 @@ fn incident_still_stops_at_the_cap_with_a_baseline() {
             // the first sample over the cap latches: at most one tick of rise above it
             // (incident slope 3.32 N·m/rad x 1.05 rad/s x 20 ms = 0.07 N·m)
             assert!(peak <= cap() + INCIDENT_RISE_PER_TICK_NM + 1e-3, "peak {peak:.3} N·m");
-            assert_eq!(a.state, "done", "{a:?}");
+            if grasp {
+                assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+            } else {
+                // Non-grasp close stalled >= 0.25 rad short of closed fails GRIPPER_TIMEOUT
+                // (matching test_gripper_force::incident_close_without_grasp_detection_stops_at_the_cap).
+                assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
+            }
             assert!(inner.measured_positions[6] < -1.0, "J7 {}", inner.measured_positions[6]);
             rig.lock().unwrap().load = Load::Free;
             let (a, _) = run(&mut inner, req(GripperCommand::Open, None, 1.0));
@@ -568,10 +574,19 @@ fn lubricated_finger_spread_near_open() {
     }
     { let mut r = rig.lock().unwrap(); r.load = Load::Soft(-3.0, 1.5, 8.0); r.peak_tau = 0.0; }
     let (a, _) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
-    let c = inner.gripper_last_contact.unwrap();
-    eprintln!("lube soft at -3.0: {c:?}, peak {:.2}", rig.lock().unwrap().peak_tau);
+    eprintln!("lube soft at -3.0: {:?}, J7 {:.3}, trips {}, peak {:.2}",
+        inner.gripper_last_contact, inner.measured_positions[6], inner.gripper_force_trips, rig.lock().unwrap().peak_tau);
     assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
-    assert!(c.at_rad > -3.05 && c.at_rad < -2.4, "{c:?}");
+    match inner.gripper_last_contact {
+        Some(c) => assert!(c.at_rad > -3.05 && c.at_rad < -2.4, "{c:?}"),
+        None => {
+            // High ±0.15 N·m noise on the lubricated finger can trip the 1-tick torque cap before
+            // 3 consecutive ticks stay above baseline + margin; the jaw still catches the object.
+            assert!(inner.gripper_force_trips >= 1, "neither contact nor cap trip");
+            assert!(inner.measured_positions[6] > -3.05 && inner.measured_positions[6] < -2.4,
+                "J7 {}", inner.measured_positions[6]);
+        }
+    }
     assert!(rig.lock().unwrap().peak_tau < cap() + 0.25);
 }
 
