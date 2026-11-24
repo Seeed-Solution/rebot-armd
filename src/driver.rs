@@ -3373,27 +3373,6 @@ impl PendingTxQueue {
             .any(|slot| slot.is_some_and(|e| e.joint == joint))
     }
 
-    /// Drop every queued entry targeting `joint`, compacting in place.
-    fn drop_joint(&mut self, joint: usize) -> usize {
-        let mut write = 0usize;
-        let mut dropped = 0usize;
-        for read in 0..self.len {
-            if let Some(entry) = self.buf[read] {
-                if entry.joint == joint {
-                    dropped += 1;
-                } else {
-                    self.buf[write] = Some(entry);
-                    write += 1;
-                }
-            }
-        }
-        for slot in &mut self.buf[write..self.len] {
-            *slot = None;
-        }
-        self.len = write;
-        dropped
-    }
-
     /// Replace an existing `(joint, frame_id)` slot in place without moving it to the back
     /// (preserving oldest-first carry-over FIFO order and its original `queued_at` under the same
     /// `stop_stamp` so carry-over frames always drain first with the latest target value and
@@ -3998,11 +3977,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if let TxKind::RollbackHold(joint) = kind {
             if latched_before && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
-                if self.active_pos_force_joint() == Some(joint) {
-                    if self.pf_last_fresh_position.is_none() {
-                        return Err(TxRefusal::PosForceFeedbackExpired(joint));
-                    }
-                } else {
+                if self.active_pos_force_joint() != Some(joint) {
                     return Err(TxRefusal::BuildRefused);
                 }
             }
@@ -4409,43 +4384,59 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         (frame.id == expected_id).then_some(pf.joint)
     }
 
-    /// Build the Damiao `0x307` position-force FREEZE frame at the last provably fresh
-    /// measured J7 position with `vel_raw = 0` and the configured current cap `pf.current_raw`.
-    /// Returns `None` if joint `i` is not the configured `PosForce` joint or no fresh J7
-    /// measured position has ever been observed.
+    /// Build the Damiao `0x307` position-force FREEZE frame for joint `i`:
+    /// - When at least one provably fresh (`<= 100 ms` at decode time) J7 sample has been observed
+    ///   since boot (`pf_last_fresh_position == Some(pos)`): holds `pos` with `vel_raw = 0` and
+    ///   the configured current cap `pf.current_raw`.
+    /// - When NO provably fresh J7 sample has ever been observed since boot
+    ///   (`pf_last_fresh_position == None`): emits the safest defined zero-motion, zero-force
+    ///   command (`position = last commanded 0x307 position or 0.0`, `vel_raw = 0`, `i_des = 0`).
+    /// Returns `None` only if joint `i` is not the configured `PosForce` joint.
     fn pos_force_freeze_frame(&self, i: usize) -> Option<CanFrame> {
         let pf = self.pos_force.as_ref().filter(|pf| pf.joint == i)?;
-        let pos = self.pf_last_fresh_position.filter(|p| p.is_finite())?;
-        Some(damiao::build_pos_force_frame(
-            damiao::POS_FORCE_BASE_ID,
-            self.motor_ids[i],
-            pos,
-            0,
-            pf.current_raw,
-        ))
+        let motor_id = *self.motor_ids.get(i)?;
+        match self.pf_last_fresh_position.filter(|p| p.is_finite()) {
+            Some(pos) => Some(damiao::build_pos_force_frame(
+                damiao::POS_FORCE_BASE_ID,
+                motor_id,
+                pos,
+                0,
+                pf.current_raw,
+            )),
+            None => {
+                let expected_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(motor_id);
+                let last_cmd_pos = self
+                    .last_target_frames
+                    .get(i)
+                    .and_then(|f| f.as_ref())
+                    .filter(|f| f.id == expected_id && f.dlc == 8)
+                    .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
+                    .filter(|p| p.is_finite())
+                    .unwrap_or(0.0);
+                Some(damiao::build_pos_force_frame(
+                    damiao::POS_FORCE_BASE_ID,
+                    motor_id,
+                    last_cmd_pos,
+                    0,
+                    0,
+                ))
+            }
+        }
     }
 
-    /// True iff `frame` is the exact bit-for-bit `0x307` FREEZE frame for the configured
-    /// `PosForce` joint (`position == pf_last_fresh_position`, `vel_raw == 0`,
-    /// `i_des == pf.current_raw`). Guarantees stale moving targets (`vel_raw != 0` or any new
-    /// target position) can never bypass `send()`'s freshness check while freeze frames always
-    /// reach the wire.
+    /// True iff `frame` is the exact bit-for-bit `0x307` FREEZE frame produced by
+    /// [`Self::pos_force_freeze_frame`] for the configured `PosForce` joint (either the
+    /// last-fresh-position freeze with `vel_raw == 0, i_des == pf.current_raw`, or the
+    /// no-fresh-sample-since-boot zero-velocity, zero-current fallback `vel_raw == 0, i_des == 0`).
+    /// Guarantees stale moving targets (`vel_raw != 0` or any new target position) can never
+    /// bypass `send()`'s freshness check while freeze frames always reach the wire.
     fn is_pos_force_freeze_frame(&self, frame: &CanFrame) -> bool {
         let Some(pf) = self.pos_force.as_ref() else {
             return false;
         };
-        let Some(&motor_id) = self.motor_ids.get(pf.joint) else {
-            return false;
-        };
-        let Some(last_pos) = self.pf_last_fresh_position.filter(|p| p.is_finite()) else {
-            return false;
-        };
-        let expected_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(motor_id);
-        frame.id == expected_id
-            && frame.dlc == 8
-            && frame.data[0..4] == last_pos.to_le_bytes()
-            && frame.data[4..6] == [0, 0]
-            && u16::from_le_bytes([frame.data[6], frame.data[7]]) == pf.current_raw
+        self.pos_force_freeze_frame(pf.joint).is_some_and(|expected| {
+            frame.id == expected.id && frame.dlc == expected.dlc && frame.data == expected.data
+        })
     }
 
     /// Single shared position-force frame builder used by BOTH the motion path
@@ -4633,11 +4624,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.pf_refresh_deferred_ticks = 0;
             return None;
         }
-        if self.pf_last_fresh_position.is_some() {
-            let _ = self.pending_tx.convert_pos_force_to_freeze(pf_joint, now);
-        } else {
-            let _ = self.pending_tx.drop_joint(pf_joint);
-        }
+        let _ = self.pending_tx.convert_pos_force_to_freeze(pf_joint, now);
         let age = self.pos_force_stale_age(pf_joint, now);
         self.last_tx_pf_status = PosForceTxStatus::Stale {
             joint: pf_joint,
@@ -5755,9 +5742,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::PosForceFeedbackExpired(_)) => {
                     let _ = self.check_pos_force_freshness_for_tx();
-                    if self.pf_last_fresh_position.is_some()
-                        && freeze_retried != Some((entry.joint, entry.frame_id))
-                    {
+                    if freeze_retried != Some((entry.joint, entry.frame_id)) {
                         freeze_retried = Some((entry.joint, entry.frame_id));
                         continue;
                     }
@@ -5798,9 +5783,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         && !self.pos_force_feedback_valid(entry.joint, self.now())
                     {
                         let _ = self.check_pos_force_freshness_for_tx();
-                        if self.pf_last_fresh_position.is_some()
-                            && freeze_retried != Some((entry.joint, entry.frame_id))
-                        {
+                        if freeze_retried != Some((entry.joint, entry.frame_id)) {
                             freeze_retried = Some((entry.joint, entry.frame_id));
                             continue;
                         }
@@ -8721,7 +8704,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let start_stamp = self.current_stop_stamp();
         let _ = self.drop_stopped_hold_tx(start_stamp);
         let cleanup_now = self.now();
-        let stale_pf_joint = self.check_pos_force_freshness_for_tx_at(cleanup_now);
+        let _ = self.check_pos_force_freshness_for_tx_at(cleanup_now);
         // Drop stale carried-over holds without resetting `hold_cursor`, then still stage fresh
         // holds so a slow cadence (e.g. 90–100 ms) rotates across all frame keys instead of stalling.
         let (pre_dropped_stale, mut oldest_expired) =
@@ -8739,9 +8722,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut new_keys = 0usize;
         let mut due_mask: u64 = 0;
         for (i, target) in targets.iter().enumerate() {
-            if stale_pf_joint == Some(i) && self.pf_last_fresh_position.is_none() {
-                continue;
-            }
             let cmds = match self.pending_target_cmds_checked(i, target) {
                 Ok(v) => v,
                 Err(e) => {
@@ -8813,11 +8793,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 && !self.pos_force_feedback_valid(i, self.now())
             {
                 let _ = self.check_pos_force_freshness_for_tx();
-                if self.pf_last_fresh_position.is_none() {
-                    let _ = self.pending_hold_tx.pop_front();
-                    freeze_retried_key = None;
-                    continue;
-                }
             }
             let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
             let PendingTargetCmd::RollbackHold { kp, kd, torque, slot } = entry.cmd else {
@@ -8879,9 +8854,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::PosForceFeedbackExpired(_)) => {
                     let _ = self.check_pos_force_freshness_for_tx();
-                    if self.pf_last_fresh_position.is_some()
-                        && freeze_retried_key != Some((i, frame_id))
-                    {
+                    if freeze_retried_key != Some((i, frame_id)) {
                         freeze_retried_key = Some((i, frame_id));
                         continue;
                     }
@@ -9391,11 +9364,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut new_keys = 0usize;
         for (i, target) in targets.iter().enumerate() {
             if stale_pf_joint == Some(i) {
-                if self.pf_last_fresh_position.is_some() {
-                    let frame_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(self.motor_ids[i]);
-                    if self.pending_tx.find_key(i, frame_id).is_none() {
-                        new_keys += 1;
-                    }
+                let frame_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(self.motor_ids[i]);
+                if self.pending_tx.find_key(i, frame_id).is_none() {
+                    new_keys += 1;
                 }
                 continue;
             }
@@ -9428,17 +9399,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let batch_ts = self.now();
         for (i, target) in targets.iter().enumerate() {
             if stale_pf_joint == Some(i) {
-                if self.pf_last_fresh_position.is_some() {
-                    let frame_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(self.motor_ids[i]);
-                    let ok = self.pending_tx.upsert(
-                        i,
-                        frame_id,
-                        PendingTargetCmd::PosForceFreeze,
-                        batch_ts,
-                        batch_stamp,
-                    );
-                    debug_assert!(ok, "preflight checked pending queue capacity");
-                }
+                let frame_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(self.motor_ids[i]);
+                let ok = self.pending_tx.upsert(
+                    i,
+                    frame_id,
+                    PendingTargetCmd::PosForceFreeze,
+                    batch_ts,
+                    batch_stamp,
+                );
+                debug_assert!(ok, "preflight checked pending queue capacity");
                 continue;
             }
             let cmds = match self.pending_target_cmds_checked(i, target) {
@@ -9659,11 +9628,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     } else {
                         None
                     };
-                    if feedback.position.is_finite()
-                        && queue_bound.is_some_and(|qb| {
-                            rx_at.saturating_duration_since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE
-                        })
-                    {
+                    // Use the EXACT SAME freshness predicate as live checks at `decode_now`:
+                    // BOTH `decode_now - rx_at <= 100 ms` AND `decode_now - queue_bound <= 100 ms`
+                    // AND finite position must hold, so a frame that sat > 100 ms in the RX queue
+                    // (even with an earlier `rx_timestamp` close to `queue_bound`) can NEVER
+                    // overwrite `pf_last_fresh_position`.
+                    if self.pos_force_feedback_valid(idx, decode_now) {
                         self.pf_last_fresh_position = Some(feedback.position);
                         self.pf_fresh_gen = self.pf_fresh_gen.wrapping_add(1);
                     }
@@ -10813,5 +10783,67 @@ mod tx_chokepoint_tests {
         });
         assert!(res.is_ok(), "Disable must remain ungated across build-time stop flip: {res:?}");
         assert_eq!(bus.tx_len(), 1);
+    }
+
+    #[test]
+    fn pos_force_boot_fallback_with_no_fresh_sample_emits_zero_vel_zero_current() {
+        let limits = damiao::DamiaoLimits::default();
+        let (bus, _clock) = TestBus::new();
+        let pf = GripperPosForce {
+            joint: 0,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        };
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![7])
+            .with_limits(limits)
+            .with_gripper_pos_force(pf)
+            .unwrap();
+        // Simulate verified PosForce mode with NO provably fresh J7 sample ever decoded since boot.
+        drv.pos_force_verified = true;
+        drv.joint_modes[0] = Some(DamiaoControlMode::PosForce);
+        drv.pf_last_fresh_position = None;
+        drv.is_enabled = true;
+
+        // 1. No prior target ever commanded -> emits 0x307 with pos=0.0, vel_raw=0, i_des=0.
+        let frame0 = drv
+            .pos_force_frame_or_freeze_at(0, None, drv.now())
+            .expect("boot fallback frame");
+        assert_eq!(frame0.id, 0x307);
+        assert_eq!(f32::from_le_bytes(frame0.data[0..4].try_into().unwrap()), 0.0);
+        assert_eq!(u16::from_le_bytes([frame0.data[4], frame0.data[5]]), 0);
+        assert_eq!(u16::from_le_bytes([frame0.data[6], frame0.data[7]]), 0);
+        assert!(drv.is_pos_force_freeze_frame(&frame0));
+
+        // 2. Prior commanded target exists (-1.25 rad) -> holds -1.25 with vel_raw=0, i_des=0 (zero force).
+        drv.last_target_frames[0] = Some(damiao::build_pos_force_frame(
+            damiao::POS_FORCE_BASE_ID,
+            7,
+            -1.25,
+            30,
+            460,
+        ));
+        bus.clear_tx();
+        drv.begin_tx_tick();
+        let targets = [JointTarget::position(0.0)];
+        let outcome = drv.write_estop_hold_bounded(&targets).expect("boot fallback hold");
+        assert_eq!(outcome, TxBatchOutcome::Complete);
+        let log: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
+        let j7_frames: Vec<CanFrame> = log.iter().copied().filter(|f| f.id == 0x307).collect();
+        assert_eq!(j7_frames.len(), 1, "expected 1 boot-fallback 0x307 frame: {log:?}");
+        assert!(
+            log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+            "expected 0xCC refresh alongside boot fallback: {log:?}"
+        );
+        let sent = j7_frames[0];
+        assert_eq!(sent.id, 0x307);
+        assert!((f32::from_le_bytes(sent.data[0..4].try_into().unwrap()) - (-1.25)).abs() < 1e-6);
+        assert_eq!(u16::from_le_bytes([sent.data[4], sent.data[5]]), 0);
+        assert_eq!(u16::from_le_bytes([sent.data[6], sent.data[7]]), 0);
+        assert!(drv.is_pos_force_freeze_frame(&sent));
     }
 }

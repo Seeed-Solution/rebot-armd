@@ -4748,3 +4748,173 @@ async fn calibration_close_at_raw_29_is_sent_as_raw_29() {
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
 }
+
+/// Round 5 M1 regression:
+/// 1. A J7 feedback frame that sat 150 ms in the RX queue (both WITH a transport `rx_timestamp`
+///    near `queue_bound` and WITHOUT `rx_timestamp`) MUST fail the exact same live freshness
+///    predicate at decode time and NEVER overwrite `pf_last_fresh_position` / freeze target.
+/// 2. With no provably fresh J7 sample ever decoded since boot (`pf_last_fresh_position == None`),
+///    J7 gets the explicit safest zero-motion, zero-force fallback (`vel_raw == 0`, `i_des == 0`)
+///    on both motion and stopped-hold paths.
+#[test]
+fn pos_force_freeze_cache_rejects_150ms_queued_sample_and_boot_fallback_zero_current() {
+    use armd::transport::{CanTransport, TransportError};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct TimestampOverrideBus {
+        inner: FakeBus,
+        next_j7_ts: Arc<Mutex<Option<std::time::Instant>>>,
+    }
+    impl CanTransport for TimestampOverrideBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            let f = self.inner.receive()?;
+            let ts = if f.id == 0x17 {
+                self.next_j7_ts.lock().unwrap().take()
+            } else {
+                None
+            };
+            Ok((f, ts))
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn flush_is_noop(&self) -> bool {
+            self.inner.flush_is_noop()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+            self.inner.clock()
+        }
+    }
+
+    // --- (1) Frame sitting 150 ms in RX queue NEVER becomes the freeze target ---
+    let clock = MockClock::new();
+    let raw_bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    raw_bus.with(|s| {
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = 0.1 * i as f32;
+        }
+        s.motors[J7].q = -2.0;
+        s.immediate_replies = true;
+    });
+    let ts_slot = Arc::new(Mutex::new(None));
+    let bus = TimestampOverrideBus { inner: raw_bus.clone(), next_j7_ts: ts_slot.clone() };
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits())
+        .unwrap()
+        .with_gripper_pos_force(pf())
+        .unwrap();
+    d.read_joint_states().unwrap();
+    raw_bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    d.set_torque(true).expect("enable");
+    // Fresh boundary at t = 0 with J7 at -2.0 rad.
+    d.read_joint_states().unwrap();
+    raw_bus.with(|s| {
+        s.immediate_replies = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[J7].q = -2.0;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    let fresh_pos = d.pos_force_last_fresh_position().expect("fresh -2.0 cached");
+    assert!((fresh_pos - (-2.0)).abs() < 1e-2, "expected -2.0, got {fresh_pos}");
+
+    // Case 1a: Frame with hardware `rx_timestamp` = t0 + 10 ms (only 10 ms after `queue_bound`)
+    // that sat in the RX queue until `decode_now` = t0 + 160 ms (150 ms old when decoded!).
+    let t_bound = clock.now();
+    *ts_slot.lock().unwrap() = Some(t_bound + Duration::from_millis(10));
+    raw_bus.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[J7].q = -0.5;
+        s.push_feedback(J7);
+        s.motors[J7].mute_feedback = true;
+    });
+    clock.advance(Duration::from_millis(160));
+    raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    assert!(
+        !d.pos_force_feedback_fresh(),
+        "150 ms queued J7 sample must not be considered fresh"
+    );
+    let cached_after_ts = d.pos_force_last_fresh_position().expect("old fresh pos preserved");
+    assert!(
+        (cached_after_ts - fresh_pos).abs() < 1e-5,
+        "150 ms queued frame (with rx_timestamp) poisoned freeze cache: {cached_after_ts} != {fresh_pos}"
+    );
+    raw_bus.clear_log();
+    d.begin_tx_tick();
+    let _ = d.write_joint_targets_bounded(&targets(0.0)).unwrap();
+    let j7_tx = j7_commands(&raw_bus.tx_log());
+    assert_eq!(j7_tx.len(), 1, "expected 1 freeze frame: {j7_tx:?}");
+    let p_wire = f32::from_le_bytes(j7_tx[0].data[0..4].try_into().unwrap());
+    let v_wire = u16::from_le_bytes([j7_tx[0].data[4], j7_tx[0].data[5]]);
+    let i_wire = u16::from_le_bytes([j7_tx[0].data[6], j7_tx[0].data[7]]);
+    assert!((p_wire - fresh_pos).abs() < 1e-5, "freeze frame used stale -0.5: {p_wire}");
+    assert_eq!(v_wire, 0);
+    assert_eq!(i_wire, RAW);
+
+    // Case 1b: Frame without `rx_timestamp` (`None`) sitting 150 ms past `queue_bound`.
+    raw_bus.with(|s| {
+        s.motors[J7].mute_feedback = false;
+        s.motors[J7].q = -0.25;
+        s.push_feedback(J7);
+        s.motors[J7].mute_feedback = true;
+    });
+    clock.advance(Duration::from_millis(150));
+    raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    let cached_after_qb = d.pos_force_last_fresh_position().expect("old fresh pos still preserved");
+    assert!(
+        (cached_after_qb - fresh_pos).abs() < 1e-5,
+        "150 ms queued frame (via queue_bound) poisoned freeze cache: {cached_after_qb} != {fresh_pos}"
+    );
+
+    // --- (2) Unbounded pre-drain sample since boot NEVER populates freeze cache, and enable fails closed ---
+    let clock2 = MockClock::new();
+    let bus2 = FakeBus::with_clock(&b601_limits(), clock2.clone());
+    bus2.with(|s| {
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = 0.1 * i as f32;
+        }
+        s.motors[J7].q = -1.5;
+        s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+        s.immediate_replies = true;
+    });
+    let mut d2 = DamiaoArmDriver::new(bus2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits())
+        .unwrap()
+        .with_gripper_pos_force(pf())
+        .unwrap();
+    // Push J7 feedback BEFORE the first empty-queue drain (unbounded) -> never qualifies as fresh!
+    bus2.with(|s| {
+        s.push_all_feedback();
+        s.motors[J7].mute_feedback = true;
+    });
+    d2.read_joint_states().unwrap();
+    assert_eq!(
+        d2.pos_force_last_fresh_position(),
+        None,
+        "unbounded pre-drain feedback must NOT populate pf_last_fresh_position"
+    );
+    assert!(
+        d2.set_torque(true).is_err(),
+        "enable must still fail closed when no provably fresh J7 sample has been observed since boot"
+    );
+    assert_eq!(d2.pos_force_last_fresh_position(), None);
+}
