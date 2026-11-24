@@ -659,30 +659,20 @@ impl ArmDriver for SimArmDriver {
             return false;
         }
         let caps = self.capabilities();
-        if self.rt_mode.load(Ordering::Relaxed) {
-            if !self.cached_has_state
-                || !self.cached_received_at.is_some_and(|t| t.elapsed() <= max_age)
-            {
-                return false;
+        // Always read BOTH timestamp and joint states from the receiver's latest coherent packet
+        // so the send gate never acts on a superseded owner-local pose when `armd-sim-rx` already
+        // holds a newer (e.g. raised) pose. In RT mode use strictly non-blocking `try_lock()` and
+        // fail closed if contended (zero allocation, zero blocking).
+        let s = if self.rt_mode.load(Ordering::Relaxed) {
+            match self.shared.try_lock() {
+                Ok(g) => g,
+                Err(_) => return false,
             }
-            for (slot, &i) in out.iter_mut().zip(joints.iter()) {
-                let Some(s) = self.cached.get(i) else {
-                    return false;
-                };
-                if !crate::driver::joint_state_valid(s, caps) {
-                    return false;
-                }
-                if caps.load_feedback && !self.cached_loads.get(i).is_some_and(|l| l.is_finite()) {
-                    return false;
-                }
-                *slot = s.position;
+        } else {
+            match self.shared.lock() {
+                Ok(g) => g,
+                Err(_) => return false,
             }
-            return true;
-        }
-        // Legacy mode: take BOTH timestamp and joint states from the same locked receiver packet
-        // so the newest received timestamp can never vouch for older owner-cached positions.
-        let Ok(s) = self.shared.lock() else {
-            return false;
         };
         if !s.received_at.is_some_and(|t| t.elapsed() <= max_age) {
             return false;
@@ -1251,12 +1241,105 @@ mod tests {
         assert!(drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(200), &mut out));
         assert!((out[0] - 0.45).abs() < 1e-5, "expected packet 2 position 0.45, got {}", out[0]);
 
-        // RT mode reads BOTH timestamp and position from the owner-local coherent snapshot.
+        // RT mode MUST also read BOTH timestamp and position from the receiver's latest packet
+        // (packet 2, 0.45), never the superseded owner cache (packet 1, 0.0).
         drv.set_rt_mode(true);
-        drv.cached_received_at = Some(Instant::now() - Duration::from_millis(500));
+        let mut out_rt = [0.0f32; 2];
+        assert!(drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(200), &mut out_rt));
         assert!(
-            !drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(100), &mut out),
-            "stale owner-local timestamp in RT mode must be refused even when receiver has newer packet"
+            (out_rt[0] - 0.45).abs() < 1e-5,
+            "RT mode must read receiver's latest packet 2 (0.45), not superseded cache (0.0); got {}",
+            out_rt[0]
         );
+
+        // Stale receiver timestamp in RT mode is refused even if owner cache looks fresh.
+        drv.cached_received_at = Some(Instant::now());
+        drv.shared.lock().unwrap().received_at = Some(Instant::now() - Duration::from_millis(500));
+        assert!(
+            !drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(100), &mut out_rt),
+            "stale receiver packet timestamp in RT mode must be refused"
+        );
+    }
+
+    #[test]
+    fn rt_sim_send_gate_reads_latest_receiver_packet_and_fails_closed_when_contended() {
+        let mut peer = Peer::new();
+        let mut drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
+        let mut arm_joints = [0usize; crate::rt_core::mailbox::MAX_DOF];
+        arm_joints[0] = 0;
+        arm_joints[1] = 1;
+        arm_joints[2] = 2;
+        drv.set_stopped_disable_gate(crate::driver::StoppedDisableGate {
+            safety_stopped: Arc::new(AtomicBool::new(true)),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 3,
+            rest_positions: [0.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+            rest_pose_tolerance_rad: 0.05,
+        });
+        // 1. Packet 1: at rest (`q = [0.0, 0.1, 0.2]`), let peer discover armd's UDP port via
+        //    initial poll, then switch into RT mode and sync into owner-local cache.
+        peer.send_state(1, 1, 0, true, 0.0);
+        settle();
+        drv.set_rt_mode(true);
+        let mut states = Vec::with_capacity(3);
+        drv.read_joint_states_budgeted(&mut states, Instant::now() + Duration::from_millis(5), 64)
+            .unwrap();
+        assert!((drv.cached[0].position - 0.0).abs() < 1e-5);
+
+        // Drain any initial keepalive polls from peer.
+        peer.socket.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        let mut drain_buf = [0u8; 4096];
+        while peer.socket.recv(&mut drain_buf).is_ok() {}
+
+        // 2. Packet 2: newer RAISED pose (`q0 = 0.50`) arrives at receiver WITHOUT calling
+        //    `read_joint_states` so `self.cached` still holds the superseded rest pose (`0.0`)!
+        peer.send_state(1, 2, 0, true, 0.50);
+        settle();
+        assert!((drv.cached[0].position - 0.0).abs() < 1e-5, "owner cache still holds superseded rest pose");
+
+        let res_raised = drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+            started_at: Instant::now(),
+            rollback: false,
+        });
+        assert!(
+            matches!(res_raised, Err(ArmDriverError::TorqueOffWouldDrop)),
+            "RT sim send gate must refuse using receiver's newer raised pose, got {res_raised:?}"
+        );
+        // Verify zero UDP `cmd` datagrams reached the simulator peer.
+        while let Ok(n) = peer.socket.recv(&mut drain_buf) {
+            if let Ok(cmd) = serde_json::from_slice::<SimCommand>(&drain_buf[..n]) {
+                assert_ne!(cmd.kind, "cmd", "unexpected cmd datagram transmitted on raised pose: {cmd:?}");
+            }
+        }
+
+        // 3. Packet 3 returns to rest (`q0 = 0.0`), but receiver mutex is contended -> RT send
+        //    gate must NOT block and must fail closed (`TorqueOffWouldDrop`, 0 cmd datagrams).
+        peer.send_state(1, 3, 0, true, 0.0);
+        settle();
+        let lock = drv.test_rx_lock_handle();
+        let _held = lock.lock();
+        let t0 = Instant::now();
+        let res_contended = drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+            started_at: Instant::now(),
+            rollback: false,
+        });
+        let elapsed = t0.elapsed();
+        drop(_held);
+        assert!(
+            matches!(res_contended, Err(ArmDriverError::TorqueOffWouldDrop)),
+            "contended RT receiver lock must fail closed, got {res_contended:?}"
+        );
+        assert!(elapsed < Duration::from_millis(10), "contended RT send gate blocked: {elapsed:?}");
+
+        // 4. Uncontended at rest (packet 3) -> succeeds and transmits enable=false!
+        drv.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+            started_at: Instant::now(),
+            rollback: false,
+        })
+        .expect("uncontended fresh rest pose in RT mode must transmit disable");
+        peer.socket.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let cmd = peer.recv_kind("cmd");
+        assert_eq!(cmd.enable, Some(false));
     }
 }
