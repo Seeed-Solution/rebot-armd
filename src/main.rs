@@ -594,7 +594,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor_handle: Option<armd::rt_core::executor::RtExecutorHandle> = None;
     match rt_owner {
         armd::rt_core::executor::RtOwner::Legacy => {
-            armd::gripper_calib::spawn_baseline_persister(supervisor.clone());
             let control_supervisor = supervisor.clone();
             let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let control_stop_flag = control_stop.clone();
@@ -658,6 +657,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             executor_handle = Some(handle);
         }
     }
+    // Start the off-control-thread automatic gripper baseline consumer for both owners.
+    armd::gripper_calib::spawn_baseline_persister(supervisor.clone());
 
     info!(
         "armd API server listening on http://{}",

@@ -1116,3 +1116,168 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
     }
     assert!(stopped_hit, "stopped jaw at 0.56 N·m (>= calibrated 0.55 N·m) did not trigger");
 }
+
+/// I16 Item 4: Automatic baseline learning must consume queued `MoveRecord`s off the control
+/// thread under BOTH `RtOwner::Executor` and `RtOwner::Legacy`, without allocating on
+/// `armd-control`, updating the owner's live baseline observation and persisting to disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
+    use armd::gripper_baseline::{FreeTorqueBaseline, MoveRecord, MoveSamples};
+    use armd::rt_core::executor::ExecutorConfig;
+    use armd::ArmSupervisor;
+
+    let make_open_record = |tau_nm: f32| -> MoveRecord {
+        let mut samples = MoveSamples::default();
+        for i in 0..=200 {
+            let q = 0.0 + (-5.7) * (i as f32 / 200.0);
+            samples.push(q, tau_nm, 1.0);
+        }
+        MoveRecord {
+            direction: Direction::Open,
+            start_rad: 0.0,
+            end_rad: -5.7,
+            samples,
+            calibration: false,
+        }
+    };
+
+    // 1. Executor owner: records queued on the owner (both pre-queued and produced by a live
+    //    unloaded opening GripperMotion completing on `armd-control`) are consumed off-thread
+    //    by `spawn_baseline_persister_with_interval`, stored back onto the owner with zero
+    //    control-thread allocations, reflected in published observations, and written to disk.
+    let dir = tempfile::tempdir().unwrap();
+    let baseline_path = dir.path().join("gripper_baseline.mock.json");
+
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.follower = Some("mock".into());
+        inner.gripper_baseline_path = Some(baseline_path.clone());
+        inner.set_torque(true).unwrap();
+        // Start an unloaded opening move from closed (0.0) to open (-5.7) so `armd-control`
+        // finishes it and queues a real `MoveRecord` into `core.gripper_baseline_pending`,
+        // plus one pre-queued unloaded open record with known 0.35 N·m torque.
+        inner.gripper_baseline_pending.push(make_open_record(0.35));
+        inner.commanded_positions[6] = -5.4;
+        inner.measured_positions[6] = -5.4;
+        inner.target_positions[6] = -5.4;
+        let ep = inner.safety.epoch_id();
+        inner
+            .start_gripper(
+                GripperRequest {
+                    command: GripperCommand::Open,
+                    fraction: None,
+                    grasp: false,
+                    speed: 2.0,
+                    timeout_s: Some(5.0),
+                    tag: None,
+                },
+                ep,
+            )
+            .unwrap();
+    }
+
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg.alloc_timing = true;
+    let handle = sup.start_executor(cfg).await.unwrap();
+
+    // Let the live opening motion finish on `armd-control` first: the control thread only
+    // queues the MoveRecord (never learns synchronously on `armd-control`), so `open_moves`
+    // stays 0 until the off-thread consumer starts.
+    let motion_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < motion_deadline {
+        let obs = sup.get_observation().await;
+        if obs.action.as_ref().is_some_and(|a| !a.is_running()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pre_obs = sup.get_observation().await;
+    assert!(pre_obs.action.as_ref().is_some_and(|a| a.state.as_str() == "done"), "{:?}", pre_obs.action);
+    assert_eq!(pre_obs.gripper.as_ref().and_then(|g| g.baseline).unwrap().open_moves, 0);
+
+    let consumer = armd::gripper_calib::spawn_baseline_persister_with_interval(
+        sup.clone(),
+        Duration::from_millis(20),
+    );
+
+    // Wait until the consumer drains the queued records, updates the owner's live baseline,
+    // and persists the JSON file to disk (read published StateHub observations so every
+    // maintenance release in `tick_samples` is a baseline op).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut learned_obs = None;
+    while std::time::Instant::now() < deadline {
+        let obs = sup.get_observation().await;
+        if let Some(b) = obs.gripper.and_then(|g| g.baseline) {
+            if b.open_moves >= 1 && b.state.as_str() == "learning" && baseline_path.exists() {
+                learned_obs = Some(b);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let obs_b = learned_obs.expect("executor baseline consumer did not drain/learn/persist queued records");
+    assert!(obs_b.open_moves >= 1, "{obs_b:?}");
+    assert_eq!(obs_b.state.as_str(), "learning", "{obs_b:?}");
+
+    // Persisted file parses cleanly and learned the 0.35 N·m opening profile.
+    let raw = std::fs::read_to_string(&baseline_path).unwrap();
+    let persisted: FreeTorqueBaseline = serde_json::from_str(&raw).unwrap();
+    persisted.validate().unwrap();
+    assert!(persisted.open_moves >= 1, "{persisted:?}");
+    let est = persisted.estimate(-3.0, Direction::Open, 1.0).expect("open bin learned");
+    assert!((est.baseline_nm - 0.35).abs() < 0.05, "unexpected learned torque: {est:?}");
+
+    // Queue must now be empty on the executor owner, and a stale-generation StoreBaseline must
+    // be refused without mutating live state.
+    let taken_after = handle
+        .take_baseline_pending_async(Vec::with_capacity(armd::supervisor::GRIPPER_BASELINE_PENDING_MAX), false)
+        .await
+        .unwrap();
+    assert!(taken_after.moves.is_empty(), "queued records were not drained: {}", taken_after.moves.len());
+    assert!(taken_after.generation >= 1, "expected generation bump after store");
+    let stale_stored = handle
+        .store_baseline_async(persisted.clone(), taken_after.generation - 1, false)
+        .await
+        .unwrap();
+    assert!(!stale_stored, "stale generation StoreBaseline must be refused");
+
+    // Verify EVERY maintenance release servicing TakeBaselinePending / StoreBaseline did 0
+    // allocations on `armd-control`.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let samples = sup.tick_samples();
+    let maint_allocs: Vec<(u64, u32)> = samples
+        .iter()
+        .filter(|s| s.maint_req_id != 0)
+        .map(|s| (s.maint_req_id, s.usage.lock_alloc_calls))
+        .collect();
+    assert!(maint_allocs.len() >= 2, "expected >= 2 baseline maintenance releases, got {maint_allocs:?}");
+    assert!(
+        maint_allocs.iter().all(|&(_, calls)| calls == 0),
+        "baseline maintenance op allocated on armd-control: {maint_allocs:?}"
+    );
+
+    // Stopping the executor causes the spawned consumer task to exit cleanly (no hang/panic).
+    handle.stop_and_join();
+    tokio::time::timeout(Duration::from_secs(2), consumer)
+        .await
+        .expect("baseline consumer did not exit after executor stop")
+        .unwrap();
+
+    // 2. Legacy owner parity: the same consumer helper drains & persists queued records in Legacy mode.
+    let dir_leg = tempfile::tempdir().unwrap();
+    let leg_path = dir_leg.path().join("gripper_baseline.legacy.json");
+    let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup_leg.inner().write().await;
+        inner.follower = Some("legacy".into());
+        inner.gripper_baseline_path = Some(leg_path.clone());
+        inner.gripper_baseline_pending.push(make_open_record(0.32));
+    }
+    assert!(armd::gripper_calib::step_baseline_persister_once(&sup_leg).await);
+    assert!(leg_path.exists(), "legacy baseline file not written");
+    let leg_obs = sup_leg.inner().read().await.gripper_baseline_observation();
+    assert_eq!(leg_obs.open_moves, 1, "{leg_obs:?}");
+    assert!(sup_leg.inner().read().await.gripper_baseline_pending.is_empty());
+}

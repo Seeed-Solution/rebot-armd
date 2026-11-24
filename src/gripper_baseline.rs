@@ -68,7 +68,7 @@ impl Direction {
 }
 
 /// One table: one direction and speed band, BINS position bins.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     /// Median |τ| (N·m) per bin.
     pub median_nm: [f32; BINS],
@@ -76,6 +76,22 @@ pub struct Table {
     pub spread_nm: [f32; BINS],
     /// Accepted moves per bin (0: not learned).
     pub moves: [u32; BINS],
+}
+
+/// `Copy` snapshot of [`FreeTorqueBaseline`]'s numeric tables and counters, allowing
+/// `armd-control` to hand baseline state off-thread without cloning heap strings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BaselineData {
+    pub lo_rad: f32,
+    pub hi_rad: f32,
+    pub close_fast: Table,
+    pub close_slow: Table,
+    pub open_fast: Table,
+    pub open_slow: Table,
+    pub close_moves: u64,
+    pub open_moves: u64,
+    pub rejected_moves: u64,
+    pub ts: Option<u64>,
 }
 
 /// Persisted free-motion torque baseline.
@@ -214,6 +230,48 @@ impl FreeTorqueBaseline {
             open_moves: 0,
             rejected_moves: 0,
             ts: None,
+        }
+    }
+
+    /// Allocation-free `Copy` snapshot of the numeric tables and counters.
+    pub fn data_snapshot(&self) -> BaselineData {
+        BaselineData {
+            lo_rad: self.lo_rad,
+            hi_rad: self.hi_rad,
+            close_fast: self.close_fast,
+            close_slow: self.close_slow,
+            open_fast: self.open_fast,
+            open_slow: self.open_slow,
+            close_moves: self.close_moves,
+            open_moves: self.open_moves,
+            rejected_moves: self.rejected_moves,
+            ts: self.ts,
+        }
+    }
+
+    /// Reconstruct a full [`FreeTorqueBaseline`] off the control thread from a [`BaselineData`]
+    /// snapshot and its tool/follower identity.
+    pub fn from_data(
+        data: BaselineData,
+        tool_id: Option<String>,
+        tool_config_digest: Option<String>,
+        follower: Option<String>,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            tool_id,
+            tool_config_digest,
+            follower,
+            lo_rad: data.lo_rad,
+            hi_rad: data.hi_rad,
+            close_fast: data.close_fast,
+            close_slow: data.close_slow,
+            open_fast: data.open_fast,
+            open_slow: data.open_slow,
+            close_moves: data.close_moves,
+            open_moves: data.open_moves,
+            rejected_moves: data.rejected_moves,
+            ts: data.ts,
         }
     }
 
