@@ -815,18 +815,22 @@ impl<P> Broker<P> {
                         write,
                         kind,
                         prepared_boot,
+                        admission_request_id,
                         check_workspace_revision,
                         poses_revision,
                         calibration_revision,
+                        gripper_calib_revision,
                         power_budget_revision,
                     } => match self.plans.stage(write) {
                         Some(plan) => CommandKind::Action(ActionCommand::InstallPrepared {
                             plan,
                             kind,
                             prepared_boot,
+                            admission_request_id,
                             check_workspace_revision,
                             poses_revision,
                             calibration_revision,
+                            gripper_calib_revision,
                             power_budget_revision,
                         }),
                         None => {
@@ -840,6 +844,7 @@ impl<P> Broker<P> {
                         prepared_boot,
                         check_workspace_revision,
                         calibration_revision,
+                        gripper_calib_revision,
                         power_budget_revision,
                     } => match self.plans.stage(write) {
                         Some(plan) => CommandKind::Action(ActionCommand::InstallChild {
@@ -847,6 +852,7 @@ impl<P> Broker<P> {
                             prepared_boot,
                             check_workspace_revision,
                             calibration_revision,
+                            gripper_calib_revision,
                             power_budget_revision,
                         }),
                         None => {

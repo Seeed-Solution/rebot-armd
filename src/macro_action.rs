@@ -89,6 +89,13 @@ pub struct MacroRun {
     pub sub: SubState,
     /// `/motion/stop` arrived while no sub-motion was running.
     pub stop_requested: bool,
+    /// True once the owner has entered its terminal finishing transition (explicit finish,
+    /// parent deadline expiry, or stop) while awaiting bus acceptance of the replacement hold;
+    /// rejects any duplicate `FinishMacro` or new `InstallChild` with `PARENT_REPLACED`.
+    pub finishing: bool,
+    /// True after a child motion was quiesced on a driver-backed RT owner until a subsequent
+    /// tick's replacement hold output is accepted on the bus.
+    pub hold_pending_bus_accept: bool,
     pub phase: Option<crate::model::HolderLabel>,
     pub phase_start: Option<Instant>,
     /// Optional owner-enforced whole-macro deadline and failure code.
@@ -105,7 +112,8 @@ pub struct MacroRun {
 impl MacroRun {
     /// A run without children.
     pub fn new(id: u64, epoch: u64, stamp: AdmissionStamp) -> Self {
-        Self { id, epoch, stamp, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None,
+        Self { id, epoch, stamp, sub: SubState::Idle, stop_requested: false, finishing: false,
+            hold_pending_bus_accept: false, phase: None, phase_start: None,
             deadline: None, timeout_code: crate::safety::BoundedText::empty(),
             children: 0, child: ChildRecord::default(), next_guard: None }
     }
@@ -1284,7 +1292,8 @@ impl MacroCtx {
                         prepared_boot: boot,
                         check_workspace_revision,
                         calibration_revision,
-                        power_budget_revision: None,
+                        gripper_calib_revision: stamp.gripper_calib_revision,
+                        power_budget_revision: stamp.power_budget_revision,
                     }),
                 )
             };

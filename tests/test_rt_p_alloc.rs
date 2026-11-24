@@ -321,9 +321,11 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
                     write: &write,
                     kind,
                     prepared_boot: boot,
+                    admission_request_id: 0,
                     check_workspace_revision: check_ws,
                     poses_revision: None,
                     calibration_revision: None,
+                    gripper_calib_revision: None,
                     power_budget_revision: None,
                 }),
             )
@@ -414,7 +416,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = c1_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 6, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 60);
     let _ = drain(&handle);
@@ -431,7 +433,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = c2_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 7, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: true, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 60);
     let _ = drain(&handle);
@@ -445,7 +447,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = c3_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 8, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 250);
     let _ = drain(&handle);
@@ -488,7 +490,7 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     {
         let write = |dst: &mut PlanSlot| *dst = cg_slot.clone();
         handle.broker().lock().unwrap().submit(ClientId(1), 11, snap.owner.authority, clock.now() + DEFAULT_ACTION_DEADLINE,
-            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, power_budget_revision: None })).unwrap();
+            Submit::Action(ActionSubmit::InstallChild { write: &write, prepared_boot: boot, check_workspace_revision: false, calibration_revision: None, gripper_calib_revision: None, power_budget_revision: None })).unwrap();
     }
     clock.run_steps(period_ns, 3);
     // Forced FinishMacro(Failed) while gripper child is running (also clears held with 0 dealloc)!
@@ -511,9 +513,11 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
             write: &write,
             kind: PreparedActionKind::Gripper,
             prepared_boot: BootId(999),
+            admission_request_id: 0,
             check_workspace_revision: false,
             poses_revision: None,
             calibration_revision: None,
+            gripper_calib_revision: None,
             power_budget_revision: None,
         })).unwrap();
     clock.run_steps(period_ns, 2);

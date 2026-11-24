@@ -838,6 +838,7 @@ pub enum MaintenanceOp {
     SetMotorZero { joint: usize },
     TakeBaselinePending {
         fresh_pending: Vec<crate::gripper_baseline::MoveRecord>,
+        fresh_samples: Vec<crate::gripper_baseline::MoveSamples>,
         clear_dirty: bool,
     },
     StoreBaseline {
@@ -880,6 +881,7 @@ struct MaintReply {
     returned_probe: Option<Box<dyn Any + Send>>,
     returned_driver_config_error: Option<String>,
     returned_pending: Option<Vec<crate::gripper_baseline::MoveRecord>>,
+    returned_samples: Option<Vec<crate::gripper_baseline::MoveSamples>>,
     returned_baseline: Option<crate::gripper_baseline::FreeTorqueBaseline>,
 }
 
@@ -916,6 +918,7 @@ impl MaintClientInner {
             drop(reply.returned_probe);
             drop(reply.returned_driver_config_error);
             drop(reply.returned_pending);
+            drop(reply.returned_samples);
             drop(reply.returned_baseline);
             if let Some(waiter) = self.waiters.remove(&reply.id) {
                 let res = match reply.result {
@@ -1493,6 +1496,7 @@ enum PersistReply {
         _returned_probe: Option<Box<dyn Any + Send>>,
     },
     Done {
+        activated_revision: Option<u64>,
         _returned_policy: Option<GripperPolicy>,
         _returned_jaw: Option<JawOpening>,
         _returned_code: Option<String>,
@@ -2004,15 +2008,43 @@ impl RtExecutorHandle {
     }
 
     pub fn set_joint_zero_offsets(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
+        let offsets_copy = offsets.clone();
         match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets { offsets })? {
-            MaintenanceResult::JointZeroOffsetsSet(r) => Ok(r),
+            MaintenanceResult::JointZeroOffsetsSet(r) => {
+                if r.is_ok() {
+                    if let Some(cur) = self.shared.hub.prep_env() {
+                        let mut next = (*cur).clone();
+                        next.joint_zero_offsets = offsets_copy;
+                        if let Some(pub_snap) = self.shared.hub.latest() {
+                            next.calibration_revision = pub_snap.rt.owner.calibration_revision;
+                            next.workspace_revision = pub_snap.rt.owner.authority.config_revision;
+                        } else {
+                            next.calibration_revision = next.calibration_revision.saturating_add(1);
+                        }
+                        self.shared.hub.update_prep_env(Arc::new(next));
+                    }
+                }
+                Ok(r)
+            }
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub fn set_motor_zero(&self, joint: usize) -> Result<Result<(), String>, OwnerError> {
         match self.call_maintenance(MaintenanceOp::SetMotorZero { joint })? {
-            MaintenanceResult::MotorZeroSet(r) => Ok(r),
+            MaintenanceResult::MotorZeroSet(r) => {
+                if r.is_ok() {
+                    if let (Some(cur), Some(pub_snap)) =
+                        (self.shared.hub.prep_env(), self.shared.hub.latest())
+                    {
+                        let mut next = (*cur).clone();
+                        next.calibration_revision = pub_snap.rt.owner.calibration_revision;
+                        next.workspace_revision = pub_snap.rt.owner.authority.config_revision;
+                        self.shared.hub.update_prep_env(Arc::new(next));
+                    }
+                }
+                Ok(r)
+            }
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -2022,9 +2054,14 @@ impl RtExecutorHandle {
         clear_dirty: bool,
     ) -> Result<BaselineTakeReply, OwnerError> {
         let fresh_pending = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
+        let mut fresh_samples = Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX);
+        for _ in 0..crate::supervisor::GRIPPER_BASELINE_PENDING_MAX {
+            fresh_samples.push(crate::gripper_baseline::MoveSamples::default());
+        }
         match self
             .call_maintenance_async(MaintenanceOp::TakeBaselinePending {
                 fresh_pending,
+                fresh_samples,
                 clear_dirty,
             })
             .await?
@@ -2536,6 +2573,7 @@ impl ControlState {
         let mut returned_offsets = None;
         let mut returned_probe = None;
         let mut returned_pending = None;
+        let mut returned_samples = None;
         let mut returned_baseline = None;
         let result = match req.op {
             MaintenanceOp::RequestShutdown => {
@@ -2601,13 +2639,19 @@ impl ControlState {
                 };
                 MaintenanceResult::MotorZeroSet(res)
             }
-            MaintenanceOp::TakeBaselinePending { fresh_pending, clear_dirty } => {
+            MaintenanceOp::TakeBaselinePending { fresh_pending, mut fresh_samples, clear_dirty } => {
                 let moves = if core.gripper_baseline_pending.is_empty() {
                     returned_pending = Some(fresh_pending);
                     Vec::new()
                 } else {
                     std::mem::replace(&mut core.gripper_baseline_pending, fresh_pending)
                 };
+                // Replenish preallocated `MoveSamples` spares without RT allocation or deallocation.
+                while core.move_samples_spares.len() < core.move_samples_spares.capacity() {
+                    let Some(s) = fresh_samples.pop() else { break; };
+                    core.move_samples_spares.push(s);
+                }
+                returned_samples = Some(fresh_samples);
                 let tool = &core.config.active_tool;
                 let stroke = core
                     .config
@@ -2675,6 +2719,7 @@ impl ControlState {
             returned_probe,
             returned_driver_config_error,
             returned_pending,
+            returned_samples,
             returned_baseline,
         });
     }
@@ -2709,16 +2754,17 @@ impl ControlState {
                 returned_probe: reply.returned_probe,
                 returned_driver_config_error: reply.returned_driver_config_error,
                 returned_pending,
+                returned_samples: reply.returned_samples,
                 returned_baseline: reply.returned_baseline,
             });
         }
         while let Ok(req) = self.maint_req_rx.pop() {
-            let (returned_offsets, returned_probe, returned_pending, returned_baseline) = match req.op {
-                MaintenanceOp::SetJointZeroOffsets { offsets } => (Some(offsets), None, None, None),
-                MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload), None, None),
-                MaintenanceOp::TakeBaselinePending { fresh_pending, .. } => (None, None, Some(fresh_pending), None),
-                MaintenanceOp::StoreBaseline { baseline, .. } => (None, None, None, Some(baseline)),
-                _ => (None, None, None, None),
+            let (returned_offsets, returned_probe, returned_pending, returned_samples, returned_baseline) = match req.op {
+                MaintenanceOp::SetJointZeroOffsets { offsets } => (Some(offsets), None, None, None, None),
+                MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload), None, None, None),
+                MaintenanceOp::TakeBaselinePending { fresh_pending, fresh_samples, .. } => (None, None, Some(fresh_pending), Some(fresh_samples), None),
+                MaintenanceOp::StoreBaseline { baseline, .. } => (None, None, None, None, Some(baseline)),
+                _ => (None, None, None, None, None),
             };
             self.push_maint_reply_or_offload(MaintReply {
                 id: req.id,
@@ -2727,6 +2773,7 @@ impl ControlState {
                 returned_probe,
                 returned_driver_config_error: None,
                 returned_pending,
+                returned_samples,
                 returned_baseline,
             });
         }
@@ -2829,6 +2876,7 @@ impl ControlState {
                     unused_jaw,
                     ..
                 } => PersistReply::Done {
+                    activated_revision: None,
                     _returned_policy: unused_policy,
                     _returned_jaw: unused_jaw,
                     _returned_code: Some(code),
@@ -2844,6 +2892,7 @@ impl ControlState {
                     msg_buf,
                     ..
                 } => PersistReply::Done {
+                    activated_revision: None,
                     _returned_policy: Some(new_policy),
                     _returned_jaw: new_jaw,
                     _returned_code: Some(code_buf),
@@ -2860,6 +2909,7 @@ impl ControlState {
             let code = self.disconnect_code_buf.take();
             let msg = self.disconnect_msg_buf.take();
             self.push_persist_reply_or_offload(PersistReply::Done {
+                activated_revision: None,
                 _returned_policy: None,
                 _returned_jaw: None,
                 _returned_code: code,
@@ -2917,6 +2967,7 @@ impl ControlState {
                 if old_code.is_some() || old_msg.is_some() {
                     self.push_persist_reply_or_retain(
                         PersistReply::Done {
+                            activated_revision: None,
                             _returned_policy: None,
                             _returned_jaw: None,
                             _returned_code: old_code,
@@ -3057,6 +3108,7 @@ impl ControlState {
                 let probe = self.take_reply_probe();
                 self.push_persist_reply_or_retain(
                     PersistReply::Done {
+                        activated_revision: None,
                         _returned_policy: unused_policy,
                         _returned_jaw: unused_jaw,
                         _returned_code: old_code,
@@ -3246,6 +3298,7 @@ impl ControlState {
                 let probe = self.take_reply_probe();
                 self.push_persist_reply_or_retain(
                     PersistReply::Done {
+                        activated_revision: None,
                         _returned_policy: unused_policy,
                         _returned_jaw: unused_jaw,
                         _returned_code: old_code,
@@ -3299,6 +3352,7 @@ impl ControlState {
                     let probe = self.take_reply_probe();
                     self.push_persist_reply_or_retain(
                         PersistReply::Done {
+                            activated_revision: None,
                             _returned_policy: Some(new_policy),
                             _returned_jaw: new_jaw,
                             _returned_code: old_code,
@@ -3332,6 +3386,7 @@ impl ControlState {
                         let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
                         core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
                     }
+                    let activated_rev = core.gripper_calib_revision;
                     if core.zero_check_persisting == Some(action_id) {
                         core.zero_check_persisting = None;
                     }
@@ -3340,6 +3395,7 @@ impl ControlState {
                     let probe = self.take_reply_probe();
                     self.push_persist_reply_or_retain(
                         PersistReply::Done {
+                            activated_revision: Some(activated_rev),
                             _returned_policy: old_policy,
                             _returned_jaw: old_jaw,
                             _returned_code: Some(code_buf),
@@ -3382,6 +3438,7 @@ impl ControlState {
                     let probe = self.take_reply_probe();
                     self.push_persist_reply_or_retain(
                         PersistReply::Done {
+                            activated_revision: None,
                             _returned_policy: Some(new_policy),
                             _returned_jaw: new_jaw,
                             _returned_code: old_code,
@@ -3421,6 +3478,7 @@ fn spawn_persist_worker(
     }
 
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
+        let hub_for_refresh = Arc::clone(&hub);
         let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             let mut pending = Some(cmd);
@@ -3655,6 +3713,7 @@ fn spawn_persist_worker(
                 // Simulated worker crash/disconnect after rename without pushing Activate.
                 break;
             }
+            let applied_policy_copy = new_policy.clone();
             let _ = push_cmd(
                 &mut cmd_tx,
                 PersistCmd::Activate {
@@ -3674,7 +3733,18 @@ fn spawn_persist_worker(
                 &control_exited,
             );
             if !hooks.leave_final_reply_queued {
-                let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                if let Some(PersistReply::Done {
+                    activated_revision: Some(new_rev),
+                    ..
+                }) = wait_reply(&rep_rx, &persist_stop, &control_exited)
+                {
+                    if let Some(cur) = hub_for_refresh.prep_env() {
+                        let mut next = (*cur).clone();
+                        next.config.gripper_policy = Some(applied_policy_copy);
+                        next.gripper_calib_revision = new_rev;
+                        hub_for_refresh.update_prep_env(Arc::new(next));
+                    }
+                }
             }
             if hooks.exit_after_first_job {
                 break;
@@ -5175,6 +5245,7 @@ mod tests {
                     returned_probe: None,
                     returned_driver_config_error: None,
                     returned_pending: None,
+                    returned_samples: None,
                     returned_baseline: None,
                 })
                 .unwrap();
@@ -5570,12 +5641,14 @@ mod tests {
                     returned_probe: None,
                     returned_driver_config_error: None,
                     returned_pending: None,
+                    returned_samples: None,
                     returned_baseline: None,
                 })
                 .unwrap();
         }
         for _ in 0..(PERSIST_REP_CAPACITY - 1) {
             persist_rep_tx.push(PersistReply::Done {
+                activated_revision: None,
                 _returned_policy: None, _returned_jaw: None, _returned_code: None,
                 _returned_msg: None, _returned_warning: None, _returned_probe: None,
             }).unwrap();
@@ -5688,6 +5761,7 @@ mod tests {
             RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
         state.offload_reclaim_tx = full_offload_tx;
         state.persist_rep_tx.push(PersistReply::Done {
+            activated_revision: None,
             _returned_policy: None, _returned_jaw: None, _returned_code: None,
             _returned_msg: None, _returned_warning: None, _returned_probe: None,
         }).unwrap();

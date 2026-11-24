@@ -205,6 +205,13 @@ impl MoveSamples {
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
     pub fn iter(&self) -> impl Iterator<Item = &(f32, f32, f32)> { self.buf[..self.len].iter() }
+
+    /// Resets counters in place without reallocating or freeing the backing buffer.
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.stride = 1;
+        self.offered = 0;
+    }
 }
 
 /// One finished, unloaded move offered for learning.
@@ -380,15 +387,7 @@ impl FreeTorqueBaseline {
     /// Baseline at `q` moving in `dir` at |v| `speed`: the matching table, else the other speed
     /// band, else the other direction (with extra margin). None: nothing learned near `q`.
     pub fn estimate(&self, q: f32, dir: Direction, speed: f32) -> Option<Estimate> {
-        if !q.is_finite() { return None; }
-        let c = self.coord(q);
-        let slow = speed.abs() < SLOW_BAND_MAX_RAD_S;
-        for (d, s, other) in [(dir, slow, false), (dir, !slow, false), (dir.other(), slow, true), (dir.other(), !slow, true)] {
-            if let Some((m, sp)) = Self::table_at(self.table(d, s), c) {
-                return Some(Estimate { baseline_nm: m, spread_nm: sp, other_direction: other });
-            }
-        }
-        None
+        self.data_snapshot().estimate(q, dir, speed)
     }
 
     /// Learned moves of a direction (any bin).

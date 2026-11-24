@@ -96,11 +96,15 @@ impl SupervisorInner {
 
     fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
         let now = self.now_s();
-        self.pending_deferred_done = None;
-        // any new action ends a running macro (quiescing any active child trajectory/gripper hold first)
+        // Clean up old macro bookkeeping without overwriting the newly prepared motion's
+        // `target_positions` or resetting `safety` back to `Armed` (caller already quiesced
+        // any old macro gripper hold before building the replacement trajectory).
         if let Some(old_id) = self.macro_run.as_ref().map(|m| m.id) {
-            self.quiesce_macro_children_rt(old_id);
+            if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == old_id) {
+                self.quintic_settle = None;
+            }
         }
+        self.pending_deferred_done = None;
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
         #[cfg(feature = "policy-runtime")]
         if let Some(mut run) = self.policy_run.take() {
@@ -495,9 +499,12 @@ impl SupervisorInner {
         Ok(id)
     }
 
-    /// The macro action `id` is still the running action.
+    /// The macro action `id` is still the running action (and not already in its terminal
+    /// finishing transition awaiting bus acceptance).
     pub fn macro_alive(&self, id: u64) -> bool {
-        self.macro_run.as_ref().is_some_and(|m| m.id == id && !m.stop_requested)
+        self.macro_run
+            .as_ref()
+            .is_some_and(|m| m.id == id && !m.stop_requested && !m.finishing)
             && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
     }
 
@@ -687,10 +694,21 @@ impl SupervisorInner {
     /// worker ends it with that code). True when it did.
     pub fn expire_macro_child(&mut self, now: Instant) -> bool {
         let Some(m) = self.macro_run.as_ref() else { return false; };
-        if m.stop_requested || m.sub != SubState::Running || !m.child.deadline.is_some_and(|d| now > d) { return false; }
+        if m.stop_requested
+            || m.finishing
+            || m.sub != SubState::Running
+            || m.deadline.is_some_and(|d| now > d)
+            || !m.child.deadline.is_some_and(|d| now > d)
+        {
+            return false;
+        }
         let id = m.id;
-        if self.macro_child_active_or_pending(id) { self.stop_motion(); }
-        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
+        if self.rt_executor_owned {
+            let _ = self.quiesce_macro_children_rt(id);
+        } else {
+            if self.macro_child_active_or_pending(id) { self.stop_motion(); }
+            if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
+        }
         let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
         let (code, message) = m.child.timeout.take().unwrap_or_else(|| (
             crate::safety::BoundedText::new("TIMEOUT"),
@@ -1193,11 +1211,20 @@ impl SupervisorInner {
         Ok(duration + crate::motion::SETTLE_MAX_S)
     }
 
-    /// End macro action `id` from its orchestrator (no-op when it already ended).
+    /// End macro action `id` from its orchestrator (no-op when it already ended or is finishing).
     pub fn finish_macro(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
         if !self.macro_alive(id) { return; }
+        self.finish_macro_inner(id, state, code, message, holding, gap);
+    }
+
+    /// Commits a macro terminal transition for `id` (shared by immediate finish and post-TX
+    /// accepted `DeferredCompletionTarget::MacroFinish`, even when `m.finishing == true`).
+    pub(crate) fn finish_macro_inner(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
+        let still_running = self.macro_run.as_ref().is_some_and(|m| m.id == id)
+            && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running());
+        if !still_running { return; }
         if self.rt_executor_owned {
-            self.quiesce_macro_children_rt(id);
+            let _ = self.quiesce_macro_children_rt(id);
         } else if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) {
             self.stop_motion();
         }
@@ -1214,6 +1241,85 @@ impl SupervisorInner {
             }
         }
         self.finish_action(id, state, code, message, None, holding, gap);
+    }
+
+    /// **Single owner-side macro finishing state machine** shared across explicit `FinishMacro`
+    /// and parent `deadline` expiry:
+    /// - Enforces `m.finishing` idempotency (`PARENT_REPLACED` on duplicate finishes while bus hold
+    ///   acceptance is pending).
+    /// - Quiesces active child trajectory/settle/deferred `MacroSub` (preserving gripper measured hold).
+    /// - Defers final terminal commit through `DeferredCompletionTarget::MacroFinish` whenever a
+    ///   driver-backed RT owner quiesced active motion OR has an unaccepted replacement hold.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enter_macro_finish_rt(
+        &mut self,
+        id: u64,
+        state_str: &str,
+        code: Option<&str>,
+        msg_bounded: crate::motion::StepErrorText,
+        legacy_msg: Option<String>,
+        holding: Option<bool>,
+        gripper_gap_rad: Option<f32>,
+        clear_held: bool,
+    ) -> Result<(), &'static str> {
+        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) else {
+            return Err("PARENT_REPLACED");
+        };
+        if run.stop_requested || run.finishing
+            || !self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
+        {
+            return Err("PARENT_REPLACED");
+        }
+        let prev_hold_pending = run.hold_pending_bus_accept;
+        let child_active = self.macro_child_running(id);
+        let quiesced_any = if child_active {
+            self.quiesce_macro_children_rt(id)
+        } else {
+            false
+        };
+        let needs_bus_accept =
+            self.rt_executor_owned && self.driver.is_some() && (quiesced_any || prev_hold_pending);
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
+            m.finishing = true;
+            if needs_bus_accept {
+                m.hold_pending_bus_accept = true;
+            }
+        }
+        if needs_bus_accept {
+            self.pending_deferred_done = Some(super::DeferredActionDone {
+                target: DeferredCompletionTarget::MacroFinish {
+                    action_id: id,
+                    state: crate::model::HolderLabel::new(state_str),
+                    code: code.map(crate::model::HolderLabel::new),
+                    message: msg_bounded,
+                    clear_held,
+                },
+                epoch_id: self.safety.epoch_id(),
+                lease_generation: self.active_lease.as_ref().map(|l| l.generation),
+                settled: None,
+                holding,
+                gripper_gap_rad,
+                clear_releasing: false,
+            });
+            return Ok(());
+        }
+        if clear_held {
+            self.clear_held_rt();
+        }
+        let msg = if self.rt_executor_owned {
+            if !msg_bounded.is_empty() {
+                let mut buf = self.take_action_msg_buf(id, msg_bounded.as_str().len().max(160));
+                buf.clear();
+                buf.push_str(msg_bounded.as_str());
+                Some(buf)
+            } else {
+                None
+            }
+        } else {
+            legacy_msg.or_else(|| (!msg_bounded.is_empty()).then(|| msg_bounded.as_str().to_owned()))
+        };
+        self.finish_macro_inner(id, state_str, code, msg, holding, gripper_gap_rad);
+        Ok(())
     }
 
     /// `/motion/stop`: ends the running macro action now, under the caller's lock, so its
@@ -1510,41 +1616,28 @@ impl SupervisorInner {
             return;
         }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
-            self.expire_macro_child(now);
+            // Check parent whole-macro deadline BEFORE child expiry so child expiry never clears
+            // active trajectory evidence before the parent timeout enters the shared finishing gate.
             let macro_expired = self
                 .macro_run
                 .as_ref()
-                .filter(|m| m.id == id && !m.stop_requested)
+                .filter(|m| m.id == id && !m.stop_requested && !m.finishing)
                 .and_then(|m| m.deadline.filter(|d| now > *d).map(|_| m.timeout_code));
             if let Some(timeout_code) = macro_expired {
-                let pending_finish = self.pending_deferred_done.as_ref().is_some_and(|d| {
-                    matches!(d.target, DeferredCompletionTarget::MacroFinish { action_id, .. } if action_id == id)
-                });
-                if !pending_finish {
-                    let had_traj = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
-                    self.quiesce_macro_children_rt(id);
-                    let code_str = if timeout_code.is_empty() { "TIMEOUT" } else { timeout_code.as_str() };
-                    if self.rt_executor_owned && self.driver.is_some() && had_traj {
-                        self.pending_deferred_done = Some(super::DeferredActionDone {
-                            target: DeferredCompletionTarget::MacroFinish {
-                                action_id: id,
-                                state: crate::model::HolderLabel::new("failed"),
-                                code: Some(crate::model::HolderLabel::new(code_str)),
-                                clear_held: false,
-                            },
-                            epoch_id: self.safety.epoch_id(),
-                            lease_generation: self.active_lease.as_ref().map(|l| l.generation),
-                            settled: None,
-                            holding: None,
-                            gripper_gap_rad: None,
-                            clear_releasing: false,
-                        });
-                        return;
-                    }
-                    self.finish_macro(id, "failed", Some(code_str), None, None, None);
-                    return;
-                }
+                let code_str = if timeout_code.is_empty() { "TIMEOUT" } else { timeout_code.as_str() };
+                let _ = self.enter_macro_finish_rt(
+                    id,
+                    "failed",
+                    Some(code_str),
+                    crate::motion::StepErrorText::empty(),
+                    None,
+                    None,
+                    None,
+                    false,
+                );
+                return;
             }
+            self.expire_macro_child(now);
         }
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let pending_done_for_id = self.pending_deferred_done.as_ref().is_some_and(|d| {

@@ -180,9 +180,11 @@ fn submit_slot_prepared(
             write: &write,
             kind,
             prepared_boot,
+            admission_request_id: 0,
             check_workspace_revision,
             poses_revision,
             calibration_revision: None,
+            gripper_calib_revision: None,
             power_budget_revision,
         }),
     )
@@ -211,6 +213,7 @@ fn submit_child(
             prepared_boot,
             check_workspace_revision,
             calibration_revision: None,
+            gripper_calib_revision: None,
             power_budget_revision: None,
         }),
     )

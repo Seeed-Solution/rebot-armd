@@ -833,7 +833,9 @@ impl CoreOps for SupervisorInner {
                 if n == 0 || n > MAX_DOF {
                     return Err("INVALID_COMMAND");
                 }
-                if !start_matches(&start[..n], &self.commanded_positions) {
+                let mut eff_start = [0.0f32; MAX_DOF];
+                let (eff_dof, _) = self.post_quiesce_commanded_positions(&mut eff_start);
+                if !start_matches(&start[..n], &eff_start[..eff_dof]) {
                     return Err("PLAN_STALE");
                 }
                 self.jog_precheck_static()?;
@@ -1641,14 +1643,25 @@ impl ReleaseEngine {
                 None
             };
             let result = match d.kind {
-                CommandKind::Install { .. } => match t.plan() {
-                    None => Err("PLAN_RETIRED"),
-                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
-                        Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
-                        None => Err("PLAN_RETIRED"),
-                    },
-                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
-                },
+                CommandKind::Install { .. } => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let mixed_a7_child = matches!(self.active, Some(ActiveSlot::Macro { .. }))
+                        && t.plan().is_some_and(|p| p.primitive.child().is_some());
+                    #[cfg(target_arch = "wasm32")]
+                    let mixed_a7_child = false;
+                    if mixed_a7_child {
+                        Err("UNSUPPORTED")
+                    } else {
+                        match t.plan() {
+                            None => Err("PLAN_RETIRED"),
+                            Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
+                                Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
+                                None => Err("PLAN_RETIRED"),
+                            },
+                            Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
+                        }
+                    }
+                }
                 CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
                 CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
                 #[cfg(not(target_arch = "wasm32"))]

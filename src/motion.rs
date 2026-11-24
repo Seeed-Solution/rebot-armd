@@ -1928,6 +1928,78 @@ impl GripperMotion {
         Ok(m)
     }
 
+    /// Zero-allocation RT counterpart of [`Self::try_with_close_speed_limit`] returning a static
+    /// refusal code on invalid speed/quantization (never allocates `String` on `armd-control`).
+    pub fn try_with_close_speed_limit_static(
+        request: GripperRequest,
+        policy: GripperPolicy,
+        limit: JointLimit,
+        start: f32,
+        gripper_index: usize,
+        close_speed_limit: Option<f32>,
+    ) -> Result<Self, &'static str> {
+        let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+        let target = match request.command {
+            GripperCommand::Open => policy.open_rad,
+            GripperCommand::Close => policy.closed_rad,
+            GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
+            GripperCommand::Seek => policy.closed_rad + dir * 0.6,
+        }.clamp(limit.min_position, limit.max_position);
+        let closing = (target - start) * dir > 1e-6;
+        let (planned_speed, max_velocity, planned_vel_raw) = match close_speed_limit {
+            Some(cap) => {
+                if !(cap.is_finite() && cap > 0.0) {
+                    return Err("INVALID_COMMAND");
+                }
+                let max_v = if limit.max_velocity.is_finite() && limit.max_velocity > 0.0 {
+                    f64::from(limit.max_velocity)
+                } else {
+                    request.speed
+                };
+                if closing {
+                    let effective = request.speed.min(max_v).min(f64::from(cap));
+                    let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(effective);
+                    if raw == 0 {
+                        return Err("INVALID_COMMAND");
+                    }
+                    (
+                        f64::from(raw) / 100.0,
+                        crate::model::DamiaoGripperDrive::step_speed_f32(raw),
+                        Some(raw),
+                    )
+                } else {
+                    let effective = request.speed.min(max_v);
+                    if crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(effective) == 0 {
+                        return Err("INVALID_COMMAND");
+                    }
+                    (request.speed, request.speed as f32, None)
+                }
+            }
+            None => (request.speed, request.speed as f32, None),
+        };
+        let limit = JointLimit { max_velocity, ..limit };
+        let mut m = Self {
+            request, policy, limit, target, start, gripper_index, planned_speed, planned_vel_raw,
+            ceiling_torque_estimate_nm: None,
+            elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, still_anchor: None, moved: false, phase: GripPhase::Moving,
+            contact_rad: None,
+            contact_detector: GripperContactDetector::default(),
+            lag_window: GripperProgressWindow::default(),
+            baseline: None, learn: LearnMode::Off, samples: None,
+            last_contact: None, loaded: false, learned: None,
+            extendable: false, hard_timeout_s: 0.0, progress_ref: (0.0, start),
+            window_unloaded: true, cap_k: None,
+        };
+        m.extendable = m.request.timeout_s.is_none();
+        m.timeout_s = m.request.timeout_s.unwrap_or_else(|| m.default_timeout_s());
+        m.hard_timeout_s = if m.extendable {
+            (m.timeout_s + GRIPPER_MAX_EXTENSION_S).min(GRIPPER_MAX_DEFAULT_TIMEOUT_S).max(m.timeout_s)
+        } else {
+            m.timeout_s
+        };
+        Ok(m)
+    }
+
     /// Switch from an explicit caller timeout to the unified derived default deadline.
     pub fn use_default_timeout(&mut self) {
         self.request.timeout_s = None;
@@ -1954,17 +2026,49 @@ impl GripperMotion {
     }
 
     /// Zero-alloc variant of [`Self::with_baseline`] using `Copy` [`crate::gripper_baseline::BaselineData`].
-    pub fn with_baseline_data(mut self, baseline: Option<crate::gripper_baseline::BaselineData>, learn: LearnMode) -> Self {
-        self.baseline = baseline;
+    pub fn with_baseline_data(self, baseline: Option<crate::gripper_baseline::BaselineData>, learn: LearnMode) -> Self {
+        let needs_samples = self.will_record_learning(learn);
+        let samples = needs_samples.then(MoveSamples::default);
+        self.with_baseline_data_and_samples(baseline, learn, samples)
+    }
+
+    /// True if `learn` will record free-motion samples for this move.
+    pub fn will_record_learning(&self, learn: LearnMode) -> bool {
         let closing = (self.target - self.start) * self.close_dir() > 0.0;
         let recorded = match learn {
             LearnMode::Off => false,
             LearnMode::Opening => !closing,
             LearnMode::Calibration => !(closing && self.request.grasp),
         };
-        self.learn = if recorded && self.request.command != GripperCommand::Seek { learn } else { LearnMode::Off };
-        if self.learn != LearnMode::Off { self.samples = Some(MoveSamples::default()); }
+        recorded && self.request.command != GripperCommand::Seek
+    }
+
+    /// Strictly zero-alloc RT variant using a caller-supplied preallocated [`MoveSamples`] buffer.
+    /// If `samples` is `None` when learning would apply, disables recording cleanly rather than allocating.
+    pub fn with_baseline_data_and_samples(
+        mut self,
+        baseline: Option<crate::gripper_baseline::BaselineData>,
+        learn: LearnMode,
+        samples: Option<MoveSamples>,
+    ) -> Self {
+        self.baseline = baseline;
+        if self.will_record_learning(learn) {
+            if let Some(mut buf) = samples {
+                buf.reset();
+                self.learn = learn;
+                self.samples = Some(buf);
+            } else {
+                self.learn = LearnMode::Off;
+            }
+        } else {
+            self.learn = LearnMode::Off;
+        }
         self
+    }
+
+    /// Takes any un-emitted `MoveSamples` buffer for zero-dealloc recycling on `armd-control`.
+    pub(crate) fn take_samples_spare(&mut self) -> Option<MoveSamples> {
+        self.samples.take().or_else(|| self.learned.take().map(|r| r.samples))
     }
 
     /// True when dropping this `GripperMotion` (excluding its enclosing `Box`) would free heap memory.
