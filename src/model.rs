@@ -2720,6 +2720,11 @@ pub struct ArmObservation {
     /// Active or most recent policy-runtime run; omitted when none has run or feature disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyObservation>,
+    /// Reason the lease watchdog held position instead of starting a park (for example
+    /// `"configuration reconciliation active"` or `"configuration hold active"`),
+    /// cleared on fault clear or subsequent park; omitted when null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_park_blocked_reason: Option<HolderLabel>,
     /// Monotonic count of deferred safety log events dropped on overflow (never reset); omitted while zero.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub safety_log_dropped: u64,
@@ -2742,7 +2747,7 @@ impl ArmObservation {
             action: None, previous_action: None, control_mode: ControlMode::default(), gravity_comp: GravityCompObservation::default(),
             driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
-            loads: None, policy: None, safety_log_dropped: 0,
+            loads: None, policy: None, watchdog_park_blocked_reason: None, safety_log_dropped: 0,
             safety_text_spare: SafetyTextSpare(String::new()),
         }
     }
@@ -2774,6 +2779,12 @@ impl ArmObservation {
                     self.safety_text_spare.0.reserve(needed - self.safety_text_spare.0.len());
                 }
             }
+        }
+        if self.gravity_comp.tau_ff.capacity() < 6 {
+            self.gravity_comp.tau_ff.reserve(6 - self.gravity_comp.tau_ff.len());
+        }
+        if self.gravity_comp.damping_kd.capacity() < 6 {
+            self.gravity_comp.damping_kd.reserve(6 - self.gravity_comp.damping_kd.len());
         }
     }
 
@@ -2840,7 +2851,7 @@ impl ArmObservation {
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, safety_log_dropped, safety_text_spare });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, watchdog_park_blocked_reason, safety_log_dropped, safety_text_spare });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]

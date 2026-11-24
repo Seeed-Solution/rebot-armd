@@ -151,11 +151,13 @@ impl SupervisorInner {
 impl ArmSupervisor {
     /// Load the episode catalog (boot recovery) once; later calls do nothing.
     pub async fn ensure_episodes_loaded(&self) -> Result<Option<store::RecoveryReport>, ArmError> {
-        let (st, offsets, names, profile, fps) = {
-            let inner = self.inner().read().await;
-            (inner.episodes.clone(), inner.joint_zero_offsets.clone(), inner.joint_names(), inner.config.profile_id.clone(), f64::from(inner.config.control_frequency_hz))
-        };
+        let pub_cfg = self.published_config().await?;
+        let st = pub_cfg.episodes.clone();
         if !st.enabled() || st.is_loaded() { return Ok(None); }
+        let offsets = pub_cfg.joint_zero_offsets.clone();
+        let names = pub_cfg.joint_names();
+        let profile = pub_cfg.config.profile_id.clone();
+        let fps = f64::from(pub_cfg.config.control_frequency_hz);
         let report = tokio::task::spawn_blocking(move || st.load(&offsets, &names, profile.as_deref(), fps)).await
             .map_err(|e| ArmError::Internal(format!("episode load failed: {e}")))??;
         Ok(Some(report))
@@ -298,6 +300,9 @@ impl ArmSupervisor {
     }
 
     pub async fn episode_store(&self) -> crate::recording::EpisodeStore {
+        if let Ok(pub_cfg) = self.published_config().await {
+            return pub_cfg.episodes.clone();
+        }
         self.inner().read().await.episodes.clone()
     }
 }
@@ -542,10 +547,8 @@ pub async fn lease_free(sup: &Arc<ArmSupervisor>, caller: &Caller, path: &str, b
         }
         "/api/v1/episodes/delete" => {
             let id = required(body, "id")?.to_string();
-            {
-                let inner = sup.inner().read().await;
-                inner.episode_delete_allowed(&id)?;
-                if !inner.episodes.take_for_delete(&id) { return Err(StoreError::NotFound(id).into()); }
+            if !sup.take_episode_for_delete(&id).await? {
+                return Err(StoreError::NotFound(id).into());
             }
             let s2 = st.clone();
             let id2 = id.clone();
@@ -566,17 +569,23 @@ pub async fn lease_free(sup: &Arc<ArmSupervisor>, caller: &Caller, path: &str, b
                 Some(Value::Bool(b)) => *b,
                 Some(_) => return Err(rejected(400, "INVALID_COMMAND", "force must be a boolean")),
             };
-            let ids = st.episodes_of(&name);
-            if force {
-                let inner = sup.inner().read().await;
-                for id in &ids { inner.episode_delete_allowed(id)?; }
-            }
             if inner_recording_dataset(sup, &name).await {
                 return Err(ArmError::detailed(409, "RECORDER_BUSY", "a recording into this dataset is running", json!({})));
             }
-            let s2 = st.clone();
-            let deleted = blocking(move || s2.delete_dataset(&name, force)).await?;
-            Ok(json!({"deleted_episodes": deleted}))
+            if force {
+                let ids = st.episodes_of(&name);
+                if !st.has_dataset(&name) && ids.is_empty() {
+                    return Err(StoreError::DatasetNotFound(name).into());
+                }
+                let taken = sup.take_dataset_episodes_for_delete(&name).await?;
+                let s2 = st.clone();
+                let deleted = blocking(move || s2.delete_dataset_taken_files(&name, &taken)).await?;
+                Ok(json!({"deleted_episodes": deleted}))
+            } else {
+                let s2 = st.clone();
+                let deleted = blocking(move || s2.delete_dataset(&name, false)).await?;
+                Ok(json!({"deleted_episodes": deleted}))
+            }
         }
         _ => Err(rejected(400, "INVALID_COMMAND", "Unknown command")),
     }

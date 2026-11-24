@@ -365,6 +365,7 @@ async fn gate_executor_owner(
                 axum::http::Method::GET | axum::http::Method::HEAD => {
                     path == "/"
                         || path.starts_with("/assets/")
+                        || path.starts_with("/api/v1/sequences/")
                         || matches!(
                             path,
                             "/api/v1/observation"
@@ -372,11 +373,22 @@ async fn gate_executor_owner(
                                 | "/api/v1/diagnostics/boots"
                                 | "/api/v1/diagnostics/blackbox"
                                 | "/api/v1/ws"
+                                | "/api/v1/workspace/keepout"
+                                | "/api/v1/safety/collision"
+                                | "/api/v1/safety/describe"
+                                | "/api/v1/gripper/calibration"
+                                | "/api/v1/poses"
+                                | "/api/v1/sequences"
+                                | "/api/v1/grasp/setup"
+                                | "/api/v1/calibration"
+                                | "/api/v1/tool/commissioning"
                         )
                 }
                 axum::http::Method::POST => matches!(
                     path,
-                    "/api/v1/safety/e_stop" | "/api/v1/diagnostics/tick/mark"
+                    "/api/v1/safety/e_stop"
+                        | "/api/v1/diagnostics/tick/mark"
+                        | "/api/v1/tool/commissioning/confirm"
                 ),
                 _ => false,
             };

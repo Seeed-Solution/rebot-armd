@@ -1906,7 +1906,8 @@ async fn two_phase_persistence_success_and_dir_sync_unconfirmed() {
     assert!(!h.planning_snapshot().unwrap().config_inhibited);
     h.stop_and_join();
 
-    // (b) Dir-sync EIO -> DurableUnconfirmed (warning recorded, live state active, not reconciling).
+    // (b) Dir-sync EIO -> MUST NOT activate: keeps OLD policy active, enters Reconciling
+    //     (motion stays inhibited), fails action with PERSIST_FAILED + durability_warning.
     let dir2 = tempfile::tempdir().unwrap();
     let path2 = dir2.path().join("gripper_calib.json");
     let (sup2, id2) = prepare_zero_check_supervisor(path2.clone()).await;
@@ -1919,11 +1920,17 @@ async fn two_phase_persistence_success_and_dir_sync_unconfirmed() {
         .await
         .unwrap();
     let a2 = wait_action_terminal(&h2, id2).await;
-    assert_eq!(a2.state, "done", "{a2:?}");
+    assert_eq!(a2.state, "failed", "{a2:?}");
+    assert_eq!(a2.code.as_deref(), Some("PERSIST_FAILED"), "{a2:?}");
     assert_eq!(a2.durability_confirmed, Some(false), "{a2:?}");
     assert!(a2.durability_warning.as_deref().unwrap_or("").contains("simulated EIO"), "{a2:?}");
-    assert!(path2.exists());
-    assert!(!h2.planning_snapshot().unwrap().config_inhibited);
+    assert!(path2.exists(), "rename happened before dir-sync failure");
+    assert!(
+        h2.planning_snapshot().unwrap().config_inhibited,
+        "dir-sync failure must enter Reconciling and keep motion inhibited"
+    );
+    let pub2 = sup2.published_config().await.unwrap();
+    assert_eq!(pub2.gripper_calib_offset, None, "old policy must remain active after dir-sync failure");
     h2.stop_and_join();
 }
 
@@ -1957,11 +1964,11 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     assert!(!h_c.planning_snapshot().unwrap().config_inhibited, "hold must be Cleared, not Reconciling");
     h_c.stop_and_join();
 
-    // (d) Post-rename revocation: barrier after grant before rename -> trigger E-stop -> allow rename ->
-    // disk has file, live policy unchanged, hold enters Reconciling (`config_inhibited == true`).
+    // (d1) Pre-rename revocation (fresh owner VerifyAuthority before rename): barrier after grant
+    // before rename -> trigger E-stop -> allow VerifyAuthority -> file NOT renamed, hold Cleared!
     let dir_d = tempfile::tempdir().unwrap();
     let path_d = dir_d.path().join("gripper_calib.json");
-    let (sup_d, _id_d) = prepare_zero_check_supervisor(path_d.clone()).await;
+    let (sup_d, id_d) = prepare_zero_check_supervisor(path_d.clone()).await;
     let (at_barrier_tx, at_barrier_rx) = mpsc::sync_channel::<()>(1);
     let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
     let go_rx = Arc::new(Mutex::new(go_rx));
@@ -1980,12 +1987,44 @@ async fn two_phase_persistence_revocation_before_and_after_rename_and_disconnect
     at_barrier_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     sup_d.trigger_e_stop_checked().await.unwrap();
     go_tx.send(()).unwrap();
+    let a_d = wait_action_terminal(&h_d, id_d).await;
+    assert!(matches!(a_d.state.as_str(), "failed" | "cancelled"), "{a_d:?}");
     wait_until_async(Duration::from_secs(2), || {
-        h_d.planning_snapshot().is_ok_and(|s| s.config_inhibited)
+        h_d.planning_snapshot().is_ok_and(|s| !s.config_inhibited)
     })
     .await;
-    assert!(path_d.exists(), "rename happened before post-rename revocation");
+    assert!(!path_d.exists(), "pre-rename VerifyAuthority must abort before rename");
     h_d.stop_and_join();
+
+    // (d2) Post-rename revocation: barrier after rename + dir-sync before activate -> trigger E-stop ->
+    // allow activate -> disk has file, live policy unchanged, hold enters Reconciling.
+    let dir_d2 = tempfile::tempdir().unwrap();
+    let path_d2 = dir_d2.path().join("gripper_calib.json");
+    let (sup_d2, _id_d2) = prepare_zero_check_supervisor(path_d2.clone()).await;
+    let (at_b2_tx, at_b2_rx) = mpsc::sync_channel::<()>(1);
+    let (go2_tx, go2_rx) = mpsc::sync_channel::<()>(1);
+    let go2_rx = Arc::new(Mutex::new(go2_rx));
+    let hooks_d2 = PersistTestHooks {
+        after_rename_before_activate: Some(Arc::new(move || {
+            let _ = at_b2_tx.send(());
+            let _ = go2_rx.lock().unwrap().recv();
+            false
+        })),
+        ..Default::default()
+    };
+    let h_d2 = sup_d2
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks_d2)
+        .await
+        .unwrap();
+    at_b2_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    sup_d2.trigger_e_stop_checked().await.unwrap();
+    go2_tx.send(()).unwrap();
+    wait_until_async(Duration::from_secs(2), || {
+        h_d2.planning_snapshot().is_ok_and(|s| s.config_inhibited)
+    })
+    .await;
+    assert!(path_d2.exists(), "rename happened before post-rename revocation");
+    h_d2.stop_and_join();
 
     // (e) Worker disconnect BEFORE rename -> hold enters Reconciling, action fails PERSIST_FAILED.
     let dir_e = tempfile::tempdir().unwrap();
@@ -2185,7 +2224,14 @@ async fn off_thread_reclamation_and_diagnostics_under_paused_dispatcher() {
         let probe = Box::new(DropProbe { dropped_on: dropped_on.clone() });
         handle.probe_owned_payload(probe).expect("probe maintenance op succeeds while dispatcher paused");
         if i % 4 == 0 {
-            handle.set_joint_zero_offsets(vec![0.0; 7]).unwrap().unwrap();
+            let err = handle
+                .set_joint_zero_offsets(vec![0.0; 7])
+                .unwrap()
+                .expect_err("joint zero must be refused on RT executor");
+            assert!(
+                err.contains("EXECUTOR_UNSUPPORTED"),
+                "expected EXECUTOR_UNSUPPORTED refusal, got: {err}"
+            );
         }
     }
     let tids = dropped_on.lock().unwrap().clone();

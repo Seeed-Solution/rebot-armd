@@ -1324,7 +1324,13 @@ pub fn kinematics_armed(inner: &SupervisorInner) -> Result<(), CalibError> {
 
 /// Under the lock, before a transaction: no other transaction, the arm idle.
 pub fn begin_checks(inner: &SupervisorInner) -> Result<(), CalibError> {
-    if inner.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply or restore is running")); }
+    if inner.calibration_busy || inner.core.config().held().is_some() {
+        return Err(CalibError::new(
+            409,
+            "CONFIG_BUSY",
+            "a calibration apply, restore, or configuration change is running",
+        ));
+    }
     if let Some(reason) = inner.workspace_change_blocker() {
         return Err(CalibError::new(409, "MOTION_BUSY", format!("the camera calibration cannot change while {reason}")));
     }
@@ -1772,6 +1778,13 @@ fn diff_view(vision: &Value, state: &ArmdState, inner: &SupervisorInner) -> Valu
 /// `/api/v1/calibration/apply` after [`begin_checks`] (the caller set `calibration_busy` for a
 /// real apply and clears it afterwards). `dry_run` returns `{before, after}` and writes nothing.
 pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
+    if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            "/api/v1/calibration/apply is not available while the RT executor owns the arm; use the legacy owner",
+        ));
+    }
     let (before, after) = {
         let inner = sup.inner().read().await;
         (armd_state(&inner), after_state(&inner, &req)?)
@@ -1785,8 +1798,11 @@ pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyR
         let inner = sup.inner().read().await;
         return Ok(json!({"dry_run": true, "before": diff_view(&vision_before, &before, &inner), "after": diff_view(&Value::Object(va), &after, &inner)}));
     }
+    let zero_guard = crate::rt_core::requests::config::LegacyZeroReservationGuard::try_acquire(sup).await?;
     let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None, durability_warnings: Vec::new() };
-    let mut out = txn.run("apply", &req.intrinsics, &after).await?;
+    let res = txn.run("apply", &req.intrinsics, &after).await;
+    zero_guard.release().await;
+    let mut out = res?;
     out["grip_pixel_model"] = json!(after.grip_pixel_model);
     tracing::info!("Camera calibration applied (backup {})", out["backup"].as_str().unwrap_or(""));
     Ok(out)
@@ -1795,6 +1811,20 @@ pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyR
 /// `/api/v1/calibration/restore {backup}`: put a backup back (rebot-vision intrinsics, armd's
 /// camera mount / calibration.json, grasp setup), with a new backup first and the same revert.
 pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Value, check: &LeaseCheck) -> Result<Value, CalibError> {
+    if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            "/api/v1/calibration/restore is not available while the RT executor owns the arm; use the legacy owner",
+        ));
+    }
+    let zero_guard = crate::rt_core::requests::config::LegacyZeroReservationGuard::try_acquire(sup).await?;
+    let res = restore_reserved(sup, deps, body, check).await;
+    zero_guard.release().await;
+    res
+}
+
+async fn restore_reserved(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Value, check: &LeaseCheck) -> Result<Value, CalibError> {
     let name = body.get("backup").and_then(Value::as_str)
         .filter(|n| !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .ok_or_else(|| CalibError::invalid("backup must be the name of a backup (GET /api/v1/calibration)"))?.to_string();
@@ -1940,32 +1970,113 @@ pub fn verification_view(inner: &SupervisorInner) -> Value {
         "table_z_source": c.and_then(|c| c.table_z_source.as_deref()).unwrap_or(if c.is_some_and(CalibrationFile::has_camera) { "camera" } else { "none" })})
 }
 
+/// Published-config counterpart of [`stale_list`] (zero `SupervisorLock`).
+pub fn stale_list_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(st) = pub_cfg
+        .calibration
+        .as_ref()
+        .filter(|c| c.has_camera())
+        .and_then(|c| c.stale.as_ref())
+    {
+        out.push(json!({"item": "camera", "reason": st.reason, "at": st.at}));
+    }
+    let stale: Vec<_> = pub_cfg
+        .poses
+        .list
+        .poses
+        .iter()
+        .filter(|p| p.stale.is_some())
+        .collect();
+    if let Some(first) = stale.first().and_then(|p| p.stale.as_ref()) {
+        out.push(json!({"item": "poses", "reason": first.reason, "at": first.at, "names": stale.iter().map(|p| &p.name).collect::<Vec<_>>()}));
+    }
+    if let Some(st) = &pub_cfg.gripper_calib_stale {
+        out.push(json!({"item": "gripper_calibration", "reason": st.reason, "at": st.at}));
+    }
+    out
+}
+
+/// Published-config counterpart of [`verification_view`] (zero `SupervisorLock`).
+pub fn verification_view_from_published(
+    pub_cfg: &crate::rt_core::requests::config::PublishedConfig,
+) -> Value {
+    let (x_fp, fp) = file_fingerprints(
+        pub_cfg.calibration.as_ref(),
+        &pub_cfg.config.camera_mount,
+        &pub_cfg.joint_zero_offsets,
+        Some(&pub_cfg.config.active_tool.config_digest),
+    );
+    let legacy_fp = legacy_file_fingerprint(
+        pub_cfg.calibration.as_ref(),
+        &pub_cfg.config.camera_mount,
+        &pub_cfg.joint_zero_offsets,
+    );
+    let c = pub_cfg.calibration.as_ref();
+    let tool_ok = c.is_some_and(|c| tool_valid_for(c, &x_fp, &pub_cfg.config.active_tool));
+    let tip_end = c
+        .and_then(|c| c.tool.as_ref())
+        .filter(|_| tool_ok)
+        .and_then(|t| {
+            let m = &pub_cfg.config.camera_mount;
+            let (q, o) = (m.q_end_cam?, m.offset_m?);
+            let r = crate::kinematics::quat_to_r(&q);
+            let p = crate::kinematics::mat_vec(&r, &t.tip_cam_m);
+            Some([p[0] + f64::from(o[0]), p[1] + f64::from(o[1]), p[2] + f64::from(o[2])])
+        });
+    json!({"x_fingerprint": x_fp, "fingerprint": fp, "tool_valid": tool_ok, "tip_end_m": tip_end,
+        "acceptance_valid": c.is_some_and(|c| acceptance_valid_for_with_legacy(c, &fp, Some(&legacy_fp), &pub_cfg.config.active_tool)),
+        "table_z_source": c.and_then(|c| c.table_z_source.as_deref()).unwrap_or(if c.is_some_and(CalibrationFile::has_camera) { "camera" } else { "none" })})
+}
+
+/// `GET /api/v1/calibration` from published configuration state (zero `SupervisorLock` in Executor).
+pub async fn status_result(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Result<Value, crate::supervisor::ArmError> {
+    let pub_cfg = sup.published_config().await?;
+    let (_, fp) = file_fingerprints(
+        pub_cfg.calibration.as_ref(),
+        &pub_cfg.config.camera_mount,
+        &pub_cfg.joint_zero_offsets,
+        Some(&pub_cfg.config.active_tool.config_digest),
+    );
+    let legacy_fp = legacy_file_fingerprint(
+        pub_cfg.calibration.as_ref(),
+        &pub_cfg.config.camera_mount,
+        &pub_cfg.joint_zero_offsets,
+    );
+    Ok(json!({
+        "calibrated": pub_cfg.camera_calibrated(),
+        "busy": pub_cfg.calibration_busy,
+        "load_error": pub_cfg.calibration_load_error,
+        "path": deps.path.display().to_string(),
+        "backup_dir": deps.backup_dir.display().to_string(),
+        "calibration": pub_cfg.calibration,
+        "camera_mount": mount_summary(&pub_cfg.config.camera_mount),
+        "kinematics_correction": pub_cfg.config.arm_model.correction(),
+        "stale": pub_cfg.calibration.as_ref().and_then(|c| c.stale.as_ref()),
+        "stale_list": stale_list_from_published(&pub_cfg),
+        "joint_zero": pub_cfg.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()),
+        "joint_zero_offsets": pub_cfg.joint_zero_offsets,
+        "zero_reference": pub_cfg.config.zero_reference,
+        "zero_convention": pub_cfg.config.zero_reference.as_ref().map(|_| &pub_cfg.zero_convention),
+        "calibration_tools": pub_cfg.calibration_tools(),
+        "calibration_tool": pub_cfg.config.calibration_tool,
+        "active_tool": pub_cfg.config.active_tool,
+        "verification": verification_view_from_published(&pub_cfg),
+        "floor": pub_cfg.profile_floor_z_m.map(|p| floor_view_for_with_legacy(p, pub_cfg.calibration.as_ref(), &fp, Some(&legacy_fp), &pub_cfg.config.active_tool)),
+        "grasp": pub_cfg.grasp_setup().map(|s| grasp_fields(&s)),
+        "grasp_revision": pub_cfg.grasp_setup_revision,
+        "backups": list_backups(deps)
+    }))
+}
+
 /// `GET /api/v1/calibration`.
 pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
-    let inner = sup.inner().read().await;
-    let (_, fp) = live_fingerprints(&inner);
-    let legacy_fp = legacy_file_fingerprint(
-        inner.calibration.as_ref(),
-        &inner.config.camera_mount,
-        &inner.joint_zero_offsets,
-    );
-    json!({"calibrated": inner.camera_calibrated(), "busy": inner.calibration_busy, "load_error": inner.calibration_load_error,
-        "path": deps.path.display().to_string(), "backup_dir": deps.backup_dir.display().to_string(),
-        "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
-        "kinematics_correction": inner.config.arm_model.correction(),
-        "stale": inner.calibration.as_ref().and_then(|c| c.stale.as_ref()),
-        "stale_list": stale_list(&inner),
-        "joint_zero": inner.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()),
-        "joint_zero_offsets": inner.joint_zero_offsets,
-        "zero_reference": inner.config.zero_reference,
-        "zero_convention": inner.config.zero_reference.as_ref().map(|_| &inner.zero_convention),
-        "calibration_tools": inner.calibration_tools(),
-        "calibration_tool": inner.config.calibration_tool,
-        "active_tool": inner.config.active_tool,
-        "verification": verification_view(&inner),
-        "floor": inner.profile_floor_z_m.map(|p| floor_view_for_with_legacy(p, inner.calibration.as_ref(), &fp, Some(&legacy_fp), &inner.config.active_tool)),
-        "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "grasp_revision": inner.grasp_setup_revision,
-        "backups": list_backups(deps)})
+    match status_result(sup, deps).await {
+        Ok(v) => v,
+        Err(e) => json!({"error": e.to_string()}),
+    }
 }
 
 /// Before a zero of `joints` (1-based) is written: mark an MIT qualification record that holds

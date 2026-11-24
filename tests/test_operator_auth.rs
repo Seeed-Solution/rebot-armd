@@ -690,8 +690,9 @@ async fn keepout_motion_between_stage_and_publish_leaves_disk_and_memory_unchang
     )
     .await;
 
-    // Wait briefly so the config write task acquires cw_lock and enters StagedWrite::stage,
-    // then start a motion (jog) before publish acquires sup.inner().write().
+    // Wait briefly so the config write task reserves Keepout (inhibiting motion) and enters
+    // StagedWrite::stage; a concurrent motion (jog) MUST be refused CONFIG_BUSY while the
+    // reservation is held, and keepout then commits cleanly at revision 2.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let mut target = INSPECT.to_vec();
     target[0] += 0.2;
@@ -708,11 +709,12 @@ async fn keepout_motion_between_stage_and_publish_leaves_disk_and_memory_unchang
         &["command_ack", "command_reject"],
     )
     .await;
-    assert_eq!(jog_reply["type"], "command_ack", "{jog_reply}");
+    assert_eq!(jog_reply["type"], "command_reject", "{jog_reply}");
+    assert_eq!(jog_reply["code"], "CONFIG_BUSY", "{jog_reply}");
 
     // Now read the delayed keepout reply (request_id 500_001).
     use futures_util::StreamExt;
-    let reject = tokio::time::timeout(Duration::from_secs(5), async {
+    let ack = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
             let msg: Value = serde_json::from_str(&text).unwrap();
@@ -725,18 +727,18 @@ async fn keepout_motion_between_stage_and_publish_leaves_disk_and_memory_unchang
     .unwrap();
     armd::persist::TEST_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
 
-    assert_eq!(reject["type"], "command_reject", "{reject}");
-    assert_eq!(reject["code"], "MOTION_BUSY", "{reject}");
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    assert_eq!(ack["revision"], 2, "{ack}");
 
-    // Memory, official file on disk, and a fresh reload must all keep ONLY old_box.
+    // Memory, official file on disk, and a fresh reload must all hold new_box at revision 2.
     let ko_mem: Value = client.get(format!("{base}/api/v1/workspace/keepout")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(ko_mem["revision"], 1);
+    assert_eq!(ko_mem["revision"], 2);
     assert_eq!(ko_mem["boxes"].as_array().unwrap().len(), 1);
-    assert_eq!(ko_mem["boxes"][0]["name"], "old_box");
+    assert_eq!(ko_mem["boxes"][0]["name"], "new_box");
 
     let disk: Value = serde_json::from_str(&std::fs::read_to_string(&keepout_path).unwrap()).unwrap();
     assert_eq!(disk["boxes"].as_array().unwrap().len(), 1);
-    assert_eq!(disk["boxes"][0]["name"], "old_box");
+    assert_eq!(disk["boxes"][0]["name"], "new_box");
 
     // No temp files left behind
     let files: Vec<String> = std::fs::read_dir(dir.path())
@@ -749,7 +751,39 @@ async fn keepout_motion_between_stage_and_publish_leaves_disk_and_memory_unchang
     armd::keepout::load_into(&fresh_sup, &keepout_path).await.unwrap();
     let fresh_state = fresh_sup.inner().read().await.keepout_state();
     assert_eq!(fresh_state.boxes.len(), 1);
-    assert_eq!(fresh_state.boxes[0].name, "old_box");
+    assert_eq!(fresh_state.boxes[0].name, "new_box");
+
+    // Once keepout activation completes, motion is eligible again and a keepout write while
+    // actively moving is refused MOTION_BUSY leaving disk and memory unchanged.
+    let jog_ok = common::ws_reply(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": 500_003,
+            "generation": g,
+            "epoch_id": epoch,
+            "path": "/api/v1/motion/jog",
+            "body": {"target_positions": target}
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(jog_ok["type"], "command_ack", "{jog_ok}");
+    let reject = common::ws_reply(
+        &mut ws,
+        json!({
+            "type": "command",
+            "request_id": 500_004,
+            "generation": g,
+            "epoch_id": epoch,
+            "path": "/api/v1/workspace/keepout",
+            "body": {"boxes": [old_box], "expected_revision": 2}
+        }),
+        &["command_ack", "command_reject"],
+    )
+    .await;
+    assert_eq!(reject["type"], "command_reject", "{reject}");
+    assert_eq!(reject["code"], "MOTION_BUSY", "{reject}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

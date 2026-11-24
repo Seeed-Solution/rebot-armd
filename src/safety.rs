@@ -1069,6 +1069,7 @@ pub enum ClearRefusal {
     EStopActive,
     ShutdownCommitted,
     DriverConfigError(BoundedText<256>),
+    ConfigPersistenceFailed(BoundedText<256>),
     GravityCompUnconfirmed,
     DisablePending,
     MitLostUnsupported,
@@ -1118,6 +1119,7 @@ impl std::fmt::Display for ClearRefusal {
             Self::EStopActive => f.write_str("E-Stop is latched, motion rejected"),
             Self::ShutdownCommitted => f.write_str("Daemon shutdown is committed"),
             Self::DriverConfigError(err) => write!(f, "Driver limit configuration error: {err}"),
+            Self::ConfigPersistenceFailed(err) => write!(f, "Configuration persistence reconciliation failed: {err}"),
             Self::GravityCompUnconfirmed => f.write_str("Gravity compensation: the switch back to POS_VEL is not confirmed yet"),
             Self::DisablePending => f.write_str("Torque disable is still unconfirmed"),
             Self::MitLostUnsupported => f.write_str("UNSUPPORTED: MIT lost recovery requires legacy path"),
@@ -1154,6 +1156,7 @@ pub struct ClearContext {
     pub pending_estop: bool,
     pub shutdown_committed: bool,
     pub driver_config_error: Option<BoundedText<256>>,
+    pub config_reconcile_fault: Option<BoundedText<256>>,
     pub gravity_comp_unconfirmed: bool,
     pub disable_pending: bool,
     pub has_driver: bool,
@@ -1195,6 +1198,7 @@ impl ClearContext {
             pending_estop: false,
             shutdown_committed: false,
             driver_config_error: None,
+            config_reconcile_fault: None,
             gravity_comp_unconfirmed: false,
             disable_pending: false,
             has_driver: false,
@@ -2077,6 +2081,9 @@ impl SafetyManager {
         }
         if let Some(err) = ctx.driver_config_error {
             return Err(ClearRefusal::DriverConfigError(err));
+        }
+        if let Some(err) = ctx.config_reconcile_fault {
+            return Err(ClearRefusal::ConfigPersistenceFailed(err));
         }
         if ctx.gravity_comp_unconfirmed {
             return Err(ClearRefusal::GravityCompUnconfirmed);

@@ -644,6 +644,21 @@ impl SupervisorInner {
     /// [`WATCHDOG_PARK_SETTLE_GRACE`]; otherwise torque is held and WatchdogTimeout latched.
     pub(super) fn supervise_watchdog_park(&mut self, dt: f64) {
         let Some(mut park) = self.watchdog_park.take() else { return; };
+        if let Some(held) = self.core.config().held() {
+            let msg = if held.state == crate::rt_core::config_iface::HoldState::Reconciling {
+                "configuration reconciliation active"
+            } else {
+                "configuration hold active"
+            };
+            let reason = crate::safety::BoundedText::new(msg);
+            self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(msg));
+            self.safety.log_watchdog_park_blocked(reason);
+            self.stop_motion();
+            if self.is_torqued {
+                self.latch_watchdog_fault();
+            }
+            return;
+        }
         if !self.pending_normal_unload {
             tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
             if self.is_torqued {
@@ -675,6 +690,14 @@ impl SupervisorInner {
     /// watchdog expires. Returns the reason the park is not allowed, or `None` when it is.
     pub(super) fn watchdog_park_blocker_bounded(&self) -> Option<crate::safety::BoundedText<160>> {
         use crate::safety::BoundedText;
+        if let Some(held) = self.core.config().held() {
+            let msg = if held.state == crate::rt_core::config_iface::HoldState::Reconciling {
+                "configuration reconciliation active"
+            } else {
+                "configuration hold active"
+            };
+            return Some(BoundedText::new(msg));
+        }
         let Some(policy) = &self.config.resting_pose else {
             return Some(BoundedText::new("no resting pose configured"));
         };
@@ -1269,24 +1292,34 @@ impl SupervisorInner {
     }
 
     /// Why the workspace rule may not change now: a motion, macro, stream or park is
+    /// running (each was checked against the current rule). Zero-allocation static variant.
+    pub(crate) fn workspace_change_blocker_static(&self) -> Option<&'static str> {
+        if self.macro_run.is_some() { return Some("a macro action is running"); }
+        if self.pending_normal_unload { return Some("a park is running"); }
+        self.busy_reason_static()
+    }
+
+    pub(crate) fn busy_reason_static(&self) -> Option<&'static str> {
+        if self.calibration_busy { return Some("a calibration apply is running"); }
+        if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted"); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading { return Some("a policy is loading"); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() { return Some("a policy run is active"); }
+        if self.active_trajectory.is_some() { return Some("a trajectory is running"); }
+        if self.servo_target.is_some() { return Some("servo streaming is active"); }
+        if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving"); }
+        None
+    }
+
+    /// Why the workspace rule may not change now: a motion, macro, stream or park is
     /// running (each was checked against the current rule).
     pub fn workspace_change_blocker(&self) -> Option<String> {
-        if self.macro_run.is_some() { return Some("a macro action is running".into()); }
-        if self.pending_normal_unload { return Some("a park is running".into()); }
-        self.busy_reason()
+        self.workspace_change_blocker_static().map(String::from)
     }
 
     pub(super) fn busy_reason(&self) -> Option<String> {
-        if self.calibration_busy { return Some("a calibration apply is running".into()); }
-        if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted".into()); }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_loading { return Some("a policy is loading".into()); }
-        #[cfg(feature = "policy-runtime")]
-        if self.policy_run.is_some() { return Some("a policy run is active".into()); }
-        if self.active_trajectory.is_some() { return Some("a trajectory is running".into()); }
-        if self.servo_target.is_some() { return Some("servo streaming is active".into()); }
-        if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving".into()); }
-        None
+        self.busy_reason_static().map(String::from)
     }
 
     /// Snapshot for planning a Cartesian action outside the lock (default [`crate::motion::GoalFrame::EndLink`]).
