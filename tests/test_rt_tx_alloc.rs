@@ -991,6 +991,7 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
         let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits.clone())
             .unwrap();
+        driver.check_mapping_ranges();
         driver.set_rt_mode(true);
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
         inner.lease_enabled = false;
