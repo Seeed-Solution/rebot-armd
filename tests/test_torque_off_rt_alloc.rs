@@ -91,11 +91,13 @@ impl Motor {
 
 struct BusState {
     motors: [Motor; 7],
+    ctrl_modes: [u32; 7],
     rx: VecDeque<(CanFrame, Option<std::time::Instant>)>,
     clock: Arc<MockClock>,
     tx_would_block: bool,
     silent_disable: bool,
     drop_enable_mask: u8,
+    mit_tx_count: u64,
 }
 
 impl BusState {
@@ -126,11 +128,13 @@ impl ZeroAllocBus {
         });
         Self(Arc::new(Mutex::new(BusState {
             motors,
+            ctrl_modes: [damiao::CTRL_MODE_POS_VEL; 7],
             rx: VecDeque::with_capacity(256),
             clock,
             tx_would_block: false,
             silent_disable: false,
             drop_enable_mask: 0,
+            mit_tx_count: 0,
         })))
     }
 
@@ -166,9 +170,10 @@ impl CanTransport for ZeroAllocBus {
         if frame.id == 0x7FF && frame.data[2] == damiao::REG_READ {
             let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             let rid = frame.data[3];
-            if let Some(m) = s.motors.iter().find(|m| m.id == id) {
+            if let Some((idx, m)) = s.motors.iter().enumerate().find(|(_, m)| m.id == id) {
+                let ctrl_mode = s.ctrl_modes[idx];
                 let val: Option<[u8; 4]> = match rid {
-                    damiao::RID_CTRL_MODE => Some(damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+                    damiao::RID_CTRL_MODE => Some(ctrl_mode.to_le_bytes()),
                     damiao::RID_PMAX => Some(m.limits.p_max.to_le_bytes()),
                     damiao::RID_VMAX => Some(m.limits.v_max.to_le_bytes()),
                     damiao::RID_TMAX => Some(m.limits.t_max.to_le_bytes()),
@@ -186,6 +191,24 @@ impl CanTransport for ZeroAllocBus {
             }
             return Ok(());
         }
+        if frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
+            let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+            let rid = frame.data[3];
+            let v = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+            if let Some(idx) = s.motors.iter().position(|m| m.id == id) {
+                if rid == damiao::RID_CTRL_MODE {
+                    s.ctrl_modes[idx] = u32::from_le_bytes(v);
+                }
+                let [lo, hi] = id.to_le_bytes();
+                let reply = CanFrame::new_standard(
+                    0x10 + id,
+                    &[lo, hi, damiao::REG_WRITE, rid, v[0], v[1], v[2], v[3]],
+                )
+                .unwrap();
+                s.rx.push_back((reply, Some(now)));
+            }
+            return Ok(());
+        }
         if let Some((idx, m)) = s.motors.iter_mut().enumerate().find(|(_, m)| u32::from(m.id) == frame.id) {
             if frame.data == damiao::CMD_ENABLE {
                 if (drop_enable_mask & (1 << idx)) == 0 {
@@ -196,6 +219,11 @@ impl CanTransport for ZeroAllocBus {
             } else if frame.data == damiao::CMD_DISABLE && !silent_disable {
                 m.enabled = false;
                 let f = m.feedback_frame();
+                s.rx.push_back((f, Some(now)));
+            } else if frame.data != damiao::CMD_DISABLE {
+                // MIT control / hold frame on standard motor CAN ID.
+                let f = m.feedback_frame();
+                s.mit_tx_count += 1;
                 s.rx.push_back((f, Some(now)));
             }
             return Ok(());
@@ -679,4 +707,354 @@ fn rt_enable_failure_with_motor_fault_and_failed_hold_ticks_zero_alloc() {
             );
         }
     }
+}
+
+/// Rule R1 (part 1): Hold capture uses data the owner already has, NOT the driver mutex, and
+/// performs strictly 0 heap allocations and 0 frees.
+/// Proves lock-freedom by poisoning `inner.driver`'s mutex after `poll_hardware_rx` populates
+/// `owner_driver_snapshot` — if `snapshot_measured_hold_with_invalidated()` acquired `inner.driver`,
+/// `PoisonError` would return mask 0 instead of `0b111_1111`.
+#[test]
+fn r1_hold_capture_uses_owner_snapshot_without_driver_mutex_zero_alloc() {
+    let (mut fx, _b, bus, clock) = build_armed_fixture(0.35);
+    bus.with(|s| s.push_all_feedback());
+    fx.step();
+    clock.advance(RELEASE);
+
+    // Poison `inner.driver` so any attempt to lock `self.driver` during hold capture would fail.
+    let _ = std::thread::scope(|s| {
+        let drv = fx.core.driver.as_ref().expect("driver attached");
+        s.spawn(move || {
+            let _guard = drv.lock().unwrap();
+            panic!("intentional poison to prove hold capture never locks driver mutex");
+        })
+        .join()
+    });
+    assert!(
+        fx.core.driver.as_ref().unwrap().is_poisoned(),
+        "driver mutex must be poisoned before testing lock-free hold capture"
+    );
+
+    let ((hold_mask, _invalidated), a, f) =
+        counted(|| fx.core.snapshot_measured_hold_with_invalidated());
+    assert_eq!(
+        hold_mask, 0b111_1111,
+        "R1: hold capture must use owner-held snapshot (all 7 joints eligible without locking driver mutex)"
+    );
+    assert_eq!(
+        (a, f),
+        (0, 0),
+        "R1: lock-free owner hold capture must perform strictly 0 allocs and 0 frees"
+    );
+}
+
+fn feetech_sync_read_reply_bytes(ids: &[u8], steps: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (&id, &pos) in ids.iter().zip(steps.iter()) {
+        let [lo, hi] = pos.to_le_bytes();
+        // 8-byte status payload: pos_l, pos_h, vel_l, vel_h, load_l, load_h, volt, temp
+        let params = [lo, hi, 0, 0, 0, 0, 120, 30];
+        let length = (params.len() + 2) as u8;
+        let checksum = armd::protocol::feetech::calculate_checksum(id, length, 0, &params);
+        out.extend_from_slice(&armd::protocol::feetech::FEETECH_HEADER);
+        out.push(id);
+        out.push(length);
+        out.push(0); // error = 0
+        out.extend_from_slice(&params);
+        out.push(checksum);
+    }
+    out
+}
+
+/// Rule R1 (part 2): Feetech `FailedHold` uses preallocated buffers for positions and the
+/// `SYNC_WRITE` packet and performs strictly 0 heap allocations and 0 frees.
+#[test]
+fn r1_feetech_failed_hold_zero_alloc() {
+    use armd::driver::{FeetechArmDriver, JointHoldStatus, JointTarget};
+
+    let clock = Arc::new(MockClock::new());
+
+    // 6-DOF zero-alloc Feetech transport that answers chunk 1 ([1,2,3]) and chunk 2 ([4,5,6])
+    // from pre-encoded fixed buffers on SYNC_READ without any heap allocation.
+    #[derive(Clone)]
+    struct ZeroAllocFeetechBus {
+        clock: Arc<MockClock>,
+        state: Arc<Mutex<ZeroAllocFeetechBusState>>,
+    }
+    struct ZeroAllocFeetechBusState {
+        chunk1_reply: [u8; 64],
+        chunk1_len: usize,
+        chunk2_reply: [u8; 64],
+        chunk2_len: usize,
+        rx: [u8; 128],
+        rx_head: usize,
+        rx_tail: usize,
+        last_tx: [u8; 128],
+        last_tx_len: usize,
+        sync_write_count: u64,
+    }
+    impl armd::transport::Transport for ZeroAllocFeetechBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(self.clock.clone() as Arc<dyn DriverClock>)
+        }
+        fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+            self.write_all(data)?;
+            Ok(data.len())
+        }
+        fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
+            let mut s = self.state.lock().unwrap();
+            let copy = data.len().min(s.last_tx.len());
+            s.last_tx[..copy].copy_from_slice(&data[..copy]);
+            s.last_tx_len = copy;
+            if data.len() >= 5 && data[4] == armd::protocol::feetech::INST_SYNC_WRITE {
+                s.sync_write_count += 1;
+            } else if data.len() >= 8 && data[4] == armd::protocol::feetech::INST_SYNC_READ {
+                // First servo ID in SYNC_READ params is at byte 7.
+                let first_id = data[7];
+                let (src_len, is_chunk1) = if first_id == 1 {
+                    (s.chunk1_len, true)
+                } else {
+                    (s.chunk2_len, false)
+                };
+                s.rx_head = 0;
+                s.rx_tail = src_len;
+                for i in 0..src_len {
+                    s.rx[i] = if is_chunk1 { s.chunk1_reply[i] } else { s.chunk2_reply[i] };
+                }
+            }
+            Ok(())
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            let mut s = self.state.lock().unwrap();
+            let avail = s.rx_tail.saturating_sub(s.rx_head);
+            if avail == 0 {
+                drop(s);
+                self.clock.advance(Duration::from_millis(1));
+                return Ok(0);
+            }
+            let n = avail.min(buf.len());
+            buf[..n].copy_from_slice(&s.rx[s.rx_head..s.rx_head + n]);
+            s.rx_head += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
+        fn clear_input_buffer(&mut self) {
+            let mut s = self.state.lock().unwrap();
+            s.rx_head = 0;
+            s.rx_tail = 0;
+        }
+    }
+
+    let c1 = feetech_sync_read_reply_bytes(&[1, 2, 3], &[2048, 2100, 1980]);
+    let c2 = feetech_sync_read_reply_bytes(&[4, 5, 6], &[2000, 2050, 2090]);
+    let mut c1_arr = [0u8; 64];
+    c1_arr[..c1.len()].copy_from_slice(&c1);
+    let mut c2_arr = [0u8; 64];
+    c2_arr[..c2.len()].copy_from_slice(&c2);
+
+    let bus = ZeroAllocFeetechBus {
+        clock: clock.clone(),
+        state: Arc::new(Mutex::new(ZeroAllocFeetechBusState {
+            chunk1_reply: c1_arr,
+            chunk1_len: c1.len(),
+            chunk2_reply: c2_arr,
+            chunk2_len: c2.len(),
+            rx: [0; 128],
+            rx_head: 0,
+            rx_tail: 0,
+            last_tx: [0; 128],
+            last_tx_len: 0,
+            sync_write_count: 0,
+        })),
+    };
+    let mut drv = FeetechArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6])
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
+    drv.read_joint_states().unwrap();
+    assert!(drv.is_feedback_valid());
+
+    // 1. Direct `FeetechArmDriver::write_measured_hold_masked` (6-DOF): strictly (0, 0).
+    let targets = vec![JointTarget::position(0.0); 6];
+    let (report, a, f) = counted(|| drv.write_measured_hold_masked(0b11_1111, &targets).unwrap());
+    assert!(report.sent_any, "Feetech FailedHold must transmit SYNC_WRITE");
+    assert_eq!(report.joint_status[..6], [JointHoldStatus::Held; 6]);
+    assert_eq!(
+        (a, f),
+        (0, 0),
+        "R1: FeetechArmDriver::write_measured_hold_masked must use preallocated buffers (0 allocs/frees)"
+    );
+    {
+        let st = bus.state.lock().unwrap();
+        assert_eq!(st.sync_write_count, 1);
+        assert_eq!(&st.last_tx[0..2], &[0xFF, 0xFF]);
+        assert_eq!(st.last_tx[4], armd::protocol::feetech::INST_SYNC_WRITE);
+        assert_eq!(st.last_tx_len, 8 + 6 * 3);
+    }
+
+    // 2. Full supervisor `FailedHold` stopped-hold pass with FeetechArmDriver: strictly (0, 0).
+    let mut drv2 = FeetechArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6])
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
+    drv2.read_joint_states().unwrap();
+    let cfg2 = ArmConfig {
+        dof: 6,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::default()
+    };
+    let mut inner2 = SupervisorInner::new(cfg2).with_driver(Box::new(drv2));
+    inner2.lease_enabled = false;
+    inner2.safety.set_off_thread_reclaim(true);
+    let stamp = inner2.current_admission_stamp();
+    let admitted = inner2.check_admission(stamp).unwrap();
+    assert!(SupervisorInner::enable_torque(admitted).is_err());
+    assert_eq!(inner2.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+
+    // Refresh fresh feedback + owner_driver_snapshot via one FailedHold tick, then prove
+    // zero-allocation stopped-hold service passes (no Vec alloc for positions or SYNC_WRITE pkt).
+    inner2.tick(0.02);
+    bus.state.lock().unwrap().sync_write_count = 0;
+    for _ in 0..3 {
+        let (ok, a, f) = counted(|| inner2.service_stopped_measured_hold_complete(0.02, false));
+        assert!(ok, "R1: Feetech FailedHold service pass must complete hold TX");
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "R1: Supervisor Feetech FailedHold service_stopped_measured_hold must allocate 0"
+        );
+    }
+    assert_eq!(bus.state.lock().unwrap().sync_write_count, 3);
+}
+
+/// Rule R1 (part 3): MIT stopped hold uses no feedback-age `Vec`, no `mit_gravity` `Vec`,
+/// no `mit_joints` `Vec`, and no `last_ff.clone()` — strictly 0 heap allocations and 0 frees
+/// both in `service_stopped_measured_hold` AND across full stopped RT releases (`fx.step()`).
+#[test]
+fn r1_mit_stopped_hold_zero_alloc() {
+    use armd::mit::MitOwner;
+    use armd::tracking::{JointTrackingConfig, JointTrackingJoint, TrackingStrategy};
+
+    let clock = Arc::new(MockClock::new());
+    let bus = ZeroAllocBus::new(clock.clone());
+    bus.with(|s| {
+        for j in 0..6 {
+            s.ctrl_modes[j] = damiao::CTRL_MODE_MIT;
+            s.motors[j].q = 0.25;
+            s.motors[j].enabled = true;
+        }
+        s.ctrl_modes[6] = damiao::CTRL_MODE_POS_VEL;
+        s.motors[6].q = 0.0;
+        s.motors[6].enabled = true;
+        s.push_all_feedback();
+    });
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    cfg.joint_tracking = Some(JointTrackingConfig {
+        enabled: true,
+        joints: (0..6)
+            .map(|_| JointTrackingJoint {
+                strategy: TrackingStrategy::Mit,
+                kp: 4.0,
+                kd: 0.15,
+                hold_kp: Some(4.0),
+                hold_kd: Some(0.15),
+                gravity_scale: 1.0,
+                effort_limit_nm: 3.0,
+                ..Default::default()
+            })
+            .collect(),
+    });
+    let limits: Vec<DamiaoLimits> = cfg.damiao_ranges.as_ref().unwrap().iter().map(|r| r.limits()).collect();
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    // Verify CTRL_MODE readback and switch J1..J6 to verified MIT mode (J7 stays POS_VEL).
+    drv.check_mapping_ranges();
+    let hold_targets: Vec<armd::driver::JointTarget> = (0..7)
+        .map(|j| {
+            if j < 6 {
+                armd::driver::JointTarget::mit(0.25, 0.0, 25.0, 1.5, 0.0)
+            } else {
+                armd::driver::JointTarget::position(0.0)
+            }
+        })
+        .collect();
+    let modes = [
+        armd::driver::JointMode::Mit,
+        armd::driver::JointMode::Mit,
+        armd::driver::JointMode::Mit,
+        armd::driver::JointMode::Mit,
+        armd::driver::JointMode::Mit,
+        armd::driver::JointMode::Mit,
+        armd::driver::JointMode::Position,
+    ];
+    drv.set_joint_modes_confirmed(&modes, &hold_targets).unwrap();
+    for j in 0..7 {
+        assert!(drv.joint_hold_mode_verified(j), "J{} must have verified hold mode", j + 1);
+    }
+
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.safety.set_off_thread_reclaim(true);
+    inner.is_torqued = true;
+    inner.mit.owner = MitOwner::Active;
+    inner.mit.joints = vec![0, 1, 2, 3, 4, 5];
+    inner.mit.last_ff = vec![0.0; 7];
+    inner.mit.last_output = Some(clock.now());
+    inner.safety.latch(
+        armd::safety::FaultKind::Estop,
+        armd::safety::FaultDetail::Estop,
+    );
+
+    let (mut fx, _b, _tw, _stop) = ReleaseFixture::new(
+        inner,
+        BOOT,
+        Capacities { commands: 8, plans: 1, replies: 16 },
+    );
+    // Warm up observation triple-buffer slots before counting allocations.
+    for _ in 0..4 {
+        bus.with(|s| s.push_all_feedback());
+        fx.step();
+        clock.advance(RELEASE);
+    }
+    assert_eq!(fx.core.mit.owner, MitOwner::Active, "MIT owner must remain Active during stopped hold");
+
+    // 1. Direct `service_stopped_measured_hold` after a Step 2 poll with MIT active: strictly (0, 0).
+    bus.with(|s| {
+        s.mit_tx_count = 0;
+        s.push_all_feedback();
+    });
+    let step2_budget = armd::rt_core::ops::ServiceBudget::for_release(fx.now(), fx.now() + RELEASE);
+    let _ = fx.core.poll_hardware(&step2_budget);
+    let (ok, a, f) = counted(|| fx.core.service_stopped_measured_hold_complete(0.02, false));
+    assert!(ok, "R1: MIT stopped hold pass must complete hold TX");
+    assert_eq!(
+        (a, f),
+        (0, 0),
+        "R1: MIT service_stopped_measured_hold must perform 0 allocs and 0 frees (no age Vec, no last_ff clone)"
+    );
+    assert!(
+        bus.with(|s| s.mit_tx_count) >= 6,
+        "R1: MIT stopped hold must transmit MIT hold frames for all 6 owned joints"
+    );
+    clock.advance(RELEASE);
+
+    // 2. Full RT stopped releases (`fx.step()`) with MIT active: strictly (0, 0) every release!
+    bus.with(|s| s.mit_tx_count = 0);
+    for tick in 0..5 {
+        bus.with(|s| s.push_all_feedback());
+        let (_, a, f) = counted(|| fx.step());
+        clock.advance(RELEASE);
+        assert_eq!(
+            (a, f),
+            (0, 0),
+            "R1: full RT stopped MIT hold release #{tick} must allocate 0 and free 0"
+        );
+    }
+    assert_eq!(fx.core.mit.owner, MitOwner::Active);
+    assert!(
+        bus.with(|s| s.mit_tx_count) >= 30,
+        "R1: 5 MIT stopped hold releases must transmit >= 30 MIT hold frames"
+    );
 }

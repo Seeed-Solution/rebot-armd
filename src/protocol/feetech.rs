@@ -237,13 +237,55 @@ pub fn build_sync_write(
     Ok(build_packet(BROADCAST_ID, INST_SYNC_WRITE, &params))
 }
 
+/// Zero-allocation builder for `SYNC_WRITE` goal positions (2 bytes per servo) into a caller-
+/// provided preallocated buffer `out`. Produces byte-for-byte identical wire output to
+/// [`build_sync_write_positions`].
+pub fn write_sync_write_positions_into(
+    positions: &[(u8, u16)],
+    out: &mut Vec<u8>,
+) -> Result<(), FeetechError> {
+    let num_servos = positions.len();
+    if num_servos == 0 {
+        return Err(FeetechError::ParameterError(
+            "SYNC_WRITE requires at least one servo entry".to_string(),
+        ));
+    }
+    // Length = (data_len + 1) * num_servos + 4 = 3 * num_servos + 4
+    let length = 3 * num_servos + 4;
+    if length > 255 {
+        return Err(FeetechError::ParameterError(
+            "SYNC_WRITE packet length exceeds 255 bytes".to_string(),
+        ));
+    }
+    let length_u8 = length as u8;
+    out.clear();
+    out.extend_from_slice(&FEETECH_HEADER);
+    out.push(BROADCAST_ID);
+    out.push(length_u8);
+    out.push(INST_SYNC_WRITE);
+    out.push(REG_GOAL_POSITION);
+    out.push(2u8);
+    let mut sum: u32 = u32::from(BROADCAST_ID)
+        + u32::from(length_u8)
+        + u32::from(INST_SYNC_WRITE)
+        + u32::from(REG_GOAL_POSITION)
+        + 2u32;
+    for &(id, pos) in positions {
+        let [lo, hi] = pos.to_le_bytes();
+        out.push(id);
+        out.push(lo);
+        out.push(hi);
+        sum += u32::from(id) + u32::from(lo) + u32::from(hi);
+    }
+    out.push(!((sum & 0xFF) as u8));
+    Ok(())
+}
+
 /// Convenience builder: build `SYNC_WRITE` for goal positions only (2 bytes per servo)
 pub fn build_sync_write_positions(positions: &[(u8, u16)]) -> Result<Vec<u8>, FeetechError> {
-    let entries: Vec<(u8, Vec<u8>)> = positions
-        .iter()
-        .map(|&(id, pos)| (id, pos.to_le_bytes().to_vec()))
-        .collect();
-    build_sync_write(REG_GOAL_POSITION, 2, &entries)
+    let mut out = Vec::with_capacity(8 + positions.len() * 3);
+    write_sync_write_positions_into(positions, &mut out)?;
+    Ok(out)
 }
 
 /// Parse a response packet from a byte stream.

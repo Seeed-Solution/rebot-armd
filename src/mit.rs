@@ -542,7 +542,7 @@ fn quantize_into(tau: f32, lo: f32, hi: f32, l: &damiao::DamiaoLimits) -> Option
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::supervisor::SupervisorInner {
     fn mit_slot(&self, j: usize) -> Option<&crate::tracking::JointTrackingJoint> {
-        let k = self.config.arm_joint_indices().iter().position(|&a| a == j)?;
+        let k = self.config.arm_joints().iter().position(|&a| a == j)?;
         self.config.joint_tracking.as_ref()?.joints.get(k)
     }
 
@@ -559,6 +559,33 @@ impl crate::supervisor::SupervisorInner {
                 self.mit.handover_error.as_deref().unwrap_or("the handover waits for the arm at rest"))),
             MitOwner::Lost => Some(format!("MIT tracking was cancelled: {}", self.mit.lost_reason.as_deref().unwrap_or("?"))),
         }
+    }
+
+    /// Zero-allocation gravity torque per joint into stack buffer `out` (Rule R1).
+    fn mit_gravity_into(
+        &self,
+        out: &mut [f32; crate::rt_core::mailbox::MAX_DOF],
+    ) -> Result<(), &'static str> {
+        out.fill(0.0);
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let arm_dof = self.config.arm_dof().min(dof);
+        let needed = (0..dof).any(|j| self.mit_slot(j).is_some_and(|c| c.gravity_scale > 0.0));
+        if !needed {
+            return Ok(());
+        }
+        if self.config.gravity_model.is_none() || self.measured_positions.len() < arm_dof {
+            return Err("gravity model unavailable");
+        }
+        let tau = self
+            .config
+            .arm_model
+            .gravity_torques(&self.measured_positions[..arm_dof])
+            .map_err(|_| "gravity torque computation failed")?;
+        if !tau[..arm_dof].iter().all(|t| t.is_finite()) {
+            return Err("gravity torque not finite");
+        }
+        out[..arm_dof].copy_from_slice(&tau[..arm_dof]);
+        Ok(())
     }
 
     /// Gravity torque per joint from the fresh measured posture, when a selected joint uses it.
@@ -627,36 +654,44 @@ impl crate::supervisor::SupervisorInner {
         Ok(ff)
     }
 
-    /// Per-joint masked MIT hold preparation for stopped / `FailedHold` states: validates each
-    /// joint in `hold_mask` independently so an excluded or stale joint never vetoes peer joints.
-    /// Returns `(filtered_mask, Option<ff>)` where failing MIT joints are cleared from `hold_mask`.
-    pub fn mit_prepare_masked(
+    /// Zero-allocation per-joint masked MIT hold preparation for stopped / `FailedHold` states
+    /// (Rule R1): reads feedback ages from the owner's inline `owner_driver_snapshot` (no driver
+    /// mutex lock and no feedback-age `Vec`), writes feed-forward torques into caller-owned
+    /// stack array `ff_out` (no `last_ff.clone()`), and validates each joint in `hold_mask`
+    /// independently. Returns `(filtered_mask, any_mit_prepared)`.
+    pub fn mit_prepare_masked_into(
         &self,
         hold_mask: u64,
         targets: &mut [JointTarget],
         dt: f64,
-    ) -> (u64, Option<Vec<f32>>) {
+        ff_out: &mut [f32; crate::rt_core::mailbox::MAX_DOF],
+    ) -> (u64, bool) {
         let mut eff_mask = hold_mask;
-        let ages = self.driver.as_ref().and_then(|d| d.lock().ok()).map(|drv| drv.feedback_ages());
-        let g_res = self.mit_gravity();
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        ff_out.fill(0.0);
+        let seed_n = self.mit.last_ff.len().min(dof);
+        ff_out[..seed_n].copy_from_slice(&self.mit.last_ff[..seed_n]);
+        let mut g_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let g_res = self.mit_gravity_into(&mut g_buf);
         let dt = (dt as f32).clamp(0.001, 0.1);
-        let mut ff = self.mit.last_ff.clone();
-        ff.resize(self.config.dof, 0.0);
+        let has_driver = self.driver.is_some();
+        let snap = self.owner_driver_snapshot;
         let mut any_mit_prepared = false;
         for &j in &self.mit.joints {
-            if j >= 64 || (eff_mask & (1u64 << j)) == 0 {
+            if j >= crate::rt_core::mailbox::MAX_DOF || (eff_mask & (1u64 << j)) == 0 {
                 continue;
             }
-            let age_ok = match ages.as_ref() {
-                Some(a) => a.get(j).copied().flatten().is_some_and(|age| !past_deadline(age)),
-                None => true,
+            let age_ok = if has_driver {
+                snap.valid && snap.feedback_ages[j].is_some_and(|age| !past_deadline(age))
+            } else {
+                true
             };
             if !age_ok {
                 eff_mask &= !(1u64 << j);
                 continue;
             }
             let g_j = match (&g_res, self.mit_slot(j)) {
-                (Ok(g), _) => g.get(j).copied().unwrap_or(0.0),
+                (Ok(()), _) => g_buf[j],
                 (Err(_), Some(c)) if c.gravity_scale <= 0.0 => 0.0,
                 (Err(_), _) => {
                     eff_mask &= !(1u64 << j);
@@ -670,10 +705,10 @@ impl crate::supervisor::SupervisorInner {
             let (q_d, v_d) = (t.position, t.velocity.unwrap_or(0.0));
             let a_d = self.commanded_accelerations.get(j).copied().unwrap_or(0.0);
             let last = self.mit.last_ff.get(j).copied().unwrap_or(0.0);
-            match self.mit_frame(j, q_d, v_d, a_d, true, g_j, Some((last, dt))) {
+            match self.mit_frame_core(j, q_d, v_d, a_d, true, g_j, Some((last, dt))) {
                 Ok((frame, tau)) => {
                     *t = frame;
-                    ff[j] = tau;
+                    ff_out[j] = tau;
                     any_mit_prepared = true;
                 }
                 Err(_) => {
@@ -681,7 +716,98 @@ impl crate::supervisor::SupervisorInner {
                 }
             }
         }
-        (eff_mask, any_mit_prepared.then_some(ff))
+        (eff_mask, any_mit_prepared)
+    }
+
+    /// Per-joint masked MIT hold preparation for stopped / `FailedHold` states: validates each
+    /// joint in `hold_mask` independently so an excluded or stale joint never vetoes peer joints.
+    /// Returns `(filtered_mask, Option<ff>)` where failing MIT joints are cleared from `hold_mask`.
+    pub fn mit_prepare_masked(
+        &self,
+        hold_mask: u64,
+        targets: &mut [JointTarget],
+        dt: f64,
+    ) -> (u64, Option<Vec<f32>>) {
+        let mut ff_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let (eff_mask, any_mit) = self.mit_prepare_masked_into(hold_mask, targets, dt, &mut ff_buf);
+        let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        (eff_mask, any_mit.then(|| ff_buf[..dof].to_vec()))
+    }
+
+    /// Zero-allocation MIT frame calculation used by stopped holds (Rule R1).
+    #[allow(clippy::too_many_arguments)]
+    fn mit_frame_core(
+        &self,
+        j: usize,
+        q_d: f32,
+        v_d: f32,
+        a_d: f32,
+        hold: bool,
+        g_j: f32,
+        slew: Option<(f32, f32)>,
+    ) -> Result<(JointTarget, f32), &'static str> {
+        let c = self.mit_slot(j).ok_or("no tracking entry")?;
+        let (q_m, v_m) = (self.measured_positions[j], self.measured_velocities[j]);
+        if ![q_d, v_d, a_d, q_m, v_m].iter().all(|x| x.is_finite()) {
+            return Err("non-finite reference or feedback");
+        }
+        let (kp, kd) = if hold {
+            (c.hold_kp.unwrap_or(0.0), c.hold_kd.unwrap_or(0.0))
+        } else {
+            (c.kp, c.kd)
+        };
+        let wl = wire_limits(&self.config, j);
+        let off = self.joint_zero_offsets.get(j).copied().unwrap_or(0.0);
+        if (q_d + off).abs() > wl.p_max
+            || v_d.abs() > wl.v_max
+            || kp > wl.kp_max
+            || kd > wl.kd_max
+            || kp <= 0.0
+            || kd <= 0.0
+        {
+            return Err("MIT frame outside wire ranges");
+        }
+        let grid = |x: f32, lo: f32, hi: f32, bits: u32| {
+            damiao::uint_to_float(damiao::float_to_uint(x, lo, hi, bits), lo, hi, bits)
+        };
+        let q_w = grid(q_d + off, wl.p_min, wl.p_max, 16) - off;
+        let v_w = grid(v_d, wl.v_min, wl.v_max, 12);
+        let kp_w = grid(kp, wl.kp_min, wl.kp_max, 12);
+        let kd_w = grid(kd, wl.kd_min, wl.kd_max, 12);
+        let pd = kp_w * (q_w - q_m) + kd_w * (v_w - v_m);
+        let dynamic = if hold {
+            0.0
+        } else {
+            c.coulomb_nm * (v_d / MIT_COULOMB_VEL_RAD_S).clamp(-1.0, 1.0)
+                + c.viscous_nm_s_rad * v_d
+                + c.inertia_kg_m2 * a_d
+        };
+        let raw = c.gravity_scale * g_j + dynamic;
+        let l = c.effort_limit_nm;
+        let mut lo = (-l).max(-l - pd);
+        let mut hi = l.min(l - pd);
+        if let Some((last, dt)) = slew {
+            lo = lo.max(last - MIT_FF_SLEW_NM_S * dt);
+            hi = hi.min(last + MIT_FF_SLEW_NM_S * dt);
+        }
+        let guard = self.torque_guard.hold.filter(|h| h.joint == j);
+        if let Some(h) = guard {
+            if h.sign > 0.0 {
+                hi = hi.min(-pd);
+            } else {
+                lo = lo.max(-pd);
+            }
+        }
+        if lo.is_nan() || hi.is_nan() || lo > hi {
+            return Err("empty effort interval");
+        }
+        let tau = quantize_into(raw.clamp(lo, hi), lo, hi, &wl)
+            .ok_or("no wire torque value inside interval")?;
+        let total = pd + tau;
+        if total.abs() > l + 1e-6 || guard.is_some_and(|h| h.sign * total > 1e-6) {
+            return Err("decoded effort outside limit or relieving side");
+        }
+        Ok((JointTarget::mit(q_w, v_w, kp_w, kd_w, tau), tau))
     }
 
     /// One MIT frame for joint `j` on the decoded wire grid and its tau_ff (see
@@ -999,19 +1125,26 @@ impl crate::supervisor::SupervisorInner {
             return;
         }
         if self.mit.owner != MitOwner::Active { return; }
-        let (trip, ages) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-            Some(drv) => (drv.mit_fence_trip(), drv.feedback_ages()),
-            None => (None, Vec::new()),
+        // R1: Reuse preallocated `self.scratch.ages` and read `clock_now()` in the same single
+        // driver lock so healthy MIT supervision allocates 0 bytes on the RT control thread.
+        let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+        scratch_ages.clear();
+        let (trip, now) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            Some(drv) => {
+                drv.feedback_ages_into(&mut scratch_ages);
+                (drv.mit_fence_trip(), drv.clock_now())
+            }
+            None => (None, std::time::Instant::now()),
         };
-        let now = self.mit_now();
         let gap = self.mit.last_output.map(|t| now.saturating_duration_since(t));
         let reason = if let Some(t) = trip { Some(format!("driver deadline fence: {t}")) }
-            else if let Some((i, a)) = ages.iter().enumerate().find(|(_, a)| a.is_none_or(past_deadline)) {
+            else if let Some((i, a)) = scratch_ages.iter().enumerate().find(|(_, a)| a.is_none_or(past_deadline)) {
                 Some(format!("joint {} feedback age {a:?} reached {MIT_DEADLINE:?}", i + 1))
-            } else if ages.len() != self.config.dof { Some("feedback ages unavailable".into()) }
+            } else if scratch_ages.len() != self.config.dof { Some("feedback ages unavailable".into()) }
             else { gap.filter(|g| past_deadline(*g)).map(|g| format!("gap between dynamic outputs {g:?} reached {MIT_DEADLINE:?}")) };
+        let worst = scratch_ages.iter().flatten().copied().chain(gap).max().unwrap_or_default();
+        self.scratch.ages = scratch_ages;
         if let Some(r) = reason { self.mit_lose(r, crate::safety::FaultCode::BusLoss); return; }
-        let worst = ages.iter().flatten().copied().chain(gap).max().unwrap_or_default();
         if worst >= MIT_NEAR_MISS {
             self.mit.near_misses += 1;
             if self.mit.near_misses.is_power_of_two() {
@@ -1039,14 +1172,16 @@ impl crate::supervisor::SupervisorInner {
     /// control of an armed arm whose qualification passed at this arm, with nothing else owning
     /// the output (no motion, park, gravity compensation, hold or fault).
     pub(crate) fn mit_maybe_activate(&mut self) {
-        let joints = mit_joints(&self.config);
-        if joints.is_empty() || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
+        if self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
             || self.disable_pending || self.pending_rearm || self.pending_normal_unload || self.gravity_comp.is_some()
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
             || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
             || self.collision.hold.is_some() || self.torque_guard.hold.is_some() || self.servo_blocked_hold
-            || self.commanded_velocities.iter().any(|v| *v != 0.0)
-            || !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() {
+            || self.commanded_velocities.iter().any(|v| *v != 0.0) {
+            return;
+        }
+        let joints = mit_joints(&self.config);
+        if joints.is_empty() || !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() {
             return;
         }
         let g = match self.mit_gravity() {

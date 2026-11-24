@@ -147,15 +147,19 @@ impl SupervisorInner {
         self.gripper_stream_lease = None;
 
         // Clear any prior captured stopped-hold targets and recapture fresh (`<= 100 ms`) measured
-        // positions through the single `capture_measured_hold_from_driver_ref` kernel (never
-        // falling back to old cached `commanded_positions`). Also update `commanded_positions`
-        // for observation telemetry when the coherent feedback snapshot is fresh and finite.
+        // positions through the single owner-snapshot capture kernel (never blocking on a contended
+        // driver mutex and never falling back to old cached `commanded_positions`). Also update
+        // `commanded_positions` for observation telemetry when the coherent feedback snapshot is
+        // fresh and finite.
         self.measured_hold.clear();
         const ESTOP_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
         let (driver_contended, snapshot_fresh) = match driver {
             None => (false, self.feedback_numeric_valid),
             Some(d) => match d.try_lock() {
-                Err(_) => (true, false),
+                Err(_) => {
+                    self.owner_driver_snapshot.invalidate();
+                    (true, false)
+                }
                 Ok(drv) => {
                     let now = drv.clock_now();
                     let dof = self.config.dof;
@@ -171,8 +175,11 @@ impl SupervisorInner {
                                 && self.joint_feedback_queue_bounds.iter().all(|b| {
                                     b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
                                 })));
-                    // Capture measured hold through the single shared tracker kernel (0 alloc).
-                    let _ = self.capture_measured_hold_from_driver_ref(drv.as_ref());
+                    // Refresh owner-held snapshot while already holding the uncontended `try_lock`
+                    // guard, then capture measured hold from owner state (0 alloc, 0 extra lock).
+                    self.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
+                    drop(drv);
+                    let _ = self.capture_measured_hold_from_owner();
                     (false, fresh)
                 }
             },

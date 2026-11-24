@@ -748,6 +748,10 @@ pub struct SupervisorInner {
     pub(crate) enable_lifecycle: driver_transitions::EnableLifecycle,
     /// Inline per-joint measured-position hold state (zero alloc on RT).
     pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
+    /// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver
+    /// lock so stopped-hold capture and MIT stopped-hold preparation never re-lock `self.driver`
+    /// or allocate (Rule R1).
+    pub(crate) owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot,
     pub last_disable_attempt: Option<Instant>,
     /// Active background/transition disable intent carried into driver sends and periodic retries.
     pub(crate) active_disable_kind: Option<crate::driver::DisableKind>,
@@ -1568,6 +1572,7 @@ impl SupervisorInner {
             torque_transition: None,
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
+            owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot::new(dof),
             last_disable_attempt: None,
             active_disable_kind: None,
             last_stopped_torque_off_refusal: None,
@@ -2470,6 +2475,7 @@ impl SupervisorInner {
         self.joint_feedback_queue_bounds.reserve(dof);
         self.motor_errors.reserve(dof);
         self.gravity_torques.reserve(arm_dof);
+        self.mit.last_ff.reserve(dof.max(crate::rt_core::mailbox::MAX_DOF));
         let tmpl = self.current_observation();
         self.core.try_prewarm_observations(|| {
             let mut obs = tmpl.clone();
@@ -4156,10 +4162,23 @@ impl SupervisorInner {
                     {
                         out.driver_torque_lost = true;
                     }
+                    // R1: Refresh the owner-held driver snapshot while already holding the driver
+                    // lock so stopped-hold capture and MIT stopped-hold preparation never lock
+                    // `self.driver` or allocate.
+                    self.owner_driver_snapshot =
+                        driver_transitions::OwnerDriverSnapshot::capture_from_driver(
+                            driver.as_ref(),
+                            self.config.dof,
+                            self.feedback_numeric_valid,
+                            &self.measured_positions,
+                            &mut sc.ages,
+                            &mut sc.fb.bounds,
+                        );
                 }
                 Err(_) => {
                     self.last_can_feedback_instant = None;
                     self.thermal_cooldown.reset();
+                    self.owner_driver_snapshot.invalidate();
                     out.reset_stillness_on_read_err = true;
                 }
             }

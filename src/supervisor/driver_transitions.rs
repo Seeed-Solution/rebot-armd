@@ -619,6 +619,95 @@ impl MeasuredHoldTracker {
     }
 }
 
+/// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver lock
+/// (`poll_hardware_rx`, torque transitions, `enter_failed_hold`, `apply_estop_latch_with_driver`).
+/// Allows stopped-hold capture and MIT stopped-hold preparation to run with zero heap allocation
+/// and zero driver mutex acquisition (Rule R1).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnerDriverSnapshot {
+    pub(crate) valid: bool,
+    pub(crate) captured_at: Option<Instant>,
+    pub(crate) motor_evidence: [crate::driver::MotorTorqueEvidence; crate::rt_core::mailbox::MAX_DOF],
+    pub(crate) fresh_samples: [Option<(f32, u64)>; crate::rt_core::mailbox::MAX_DOF],
+    pub(crate) feedback_ages: [Option<Duration>; crate::rt_core::mailbox::MAX_DOF],
+    pub(crate) hold_mode_verified: [bool; crate::rt_core::mailbox::MAX_DOF],
+}
+
+impl OwnerDriverSnapshot {
+    pub(crate) fn new(_dof: usize) -> Self {
+        Self {
+            valid: false,
+            captured_at: None,
+            motor_evidence: [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF],
+            fresh_samples: [None; crate::rt_core::mailbox::MAX_DOF],
+            feedback_ages: [None; crate::rt_core::mailbox::MAX_DOF],
+            hold_mode_verified: [false; crate::rt_core::mailbox::MAX_DOF],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+        self.captured_at = None;
+        self.motor_evidence.fill(crate::driver::MotorTorqueEvidence::Unknown);
+        self.fresh_samples.fill(None);
+        self.feedback_ages.fill(None);
+        self.hold_mode_verified.fill(false);
+    }
+
+    /// Captures all driver-owned state needed for stopped-hold evaluation and MIT stopped-hold
+    /// preparation using caller-provided preallocated scratch buffers (zero heap allocations).
+    pub(crate) fn capture_from_driver(
+        drv: &dyn crate::driver::ArmDriver,
+        dof: usize,
+        feedback_numeric_valid: bool,
+        measured_positions: &[f32],
+        ages_buf: &mut Vec<Option<Duration>>,
+        bounds_buf: &mut Vec<Option<Instant>>,
+    ) -> Self {
+        use crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE;
+        let dof = dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let mut snap = Self::new(dof);
+        drv.motor_torque_evidence_into(&mut snap.motor_evidence[..dof]);
+        let drv_now = drv.clock_now();
+        snap.captured_at = Some(drv_now);
+        let has_drv_fresh = drv.has_driver_fresh_position_api();
+        drv.feedback_ages_into(ages_buf);
+        for j in 0..dof {
+            snap.feedback_ages[j] = ages_buf.get(j).copied().flatten();
+        }
+        let mut has_bounds = false;
+        if !has_drv_fresh {
+            drv.feedback_queue_bounds_into(bounds_buf);
+            has_bounds = !bounds_buf.is_empty();
+        }
+        for j in 0..dof {
+            snap.fresh_samples[j] = if has_drv_fresh {
+                drv.fresh_measured_sample_for(j, STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+            } else {
+                let age_ok = snap.feedback_ages[j]
+                    .is_some_and(|a| a <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+                let bound_ok = !has_bounds
+                    || bounds_buf.get(j).copied().flatten().is_some_and(|b| {
+                        drv_now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                    });
+                if feedback_numeric_valid && age_ok && bound_ok {
+                    measured_positions
+                        .get(j)
+                        .copied()
+                        .filter(|p| p.is_finite())
+                        .map(|p| (p, 0u64))
+                } else {
+                    None
+                }
+            };
+            snap.hold_mode_verified[j] = drv.joint_hold_mode_verified(j);
+        }
+        snap.valid = true;
+        snap
+    }
+}
+
 /// Phase of the single budgeted enable transition reducer (`Enable -> Validate -> Armed | FailedHold`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnableReducerPhase {
@@ -703,6 +792,7 @@ impl SupervisorInner {
         let mut driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &self.joint_zero_offsets));
         driver.set_stopped_disable_gate(self.stopped_disable_gate());
         self.apply_driver_limits(driver.as_ref());
+        self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
         self.driver = Some(std::sync::Mutex::new(driver));
         self
     }
@@ -1286,6 +1376,18 @@ impl SupervisorInner {
                     crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)
                 ) && DisableConfirm::confirmed(&**drv);
                 let done_unconfirmed = matches!(res, crate::driver::TorqueProgress::Done(_)) && !confirmed_now;
+                let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                    drv.as_ref(),
+                    self.config.dof,
+                    self.feedback_numeric_valid,
+                    &self.measured_positions,
+                    &mut ages_buf,
+                    &mut bounds_buf,
+                );
+                self.scratch.ages = ages_buf;
+                self.scratch.fb.bounds = bounds_buf;
                 drop(drv);
                 if confirmed_now {
                     self.disable_confirmed();
@@ -1342,6 +1444,18 @@ impl SupervisorInner {
             while confirm.serve(&mut **drv).is_none() {
                 drv.clock_pause(DISABLE_CONFIRM_SERVICE);
             }
+            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+            self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                drv.as_ref(),
+                self.config.dof,
+                self.feedback_numeric_valid,
+                &self.measured_positions,
+                &mut ages_buf,
+                &mut bounds_buf,
+            );
+            self.scratch.ages = ages_buf;
+            self.scratch.fb.bounds = bounds_buf;
             if !DisableConfirm::confirmed(&**drv) {
                 drop(drv);
                 if pending_disable {
@@ -1450,67 +1564,49 @@ impl SupervisorInner {
             || self.is_torqued
     }
 
-    /// Single shared stopped-hold capture kernel used by both `snapshot_measured_hold` and
-    /// `apply_estop_latch_with_driver` (zero heap allocations). Evaluates each joint independently
-    /// from driver-owned torque evidence, fresh (`<= 100 ms`) finite measured position with
-    /// continuity tracking, and verified hold mode. Returns `(hold_mask, invalidated_mask)` where
-    /// `invalidated_mask` names joints whose continuity broke across a `> 100 ms` gap or became
-    /// ineligible so queued holds for those joints are dropped before sending.
-    pub(crate) fn capture_measured_hold_from_driver_ref(
-        &mut self,
-        drv: &dyn crate::driver::ArmDriver,
-    ) -> (u64, u64) {
+    /// Refreshes [`Self::owner_driver_snapshot`] from an already-locked driver reference without
+    /// acquiring `self.driver` and without heap allocations (Rule R1).
+    pub(crate) fn refresh_owner_driver_snapshot_from_ref(&mut self, drv: &dyn crate::driver::ArmDriver) {
+        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+        self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+            drv,
+            self.config.dof,
+            self.feedback_numeric_valid,
+            &self.measured_positions,
+            &mut ages_buf,
+            &mut bounds_buf,
+        );
+        self.scratch.ages = ages_buf;
+        self.scratch.fb.bounds = bounds_buf;
+    }
+
+    /// Single shared stopped-hold capture kernel reading strictly from the owner's inline
+    /// [`Self::owner_driver_snapshot`] with ZERO driver mutex acquisition and ZERO heap
+    /// allocations (Rule R1). Evaluates each joint independently from driver-owned torque
+    /// evidence, fresh (`<= 100 ms`) finite measured position with continuity tracking, and
+    /// verified hold mode. Returns `(hold_mask, invalidated_mask)`.
+    pub(crate) fn capture_measured_hold_from_owner(&mut self) -> (u64, u64) {
         use crate::driver::{JointHoldStatus, MotorTorqueEvidence, STOPPED_DISABLE_FEEDBACK_MAX_AGE};
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         self.measured_hold.dof = dof;
-        let mut ev = [MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF];
-        drv.motor_torque_evidence_into(&mut ev[..dof]);
-        let has_drv_fresh = drv.has_driver_fresh_position_api();
-        let drv_now = drv.clock_now();
-        let mut ages_arr = [None::<Duration>; crate::rt_core::mailbox::MAX_DOF];
-        let mut bounds_arr = [None::<Instant>; crate::rt_core::mailbox::MAX_DOF];
-        let mut has_bounds = false;
-        if !has_drv_fresh {
-            let mut ages_buf = std::mem::take(&mut self.scratch.ages);
-            let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
-            drv.feedback_ages_into(&mut ages_buf);
-            drv.feedback_queue_bounds_into(&mut bounds_buf);
-            has_bounds = !bounds_buf.is_empty();
+        if !self.owner_driver_snapshot.valid {
             for j in 0..dof {
-                ages_arr[j] = ages_buf.get(j).copied().flatten();
-                bounds_arr[j] = bounds_buf.get(j).copied().flatten();
+                self.measured_hold.motor_evidence[j] = MotorTorqueEvidence::Unknown;
+                self.measured_hold.captured_positions[j] = None;
+                self.measured_hold.captured_continuity_epoch[j] = None;
+                self.measured_hold.last_seen_fresh_at[j] = None;
+                self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
             }
-            self.scratch.ages = ages_buf;
-            self.scratch.fb.bounds = bounds_buf;
+            return (0, u64::MAX);
         }
-        let mut fresh_sample_arr = [None::<(f32, u64)>; crate::rt_core::mailbox::MAX_DOF];
-        let mut mode_ok_arr = [false; crate::rt_core::mailbox::MAX_DOF];
-        for j in 0..dof {
-            fresh_sample_arr[j] = if has_drv_fresh {
-                drv.fresh_measured_sample_for(j, STOPPED_DISABLE_FEEDBACK_MAX_AGE)
-            } else {
-                let age_ok = ages_arr[j].is_some_and(|a| a <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
-                let bound_ok = !has_bounds
-                    || bounds_arr[j].is_some_and(|b| {
-                        drv_now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
-                    });
-                if self.feedback_numeric_valid && age_ok && bound_ok {
-                    self.measured_positions
-                        .get(j)
-                        .copied()
-                        .filter(|p| p.is_finite())
-                        .map(|p| (p, 0u64))
-                } else {
-                    None
-                }
-            };
-            mode_ok_arr[j] = drv.joint_hold_mode_verified(j);
-        }
-        self.measured_hold.motor_evidence[..dof].copy_from_slice(&ev[..dof]);
+        let snap = self.owner_driver_snapshot;
+        let drv_now = snap.captured_at.unwrap_or_else(Instant::now);
+        self.measured_hold.motor_evidence[..dof].copy_from_slice(&snap.motor_evidence[..dof]);
         let mut hold_mask = 0u64;
         let mut invalidated_mask = 0u64;
         for j in 0..dof {
-            if ev[j] == MotorTorqueEvidence::OffConfirmed {
+            if snap.motor_evidence[j] == MotorTorqueEvidence::OffConfirmed {
                 self.measured_hold.captured_positions[j] = None;
                 self.measured_hold.captured_continuity_epoch[j] = None;
                 self.measured_hold.last_seen_fresh_at[j] = None;
@@ -1518,7 +1614,7 @@ impl SupervisorInner {
                 invalidated_mask |= 1u64 << j;
                 continue;
             }
-            let Some((pos, epoch)) = fresh_sample_arr[j] else {
+            let Some((pos, epoch)) = snap.fresh_samples[j] else {
                 self.measured_hold.captured_positions[j] = None;
                 self.measured_hold.captured_continuity_epoch[j] = None;
                 self.measured_hold.last_seen_fresh_at[j] = None;
@@ -1526,7 +1622,7 @@ impl SupervisorInner {
                 invalidated_mask |= 1u64 << j;
                 continue;
             };
-            if !mode_ok_arr[j] {
+            if !snap.hold_mode_verified[j] {
                 self.measured_hold.captured_positions[j] = None;
                 self.measured_hold.captured_continuity_epoch[j] = None;
                 self.measured_hold.last_seen_fresh_at[j] = None;
@@ -1556,14 +1652,14 @@ impl SupervisorInner {
         (hold_mask, invalidated_mask)
     }
 
-    /// Evaluates each joint independently from driver-owned per-motor torque evidence, fresh
+    /// Evaluates each joint independently from owner-held per-motor torque evidence, fresh
     /// (`<= 100 ms`) finite measured position with transport provenance and continuity tracking,
-    /// and verified hold mode. Returns `(hold_mask, invalidated_mask)` (zero heap allocations).
-    pub(crate) fn snapshot_measured_hold_with_invalidated(&mut self) -> (u64, u64) {
+    /// and verified hold mode without acquiring the driver mutex (Rule R1; zero heap allocations).
+    pub fn snapshot_measured_hold_with_invalidated(&mut self) -> (u64, u64) {
         use crate::driver::{JointHoldStatus, MotorTorqueEvidence};
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         self.measured_hold.dof = dof;
-        let Some(d) = self.driver.take() else {
+        if self.driver.is_none() {
             self.measured_hold.motor_evidence[..dof].fill(if self.is_torqued {
                 MotorTorqueEvidence::OnConfirmed
             } else {
@@ -1584,30 +1680,31 @@ impl SupervisorInner {
                 }
             }
             return (0, 0);
-        };
-        let res = match d.lock() {
-            Ok(drv) => self.capture_measured_hold_from_driver_ref(drv.as_ref()),
-            Err(_) => {
-                for j in 0..dof {
-                    self.measured_hold.motor_evidence[j] = MotorTorqueEvidence::Unknown;
-                    self.measured_hold.captured_positions[j] = None;
-                    self.measured_hold.captured_continuity_epoch[j] = None;
-                    self.measured_hold.last_seen_fresh_at[j] = None;
-                    self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
-                }
-                (0, u64::MAX)
-            }
-        };
-        self.driver = Some(d);
-        res
+        }
+        self.capture_measured_hold_from_owner()
     }
 
     pub(crate) fn snapshot_measured_hold(&mut self) -> u64 {
         self.snapshot_measured_hold_with_invalidated().0
     }
 
+    /// Test-only wrapper around [`Self::service_stopped_measured_hold`] returning `true` when the
+    /// stopped-hold pass completed without exposing private `TickOutput`.
+    #[doc(hidden)]
+    pub fn service_stopped_measured_hold_complete(
+        &mut self,
+        dt: f64,
+        gravity_output_enabled: bool,
+    ) -> bool {
+        matches!(
+            self.service_stopped_measured_hold(dt, gravity_output_enabled),
+            crate::supervisor::TickOutput::Complete { is_hold: true }
+        )
+    }
+
     /// Services one masked measured-position hold pass while stopped or in `FailedHold`
-    /// (zero heap allocation on RT; never falls back to cached `commanded_positions`).
+    /// (zero heap allocation on RT; hold capture and MIT preparation read owner-held data without
+    /// locking the driver mutex; never falls back to cached `commanded_positions`).
     pub(crate) fn service_stopped_measured_hold(
         &mut self,
         dt: f64,
@@ -1626,15 +1723,6 @@ impl SupervisorInner {
         }
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
         let (mut hold_mask, invalidated_mask) = self.snapshot_measured_hold_with_invalidated();
-
-        // Always prune queued holds for ineligible or continuity-broken joints BEFORE any MIT
-        // preparation or transmit so a stale/excluded joint's queued hold can never leak.
-        let keep_queued_mask = hold_mask & !invalidated_mask;
-        if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.lock() {
-                drv.drop_pending_holds_outside_mask(keep_queued_mask);
-            }
-        }
 
         let mut targets = std::mem::take(&mut self.scratch.targets);
         targets.clear();
@@ -1657,11 +1745,13 @@ impl SupervisorInner {
             });
         }
 
-        // Per-joint masked MIT hold preparation: an excluded or stale MIT joint clears ONLY its
-        // own bit from `hold_mask` and drops its queued hold without vetoing eligible peers.
-        let ff = if self.mit.owner == crate::mit::MitOwner::Active && hold_mask != 0 {
+        // Per-joint masked MIT hold preparation (Rule R1: zero alloc, no feedback-age Vec,
+        // no `last_ff.clone()`, and no driver mutex lock).
+        let mut ff_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let mit_prepared = if self.mit.owner == crate::mit::MitOwner::Active && hold_mask != 0 {
             let before_mask = hold_mask;
-            let (filtered_mask, ff_opt) = self.mit_prepare_masked(hold_mask, &mut targets, dt);
+            let (filtered_mask, any_mit) =
+                self.mit_prepare_masked_into(hold_mask, &mut targets, dt, &mut ff_buf);
             let rejected = before_mask & !filtered_mask;
             if rejected != 0 {
                 for j in 0..dof {
@@ -1672,19 +1762,18 @@ impl SupervisorInner {
                         self.measured_hold.joint_status[j] = JointHoldStatus::UnheldNoFreshFeedback;
                     }
                 }
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut drv) = d.lock() {
-                        drv.drop_pending_holds_outside_mask(filtered_mask);
-                    }
-                }
             }
             hold_mask = filtered_mask;
-            ff_opt
+            any_mit
         } else {
-            None
+            false
         };
 
+        // Prune queued holds for ineligible, continuity-broken, or MIT-rejected joints and
+        // transmit the masked hold batch in one single driver lock.
+        let keep_queued_mask = hold_mask & !invalidated_mask;
         let write_result = self.driver.as_ref().and_then(|d| d.lock().ok()).map(|mut drv| {
+            drv.drop_pending_holds_outside_mask(keep_queued_mask);
             if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
                 if cap.joint < targets.len() && (hold_mask & (1u64 << cap.joint)) != 0 {
                     targets[cap.joint].velocity = Some(cap.close_speed_rad_s);
@@ -1757,11 +1846,15 @@ impl SupervisorInner {
             }
         };
 
-        if let Some(ff) = ff {
-            if matches!(out, TickOutput::Complete { .. }) {
-                self.mit.last_ff = ff;
-                self.mit.last_output = Some(self.mit_now());
+        if mit_prepared && matches!(out, TickOutput::Complete { .. }) {
+            let ff_n = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+            if self.mit.last_ff.len() == ff_n {
+                self.mit.last_ff.copy_from_slice(&ff_buf[..ff_n]);
+            } else {
+                self.mit.last_ff.clear();
+                self.mit.last_ff.extend_from_slice(&ff_buf[..ff_n]);
             }
+            self.mit.last_output = Some(now);
         }
         out
     }
@@ -1906,13 +1999,20 @@ impl SupervisorInner {
         // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback.
         let mut any_driver_enabled = false;
 
-        if let Some(ref d) = self.driver {
+        if let Some(d) = self.driver.take() {
             // Secondary double-check latch right before hardware actuation
             if self.estop_pending() {
+                self.driver = Some(d);
                 return Err(SafetyError::EStopActive);
             }
-            let mut driver = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+            let Ok(mut driver) = d.lock() else {
+                self.owner_driver_snapshot.invalidate();
+                self.driver = Some(d);
+                return Err(SafetyError::FeedbackUnavailable);
+            };
             if self.estop_pending() {
+                drop(driver);
+                self.driver = Some(d);
                 return Err(SafetyError::EStopActive);
             }
             if allow_bus_read && !driver.is_feedback_valid() {
@@ -1939,6 +2039,9 @@ impl SupervisorInner {
                 }
             }
             any_driver_enabled = driver.has_any_joint_enabled() || driver.has_known_partial_enable();
+            self.refresh_owner_driver_snapshot_from_ref(driver.as_ref());
+            drop(driver);
+            self.driver = Some(d);
         }
         let was_torqued = self.is_torqued || any_driver_enabled;
         let prev_gripper_cmd = if was_torqued {
@@ -1970,19 +2073,25 @@ impl SupervisorInner {
         if self.estop_request_unapplied() {
             self.consume_pending_estop();
         }
-        // 2. Cancel queued enable work; NEVER send automatic rollback disable frames at any pose.
-        if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.lock() {
-                drv.abort_enable();
+        // 2 & 3. Cancel queued enable work (NEVER send automatic rollback disable frames),
+        // refresh owner-held driver snapshot in the SAME single lock, capture per-joint holds from
+        // owner data (no extra driver lock), and drop queued driver holds outside `hold_mask`.
+        if let Some(d) = self.driver.take() {
+            match d.lock() {
+                Ok(mut drv) => {
+                    drv.abort_enable();
+                    self.refresh_owner_driver_snapshot_from_ref(drv.as_ref());
+                    let (hold_mask, _) = self.capture_measured_hold_from_owner();
+                    drv.drop_pending_holds_outside_mask(hold_mask);
+                }
+                Err(_) => {
+                    self.owner_driver_snapshot.invalidate();
+                    let _ = self.capture_measured_hold_from_owner();
+                }
             }
-        }
-        // 3. Snapshot per-motor evidence and per-joint measured-position hold targets independently,
-        //    and drop queued driver holds for stale / unverified / OffConfirmed joints.
-        let hold_mask = self.snapshot_measured_hold();
-        if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.lock() {
-                drv.drop_pending_holds_outside_mask(hold_mask);
-            }
+            self.driver = Some(d);
+        } else {
+            let _ = self.snapshot_measured_hold();
         }
         // 4. Record captured measured positions and enter FailedHold (no cached-command fallback).
         let dof = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
@@ -2095,8 +2204,13 @@ impl SupervisorInner {
                 budgeted,
             );
         };
-        let (started, enable_fb, drv_now) = {
+        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+        let (started, enable_fb, drv_now, snap) = {
             let Ok(mut drv) = d.lock() else {
+                self.scratch.ages = ages_buf;
+                self.scratch.fb.bounds = bounds_buf;
+                self.owner_driver_snapshot.invalidate();
                 let message = self.enter_failed_hold(was_torqued, |buf| {
                     buf.push_str("driver mutex poisoned during enable");
                 });
@@ -2114,8 +2228,19 @@ impl SupervisorInner {
             } else {
                 drv.begin_torque(true)
             };
-            (started, enable_fb, drv_now)
+            let snap = OwnerDriverSnapshot::capture_from_driver(
+                drv.as_ref(),
+                self.config.dof,
+                self.feedback_numeric_valid,
+                &self.measured_positions,
+                &mut ages_buf,
+                &mut bounds_buf,
+            );
+            (started, enable_fb, drv_now, snap)
         };
+        self.scratch.ages = ages_buf;
+        self.scratch.fb.bounds = bounds_buf;
+        self.owner_driver_snapshot = snap;
         match started {
             Ok(Drv::Pending { wake }) => {
                 self.torque_transition = Some(TorqueTransition::Enable(reducer));
@@ -2209,10 +2334,13 @@ impl SupervisorInner {
                 };
                 let mut scratch_states = std::mem::take(&mut self.scratch.states);
                 let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+                let mut scratch_bounds = std::mem::take(&mut self.scratch.fb.bounds);
                 let lock_res = {
                     let Ok(mut drv) = d.lock() else {
                         self.scratch.states = scratch_states;
                         self.scratch.ages = scratch_ages;
+                        self.scratch.fb.bounds = scratch_bounds;
+                        self.owner_driver_snapshot.invalidate();
                         let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
                             buf.push_str("driver mutex poisoned during enable poll");
                         });
@@ -2244,9 +2372,18 @@ impl SupervisorInner {
                         drv.feedback_ages_into(&mut scratch_ages);
                         cached_temps_read = true;
                     }
-                    (r, rx, enable_fb, temp_fb, drv_now, cached_temps_read)
+                    let snap = OwnerDriverSnapshot::capture_from_driver(
+                        drv.as_ref(),
+                        self.config.dof,
+                        self.feedback_numeric_valid,
+                        &self.measured_positions,
+                        &mut scratch_ages,
+                        &mut scratch_bounds,
+                    );
+                    (r, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap)
                 };
-                let (poll_res, rx, enable_fb, temp_fb, drv_now, cached_temps_read) = lock_res;
+                let (poll_res, rx, enable_fb, temp_fb, drv_now, cached_temps_read, snap) = lock_res;
+                self.owner_driver_snapshot = snap;
                 if cached_temps_read {
                     let n = self.config.dof.min(self.temperatures.len()).min(scratch_states.len());
                     for i in 0..n {
@@ -2259,6 +2396,7 @@ impl SupervisorInner {
                 }
                 self.scratch.states = scratch_states;
                 self.scratch.ages = scratch_ages;
+                self.scratch.fb.bounds = scratch_bounds;
                 if let Some(failed) = self.check_enable_thermal_trip(reducer.was_torqued, temp_fb) {
                     return (failed, rx);
                 }
@@ -2419,6 +2557,14 @@ impl SupervisorInner {
                                     self.config.dof,
                                     &scratch_states,
                                     loads_slice,
+                                );
+                                self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                                    driver.as_ref(),
+                                    self.config.dof,
+                                    self.feedback_numeric_valid,
+                                    &self.measured_positions,
+                                    &mut scratch_ages,
+                                    &mut self.scratch.fb.bounds,
                                 );
                                 (Ok(()), temp_fb)
                             }
@@ -2719,7 +2865,20 @@ impl SupervisorInner {
                     started_at: drv_now,
                     rollback: false,
                 };
-                Some((drv.begin_disable_torque_budgeted(disable_kind, 0), drv_now, disable_kind))
+                let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
+                let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+                let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+                self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+                    drv.as_ref(),
+                    self.config.dof,
+                    self.feedback_numeric_valid,
+                    &self.measured_positions,
+                    &mut ages_buf,
+                    &mut bounds_buf,
+                );
+                self.scratch.ages = ages_buf;
+                self.scratch.fb.bounds = bounds_buf;
+                Some((res, drv_now, disable_kind))
             }
         };
         if let Some((_, _, disable_kind)) = started {
@@ -2793,6 +2952,18 @@ impl SupervisorInner {
         let span = budget.deadline.saturating_duration_since(budget.now);
         let poll_res = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
         let rx = drv.take_last_poll_rx();
+        let mut ages_buf = std::mem::take(&mut self.scratch.ages);
+        let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
+        self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
+            drv.as_ref(),
+            self.config.dof,
+            self.feedback_numeric_valid,
+            &self.measured_positions,
+            &mut ages_buf,
+            &mut bounds_buf,
+        );
+        self.scratch.ages = ages_buf;
+        self.scratch.fb.bounds = bounds_buf;
         drop(drv);
         if matches!(
             poll_res,

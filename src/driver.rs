@@ -1393,6 +1393,10 @@ pub struct FeetechArmDriver<T: Transport> {
     /// True after any Feetech request times out or observes an ambiguous duplicate reply; the next
     /// request MUST discard RX bytes until continuous line idle before transmitting (E3).
     line_poisoned: bool,
+    /// Preallocated goal-position scratch buffer for zero-alloc `FailedHold` / stopped holds (R1).
+    hold_positions_buf: Vec<(u8, u16)>,
+    /// Preallocated `SYNC_WRITE` packet buffer for zero-alloc `FailedHold` / stopped holds (R1).
+    hold_sync_pkt_buf: Vec<u8>,
     consecutive_missed_echoes: u32,
     warned_missed_echoes: bool,
 }
@@ -1401,6 +1405,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     pub fn new(transport: T, servo_ids: Vec<u8>) -> Self {
         let clock = transport.clock();
         let dof = servo_ids.len();
+        let hold_cap = dof.max(crate::rt_core::mailbox::MAX_DOF);
         let joints: Vec<feetech::FeetechJointCalib> = servo_ids
             .iter()
             .map(|&id| feetech::FeetechJointCalib {
@@ -1447,6 +1452,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             partial_pos_rx: Vec::with_capacity(64),
             rx_timestamps: Vec::with_capacity(256),
             line_poisoned: false,
+            hold_positions_buf: Vec::with_capacity(hold_cap),
+            hold_sync_pkt_buf: Vec::with_capacity(16 + hold_cap * 3),
             consecutive_missed_echoes: 0,
             warned_missed_echoes: false,
         }
@@ -1542,6 +1549,14 @@ impl<T: Transport> FeetechArmDriver<T> {
             .collect();
         if self.effective_ranges.len() != dof {
             self.effective_ranges.resize(dof, (0, 4095));
+        }
+        let hold_cap = dof.max(crate::rt_core::mailbox::MAX_DOF);
+        if self.hold_positions_buf.capacity() < hold_cap {
+            self.hold_positions_buf.reserve(hold_cap - self.hold_positions_buf.len());
+        }
+        let pkt_cap = 16 + hold_cap * 3;
+        if self.hold_sync_pkt_buf.capacity() < pkt_cap {
+            self.hold_sync_pkt_buf.reserve(pkt_cap - self.hold_sync_pkt_buf.len());
         }
         self
     }
@@ -2778,8 +2793,70 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         Some(self.motor_status.clone())
     }
 
+    fn motor_status_into(&self, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        out.extend_from_slice(&self.motor_status);
+        true
+    }
+
     fn joint_loads(&self) -> Option<Vec<f32>> {
         Some(self.cached_loads.clone())
+    }
+
+    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
+        out.clear();
+        out.extend_from_slice(&self.cached_loads);
+        true
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        let now = self.clock_now();
+        out.clear();
+        out.extend(
+            self.last_feedback_instant
+                .iter()
+                .map(|opt| opt.map(|t| now.saturating_duration_since(t))),
+        );
+    }
+
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        let now = self.clock_now();
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|opt| {
+            opt.map(|t| now.saturating_duration_since(t).as_millis().min(u64::MAX as u128) as u64)
+        }));
+    }
+
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        out.extend_from_slice(&self.last_feedback_instant);
+    }
+
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend_from_slice(&self.feedback_seq);
+    }
+
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+    }
+
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        out.extend_from_slice(&self.last_feedback_instant);
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        let now = self.clock_now();
+        self.last_feedback_instant.len() == dof
+            && self
+                .last_feedback_instant
+                .iter()
+                .all(|opt| opt.is_some_and(|t| now.saturating_duration_since(t) <= max_age))
+    }
+
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
+        out.clear();
     }
 
     fn decode_motor_error(&self, code: u8) -> Option<String> {
@@ -3146,7 +3223,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.pending_stop_check(Some(start_stamp))?;
         let dof = self.servo_ids.len().min(crate::rt_core::mailbox::MAX_DOF);
         let mut report = HoldPassReport::empty(dof);
-        let mut positions = Vec::with_capacity(dof);
+        // R1: Reuse preallocated buffers for goal positions and SYNC_WRITE packet (0 heap allocs).
+        self.hold_positions_buf.clear();
         let mut held_mask = 0u64;
         let default_calib = feetech::FeetechJointCalib::default();
         for (i, target) in targets.iter().enumerate().take(dof) {
@@ -3172,7 +3250,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             let range = self.effective_ranges.get(i).copied().unwrap_or_else(|| calib.effective_range_steps());
             match calib.checked_rad_to_steps_in_range(pos, range) {
                 Ok(raw_steps) => {
-                    positions.push((self.servo_ids[i], raw_steps));
+                    self.hold_positions_buf.push((self.servo_ids[i], raw_steps));
                     report.joint_status[i] = JointHoldStatus::Queued;
                     held_mask |= 1u64 << i;
                 }
@@ -3181,14 +3259,23 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
             }
         }
-        if !positions.is_empty() {
-            let sync_pkt = feetech::build_sync_write_positions(&positions)
-                .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
-            self.pending_stop_check(Some(start_stamp))?;
-            self.transport.write_all(&sync_pkt)?;
-            self.pending_stop_check(Some(start_stamp))?;
-            self.transport.flush()?;
-            self.drain_tx_echo(&sync_pkt)?;
+        if !self.hold_positions_buf.is_empty() {
+            let mut sync_pkt = std::mem::take(&mut self.hold_sync_pkt_buf);
+            let build_res = feetech::write_sync_write_positions_into(
+                &self.hold_positions_buf,
+                &mut sync_pkt,
+            )
+            .map_err(|e| ArmDriverError::Protocol(e.to_string()));
+            let tx_res = build_res.and_then(|()| {
+                self.pending_stop_check(Some(start_stamp))?;
+                self.transport.write_all(&sync_pkt)?;
+                self.pending_stop_check(Some(start_stamp))?;
+                self.transport.flush()?;
+                self.drain_tx_echo(&sync_pkt)?;
+                Ok(())
+            });
+            self.hold_sync_pkt_buf = sync_pkt;
+            tx_res?;
             if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
                 self.partial_pos_rx.append(&mut self.rx_buffer);
                 self.rx_timestamps.clear();

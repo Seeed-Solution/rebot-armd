@@ -615,12 +615,21 @@ impl crate::supervisor::SupervisorInner {
     /// Receive times of the oldest and newest joint feedback sample, when every joint has one
     /// (`ArmDriver::feedback_instants`: the driver's own receive instants, not now - age).
     fn feedback_instant_range(&self) -> Option<(std::time::Instant, std::time::Instant)> {
-        let instants = self.driver.as_ref()?.lock().ok()?.feedback_instants();
+        self.driver.as_ref()?;
+        // R1: Read the owner-held feedback instants populated by `poll_hardware_rx` /
+        // `step_enable_validate` with zero driver lock and zero heap allocation.
+        let instants = self.core.feedback().instants();
         if instants.len() != self.config.dof {
             return None;
         }
-        let instants: Vec<std::time::Instant> = instants.into_iter().collect::<Option<Vec<_>>>()?;
-        Some((*instants.iter().min()?, *instants.iter().max()?))
+        let mut min_t: Option<std::time::Instant> = None;
+        let mut max_t: Option<std::time::Instant> = None;
+        for opt in instants {
+            let t = (*opt)?;
+            min_t = Some(min_t.map_or(t, |m| m.min(t)));
+            max_t = Some(max_t.map_or(t, |m| m.max(t)));
+        }
+        Some((min_t?, max_t?))
     }
 
     /// Positive evidence that the arm joints are at rest, from fresh feedback: measured
@@ -636,7 +645,7 @@ impl crate::supervisor::SupervisorInner {
         {
             return false;
         }
-        let arm = self.config.arm_joint_indices();
+        let arm = self.config.arm_joints();
         let velocity_feedback = self
             .driver
             .as_ref()
@@ -677,7 +686,7 @@ impl crate::supervisor::SupervisorInner {
             self.tracking.position_sample = None;
             return;
         }
-        let arm = self.config.arm_joint_indices();
+        let arm = self.config.arm_joints();
         let range = self.feedback_instant_range();
         let keep = self.tracking.position_sample.as_ref().is_some_and(|(oldest, newest, q_ref)| {
             // Age of the reference (its oldest reply) against this sample's newest reply
@@ -690,8 +699,19 @@ impl crate::supervisor::SupervisorInner {
                 && arm.iter().all(|&j| (self.measured_positions[j] - q_ref[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
         });
         if !keep {
-            self.tracking.position_sample =
-                range.map(|(oldest, newest)| (oldest, newest, self.measured_positions.clone()));
+            match (range, self.tracking.position_sample.as_mut()) {
+                (Some((oldest, newest)), Some((o, n, q_ref))) => {
+                    *o = oldest;
+                    *n = newest;
+                    crate::rt_core::scratch::copy_into(q_ref, &self.measured_positions);
+                }
+                (Some((oldest, newest)), None) => {
+                    self.tracking.position_sample = Some((oldest, newest, self.measured_positions.clone()));
+                }
+                (None, _) => {
+                    self.tracking.position_sample = None;
+                }
+            }
         }
     }
 
