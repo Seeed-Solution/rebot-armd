@@ -1108,13 +1108,11 @@ impl MacroCtx {
                 timeout_code: self.timeout_code,
                 contact: None,
             };
-            let slot = req::prepare_child_replay_slot(
-                &snap.commanded_positions,
-                &plan,
-                tool_digest,
-                child_spec,
-            )
-            .map_err(|c| fail(c, format!("failed to stage replay child for {phase}: {c}")))?;
+            // Always stage `plan`'s original planned start and pre-swept approach (never
+            // `snap.commanded_positions` from a post-planning snapshot) so commit refuses
+            // `PLAN_STALE` if the pose moved while planning.
+            let slot = req::prepare_child_replay_slot(&plan, tool_digest, child_spec)
+                .map_err(|c| fail(c, format!("failed to stage replay child for {phase}: {c}")))?;
             self.submit_child_slot_executor(&child_stamp, slot, true, calibration_rev)
                 .await?;
             child_spec.ticket
@@ -1138,6 +1136,7 @@ impl MacroCtx {
                 contact: None,
             };
             let owner_ctx = req::OwnerCheckCtx::for_legacy(&inner);
+            let planned_start = plan.input.start.clone();
             match req::install_macro_child(
                 &mut inner,
                 &child_stamp,
@@ -1145,7 +1144,7 @@ impl MacroCtx {
                 true,
                 req::MacroChildPayload::LegacyReplay {
                     spec: child_spec,
-                    start: snap.commanded_positions,
+                    start: planned_start,
                     plan,
                     tool_digest,
                 },

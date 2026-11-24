@@ -405,6 +405,16 @@ async fn b2_pr_p_prepared_actions_and_macro_lifecycle_are_zero_alloc_on_rt() {
     }
     let mut s_arr = [0.0f32; MAX_DOF];
     s_arr[..snap.commanded_positions.len()].copy_from_slice(&snap.commanded_positions);
+    replay_slot.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(
+            &snap.commanded_positions,
+            &snap.commanded_positions,
+            0.2,
+            None,
+            true,
+        )
+        .unwrap(),
+    );
     replay_slot.primitive = Primitive::Action(StagedAction::Replay {
         child: None,
         dof: snap.commanded_positions.len() as u8,
@@ -1173,7 +1183,6 @@ async fn b2_r2_m4_prepared_replay_approach_planned_off_thread_is_zero_alloc_on_r
         contact: None,
     };
     let c_slot = armd::rt_core::requests::actions::prepare_child_replay_slot(
-        &snap3.commanded_positions,
         &prep_child.plan,
         snap3.env.tool_digest_hash,
         c_spec,

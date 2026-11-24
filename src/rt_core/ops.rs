@@ -207,11 +207,14 @@ impl PreparedPath {
     }
 }
 
-/// One plan slot: the primitive and the prepared path a [`Primitive::Prepared`] reads.
+/// One plan slot: the primitive, the prepared path a [`Primitive::Prepared`] reads, and (for
+/// prepared replays) the exact off-thread fitted & workspace-swept approach quintic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanSlot {
     pub primitive: Primitive,
     pub path: PreparedPath,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub replay_approach: Option<crate::replay::PreparedReplayApproach>,
 }
 
 impl Default for PlanSlot {
@@ -220,22 +223,41 @@ impl Default for PlanSlot {
 }
 
 impl PlanSlot {
-    pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+    pub fn with_path_capacity(n: usize) -> Self {
+        Self {
+            primitive: Primitive::None,
+            path: PreparedPath::with_capacity(n),
+            #[cfg(not(target_arch = "wasm32"))]
+            replay_approach: None,
+        }
+    }
 
     /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
     pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
-    /// Stages a primitive that reads no path (the path is cleared).
+    /// Stages a primitive that reads no path (the path and replay approach are cleared).
     pub fn set(&mut self, p: Primitive) {
         self.primitive = p;
         self.path.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = None;
+        }
     }
 
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
     pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
         self.primitive = Primitive::None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = None;
+        }
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.replay_approach = other.replay_approach;
+        }
         Ok(())
     }
 }
@@ -961,6 +983,7 @@ impl CoreOps for SupervisorInner {
                         let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
                         let prepared = self.prepared_replay_from_slot_preplanned(
                             n,
+                            &start[..n],
                             slot,
                             checked,
                             duration_s,
@@ -976,6 +999,7 @@ impl CoreOps for SupervisorInner {
                             .map_err(|code| ArmError::Rejected { status: 409, code: code.into(), message: code.into() })?;
                         let prepared = this.prepared_replay_from_slot_preplanned(
                             n,
+                            &start[..n],
                             slot,
                             checked,
                             duration_s,

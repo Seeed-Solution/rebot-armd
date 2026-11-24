@@ -89,6 +89,112 @@ pub struct ReplayInput {
     pub active_tool: crate::tool::ActiveToolInfo,
 }
 
+/// Complete off-thread prepared replay approach (fitted & workspace-swept at prepare time,
+/// zero-alloc `Copy`, installed verbatim at commit without rebuilding a different curve).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreparedReplayApproach {
+    pub dof: u8,
+    /// Commanded start pose from which `polys` was planned, power-fitted, and workspace-swept.
+    pub start: [f32; crate::rt_core::mailbox::MAX_DOF],
+    /// Resolved frame-0 target pose (with held gripper when `!gripper`).
+    pub first: [f32; crate::rt_core::mailbox::MAX_DOF],
+    /// Exact fitted & workspace-swept per-joint quintic polynomials (`[0..dof]`).
+    pub polys: [crate::trajectory::QuinticPolynomial; crate::trajectory::INLINE_POLYS],
+    /// Fitted approach duration (s).
+    pub duration_s: f64,
+    /// Power-budget time scale applied to this approach, if any.
+    pub power_scale: Option<f64>,
+    /// True when this curve passed off-thread workspace/keepout sweeping (or no workspace policy existed at prepare time).
+    pub workspace_swept: bool,
+}
+
+impl PreparedReplayApproach {
+    /// Captures an already-fitted, already-swept [`MultiJointQuinticTrajectory`] inline (`dof <= MAX_DOF`).
+    pub fn from_trajectory(
+        start: &[f32],
+        first: &[f32],
+        traj: &MultiJointQuinticTrajectory,
+        power_scale: Option<f64>,
+        workspace_swept: bool,
+    ) -> Result<Self, &'static str> {
+        let dof = start.len();
+        let slice = traj.polynomials.as_slice();
+        if dof == 0
+            || dof > crate::rt_core::mailbox::MAX_DOF
+            || dof > crate::trajectory::INLINE_POLYS
+            || first.len() != dof
+            || slice.len() != dof
+            || !(traj.duration.is_finite() && traj.duration > 1e-9)
+        {
+            return Err("INVALID_COMMAND");
+        }
+        let zero = crate::trajectory::QuinticPolynomial {
+            a0: 0.0, a1: 0.0, a2: 0.0, a3: 0.0, a4: 0.0, a5: 0.0,
+            duration: traj.duration,
+            p0: 0.0, p1: 0.0, v0: 0.0, v1: 0.0, a_start: 0.0, a_end: 0.0,
+        };
+        let mut s_arr = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let mut f_arr = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let mut polys = [zero; crate::trajectory::INLINE_POLYS];
+        s_arr[..dof].copy_from_slice(start);
+        f_arr[..dof].copy_from_slice(first);
+        polys[..dof].copy_from_slice(slice);
+        Ok(Self {
+            dof: dof as u8,
+            start: s_arr,
+            first: f_arr,
+            polys,
+            duration_s: traj.duration,
+            power_scale,
+            workspace_swept,
+        })
+    }
+
+    /// Off-thread helper for tests/fixtures constructing synthetic replay `PlanSlot`s without parquet I/O.
+    pub fn from_endpoints(
+        start: &[f32],
+        first: &[f32],
+        duration_s: f64,
+        power_scale: Option<f64>,
+        workspace_swept: bool,
+    ) -> Result<Self, &'static str> {
+        let dof = start.len();
+        if dof == 0 || dof > crate::rt_core::mailbox::MAX_DOF || first.len() != dof {
+            return Err("INVALID_COMMAND");
+        }
+        let zeros = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let traj = MultiJointQuinticTrajectory::new(
+            start,
+            &zeros[..dof],
+            first,
+            &zeros[..dof],
+            duration_s,
+        )
+        .map_err(|_| "INVALID_COMMAND")?;
+        Self::from_trajectory(start, first, &traj, power_scale, workspace_swept)
+    }
+
+    /// Reconstructs the EXACT pre-fitted, pre-swept [`MultiJointQuinticTrajectory`] verbatim
+    /// without rebuilding or refitting any polynomial (strictly 0 allocations).
+    pub fn to_trajectory(&self) -> Result<MultiJointQuinticTrajectory, &'static str> {
+        let dof = usize::from(self.dof);
+        if dof == 0
+            || dof > crate::trajectory::INLINE_POLYS
+            || !(self.duration_s.is_finite() && self.duration_s > 1e-9)
+        {
+            return Err("INVALID_COMMAND");
+        }
+        Ok(MultiJointQuinticTrajectory {
+            polynomials: crate::trajectory::JointPolynomials::Inline {
+                data: self.polys,
+                len: dof,
+            },
+            duration: self.duration_s,
+            elapsed: 0.0,
+        })
+    }
+}
+
 /// A checked replay ready to install.
 #[derive(Debug, Clone)]
 pub struct ReplayPlan {
@@ -106,6 +212,9 @@ pub struct ReplayPlan {
     pub approach: MultiJointQuinticTrajectory,
     /// Power-budget time scale of the approach quintic, if a planning power budget applied.
     pub approach_power_scale: Option<f64>,
+    /// Inline zero-alloc representation of `approach` (`Some` for all `dof <= MAX_DOF`),
+    /// carried verbatim from prepare to install so commit NEVER rebuilds a different curve.
+    pub prepared_approach: Option<PreparedReplayApproach>,
     pub has_gripper_motion: bool,
     pub tool_provenance_ok: bool,
     pub planned_tool_digest: String,
@@ -178,19 +287,19 @@ pub fn prepare_replay(plan: &ReplayPlan, active_tool_digest: &str, child: Option
     let approach_moves_gripper = input.gripper_idx.is_some_and(|g| input.request.gripper && (plan.samples[0][g] - input.start[g]).abs() > 1e-3);
     if input.request.gripper && (plan.has_gripper_motion || approach_moves_gripper) && !plan.tool_provenance_ok { return Err("TOOL_MISMATCH"); }
     let episode = EpisodeRef::new(&input.request.episode).ok_or("INVALID_COMMAND")?;
+    let approach = plan.prepared_approach.ok_or("INVALID_COMMAND")?;
     let mut slot = PlanSlot::with_path_capacity(plan.samples.len());
     for (k, q) in plan.samples.iter().enumerate() { slot.path.push(q, k as f64)?; }
-    let mut start = [0.0; MAX_DOF];
-    start[..dof].copy_from_slice(&input.start);
+    slot.replay_approach = Some(approach);
     slot.primitive = Primitive::Prepared {
-        child, dof: dof as u8, start,
+        child, dof: dof as u8, start: approach.start,
         kind: PathKind::Replay {
             episode,
             speed: input.request.speed as f32,
             gripper: input.request.gripper,
             sample_dt: plan.sample_dt,
-            approach_duration_s: plan.approach.duration,
-            approach_power_scale: plan.approach_power_scale,
+            approach_duration_s: approach.duration_s,
+            approach_power_scale: approach.power_scale,
             tool_digest: tool_digest_hash(active_tool_digest),
         },
         duration_s: plan.duration, power_scale: plan.power_scale,
@@ -434,7 +543,7 @@ fn plan_frames_with_provenance(
     };
     // Plan, power-fit, and workspace-sweep the approach-to-first-frame OFF-thread once so neither
     // the Legacy install lock nor `armd-control` ever recomputes or sweeps the approach.
-    let (approach, approach_power_scale) = plan_replay_approach_off_lock(&input, &samples[0])?;
+    let (approach, approach_power_scale, prepared_approach) = plan_replay_approach_off_lock(&input, &samples[0])?;
     let planned_tool_digest = input.active_tool.config_digest.clone();
     Ok(ReplayPlan {
         input,
@@ -444,6 +553,7 @@ fn plan_frames_with_provenance(
         power_scale,
         approach,
         approach_power_scale,
+        prepared_approach,
         has_gripper_motion,
         tool_provenance_ok,
         planned_tool_digest,
@@ -458,7 +568,7 @@ fn plan_frames_with_provenance(
 fn plan_replay_approach_off_lock(
     input: &ReplayInput,
     first_sample: &[f32],
-) -> Result<(MultiJointQuinticTrajectory, Option<f64>), ArmError> {
+) -> Result<(MultiJointQuinticTrajectory, Option<f64>, Option<PreparedReplayApproach>), ArmError> {
     if first_sample.len() != input.dof || input.start.len() != input.dof {
         return Err(MotionError::InvalidCommand("replay approach dimension mismatch".into()).into());
     }
@@ -493,7 +603,7 @@ fn plan_replay_approach_off_lock(
         input.power.as_ref(),
         &input.arm,
     )?;
-    if let Some((ws, cam)) = input.ws.as_ref() {
+    let workspace_swept = if let Some((ws, cam)) = input.ws.as_ref() {
         crate::rt_core::requests::actions::check_quintic_workspace_off_lock(
             &traj,
             &input.start,
@@ -502,8 +612,25 @@ fn plan_replay_approach_off_lock(
             &input.arm,
             input.tcp_offset,
         )?;
-    }
-    Ok((traj, approach_scale))
+        true
+    } else {
+        false
+    };
+    let prepared = if input.dof <= crate::rt_core::mailbox::MAX_DOF {
+        Some(
+            PreparedReplayApproach::from_trajectory(
+                &input.start,
+                &first,
+                &traj,
+                approach_scale,
+                workspace_swept,
+            )
+            .map_err(|_| MotionError::InvalidCommand("invalid prepared replay approach".into()))?,
+        )
+    } else {
+        None
+    };
+    Ok((traj, approach_scale, prepared))
 }
 
 fn workspace_reject(e: SafetyError) -> ArmError {
@@ -939,14 +1066,92 @@ impl SupervisorInner {
         Ok((episode, speed, gripper, sample_dt, approach_duration_s, approach_power_scale))
     }
 
+    /// **Single shared owner-side replay approach verifier (M4)** used by BOTH Legacy
+    /// (`replay_motion`) and RT Executor (`prepared_replay_from_slot_preplanned`):
+    /// - Compares current `self.commanded_positions` against `approach.start` within
+    ///   `START_TOLERANCE` via the single `check_start_fresh` check (`PLAN_STALE` on drift).
+    /// - Requires rest velocity (`|v| < 1e-3`, `PLAN_STALE` if moving).
+    /// - Requires `approach.workspace_swept` when a workspace policy is active (`PLAN_STALE`).
+    /// - Verifies `approach.first` matches `raw_first_sample` (with held gripper when `!gripper`),
+    ///   obeys joint soft limits, and matches the stored quintic endpoints.
+    /// - Returns the EXACT pre-fitted, pre-swept [`MultiJointQuinticTrajectory`] verbatim —
+    ///   NEVER rebuilds a different curve at commit (0 allocations).
+    pub(crate) fn verify_prepared_replay_approach(
+        &self,
+        approach: &PreparedReplayApproach,
+        raw_first_sample: &[f32],
+        gripper: bool,
+    ) -> Result<(MultiJointQuinticTrajectory, [f32; crate::rt_core::mailbox::MAX_DOF], Option<f64>), &'static str> {
+        let dof = usize::from(approach.dof);
+        if dof == 0
+            || dof > crate::rt_core::mailbox::MAX_DOF
+            || dof != self.config.dof
+            || raw_first_sample.len() < dof
+            || !(approach.duration_s.is_finite() && approach.duration_s > 1e-9)
+        {
+            return Err("INVALID_COMMAND");
+        }
+        crate::rt_core::requests::actions::check_start_fresh(
+            &self.commanded_positions,
+            &approach.start[..dof],
+        )
+        .map_err(|r| r.code)?;
+        if self.commanded_velocities.iter().take(dof).any(|v| v.abs() >= 1e-3) {
+            return Err("PLAN_STALE");
+        }
+        if self.workspace_policy().is_some() && !approach.workspace_swept {
+            return Err("PLAN_STALE");
+        }
+        let gripper_idx = self.config.gripper_index();
+        let mut expected_first = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        expected_first[..dof].copy_from_slice(&raw_first_sample[..dof]);
+        if let (false, Some(g)) = (gripper, gripper_idx) {
+            if g < dof {
+                expected_first[g] = approach.start[g];
+            }
+        }
+        for (i, (&exp, &got)) in expected_first[..dof]
+            .iter()
+            .zip(&approach.first[..dof])
+            .enumerate()
+        {
+            if !exp.is_finite() || !got.is_finite() {
+                return Err("INVALID_COMMAND");
+            }
+            if (exp - got).abs() >= crate::rt_core::ops::START_TOLERANCE {
+                return Err("PLAN_STALE");
+            }
+            let l = &self.config.limits[i];
+            if got < l.min_position || got > l.max_position {
+                return Err("SOFT_LIMIT_EXCEEDED");
+            }
+            let poly = &approach.polys[i];
+            if !poly.duration.is_finite()
+                || (poly.duration - approach.duration_s).abs() > 1e-9
+                || !poly.p0.is_finite()
+                || !poly.p1.is_finite()
+                || (poly.p0 as f32 - approach.start[i]).abs()
+                    >= crate::rt_core::ops::START_TOLERANCE
+                || (poly.p1 as f32 - got).abs()
+                    >= crate::rt_core::ops::START_TOLERANCE
+            {
+                return Err("INVALID_COMMAND");
+            }
+        }
+        let traj = approach.to_trajectory()?;
+        Ok((traj, approach.first, approach.power_scale))
+    }
+
     /// Zero-allocation, zero-planning RT install of a prepared replay borrowing directly from an
     /// immutable pinned plan slot (`PlanSlotRef`) using the off-thread pre-planned approach
-    /// `(approach_duration_s, approach_power_scale)` (M4): performs NO `TrajectoryPlanner::plan`,
-    /// NO power-budget fit, and NO workspace sweep on `armd-control`.
+    /// carried on `slot.replay_approach` (M4): verifies start/sweep/endpoints through the ONE
+    /// shared [`Self::verify_prepared_replay_approach`] and installs the exact pre-swept curve
+    /// verbatim without rebuilding or allocating on `armd-control`.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn prepared_replay_from_slot_preplanned(
         &self,
         dof: usize,
+        staged_start: &[f32],
         slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
         checked: (crate::rt_core::ops::EpisodeRef, f32, bool, f64),
         duration: f64,
@@ -958,38 +1163,26 @@ impl SupervisorInner {
         if dof == 0
             || dof > crate::rt_core::mailbox::MAX_DOF
             || dof != self.config.dof
+            || staged_start.len() != dof
             || !(approach_duration_s.is_finite() && approach_duration_s > 1e-9)
         {
             return Err("INVALID_COMMAND");
         }
-        if self.commanded_velocities.iter().take(dof).any(|v| v.abs() >= 1e-3) {
-            return Err("PLAN_STALE");
+        let approach = slot.replay_approach.as_ref().ok_or("INVALID_COMMAND")?;
+        if usize::from(approach.dof) != dof
+            || (approach.duration_s - approach_duration_s).abs() > 1e-9
+        {
+            return Err("INVALID_COMMAND");
         }
+        // Staged start metadata MUST agree with the prepared approach's start.
+        crate::rt_core::requests::actions::check_start_fresh(staged_start, &approach.start[..dof])
+            .map_err(|r| r.code)?;
+        let (traj, first, verified_power_scale) =
+            self.verify_prepared_replay_approach(approach, &slot.path.samples()[0][..dof], gripper)?;
         let gripper_idx = self.config.gripper_index();
-        let hold_gripper = gripper_idx.filter(|_| !gripper).map(|g| self.commanded_positions[g]);
-        let mut first = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        first[..dof].copy_from_slice(&slot.path.samples()[0][..dof]);
-        if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) {
-            first[g] = h;
-        }
-        for (p, l) in first[..dof].iter().zip(&self.config.limits) {
-            if !p.is_finite() {
-                return Err("INVALID_COMMAND");
-            }
-            if *p < l.min_position || *p > l.max_position {
-                return Err("SOFT_LIMIT_EXCEEDED");
-            }
-        }
-        let zeros = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-        let traj = MultiJointQuinticTrajectory::new(
-            &self.commanded_positions[..dof],
-            &zeros[..dof],
-            &first[..dof],
-            &zeros[..dof],
-            approach_duration_s,
-        )
-        .map_err(|_| "INVALID_COMMAND")?;
+        let hold_gripper = gripper_idx.filter(|_| !gripper).map(|g| approach.start[g]);
         let approach_duration = traj.duration;
+        let final_approach_scale = verified_power_scale.or(approach_power_scale);
         let motion = ReplayMotion {
             episode: ReplayEpisode::Inline(episode),
             speed: f64::from(speed) * power_scale.unwrap_or(1.0),
@@ -1003,7 +1196,7 @@ impl SupervisorInner {
             approach_duration,
             phase: Phase::Approach(traj),
         };
-        Ok((motion, first, dof, [power_scale, approach_power_scale]))
+        Ok((motion, first, dof, [power_scale, final_approach_scale]))
     }
 
     /// Fallback prepared replay when called through `CoreOps::commit_prepared(&PreparedPath)`
@@ -1062,9 +1255,6 @@ impl SupervisorInner {
             return Err(MotionError::PlanStale("workspace or keep-out boxes changed while loading the episode".into()).into());
         }
         self.replay_preconditions()?;
-        if self.commanded_positions.iter().zip(&input.start).any(|(a, b)| (a - b).abs() >= 1e-4) {
-            return Err(MotionError::PlanStale("commanded positions changed while loading the episode".into()).into());
-        }
         if plan.planned_tool_digest != self.config.active_tool.config_digest {
             return Err(rejected(409, "TOOL_MISMATCH", format!(
                 "Replay for episode '{}' was planned for tool digest '{}' which does not match active tool '{}' ({})",
@@ -1072,11 +1262,9 @@ impl SupervisorInner {
             )));
         }
         let gripper_idx = input.gripper_idx;
-        let hold_gripper = gripper_idx.filter(|_| !input.request.gripper).map(|g| self.commanded_positions[g]);
-        let mut first = plan.samples[0].clone();
-        if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) { first[g] = h; }
+        let hold_gripper = gripper_idx.filter(|_| !input.request.gripper).map(|g| input.start[g]);
         let approach_moves_gripper = gripper_idx.is_some_and(|g| {
-            input.request.gripper && (first[g] - self.commanded_positions[g]).abs() > 1e-3
+            input.request.gripper && (plan.samples[0][g] - input.start[g]).abs() > 1e-3
         });
         let tool_provenance_ok = self
             .config
@@ -1088,6 +1276,36 @@ impl SupervisorInner {
                 input.request.episode, plan.recorded_tool_id, plan.recorded_tool_digest, self.config.active_tool.id, self.config.active_tool.config_digest
             )));
         }
+        let (verified_approach, first, verified_approach_scale) =
+            if let Some(prep) = plan.prepared_approach.as_ref() {
+                let (traj, first_arr, scale) = self
+                    .verify_prepared_replay_approach(prep, &plan.samples[0], input.request.gripper)
+                    .map_err(|code| match code {
+                        "PLAN_STALE" => ArmError::from(MotionError::PlanStale(
+                            "commanded positions changed while loading the episode".into(),
+                        )),
+                        "SOFT_LIMIT_EXCEEDED" => ArmError::from(SafetyError::InvalidValue),
+                        _ => ArmError::from(MotionError::InvalidCommand(
+                            "prepared replay approach invalid".into(),
+                        )),
+                    })?;
+                (Some(traj), first_arr[..input.dof].to_vec(), scale)
+            } else {
+                crate::rt_core::requests::actions::check_start_fresh(
+                    &self.commanded_positions,
+                    &input.start,
+                )
+                .map_err(|_| {
+                    ArmError::from(MotionError::PlanStale(
+                        "commanded positions changed while loading the episode".into(),
+                    ))
+                })?;
+                let mut f = plan.samples[0].clone();
+                if let (false, Some(g)) = (input.request.gripper, input.gripper_idx) {
+                    f[g] = input.start[g];
+                }
+                (None, f, plan.approach_power_scale)
+            };
         let ReplayPlan {
             input,
             samples,
@@ -1095,9 +1313,9 @@ impl SupervisorInner {
             duration,
             power_scale,
             approach,
-            approach_power_scale,
             ..
         } = plan;
+        let approach = verified_approach.unwrap_or(approach);
         let motion = ReplayMotion {
             episode: ReplayEpisode::Owned(input.request.episode.clone()),
             speed: input.request.speed * power_scale.unwrap_or(1.0),
@@ -1111,7 +1329,7 @@ impl SupervisorInner {
             approach_duration: approach.duration,
             phase: Phase::Approach(approach),
         };
-        Ok((motion, first, [power_scale, approach_power_scale]))
+        Ok((motion, first, [power_scale, verified_approach_scale]))
     }
 
     /// Check and start a replay under the caller's lock (tests, in-process callers). The WS

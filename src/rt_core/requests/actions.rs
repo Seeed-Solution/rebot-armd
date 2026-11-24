@@ -1715,9 +1715,11 @@ pub struct PreparedReplayAction {
 }
 
 impl PreparedReplayAction {
-    /// Stages this prepared replay into a broker [`PlanSlot`] (no file I/O on RT).
+    /// Stages this prepared replay into a broker [`PlanSlot`] (no file I/O on RT), carrying
+    /// the exact off-thread fitted & workspace-swept [`crate::replay::PreparedReplayApproach`].
     pub fn to_plan_slot(&self, child: Option<ChildSpec>) -> Result<PlanSlot, &'static str> {
-        let dof = self.start.len();
+        let approach = self.plan.prepared_approach.ok_or("INVALID_COMMAND")?;
+        let dof = usize::from(approach.dof);
         if dof == 0 || dof > MAX_DOF {
             return Err("INVALID_COMMAND");
         }
@@ -1726,20 +1728,19 @@ impl PreparedReplayAction {
         for (i, sample) in self.plan.samples.iter().enumerate() {
             slot.path.push(sample, i as f64)?;
         }
-        let mut start = [0.0f32; MAX_DOF];
-        start[..dof].copy_from_slice(&self.start);
+        slot.replay_approach = Some(approach);
         slot.primitive = Primitive::Action(StagedAction::Replay {
             child,
             dof: dof as u8,
-            start,
+            start: approach.start,
             episode,
             speed: self.plan.input.request.speed as f32,
             gripper: self.plan.input.request.gripper,
             sample_dt: self.plan.sample_dt,
             duration_s: self.plan.duration,
             power_scale: self.plan.power_scale,
-            approach_duration_s: self.plan.approach.duration,
-            approach_power_scale: self.plan.approach_power_scale,
+            approach_duration_s: approach.duration_s,
+            approach_power_scale: approach.power_scale,
             tool_digest: self.tool_digest,
         });
         Ok(slot)
@@ -2496,13 +2497,15 @@ pub fn prepare_child_gripper_slot(
 }
 
 /// Off-thread helper: stage a prepared replay macro child into a [`PlanSlot`].
+/// Always carries `plan.prepared_approach` (and its original planned `start`) directly from
+/// `plan` so a caller can never substitute a different start pose than the one fitted & swept.
 pub fn prepare_child_replay_slot(
-    start: &[f32],
     plan: &ReplayPlan,
     tool_digest: u64,
     child: ChildSpec,
 ) -> Result<PlanSlot, &'static str> {
-    let dof = start.len();
+    let approach = plan.prepared_approach.ok_or("INVALID_COMMAND")?;
+    let dof = usize::from(approach.dof);
     if dof == 0 || dof > MAX_DOF {
         return Err("INVALID_COMMAND");
     }
@@ -2511,20 +2514,19 @@ pub fn prepare_child_replay_slot(
     for (i, sample) in plan.samples.iter().enumerate() {
         slot.path.push(sample, i as f64)?;
     }
-    let mut s = [0.0f32; MAX_DOF];
-    s[..dof].copy_from_slice(start);
+    slot.replay_approach = Some(approach);
     slot.primitive = Primitive::Action(StagedAction::Replay {
         child: Some(child),
         dof: dof as u8,
-        start: s,
+        start: approach.start,
         episode,
         speed: plan.input.request.speed as f32,
         gripper: plan.input.request.gripper,
         sample_dt: plan.sample_dt,
         duration_s: plan.duration,
         power_scale: plan.power_scale,
-        approach_duration_s: plan.approach.duration,
-        approach_power_scale: plan.approach_power_scale,
+        approach_duration_s: approach.duration_s,
+        approach_power_scale: approach.power_scale,
         tool_digest,
     });
     Ok(slot)
@@ -3439,6 +3441,7 @@ fn install_replay_slot_rt(
     )?;
     let prepared = inner.prepared_replay_from_slot_preplanned(
         dof,
+        &start[..dof],
         slot,
         checked,
         duration_s,
@@ -4255,6 +4258,7 @@ fn install_macro_child_slot_rt(
             })
         }
         StagedAction::Replay {
+            start,
             episode,
             speed,
             gripper,
@@ -4284,6 +4288,7 @@ fn install_macro_child_slot_rt(
             )?;
             let prepared = inner.prepared_replay_from_slot_preplanned(
                 dof,
+                &start[..dof],
                 slot,
                 checked,
                 duration_s,

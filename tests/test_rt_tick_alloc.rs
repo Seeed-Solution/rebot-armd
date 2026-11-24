@@ -792,6 +792,16 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
         q[0] += 0.05 * f;
         replay_slot.path.push(&q[..dof], k as f64).unwrap();
     }
+    replay_slot.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(
+            &start[..dof],
+            &start[..dof],
+            0.04,
+            None,
+            true,
+        )
+        .unwrap(),
+    );
     replay_slot.primitive = Primitive::Prepared {
         child: None,
         dof: dof as u8,
@@ -1176,6 +1186,16 @@ fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_all
         q[0] += 0.04 * f;
         replay.path.push(&q[..dof], k as f64).unwrap();
     }
+    replay.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(
+            &start[..dof],
+            &start[..dof],
+            0.2,
+            None,
+            true,
+        )
+        .unwrap(),
+    );
     replay.primitive = Primitive::Prepared {
         child: None,
         dof: dof as u8,

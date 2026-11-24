@@ -370,6 +370,10 @@ fn a6_prepared_actions_commit_and_complete_on_rt_executor() {
     let mut start_arr = [0.0f32; MAX_DOF];
     start_arr[..start.len()].copy_from_slice(&start);
     let tool_digest = armd::rt_core::ops::tool_digest_hash(&fx.core.config.active_tool.config_digest);
+    replay_slot.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(&start, &start, 0.2, None, true)
+            .unwrap(),
+    );
     replay_slot.primitive = armd::rt_core::ops::Primitive::Action(
         armd::rt_core::requests::actions::StagedAction::Replay {
             child: None,
@@ -807,6 +811,10 @@ fn a7_macro_begin_children_and_finish_lifecycle_with_independent_terminal() {
     }
     let mut s_arr = [0.0f32; MAX_DOF];
     s_arr[..start.len()].copy_from_slice(&start);
+    c4_slot.replay_approach = Some(
+        armd::replay::PreparedReplayApproach::from_endpoints(&start, &start, 0.2, None, true)
+            .unwrap(),
+    );
     c4_slot.primitive = armd::rt_core::ops::Primitive::Action(
         armd::rt_core::requests::actions::StagedAction::Replay {
             child: Some(c4_spec),
@@ -3729,5 +3737,292 @@ async fn r2_m6_multiview_measurement_published_before_terminal_on_both_owners() 
         );
 
         handle.stop_and_join();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_m4_replay_pose_change_during_planning_refused_never_installs_unswept_curve() {
+    // Round 3 M4: if commanded_positions changes while replay planning runs off-thread,
+    // BOTH Legacy and Executor `MacroCtx::install_replay_child` MUST compare against the
+    // prepared approach's original start (`plan.input.start` / `plan.prepared_approach.start`)
+    // and refuse with `PLAN_STALE` — NEVER substituting a newer snapshot's start or rebuilding
+    // an unswept curve at commit. After re-planning from the new pose, the freshly fitted &
+    // swept approach commits and completes cleanly. Also proves unswept approaches are refused
+    // when workspace policy is active.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut frame0 = INSPECT;
+    frame0[0] += 0.14;
+    let mut frames = Vec::new();
+    for k in 0..=20 {
+        let f = k as f32 / 20.0;
+        let mut q = frame0.to_vec();
+        q[0] -= 0.05 * f;
+        frames.push(armd::recording::RecordFrame {
+            timestamp: 10.0 + k as f64 * 0.02,
+            observation_state: q.clone(),
+            action: q,
+        });
+    }
+    armd::recording::write_frames_to_parquet(&tmp.path().join("ep_r3_m4.parquet"), &frames)
+        .unwrap();
+
+    // --- 1) Legacy owner: pose drifts during off-thread planning -> PLAN_STALE ---
+    {
+        let cfg = ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        assert!(cfg.workspace.is_some());
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        sup.set_lease_enabled(false).await;
+        let (parent_id, ws_rev, cal_rev, epoch, adm) = {
+            let mut inner = sup.inner().write().await;
+            inner.episodes = armd::recording::EpisodeStore::new(Some(tmp.path().to_path_buf()));
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            SupervisorInner::enable_torque(a).unwrap();
+            inner.tick(DT);
+            let env = armd::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner);
+            sup.hub().update_prep_env(Arc::new(env));
+            let ep = inner.safety.epoch_id();
+            let ws_rev = inner.workspace_revision;
+            let cal_rev = inner.calibration_revision;
+            let adm = inner.current_admission_stamp();
+            let a2 = inner.check_admission(adm).unwrap();
+            let id = SupervisorInner::begin_sequence_action(a2, None, ep).unwrap();
+            (id, ws_rev, cal_rev, ep, adm)
+        };
+        let ctx = armd::macro_action::MacroCtx {
+            sup: sup.clone(),
+            id: parent_id,
+            stamp: adm,
+            deadline: Instant::now() + Duration::from_secs(30),
+            phase_timeout_s: 20.0,
+            timeout_code: "SEQUENCE_TIMEOUT",
+            timeout_message: String::new(),
+        };
+        // Plan replay off-thread at INSPECT (`Q_old`).
+        let snap_old = ctx.snapshot(ctx.deadline).await.unwrap();
+        let req_r = armd::replay::ReplayRequest {
+            episode: "ep_r3_m4".into(),
+            speed: 1.0,
+            gripper: false,
+            tag: None,
+            allow_stale: false,
+        };
+        let input_old = snap_old.replay_input(req_r.clone(), epoch).unwrap();
+        let plan_old = armd::replay::plan(input_old).unwrap();
+        assert!(
+            plan_old.prepared_approach.as_ref().is_some_and(|a| a.workspace_swept),
+            "off-thread replay plan must record workspace_swept = true"
+        );
+        // Simulate commanded pose changing to `Q_new` while planning ran!
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions[0] += 0.08;
+            inner.measured_positions[0] += 0.08;
+            inner.target_positions[0] += 0.08;
+            inner.tick(DT);
+        }
+        let err = ctx
+            .install_replay_child("replay", plan_old, Some(ws_rev), Some(cal_rev))
+            .await
+            .expect_err("Legacy install_replay_child MUST refuse PLAN_STALE when pose changed during planning");
+        assert!(
+            matches!(err, armd::macro_action::Stop::Fail(ref code, _) if code == "PLAN_STALE"),
+            "expected PLAN_STALE on legacy owner, got {err:?}"
+        );
+        assert!(
+            sup.inner().read().await.active_trajectory.is_none(),
+            "no unswept curve may be installed on legacy owner"
+        );
+    }
+
+    // --- 2) Executor owner: pose moves via child motion during off-thread planning -> PLAN_STALE ---
+    {
+        let cfg = ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        assert!(cfg.workspace.is_some());
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.episodes = armd::recording::EpisodeStore::new(Some(tmp.path().to_path_buf()));
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            SupervisorInner::enable_torque(a).unwrap();
+            inner.tick(DT);
+            let env = armd::rt_core::requests::actions::ActionPrepEnv::from_inner(&inner);
+            sup.hub().update_prep_env(Arc::new(env));
+        }
+        let handle = sup
+            .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(
+                Duration::from_millis(5),
+            ))
+            .await
+            .unwrap();
+        handle.attach_external_reply_sink(Arc::new(|_cid, _reply| {
+            armd::rt_core::broker::DeliveryDecision::Delivered
+        }));
+        let wait_pub = Instant::now() + Duration::from_secs(3);
+        while sup.hub().published_seq() == 0 {
+            assert!(Instant::now() < wait_pub);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 91;
+        let snap0 = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE)
+            .await
+            .unwrap();
+        let ws_rev = snap0.owner.authority.config_revision;
+        let cal_rev = snap0.owner.calibration_revision;
+        let epoch = snap0.owner.authority.epoch;
+        let mut begin = BeginMacroSpec::new(MacroKind::Sequence, handle.boot());
+        begin.admission_request_id = adm.request_id;
+        let (parent_id, _) = armd::macro_action::begin_macro_executor(
+            &sup,
+            &snap0.stamp,
+            begin,
+            Instant::now() + DEFAULT_ACTION_DEADLINE,
+        )
+        .await
+        .unwrap();
+        let ctx = armd::macro_action::MacroCtx {
+            sup: sup.clone(),
+            id: parent_id,
+            stamp: adm,
+            deadline: Instant::now() + Duration::from_secs(30),
+            phase_timeout_s: 20.0,
+            timeout_code: "SEQUENCE_TIMEOUT",
+            timeout_message: String::new(),
+        };
+
+        // Plan replay off-thread at INSPECT (`Q_old`).
+        let snap_old = ctx.snapshot(ctx.deadline).await.unwrap();
+        let req_r = armd::replay::ReplayRequest {
+            episode: "ep_r3_m4".into(),
+            speed: 1.0,
+            gripper: false,
+            tag: None,
+            allow_stale: false,
+        };
+        let input_old = snap_old.replay_input(req_r.clone(), epoch).unwrap();
+        let plan_old = armd::replay::plan(input_old).unwrap();
+
+        // While `plan_old` was prepared for `Q_old`, move the arm to `Q_new` via a real child!
+        let mut q_new = snap_old.commanded_positions.clone();
+        q_new[0] += 0.08;
+        let limits = snap_old.env.planning_limits(Some(0.8));
+        ctx.install_joint_child("drift", q_new.clone(), limits, true, Some(ws_rev), Some(cal_rev))
+            .await
+            .expect("drift child must complete");
+        let q_at_new = sup.get_observation().await.positions;
+        assert!((q_at_new[0] - q_new[0]).abs() < 2e-3);
+
+        // Now call `install_replay_child` with the stale `plan_old` -> MUST refuse `PLAN_STALE`
+        // (even though `install_replay_child` captures a fresh snapshot at `Q_new` internally!).
+        let err = ctx
+            .install_replay_child("replay", plan_old, Some(ws_rev), Some(cal_rev))
+            .await
+            .expect_err("Executor install_replay_child MUST refuse PLAN_STALE when pose moved during planning");
+        assert!(
+            matches!(err, armd::macro_action::Stop::Fail(ref code, _) if code == "PLAN_STALE"),
+            "expected PLAN_STALE on executor owner, got {err:?}"
+        );
+        // Arm must NOT have moved along any unswept curve!
+        let q_after_refusal = sup.get_observation().await.positions;
+        assert!(
+            (q_after_refusal[0] - q_new[0]).abs() < 2e-3,
+            "refused stale replay must not move arm from Q_new"
+        );
+
+        // Re-plan off-thread from fresh `Q_new` -> newly fitted & swept curve commits & completes!
+        let snap_fresh = ctx.snapshot(ctx.deadline).await.unwrap();
+        let input_fresh = snap_fresh.replay_input(req_r, epoch).unwrap();
+        let plan_fresh = armd::replay::plan(input_fresh).unwrap();
+        assert!(plan_fresh.prepared_approach.as_ref().is_some_and(|a| a.workspace_swept));
+        ctx.install_replay_child("replay", plan_fresh, Some(ws_rev), Some(cal_rev))
+            .await
+            .expect("re-planned & re-swept replay from Q_new must succeed");
+
+        ctx.finish(
+            armd::rt_core::requests::actions::FinishState::Done,
+            None,
+            None,
+            None,
+            None,
+            HeldUpdate::Unchanged,
+        )
+        .await;
+        handle.stop_and_join();
+    }
+
+    // --- 3) Direct RT check: unswept approach with active workspace -> PLAN_STALE ---
+    {
+        let (mut fx, mut b, _clock, _stop) = fixture();
+        assert!(fx.core.workspace_policy().is_some());
+        let start = fx.core.commanded_positions.clone();
+        let mut first = start.clone();
+        first[0] += 0.05;
+        let mut slot = PlanSlot::default();
+        for k in 0..=10 {
+            let mut q = first.clone();
+            q[0] += 0.01 * (k as f32 / 10.0);
+            slot.path.push(&q, k as f64).unwrap();
+        }
+        let unswept = armd::replay::PreparedReplayApproach::from_endpoints(
+            &start, &first, 0.25, None, false,
+        )
+        .unwrap();
+        slot.replay_approach = Some(unswept);
+        let tool_digest =
+            armd::rt_core::ops::tool_digest_hash(&fx.core.config.active_tool.config_digest);
+        slot.primitive = armd::rt_core::ops::Primitive::Action(
+            armd::rt_core::requests::actions::StagedAction::Replay {
+                child: None,
+                dof: start.len() as u8,
+                start: unswept.start,
+                episode: armd::rt_core::ops::EpisodeRef::new("ep_unswept").unwrap(),
+                speed: 1.0,
+                gripper: false,
+                sample_dt: 0.02,
+                duration_s: 0.2,
+                power_scale: None,
+                approach_duration_s: 0.25,
+                approach_power_scale: None,
+                tool_digest,
+            },
+        );
+        let req = submit_slot_prepared(
+            &mut b,
+            ClientId(1),
+            1,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            PreparedActionKind::Replay,
+            BOOT,
+            slot,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let rep = fx.step();
+        assert_eq!(
+            rep.command,
+            Some((req, Err("PLAN_STALE"))),
+            "unswept PreparedReplayApproach must be refused PLAN_STALE when workspace policy is active"
+        );
+        assert!(fx.core.active_trajectory.is_none());
     }
 }
