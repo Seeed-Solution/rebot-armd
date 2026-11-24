@@ -2696,6 +2696,13 @@ impl ArmConfig {
                 self.dof
             ));
         }
+        if self.limits.len() != self.dof {
+            return Err(format!(
+                "Limits length {} does not match DOF {}",
+                self.limits.len(),
+                self.dof
+            ));
+        }
         let mut profile_vendor: Option<VendorBinding> = None;
         for (i, slot) in entries.iter().enumerate() {
             let Some(entry) = slot else {
@@ -2800,6 +2807,12 @@ impl ArmConfig {
                                 pv.max_velocity_rad_s, r.v_max
                             ));
                         }
+                        if jl.min_position < -r.p_max || jl.max_position > r.p_max {
+                            return Err(format!(
+                                "control_mode[{i}]: joint position range [{}, {}] exceeds damiao_ranges[{i}].p_max +/-{}",
+                                jl.min_position, jl.max_position, r.p_max
+                            ));
+                        }
                     }
                 }
                 ModeLimits::Impedance(imp) => {
@@ -2832,6 +2845,14 @@ impl ArmConfig {
                     }
                 }
                 ModeLimits::PositionForce(_pf) => {
+                    if let Some(r) = self.damiao_ranges.as_ref().and_then(|rs| rs.get(i)) {
+                        if jl.min_position < -r.p_max || jl.max_position > r.p_max {
+                            return Err(format!(
+                                "control_mode[{i}]: joint position range [{}, {}] exceeds damiao_ranges[{i}].p_max +/-{}",
+                                jl.min_position, jl.max_position, r.p_max
+                            ));
+                        }
+                    }
                     if DamiaoGripperDrive::quantize_vel_raw(jl.max_velocity) == 0 {
                         return Err(format!(
                             "control_mode[{i}]: joint max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"

@@ -696,6 +696,12 @@ pub fn decode_feedback_bytes(
             actual: data.len(),
         });
     }
+    if data.len() > 8 {
+        return Err(DamiaoError::ParameterError(format!(
+            "Damiao feedback payload must be 8 bytes, got {}",
+            data.len()
+        )));
+    }
     if !(limits.p_min.is_finite()
         && limits.p_max.is_finite()
         && limits.p_min < limits.p_max

@@ -747,7 +747,7 @@ fn damiao_pure_codec_pos_vel_matches_legacy_builder_byte_for_byte() {
             (-0.0_f32, None, 2.0_f32),
             (1.2345_f32, Some(0.45), 0.45),
             (-5.75_f32, Some(3.5), 2.0), // clamped to max_velocity_rad_s
-            (3.14159_f32, Some(2.0), 2.0),
+            (std::f32::consts::PI, Some(2.0), 2.0),
         ] {
             let encoded = damiao::encode_command(
                 motor_id,
@@ -1100,11 +1100,15 @@ fn damiao_pure_feedback_decoder_matches_unpack_feedback_frame() {
         }
     }
 
-    // Short slice rejected with IncompleteFrame.
+    // Short or oversized slices rejected.
     assert_eq!(
         damiao::decode_feedback_bytes(&[0u8; 7], &DamiaoLimits::default()),
         Err(DamiaoError::IncompleteFrame { expected: 8, actual: 7 })
     );
+    assert!(matches!(
+        damiao::decode_feedback_bytes(&[0u8; 9], &DamiaoLimits::default()),
+        Err(DamiaoError::ParameterError(_))
+    ));
     // Inverted / non-finite limits rejected.
     let bad_limits = DamiaoLimits { p_min: 12.5, p_max: -12.5, ..DamiaoLimits::default() };
     assert!(matches!(
