@@ -5634,8 +5634,7 @@ impl SupervisorInner {
                     }
                 }
                 Reference::Replay(replay) => {
-                    if j7_pf_stale_before_step && replay.gripper && replay.gripper_idx.is_some() {
-                        let g = replay.gripper_idx.unwrap();
+                    if let Some(g) = replay.gripper_idx.filter(|_| j7_pf_stale_before_step && replay.gripper) {
                         step_buf.positions.clear();
                         step_buf.positions.extend_from_slice(&self.commanded_positions);
                         step_buf.velocities.clear();

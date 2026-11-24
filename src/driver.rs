@@ -3993,10 +3993,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         if let TxKind::RollbackHold(joint) = kind {
-            if latched_before && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
-                if self.active_pos_force_joint() != Some(joint) {
-                    return Err(TxRefusal::BuildRefused);
-                }
+            if latched_before
+                && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none()
+                && self.active_pos_force_joint() != Some(joint)
+            {
+                return Err(TxRefusal::BuildRefused);
             }
         }
         let Some(frame) = build(self) else {
@@ -4408,6 +4409,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// - When NO provably fresh J7 sample has ever been observed since boot
     ///   (`pf_last_fresh_position == None`): emits the safest defined zero-motion, zero-force
     ///   command (`position = last commanded 0x307 position or 0.0`, `vel_raw = 0`, `i_des = 0`).
+    ///
     /// Returns `None` only if joint `i` is not the configured `PosForce` joint.
     fn pos_force_freeze_frame(&self, i: usize) -> Option<CanFrame> {
         let pf = self.pos_force.as_ref().filter(|pf| pf.joint == i)?;
