@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
-use crate::motion::{self, PlanInput};
+use crate::motion::PlanInput;
 use crate::safety::SafetyError;
 use crate::api::rest::ApiError;
 use axum::http::StatusCode;
@@ -16,9 +16,9 @@ use axum::http::StatusCode;
 mod lease;
 #[allow(unused_imports)]
 use lease::*;
-mod motion_cmds;
+mod motion;
 #[allow(unused_imports)]
-use motion_cmds::*;
+use motion::*;
 mod policy;
 #[allow(unused_imports)]
 use policy::*;
@@ -1415,19 +1415,19 @@ fn prepare_action(
         "/api/v1/action/move_to" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_to", motion::parse_move_to(body))
+            ("move_to", crate::motion::parse_move_to(body))
         }
         "/api/v1/action/move_relative" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_relative", motion::parse_move_relative(body))
+            ("move_relative", crate::motion::parse_move_relative(body))
         }
         "/api/v1/action/gripper" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            let mut request = motion::parse_gripper(body).map_err(ArmError::from)?;
-            if let Some(scale) = motion::num(body, "speed_scale").map_err(ArmError::from)? {
+            let mut request = crate::motion::parse_gripper(body).map_err(ArmError::from)?;
+            if let Some(scale) = crate::motion::num(body, "speed_scale").map_err(ArmError::from)? {
                 if !(0.05..=1.0).contains(&scale) {
-                    return Err(ArmError::from(motion::MotionError::InvalidCommand(
+                    return Err(ArmError::from(crate::motion::MotionError::InvalidCommand(
                         "speed_scale must be in [0.05, 1.0]".into(),
                     ))
                     .into());
@@ -1496,7 +1496,7 @@ fn prepare_action(
         crate::gripper_calib::CALIBRATE_PATH => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let tag = motion::tag(body).map_err(ArmError::from)?;
+            let tag = crate::motion::tag(body).map_err(ArmError::from)?;
             return Ok(ActionStart::GripperCalibrate(epoch, tag));
         }
         crate::measure_multiview::PATH => {
@@ -1536,21 +1536,21 @@ fn prepare_action(
     let _ = &mut spec;
     // move_to / move_relative keep their straight line to the goal; `precise: true` (profile
     // `applies_to` move_to_precise) or `approach: "same_side"` end it with the short segment
-    let precise = motion::flag(body, "precise", false).map_err(ArmError::from)?;
+    let precise = crate::motion::flag(body, "precise", false).map_err(ArmError::from)?;
     let request = crate::backlash::parse_request(body).map_err(ArmError::from)?;
-    let path_mode = motion::parse_path_mode(body).map_err(ArmError::from)?;
+    let path_mode = crate::motion::parse_path_mode(body).map_err(ArmError::from)?;
     let same_side = precise || request != crate::backlash::Request::Profile;
-    if path_mode == motion::PathMode::Joint && body.get("speed").is_some_and(|v| !v.is_null()) {
+    if path_mode == crate::motion::PathMode::Joint && body.get("speed").is_some_and(|v| !v.is_null()) {
         return Err(invalid_command("speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)"));
     }
-    let linear_speed_scale = if path_mode == motion::PathMode::Linear {
-        if let Some(s) = motion::num(body, "speed_scale").map_err(ArmError::from)? {
+    let linear_speed_scale = if path_mode == crate::motion::PathMode::Linear {
+        if let Some(s) = crate::motion::num(body, "speed_scale").map_err(ArmError::from)? {
             if !(0.05..=1.0).contains(&s) {
                 return Err(invalid_command("speed_scale must be in [0.05, 1.0]"));
             }
             if body.get("speed").is_none_or(Value::is_null) {
-                speed.linear = (motion::MAX_LINEAR_MPS * s).min(motion::MAX_LINEAR_MPS);
-                speed.angular = (motion::MAX_ANGULAR_RPS * s).min(motion::MAX_ANGULAR_RPS);
+                speed.linear = (crate::motion::MAX_LINEAR_MPS * s).min(crate::motion::MAX_LINEAR_MPS);
+                speed.angular = (crate::motion::MAX_ANGULAR_RPS * s).min(crate::motion::MAX_ANGULAR_RPS);
             }
             Some(s)
         } else {
@@ -1559,27 +1559,27 @@ fn prepare_action(
     } else {
         None
     };
-    let approach = if same_side && path_mode == motion::PathMode::Linear { inner.approach_plan("move_to_precise", request) } else { Err(None) };
+    let approach = if same_side && path_mode == crate::motion::PathMode::Linear { inner.approach_plan("move_to_precise", request) } else { Err(None) };
     let input = inner.plan_input_tcp()?;
-    let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
+    let (goal, opts) = crate::motion::resolve_goal_opts(&input, &spec);
     let joint = match path_mode {
-        motion::PathMode::Linear => {
+        crate::motion::PathMode::Linear => {
             if inner.config.active_tool.commissioning_required {
                 let scale_ok = linear_speed_scale.is_none_or(|s| s <= 0.2 + 1e-6);
-                let speed_ok = speed.linear <= 0.2 * motion::MAX_LINEAR_MPS + 1e-6
-                    && speed.angular <= 0.2 * motion::MAX_ANGULAR_RPS + 1e-6;
+                let speed_ok = speed.linear <= 0.2 * crate::motion::MAX_LINEAR_MPS + 1e-6
+                    && speed.angular <= 0.2 * crate::motion::MAX_ANGULAR_RPS + 1e-6;
                 if !scale_ok || !speed_ok {
                     return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
                         "{kind} (requires speed_scale <= 0.2 or speed <= {:.3} m/s / {:.2} rad/s)",
-                        0.2 * motion::MAX_LINEAR_MPS,
-                        0.2 * motion::MAX_ANGULAR_RPS
+                        0.2 * crate::motion::MAX_LINEAR_MPS,
+                        0.2 * crate::motion::MAX_ANGULAR_RPS
                     )))
                     .into());
                 }
             }
             None
         }
-        motion::PathMode::Joint => {
+        crate::motion::PathMode::Joint => {
             let speed_scale = crate::poses::speed_scale(body)?;
             if inner.config.active_tool.commissioning_required && speed_scale > 0.2 + 1e-6 {
                 return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
@@ -1594,7 +1594,7 @@ fn prepare_action(
             })
         }
     };
-    let seeds = motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
+    let seeds = crate::motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
     Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach, joint, seeds }))
 }
 
@@ -2859,34 +2859,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         });
                                     }
                                 }
-                            } else if kind == "preset" && inner.calibration_busy {
-                                response = Some(json!({"type":"preset_reject", "name":value.get("name"), "status":409, "code":"MOTION_BUSY", "error":"MOTION_BUSY",
-                                    "message":"a camera calibration apply or restore is running", "epoch_id":epoch}));
                             } else if kind == "preset" {
-                                let name = value.get("name").and_then(Value::as_str).unwrap_or("");
-                                let (path, body) = match name {
-                                    "home" => ("/api/v1/motion/home", json!({})),
-                                    "park" | "unload" => ("/api/v1/motion/unload", json!({})),
-                                    _ => {
-                                        let mut j = json!({"target_positions":value.get("positions")});
-                                        if let Some(s) = value.get("speed_scale") {
-                                            j["speed_scale"] = s.clone();
-                                        }
-                                        ("/api/v1/motion/jog", j)
-                                    }
-                                };
-                                response = Some(match execute_command(&mut inner, stamp, path, &body, epoch) {
-                                    Ok(started) => {
-                                        let mut ack = json!({"type":"preset_ack", "name":name, "epoch_id":inner.safety.epoch_id()});
-                                        if let Some((id, _)) = started { ack["action_id"] = json!(id); }
-                                        ack
-                                    }
-                                    Err(error) => {
-                                        let mut reply = rejection(error, "preset_reject", inner.safety.epoch_id());
-                                        reply["name"] = json!(name);
-                                        reply
-                                    },
-                                });
+                                response = Some(motion::handle_preset(&mut inner, stamp, &value, epoch));
                             } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
                                 match value.get("sequence_id").and_then(Value::as_u64) {
                                     _ if inner.calibration_busy => response = Some(json!({"type":"servo_reject", "reason":"calibration_busy"})),
@@ -2933,7 +2907,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if cancel.load(Ordering::Acquire) {
                                 return None;
                             }
-                            let q = motion::solve_goal_joints(&input, &goal, opts, &seeds);
+                            let q = crate::motion::solve_goal_joints(&input, &goal, opts, &seeds);
                             if cancel.load(Ordering::Acquire) {
                                 return None;
                             }
@@ -2987,7 +2961,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if cancel.load(Ordering::Acquire) {
                                 return None;
                             }
-                            let result = motion::plan_cartesian_opts(&input, goal, speed, opts);
+                            let result = crate::motion::plan_cartesian_opts(&input, goal, speed, opts);
                             if cancel.load(Ordering::Acquire) {
                                 return None;
                             }
@@ -3001,7 +2975,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             }
                             // a branch flip: would the joint-space move reach the goal (hint)?
                             let joint_goal = match &result {
-                                Err(motion::MotionError::IkBranchFlip { .. }) => motion::solve_goal_joints(&input, &goal, opts, &seeds).ok(),
+                                Err(crate::motion::MotionError::IkBranchFlip { .. }) => crate::motion::solve_goal_joints(&input, &goal, opts, &seeds).ok(),
                                 _ => None,
                             };
                             if cancel.load(Ordering::Acquire) {
@@ -3030,7 +3004,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
                                     Ok(Some((_, Err((error, joint_goal))))) => {
                                         let mut api: ApiError = ArmError::from(error).into();
-                                        if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(motion::JOINT_PATH_HINT); }
+                                        if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(crate::motion::JOINT_PATH_HINT); }
                                         Some(command_reject(&inner, &request_id, api))
                                     }
                                     Ok(Some((input, Ok((path, pre, approach))))) => Some(
@@ -3091,7 +3065,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         request_id,
                         generation,
                         stamp,
-                        abort: motion_cmds::AbortOnDrop(abort),
+                        abort: motion::AbortOnDrop(abort),
                         rx: res_rx,
                     });
                 }
@@ -3426,7 +3400,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             };
                             let _ = job_tx.send(res);
                         });
-                        let _abort_inner = motion_cmds::AbortOnDrop(job_abort);
+                        let _abort_inner = motion::AbortOnDrop(job_abort);
                         let result = job_rx.await.unwrap_or_else(|e| {
                             tracing::error!("calibration task failed: {e}");
                             Err(crate::calibration::CalibError::new(500, "INTERNAL", format!("calibration task failed: {e}; check GET /api/v1/calibration and the backups")))

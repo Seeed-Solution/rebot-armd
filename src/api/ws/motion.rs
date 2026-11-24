@@ -1,7 +1,8 @@
-//! Motion commands of the WS command path: direct commands, Cartesian plans and joint goals, macro planning and checks (tracks C and E).
+//! Motion commands of the WS command path: direct commands, preset translation, gravity comp,
+//! Cartesian plans and joint goals (family M).
 //!
-//! Moved from `api/ws.rs` without changes (armd 1.6 RT-core foundation); moved items, their
-//! fields and inherent methods are `pub(super)` so the connection loop keeps using them.
+//! Renamed from `api/ws/motion_cmds.rs` and extended with preset handling from `api/ws.rs`
+//! without behaviour changes (A1b PR 1).
 
 #[allow(unused_imports)]
 use super::*;
@@ -22,7 +23,7 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
             SupervisorInner::servo(admitted, targets, epoch).map_err(ArmError::from)?;
         }
         "/api/v1/motion/jog" => {
-            let speed_scale = motion::num(body, "speed_scale").map_err(ArmError::from)?;
+            let speed_scale = crate::motion::num(body, "speed_scale").map_err(ArmError::from)?;
             let target_positions = positions(body.get("target_positions"))?;
             let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
             let (_, id, duration) = SupervisorInner::jog_action_with_speed_scale(
@@ -90,6 +91,45 @@ pub(super) fn gravity_comp_request(body: &Value) -> Result<crate::gravity_comp::
         Some(_) => return Err(invalid_command("damping_kd must be a number or an array of 6 numbers")),
     };
     Ok(crate::gravity_comp::GravityCompRequest { scale, damping_kd })
+}
+
+/// Handle a WS `preset` frame under the supervisor write lock.
+pub(super) fn handle_preset(
+    inner: &mut SupervisorInner,
+    stamp: crate::supervisor::AdmissionStamp,
+    value: &Value,
+    epoch: u64,
+) -> Value {
+    if inner.calibration_busy {
+        return json!({"type":"preset_reject", "name":value.get("name"), "status":409, "code":"MOTION_BUSY", "error":"MOTION_BUSY",
+            "message":"a camera calibration apply or restore is running", "epoch_id":epoch});
+    }
+    let name = value.get("name").and_then(Value::as_str).unwrap_or("");
+    let (path, body) = match name {
+        "home" => ("/api/v1/motion/home", json!({})),
+        "park" | "unload" => ("/api/v1/motion/unload", json!({})),
+        _ => {
+            let mut j = json!({"target_positions":value.get("positions")});
+            if let Some(s) = value.get("speed_scale") {
+                j["speed_scale"] = s.clone();
+            }
+            ("/api/v1/motion/jog", j)
+        }
+    };
+    match execute_command(inner, stamp, path, &body, epoch) {
+        Ok(started) => {
+            let mut ack = json!({"type":"preset_ack", "name":name, "epoch_id":inner.safety.epoch_id()});
+            if let Some((id, _)) = started {
+                ack["action_id"] = json!(id);
+            }
+            ack
+        }
+        Err(error) => {
+            let mut reply = rejection(error, "preset_reject", inner.safety.epoch_id());
+            reply["name"] = json!(name);
+            reply
+        }
+    }
 }
 
 /// A Cartesian action waiting for its plan (computed outside the lock).
