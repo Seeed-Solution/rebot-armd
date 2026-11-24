@@ -3275,13 +3275,15 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
             bus.tx_log()
         );
 
-        // (d) Cool motor 0 to 35 C and move J0 to 0.40 rad, but omit confirmation -> refused with
-        //     RECOVERY_CONFIRM_CODE, still ZERO fence ack and ZERO state mutation!
+        // (d) Cool motor 0 to 35 C and nudge J0 to 0.03 rad (within the 0.05 rad rest tolerance
+        //     so Rule A' allows recovery, while distinct from 0.0 to detect state mutation), but
+        //     omit confirmation -> refused with RECOVERY_CONFIRM_CODE, still ZERO fence ack and
+        //     ZERO state mutation!
         let pos_before_unconf = inner.measured_positions.clone();
         let temps_before_unconf = inner.temperatures.clone();
         bus.with(|s| {
             s.motors[0].temperature_c = 35;
-            s.motors[0].q = 0.40;
+            s.motors[0].q = 0.03;
         });
         let err_unconf = inner.clear_fault_confirmed(false).unwrap_err();
         assert!(matches!(err_unconf, ArmError::Rejected { ref code, .. } if code == mit::RECOVERY_CONFIRM_CODE), "{err_unconf}");
@@ -3342,6 +3344,16 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
         fn enable_state(&self) -> EnableState { EnableState::Disabled }
         fn is_feedback_valid(&self) -> bool { true }
         fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(5)); self.dof] }
+        fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+            if max_age < Duration::from_millis(5) || out.len() < joints.len() {
+                return false;
+            }
+            for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+                let Some(s) = self.states.get(i) else { return false; };
+                *slot = s.position;
+            }
+            true
+        }
         fn feedback_seqs(&self) -> Vec<u64> { self.seqs.clone() }
         fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
             // Returns pre-recovery cached states without advancing `seqs`.
@@ -3363,7 +3375,6 @@ fn mit_recovery_final_read_rejects_cached_feedback_without_post_recovery_rx_seq(
     }
 
     let cfg = ArmConfig {
-        resting_pose: None,
         workspace: None,
         ..ArmConfig::rebot_dm()
     };
