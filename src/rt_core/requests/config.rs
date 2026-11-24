@@ -1011,6 +1011,8 @@ pub enum ReservePrecheck {
     Sequences {
         steps: Option<Vec<Step>>,
         deleting_sequence_id: Option<HolderLabel>,
+        /// Pose + replay-episode pins installed atomically on the owner when `Reserve` grants.
+        reserved_pins: Option<crate::sequences::ReservedSequencePins>,
     },
     GraspSetup {
         new_camera_tilt_deg: f32,
@@ -1276,6 +1278,9 @@ pub enum ConfigRequest {
     SampleTableCapture,
     GravityComp(GravityCompOp),
     InspectHold(ConfigDomain),
+    /// Zero-alloc check on live owner whether `episode_id` may be deleted (not referenced by
+    /// saved sequences, running sequence pins, or an active `Sequences` save reservation).
+    CheckEpisodeDeleteAllowed(HolderLabel),
 }
 
 /// Reply produced on the owner and read off-thread from `ConfigExchange`.
@@ -1300,6 +1305,7 @@ pub enum ConfigReply {
         config_inhibited: bool,
         state: Option<crate::rt_core::config_iface::HoldState>,
     },
+    EpisodeDeleteAllowed(bool),
 }
 
 /// Displaced or unused heap payloads carried back inside the SAME `Box<ConfigExchange>`
@@ -1315,6 +1321,7 @@ pub struct ConfigRetiredPayloads {
     pub gripper_stale: Option<CalibrationStale>,
     pub pose_list: Option<PoseList>,
     pub sequence_file: Option<SequenceFile>,
+    pub reserved_sequence_pins: Option<crate::sequences::ReservedSequencePins>,
     pub steps: Option<Vec<Step>>,
     pub grasp_setup: Option<GraspSetup>,
     pub string_a: Option<String>,
@@ -1383,7 +1390,14 @@ pub(crate) fn handle_config_exchange(
         )),
         ConfigRequest::Persisted(p) => ConfigReply::Persisted(install_persisted_config(core, p)),
         ConfigRequest::Activate(a) => ConfigReply::Activated(install_activate_config(core, ctx, a, &mut ex.retired)),
-        ConfigRequest::Release(r) => ConfigReply::Released(ConfigAuthority::release(core, r.reservation)),
+        ConfigRequest::Release(r) => {
+            let domain = r.reservation.domain();
+            let released = ConfigAuthority::release(core, r.reservation);
+            if domain == ConfigDomain::Sequences && released == Released::Cleared {
+                ex.retired.reserved_sequence_pins = core.sequences.reserved_pins.take();
+            }
+            ConfigReply::Released(released)
+        }
         ConfigRequest::SetCalibrationBusy {
             busy,
             motor_zero,
@@ -1454,6 +1468,9 @@ pub(crate) fn handle_config_exchange(
             config_inhibited: core.core.motion_inhibited_by_config(),
             state: core.core.config_held(domain).map(|h| h.state),
         },
+        ConfigRequest::CheckEpisodeDeleteAllowed(episode_id) => {
+            ConfigReply::EpisodeDeleteAllowed(!core.sequences.is_episode_in_use(episode_id.as_str()))
+        }
     };
     ex.reply = Some(reply);
 }
@@ -1546,6 +1563,7 @@ fn run_reserve_precheck(
         ReservePrecheck::Sequences {
             steps,
             deleting_sequence_id,
+            reserved_pins,
         } => {
             let check_res = (|| {
                 if core.calibration_busy {
@@ -1574,6 +1592,7 @@ fn run_reserve_precheck(
                 Ok(())
             })();
             retired.steps = steps;
+            retired.reserved_sequence_pins = reserved_pins;
             check_res
         }
         ReservePrecheck::GraspSetup {
@@ -1670,19 +1689,25 @@ fn install_reserve_config(
     let ReserveConfig {
         proposal,
         auth,
-        precheck,
+        mut precheck,
         expected_workspace_revision,
         expected_poses_revision,
     } = req;
+    let seq_reserved_pins = match &mut precheck {
+        ReservePrecheck::Sequences { reserved_pins, .. } => reserved_pins.take(),
+        _ => None,
+    };
     // Always retire any heap payload inside `precheck` even if authority or revision check fails.
     let auth_res = check_config_authority(core, ctx, &proposal, &auth, true);
     if let Err(err) = auth_res {
         retire_precheck_payloads(precheck, retired);
+        retired.reserved_sequence_pins = seq_reserved_pins;
         return Err(err);
     }
     let current_rev = ConfigAuthority::revision(core, proposal.domain);
     if proposal.expected_revision != current_rev {
         retire_precheck_payloads(precheck, retired);
+        retired.reserved_sequence_pins = seq_reserved_pins;
         return Err(ConfigError::RevisionMismatch {
             expected: proposal.expected_revision,
             current: current_rev,
@@ -1691,6 +1716,7 @@ fn install_reserve_config(
     if let Some(exp_ws) = expected_workspace_revision {
         if core.workspace_revision != exp_ws {
             retire_precheck_payloads(precheck, retired);
+            retired.reserved_sequence_pins = seq_reserved_pins;
             return Err(ConfigError::PlanStale(
                 "workspace changed while preparing configuration candidate",
             ));
@@ -1699,31 +1725,60 @@ fn install_reserve_config(
     if let Some(exp_poses) = expected_poses_revision {
         if core.poses.revision != exp_poses {
             retire_precheck_payloads(precheck, retired);
+            retired.reserved_sequence_pins = seq_reserved_pins;
             return Err(ConfigError::PlanStale(
                 "poses changed while preparing calibration candidate",
             ));
         }
     }
-    run_reserve_precheck(core, precheck, retired)?;
+    if let Err(err) = run_reserve_precheck(core, precheck, retired) {
+        retired.reserved_sequence_pins = seq_reserved_pins;
+        return Err(err);
+    }
     match ConfigAuthority::reserve(core, &proposal, ctx) {
         Reserved::Granted(reservation) => {
             core.record_consumed_stamp(auth.admission.request_id);
+            if proposal.domain == ConfigDomain::Sequences {
+                retired.reserved_sequence_pins =
+                    std::mem::replace(&mut core.sequences.reserved_pins, seq_reserved_pins);
+            } else {
+                retired.reserved_sequence_pins = seq_reserved_pins;
+            }
             Ok(reservation)
         }
-        Reserved::Refused { code: "REVISION_MISMATCH", current } => Err(ConfigError::RevisionMismatch {
-            expected: proposal.expected_revision,
-            current,
-        }),
+        Reserved::Refused { code: "REVISION_MISMATCH", current } => {
+            retired.reserved_sequence_pins = seq_reserved_pins;
+            Err(ConfigError::RevisionMismatch {
+                expected: proposal.expected_revision,
+                current,
+            })
+        }
         Reserved::Refused { code: "CONFIG_BUSY", .. } => {
+            retired.reserved_sequence_pins = seq_reserved_pins;
             Err(ConfigError::Busy("another configuration change is being activated or reconciled"))
         }
-        Reserved::Refused { code: "EPOCH_MISMATCH", .. } => Err(ConfigError::EpochMismatch {
-            current_epoch: core.safety.epoch_id(),
-        }),
-        Reserved::Refused { code: "LEASE_LOST", .. } => Err(ConfigError::LeaseLost),
-        Reserved::Refused { code: "STOPPED", .. } => Err(ConfigError::Stopped),
-        Reserved::Refused { code: "DEADLINE_EXPIRED", .. } => Err(ConfigError::DeadlineExpired),
-        Reserved::Refused { .. } => Err(ConfigError::WrongTarget),
+        Reserved::Refused { code: "EPOCH_MISMATCH", .. } => {
+            retired.reserved_sequence_pins = seq_reserved_pins;
+            Err(ConfigError::EpochMismatch {
+                current_epoch: core.safety.epoch_id(),
+            })
+        }
+        Reserved::Refused { code: "LEASE_LOST", .. } => {
+            retired.reserved_sequence_pins = seq_reserved_pins;
+            Err(ConfigError::LeaseLost)
+        }
+        Reserved::Refused { code: "STOPPED", .. } => {
+            retired.reserved_sequence_pins = seq_reserved_pins;
+            Err(ConfigError::Stopped)
+        }
+        Reserved::Refused { code: "DEADLINE_EXPIRED", .. } => {
+            retired.reserved_sequence_pins = seq_reserved_pins;
+            Err(ConfigError::DeadlineExpired)
+        }
+        Reserved::Refused { .. } => {
+            retired.reserved_sequence_pins = seq_reserved_pins;
+            Err(ConfigError::WrongTarget)
+        }
     }
 }
 
@@ -1775,8 +1830,13 @@ fn retire_precheck_payloads(precheck: ReservePrecheck, retired: &mut ConfigRetir
         ReservePrecheck::GripperCalibration { candidate_policy } => {
             retired.gripper_policy = candidate_policy;
         }
-        ReservePrecheck::Sequences { steps, .. } => {
+        ReservePrecheck::Sequences {
+            steps,
+            reserved_pins,
+            ..
+        } => {
             retired.steps = steps;
+            retired.reserved_sequence_pins = reserved_pins;
         }
         _ => {}
     }
@@ -1810,7 +1870,10 @@ fn fail_activation(
     match core.core.config_mut().activation_failed(reservation, code) {
         Activated::Reconciling { code } => ConfigError::Reconciling(code),
         Activated::Refused { code, reservation } => {
-            let _ = ConfigAuthority::release(core, reservation);
+            let rel = ConfigAuthority::release(core, reservation);
+            if domain == ConfigDomain::Sequences && rel == Released::Cleared {
+                retired.reserved_sequence_pins = core.sequences.reserved_pins.take();
+            }
             match code {
                 "LEASE_LOST" => ConfigError::LeaseLost,
                 "EPOCH_MISMATCH" => ConfigError::EpochMismatch {
@@ -2071,6 +2134,7 @@ fn install_activate_config(
         }
         ConfigCandidate::Sequences { next_file } => {
             retired.sequence_file = Some(std::mem::replace(&mut core.sequences.file, next_file));
+            retired.reserved_sequence_pins = core.sequences.reserved_pins.take();
             core.sequences.revision += 1;
         }
         ConfigCandidate::GraspSetup { setup, ws_eval_bufs } => {
@@ -2934,12 +2998,43 @@ where
     let ConfigCommitPlan {
         proposal,
         auth,
-        precheck,
+        mut precheck,
         candidate,
         write,
         expected_workspace_revision,
         expected_poses_revision,
     } = plan;
+
+    // For `Sequences` saves, collect replay-step `(step_idx, episode_id)` references and ensure
+    // `reserved_pins` covers BOTH pose and replay episode IDs across the reservation lifetime.
+    let mut replay_episode_refs: Vec<(usize, String)> = Vec::new();
+    if let ReservePrecheck::Sequences {
+        steps: Some(ref steps),
+        ref mut reserved_pins,
+        ..
+    } = precheck
+    {
+        for (i, step) in steps.iter().enumerate() {
+            if let Step::Replay { episode_id, .. } = step {
+                replay_episode_refs.push((i, episode_id.clone()));
+            }
+        }
+        if reserved_pins.is_none() {
+            let pose_ids = steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Pose { pose_id, .. } => Some(pose_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let episode_ids = replay_episode_refs.iter().map(|(_, id)| id.clone()).collect();
+            *reserved_pins = Some(crate::sequences::ReservedSequencePins {
+                sequence_id: String::new(),
+                pose_ids,
+                episode_ids,
+            });
+        }
+    }
 
     let file_ops: Vec<FileWriteOp> = match write {
         ConfigWriteOp::Volatile => Vec::new(),
@@ -2994,6 +3089,29 @@ where
                 .await;
         }
     };
+
+    // 1b. For `Sequences` saves referencing replay episodes, atomically verify existence and pin
+    //     them in `EpisodeStore` right under the granted `Sequences` reservation (before staging,
+    //     hooks, or rename) so concurrent episode deletion is refused with 409 IN_USE and an
+    //     already-deleted episode aborts cleanly with 422 SEQUENCE_REF_MISSING.
+    let mut episode_pin_guard: Option<crate::recording::store::EpisodePinGuard> =
+        if !replay_episode_refs.is_empty() {
+            let store = sup.episode_store().await;
+            match store.pin_episodes_for_sequence(&replay_episode_refs) {
+                Ok(pg) => Some(pg),
+                Err((step, ep_id)) => {
+                    release_pre_rename(Arc::clone(&sup), guard).await;
+                    return Err(ConfigCommitError::pre_publish(ArmError::detailed(
+                        422,
+                        "SEQUENCE_REF_MISSING",
+                        format!("step {step}: no episode '{ep_id}'"),
+                        json!({"step": step}),
+                    )));
+                }
+            }
+        } else {
+            None
+        };
 
     // 2. Off-thread stage + file fsync (`StagedWrite::stage`) strictly AFTER reserve.
     enum StagedOp {
@@ -3160,6 +3278,9 @@ where
             Err(e) => {
                 // JoinError after spawn_blocking started: conservatively treat as post-publish
                 // reconciling because a rename may have completed before the panic/abort.
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
                 guard.mark_renamed();
                 if let Some(r) = guard.take() {
                     if let Ok(ConfigReply::Persisted(Ok(pr))) = sup
@@ -3206,6 +3327,9 @@ where
             }
             // At least one file was already renamed/removed before a later file in the batch failed:
             // disk and live state may diverge -> enter Reconciling and keep motion inhibited.
+            if let Some(pg) = episode_pin_guard.take() {
+                pg.keep_pinned_for_reconcile();
+            }
             if let Some(r) = guard.take() {
                 if let Ok(ConfigReply::Persisted(Ok(pr))) = sup
                     .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
@@ -3242,6 +3366,9 @@ where
                 .is_some_and(|f| f.swap(false, Ordering::AcqRel));
             let r = guard.take().expect("reservation held by guard");
             if sim_persisted_fail {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
                 if let Ok(ConfigReply::Persisted(Ok(r))) = sup
                     .dispatch_config_request_owned_reliable(ConfigRequest::Persisted(
                         PersistedConfig {
@@ -3270,12 +3397,21 @@ where
             {
                 Ok(ConfigReply::Persisted(Ok(r))) => r,
                 Ok(ConfigReply::Persisted(Err(e))) => {
+                    if let Some(pg) = episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
                     return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
                 }
                 Err(e) => {
+                    if let Some(pg) = episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
                     return Err(ConfigCommitError::post_publish_reconciling(e.to_arm_error()));
                 }
                 _ => {
+                    if let Some(pg) = episode_pin_guard.take() {
+                        pg.keep_pinned_for_reconcile();
+                    }
                     return Err(ConfigCommitError::post_publish_reconciling(
                         ArmError::Internal("unexpected config persisted reply".into()),
                     ));
@@ -3314,6 +3450,9 @@ where
             };
 
             if let Err(warn) = dir_sync_res {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
                 let r = guard.take().expect("persisted reservation held by guard");
                 let rel = sup
                     .dispatch_config_request_owned_reliable(ConfigRequest::Release(ReleaseConfig {
@@ -3374,6 +3513,11 @@ where
         Ok(ConfigReply::Activated(Ok(act))) => act,
         Ok(ConfigReply::Activated(Err(e))) => {
             let is_reconciling = matches!(e, ConfigError::Reconciling(_)) || disk_published;
+            if is_reconciling {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+            }
             if disk_published {
                 tracing::error!("Configuration written on disk but not activated: {:?}; reconciling", e);
             }
@@ -3384,6 +3528,11 @@ where
             });
         }
         Err(e) => {
+            if disk_published {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+            }
             return Err(ConfigCommitError {
                 error: e.to_arm_error(),
                 disk_published,
@@ -3391,6 +3540,11 @@ where
             });
         }
         _ => {
+            if disk_published {
+                if let Some(pg) = episode_pin_guard.take() {
+                    pg.keep_pinned_for_reconcile();
+                }
+            }
             return Err(ConfigCommitError {
                 error: ArmError::Internal("unexpected config activate reply".into()),
                 disk_published,
@@ -3399,11 +3553,18 @@ where
         }
     };
 
+    // Publish committed sequence revision BEFORE dropping `episode_pin_guard` so concurrent
+    // episode deletes linearize cleanly with the newly active `SequenceFile`.
+    if domain == ConfigDomain::Sequences {
+        sup.set_sequences_revision(activated.revision);
+    }
+
     // Update PublishedConfigHub off-thread immediately after owner activation.
     sup.published_config_hub().update(|cfg| {
         cfg.workspace_revision = activated.workspace_revision;
         update_published(cfg, activated);
     });
+    drop(episode_pin_guard);
 
     Ok(ConfigCommitOutcome {
         activated,

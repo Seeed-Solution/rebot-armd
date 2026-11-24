@@ -638,13 +638,9 @@ pub async fn dataset_episode_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;
-    let store = {
-        let inner = supervisor.inner().read().await;
-        inner.episodes.path_of(&id).map_err(ArmError::from)?;
-        inner.episode_delete_allowed(&id)?;
-        inner.episodes.take_for_delete(&id);
-        inner.episodes.clone()
-    };
+    let store = supervisor.episode_store().await;
+    store.path_of(&id).map_err(ArmError::from)?;
+    supervisor.take_episode_for_delete(&id).await?;
     let id2 = id.clone();
     tokio::task::spawn_blocking(move || store.delete_files(&id2)).await
         .map_err(|e| ArmError::Internal(format!("episode delete failed: {e}")))?

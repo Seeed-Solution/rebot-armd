@@ -547,10 +547,8 @@ pub async fn lease_free(sup: &Arc<ArmSupervisor>, caller: &Caller, path: &str, b
         }
         "/api/v1/episodes/delete" => {
             let id = required(body, "id")?.to_string();
-            {
-                let inner = sup.inner().read().await;
-                inner.episode_delete_allowed(&id)?;
-                if !inner.episodes.take_for_delete(&id) { return Err(StoreError::NotFound(id).into()); }
+            if !sup.take_episode_for_delete(&id).await? {
+                return Err(StoreError::NotFound(id).into());
             }
             let s2 = st.clone();
             let id2 = id.clone();
@@ -571,17 +569,23 @@ pub async fn lease_free(sup: &Arc<ArmSupervisor>, caller: &Caller, path: &str, b
                 Some(Value::Bool(b)) => *b,
                 Some(_) => return Err(rejected(400, "INVALID_COMMAND", "force must be a boolean")),
             };
-            let ids = st.episodes_of(&name);
-            if force {
-                let inner = sup.inner().read().await;
-                for id in &ids { inner.episode_delete_allowed(id)?; }
-            }
             if inner_recording_dataset(sup, &name).await {
                 return Err(ArmError::detailed(409, "RECORDER_BUSY", "a recording into this dataset is running", json!({})));
             }
-            let s2 = st.clone();
-            let deleted = blocking(move || s2.delete_dataset(&name, force)).await?;
-            Ok(json!({"deleted_episodes": deleted}))
+            if force {
+                let ids = st.episodes_of(&name);
+                if !st.has_dataset(&name) && ids.is_empty() {
+                    return Err(StoreError::DatasetNotFound(name).into());
+                }
+                let taken = sup.take_dataset_episodes_for_delete(&name).await?;
+                let s2 = st.clone();
+                let deleted = blocking(move || s2.delete_dataset_taken_files(&name, &taken)).await?;
+                Ok(json!({"deleted_episodes": deleted}))
+            } else {
+                let s2 = st.clone();
+                let deleted = blocking(move || s2.delete_dataset(&name, false)).await?;
+                Ok(json!({"deleted_episodes": deleted}))
+            }
         }
         _ => Err(rejected(400, "INVALID_COMMAND", "Unknown command")),
     }

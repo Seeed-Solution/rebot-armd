@@ -6535,6 +6535,9 @@ pub struct ArmSupervisor {
     published_config: Arc<crate::rt_core::requests::config::PublishedConfigHub>,
     /// Test-only hooks for deterministic config-commit failure injection across both owners.
     config_commit_hooks: std::sync::Mutex<crate::rt_core::requests::config::ConfigCommitTestHooks>,
+    /// Monotonic mirror of committed `SequenceStore::revision` (Release-updated on activate
+    /// BEFORE unpinning reserved replay episodes so concurrent episode deletes are linearizable).
+    sequences_revision: Arc<AtomicU64>,
     /// Single-owner slot (`Legacy` -> `Transferring` -> `Executor` | `Failed`).
     /// Lock order: always `self.inner` before `self.owner`.
     owner: std::sync::Mutex<OwnerSlot>,
@@ -6747,6 +6750,7 @@ impl ArmSupervisor {
             config_commit_hooks: std::sync::Mutex::new(
                 crate::rt_core::requests::config::ConfigCommitTestHooks::default(),
             ),
+            sequences_revision: Arc::new(AtomicU64::new(0)),
             owner: std::sync::Mutex::new(OwnerSlot::Legacy),
             owner_mode: AtomicU8::new(OWNER_LEGACY),
             executor_base_gen: AtomicU64::new(0),
@@ -6755,6 +6759,128 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             instance_id,
+        }
+    }
+
+    /// Current live `SequenceStore::revision` mirror used to linearize episode deletes against
+    /// concurrent `Sequences` save commits without blocking on `config_write_mutex`.
+    pub fn sequences_revision(&self) -> u64 {
+        self.sequences_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_sequences_revision(&self, rev: u64) {
+        self.sequences_revision.store(rev, Ordering::Release);
+    }
+
+    /// Checks on the single live owner (`Legacy` or `Executor`) whether episode `id` is free of
+    /// saved, running, or reserved sequence references (`409 IN_USE` otherwise).
+    pub async fn check_episode_delete_allowed(&self, id: &str) -> Result<(), ArmError> {
+        use crate::rt_core::requests::config::{ConfigReply, ConfigRequest};
+        if self.owner_mode() == OWNER_LEGACY {
+            let inner = self.inner.read().await;
+            inner.episode_delete_allowed(id)?;
+            if inner.episodes.is_pinned(id) {
+                return Err(ArmError::detailed(
+                    409,
+                    "IN_USE",
+                    format!("Episode '{id}' is reserved by an in-progress sequence save"),
+                    serde_json::json!({"sequences": ["pending_save"]}),
+                ));
+            }
+            return Ok(());
+        }
+        match self
+            .dispatch_config_request_owned_reliable(ConfigRequest::CheckEpisodeDeleteAllowed(
+                crate::model::HolderLabel::new(id),
+            ))
+            .await
+        {
+            Ok(ConfigReply::EpisodeDeleteAllowed(true)) => Ok(()),
+            Ok(ConfigReply::EpisodeDeleteAllowed(false)) => {
+                let mut users = self
+                    .published_config()
+                    .await
+                    .map(|p| p.sequences.using_episode(id))
+                    .unwrap_or_default();
+                if users.is_empty() {
+                    users.push("pending_save".to_string());
+                }
+                Err(ArmError::detailed(
+                    409,
+                    "IN_USE",
+                    format!("Episode '{id}' is used by {} sequence(s)", users.len()),
+                    serde_json::json!({"sequences": users}),
+                ))
+            }
+            Err(e) => Err(e.to_arm_error()),
+            _ => Err(ArmError::Internal("unexpected CheckEpisodeDeleteAllowed reply".into())),
+        }
+    }
+
+    /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
+    /// live owner and removes it from the `EpisodeStore` catalog. Returns `Ok(true)` if removed,
+    /// `Ok(false)` if absent, or `Err(409 IN_USE)` if referenced or pinned by a sequence save.
+    pub async fn take_episode_for_delete(&self, id: &str) -> Result<bool, ArmError> {
+        use crate::recording::store::TakeEpisodeOutcome;
+        loop {
+            let rev0 = self.sequences_revision();
+            self.check_episode_delete_allowed(id).await?;
+            let store = self.episode_store().await;
+            match store.take_if_unpinned_and_rev_matches(id, &self.sequences_revision, rev0) {
+                TakeEpisodeOutcome::Removed => return Ok(true),
+                TakeEpisodeOutcome::NotFound => return Ok(false),
+                TakeEpisodeOutcome::Pinned => {
+                    let mut users = self
+                        .published_config()
+                        .await
+                        .map(|p| p.sequences.using_episode(id))
+                        .unwrap_or_default();
+                    if users.is_empty() {
+                        users.push("pending_save".to_string());
+                    }
+                    return Err(ArmError::detailed(
+                        409,
+                        "IN_USE",
+                        format!("Episode '{id}' is used by {} sequence(s)", users.len()),
+                        serde_json::json!({"sequences": users}),
+                    ));
+                }
+                TakeEpisodeOutcome::SequenceRevisionChanged => continue,
+            }
+        }
+    }
+
+    /// Linearizably verifies every episode in `dataset` is unreferenced (saved, running, or
+    /// reserved) and atomically removes all of them from the `EpisodeStore` catalog.
+    pub async fn take_dataset_episodes_for_delete(&self, dataset: &str) -> Result<Vec<String>, ArmError> {
+        use crate::recording::store::TakeDatasetOutcome;
+        loop {
+            let rev0 = self.sequences_revision();
+            let store = self.episode_store().await;
+            let ids = store.episodes_of(dataset);
+            for id in &ids {
+                self.check_episode_delete_allowed(id).await?;
+            }
+            match store.take_dataset_if_unpinned_and_rev_matches(&ids, &self.sequences_revision, rev0) {
+                TakeDatasetOutcome::Removed(taken) => return Ok(taken),
+                TakeDatasetOutcome::Pinned(pinned_id) => {
+                    let mut users = self
+                        .published_config()
+                        .await
+                        .map(|p| p.sequences.using_episode(&pinned_id))
+                        .unwrap_or_default();
+                    if users.is_empty() {
+                        users.push("pending_save".to_string());
+                    }
+                    return Err(ArmError::detailed(
+                        409,
+                        "IN_USE",
+                        format!("Episode '{pinned_id}' is used by {} sequence(s)", users.len()),
+                        serde_json::json!({"sequences": users}),
+                    ));
+                }
+                TakeDatasetOutcome::SequenceRevisionChanged => continue,
+            }
         }
     }
 

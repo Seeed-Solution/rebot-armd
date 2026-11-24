@@ -786,6 +786,7 @@ async fn run_all_domains_test(owner: RtOwner) {
             precheck: ReservePrecheck::Sequences {
                 steps: Some(seq.steps.clone()),
                 deleting_sequence_id: None,
+                reserved_pins: None,
             },
             candidate: ConfigCandidate::Sequences {
                 next_file: next_seq_file.clone(),
@@ -2581,4 +2582,343 @@ async fn zero_check_store_offset_legacy_pre_rename_verify_and_dir_sync_reconcile
             Some(HoldState::Reconciling)
         );
     }
+}
+
+// ============================================================================
+// 12. M4: Sequences reservation pins replay-step episode IDs against concurrent
+//         episode deletion (409 IN_USE while reserved AND after save; both owners)
+// ============================================================================
+
+async fn run_sequence_replay_episode_pin_test(owner: RtOwner) {
+    let ep_dir = tempfile::tempdir().unwrap();
+    let ep_id = "ep_m4_concurrent_pin";
+    let ep_id_abort = "ep_m4_abort_unpin";
+
+    let rig = Rig::new(owner, |_| {}).await;
+    // Configure EpisodeStore and write two real episodes (catalog + files) BEFORE locking detached inner.
+    let seed_episode = |store: &armd::recording::EpisodeStore, id: &str| {
+        let sidecar = armd::recording::EpisodeSidecar {
+            id: id.into(),
+            dataset: "default".into(),
+            task: "m4-test".into(),
+            source: "sdk".into(),
+            sequence_id: None,
+            repeat_index: None,
+            outcome: "ok".into(),
+            recorded_at: "2026-11-24T00:00:00Z".into(),
+            duration_s: 0.1,
+            frames: 2,
+            joint_names: vec![
+                "joint_1".into(),
+                "joint_2".into(),
+                "joint_3".into(),
+                "joint_4".into(),
+                "joint_5".into(),
+                "joint_6".into(),
+                "gripper".into(),
+            ],
+            units: "rad".into(),
+            joint_zero: armd::recording::JointZeroStamp::of(&[0.0; 7]),
+            profile_id: Some("rebot_b601dm".into()),
+            armd_version: "1.6.0".into(),
+            fps_nominal: 50.0,
+            truncated: false,
+            stopped_by: None,
+            arm_dof: Some(6),
+            gripper_joint: Some(6),
+            recovered: None,
+            first_state: Some(INSPECT.to_vec()),
+            last_state: Some(INSPECT.to_vec()),
+            tool_id: None,
+            tool_config_digest: None,
+            has_gripper_motion: None,
+            frames_dropped: None,
+        };
+        let frames = vec![
+            armd::recording::RecordFrame {
+                timestamp: 0.0,
+                observation_state: INSPECT.to_vec(),
+                action: INSPECT.to_vec(),
+            },
+            armd::recording::RecordFrame {
+                timestamp: 0.02,
+                observation_state: INSPECT.to_vec(),
+                action: INSPECT.to_vec(),
+            },
+        ];
+        store.write_episode(&sidecar, &frames, None).unwrap();
+    };
+
+    // Attach the episode store to both supervisor and PublishedConfigHub (shares Arc<Mutex<Catalog>>).
+    let store = armd::recording::EpisodeStore::new(Some(ep_dir.path().to_path_buf()));
+    seed_episode(&store, ep_id);
+    seed_episode(&store, ep_id_abort);
+    if owner == RtOwner::Legacy {
+        rig.sup.inner().write().await.episodes = store.clone();
+    }
+    rig.sup.published_config_hub().update(|cfg| {
+        cfg.episodes = store.clone();
+    });
+
+    let _detached = if owner == RtOwner::Executor {
+        Some(rig.sup.inner().write().await)
+    } else {
+        None
+    };
+
+    // 12a. Start sequences/save referencing `ep_id`, pause while the reservation is held
+    //      (`after_reserve_before_rename`), and attempt a concurrent episode delete -> 409 IN_USE!
+    let (at_hook_tx, at_hook_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (go_tx, go_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let go_rx = Arc::new(std::sync::Mutex::new(go_rx));
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        after_reserve_before_rename: Some(Arc::new(move || {
+            let _ = at_hook_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    });
+
+    let pub0 = rig.sup.published_config().await.unwrap();
+    let seq_id = "01J00000000000000000000M41".to_string();
+    let seq = armd::sequences::Sequence {
+        id: seq_id.clone(),
+        name: "seq_m4_replay".into(),
+        description: String::new(),
+        steps: vec![armd::sequences::Step::Replay {
+            episode_id: ep_id.into(),
+            speed: 0.5,
+            gripper: true,
+        }],
+        created_at: "2026-11-24T00:00:00Z".into(),
+        updated_at: "2026-11-24T00:00:00Z".into(),
+        rev: 1,
+    };
+    let next_seq_file = armd::sequences::SequenceFile {
+        sequences: vec![seq.clone()],
+    };
+    let adm = capture_config_admission(&rig.sup, 601, rig.lease_gen, Some(rig.epoch));
+    let prop = build_config_proposal(
+        &rig.sup,
+        ConfigDomain::Sequences,
+        pub0.sequences.revision,
+        adm,
+        rig.lease_gen,
+        pub0.workspace_revision,
+    );
+    let sup_save = Arc::clone(&rig.sup);
+    let seq_path = rig.sequences_path.clone();
+    let lease_conn = rig.lease_conn.clone();
+    let lease_gen = rig.lease_gen;
+    let nf_pub = next_seq_file.clone();
+    let save_task = tokio::spawn(async move {
+        run_config_commit(
+            &sup_save,
+            ConfigCommitPlan {
+                proposal: prop,
+                auth: ConfigAuthContext {
+                    admission: adm,
+                    lease_holder: Some((HolderLabel::new(&lease_conn), lease_gen)),
+                },
+                precheck: ReservePrecheck::Sequences {
+                    steps: Some(seq.steps.clone()),
+                    deleting_sequence_id: None,
+                    reserved_pins: Some(armd::sequences::ReservedSequencePins {
+                        sequence_id: seq.id.clone(),
+                        pose_ids: Vec::new(),
+                        episode_ids: vec![ep_id.to_string()],
+                    }),
+                },
+                candidate: ConfigCandidate::Sequences {
+                    next_file: next_seq_file.clone(),
+                },
+                write: ConfigWriteOp::from(Some(PendingWrite::new(
+                    seq_path,
+                    serde_json::to_string_pretty(&next_seq_file).unwrap(),
+                ))),
+                expected_workspace_revision: None,
+                expected_poses_revision: None,
+            },
+            || Ok(()),
+            move |cfg, act| {
+                cfg.sequences.file = nf_pub;
+                cfg.sequences.revision = act.revision;
+            },
+        )
+        .await
+    });
+
+    // Wait until the Sequences reservation is held and replay episode is pinned.
+    tokio::task::spawn_blocking(move || at_hook_rx.recv_timeout(Duration::from_secs(3)).unwrap())
+        .await
+        .unwrap();
+
+    // Concurrent episode delete while reservation is held MUST fail with 409 IN_USE!
+    let del_during = rig
+        .sup
+        .take_episode_for_delete(ep_id)
+        .await
+        .expect_err("concurrent episode delete during held Sequences reservation must fail IN_USE");
+    assert!(
+        matches!(&del_during, ArmError::Detailed { status: 409, code, .. } if code == "IN_USE"),
+        "expected 409 IN_USE during held reservation, got {del_during:?}"
+    );
+    assert!(store.contains(ep_id), "referenced episode must still exist in catalog");
+
+    // Concurrent dataset force-delete MUST ALSO fail with 409 IN_USE while reservation is held!
+    let ds_del_during = rig
+        .sup
+        .take_dataset_episodes_for_delete("default")
+        .await
+        .expect_err("concurrent dataset force delete must fail IN_USE while reservation is held");
+    assert!(
+        matches!(&ds_del_during, ArmError::Detailed { status: 409, code, .. } if code == "IN_USE"),
+        "expected 409 IN_USE on dataset force delete, got {ds_del_during:?}"
+    );
+    assert!(store.contains(ep_id) && store.contains(ep_id_abort));
+
+    // Allow the sequence save to complete.
+    go_tx.send(()).unwrap();
+    let out = save_task
+        .await
+        .unwrap()
+        .expect("sequence save should commit cleanly after refusing concurrent delete");
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    assert_eq!(out.activated.revision, pub0.sequences.revision + 1);
+
+    // 12b. After the save activates, episode delete MUST STILL be refused with 409 IN_USE!
+    let del_after = rig
+        .sup
+        .take_episode_for_delete(ep_id)
+        .await
+        .expect_err("episode delete after sequence save must fail IN_USE");
+    assert!(
+        matches!(&del_after, ArmError::Detailed { status: 409, code, .. } if code == "IN_USE"),
+        "expected 409 IN_USE after sequence save, got {del_after:?}"
+    );
+    assert!(store.contains(ep_id));
+
+    // 12c. If a sequence save aborts BEFORE rename (fail_rename_once), its reservation and
+    //      episode pin are released Cleared -> episode delete succeeds, and a subsequent save
+    //      referencing the deleted episode fails 422 SEQUENCE_REF_MISSING (no dangling ref)!
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        fail_rename_once: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    });
+    let pub1 = rig.sup.published_config().await.unwrap();
+    let seq_abort = armd::sequences::Sequence {
+        id: "01J00000000000000000000M42".into(),
+        name: "seq_m4_abort".into(),
+        description: String::new(),
+        steps: vec![armd::sequences::Step::Replay {
+            episode_id: ep_id_abort.into(),
+            speed: 0.5,
+            gripper: true,
+        }],
+        created_at: "2026-11-24T00:00:00Z".into(),
+        updated_at: "2026-11-24T00:00:00Z".into(),
+        rev: 1,
+    };
+    let mut abort_file = pub1.sequences.file.clone();
+    abort_file.sequences.push(seq_abort.clone());
+    let adm2 = capture_config_admission(&rig.sup, 602, rig.lease_gen, Some(rig.epoch));
+    let prop2 = build_config_proposal(
+        &rig.sup,
+        ConfigDomain::Sequences,
+        pub1.sequences.revision,
+        adm2,
+        rig.lease_gen,
+        pub1.workspace_revision,
+    );
+    let abort_err = run_config_commit(
+        &rig.sup,
+        ConfigCommitPlan {
+            proposal: prop2,
+            auth: ConfigAuthContext {
+                admission: adm2,
+                lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+            },
+            precheck: ReservePrecheck::Sequences {
+                steps: Some(seq_abort.steps.clone()),
+                deleting_sequence_id: None,
+                reserved_pins: None,
+            },
+            candidate: ConfigCandidate::Sequences {
+                next_file: abort_file.clone(),
+            },
+            write: ConfigWriteOp::from(Some(PendingWrite::new(
+                rig.sequences_path.clone(),
+                serde_json::to_string_pretty(&abort_file).unwrap(),
+            ))),
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
+        },
+        || Ok(()),
+        |_, _| {},
+    )
+    .await
+    .unwrap_err();
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    assert!(matches!(&abort_err, ArmError::Rejected { status: 500, code, .. } if code == "PERSIST_FAILED"));
+    // Pin was released cleanly -> ep_id_abort can now be deleted!
+    assert!(rig.sup.take_episode_for_delete(ep_id_abort).await.unwrap());
+    assert!(!store.contains(ep_id_abort));
+
+    // Trying to save a sequence referencing the deleted episode fails 422 SEQUENCE_REF_MISSING.
+    let adm3 = capture_config_admission(&rig.sup, 603, rig.lease_gen, Some(rig.epoch));
+    let prop3 = build_config_proposal(
+        &rig.sup,
+        ConfigDomain::Sequences,
+        pub1.sequences.revision,
+        adm3,
+        rig.lease_gen,
+        pub1.workspace_revision,
+    );
+    let missing_err = run_config_commit(
+        &rig.sup,
+        ConfigCommitPlan {
+            proposal: prop3,
+            auth: ConfigAuthContext {
+                admission: adm3,
+                lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+            },
+            precheck: ReservePrecheck::Sequences {
+                steps: Some(seq_abort.steps.clone()),
+                deleting_sequence_id: None,
+                reserved_pins: None,
+            },
+            candidate: ConfigCandidate::Sequences {
+                next_file: abort_file.clone(),
+            },
+            write: ConfigWriteOp::from(Some(PendingWrite::new(
+                rig.sequences_path.clone(),
+                serde_json::to_string_pretty(&abort_file).unwrap(),
+            ))),
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
+        },
+        || Ok(()),
+        |_, _| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&missing_err, ArmError::Detailed { status: 422, code, .. } if code == "SEQUENCE_REF_MISSING"),
+        "expected 422 SEQUENCE_REF_MISSING for deleted episode, got {missing_err:?}"
+    );
+    assert!(!rig.is_config_inhibited().await);
+
+    rig.assert_executor_zero_alloc("M4 sequence replay episode reservation and concurrent delete");
+    drop(_detached);
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_save_reservation_pins_replay_episodes_against_concurrent_delete_legacy() {
+    run_sequence_replay_episode_pin_test(RtOwner::Legacy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_save_reservation_pins_replay_episodes_against_concurrent_delete_executor() {
+    run_sequence_replay_episode_pin_test(RtOwner::Executor).await;
 }

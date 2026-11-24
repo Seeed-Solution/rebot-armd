@@ -1039,30 +1039,6 @@ async fn commit_prepared_config(
     let ws_rev = prepared.workspace_revision;
     let write = prepared.write;
 
-    // For `sequences/save`, re-verify referenced episodes still exist before staging/reserve.
-    if let PreparedPayload::Sequences {
-        sequence: Some(ref seq),
-        ..
-    } = prepared.payload
-    {
-        if let Ok(pub_cfg) = sup.published_config().await {
-            for (i, step) in seq.steps.iter().enumerate() {
-                if let crate::sequences::Step::Replay { episode_id, .. } = step {
-                    if !pub_cfg.episodes.contains(episode_id) {
-                        let err = ArmError::detailed(
-                            422,
-                            "SEQUENCE_REF_MISSING",
-                            format!("step {i}: no episode '{episode_id}'"),
-                            json!({"step": i}),
-                        );
-                        let cur_epoch = current_epoch_off_lock(&sup, epoch);
-                        return off_lock_command_reject(&request_id, cur_epoch, err.into());
-                    }
-                }
-            }
-        }
-    }
-
     let ingress_deadline = std::time::Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET;
     let write_op = crate::rt_core::requests::config::ConfigWriteOp::from(write);
     let proposal = crate::rt_core::requests::config::build_config_proposal_with_deadline(
@@ -1191,16 +1167,24 @@ async fn commit_prepared_config(
             sequence,
             deleting_id,
             next_file,
-        } => (
-            ReservePrecheck::Sequences {
-                steps: sequence.as_ref().map(|s| s.steps.clone()),
-                deleting_sequence_id: deleting_id.as_deref().map(HolderLabel::new),
-            },
-            ConfigCandidate::Sequences {
-                next_file: next_file.clone(),
-            },
-            AckMeta::Sequences { sequence, next_file },
-        ),
+        } => {
+            let reserved_pins = sequence.as_ref().map(|s| crate::sequences::ReservedSequencePins {
+                sequence_id: s.id.clone(),
+                pose_ids: s.pose_ids().map(str::to_string).collect(),
+                episode_ids: s.episode_ids().map(str::to_string).collect(),
+            });
+            (
+                ReservePrecheck::Sequences {
+                    steps: sequence.as_ref().map(|s| s.steps.clone()),
+                    deleting_sequence_id: deleting_id.as_deref().map(HolderLabel::new),
+                    reserved_pins,
+                },
+                ConfigCandidate::Sequences {
+                    next_file: next_file.clone(),
+                },
+                AckMeta::Sequences { sequence, next_file },
+            )
+        }
         PreparedPayload::GraspSetup { setup, ws_eval_bufs } => (
             ReservePrecheck::GraspSetup {
                 new_camera_tilt_deg: setup.camera_tilt_deg as f32,
