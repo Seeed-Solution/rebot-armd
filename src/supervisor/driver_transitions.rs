@@ -1390,14 +1390,26 @@ impl SupervisorInner {
                 driver.read_joint_states_into(&mut scratch_states)
             };
             if read_res.is_err() {
-                let disable_outcome = if !was_torqued && prior_proven_off {
-                    let rb_kind = crate::driver::DisableKind::DisableProtective {
-                        reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
+                let disable_outcome = if !was_torqued {
+                    let rb_kind = if prior_proven_off {
+                        crate::driver::DisableKind::DisableProtective {
+                            reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
+                        }
+                    } else {
+                        crate::driver::DisableKind::DisableRequested {
+                            started_at: driver.clock_now(),
+                        }
                     };
                     if use_cached {
                         let sent = driver.begin_disable_torque_budgeted(rb_kind, 0);
+                        let refused = matches!(
+                            sent,
+                            Err(crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired)
+                        );
                         Some((
                             rb_kind,
+                            refused,
                             matches!(
                                 sent,
                                 Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
@@ -1405,9 +1417,23 @@ impl SupervisorInner {
                                 && driver.enable_state() == EnableState::Disabled,
                         ))
                     } else {
-                        let sent = driver.disable_torque(rb_kind).is_ok();
-                        let _ = driver.read_joint_states();
-                        Some((rb_kind, sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled))
+                        let res = driver.disable_torque(rb_kind);
+                        let refused = matches!(
+                            res,
+                            Err(crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired)
+                        );
+                        if refused {
+                            Some((rb_kind, true, false))
+                        } else {
+                            let sent = res.is_ok();
+                            let _ = driver.read_joint_states();
+                            Some((
+                                rb_kind,
+                                false,
+                                sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled,
+                            ))
+                        }
                     }
                 } else {
                     None
@@ -1416,8 +1442,13 @@ impl SupervisorInner {
                 self.scratch.states = scratch_states;
                 self.scratch.ages = scratch_ages;
                 self.scratch.loads = scratch_loads;
-                if let Some((rb_kind, confirmed_off)) = disable_outcome {
-                    if use_cached {
+                if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
+                    if refused {
+                        self.is_torqued = true;
+                        self.disable_pending = false;
+                        self.active_disable_kind = None;
+                        self.last_disable_attempt = None;
+                    } else if use_cached {
                         if confirmed_off {
                             self.disable_confirmed();
                         } else {
@@ -1431,9 +1462,6 @@ impl SupervisorInner {
                         self.active_disable_kind = (!confirmed_off).then_some(rb_kind);
                         self.last_disable_attempt = Some(Instant::now());
                     }
-                } else if !was_torqued {
-                    self.is_torqued = true;
-                    self.pending_rearm = true;
                 }
                 return Err(SafetyError::FeedbackUnavailable);
             }
@@ -1443,14 +1471,26 @@ impl SupervisorInner {
                 || !Self::states_valid(&scratch_states, driver.capabilities(), self.config.dof, loads_slice)
                 || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled)
             {
-                let disable_outcome = if !was_torqued && prior_proven_off {
-                    let rb_kind = crate::driver::DisableKind::DisableProtective {
-                        reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
+                let disable_outcome = if !was_torqued {
+                    let rb_kind = if prior_proven_off {
+                        crate::driver::DisableKind::DisableProtective {
+                            reason: crate::driver::DisableProtectiveReason::EnableRollbackProven,
+                        }
+                    } else {
+                        crate::driver::DisableKind::DisableRequested {
+                            started_at: driver.clock_now(),
+                        }
                     };
                     if use_cached {
                         let sent = driver.begin_disable_torque_budgeted(rb_kind, 0);
+                        let refused = matches!(
+                            sent,
+                            Err(crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired)
+                        );
                         Some((
                             rb_kind,
+                            refused,
                             matches!(
                                 sent,
                                 Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed))
@@ -1458,9 +1498,23 @@ impl SupervisorInner {
                                 && driver.enable_state() == EnableState::Disabled,
                         ))
                     } else {
-                        let sent = driver.disable_torque(rb_kind).is_ok();
-                        let _ = driver.read_joint_states();
-                        Some((rb_kind, sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled))
+                        let res = driver.disable_torque(rb_kind);
+                        let refused = matches!(
+                            res,
+                            Err(crate::driver::ArmDriverError::TorqueOffWouldDrop
+                                | crate::driver::ArmDriverError::DisableRequestExpired)
+                        );
+                        if refused {
+                            Some((rb_kind, true, false))
+                        } else {
+                            let sent = res.is_ok();
+                            let _ = driver.read_joint_states();
+                            Some((
+                                rb_kind,
+                                false,
+                                sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled,
+                            ))
+                        }
                     }
                 } else {
                     None
@@ -1469,8 +1523,13 @@ impl SupervisorInner {
                 self.scratch.states = scratch_states;
                 self.scratch.ages = scratch_ages;
                 self.scratch.loads = scratch_loads;
-                if let Some((rb_kind, confirmed_off)) = disable_outcome {
-                    if use_cached {
+                if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
+                    if refused {
+                        self.is_torqued = true;
+                        self.disable_pending = false;
+                        self.active_disable_kind = None;
+                        self.last_disable_attempt = None;
+                    } else if use_cached {
                         if confirmed_off {
                             self.disable_confirmed();
                         } else {
@@ -1484,9 +1543,6 @@ impl SupervisorInner {
                         self.active_disable_kind = (!confirmed_off).then_some(rb_kind);
                         self.last_disable_attempt = Some(Instant::now());
                     }
-                } else if !was_torqued {
-                    self.is_torqued = true;
-                    self.pending_rearm = true;
                 }
                 return Err(SafetyError::FeedbackUnavailable);
             }

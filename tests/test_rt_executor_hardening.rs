@@ -1085,8 +1085,10 @@ async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
         "zero UDP cmd datagrams may be transmitted when E-stop arrives after serialization"
     );
 
-    // Disable (`begin_torque(false)`) is NEVER inhibited even when BOTH pending and latched
-    // E-stop arrive right before `send_nonblocking`!
+    // Requested disable (`begin_torque(false)`) without a calibrated rest-pose gate / fresh rest
+    // feedback is refused by Rule A′ when E-stop arrives right before `send_nonblocking`, whereas
+    // `DisableProtective` (thermal / process-exit) is NEVER inhibited even when BOTH pending and
+    // latched E-stop arrive right before `send_nonblocking`!
     {
         let req_h = req.clone();
         let latched_h = latched.clone();
@@ -1097,10 +1099,26 @@ async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
             latched_h.store(true, Ordering::SeqCst);
         })));
     }
-    let _ = drv.begin_torque(false).unwrap();
+    req.store(0, Ordering::SeqCst);
+    latched.store(false, Ordering::SeqCst);
+    let err_dis_req = drv.begin_torque(false).unwrap_err();
+    assert!(
+        matches!(err_dis_req, armd::driver::ArmDriverError::TorqueOffWouldDrop),
+        "DisableRequested without rest pose must fail closed under E-stop: {err_dis_req:?}"
+    );
     assert_eq!(hook_hits.load(Ordering::SeqCst), 4);
+    assert!(
+        drain_cmds(&peer).is_empty(),
+        "zero UDP cmd datagrams may be transmitted when DisableRequested is refused"
+    );
+    let _ = drv
+        .begin_disable_torque(armd::driver::DisableKind::DisableProtective {
+            reason: armd::driver::DisableProtectiveReason::Thermal,
+        })
+        .unwrap();
+    assert_eq!(hook_hits.load(Ordering::SeqCst), 5);
     let dis_cmds = drain_cmds(&peer);
-    assert_eq!(dis_cmds.len(), 1, "disable cmd must still transmit under E-stop: {dis_cmds:?}");
+    assert_eq!(dis_cmds.len(), 1, "protective disable cmd must still transmit under E-stop: {dis_cmds:?}");
     assert_eq!(dis_cmds[0].enable, Some(false));
     assert!(dis_cmds[0].targets.is_none());
 

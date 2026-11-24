@@ -926,6 +926,14 @@ impl ArmDriver for SimArmDriver {
         Ok(TorqueProgress::Pending { wake: now })
     }
 
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: crate::driver::DisableKind,
+        _max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable_torque(kind)
+    }
+
     /// No receive pass (the receiver thread fills the cache): `_deadline` bounds nothing.
     fn poll_torque(&mut self, _deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
         let Some((enabled, deadline)) = self.torque_hs else {

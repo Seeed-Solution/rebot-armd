@@ -298,16 +298,30 @@ fn estop_between_transmit_attempts_sends_nothing_more() {
     assert_eq!(bus.tx_log().len(), 1, "retries after the E-stop request: {:?}", bus.tx_log());
 }
 
-/// Disable during a gravity-comp style MIT session still goes out while an E-stop is pending
-/// (torque removal is never inhibited by the gate) and is confirmed.
+/// Disable while an E-stop is pending is never inhibited by the E-stop gate when the arm
+/// is at rest (Rule A′ satisfied) and is confirmed; protective disables also bypass Rule A′.
 #[test]
 fn disable_is_not_inhibited_by_a_pending_estop() {
+    use armd::driver::StoppedDisableGate;
+    use std::sync::atomic::AtomicBool;
     let requested = Arc::new(AtomicU64::new(1));
     let applied = Arc::new(AtomicU64::new(0));
     let (mut d, bus, clock) = enabled_rig();
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    for i in 0..6 {
+        arm_joints[i] = i;
+    }
+    d.set_stopped_disable_gate(StoppedDisableGate {
+        safety_stopped: Arc::new(AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 6,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
     d.set_estop_gate(EstopGate::new(requested, applied));
     let t0 = clock.now();
-    d.set_torque(false).expect("disable");
+    d.set_torque(false).expect("disable at rest under pending E-stop");
     assert_eq!(ids(&torque_frames(&bus, t0)), vec![1, 2, 3, 4, 5, 6, 7]);
     assert!(!d.is_enabled());
 }

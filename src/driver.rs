@@ -675,9 +675,12 @@ pub trait ArmDriver: Send {
     }
 
     /// Non-blocking hardware torque disable with an explicit [`DisableKind`].
+    /// Defaults to [`Self::begin_torque`]`(false)` so mock/custom drivers implementing
+    /// non-blocking `begin_torque` preserve their async confirmation handshake; real
+    /// hardware drivers override this to forward `kind` to their transmit choke point.
     fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
-        self.disable_torque(kind)
-            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+        let _ = kind;
+        self.begin_torque(false)
     }
 
     /// Budgeted [`Self::begin_torque`]: when `max_rx_frames == 0`, performs no bus RX drain
@@ -690,9 +693,10 @@ pub trait ArmDriver: Send {
     fn begin_disable_torque_budgeted(
         &mut self,
         kind: DisableKind,
-        _max_rx_frames: u16,
+        max_rx_frames: u16,
     ) -> Result<TorqueProgress, ArmDriverError> {
-        self.begin_disable_torque(kind)
+        let _ = kind;
+        self.begin_torque_budgeted(false, max_rx_frames)
     }
 
     /// Serve the pending torque transition once: one receive pass ending by `deadline` (and the
@@ -2479,6 +2483,19 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         }
     }
 
+    fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        self.disable_torque(kind)
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: DisableKind,
+        _max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable_torque(kind)
+    }
+
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         self.assert_clock_matches_transport();
         if targets.len() != self.servo_ids.len() {
@@ -2985,6 +3002,19 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             return Err(e);
         }
         Ok(())
+    }
+
+    fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        self.disable_torque(kind)
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: DisableKind,
+        _max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable_torque(kind)
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -6879,13 +6909,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
-        if !sent_any {
-            // Choke point refused every disable frame (0 CAN frames transmitted): preserve prior
-            // enable/feedback boundary state untouched so telemetry & enable_state stay honest.
-            self.awaiting_rx_boundary = prev_awaiting_rx_boundary;
-            return Err(refused_err
-                .or(other_err)
-                .unwrap_or(ArmDriverError::TorqueOffWouldDrop));
+        if !sent_any && other_err.is_none() {
+            if let Some(e) = refused_err {
+                // Choke point refused every disable frame before touching the transport (0 CAN
+                // frames attempted): preserve prior enable/feedback boundary state untouched so
+                // telemetry & enable_state stay honest. A transport TX error falls through below
+                // so enable_state becomes Unknown until post-error feedback proves motor state.
+                self.awaiting_rx_boundary = prev_awaiting_rx_boundary;
+                return Err(e);
+            }
         }
         // MIT tracking: once any disable frame is transmitted, discard cached targets so no
         // later recovery can replay one, whatever the disable's outcome (the fence stays
@@ -9188,6 +9220,19 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             return Err(e);
         }
         Ok(())
+    }
+
+    fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        self.disable_torque(kind)
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: DisableKind,
+        _max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable_torque(kind)
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
