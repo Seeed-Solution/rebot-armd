@@ -3413,6 +3413,885 @@ where
     })
 }
 
+// ============================================================================
+// Unified gripper_zero_check(store_offset=true) commit path (Executor + Legacy + Sync)
+// ============================================================================
+
+/// Zero-allocation live owner authority check shared across Reserve, pre-rename VerifyAuthority,
+/// and post-dir-sync Activate for `gripper_zero_check(store_offset=true)`.
+///
+/// Calls the single authority entry point [`check_config_authority`] (boot, connection, unapplied
+/// estop/stop, stop_generation, epoch, lease_holder, deadline) plus gripper-calibration invariants.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_zero_check_authority(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    proposal: &ConfigProposal,
+    auth: &ConfigAuthContext,
+    action_id: u64,
+    base_revision: u64,
+    candidate_policy: Option<&GripperPolicy>,
+) -> Result<(), (&'static str, &'static str, &'static str)> {
+    if core.zero_check_persisting != Some(action_id)
+        || !core
+            .last_action
+            .as_ref()
+            .is_some_and(|a| a.id == action_id && a.is_running())
+    {
+        return Err((
+            "cancelled",
+            "CANCELLED",
+            "Gripper zero check cancelled before calibration persisted",
+        ));
+    }
+    if core.safety.state().is_stopped() {
+        return Err((
+            "cancelled",
+            "STOPPED",
+            "Safety stop intervened before gripper calibration persisted",
+        ));
+    }
+    if let Err(err) = check_config_authority(core, ctx, proposal, auth, false) {
+        return Err(match err {
+            ConfigError::LeaseLost | ConfigError::ConnectionClosed => (
+                "cancelled",
+                "LEASE_LOST",
+                "Control lease lost or expired before gripper calibration persisted",
+            ),
+            ConfigError::EpochMismatch { .. } => (
+                "cancelled",
+                "EPOCH_MISMATCH",
+                "Safety epoch changed before gripper calibration persisted",
+            ),
+            ConfigError::Stopped => (
+                "cancelled",
+                "STOPPED",
+                "Authorized stop intervened before gripper calibration persisted",
+            ),
+            ConfigError::DeadlineExpired => (
+                "failed",
+                "DEADLINE_EXPIRED",
+                "Gripper calibration persistence deadline expired",
+            ),
+            _ => (
+                "failed",
+                "WRONG_TARGET",
+                "Gripper calibration authority check failed",
+            ),
+        });
+    }
+    if core.gripper_calib_revision != base_revision {
+        return Err((
+            "failed",
+            "POLICY_REVISION_MISMATCH",
+            "Gripper calibration revision changed concurrently",
+        ));
+    }
+    if core.driver_config_error.is_some() {
+        return Err((
+            "failed",
+            "INVALID_CALIBRATION",
+            "Driver limit configuration error prevents gripper calibration",
+        ));
+    }
+    if let Some(gp) = candidate_policy {
+        if (core.driver.is_some() || core.driver_config_error.is_some())
+            && core.validate_gripper_policy_against_driver_bounded(gp).is_err()
+        {
+            return Err((
+                "failed",
+                "INVALID_CALIBRATION",
+                "Gripper calibration rejected by driver position limits",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Phase 1 (owner-side, zero-alloc on `armd-control`): reserve `ConfigDomain::GripperCalibration`
+/// for `gripper_zero_check(store_offset=true)` strictly BEFORE serialization/staging.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zero_check_owner_reserve(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    action_id: u64,
+    base_revision: u64,
+    lease_owner: Option<(HolderLabel, u64)>,
+    estop_epoch: u64,
+    stop_gen: u64,
+    deadline: Instant,
+    candidate_policy: &GripperPolicy,
+    req_seq: u64,
+    code_buf: Option<String>,
+    msg_buf: Option<String>,
+) -> Result<
+    (Reservation, ConfigProposal, ConfigAuthContext, Option<String>, Option<String>),
+    (Option<String>, Option<String>),
+> {
+    let lease_gen = lease_owner.map_or(0, |(_, g)| g);
+    let proposal = ConfigProposal {
+        domain: ConfigDomain::GripperCalibration,
+        expected_revision: base_revision,
+        candidate: CandidateId(req_seq),
+        stamp: Stamp {
+            arm: ctx.arm,
+            boot: ctx.boot,
+            request: RequestId(req_seq),
+            client: ClientId(0),
+            client_seq: req_seq,
+            authority: Authority {
+                lease_generation: lease_gen,
+                epoch: estop_epoch,
+                stop_generation: stop_gen,
+                config_revision: core.workspace_revision,
+                parent_generation: 0,
+            },
+            deadline,
+        },
+    };
+    let auth = ConfigAuthContext {
+        admission: AdmissionStamp {
+            stop_gen,
+            estop_epoch,
+            lease_gen,
+            connection_id: 0,
+            request_id: req_seq,
+        },
+        lease_holder: lease_owner,
+    };
+    if let Err((state, code, msg)) = check_zero_check_authority(
+        core,
+        ctx,
+        &proposal,
+        &auth,
+        action_id,
+        base_revision,
+        Some(candidate_policy),
+    ) {
+        if core.zero_check_persisting == Some(action_id) {
+            core.zero_check_persisting = None;
+        }
+        let ret = if core
+            .last_action
+            .as_ref()
+            .is_some_and(|a| a.id == action_id && a.is_running())
+        {
+            core.finish_zero_check_action_in_place(action_id, state, code, msg, code_buf, msg_buf)
+        } else {
+            (code_buf, msg_buf)
+        };
+        return Err(ret);
+    }
+    match ConfigAuthority::reserve(core, &proposal, ctx) {
+        Reserved::Granted(reservation) => Ok((reservation, proposal, auth, code_buf, msg_buf)),
+        Reserved::Refused { code, .. } => {
+            if core.zero_check_persisting == Some(action_id) {
+                core.zero_check_persisting = None;
+            }
+            let ret = core.finish_zero_check_action_in_place(
+                action_id,
+                "failed",
+                code,
+                "Failed to reserve gripper calibration domain",
+                code_buf,
+                msg_buf,
+            );
+            Err(ret)
+        }
+    }
+}
+
+/// Phase 3 (owner-side, zero-alloc on `armd-control`): fresh pre-rename live owner authority
+/// recheck strictly BEFORE `rename_only()`. On refusal, releases the reservation (`Cleared`) and
+/// finishes the action so no file is renamed onto disk.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zero_check_owner_verify_authority(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    action_id: u64,
+    reservation: Reservation,
+    proposal: &ConfigProposal,
+    auth: &ConfigAuthContext,
+    base_revision: u64,
+    code_buf: Option<String>,
+    msg_buf: Option<String>,
+) -> Result<(Reservation, Option<String>, Option<String>), (Option<String>, Option<String>)> {
+    let hold_ok = core
+        .core
+        .config_held(ConfigDomain::GripperCalibration)
+        .is_some_and(|h| h.grant == Some(reservation.grant()));
+    if !hold_ok {
+        let _ = ConfigAuthority::release(core, reservation);
+        if core.zero_check_persisting == Some(action_id) {
+            core.zero_check_persisting = None;
+        }
+        let ret = core.finish_zero_check_action_in_place(
+            action_id,
+            "failed",
+            "PERSIST_FAILED",
+            "Gripper calibration reservation lost before rename",
+            code_buf,
+            msg_buf,
+        );
+        return Err(ret);
+    }
+    if let Err((state, code, msg)) =
+        check_zero_check_authority(core, ctx, proposal, auth, action_id, base_revision, None)
+    {
+        let _ = ConfigAuthority::release(core, reservation);
+        if core.zero_check_persisting == Some(action_id) {
+            core.zero_check_persisting = None;
+        }
+        let ret = if core
+            .last_action
+            .as_ref()
+            .is_some_and(|a| a.id == action_id && a.is_running())
+        {
+            core.finish_zero_check_action_in_place(action_id, state, code, msg, code_buf, msg_buf)
+        } else {
+            (code_buf, msg_buf)
+        };
+        return Err(ret);
+    }
+    Ok((reservation, code_buf, msg_buf))
+}
+
+/// Phase 4b (owner-side, zero-alloc on `armd-control`): mark reservation persisted after
+/// `rename_only()`. On refusal, unconditionally enters `Reconciling`.
+pub(crate) fn zero_check_owner_persisted(
+    core: &mut SupervisorInner,
+    action_id: u64,
+    reservation: Reservation,
+    simulated_err: bool,
+    code_buf: Option<String>,
+    msg_buf: Option<String>,
+) -> Result<(Reservation, Option<String>, Option<String>), (Option<String>, Option<String>)> {
+    let res = if simulated_err {
+        Err("SIMULATED_PERSISTED_ERR")
+    } else {
+        ConfigAuthority::persisted(core, &reservation, Durability::DurableUnconfirmed)
+    };
+    if res.is_ok() {
+        Ok((reservation, code_buf, msg_buf))
+    } else {
+        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+        core.core
+            .config_mut()
+            .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+        if core.zero_check_persisting == Some(action_id) {
+            core.zero_check_persisting = None;
+        }
+        let ret = core.finish_zero_check_action_in_place(
+            action_id,
+            "failed",
+            "PERSIST_FAILED",
+            "Failed to record post-rename persistence state; reconciling required",
+            code_buf,
+            msg_buf,
+        );
+        Err(ret)
+    }
+}
+
+/// Phase 5-error (owner-side, zero-alloc on `armd-control`): parent-directory fsync failed after
+/// `rename_only()`. Keeps the OLD policy active, enters `HoldState::Reconciling` (motion stays
+/// inhibited), and fails the action with `PERSIST_FAILED` + durability warning.
+pub(crate) fn zero_check_owner_reconcile_dir_sync_failed(
+    core: &mut SupervisorInner,
+    action_id: u64,
+    reservation: Reservation,
+    warning: String,
+    msg_buf: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if !matches!(
+        ConfigAuthority::release(core, reservation),
+        Released::Reconciling
+    ) {
+        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+        core.core
+            .config_mut()
+            .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+    }
+    if core.zero_check_persisting == Some(action_id) {
+        core.zero_check_persisting = None;
+    }
+    core.fail_zero_check_dir_sync_in_place(action_id, warning, msg_buf)
+}
+
+/// Phase 6 (owner-side, zero-alloc on `armd-control`): post-dir-sync live owner authority recheck
+/// and atomic in-place activation (`Durability::Durable`). Any failure enters `Reconciling`
+/// without mutating live gripper calibration.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zero_check_owner_activate(
+    core: &mut SupervisorInner,
+    ctx: &CommitCtx,
+    action_id: u64,
+    reservation: Reservation,
+    proposal: &ConfigProposal,
+    auth: &ConfigAuthContext,
+    base_revision: u64,
+    offset_rad: f32,
+    new_policy: GripperPolicy,
+    new_jaw: Option<JawOpening>,
+    operator_revoked: bool,
+    code_buf: Option<String>,
+    msg_buf: Option<String>,
+) -> Result<
+    (Option<GripperPolicy>, Option<JawOpening>, Option<String>, Option<String>),
+    (Option<GripperPolicy>, Option<JawOpening>, Option<String>, Option<String>),
+> {
+    let auth_res = if operator_revoked {
+        Err((
+            "failed",
+            "OPERATOR_REQUIRED",
+            "Operator session revoked after disk rename; reconciliation required",
+        ))
+    } else {
+        check_zero_check_authority(core, ctx, proposal, auth, action_id, base_revision, None)
+    };
+    if auth_res.is_ok() {
+        let (old_policy, old_jaw) =
+            core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
+        let _ = core.core.config_mut().confirm_durable(&reservation);
+        if !matches!(
+            ConfigAuthority::activate(core, reservation),
+            Activated::Active { .. }
+        ) {
+            let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+            core.core
+                .config_mut()
+                .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+        }
+        if core.zero_check_persisting == Some(action_id) {
+            core.zero_check_persisting = None;
+        }
+        let _ = core.complete_zero_check_action(action_id, Durability::Durable, None);
+        Ok((old_policy, old_jaw, code_buf, msg_buf))
+    } else {
+        let (state, code, msg) = auth_res.unwrap_err();
+        if !matches!(
+            core.core.config_mut().activation_failed(reservation, code),
+            Activated::Reconciling { .. }
+        ) {
+            let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+            core.core
+                .config_mut()
+                .force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+        }
+        if core.zero_check_persisting == Some(action_id) {
+            core.zero_check_persisting = None;
+        }
+        let (old_code, old_msg) = if core
+            .last_action
+            .as_ref()
+            .is_some_and(|a| a.id == action_id && a.is_running())
+        {
+            core.finish_zero_check_action_in_place(action_id, state, code, msg, code_buf, msg_buf)
+        } else {
+            (code_buf, msg_buf)
+        };
+        Err((Some(new_policy), new_jaw, old_code, old_msg))
+    }
+}
+
+/// Legacy `tick_shared` async worker for `gripper_zero_check(store_offset=true)` routed through
+/// the exact common commit ordering:
+/// `reserve -> off-thread serialize + stage + file fsync -> fresh owner authority recheck ->
+/// rename -> parent-directory fsync (failure -> Reconciling) -> fresh owner authority recheck ->
+/// activate/publish`.
+pub(crate) async fn run_legacy_zero_check_commit(
+    sup_inner: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>,
+    cw_lock: Arc<tokio::sync::Mutex<()>>,
+    published_config: Arc<PublishedConfigHub>,
+    hooks: ConfigCommitTestHooks,
+    job: crate::supervisor::PendingZeroCheckPersist,
+) {
+    let _cw = cw_lock.lock().await;
+    let check_op_auth = |ctx: &crate::supervisor::ZeroCheckPersistContext| -> bool {
+        ctx.operator_auth
+            .as_ref()
+            .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()))
+    };
+    if !check_op_auth(&job.ctx) {
+        let mut inner = sup_inner.write().await;
+        if inner.zero_check_persisting == Some(job.action_id) {
+            inner.zero_check_persisting = None;
+        }
+        let _ = inner.fail_zero_check_action_owned(
+            job.action_id,
+            "OPERATOR_REQUIRED".into(),
+            "Operator session expired or locked before gripper calibration persisted".into(),
+        );
+        return;
+    }
+    let candidate_policy = match SupervisorInner::validate_gripper_calibration_off_thread(
+        job.ctx.base_gripper_policy.as_ref(),
+        job.ctx.jaw_opening.as_ref(),
+        job.ctx.gripper_limit.as_ref(),
+        job.ctx.active_tool_is_stock,
+        Some(job.offset_rad),
+        job.ctx.jaw_opening.as_ref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Failed to validate gripper calibration after zero_check: {e}");
+            let mut inner = sup_inner.write().await;
+            if inner.zero_check_persisting == Some(job.action_id) {
+                inner.zero_check_persisting = None;
+            }
+            let _ = inner.fail_zero_check_action_owned(
+                job.action_id,
+                "INVALID_CALIBRATION".into(),
+                format!("Gripper calibration rejected: {e}"),
+            );
+            return;
+        }
+    };
+
+    if let Some(h) = hooks.before_reserve.as_ref() {
+        h();
+    }
+
+    // 1. Reserve strictly BEFORE serialization and staging.
+    let req_seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let (reservation, proposal, auth) = {
+        let mut inner = sup_inner.write().await;
+        if inner.detached {
+            return;
+        }
+        let ctx = CommitCtx {
+            arm: inner.core.id(),
+            boot: BootId::process(),
+            now: Instant::now(),
+            stop_generation: inner.current_stop_gen(),
+        };
+        match zero_check_owner_reserve(
+            &mut inner,
+            &ctx,
+            job.action_id,
+            job.base_revision,
+            job.lease_owner,
+            job.estop_epoch,
+            job.stop_gen,
+            job.deadline,
+            &candidate_policy,
+            req_seq,
+            Some(String::with_capacity(64)),
+            Some(String::with_capacity(160)),
+        ) {
+            Ok((r, p, a, _, _)) => (r, p, a),
+            Err(_) => return,
+        }
+    };
+
+    // 2. Off-thread serialize + stage + file fsync strictly AFTER reserve.
+    let write = job.ctx.serialize_write(job.offset_rad);
+    let staged_res = tokio::task::spawn_blocking(move || StagedWrite::stage(write.path, write.text))
+        .await
+        .map_err(|e| format!("stage task failed: {e}"))
+        .and_then(|r| r);
+    let staged = match staged_res {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
+            let mut inner = sup_inner.write().await;
+            let _ = ConfigAuthority::release(&mut *inner, reservation);
+            if inner.zero_check_persisting == Some(job.action_id) {
+                inner.zero_check_persisting = None;
+            }
+            let _ = inner.fail_zero_check_action_owned(
+                job.action_id,
+                "PERSIST_FAILED".into(),
+                format!("Failed to persist gripper calibration: {e}"),
+            );
+            return;
+        }
+    };
+
+    if let Some(h) = hooks.after_reserve_before_rename.as_ref() {
+        h();
+    }
+
+    // 3. Fresh pre-rename operator auth + live owner authority recheck.
+    if !check_op_auth(&job.ctx) {
+        staged.abort();
+        let mut inner = sup_inner.write().await;
+        let _ = ConfigAuthority::release(&mut *inner, reservation);
+        if inner.zero_check_persisting == Some(job.action_id) {
+            inner.zero_check_persisting = None;
+        }
+        let _ = inner.fail_zero_check_action_owned(
+            job.action_id,
+            "OPERATOR_REQUIRED".into(),
+            "Operator session expired or locked before gripper calibration persisted".into(),
+        );
+        return;
+    }
+    let reservation = {
+        let mut inner = sup_inner.write().await;
+        if inner.detached {
+            staged.abort();
+            return;
+        }
+        let ctx = CommitCtx {
+            arm: inner.core.id(),
+            boot: BootId::process(),
+            now: Instant::now(),
+            stop_generation: inner.current_stop_gen(),
+        };
+        match zero_check_owner_verify_authority(
+            &mut inner,
+            &ctx,
+            job.action_id,
+            reservation,
+            &proposal,
+            &auth,
+            job.base_revision,
+            Some(String::with_capacity(64)),
+            Some(String::with_capacity(160)),
+        ) {
+            Ok((r, _, _)) => r,
+            Err(_) => {
+                staged.abort();
+                return;
+            }
+        }
+    };
+
+    // 4a. Rename off-thread.
+    let sim_rename_fail = hooks
+        .fail_rename_once
+        .as_ref()
+        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+    let rename_res = if sim_rename_fail {
+        staged.abort();
+        Err("simulated rename failure".to_string())
+    } else {
+        tokio::task::spawn_blocking(move || staged.rename_only())
+            .await
+            .map_err(|e| format!("rename task failed: {e}"))
+            .and_then(|r| r)
+    };
+    let dir_sync = match rename_res {
+        Ok(ds) => ds,
+        Err(e) => {
+            tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
+            let mut inner = sup_inner.write().await;
+            let _ = ConfigAuthority::release(&mut *inner, reservation);
+            if inner.zero_check_persisting == Some(job.action_id) {
+                inner.zero_check_persisting = None;
+            }
+            let _ = inner.fail_zero_check_action_owned(
+                job.action_id,
+                "PERSIST_FAILED".into(),
+                format!("Failed to persist gripper calibration: {e}"),
+            );
+            return;
+        }
+    };
+
+    // 4b. Mark Persisted(DurableUnconfirmed) immediately after rename.
+    let sim_persisted_fail = hooks
+        .fail_persisted_once
+        .as_ref()
+        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+    let reservation = {
+        let mut inner = sup_inner.write().await;
+        match zero_check_owner_persisted(
+            &mut inner,
+            job.action_id,
+            reservation,
+            sim_persisted_fail,
+            Some(String::with_capacity(64)),
+            Some(String::with_capacity(160)),
+        ) {
+            Ok((r, _, _)) => r,
+            Err(_) => return,
+        }
+    };
+
+    // 5. Parent-directory fsync strictly BEFORE activation. Failure enters Reconciling!
+    let sim_dir_sync_fail = hooks
+        .fail_dir_sync_once
+        .as_ref()
+        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
+    let outcome = if sim_dir_sync_fail {
+        PublishOutcome::PublishedDurabilityUnconfirmed("simulated parent dir fsync failure".into())
+    } else {
+        tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
+            .await
+            .unwrap_or_else(|e| PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()))
+    };
+    if let PublishOutcome::PublishedDurabilityUnconfirmed(warn) = outcome {
+        let mut inner = sup_inner.write().await;
+        let _ = zero_check_owner_reconcile_dir_sync_failed(
+            &mut inner,
+            job.action_id,
+            reservation,
+            warn,
+            Some(String::with_capacity(160)),
+        );
+        return;
+    }
+
+    if let Some(h) = hooks.after_rename_before_activate.as_ref() {
+        h();
+    }
+
+    // 6. Fresh post-dir-sync authority recheck + atomic activation + PublishedConfigHub update.
+    let operator_revoked = !check_op_auth(&job.ctx);
+    let pub_policy = candidate_policy.clone();
+    let pub_jaw = job.ctx.jaw_opening.clone();
+    let activated_ok = {
+        let mut inner = sup_inner.write().await;
+        if inner.detached {
+            return;
+        }
+        let ctx = CommitCtx {
+            arm: inner.core.id(),
+            boot: BootId::process(),
+            now: Instant::now(),
+            stop_generation: inner.current_stop_gen(),
+        };
+        zero_check_owner_activate(
+            &mut inner,
+            &ctx,
+            job.action_id,
+            reservation,
+            &proposal,
+            &auth,
+            job.base_revision,
+            job.offset_rad,
+            candidate_policy,
+            job.ctx.jaw_opening,
+            operator_revoked,
+            Some(String::with_capacity(64)),
+            Some(String::with_capacity(160)),
+        )
+        .is_ok()
+    };
+    if activated_ok {
+        published_config.apply_zero_check_commit(
+            job.offset_rad,
+            pub_policy,
+            pub_jaw,
+            job.base_revision + 1,
+        );
+    }
+}
+
+/// Synchronous legacy fallback when `defer_zero_check_persist == false` (bare `SupervisorInner`
+/// tests): runs the exact same common commit state machine (`reserve -> serialize + stage +
+/// file fsync -> fresh authority recheck -> rename -> persisted -> parent-dir fsync (failure ->
+/// Reconciling) -> fresh authority recheck -> activate`).
+pub(crate) fn commit_zero_check_sync(
+    core: &mut SupervisorInner,
+    action_id: u64,
+    offset_rad: f32,
+    ctx_box: Box<crate::supervisor::ZeroCheckPersistContext>,
+) {
+    let check_op_auth = |c: &crate::supervisor::ZeroCheckPersistContext| -> bool {
+        c.operator_auth
+            .as_ref()
+            .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()))
+    };
+    // Hold action as running under `zero_check_persisting` so every owner primitive runs identically.
+    if let Some(a) = core.last_action.as_mut().filter(|a| a.id == action_id) {
+        a.state = HolderLabel::new("running");
+        a.finished_at = None;
+    }
+    core.zero_check_persisting = Some(action_id);
+
+    if !check_op_auth(&ctx_box) {
+        core.zero_check_persisting = None;
+        let _ = core.fail_zero_check_action_owned(
+            action_id,
+            "OPERATOR_REQUIRED".into(),
+            "Operator session expired or locked before gripper calibration persisted".into(),
+        );
+        return;
+    }
+    let candidate_policy = match SupervisorInner::validate_gripper_calibration_off_thread(
+        ctx_box.base_gripper_policy.as_ref(),
+        ctx_box.jaw_opening.as_ref(),
+        ctx_box.gripper_limit.as_ref(),
+        ctx_box.active_tool_is_stock,
+        Some(offset_rad),
+        ctx_box.jaw_opening.as_ref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
+            core.zero_check_persisting = None;
+            let _ = core.fail_zero_check_action_owned(
+                action_id,
+                "INVALID_CALIBRATION".into(),
+                format!("Gripper calibration rejected: {e}"),
+            );
+            return;
+        }
+    };
+
+    let base_revision = core.gripper_calib_revision;
+    let lease_owner = core
+        .active_lease
+        .as_ref()
+        .map(|l| (HolderLabel::new(&l.client_id), l.generation));
+    let estop_epoch = core.safety.epoch_id();
+    let stop_gen = core.current_stop_gen();
+    let deadline = Instant::now() + CONFIG_PROPOSAL_BUDGET;
+    let req_seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let commit_ctx = CommitCtx {
+        arm: core.core.id(),
+        boot: BootId::process(),
+        now: Instant::now(),
+        stop_generation: stop_gen,
+    };
+
+    // 1. Reserve strictly BEFORE serialization and staging.
+    let (reservation, proposal, auth) = match zero_check_owner_reserve(
+        core,
+        &commit_ctx,
+        action_id,
+        base_revision,
+        lease_owner,
+        estop_epoch,
+        stop_gen,
+        deadline,
+        &candidate_policy,
+        req_seq,
+        Some(String::with_capacity(64)),
+        Some(String::with_capacity(160)),
+    ) {
+        Ok((r, p, a, _, _)) => (r, p, a),
+        Err(_) => return,
+    };
+
+    // 2. Serialize + stage + file fsync strictly AFTER reserve.
+    let write = ctx_box.serialize_write(offset_rad);
+    let staged = match StagedWrite::stage(write.path, write.text) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
+            let _ = ConfigAuthority::release(core, reservation);
+            if core.zero_check_persisting == Some(action_id) {
+                core.zero_check_persisting = None;
+            }
+            let _ = core.fail_zero_check_action_owned(
+                action_id,
+                "PERSIST_FAILED".into(),
+                format!("Failed to persist gripper calibration: {e}"),
+            );
+            return;
+        }
+    };
+
+    // 3. Fresh pre-rename operator auth + live owner authority recheck.
+    if !check_op_auth(&ctx_box) {
+        staged.abort();
+        let _ = ConfigAuthority::release(core, reservation);
+        if core.zero_check_persisting == Some(action_id) {
+            core.zero_check_persisting = None;
+        }
+        let _ = core.fail_zero_check_action_owned(
+            action_id,
+            "OPERATOR_REQUIRED".into(),
+            "Operator session expired or locked before gripper calibration persisted".into(),
+        );
+        return;
+    }
+    let verify_ctx = CommitCtx {
+        arm: core.core.id(),
+        boot: BootId::process(),
+        now: Instant::now(),
+        stop_generation: core.current_stop_gen(),
+    };
+    let reservation = match zero_check_owner_verify_authority(
+        core,
+        &verify_ctx,
+        action_id,
+        reservation,
+        &proposal,
+        &auth,
+        base_revision,
+        Some(String::with_capacity(64)),
+        Some(String::with_capacity(160)),
+    ) {
+        Ok((r, _, _)) => r,
+        Err(_) => {
+            staged.abort();
+            return;
+        }
+    };
+
+    // 4a. Rename.
+    let dir_sync = match staged.rename_only() {
+        Ok(ds) => ds,
+        Err(e) => {
+            tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
+            let _ = ConfigAuthority::release(core, reservation);
+            if core.zero_check_persisting == Some(action_id) {
+                core.zero_check_persisting = None;
+            }
+            let _ = core.fail_zero_check_action_owned(
+                action_id,
+                "PERSIST_FAILED".into(),
+                format!("Failed to persist gripper calibration: {e}"),
+            );
+            return;
+        }
+    };
+
+    // 4b. Mark Persisted(DurableUnconfirmed).
+    let reservation = match zero_check_owner_persisted(
+        core,
+        action_id,
+        reservation,
+        false,
+        Some(String::with_capacity(64)),
+        Some(String::with_capacity(160)),
+    ) {
+        Ok((r, _, _)) => r,
+        Err(_) => return,
+    };
+
+    // 5. Parent-directory fsync strictly BEFORE activation. Failure enters Reconciling.
+    if let PublishOutcome::PublishedDurabilityUnconfirmed(warn) = dir_sync.sync_parent_dir() {
+        let _ = zero_check_owner_reconcile_dir_sync_failed(
+            core,
+            action_id,
+            reservation,
+            warn,
+            Some(String::with_capacity(160)),
+        );
+        return;
+    }
+
+    // 6. Fresh post-dir-sync authority recheck + atomic activation.
+    let operator_revoked = !check_op_auth(&ctx_box);
+    let act_ctx = CommitCtx {
+        arm: core.core.id(),
+        boot: BootId::process(),
+        now: Instant::now(),
+        stop_generation: core.current_stop_gen(),
+    };
+    let _ = zero_check_owner_activate(
+        core,
+        &act_ctx,
+        action_id,
+        reservation,
+        &proposal,
+        &auth,
+        base_revision,
+        offset_rad,
+        candidate_policy,
+        ctx_box.jaw_opening,
+        operator_revoked,
+        Some(String::with_capacity(64)),
+        Some(String::with_capacity(160)),
+    );
+}
+
 /// Pre-builds an `EvalBufs` off-thread for a given `(ArmModel, WorkspacePolicy, CameraMount, tcp_offset)`.
 pub fn prepare_eval_bufs_off_thread(
     arm_model: &ArmModel,

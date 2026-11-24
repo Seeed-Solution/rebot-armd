@@ -389,6 +389,9 @@ fn sample_persist_job(action_id: u64, dir: &std::path::Path) -> PendingZeroCheck
         offset_rad: 0.01,
         base_revision: 1,
         lease_owner: None,
+        estop_epoch: 1,
+        stop_gen: 0,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
         ctx: Box::new(armd::supervisor::ZeroCheckPersistContext {
             path: dir.join(format!("gripper_calib_{action_id}.json")),
             jaw_opening: None,

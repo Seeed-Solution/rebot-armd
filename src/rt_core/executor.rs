@@ -19,9 +19,8 @@ use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::broker::{Authority, BootId, Broker, Capacities, ClientId, RequestId, Stamp};
-use super::config_iface::{Activated, CandidateId, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Reservation, Reserved};
-use super::ids::ArmId;
+use super::broker::{BootId, Broker, Capacities};
+use super::config_iface::{ConfigAuthority, ConfigDomain, ConfigProposal, Reservation};
 use super::mailbox::TargetWriter;
 use super::ops::{CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, MAX_SERVICE_WAKES};
 use super::publish::StateHub;
@@ -1489,9 +1488,21 @@ enum PersistCmd {
         action_id: u64,
         base_revision: u64,
         lease_owner: Option<(crate::model::HolderLabel, u64)>,
+        estop_epoch: u64,
+        stop_gen: u64,
+        deadline: Instant,
         new_policy: GripperPolicy,
         jaw_opening: Option<JawOpening>,
         probe: Option<Box<dyn Any + Send>>,
+        code_buf: String,
+        msg_buf: String,
+    },
+    VerifyAuthority {
+        action_id: u64,
+        reservation: Reservation,
+        proposal: ConfigProposal,
+        auth: super::requests::config::ConfigAuthContext,
+        base_revision: u64,
         code_buf: String,
         msg_buf: String,
     },
@@ -1513,20 +1524,26 @@ enum PersistCmd {
     Persisted {
         action_id: u64,
         reservation: Reservation,
-        durability: Durability,
         code_buf: String,
+        msg_buf: String,
+    },
+    DirSyncFailed {
+        action_id: u64,
+        reservation: Reservation,
+        warning: String,
+        unused_policy: Option<GripperPolicy>,
+        unused_jaw: Option<JawOpening>,
         msg_buf: String,
     },
     Activate {
         action_id: u64,
         reservation: Reservation,
+        proposal: ConfigProposal,
+        auth: super::requests::config::ConfigAuthContext,
         base_revision: u64,
-        lease_owner: Option<(crate::model::HolderLabel, u64)>,
         offset_rad: f32,
         new_policy: GripperPolicy,
         new_jaw: Option<JawOpening>,
-        durability: Durability,
-        warning: Option<String>,
         operator_revoked: bool,
         code_buf: String,
         msg_buf: String,
@@ -1535,9 +1552,19 @@ enum PersistCmd {
 
 enum PersistReply {
     Reserved {
-        reservation: Option<Reservation>,
+        reservation: Option<(
+            Reservation,
+            ConfigProposal,
+            super::requests::config::ConfigAuthContext,
+        )>,
         policy: Option<GripperPolicy>,
         returned_jaw: Option<JawOpening>,
+        _returned_code: Option<String>,
+        _returned_msg: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
+    Verified {
+        reservation: Option<Reservation>,
         _returned_code: Option<String>,
         _returned_msg: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
@@ -3045,6 +3072,16 @@ impl ControlState {
                     _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 },
+                PersistCmd::VerifyAuthority {
+                    code_buf,
+                    msg_buf,
+                    ..
+                } => PersistReply::Verified {
+                    reservation: None,
+                    _returned_code: Some(code_buf),
+                    _returned_msg: Some(msg_buf),
+                    _returned_probe: self.take_reply_probe(),
+                },
                 PersistCmd::Persisted {
                     code_buf,
                     msg_buf,
@@ -3055,10 +3092,23 @@ impl ControlState {
                     _returned_msg: Some(msg_buf),
                     _returned_probe: self.take_reply_probe(),
                 },
+                PersistCmd::DirSyncFailed {
+                    warning,
+                    unused_policy,
+                    unused_jaw,
+                    msg_buf,
+                    ..
+                } => PersistReply::Done {
+                    _returned_policy: unused_policy,
+                    _returned_jaw: unused_jaw,
+                    _returned_code: None,
+                    _returned_msg: Some(msg_buf),
+                    _returned_warning: Some(warning),
+                    _returned_probe: self.take_reply_probe(),
+                },
                 PersistCmd::Activate {
                     new_policy,
                     new_jaw,
-                    warning,
                     code_buf,
                     msg_buf,
                     ..
@@ -3067,7 +3117,7 @@ impl ControlState {
                     _returned_jaw: new_jaw,
                     _returned_code: Some(code_buf),
                     _returned_msg: Some(msg_buf),
-                    _returned_warning: warning,
+                    _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 },
             };
@@ -3290,162 +3340,97 @@ impl ControlState {
                 action_id,
                 base_revision,
                 lease_owner,
+                estop_epoch,
+                stop_gen,
+                deadline,
                 new_policy,
                 jaw_opening,
                 probe,
                 code_buf,
                 msg_buf,
             } => {
-                let now = ctx.now;
-                let still_persisting = core.zero_check_persisting == Some(action_id);
-                let action_running = core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
-                let lease_ok = match &lease_owner {
-                    None => true,
-                    Some((c, g)) => core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < core.lease_timeout
-                            && l.generation == *g
-                            && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
-                    }),
-                };
-                let rev_ok = core.gripper_calib_revision == base_revision;
-                let urgent_pending = core.estop_pending()
-                    || self.stop_requests.current() != self.stop_requests.applied();
-                let stopped = core.safety.state().is_stopped() || urgent_pending;
-
-                if !still_persisting || !action_running || !lease_ok || stopped {
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = if action_running {
-                        let (code, msg) = if stopped {
-                            ("STOPPED", "Safety stop intervened before gripper calibration persisted")
-                        } else if !lease_ok {
-                            ("LEASE_LOST", "Control lease lost or expired before gripper calibration persisted")
-                        } else {
-                            ("CANCELLED", "Gripper zero check cancelled before calibration persisted")
-                        };
-                        core.finish_zero_check_action_in_place(
-                            action_id,
-                            "cancelled",
-                            code,
-                            msg,
-                            Some(code_buf),
-                            Some(msg_buf),
-                        )
-                    } else {
-                        (Some(code_buf), Some(msg_buf))
-                    };
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Reserved {
-                            reservation: None,
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
-                }
-                if !rev_ok {
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                        action_id,
-                        "failed",
-                        "POLICY_REVISION_MISMATCH",
-                        "Gripper calibration revision changed concurrently",
-                        Some(code_buf),
-                        Some(msg_buf),
-                    );
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Reserved {
-                            reservation: None,
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
-                }
-                if core.driver_config_error.is_some() {
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                        action_id,
-                        "failed",
-                        "INVALID_CALIBRATION",
-                        "Driver limit configuration error prevents gripper calibration",
-                        Some(code_buf),
-                        Some(msg_buf),
-                    );
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Reserved {
-                            reservation: None,
-                            policy: Some(new_policy),
-                            returned_jaw: jaw_opening,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
-                }
-                let auth = core.authority(ctx);
                 self.next_persist_req += 1;
-                let proposal = ConfigProposal {
-                    domain: ConfigDomain::GripperCalibration,
-                    expected_revision: base_revision,
-                    candidate: CandidateId(self.next_persist_req),
-                    stamp: Stamp {
-                        arm: ArmId::LOCAL,
-                        boot: ctx.boot,
-                        request: RequestId(self.next_persist_req),
-                        client: ClientId(0),
-                        client_seq: self.next_persist_req,
-                        authority: Authority { lease_generation: auth.lease_generation, ..auth },
-                        deadline: now + Duration::from_secs(5),
-                    },
-                };
-                match ConfigAuthority::reserve(core, &proposal, ctx) {
-                    Reserved::Granted(reservation) => {
+                let req_seq = self.next_persist_req;
+                match super::requests::config::zero_check_owner_reserve(
+                    core,
+                    ctx,
+                    action_id,
+                    base_revision,
+                    lease_owner,
+                    estop_epoch,
+                    stop_gen,
+                    deadline,
+                    &new_policy,
+                    req_seq,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((reservation, proposal, auth, ret_code, ret_msg)) => {
                         self.persist_granted = Some((action_id, ConfigDomain::GripperCalibration));
                         self.push_persist_reply_or_retain(
                             PersistReply::Reserved {
-                                reservation: Some(reservation),
+                                reservation: Some((reservation, proposal, auth)),
                                 policy: Some(new_policy),
                                 returned_jaw: jaw_opening,
-                                _returned_code: Some(code_buf),
-                                _returned_msg: Some(msg_buf),
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
                                 _returned_probe: probe,
                             },
                             core,
                         );
                     }
-                    Reserved::Refused { code, .. } => {
-                        if core.zero_check_persisting == Some(action_id) {
-                            core.zero_check_persisting = None;
-                        }
-                        let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                            action_id,
-                            "failed",
-                            code,
-                            "Failed to reserve gripper calibration domain",
-                            Some(code_buf),
-                            Some(msg_buf),
-                        );
+                    Err((old_code, old_msg)) => {
                         self.push_persist_reply_or_retain(
                             PersistReply::Reserved {
                                 reservation: None,
                                 policy: Some(new_policy),
                                 returned_jaw: jaw_opening,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                }
+            }
+            PersistCmd::VerifyAuthority {
+                action_id,
+                reservation,
+                proposal,
+                auth,
+                base_revision,
+                code_buf,
+                msg_buf,
+            } => {
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_verify_authority(
+                    core,
+                    ctx,
+                    action_id,
+                    reservation,
+                    &proposal,
+                    &auth,
+                    base_revision,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((reservation, ret_code, ret_msg)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Verified {
+                                reservation: Some(reservation),
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                    Err((old_code, old_msg)) => {
+                        self.persist_granted = None;
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Verified {
+                                reservation: None,
                                 _returned_code: old_code,
                                 _returned_msg: old_msg,
                                 _returned_probe: probe,
@@ -3478,7 +3463,6 @@ impl ControlState {
             PersistCmd::Persisted {
                 action_id,
                 reservation,
-                durability,
                 code_buf,
                 msg_buf,
             } => {
@@ -3487,201 +3471,126 @@ impl ControlState {
                     .fail_persisted_once
                     .as_ref()
                     .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-                let persisted_res = if simulated_err {
-                    Err("SIMULATED_PERSISTED_ERR")
-                } else {
-                    ConfigAuthority::persisted(core, &reservation, durability)
-                };
-                if persisted_res.is_ok() {
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Persisted {
-                            reservation: Some(reservation),
-                            _returned_code: Some(code_buf),
-                            _returned_msg: Some(msg_buf),
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                } else {
-                    self.persist_granted = None;
-                    let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-                    core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_persisted(
+                    core,
+                    action_id,
+                    reservation,
+                    simulated_err,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((reservation, ret_code, ret_msg)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Persisted {
+                                reservation: Some(reservation),
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
-                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
+                    Err((old_code, old_msg)) => {
+                        self.persist_granted = None;
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Persisted {
+                                reservation: None,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
+                    }
+                }
+            }
+            PersistCmd::DirSyncFailed {
+                action_id,
+                reservation,
+                warning,
+                unused_policy,
+                unused_jaw,
+                msg_buf,
+            } => {
+                self.persist_granted = None;
+                let (old_msg, old_warn) =
+                    super::requests::config::zero_check_owner_reconcile_dir_sync_failed(
+                        core,
                         action_id,
-                        "failed",
-                        "PERSIST_FAILED",
-                        "Failed to record post-rename persistence state; reconciling required",
-                        Some(code_buf),
+                        reservation,
+                        warning,
                         Some(msg_buf),
                     );
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Persisted {
-                            reservation: None,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                }
+                let probe = self.take_reply_probe();
+                self.push_persist_reply_or_retain(
+                    PersistReply::Done {
+                        _returned_policy: unused_policy,
+                        _returned_jaw: unused_jaw,
+                        _returned_code: None,
+                        _returned_msg: old_msg,
+                        _returned_warning: old_warn,
+                        _returned_probe: probe,
+                    },
+                    core,
+                );
             }
             PersistCmd::Activate {
                 action_id,
                 reservation,
+                proposal,
+                auth,
                 base_revision,
-                lease_owner,
                 offset_rad,
                 new_policy,
                 new_jaw,
-                durability,
-                warning,
                 operator_revoked,
                 code_buf,
                 msg_buf,
             } => {
                 self.persist_granted = None;
-                let already_persisted = core
-                    .core
-                    .config_held(ConfigDomain::GripperCalibration)
-                    .is_some_and(|h| {
-                        h.grant == Some(reservation.grant())
-                            && matches!(
-                                h.state,
-                                crate::rt_core::config_iface::HoldState::PersistedAwaitingActivation { .. }
-                            )
-                    });
-                let persisted_res = if already_persisted {
-                    Ok(())
-                } else {
-                    let simulated_err = self
-                        .hooks
-                        .fail_persisted_once
-                        .as_ref()
-                        .is_some_and(|f| f.swap(false, Ordering::AcqRel));
-                    if simulated_err {
-                        Err("SIMULATED_PERSISTED_ERR")
-                    } else {
-                        ConfigAuthority::persisted(core, &reservation, durability)
+                let probe = self.take_reply_probe();
+                match super::requests::config::zero_check_owner_activate(
+                    core,
+                    ctx,
+                    action_id,
+                    reservation,
+                    &proposal,
+                    &auth,
+                    base_revision,
+                    offset_rad,
+                    new_policy,
+                    new_jaw,
+                    operator_revoked,
+                    Some(code_buf),
+                    Some(msg_buf),
+                ) {
+                    Ok((old_policy, old_jaw, ret_code, ret_msg)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Activated {
+                                _returned_policy: old_policy,
+                                _returned_jaw: old_jaw,
+                                _returned_code: ret_code,
+                                _returned_msg: ret_msg,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
-                };
-                if persisted_res.is_err() {
-                    // Persistence #5: disk may already have been renamed — unconditionally force
-                    // Reconciling (inhibiting motion even if another domain occupied the slot).
-                    let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-                    core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
+                    Err((ret_policy, ret_jaw, old_code, old_msg)) => {
+                        self.push_persist_reply_or_retain(
+                            PersistReply::Done {
+                                _returned_policy: ret_policy,
+                                _returned_jaw: ret_jaw,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_warning: None,
+                                _returned_probe: probe,
+                            },
+                            core,
+                        );
                     }
-                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
-                        action_id,
-                        "failed",
-                        "PERSIST_FAILED",
-                        "Failed to record post-rename persistence state; reconciling required",
-                        Some(code_buf),
-                        Some(msg_buf),
-                    );
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Done {
-                            _returned_policy: Some(new_policy),
-                            _returned_jaw: new_jaw,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_warning: warning,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                    return;
-                }
-
-                let still_persisting = core.zero_check_persisting == Some(action_id);
-                let action_running = core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
-                let lease_ok = match &lease_owner {
-                    None => true,
-                    Some((c, g)) => core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < core.lease_timeout
-                            && l.generation == *g
-                            && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
-                    }),
-                };
-                let rev_ok = core.gripper_calib_revision == base_revision;
-                let urgent_pending = core.estop_pending()
-                    || self.stop_requests.current() != self.stop_requests.applied();
-                let stopped = core.safety.state().is_stopped() || urgent_pending;
-
-                if still_persisting && action_running && lease_ok && rev_ok && !stopped && !operator_revoked {
-                    let (old_policy, old_jaw) = core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
-                    if !matches!(ConfigAuthority::activate(core, reservation), Activated::Active { .. }) {
-                        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-                        core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-                    }
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let unused_warning = core.complete_zero_check_action(action_id, durability, warning);
-                    // Return unused scratch strings + any displaced warning/policy/jaw off-thread.
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Activated {
-                            _returned_policy: old_policy,
-                            _returned_jaw: old_jaw,
-                            _returned_code: Some(code_buf),
-                            _returned_msg: Some(msg_buf),
-                            _returned_warning: unused_warning,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
-                } else {
-                    // Post-rename revocation: keep live state/revision unchanged and enter Reconciling.
-                    let code = if stopped {
-                        "STOPPED"
-                    } else if operator_revoked {
-                        "OPERATOR_REQUIRED"
-                    } else if !lease_ok {
-                        "LEASE_LOST"
-                    } else if !rev_ok {
-                        "POLICY_REVISION_MISMATCH"
-                    } else {
-                        "CANCELLED"
-                    };
-                    if !matches!(core.core.config_mut().activation_failed(reservation, code), Activated::Reconciling { .. }) {
-                        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
-                        core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-                    }
-                    if core.zero_check_persisting == Some(action_id) {
-                        core.zero_check_persisting = None;
-                    }
-                    let (old_code, old_msg) = if action_running {
-                        core.finish_zero_check_action_in_place(
-                            action_id,
-                            "cancelled",
-                            code,
-                            "Gripper calibration revoked after disk rename; reconciliation required",
-                            Some(code_buf),
-                            Some(msg_buf),
-                        )
-                    } else {
-                        (Some(code_buf), Some(msg_buf))
-                    };
-                    let probe = self.take_reply_probe();
-                    self.push_persist_reply_or_retain(
-                        PersistReply::Done {
-                            _returned_policy: Some(new_policy),
-                            _returned_jaw: new_jaw,
-                            _returned_code: old_code,
-                            _returned_msg: old_msg,
-                            _returned_warning: warning,
-                            _returned_probe: probe,
-                        },
-                        core,
-                    );
                 }
             }
         }
@@ -3811,26 +3720,7 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
-            let write = job.ctx.serialize_write(job.offset_rad);
-            let staged = match StagedWrite::stage(write.path, write.text) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = push_cmd(
-                        &mut cmd_tx,
-                        PersistCmd::Fail {
-                            action_id: job.action_id,
-                            code: "PERSIST_FAILED".into(),
-                            message: format!("Failed to stage gripper calibration: {e}"),
-                            unused_policy: Some(candidate_policy),
-                            unused_jaw: job.ctx.jaw_opening,
-                        },
-                        &persist_stop,
-                        &control_exited,
-                    );
-                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
-                    continue;
-                }
-            };
+            // 1. Reserve strictly BEFORE serialization and staging.
             let lease_owner_inline = job.lease_owner;
             let payload_probe = hooks
                 .payload_drop_probe
@@ -3842,8 +3732,11 @@ fn spawn_persist_worker(
                     action_id: job.action_id,
                     base_revision: job.base_revision,
                     lease_owner: lease_owner_inline,
+                    estop_epoch: job.estop_epoch,
+                    stop_gen: job.stop_gen,
+                    deadline: job.deadline,
                     new_policy: candidate_policy,
-                    jaw_opening: job.ctx.jaw_opening,
+                    jaw_opening: job.ctx.jaw_opening.clone(),
                     probe: payload_probe,
                     code_buf: String::with_capacity(64),
                     msg_buf: String::with_capacity(160),
@@ -3851,7 +3744,6 @@ fn spawn_persist_worker(
                 &persist_stop,
                 &control_exited,
             ) {
-                staged.abort();
                 break;
             }
             let Some(PersistReply::Reserved {
@@ -3863,29 +3755,54 @@ fn spawn_persist_worker(
                 _returned_probe,
             }) = wait_reply(&rep_rx, &persist_stop, &control_exited)
             else {
-                staged.abort();
                 break;
             };
             drop(_returned_code);
             drop(_returned_msg);
             drop(_returned_probe);
-            let (reservation, new_policy, new_jaw) = match (reservation, policy) {
-                (Some(reservation), Some(new_policy)) => (reservation, new_policy, returned_jaw),
+            let ((reservation, proposal, auth), new_policy, new_jaw) = match (reservation, policy) {
+                (Some(rpa), Some(new_policy)) => (rpa, new_policy, returned_jaw),
                 (_, returned_policy) => {
                     drop(returned_policy);
                     drop(returned_jaw);
-                    staged.abort();
                     if hooks.exit_after_first_job { break; }
                     continue;
                 }
             };
+
+            // 2. Off-thread serialize + stage + file fsync strictly AFTER reserve.
+            let write = job.ctx.serialize_write(job.offset_rad);
+            let staged = match StagedWrite::stage(write.path, write.text) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = push_cmd(
+                        &mut cmd_tx,
+                        PersistCmd::Abort {
+                            action_id: job.action_id,
+                            reservation,
+                            code: "PERSIST_FAILED".into(),
+                            message: format!("Failed to stage gripper calibration: {e}"),
+                            unused_policy: Some(new_policy),
+                            unused_jaw: new_jaw,
+                        },
+                        &persist_stop,
+                        &control_exited,
+                    );
+                    if !hooks.leave_final_reply_queued {
+                        let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                    }
+                    if hooks.exit_after_first_job { break; }
+                    continue;
+                }
+            };
+
             if hooks.after_grant_before_rename.as_ref().is_some_and(|h| h()) {
                 // Simulated worker crash/disconnect before rename (reservation dropped with worker).
                 staged.abort();
                 break;
             }
-            // Re-verify operator authorization immediately before rename (operator session may
-            // have expired or locked during staging or reservation wait).
+
+            // 3. Fresh pre-rename operator auth + live owner authority recheck BEFORE rename.
             let auth_still_ok = job
                 .ctx
                 .operator_auth
@@ -3912,6 +3829,35 @@ fn spawn_persist_worker(
                 if hooks.exit_after_first_job { break; }
                 continue;
             }
+            if !push_cmd(
+                &mut cmd_tx,
+                PersistCmd::VerifyAuthority {
+                    action_id: job.action_id,
+                    reservation,
+                    proposal,
+                    auth,
+                    base_revision: job.base_revision,
+                    code_buf: String::with_capacity(64),
+                    msg_buf: String::with_capacity(160),
+                },
+                &persist_stop,
+                &control_exited,
+            ) {
+                staged.abort();
+                break;
+            }
+            let reservation = match wait_reply(&rep_rx, &persist_stop, &control_exited) {
+                Some(PersistReply::Verified { reservation: Some(r), .. }) => r,
+                _ => {
+                    staged.abort();
+                    drop(new_policy);
+                    drop(new_jaw);
+                    if hooks.exit_after_first_job { break; }
+                    continue;
+                }
+            };
+
+            // 4a. Rename off-thread.
             let dir_sync = match staged.rename_only() {
                 Ok(ds) => ds,
                 Err(e) => {
@@ -3935,15 +3881,13 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
-            // Record Persisted(DurableUnconfirmed) immediately after rename_only() so
-            // ConfigAuthority enters PersistedAwaitingActivation (inhibiting motion) before
-            // parent-directory sync runs.
+
+            // 4b. Record Persisted(DurableUnconfirmed) immediately after rename_only().
             if !push_cmd(
                 &mut cmd_tx,
                 PersistCmd::Persisted {
                     action_id: job.action_id,
                     reservation,
-                    durability: Durability::DurableUnconfirmed,
                     code_buf: String::with_capacity(64),
                     msg_buf: String::with_capacity(160),
                 },
@@ -3961,20 +3905,40 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
+
+            // 5. Parent-directory fsync strictly BEFORE activation. Any failure enters Reconciling
+            //    and keeps the old policy active with motion inhibited.
             let outcome = match hooks.dir_sync_override.as_ref() {
                 Some(f) => dir_sync.sync_with(|dir| f(dir)),
                 None => dir_sync.sync_parent_dir(),
             };
-            let (durability, warning) = match outcome {
-                PublishOutcome::Published => (Durability::Durable, None),
-                PublishOutcome::PublishedDurabilityUnconfirmed(w) => (Durability::DurableUnconfirmed, Some(w)),
-            };
+            if let PublishOutcome::PublishedDurabilityUnconfirmed(warn) = outcome {
+                let _ = push_cmd(
+                    &mut cmd_tx,
+                    PersistCmd::DirSyncFailed {
+                        action_id: job.action_id,
+                        reservation,
+                        warning: warn,
+                        unused_policy: Some(new_policy),
+                        unused_jaw: new_jaw,
+                        msg_buf: String::with_capacity(160),
+                    },
+                    &persist_stop,
+                    &control_exited,
+                );
+                if !hooks.leave_final_reply_queued {
+                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                }
+                if hooks.exit_after_first_job { break; }
+                continue;
+            }
+
             if hooks.after_rename_before_activate.as_ref().is_some_and(|h| h()) {
-                // Simulated worker crash/disconnect after rename without pushing Activate.
+                // Simulated worker crash/disconnect after rename + dir-sync without pushing Activate.
                 break;
             }
-            // Re-verify operator authorization after dir_sync immediately before Activate so
-            // operator lock/expiry during a slow fsync cannot activate (enters Reconciling).
+
+            // 6. Fresh post-dir-sync operator auth recheck + live owner Activate.
             let operator_revoked = !job
                 .ctx
                 .operator_auth
@@ -3987,13 +3951,12 @@ fn spawn_persist_worker(
                 PersistCmd::Activate {
                     action_id: job.action_id,
                     reservation,
+                    proposal,
+                    auth,
                     base_revision: job.base_revision,
-                    lease_owner: lease_owner_inline,
                     offset_rad: job.offset_rad,
                     new_policy,
                     new_jaw,
-                    durability,
-                    warning,
                     operator_revoked,
                     code_buf: String::with_capacity(64),
                     msg_buf: String::with_capacity(160),
@@ -4384,7 +4347,8 @@ fn control_thread_main(
                     let (phases, body_end) = core.take_tick_phases();
                     let body_end = body_end.unwrap_or_else(now_inst);
                     core.defer_zero_check_persist = false;
-                    if let Some(job) = core.pending_zero_check_persist.take() {
+                    if let Some(mut job) = core.pending_zero_check_persist.take() {
+                        job.stop_gen = state.stop_requests.current();
                         match state.persist_job_tx.push(job) {
                             Ok(()) => {
                                 state.persist_wake.unpark();
@@ -5935,6 +5899,9 @@ mod tests {
             action_id: 1,
             base_revision: 0,
             lease_owner: None,
+            estop_epoch: 1,
+            stop_gen: 0,
+            deadline: Instant::now() + Duration::from_secs(5),
             new_policy: crate::model::GripperPolicy::rebot_dm(),
             jaw_opening: None,
             probe: Some(Box::new(FlagDrop(persist_probe_dropped.clone()))),
@@ -5989,6 +5956,9 @@ mod tests {
             offset_rad: 0.01,
             base_revision: 0,
             lease_owner: None,
+            estop_epoch: 1,
+            stop_gen: 0,
+            deadline: Instant::now() + Duration::from_secs(5),
             ctx: Box::new(crate::supervisor::ZeroCheckPersistContext {
                 path: std::path::PathBuf::from("/tmp/armd-unused-test.json"),
                 jaw_opening: None,

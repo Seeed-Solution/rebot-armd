@@ -330,72 +330,18 @@ impl SupervisorInner {
                         offset_rad,
                         base_revision: self.gripper_calib_revision,
                         lease_owner,
+                        estop_epoch: self.safety.epoch_id(),
+                        stop_gen: self.current_stop_gen(),
+                        deadline: Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
                         ctx,
                     });
                 }
             } else {
-                let candidate_jaw = ctx.jaw_opening.clone();
-                match self.build_gripper_calibration_candidate(Some(offset_rad), candidate_jaw) {
-                    Err(e) => {
-                        tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
-                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                            a.state = "failed".into();
-                            a.code = Some("INVALID_CALIBRATION".into());
-                            a.message = Some(format!("Gripper calibration rejected: {e}"));
-                        }
-                    }
-                    Ok((cand, _)) => {
-                        let auth_ok = ctx
-                            .operator_auth
-                            .as_ref()
-                            .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-                        if !auth_ok {
-                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = "failed".into();
-                                a.code = Some("OPERATOR_REQUIRED".into());
-                                a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
-                            }
-                        } else {
-                            let write = ctx.serialize_write(offset_rad);
-                            match crate::persist::StagedWrite::stage(write.path, write.text) {
-                                Err(e) => {
-                                    tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
-                                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                        a.state = "failed".into();
-                                        a.code = Some("PERSIST_FAILED".into());
-                                        a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                                    }
-                                }
-                                Ok(staged) => match staged.rename_only() {
-                                    Err(e) => {
-                                        tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
-                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                            a.state = "failed".into();
-                                            a.code = Some("PERSIST_FAILED".into());
-                                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                                        }
-                                    }
-                                    Ok(dir_sync) => {
-                                        self.commit_gripper_calibration_candidate(cand);
-                                        self.gripper_calib_revision += 1;
-                                        let outcome = dir_sync.sync_parent_dir();
-                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                            match outcome {
-                                                crate::persist::PublishOutcome::Published => {
-                                                    a.durability_confirmed = Some(true);
-                                                }
-                                                crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
-                                                    a.durability_confirmed = Some(false);
-                                                    a.durability_warning = Some(w);
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                            }
-                        }
-                    }
-                }
+                // Non-deferred legacy path (direct `SupervisorInner::tick` tests): route through
+                // the EXACT same common commit state machine (`reserve -> serialize + stage + fsync
+                // -> fresh authority recheck -> rename -> parent-dir fsync -> authority recheck
+                // -> activate`, with dir-sync failure entering `Reconciling`).
+                crate::rt_core::requests::config::commit_zero_check_sync(self, id, offset_rad, ctx);
             }
         }
         if holding == Some(false) { self.held = None; }

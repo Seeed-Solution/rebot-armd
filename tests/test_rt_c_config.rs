@@ -2431,3 +2431,154 @@ async fn joint_zero_rename_failure_leaves_offsets_poses_and_gripper_untouched_le
 async fn joint_zero_rename_failure_leaves_offsets_poses_and_gripper_untouched_executor() {
     run_joint_zero_calib_is_dir_test(RtOwner::Executor).await;
 }
+
+// ============================================================================
+// 11. M3: gripper_zero_check(store_offset=true) routed through common commit path
+//         on Legacy (pre-rename VerifyAuthority + dir-sync failure -> Reconciling)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_check_store_offset_legacy_pre_rename_verify_and_dir_sync_reconcile() {
+    // 11a. Pre-rename revocation (E-stop during after_reserve_before_rename on Legacy tick_shared):
+    //      fresh owner VerifyAuthority aborts BEFORE rename, file untouched, hold Cleared.
+    let dir1 = tempfile::tempdir().unwrap();
+    let path1 = dir1.path().join("gripper_calib.json");
+    let sup1 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let id1 = {
+        let mut inner = sup1.inner().write().await;
+        inner.lease_enabled = false;
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.measured_positions[6] = -0.05;
+        inner.commanded_positions[6] = -0.05;
+        inner.target_positions[6] = -0.05;
+        inner.gripper_calib_path = Some(path1.clone());
+        inner.set_mock_gripper_stall_offset(Some(0.05));
+        let ep = inner.safety.epoch_id();
+        let adm = sup1.capture_admission_stamp();
+        let admitted = inner.check_admission(adm).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+        let adm2 = sup1.capture_admission_stamp();
+        let admitted2 = inner.check_admission(adm2).unwrap();
+        armd::SupervisorInner::start_gripper_zero_check(
+            admitted2,
+            &json!({"threshold_rad": 0.10, "store_offset": true}),
+            ep,
+        )
+        .unwrap()
+        .0
+    };
+    let (at_hook_tx, at_hook_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (go_tx, go_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let go_rx = Arc::new(std::sync::Mutex::new(go_rx));
+    sup1.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        after_reserve_before_rename: Some(Arc::new(move || {
+            let _ = at_hook_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    });
+    // Drive legacy ticks until zero_check spawns the deferred commit task and enters the hook.
+    let sup1_tick = Arc::clone(&sup1);
+    let ticker = tokio::spawn(async move {
+        for _ in 0..200 {
+            sup1_tick.tick(0.02).await;
+            if sup1_tick.inner().read().await.zero_check_persisting.is_some() {
+                break;
+            }
+        }
+    });
+    tokio::task::spawn_blocking(move || at_hook_rx.recv_timeout(Duration::from_secs(3)).unwrap())
+        .await
+        .unwrap();
+    let _ = ticker.await;
+    // Trigger E-stop BEFORE pre-rename VerifyAuthority runs.
+    sup1.trigger_e_stop_checked().await.unwrap();
+    go_tx.send(()).unwrap();
+    let dl = Instant::now() + Duration::from_secs(3);
+    loop {
+        let done = {
+            let inner = sup1.inner().read().await;
+            inner.last_action.as_ref().is_some_and(|a| a.id == id1 && !a.is_running())
+        };
+        if done {
+            break;
+        }
+        assert!(Instant::now() < dl, "legacy zero_check did not terminate after pre-rename E-stop");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!path1.exists(), "Legacy pre-rename VerifyAuthority must abort before rename");
+    {
+        let inner = sup1.inner().read().await;
+        assert!(!inner.core.motion_inhibited_by_config(), "pre-rename abort must leave hold Cleared");
+        assert_eq!(inner.gripper_calib_offset, None, "old policy must stay unchanged");
+    }
+
+    // 11b. Dir-sync failure on Legacy tick_shared: rename occurs, OLD policy stays active,
+    //      hold enters Reconciling, motion stays inhibited!
+    let dir2 = tempfile::tempdir().unwrap();
+    let path2 = dir2.path().join("gripper_calib.json");
+    let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let id2 = {
+        let mut inner = sup2.inner().write().await;
+        inner.lease_enabled = false;
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.measured_positions[6] = -0.05;
+        inner.commanded_positions[6] = -0.05;
+        inner.target_positions[6] = -0.05;
+        inner.gripper_calib_path = Some(path2.clone());
+        inner.set_mock_gripper_stall_offset(Some(0.05));
+        let ep = inner.safety.epoch_id();
+        let adm = sup2.capture_admission_stamp();
+        let admitted = inner.check_admission(adm).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+        let adm2 = sup2.capture_admission_stamp();
+        let admitted2 = inner.check_admission(adm2).unwrap();
+        armd::SupervisorInner::start_gripper_zero_check(
+            admitted2,
+            &json!({"threshold_rad": 0.10, "store_offset": true}),
+            ep,
+        )
+        .unwrap()
+        .0
+    };
+    sup2.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        fail_dir_sync_once: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    });
+    for _ in 0..200 {
+        sup2.tick(0.02).await;
+        if sup2.inner().read().await.zero_check_persisting.is_some() {
+            break;
+        }
+    }
+    let dl2 = Instant::now() + Duration::from_secs(3);
+    loop {
+        let done = {
+            let inner = sup2.inner().read().await;
+            inner.last_action.as_ref().is_some_and(|a| a.id == id2 && !a.is_running())
+        };
+        if done {
+            break;
+        }
+        assert!(Instant::now() < dl2, "legacy zero_check did not terminate after dir-sync failure");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(path2.exists(), "rename happened before dir-sync failure");
+    {
+        let inner = sup2.inner().read().await;
+        let a = inner.last_action.as_ref().unwrap();
+        assert_eq!(a.state, "failed", "{a:?}");
+        assert_eq!(a.code.as_deref(), Some("PERSIST_FAILED"), "{a:?}");
+        assert_eq!(a.durability_confirmed, Some(false), "{a:?}");
+        assert_eq!(inner.gripper_calib_offset, None, "old policy must stay active on dir-sync failure");
+        assert!(inner.core.motion_inhibited_by_config(), "dir-sync failure must inhibit motion");
+        assert_eq!(
+            inner.core.config_held(ConfigDomain::GripperCalibration).map(|h| h.state),
+            Some(HoldState::Reconciling)
+        );
+    }
+}
