@@ -2971,16 +2971,20 @@ fn control_thread_main(
             break;
         }
 
+        // Sample actual wake time FIRST — right after sleep returns and stop check,
+        // strictly before allocation bookkeeping (`WholeReleaseAllocGuard`) and `UsageMark::now()`
+        // (matching `run_periodic_with_clock`).
+        let actual_ns = now_ns_fn();
+        let release_start = now_inst();
+        let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
+
         // ---- Window 1: Whole release (disjoint from sub-release wakes) ----
         let release_res = {
             // Declared FIRST -> drops LAST, after catch_unwind and ALL release locals drop!
             let _alloc_scope = WholeReleaseAllocGuard::enter(&stats, false);
-            let release_start = now_inst();
-            let usage_start = UsageMark::now();
-            let now_ns = now_ns_fn();
-            let wake_lateness_ns = now_ns.saturating_sub(scheduled_ns);
             let wake_lateness_us = stats.record_wake_lateness_ns(wake_lateness_ns);
-            let skipped = releases.advance(now_ns);
+            let usage_start = UsageMark::now();
+            let skipped = releases.advance(actual_ns);
             if skipped > 0 {
                 stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
             }
