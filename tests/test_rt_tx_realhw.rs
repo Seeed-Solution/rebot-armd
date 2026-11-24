@@ -2663,9 +2663,9 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
             );
         }
 
-        // Part B: Continuously full 6-frame budget across motion AND stopped-hold -> Tick 1 sends
-        // J1-J6 first (deferring J7 freeze + 0xCC), Tick 2 sends priority J7 0xCC refresh + J7
-        // freeze frame (`vel_raw == 0`) so neither freeze nor refresh starves!
+        // Part B: Tight 6-frame budget on a 7-motor arm under Round-8 M2 priority-by-change:
+        // Class 1 (motion -> stop / hold / freeze, ANY joint including J7) > Class 2 (motion
+        // targets) > Class 3 (unchanged hold re-sends) > Class 4 (J7 0xCC refresh and reads).
         let tight = TxBudget { max_frames: 6, max_duration: ms(10), frame_max_age: ms(45) };
         let mut rig_full = DualRig::new_pos_force(owner, base_cfg(), Some(tight));
         let full_last_fresh_j7 = rig_full.inner().measured_positions[6];
@@ -2674,35 +2674,42 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
             s.immediate_replies = false;
         });
         rig_full.clock.advance(ms(110));
-        // Tick 1 (motion): J1-J6 consume all 6 frames; J7 freeze + 0xCC deferred (deferred_ticks -> 1).
+        // Tick 1 (operational): J7 was executing motion and now needs FREEZE (Class 1 > Class 2),
+        // so J7's freeze frame transmits immediately within ceil(7/6) = 2 ticks (on tick 1!)
+        // ahead of Class-2 arm motion targets; Class-4 0xCC does not steal a slot.
         rig_full.bus.clear_log();
         rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
         rig_full.step_dt(DT, false);
         let t1 = rig_full.bus.tx_log();
-        for id in 1u32..=6 {
-            assert!(t1.iter().any(|f| f.id == 0x100 + id), "{owner:?}: tick 1 did not send J{id}: {t1:?}");
-        }
-        assert!(j7_refresh_frames(&t1).is_empty(), "{owner:?}: tick 1 should prioritize J1-J6 before 0xCC: {t1:?}");
+        assert_j7_freeze_frames(
+            &j7_pf_frames(&t1),
+            full_last_fresh_j7,
+            pf_cur,
+            &format!("{owner:?} 6-frame motion tick 1 (Class-1 J7 freeze)"),
+        );
+        assert!(j7_refresh_frames(&t1).is_empty(), "{owner:?}: Class-4 0xCC must not steal a slot on tick 1: {t1:?}");
         assert!(rig_full.inner().safety.state().is_operational());
 
-        // Tick 2 (motion): priority 0xCC refresh runs FIRST + carried J7 freeze frame (vel=0) + arm frames; no stall!
+        // Tick 2 (operational): J7's unchanged freeze is now Class 3 < Class 2, so all 6 arm
+        // joints J1-J6 transmit their Class-2 targets with zero fault!
         rig_full.bus.clear_log();
         rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
         rig_full.step_dt(DT, false);
         let t2 = rig_full.bus.tx_log();
-        assert_j7_freeze_frames(
-            &j7_pf_frames(&t2),
-            full_last_fresh_j7,
-            pf_cur,
-            &format!("{owner:?} 6-frame motion tick 2"),
-        );
-        assert!(
-            !j7_refresh_frames(&t2).is_empty(),
-            "{owner:?}: tick 2 must send priority J7 0xCC refresh under full 6-frame budget: {t2:?}"
-        );
+        for id in 1u32..=6 {
+            assert!(t2.iter().any(|f| f.id == 0x100 + id), "{owner:?}: tick 2 did not send Class-2 J{id}: {t2:?}");
+        }
+        assert!(j7_refresh_frames(&t2).is_empty(), "{owner:?}: Class-4 0xCC must not steal a Class-2 slot: {t2:?}");
         assert!(rig_full.inner().safety.state().is_operational());
 
-        // Unmute J7 -> recovers and resumes fresh 0x307 with 0 faults.
+        // Unmute J7 -> recovers and resumes fresh 0x307 with 0 faults (give 7-slot budget so all 7 send each tick).
+        rig_full.inner_mut()
+            .driver
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .set_tx_budget(TxBudget { max_frames: 8, max_duration: ms(10), frame_max_age: ms(45) });
         rig_full.bus.with(|s| {
             s.motors[6].mute_feedback = false;
             s.push_all_feedback();
@@ -2718,26 +2725,53 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
             "{owner:?}: J7 did not resume moving/fresh 0x307 after recovery"
         );
 
-        // Stopped-hold priority check (M2): under a 6-frame budget on a 7-motor arm, all 6 due
-        // J1–J6 stopped holds take strict priority every tick (0 starvation by J7 freeze/0xCC);
-        // once capacity allows (max_frames = 8), all 6 J1–J6 holds go first, then J7 freeze + 0xCC.
-        rig_full.inner_mut()
-            .safety
-            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("6-frame hold test".into()));
+        // Stopped-hold priority-by-change check (Round-8 M2): keep J1-J6 fresh while aging J7
+        // past 100 ms, then restore the 6-frame budget and fault. All 7 joints (J1-J6 holds
+        // + J7 freeze) transmit within ceil(7/6) = 2 ticks with 0 Class-4 0xCC stealing slots.
         rig_full.bus.with(|s| s.motors[6].mute_feedback = true);
         for _ in 0..6 {
             rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
             rig_full.step_dt(DT, false);
         }
-        rig_full.bus.clear_log();
-        rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
-        rig_full.step_dt(DT, false);
-        let h6 = rig_full.bus.tx_log();
-        for id in 1u32..=6 {
-            assert!(h6.iter().any(|f| f.id == 0x100 + id), "{owner:?}: 6-frame hold missed J{id}: {h6:?}");
+        rig_full.inner_mut()
+            .driver
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .set_tx_budget(tight);
+        rig_full.inner_mut()
+            .safety
+            .trigger_fault_coded(FaultCode::Other, FaultReason::Other("6-frame hold test".into()));
+        let mut h6_arm_seen = std::collections::BTreeSet::new();
+        let mut h6_j7_freeze_seen = false;
+        for tick in 1..=2 {
+            rig_full.bus.clear_log();
+            rig_full.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig_full.step_dt(DT, false);
+            let h6 = rig_full.bus.tx_log();
+            assert_eq!(h6.len(), 6, "{owner:?}: tick {tick} must fill all 6 slots with Class 1/3: {h6:?}");
+            assert!(j7_refresh_frames(&h6).is_empty(), "{owner:?}: Class-4 0xCC must not steal a Class-1/3 slot: {h6:?}");
+            for id in 1u32..=6 {
+                if h6.iter().any(|f| f.id == 0x100 + id) {
+                    h6_arm_seen.insert(id);
+                }
+            }
+            let pf_now = j7_pf_frames(&h6);
+            if !pf_now.is_empty() {
+                assert_eq!(u16::from_le_bytes([pf_now[0].data[4], pf_now[0].data[5]]), 0);
+                h6_j7_freeze_seen = true;
+            }
         }
-        assert!(j7_pf_frames(&h6).is_empty(), "{owner:?}: 6-frame hold must prioritize J1-J6 over J7 freeze: {h6:?}");
-        assert!(j7_refresh_frames(&h6).is_empty(), "{owner:?}: 6-frame hold must prioritize J1-J6 over J7 0xCC: {h6:?}");
+        assert_eq!(
+            h6_arm_seen,
+            (1u32..=6).collect(),
+            "{owner:?}: all 6 arm joints J1-J6 must receive Class-1 holds within ceil(7/6)=2 ticks"
+        );
+        assert!(
+            h6_j7_freeze_seen,
+            "{owner:?}: J7 freeze must transmit within ceil(7/6)=2 ticks under 6-frame budget"
+        );
 
         // With 8-frame capacity (6 arm holds + J7 freeze + J7 0xCC), all 6 arm holds go first,
         // followed by J7 freeze AND J7 0xCC refresh with no false CAN_TX_STALLED!
@@ -6213,5 +6247,214 @@ fn dual_owner_r8_b1_stop_between_pending_check_and_stamping_sends_no_target() {
         let vel = u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]);
         assert!((pos - (-2.5)).abs() < 1e-2, "pre-STOP target leaked on Legacy: pos={pos}");
         assert_eq!(vel, 0, "Legacy local stop_gen advance must degrade Target to vel_raw==0 Hold");
+    }
+}
+
+/// Round-8 M2: transmit priority is by CHANGE, not by joint:
+/// 1. Motion -> stop / hold / freeze for ANY joint including J7 (oldest pending first, round-robin).
+/// 2. Motion targets.
+/// 3. Re-sends of an unchanged hold.
+/// 4. J7 `0xCC` refresh and other reads.
+///
+/// Asserts that a J7 stop or freeze superseding a closing command transmits within
+/// `N = ceil(joints / max_frames)` ticks for `max_frames = 1, 2, 6`, with six fresh arm joints,
+/// on BOTH owners (Legacy and RT Executor).
+#[test]
+fn dual_owner_r8_m2_tx_priority_by_change_class1_j7_within_ceil_bound_1_2_6() {
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+    let joints = 7usize;
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        for max_frames in [1usize, 2, 6] {
+            let bound_ticks = joints.div_ceil(max_frames);
+
+            // (a) STOP / E-stop superseding active motion (all 6 arm joints moving + J7 closing):
+            //     ALL 7 joints are Class 1 -> ALL 7 (including J7 vel_raw == 0 hold) must reach
+            //     the bus within `bound_ticks = ceil(7 / max_frames)`, with 0 Class-4 0xCC frames.
+            {
+                let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+                rig.inner_mut().commanded_positions[6] = -2.5;
+                rig.inner_mut().target_positions[6] = -2.5;
+                rig.inner_mut().measured_positions[6] = -2.5;
+                rig.bus.with(|s| {
+                    s.motors[6].q = -2.5;
+                    s.push_all_feedback();
+                });
+                rig.step();
+
+                // Admit a 7-joint jog (J1-J6 moving + J7 closing toward 0.0 rad) and run 1 tick
+                // so all 7 motors are executing motion on the wire (`vel_raw > 0` on J7).
+                {
+                    let inner = rig.inner_mut();
+                    let ep = inner.safety.epoch_id();
+                    let mut goal = inner.commanded_positions.clone();
+                    for g in goal.iter_mut().take(6) {
+                        *g += 0.25;
+                    }
+                    goal[6] = 0.0;
+                    let stamp = inner.current_admission_stamp();
+                    let admitted = inner.check_admission(stamp).expect("admit 7-joint move");
+                    SupervisorInner::jog_action(admitted, goal, Some(1.0), Some(ep), "joint_move")
+                        .expect("start 7-joint close move");
+                }
+                rig.bus.clear_log();
+                rig.bus.with(|s| s.push_all_feedback());
+                rig.step_dt(DT, false);
+                let pre_j7 = j7_pf_frames(&rig.bus.tx_log());
+                assert_eq!(pre_j7.len(), 1, "{owner:?} max_frames={max_frames}: expected closing J7 frame");
+                assert!(
+                    u16::from_le_bytes([pre_j7[0].data[4], pre_j7[0].data[5]]) > 0,
+                    "{owner:?} max_frames={max_frames}: J7 must be executing closing motion before STOP"
+                );
+
+                // Tighten TX budget to `max_frames` and latch E-stop (all 7 joints -> Class 1).
+                rig.inner_mut()
+                    .driver
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .set_tx_budget(TxBudget {
+                        max_frames,
+                        max_duration: ms(10),
+                        frame_max_age: ms(45),
+                    });
+                rig.inner_mut().apply_stop_policy(armd::StopPolicy::EStopLatch);
+
+                let mut seen_arm = std::collections::BTreeSet::new();
+                let mut j7_stop_tick: Option<usize> = None;
+                for tick in 1..=bound_ticks {
+                    rig.bus.clear_log();
+                    rig.bus.with(|s| s.push_all_feedback());
+                    rig.step_dt(DT, false);
+                    let log = rig.bus.tx_log();
+                    assert!(
+                        log.len() <= max_frames,
+                        "{owner:?} max_frames={max_frames} tick={tick}: exceeded budget: {log:?}"
+                    );
+                    assert!(
+                        j7_refresh_frames(&log).is_empty(),
+                        "{owner:?} max_frames={max_frames} tick={tick}: Class-4 0xCC stole slot: {log:?}"
+                    );
+                    for id in 1u32..=6 {
+                        if log.iter().any(|f| f.id == 0x100 + id) {
+                            seen_arm.insert(id);
+                        }
+                    }
+                    let j7 = j7_pf_frames(&log);
+                    if !j7.is_empty() {
+                        assert_eq!(
+                            u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]),
+                            0,
+                            "{owner:?} max_frames={max_frames} tick={tick}: J7 stop frame must have vel_raw == 0"
+                        );
+                        assert_eq!(u16::from_le_bytes([j7[0].data[6], j7[0].data[7]]), pf_cur);
+                        j7_stop_tick.get_or_insert(tick);
+                    }
+                }
+                assert_eq!(
+                    seen_arm,
+                    (1u32..=6).collect(),
+                    "{owner:?} max_frames={max_frames}: all 6 fresh arm joints must receive Class-1 holds within {bound_ticks} ticks"
+                );
+                assert!(
+                    j7_stop_tick.is_some_and(|t| t <= bound_ticks),
+                    "{owner:?} max_frames={max_frames}: J7 Class-1 stop must transmit within ceil(7/{max_frames})={bound_ticks} ticks, got {j7_stop_tick:?}"
+                );
+            }
+
+            // (b) J7 stale freeze superseding a closing command while 6 fresh arm joints continue
+            //     moving (Class 1 J7 freeze > Class 2 arm motion targets): J7 freeze transmits on
+            //     Tick 1 (strictly <= ceil(7 / max_frames)), then on Tick 2 J7 unchanged freeze is
+            //     Class 3 < Class 2 so arm motion targets run ahead of J7 re-sends!
+            {
+                let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+                rig.inner_mut().commanded_positions[6] = -2.5;
+                rig.inner_mut().target_positions[6] = -2.5;
+                rig.inner_mut().measured_positions[6] = -2.5;
+                rig.bus.with(|s| {
+                    s.motors[6].q = -2.5;
+                    s.push_all_feedback();
+                });
+                rig.step();
+
+                {
+                    let inner = rig.inner_mut();
+                    let ep = inner.safety.epoch_id();
+                    let mut goal = inner.commanded_positions.clone();
+                    for g in goal.iter_mut().take(6) {
+                        *g += 0.25;
+                    }
+                    goal[6] = 0.0;
+                    let stamp = inner.current_admission_stamp();
+                    let admitted = inner.check_admission(stamp).expect("admit close move");
+                    SupervisorInner::jog_action(admitted, goal, Some(1.0), Some(ep), "joint_move")
+                        .expect("start close move");
+                }
+                rig.bus.clear_log();
+                rig.bus.with(|s| s.push_all_feedback());
+                rig.step_dt(DT, false);
+                let last_fresh_j7 = rig.inner().measured_positions[6];
+                let pre_j7 = j7_pf_frames(&rig.bus.tx_log());
+                assert_eq!(pre_j7.len(), 1);
+                assert!(u16::from_le_bytes([pre_j7[0].data[4], pre_j7[0].data[5]]) > 0);
+
+                // Mute J7 past 100 ms while keeping all 6 arm joints fresh, and set budget = max_frames.
+                rig.bus.with(|s| {
+                    s.rx.clear();
+                    s.pending.clear();
+                    s.motors[6].mute_feedback = true;
+                });
+                rig.clock.advance(ms(115));
+                rig.inner_mut()
+                    .driver
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .set_tx_budget(TxBudget {
+                        max_frames,
+                        max_duration: ms(10),
+                        frame_max_age: ms(45),
+                    });
+
+                // Tick 1: Class-1 J7 freeze MUST preempt Class-2 arm motion targets on Tick 1!
+                rig.bus.clear_log();
+                rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+                rig.step_dt(DT, false);
+                let t1 = rig.bus.tx_log();
+                assert!(t1.len() <= max_frames, "{owner:?} max_frames={max_frames}: tick 1 over budget: {t1:?}");
+                assert_j7_freeze_frames(
+                    &j7_pf_frames(&t1),
+                    last_fresh_j7,
+                    pf_cur,
+                    &format!("{owner:?} max_frames={max_frames} Class-1 J7 freeze over Class-2 motion"),
+                );
+                assert!(
+                    j7_refresh_frames(&t1).is_empty(),
+                    "{owner:?} max_frames={max_frames}: Class-4 0xCC must not steal a slot: {t1:?}"
+                );
+
+                // Tick 2: J7's unchanged freeze is now Class 3 < Class 2 -> all `max_frames` slots
+                // go to Class-2 arm motion targets (0 J7 unchanged freeze re-sends, 0 Class-4 0xCC)!
+                rig.bus.clear_log();
+                rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+                rig.step_dt(DT, false);
+                let t2 = rig.bus.tx_log();
+                let arm_t2 = t2.iter().filter(|f| (0x101..=0x106).contains(&f.id)).count();
+                assert_eq!(
+                    arm_t2, max_frames,
+                    "{owner:?} max_frames={max_frames}: Class-2 arm motion must take all {max_frames} slots over Class-3 unchanged freeze: {t2:?}"
+                );
+                assert!(
+                    j7_pf_frames(&t2).is_empty(),
+                    "{owner:?} max_frames={max_frames}: Class-3 unchanged J7 freeze must not preempt Class-2 arm motion: {t2:?}"
+                );
+                assert!(
+                    j7_refresh_frames(&t2).is_empty(),
+                    "{owner:?} max_frames={max_frames}: Class-4 0xCC must not steal a Class-2 slot: {t2:?}"
+                );
+            }
+        }
     }
 }

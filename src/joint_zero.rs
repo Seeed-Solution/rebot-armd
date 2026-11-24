@@ -189,6 +189,7 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) { self.inner.set_tx_release_deadline(deadline); }
+    fn set_tx_budget(&mut self, budget: crate::driver::TxBudget) { self.inner.set_tx_budget(budget); }
     fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
     fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
     fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }
@@ -231,6 +232,9 @@ impl ArmDriver for ZeroOffsetDriver {
     ) -> Result<(), ArmDriverError> {
         let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
         self.inner.validate_pos_force_intent_target(position + offset, velocity, current_raw)
+    }
+    fn set_pending_pos_force_hold_hint(&mut self, is_hold: bool) {
+        self.inner.set_pending_pos_force_hold_hint(is_hold);
     }
     fn emit_pos_force_j7(
         &mut self,

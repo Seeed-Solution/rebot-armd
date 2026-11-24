@@ -4437,7 +4437,18 @@ fn j1_j6_stopped_holds_prioritized_over_j7_under_tight_budget_1_2_3() {
         });
         d.read_joint_states().unwrap();
 
-        // Make J7 stale (> 100 ms) so both J7 freeze AND 0xCC refresh want slots.
+        // First issue one motion pass so all 7 joints (J1-J6 + J7) are executing motion (`vel > 0`).
+        d.begin_tx_tick();
+        assert_eq!(d.write_joint_targets_bounded(&targets_const(0.2)).unwrap(), TxBatchOutcome::Complete);
+        clock.advance(ms(20));
+        bus.with(|s| {
+            s.rx.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+
+        // Make J7 stale (> 100 ms) so both J7 freeze (Class 1 -> Class 3) AND 0xCC refresh (Class 4)
+        // want slots, then tighten budget to `max_frames` ∈ {1, 2, 3}.
         clock.advance(ms(115));
         bus.with(|s| {
             s.rx.clear();
@@ -4454,8 +4465,11 @@ fn j1_j6_stopped_holds_prioritized_over_j7_under_tight_budget_1_2_3() {
             frame_max_age: ms(45),
         });
 
+        let bound_ticks = 7usize.div_ceil(max_frames);
         let mut seen_arm_ids = std::collections::BTreeSet::new();
-        for tick in 0..12 {
+        let mut j7_freeze_first_tick: Option<usize> = None;
+        let mut total_j7_freezes = 0usize;
+        for tick in 1..=14 {
             clock.advance(ms(20));
             bus.with(|s| {
                 s.rx.clear();
@@ -4469,7 +4483,7 @@ fn j1_j6_stopped_holds_prioritized_over_j7_under_tight_budget_1_2_3() {
             let out = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap();
             assert!(
                 matches!(out, TxBatchOutcome::Deferred { .. } | TxBatchOutcome::Expired { .. }),
-                "max_frames={max_frames} tick={tick}: 6 due arm holds + J7 cannot complete in {max_frames} frames: {out:?}"
+                "max_frames={max_frames} tick={tick}: 7 joints cannot complete in {max_frames} frames: {out:?}"
             );
             let tx = bus.with(|s| s.tx_accepted.clone());
             let arm_holds: Vec<u32> = tx
@@ -4483,26 +4497,35 @@ fn j1_j6_stopped_holds_prioritized_over_j7_under_tight_budget_1_2_3() {
                 .filter(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC)
                 .collect();
             assert_eq!(
-                arm_holds.len(),
+                arm_holds.len() + j7_frames.len(),
                 max_frames,
-                "max_frames={max_frames} tick={tick}: J1-J6 holds must get EVERY slot (0 starvation): tx={tx:?}"
-            );
-            assert!(
-                j7_frames.is_empty(),
-                "max_frames={max_frames} tick={tick}: J7 freeze must not steal slot while J1-J6 holds remain due: tx={tx:?}"
+                "max_frames={max_frames} tick={tick}: Class 1/3 holds+freeze must fill all {max_frames} slots: tx={tx:?}"
             );
             assert!(
                 j7_refresh.is_empty(),
-                "max_frames={max_frames} tick={tick}: J7 0xCC refresh must not steal slot while J1-J6 holds remain due: tx={tx:?}"
+                "max_frames={max_frames} tick={tick}: Class-4 0xCC refresh must not steal slot from Class 1/3: tx={tx:?}"
             );
             for id in arm_holds {
                 seen_arm_ids.insert(id);
+            }
+            if !j7_frames.is_empty() {
+                assert_eq!(u16::from_le_bytes([j7_frames[0].data[4], j7_frames[0].data[5]]), 0);
+                j7_freeze_first_tick.get_or_insert(tick);
+                total_j7_freezes += 1;
             }
         }
         assert_eq!(
             seen_arm_ids,
             (0x101u32..=0x106).collect(),
             "max_frames={max_frames}: all 6 arm joints J1-J6 must receive holds via round-robin"
+        );
+        assert!(
+            j7_freeze_first_tick.is_some_and(|t| t <= bound_ticks),
+            "max_frames={max_frames}: J7 Class-1 freeze must transmit within ceil(7/{max_frames})={bound_ticks} ticks, got {j7_freeze_first_tick:?}"
+        );
+        assert!(
+            total_j7_freezes >= 2,
+            "max_frames={max_frames}: J7 must also rotate fairly in Class 3 across 14 ticks, got {total_j7_freezes}"
         );
 
         // Part B1: Once capacity allows on the same driver (max_frames = 7 -> 6 arm holds + 1 J7 freeze;

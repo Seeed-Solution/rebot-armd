@@ -690,6 +690,12 @@ pub trait ArmDriver: Send {
         Ok(())
     }
 
+    /// When attached to `SupervisorInner`, informs the driver before the arm write whether the
+    /// upcoming tick-epilogue J7 `PosForce` intent is a `Hold`/`Stop` (Class 1 if J7 is currently
+    /// executing motion, Class 3 otherwise) vs a `Target` (Class 2), so the TX scheduler orders
+    /// frames strictly by change priority across all joints (J1–J6 and J7).
+    fn set_pending_pos_force_hold_hint(&mut self, _is_hold: bool) {}
+
     /// Single J7 `PosForce` (`0x307`) emitter called once per control tick from the tick epilogue
     /// on both owners (Legacy and RT Executor), after whatever arm-write path ran (whether that
     /// arm path succeeded, refused, tripped the MIT fence, hit `BuildRefused`, had an invalid
@@ -752,6 +758,9 @@ pub trait ArmDriver: Send {
     /// (`tx_deadline = min(first_tx + tx_budget, ceiling)`). Pass `None` when leaving a
     /// control release so off-tick calls are never clipped by a prior release deadline.
     fn set_tx_release_deadline(&mut self, _deadline: Option<Instant>) {}
+    /// Update the bounded per-tick TX budget dynamically (used by dual-owner tests).
+    #[doc(hidden)]
+    fn set_tx_budget(&mut self, _budget: TxBudget) {}
 
     /// Configured inclusive maximum age for carried-over TX frames (default 45 ms).
     fn tx_frame_max_age(&self) -> Duration { DAMIAO_TX_FRAME_MAX_AGE }
@@ -3285,7 +3294,31 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pf_deferred_since: Option<Instant>,
     /// Last deferred J7 intent (used by direct-driver `drain_pending_tx`).
     pf_deferred_intent: Option<PosForceIntent>,
+    /// Per-`(joint, slot)` unchanged-hold state (`true` once a stop/hold/freeze frame has been
+    /// flushed for that slot and no motion frame has superseded it; `false` after enable or any
+    /// flushed motion frame). Drives TX Class 1 (motion/non-hold -> stop / hold / freeze) vs
+    /// Class 3 (re-send of an unchanged hold) across ALL joints including J7.
+    slot_in_unchanged_hold: [bool; MAX_MODE_JOINTS * 2],
+    /// Monotonic counter incremented on every flushed joint TX frame (J1–J6 slots and J7).
+    tx_progress_seq: u64,
+    /// Per-`(joint, slot)` sequence number of the last flushed TX frame (`joint * 2 + slot`;
+    /// smallest = waited longest = oldest pending first round-robin within each priority class
+    /// across J1–J6 POS_VEL/MIT slots and J7).
+    slot_last_tx_seq: [u64; MAX_MODE_JOINTS * 2],
+    /// Hint set by `SupervisorInner` before arm output indicating whether this tick's upcoming
+    /// J7 intent is `Hold`/`Stop` (rather than a `Target`). Cleared after `emit_pos_force_j7_impl`.
+    pf_next_intent_is_hold: bool,
 }
+
+/// Transmit priority classes (lower value = higher priority):
+/// 1. Transition from motion to stop / hold / freeze for ANY joint (including J7).
+/// 2. Motion targets.
+/// 3. Re-sends of an unchanged hold / freeze.
+/// (Class 4: J7 `0xCC` refresh and other reads — sent only when Classes 1–3 have no pending work
+/// and spare TX budget remains.)
+const TX_CLASS_STOP_TRANSITION: u8 = 1;
+const TX_CLASS_MOTION_TARGET: u8 = 2;
+const TX_CLASS_HOLD_RESEND: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct TxProbeState {
@@ -3423,6 +3456,52 @@ impl PendingTxQueue {
         self.len -= 1;
         self.buf[self.len] = None;
         head
+    }
+
+    /// Peek the highest-priority stopped-hold entry ordered by
+    /// `(priority_class, slot_last_tx_seq[joint * 2 + slot])` (Class 1 transition before Class 3
+    /// unchanged-hold re-send; within each class, oldest waiting slot first, FIFO tie-break).
+    fn peek_best_hold(
+        &self,
+        slot_in_unchanged_hold: &[bool; MAX_MODE_JOINTS * 2],
+        slot_last_tx_seq: &[u64; MAX_MODE_JOINTS * 2],
+    ) -> Option<(usize, PendingTxFrame, u8, u64)> {
+        let mut best: Option<(usize, PendingTxFrame, u8, u64)> = None;
+        for (idx, slot_opt) in self.buf[..self.len].iter().enumerate() {
+            let Some(entry) = *slot_opt else { continue };
+            let sub = match entry.cmd {
+                PendingTargetCmd::RollbackHold { slot, .. } => usize::from(slot).min(1),
+                _ => 0,
+            };
+            let flat = entry.joint.saturating_mul(2).saturating_add(sub);
+            let class = if flat < slot_in_unchanged_hold.len() && slot_in_unchanged_hold[flat] {
+                TX_CLASS_HOLD_RESEND
+            } else {
+                TX_CLASS_STOP_TRANSITION
+            };
+            let seq = slot_last_tx_seq.get(flat).copied().unwrap_or(0);
+            let better = match best {
+                None => true,
+                Some((_, _, best_class, best_seq)) => (class, seq) < (best_class, best_seq),
+            };
+            if better {
+                best = Some((idx, entry, class, seq));
+            }
+        }
+        best
+    }
+
+    fn remove_at(&mut self, idx: usize) -> Option<PendingTxFrame> {
+        if idx >= self.len {
+            return None;
+        }
+        let item = self.buf[idx];
+        for i in (idx + 1)..self.len {
+            self.buf[i - 1] = self.buf[i];
+        }
+        self.len -= 1;
+        self.buf[self.len] = None;
+        item
     }
 
     fn clear(&mut self) -> usize {
@@ -3776,6 +3855,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_deferred_motion: false,
             pf_deferred_since: None,
             pf_deferred_intent: None,
+            slot_in_unchanged_hold: [false; MAX_MODE_JOINTS * 2],
+            tx_progress_seq: 0,
+            slot_last_tx_seq: [0; MAX_MODE_JOINTS * 2],
+            pf_next_intent_is_hold: false,
         }
     }
 
@@ -3986,48 +4069,91 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && self.now() < effective_deadline
     }
 
-    /// Per-tick TX frame slots reserved for the J7 `PosForce` tick-epilogue emitter during normal
-    /// motion passes when J7 (or its stale `0xCC` refresh) was deferred on the previous tick
-    /// (e.g. `max_frames = 6` on a 7-motor arm).
-    ///
-    /// Never reserves slots when due J1–J6 stopped holds are queued or in stopped-hold mode, and
-    /// always leaves at least 1 slot for J1–J6 so J7 can never starve arm output under tight
-    /// budgets (`max_frames = 1, 2, 3`).
+    /// Remaining TX frame slots in the active tick pass (`0` if backpressured or past deadline).
     #[inline]
-    fn pos_force_reserved_slots(&self) -> usize {
-        if !self.is_enabled
-            || self.active_pos_force_joint().is_none()
-            || self.last_output_was_hold
-            || self.pending_hold_tx.len() > 0
-            || self.tx_budget.max_frames <= 1
-        {
-            return 0;
-        }
-        let j7_frame = usize::from(self.pf_deferred_ticks >= 1);
-        let refresh = usize::from(
-            self.pf_refresh_pending
-                && self.pf_refresh_deferred_ticks >= 1
-                && !self.pf_refresh_attempted_this_tick
-                && self.poll_tx_allowed(),
-        );
-        (j7_frame + refresh).min(self.tx_budget.max_frames.saturating_sub(1))
-    }
-
-    /// True when an arm joint (J1–J6) may start one more frame transmit in the current tick pass
-    /// while leaving [`Self::pos_force_reserved_slots`] available for the J7 tick-epilogue emitter.
-    #[inline]
-    fn can_start_arm_tx(&self) -> bool {
-        let arm_cap = self.tx_budget.max_frames.saturating_sub(self.pos_force_reserved_slots());
+    fn remaining_tick_tx_slots(&self) -> usize {
         let Some(pass) = self.tick_tx else {
-            return 1 <= arm_cap
-                && self.tx_release_deadline.is_none_or(|cap| self.now() < cap);
+            if self.tx_release_deadline.is_some_and(|cap| self.now() >= cap) {
+                return 0;
+            }
+            return self.tx_budget.max_frames;
         };
         let effective_deadline = self
             .tx_release_deadline
             .map_or(pass.deadline, |cap| pass.deadline.min(cap));
-        !pass.backpressured
-            && pass.attempts.saturating_add(1) <= arm_cap
-            && self.now() < effective_deadline
+        if pass.backpressured || self.now() >= effective_deadline {
+            return 0;
+        }
+        self.tx_budget.max_frames.saturating_sub(pass.attempts)
+    }
+
+    /// Priority `(class, slot_last_tx_seq)` of the active `PosForce` J7 joint's `0x307` frame
+    /// for the current tick epilogue, or `None` when J7 has no `0x307` frame to send.
+    ///
+    /// - Class 1 (`TX_CLASS_STOP_TRANSITION`): J7 is not yet in an unchanged hold/freeze
+    ///   (`slot_in_unchanged_hold[pf_j * 2] == false`) and is about to emit stop / hold / freeze.
+    /// - Class 2 (`TX_CLASS_MOTION_TARGET`): J7 fresh moving target.
+    /// - Class 3 (`TX_CLASS_HOLD_RESEND`): J7 re-send of an unchanged hold / freeze.
+    #[inline]
+    fn j7_tx_priority(&self, is_hold_pass: bool) -> Option<(u8, u64)> {
+        if !self.is_enabled {
+            return None;
+        }
+        let pf_j = self.active_pos_force_joint()?;
+        let now = self.now();
+        let fresh = self.pos_force_feedback_valid(pf_j, now);
+        if !fresh && self.pos_force_freeze_params(pf_j).is_none() {
+            return None;
+        }
+        let j7_emitting_hold_or_freeze =
+            is_hold_pass || self.pf_next_intent_is_hold || !fresh;
+        let flat = pf_j.saturating_mul(2);
+        let j7_in_hold = self.slot_in_unchanged_hold.get(flat).copied().unwrap_or(false);
+        let class = if j7_emitting_hold_or_freeze {
+            if j7_in_hold {
+                TX_CLASS_HOLD_RESEND
+            } else {
+                TX_CLASS_STOP_TRANSITION
+            }
+        } else {
+            TX_CLASS_MOTION_TARGET
+        };
+        let seq = self.slot_last_tx_seq.get(flat).copied().unwrap_or(0);
+        Some((class, seq))
+    }
+
+    /// Record a flushed joint TX frame's execution state (`motion` vs `unchanged hold/freeze`)
+    /// and advance the global per-slot progress sequence for fair round-robin ordering.
+    #[inline]
+    fn record_flushed_joint_tx(&mut self, joint: usize, slot: usize, is_motion: bool) {
+        let flat = joint.saturating_mul(2).saturating_add(slot.min(1));
+        if flat < self.slot_in_unchanged_hold.len() {
+            if is_motion {
+                // Any motion frame invalidates both POS_VEL and MIT hold slots for this joint.
+                let base = joint.saturating_mul(2);
+                self.slot_in_unchanged_hold[base] = false;
+                if base + 1 < self.slot_in_unchanged_hold.len() {
+                    self.slot_in_unchanged_hold[base + 1] = false;
+                }
+            } else {
+                self.slot_in_unchanged_hold[flat] = true;
+            }
+            self.tx_progress_seq = self.tx_progress_seq.saturating_add(1);
+            self.slot_last_tx_seq[flat] = self.tx_progress_seq;
+        }
+    }
+
+    /// True when any joint (J1–J6 or J7) still awaits a Class-1 motion->stop/hold/freeze frame.
+    #[inline]
+    fn has_class1_transition_pending(&self) -> bool {
+        if self.last_output_was_hold {
+            let n = self.motor_ids.len().min(MAX_MODE_JOINTS);
+            if (0..n).any(|i| !self.slot_in_unchanged_hold[i * 2]) {
+                return true;
+            }
+        }
+        self.j7_tx_priority(self.last_output_was_hold)
+            .is_some_and(|(class, _)| class == TX_CLASS_STOP_TRANSITION)
     }
 
     #[inline]
@@ -4766,17 +4892,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let entry_now = self.now();
         let _ = self.check_pos_force_freshness_for_tx_at(entry_now);
 
-        // Strict stopped-hold priority: J1–J6 hold and stop frames take priority over both the
-        // J7 freeze/hold frame and the J7 `0xCC` refresh. J7 may consume a TX slot ONLY after all
-        // due J1–J6 stopped holds have been queued and drained (`pending_hold_tx.is_empty()`).
-        if self.pending_hold_tx.len() > 0 {
-            if self.pf_refresh_pending && !self.pf_refresh_attempted_this_tick && self.poll_tx_allowed() {
-                self.pf_refresh_deferred_ticks = self.pf_refresh_deferred_ticks.saturating_add(1);
-            }
-            self.pf_deferred_ticks = self.pf_deferred_ticks.saturating_add(1);
-            let pf_status = self.take_last_pos_force_tx_status();
-            return Ok(PosForceEmitOutcome::Deferred { joint: pf_j, pf_status });
-        }
+        // Clear per-tick J7 hold hint after consulting it in the arm write pass.
+        self.pf_next_intent_is_hold = false;
 
         let mut active_kind = effective_kind;
         let mut retried = false;
@@ -4868,9 +4985,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.record_sent_target(pf_j, sent_frame, None);
 
-        // J7 `0xCC` refresh runs strictly AFTER all due J1–J6 holds and the J7 hold/freeze frame,
-        // consuming a slot only if TX budget capacity still allows.
+        // Class 4 (`0xCC` refresh) runs strictly AFTER all Class-1, Class-2, and Class-3 frames
+        // (both arm and J7 `0x307`) have drained and only if TX budget capacity still allows.
         if self.pending_hold_tx.len() == 0
+            && self.pending_tx.len() == 0
             && self.pf_refresh_pending
             && !self.pf_refresh_attempted_this_tick
             && self.poll_tx_allowed()
@@ -4908,6 +5026,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.pf_deferred_motion = false;
         self.pf_deferred_since = None;
         self.pf_deferred_intent = None;
+        let sent_vel_raw = u16::from_le_bytes([sent_frame.data[4], sent_frame.data[5]]);
+        self.record_flushed_joint_tx(pf_j, 0, sent_vel_raw > 0);
         if pf_j < 64 {
             self.last_target_tx_sent_mask |= 1u64 << pf_j;
         }
@@ -6011,11 +6131,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.last_target_tx_sent_mask = 0;
         let mut sent_any = false;
         let mut sent_mask: u64 = 0;
+        let mut sent_order = [0usize; MAX_MODE_JOINTS];
+        let mut sent_order_len = 0usize;
         let mut dropped_stale_in_pass = 0usize;
         let mut oldest_expired = pre_oldest_expired;
         while let Some(entry) = self.pending_tx.front() {
-            if !self.can_start_arm_tx() {
+            let rem = self.remaining_tick_tx_slots();
+            if rem == 0 || !self.can_start_tick_tx() {
                 break;
+            }
+            // If this is the last remaining TX slot of the tick, yield it to the J7 epilogue
+            // whenever J7 outranks this Class-2 arm motion frame (e.g. J7 Class-1 freeze/stop,
+            // or an older waiting Class-2 J7 target by `joint_last_tx_seq`).
+            if rem == 1 {
+                if let Some((j7_class, j7_seq)) = self.j7_tx_priority(false) {
+                    let arm_seq = self.slot_last_tx_seq.get(entry.joint.saturating_mul(2)).copied().unwrap_or(0);
+                    if (j7_class, j7_seq) < (TX_CLASS_MOTION_TARGET, arm_seq) {
+                        break;
+                    }
+                }
             }
             let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
             match self.send(
@@ -6038,6 +6172,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     };
                     self.record_sent_target(entry.joint, sent_frame, mit_params);
                     sent_any = true;
+                    if sent_order_len < MAX_MODE_JOINTS {
+                        sent_order[sent_order_len] = entry.joint;
+                        sent_order_len += 1;
+                    }
                     if entry.joint < 64 {
                         sent_mask |= 1u64 << entry.joint;
                     }
@@ -6105,6 +6243,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if let Err(e) = self.strict_stop_check(Some(pass_stop_stamp)) {
             self.discard_pending_tx_stopped();
             return Err(e);
+        }
+        for &joint in &sent_order[..sent_order_len] {
+            self.record_flushed_joint_tx(joint, 0, true);
         }
         // Record per-joint wire progress only after flush and post-flush stop checks succeed,
         // excluding any joint that still has an unsent frame remaining in `pending_tx`.
@@ -7626,6 +7767,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.last_mit_recovery_rx_seq = None;
                 self.mit_tracking_used = false;
                 self.mit_fence_last_cmd.fill(None);
+                self.slot_in_unchanged_hold = [false; MAX_MODE_JOINTS * 2];
+                self.pf_next_intent_is_hold = false;
                 Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
             }
             Service::Fault { .. } => {
@@ -8885,6 +9028,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 for (i, t) in started.into_iter().enumerate().take(targets.len()) {
                     if t.is_some() {
                         self.mit_fence_last_cmd[i] = t;
+                        self.record_flushed_joint_tx(i, 0, false);
                     }
                 }
                 self.last_hold_tx_sent_any = sent_any;
@@ -8982,16 +9126,33 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let _ = self.ensure_tx_pass();
             let mut sent_any = false;
             let mut sent_slot_mask: u64 = 0;
+            let mut sent_order = [(0usize, 0usize); MAX_MODE_JOINTS * 2];
+            let mut sent_order_len = 0usize;
             let mut dropped_stale_in_pass = 0usize;
             (|| -> Result<TxBatchOutcome, ArmDriverError> {
-                while let Some(entry) = self.pending_hold_tx.front() {
-                    if !self.can_start_tick_tx() {
+                while let Some((idx, entry, arm_class, arm_seq)) = self
+                    .pending_hold_tx
+                    .peek_best_hold(&self.slot_in_unchanged_hold, &self.slot_last_tx_seq)
+                {
+                    let rem = self.remaining_tick_tx_slots();
+                    if rem == 0 || !self.can_start_tick_tx() {
                         break;
+                    }
+                    // Priority by change across ALL joints (J1–J6 and J7): if taking this slot
+                    // leaves 0 slots for the J7 epilogue, yield whenever J7 outranks `entry` by
+                    // `(priority_class, slot_last_tx_seq)` (Class 1 transition before Class 3
+                    // unchanged hold re-send; oldest waiting slot first within a class).
+                    if rem == 1 {
+                        if let Some((j7_class, j7_seq)) = self.j7_tx_priority(true) {
+                            if (j7_class, j7_seq) < (arm_class, arm_seq) {
+                                break;
+                            }
+                        }
                     }
                     let i = entry.joint;
                     let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
                     let PendingTargetCmd::RollbackHold { kp, kd, torque, slot } = entry.cmd else {
-                        let _ = self.pending_hold_tx.pop_front();
+                        let _ = self.pending_hold_tx.remove_at(idx);
                         continue;
                     };
                     match self.send(
@@ -9017,7 +9178,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         },
                     ) {
                         Ok(sent_frame) => {
-                            let _ = self.pending_hold_tx.pop_front();
+                            let _ = self.pending_hold_tx.remove_at(idx);
                             let mit_params = (
                                 kp.filter(|k| k.is_finite()).unwrap_or(self.default_kp),
                                 kd.filter(|k| k.is_finite()).unwrap_or(self.default_kd),
@@ -9025,6 +9186,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             );
                             self.record_sent_target(i, sent_frame, Some(mit_params));
                             sent_any = true;
+                            if sent_order_len < sent_order.len() {
+                                sent_order[sent_order_len] = (i, usize::from(slot));
+                                sent_order_len += 1;
+                            }
                             let flat_bit = i.saturating_mul(2).saturating_add(usize::from(slot));
                             if flat_bit < 64 {
                                 sent_slot_mask |= 1u64 << flat_bit;
@@ -9034,12 +9199,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             }
                         }
                         Err(TxRefusal::PosForceFeedbackExpired(_)) => {
-                            let _ = self.pending_hold_tx.pop_front();
+                            let _ = self.pending_hold_tx.remove_at(idx);
                             continue;
                         }
                         Err(TxRefusal::DeadlinePassed) => {
                             let now = self.now();
-                            let _ = self.pending_hold_tx.pop_front();
+                            let _ = self.pending_hold_tx.remove_at(idx);
                             let age = now.saturating_duration_since(entry.queued_at);
                             oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
                             dropped_stale_in_pass += 1;
@@ -9059,7 +9224,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 due_mask &= !(1u64 << flat_bit);
                             }
                             first_build_refused_joint.get_or_insert(i);
-                            let _ = self.pending_hold_tx.pop_front();
+                            let _ = self.pending_hold_tx.remove_at(idx);
                             continue;
                         }
                         Err(TxRefusal::MitFenceTripped(reason)) => {
@@ -9130,6 +9295,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.last_hold_tx_sent_mask = 0;
                     self.discard_pending_hold_tx();
                     return Err(ArmDriverError::EstopInhibited);
+                }
+                for &(joint, slot) in &sent_order[..sent_order_len] {
+                    self.record_flushed_joint_tx(joint, slot, false);
                 }
                 if let Some(refused_joint) = first_build_refused_joint {
                     let post_now = self.now();
@@ -9257,6 +9425,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(ArmDriverError::PosForceTargetUnavailable { joint: pf.joint });
         }
         Ok(())
+    }
+
+    fn set_pending_pos_force_hold_hint(&mut self, is_hold: bool) {
+        self.pf_next_intent_is_hold = is_hold;
     }
 
     fn emit_pos_force_j7(
@@ -9526,6 +9698,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 for (i, t) in started.into_iter().enumerate().take(targets.len()) {
                     if t.is_some() {
                         self.mit_fence_last_cmd[i] = t;
+                        self.record_flushed_joint_tx(i, 0, true);
                         if i < 64 {
                             sent_mask |= 1u64 << i;
                         }
@@ -9692,6 +9865,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn discard_pending_tx(&mut self) {
         self.discard_all_pending_tx();
+    }
+
+    fn set_tx_budget(&mut self, budget: TxBudget) {
+        self.tx_budget = budget;
     }
 
     fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
@@ -9995,6 +10172,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             })
         {
             self.disable_confirmed_sticky = true;
+            self.slot_in_unchanged_hold = [false; MAX_MODE_JOINTS * 2];
+            self.pf_next_intent_is_hold = false;
         }
 
         // Evaluate feedback age only after receive() explicitly reports an empty
@@ -10026,11 +10205,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         } else {
             let _ = self.drop_stopped_hold_tx(rx_stop_stamp);
         }
-        // Priority J7 0xCC refresh when enabled: if a needed refresh was previously deferred by
-        // full-budget contention (`pf_refresh_deferred_ticks >= 1`) OR no output pass ran since the
-        // previous RX pass (`pf_refresh_pending && !output_ran_since_rx`), emit ONE 0xCC before
-        // competing RX recovery frames so J7 refresh never starves. Otherwise yield the shared TX
-        // budget to the upcoming output pass so healthy J1–J6 targets/holds go first.
+        // Class 4 (`0xCC` refresh) when enabled: ONLY emit during RX when no output pass ran since
+        // the previous RX (e.g. `send_to_bus == false` during bus loss) and no Class-1/2/3 frames
+        // are pending. Whenever output runs, `emit_pos_force_j7_impl` emits `0xCC` strictly AFTER
+        // all Class-1, Class-2, and Class-3 arm and J7 frames if spare TX budget remains.
         let mut rx_pf_refresh_sent = false;
         let enabled_pf_joint = if self.is_enabled { self.active_pos_force_joint() } else { None };
         if let Some(pf_j) = enabled_pf_joint {
@@ -10043,19 +10221,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if self.pos_force_feedback_valid(pf_j, self.now()) {
                     self.pf_refresh_pending = false;
                     self.pf_refresh_deferred_ticks = 0;
-                } else {
-                    if self.pf_refresh_pending
-                        && self.pending_hold_tx.len() == 0
-                        && !self.last_output_was_hold
-                        && self.tx_budget.max_frames > self.motor_ids.len()
-                        && (self.pf_refresh_deferred_ticks >= 1 || !self.output_ran_since_rx)
-                    {
-                        if let Ok(true) = self.try_send_pf_refresh(rx_stop_stamp) {
-                            rx_pf_refresh_sent = true;
-                        }
-                    } else {
-                        self.pf_refresh_pending = true;
+                } else if self.pf_refresh_pending
+                    && !self.output_ran_since_rx
+                    && self.pending_hold_tx.len() == 0
+                    && self.pending_tx.len() == 0
+                    && self.tx_budget.max_frames > self.motor_ids.len()
+                {
+                    if let Ok(true) = self.try_send_pf_refresh(rx_stop_stamp) {
+                        rx_pf_refresh_sent = true;
                     }
+                } else {
+                    self.pf_refresh_pending = true;
                 }
             }
         }
@@ -10197,6 +10373,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             && !self.is_enabling
             && self.poll_tx_allowed()
             && self.pending_stop_check(Some(rx_stop_stamp)).is_ok()
+            && !(self.is_enabled
+                && self.output_ran_since_rx
+                && (self.pending_hold_tx.len() > 0
+                    || self.pending_tx.len() > 0
+                    || self.has_class1_transition_pending()))
         {
             let cooldown_ready = self.last_refresh_instant.is_none_or(|t| self.since(t) >= REFRESH_AFTER);
             if cooldown_ready || self.refresh_unfinished != 0 {

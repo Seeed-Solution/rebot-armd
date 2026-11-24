@@ -969,6 +969,12 @@ impl crate::supervisor::SupervisorInner {
                         });
                     }
                 }
+                let j7_hold_hint = is_hold
+                    || computed_j7_intent.is_some_and(|intent| {
+                        !matches!(intent.kind, crate::driver::PosForceIntentKind::Target { .. })
+                            || intent.stamp != non_target_stamp
+                    });
+                drv.set_pending_pos_force_hold_hint(j7_hold_hint);
                 let write_res = if is_hold {
                     drv.write_estop_hold_bounded(targets)
                 } else {
