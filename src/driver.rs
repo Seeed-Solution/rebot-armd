@@ -518,6 +518,92 @@ pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
 /// Time bound of one Damiao receive pass (with at most 64 frames).
 pub const DAMIAO_RX_PASS: Duration = Duration::from_millis(5);
 
+/// Driver-owned causal evidence of one motor's physical torque state.
+///
+/// Starts [`Self::Unknown`], is invalidated to [`Self::Unknown`] before any torque-changing
+/// write that could reach the device (deferred/refused writes that never reached the transport
+/// leave evidence intact), and transitions to [`Self::OffConfirmed`] or [`Self::OnConfirmed`]
+/// only on causal device evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotorTorqueEvidence {
+    OffConfirmed,
+    OnConfirmed,
+    Unknown,
+}
+
+impl MotorTorqueEvidence {
+    #[inline]
+    pub const fn short_tag(self) -> &'static str {
+        match self {
+            Self::OffConfirmed => "off",
+            Self::OnConfirmed => "on",
+            Self::Unknown => "unk",
+        }
+    }
+}
+
+/// Per-joint hold status reported by measured-position hold servicing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JointHoldStatus {
+    /// Motor is confirmed off (`OffConfirmed`): hold frame intentionally skipped.
+    SkippedOff,
+    /// Motor has fresh measured feedback and a verified hold mode; hold target serviced.
+    Held,
+    /// Motor could not be held: feedback missing, stale (> 100 ms), or unbounded.
+    UnheldNoFreshFeedback,
+    /// Motor could not be held: control mode is unverified/unavailable.
+    UnheldNoVerifiedMode,
+}
+
+impl JointHoldStatus {
+    #[inline]
+    pub const fn short_tag(self) -> &'static str {
+        match self {
+            Self::SkippedOff => "skip",
+            Self::Held => "held",
+            Self::UnheldNoFreshFeedback => "unheld(no_fresh_fb)",
+            Self::UnheldNoVerifiedMode => "unheld(no_mode)",
+        }
+    }
+}
+
+/// Zero-allocation summary of one masked measured-position hold pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoldPassReport {
+    pub outcome: TxBatchOutcome,
+    pub dof: usize,
+    pub sent_any: bool,
+    pub joint_status: [JointHoldStatus; crate::rt_core::mailbox::MAX_DOF],
+}
+
+impl HoldPassReport {
+    pub fn empty(dof: usize) -> Self {
+        Self {
+            outcome: TxBatchOutcome::Complete,
+            dof: dof.min(crate::rt_core::mailbox::MAX_DOF),
+            sent_any: false,
+            joint_status: [JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
+        }
+    }
+}
+
+/// Aggregate [`EnableState`] derived strictly from per-motor torque evidence:
+/// `Disabled` holds ONLY when every motor is [`MotorTorqueEvidence::OffConfirmed`];
+/// `Enabled` holds ONLY when every motor is [`MotorTorqueEvidence::OnConfirmed`].
+#[inline]
+pub fn aggregate_enable_state(evidence: &[MotorTorqueEvidence]) -> EnableState {
+    if evidence.is_empty() {
+        return EnableState::Unknown;
+    }
+    if evidence.iter().all(|e| *e == MotorTorqueEvidence::OffConfirmed) {
+        EnableState::Disabled
+    } else if evidence.iter().all(|e| *e == MotorTorqueEvidence::OnConfirmed) {
+        EnableState::Enabled
+    } else {
+        EnableState::Unknown
+    }
+}
+
 /// Per-joint numeric validity check for the driver's advertised feedback capabilities.
 #[inline]
 pub(crate) fn joint_state_valid(s: &JointState, caps: DriverCapabilities) -> bool {
@@ -532,16 +618,41 @@ pub trait ArmDriver: Send {
 
     fn enable_state(&self) -> EnableState { EnableState::Unknown }
 
-    /// Single authoritative torque-off reconciliation helper consulted by BOTH
-    /// [`Self::enable_state`] and `SupervisorInner::sync_torque_state_after_stop`: returns
-    /// `true` ONLY when this driver reports enable feedback and fresh feedback from EVERY motor
-    /// proves torque is off strictly after that motor's last enable write (including deferred
-    /// and retried writes). Fails closed (`false`) otherwise so the arm keeps holding.
-    fn all_motors_confirmed_off_after_enable_writes(&self) -> bool {
-        self.capabilities().enable_feedback
-            && self.is_feedback_valid()
-            && self.enable_state() == EnableState::Disabled
+    /// Copy each motor's driver-owned [`MotorTorqueEvidence`] into `out[..n]` without
+    /// allocating and return `n` (clamped to `out.len()`).
+    fn motor_torque_evidence_into(&self, out: &mut [MotorTorqueEvidence]) -> usize {
+        let ev = if !self.capabilities().enable_feedback {
+            MotorTorqueEvidence::Unknown
+        } else {
+            match self.enable_state() {
+                EnableState::Disabled => MotorTorqueEvidence::OffConfirmed,
+                EnableState::Enabled => MotorTorqueEvidence::OnConfirmed,
+                EnableState::Unknown => MotorTorqueEvidence::Unknown,
+            }
+        };
+        out.fill(ev);
+        out.len()
     }
+
+    /// True when this driver implements [`Self::fresh_measured_position_for`] directly from
+    /// its own transport-provenance feedback cache (true for all real hardware and sim drivers).
+    fn has_driver_fresh_position_api(&self) -> bool { false }
+
+    /// Fresh, finite measured position for a single `joint` no older than `max_age`, with
+    /// transport provenance (receive-queue bound when tracked). Zero heap allocations.
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = [0.0f32; 1];
+        self.fresh_joint_positions_into(&[joint], max_age, &mut pos)
+            .then_some(pos[0])
+    }
+
+    /// True when `joint` has a verified hold mode capable of receiving stationary hold frames
+    /// without enable or mode-switch side effects.
+    fn joint_hold_mode_verified(&self, _joint: usize) -> bool { true }
+
+    /// Drop any queued stopped-hold frames for joints whose bit is NOT set in `hold_mask`
+    /// without disturbing queued holds for other joints.
+    fn drop_pending_holds_outside_mask(&mut self, _hold_mask: u64) {}
 
     /// Age of the last received sample for each joint. Reading a cache does not refresh it.
     fn feedback_ages(&self) -> Vec<Option<Duration>> { Vec::new() }
@@ -692,6 +803,46 @@ pub trait ArmDriver: Send {
         self.write_estop_hold(targets).map(|()| TxBatchOutcome::Complete)
     }
 
+    /// Masked measured-position hold pass: services ONLY joints with bit set in `hold_mask`
+    /// that are not `OffConfirmed`, have fresh (`<= 100 ms`) finite feedback with transport
+    /// provenance, and have a verified hold mode. Joints outside `hold_mask` or unavailable
+    /// get no hold frame and never veto other joints.
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<HoldPassReport, ArmDriverError> {
+        let dof = targets.len().min(crate::rt_core::mailbox::MAX_DOF);
+        let mut report = HoldPassReport::empty(dof);
+        let mut ev = [MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF];
+        self.motor_torque_evidence_into(&mut ev[..dof]);
+        let mut eff_mask = 0u64;
+        for i in 0..dof {
+            if ev[i] == MotorTorqueEvidence::OffConfirmed {
+                report.joint_status[i] = JointHoldStatus::SkippedOff;
+            } else if (hold_mask & (1u64 << i)) == 0 {
+                report.joint_status[i] = if !self.joint_hold_mode_verified(i) {
+                    JointHoldStatus::UnheldNoVerifiedMode
+                } else {
+                    JointHoldStatus::UnheldNoFreshFeedback
+                };
+            } else if !self.joint_hold_mode_verified(i) {
+                report.joint_status[i] = JointHoldStatus::UnheldNoVerifiedMode;
+            } else {
+                eff_mask |= 1u64 << i;
+                report.joint_status[i] = JointHoldStatus::Held;
+            }
+        }
+        self.drop_pending_holds_outside_mask(eff_mask);
+        if eff_mask == 0 {
+            return Ok(report);
+        }
+        let outcome = self.write_estop_hold_bounded(targets)?;
+        report.outcome = outcome;
+        report.sent_any = self.last_hold_tx_sent_any();
+        Ok(report)
+    }
+
     /// True if the most recent bounded stopped-hold pass submitted at least one frame to the bus.
     fn last_hold_tx_sent_any(&self) -> bool { true }
 
@@ -774,7 +925,14 @@ pub trait ArmDriver: Send {
     /// returns `Done`; nothing else may be sent to the arm meanwhile except a disable, which
     /// replaces a pending enable. Default: the blocking [`ArmDriver::set_torque`], `Done` on success.
     fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
-        self.set_torque(enabled).map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+        self.set_torque(enabled).map(|()| {
+            let outcome = if self.capabilities().enable_feedback {
+                TorqueOutcome::Confirmed
+            } else {
+                TorqueOutcome::Unconfirmed
+            };
+            TorqueProgress::Done(outcome)
+        })
     }
 
     /// Non-blocking hardware torque disable with an explicit [`DisableKind`].
@@ -1122,7 +1280,8 @@ pub struct FeetechArmDriver<T: Transport> {
     pub motor_status: Vec<u8>,
     last_feedback_instant: Vec<Option<Instant>>,
     feedback_seq: Vec<u64>,
-    confirmed_enable_state: EnableState,
+    /// Driver-owned per-motor causal torque evidence (`OffConfirmed` / `OnConfirmed` / `Unknown`).
+    motor_evidence: Vec<MotorTorqueEvidence>,
     tx_echo: Option<bool>,
     tx_echo_auto: bool,
     poll_cursor: usize,
@@ -1131,8 +1290,6 @@ pub struct FeetechArmDriver<T: Transport> {
     cached_raw_steps: Vec<i32>,
     read_poll_count: u64,
     missed_poll_replies: u64,
-    partial_enable_known: bool,
-    joint_torque_enabled: Vec<Option<bool>>,
     abort_flag: Option<Arc<AtomicBool>>,
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     stopped_disable_gate: Option<StoppedDisableGate>,
@@ -1173,7 +1330,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             motor_status: vec![0; dof],
             last_feedback_instant: vec![None; dof],
             feedback_seq: vec![0; dof],
-            confirmed_enable_state: EnableState::Unknown,
+            motor_evidence: vec![MotorTorqueEvidence::Unknown; dof],
             tx_echo: None,
             tx_echo_auto: false,
             poll_cursor: 0,
@@ -1182,8 +1339,6 @@ impl<T: Transport> FeetechArmDriver<T> {
             cached_raw_steps: vec![0; dof],
             read_poll_count: 0,
             missed_poll_replies: 0,
-            partial_enable_known: false,
-            joint_torque_enabled: vec![None; dof],
             abort_flag: None,
             estop_gate: None,
             stopped_disable_gate: None,
@@ -1263,10 +1418,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             self.last_enable_confirmed = vec![None; dof];
             self.missed_enable_polls = vec![0; dof];
             if self.servo_ids != old_ids {
-                self.joint_torque_enabled = vec![None; dof];
+                self.motor_evidence = vec![MotorTorqueEvidence::Unknown; dof];
                 self.poll_cursor = 0;
-                self.confirmed_enable_state = EnableState::Unknown;
-                self.partial_enable_known = false;
                 self.hw_angle_limits = vec![None; dof];
                 self.invalidate_partial_pos_rx();
             } else if self.hw_angle_limits.len() != dof {
@@ -1330,12 +1483,17 @@ impl<T: Transport> FeetechArmDriver<T> {
 
     #[doc(hidden)]
     pub fn confirmed_enable_state(&self) -> EnableState {
-        self.confirmed_enable_state
+        aggregate_enable_state(&self.motor_evidence)
     }
 
     #[doc(hidden)]
     pub fn set_confirmed_enable_state(&mut self, state: EnableState) {
-        self.confirmed_enable_state = state;
+        let ev = match state {
+            EnableState::Disabled => MotorTorqueEvidence::OffConfirmed,
+            EnableState::Enabled => MotorTorqueEvidence::OnConfirmed,
+            EnableState::Unknown => MotorTorqueEvidence::Unknown,
+        };
+        self.motor_evidence.fill(ev);
     }
 
     #[doc(hidden)]
@@ -1445,6 +1603,11 @@ impl<T: Transport> FeetechArmDriver<T> {
                 self.check_stopped_disable_requested(started_at, rollback)?;
             }
             DisableKind::DisableProtective { .. } => {}
+        }
+        // Invalidate per-motor torque evidence immediately BEFORE the torque-changing write
+        // reaches the transport; a gate refusal above leaves evidence intact.
+        if let Some(idx) = self.servo_ids.iter().position(|&id| id == servo_id) {
+            self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
         }
         let pkt = feetech::build_set_torque(servo_id, false);
         self.transport.write_all(&pkt)?;
@@ -1606,7 +1769,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     /// Reads REG_TORQUE_ENABLE from each servo in `ids` (indexed like `servo_ids`), records
-    /// the per-joint state, and returns (disabled count, enabled count, read errors).
+    /// the per-motor causal torque evidence, and returns (disabled count, enabled count, read errors).
     fn read_torque_enable_states(&mut self, ids: &[u8]) -> (usize, usize, Vec<String>) {
         let mut count_0 = 0;
         let mut count_1 = 0;
@@ -1614,17 +1777,22 @@ impl<T: Transport> FeetechArmDriver<T> {
         for (idx, &id) in ids.iter().enumerate() {
             match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
                 Ok(v @ (0 | 1)) => {
-                    if v == 0 { count_0 += 1; } else { count_1 += 1; }
-                    self.joint_torque_enabled[idx] = Some(v == 1);
+                    if v == 0 {
+                        count_0 += 1;
+                        self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
+                    } else {
+                        count_1 += 1;
+                        self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
+                    }
                     self.last_enable_confirmed[idx] = Some(self.clock_now());
                     self.missed_enable_polls[idx] = 0;
                 }
                 Ok(v) => {
-                    self.joint_torque_enabled[idx] = None;
+                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                     read_errors.push(format!("servo {} returned unexpected value {}", id, v));
                 }
                 Err(e) => {
-                    self.joint_torque_enabled[idx] = None;
+                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                     read_errors.push(format!("servo {} read failed: {}", id, e));
                 }
             }
@@ -1768,24 +1936,24 @@ impl<T: Transport> FeetechArmDriver<T> {
             let torque_en = self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE)?;
             match torque_en {
                 0 => {
-                    if joint_idx < self.joint_torque_enabled.len() {
-                        self.joint_torque_enabled[joint_idx] = Some(false);
+                    if joint_idx < self.motor_evidence.len() {
+                        self.motor_evidence[joint_idx] = MotorTorqueEvidence::OffConfirmed;
                         self.last_enable_confirmed[joint_idx] = Some(self.clock_now());
                         self.missed_enable_polls[joint_idx] = 0;
                     }
                     all_enabled = false;
                 }
                 1 => {
-                    if joint_idx < self.joint_torque_enabled.len() {
-                        self.joint_torque_enabled[joint_idx] = Some(true);
+                    if joint_idx < self.motor_evidence.len() {
+                        self.motor_evidence[joint_idx] = MotorTorqueEvidence::OnConfirmed;
                         self.last_enable_confirmed[joint_idx] = Some(self.clock_now());
                         self.missed_enable_polls[joint_idx] = 0;
                     }
                     all_disabled = false;
                 }
                 _ => {
-                    if joint_idx < self.joint_torque_enabled.len() {
-                        self.joint_torque_enabled[joint_idx] = None;
+                    if joint_idx < self.motor_evidence.len() {
+                        self.motor_evidence[joint_idx] = MotorTorqueEvidence::Unknown;
                     }
                     all_enabled = false;
                     all_disabled = false;
@@ -1971,18 +2139,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             }
         }
 
-        if !self.servo_ids.is_empty() {
-            if all_disabled {
-                self.confirmed_enable_state = EnableState::Disabled;
-                self.partial_enable_known = false;
-            } else if all_enabled {
-                self.confirmed_enable_state = EnableState::Enabled;
-                self.partial_enable_known = false;
-            } else {
-                self.confirmed_enable_state = EnableState::Unknown;
-                self.partial_enable_known = true;
-            }
-        }
+        let _ = (all_disabled, all_enabled);
 
         Ok(())
     }
@@ -2101,7 +2258,21 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn enable_state(&self) -> EnableState {
-        self.confirmed_enable_state
+        aggregate_enable_state(&self.motor_evidence)
+    }
+
+    fn motor_torque_evidence_into(&self, out: &mut [MotorTorqueEvidence]) -> usize {
+        let n = self.motor_evidence.len().min(out.len());
+        out[..n].copy_from_slice(&self.motor_evidence[..n]);
+        n
+    }
+
+    fn has_driver_fresh_position_api(&self) -> bool { true }
+
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = [0.0f32; 1];
+        self.fresh_joint_positions_into(&[joint], max_age, &mut pos)
+            .then_some(pos[0])
     }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
@@ -2168,7 +2339,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn is_enabled(&self) -> bool {
-        self.confirmed_enable_state == EnableState::Enabled && self.is_feedback_valid()
+        self.enable_state() == EnableState::Enabled && self.is_feedback_valid()
     }
 
     fn read_joint_states_budgeted(
@@ -2242,13 +2413,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn has_known_partial_enable(&self) -> bool {
-        self.partial_enable_known
+        !self.motor_evidence.is_empty()
+            && !self.motor_evidence.contains(&MotorTorqueEvidence::Unknown)
+            && self.motor_evidence.contains(&MotorTorqueEvidence::OnConfirmed)
+            && self.motor_evidence.contains(&MotorTorqueEvidence::OffConfirmed)
     }
 
     fn has_any_joint_enabled(&self) -> bool {
-        self.confirmed_enable_state == EnableState::Enabled
-            || self.partial_enable_known
-            || self.joint_torque_enabled.contains(&Some(true))
+        self.motor_evidence.contains(&MotorTorqueEvidence::OnConfirmed)
     }
 
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
@@ -2267,27 +2439,11 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     fn refresh_enable_state(&mut self) -> Result<EnableState, ArmDriverError> {
         self.assert_clock_matches_transport();
         if self.servo_ids.is_empty() {
-            return Ok(self.confirmed_enable_state);
+            return Ok(self.enable_state());
         }
         let ids = self.servo_ids.clone();
-        let (count_0, count_1, read_errors) = self.read_torque_enable_states(&ids);
-        let read_all_valid = read_errors.is_empty();
-
-        if read_all_valid && count_0 == ids.len() {
-            self.confirmed_enable_state = EnableState::Disabled;
-            self.partial_enable_known = false;
-        } else if read_all_valid && count_1 == ids.len() {
-            self.confirmed_enable_state = EnableState::Enabled;
-            self.partial_enable_known = false;
-        } else if read_all_valid && count_0 > 0 && count_1 > 0 && count_0 + count_1 == ids.len() {
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = true;
-        } else {
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = false;
-        }
-
-        Ok(self.confirmed_enable_state)
+        let _ = self.read_torque_enable_states(&ids);
+        Ok(self.enable_state())
     }
 
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
@@ -2324,35 +2480,17 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         }
 
         if let Some(e) = write_err {
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = false;
             return Err(e);
         }
 
         let ids = self.servo_ids.clone();
-        let (count_0, count_1, read_errors) = self.read_torque_enable_states(&ids);
+        let (_, _, read_errors) = self.read_torque_enable_states(&ids);
 
         if !read_errors.is_empty() {
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = false;
             return Err(ArmDriverError::HardwareFault(format!(
                 "clear_fault readback error: {}",
                 read_errors.join("; ")
             )));
-        }
-
-        if count_0 == self.servo_ids.len() {
-            self.confirmed_enable_state = EnableState::Disabled;
-            self.partial_enable_known = false;
-        } else if count_1 == self.servo_ids.len() {
-            self.confirmed_enable_state = EnableState::Enabled;
-            self.partial_enable_known = false;
-        } else if count_0 + count_1 == self.servo_ids.len() {
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = true;
-        } else {
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = false;
         }
 
         Ok(())
@@ -2364,7 +2502,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let ids = self.servo_ids.clone();
         if enabled {
             self.check_hardware_status()?;
-            let prev_joint_enabled = self.joint_torque_enabled.clone();
+            let prev_evidence = self.motor_evidence.clone();
             if self.is_aborted() {
                 return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
             }
@@ -2396,10 +2534,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 })?;
             }
 
-            // Write targets only for joints that are not already holding (Some(true))
+            // Write measured goal positions only for joints that are not already OnConfirmed.
             let mut positions_to_write = Vec::new();
             for (i, s) in self.cached_states.iter().enumerate() {
-                if prev_joint_enabled.get(i).copied().flatten() == Some(true) {
+                if prev_evidence.get(i).copied() == Some(MotorTorqueEvidence::OnConfirmed) {
                     continue;
                 }
                 let calib = self.config.joints.get(i).unwrap_or(&default_calib);
@@ -2417,12 +2555,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
 
             let mut write_err = None;
-            let mut written_indices = Vec::new();
             for (idx, &id) in ids.iter().enumerate() {
                 if self.is_aborted() {
                     write_err = Some(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
                     break;
                 }
+                // Invalidate this motor's torque evidence BEFORE the write reaches the transport.
+                // Any servo whose write is skipped by abort above keeps its prior evidence intact.
+                self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                 let pkt = feetech::build_set_torque(id, true);
                 if let Err(e) = self.transport.write_all(&pkt) {
                     write_err = Some(e.into());
@@ -2436,19 +2576,9 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                     write_err = Some(e);
                     break;
                 }
-                written_indices.push(idx);
             }
 
             if self.is_aborted() {
-                if !written_indices.is_empty() {
-                    for &idx in &written_indices {
-                        self.joint_torque_enabled[idx] = None;
-                    }
-                    self.partial_enable_known = true;
-                } else {
-                    self.partial_enable_known = false;
-                }
-                self.confirmed_enable_state = EnableState::Unknown;
                 return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
             }
 
@@ -2458,104 +2588,41 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
             for (idx, &id) in ids.iter().enumerate() {
                 if self.is_aborted() {
-                    for &w_idx in &written_indices {
-                        if w_idx >= idx {
-                            self.joint_torque_enabled[w_idx] = None;
-                        }
-                    }
-                    self.partial_enable_known = true;
-                    self.confirmed_enable_state = EnableState::Unknown;
                     return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
                 }
                 match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
                     Ok(1) => {
                         one_count += 1;
-                        self.joint_torque_enabled[idx] = Some(true);
+                        self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
                         self.last_enable_confirmed[idx] = Some(self.clock_now());
                         self.missed_enable_polls[idx] = 0;
                     }
                     Ok(0) => {
                         all_enabled = false;
-                        self.joint_torque_enabled[idx] = Some(false);
+                        self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
                         self.last_enable_confirmed[idx] = Some(self.clock_now());
                         self.missed_enable_polls[idx] = 0;
                         read_errors.push(format!("servo {} returned 0", id));
                     }
                     Ok(v) => {
                         all_enabled = false;
-                        self.joint_torque_enabled[idx] = None;
+                        self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                         read_errors.push(format!("servo {} returned unexpected value {}", id, v));
                     }
                     Err(e) => {
                         all_enabled = false;
-                        self.joint_torque_enabled[idx] = None;
+                        self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                         read_errors.push(format!("servo {} read failed: {}", id, e));
                     }
                 }
             }
 
             if all_enabled && one_count == ids.len() {
-                self.confirmed_enable_state = EnableState::Enabled;
-                self.partial_enable_known = false;
                 self.last_enable_poll = Some(self.clock_now());
                 Ok(())
             } else {
-                let mut rb_write_err = false;
-                let mut rb_refused = false;
-                let rb_started_at = self.clock_now();
-                for (i, &id) in ids.iter().enumerate() {
-                    let prev_state = prev_joint_enabled.get(i).copied().flatten();
-                    if prev_state == Some(true) {
-                        continue;
-                    }
-                    // Every enable rollback routes unconditionally through `DisableRequested { rollback: true }`
-                    // at the transmit choke point (allowed only at the rest pose from fresh feedback).
-                    let rb_kind = DisableKind::DisableRequested {
-                        started_at: rb_started_at,
-                        rollback: true,
-                    };
-                    match self.write_torque_off(id, rb_kind) {
-                        Ok(()) => {}
-                        Err(ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired) => {
-                            rb_refused = true;
-                            // Zero frames sent to this servo: preserve its just-readback state.
-                            continue;
-                        }
-                        Err(_) => {
-                            rb_write_err = true;
-                            self.joint_torque_enabled[i] = None;
-                            continue;
-                        }
-                    }
-
-                    match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
-                        Ok(0) => {
-                            self.joint_torque_enabled[i] = Some(false);
-                            self.last_enable_confirmed[i] = Some(self.clock_now());
-                            self.missed_enable_polls[i] = 0;
-                        }
-                        _ => {
-                            self.joint_torque_enabled[i] = None;
-                            rb_write_err = true;
-                        }
-                    }
-                }
-
-                if !rb_write_err && !rb_refused && write_err.is_none() && self.joint_torque_enabled.iter().all(|s| *s == Some(false)) {
-                    self.confirmed_enable_state = EnableState::Disabled;
-                    self.partial_enable_known = false;
-                } else if !rb_write_err && write_err.is_none()
-                    && self.joint_torque_enabled.iter().all(|s| s.is_some())
-                    && self.joint_torque_enabled.contains(&Some(true))
-                    && self.joint_torque_enabled.contains(&Some(false))
-                {
-                    self.confirmed_enable_state = EnableState::Unknown;
-                    self.partial_enable_known = true;
-                } else {
-                    self.confirmed_enable_state = EnableState::Unknown;
-                    self.partial_enable_known = false;
-                }
-
+                // No local rollback on Feetech enable failure: keep the per-motor readback
+                // evidence intact and return the failure so the supervisor enters FailedHold.
                 let err_msg = if let Some(e) = write_err {
                     format!("Torque enable write failed: {e}")
                 } else {
@@ -2595,15 +2662,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
         }
 
-        let (count_0, _, _) = self.read_torque_enable_states(&ids);
-
-        if count_0 == ids.len() {
-            self.confirmed_enable_state = EnableState::Disabled;
-            self.partial_enable_known = false;
-        } else {
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = false;
-        }
+        let _ = self.read_torque_enable_states(&ids);
 
         if let Some(e) = refused_err.or(write_err) {
             Err(e)
@@ -2613,8 +2672,13 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
-        self.disable_torque(kind)
-            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+        self.disable_torque(kind)?;
+        let outcome = if self.enable_state() == EnableState::Disabled {
+            TorqueOutcome::Confirmed
+        } else {
+            TorqueOutcome::Unconfirmed
+        };
+        Ok(TorqueProgress::Done(outcome))
     }
 
     fn begin_disable_torque_budgeted(
@@ -2731,7 +2795,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
         self.read_poll_count += 1;
         let did_enable_poll = self.incomplete_chunk_idx.is_none()
-            && (self.confirmed_enable_state == EnableState::Enabled || self.partial_enable_known)
+            && self.motor_evidence.contains(&MotorTorqueEvidence::OnConfirmed)
             && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| self.elapsed_since(t) >= Duration::from_millis(200)));
         if did_enable_poll {
             self.last_enable_poll = Some(self.clock_now());
@@ -2775,50 +2839,30 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
 
                 let now = self.clock_now();
-                let prev_holding_lost = self.partial_enable_known && self.servo_ids.iter().enumerate().any(|(idx, id)| {
-                    self.joint_torque_enabled.get(idx).copied().flatten() == Some(true)
-                        && replies.get(id).copied() == Some(0)
-                });
-
                 for (idx, &id) in self.servo_ids.iter().enumerate() {
                     match replies.get(&id) {
                         Some(&0) => {
-                            self.joint_torque_enabled[idx] = Some(false);
+                            self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
                             self.last_enable_confirmed[idx] = Some(now);
                             self.missed_enable_polls[idx] = 0;
                         }
                         Some(&1) => {
-                            self.joint_torque_enabled[idx] = Some(true);
+                            self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
                             self.last_enable_confirmed[idx] = Some(now);
                             self.missed_enable_polls[idx] = 0;
                         }
                         Some(&_v) => {
-                            self.joint_torque_enabled[idx] = None;
-                            self.confirmed_enable_state = EnableState::Unknown;
-                            self.partial_enable_known = false;
+                            self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                         }
                         None => {
                             self.missed_enable_polls[idx] = self.missed_enable_polls[idx].saturating_add(1);
                             if self.missed_enable_polls[idx] >= 3
                                 || self.last_enable_confirmed[idx].is_none_or(|t| now.saturating_duration_since(t) > Duration::from_millis(600))
                             {
-                                self.joint_torque_enabled[idx] = None;
-                                self.confirmed_enable_state = EnableState::Unknown;
-                                self.partial_enable_known = false;
+                                self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
                             }
                         }
                     }
-                }
-
-                if replies.len() == self.servo_ids.len() && replies.values().all(|&v| v == 0) {
-                    self.confirmed_enable_state = EnableState::Disabled;
-                    self.partial_enable_known = false;
-                } else if self.confirmed_enable_state == EnableState::Enabled && replies.values().any(|&v| v == 0) {
-                    self.confirmed_enable_state = EnableState::Unknown;
-                    self.partial_enable_known = false;
-                } else if prev_holding_lost {
-                    self.partial_enable_known = false;
-                    self.confirmed_enable_state = EnableState::Unknown;
                 }
             }
         }
@@ -3044,6 +3088,22 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
+    fn enable_state(&self) -> EnableState { EnableState::Unknown }
+
+    fn motor_torque_evidence_into(&self, out: &mut [MotorTorqueEvidence]) -> usize {
+        let n = self.servo_ids.len().min(out.len());
+        out[..n].fill(MotorTorqueEvidence::Unknown);
+        n
+    }
+
+    fn has_driver_fresh_position_api(&self) -> bool { true }
+
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = [0.0f32; 1];
+        self.fresh_joint_positions_into(&[joint], max_age, &mut pos)
+            .then_some(pos[0])
+    }
+
     fn clock_now(&self) -> Instant {
         self.now()
     }
@@ -3176,9 +3236,14 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         Ok(())
     }
 
+    fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
+        self.set_torque(enabled)
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Unconfirmed))
+    }
+
     fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
         self.disable_torque(kind)
-            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Unconfirmed))
     }
 
     fn begin_disable_torque_budgeted(
@@ -3464,10 +3529,19 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Sequence number of the last processed RX frame, and of each joint's last feedback.
     rx_seq: u64,
     last_feedback_seq: Vec<u64>,
-    /// Per-motor `rx_seq` snapshot taken immediately after the most recent enable-direction write
-    /// (`CMD_ENABLE`) to that motor returns from `can.transmit`. Post-enable-write off reconciliation
-    /// counts feedback only when `last_feedback_seq[joint] > last_enable_write_seq[joint]`.
-    last_enable_write_seq: Vec<Option<u64>>,
+    /// Driver-owned per-motor causal torque evidence (`OffConfirmed` / `OnConfirmed` / `Unknown`).
+    motor_evidence: Vec<MotorTorqueEvidence>,
+    /// True once a `CMD_ENABLE` frame reached `can.transmit` for motor `i`, cleared ONLY by
+    /// a verified disable transaction. Prevents unsolicited `0x0` from ever resolving an
+    /// attempted enable.
+    motor_enable_attempted: Vec<bool>,
+    /// Causal RX boundary `(cmd_start, boundary_rx_seq)` of the active/latest verified disable
+    /// transaction that actually transmitted `CMD_DISABLE` to motor `i`.
+    motor_disable_boundary: Vec<Option<(Instant, u64)>>,
+    /// True when motor `i` reached `OffConfirmed` via a verified disable transaction (sticky
+    /// across poll gaps such as an unacknowledged MIT fence trip until the next torque write
+    /// or non-zero feedback).
+    motor_disable_confirmed: Vec<bool>,
     /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
     mit_fence: Option<Duration>,
     /// Per joint: when its last confirmed command started out (the earliest frame of it, never
@@ -3988,7 +4062,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             clock,
             rx_seq: 0,
             last_feedback_seq: vec![0; dof],
-            last_enable_write_seq: vec![None; dof],
+            motor_evidence: vec![MotorTorqueEvidence::Unknown; dof],
+            motor_enable_attempted: vec![false; dof],
+            motor_disable_boundary: vec![None; dof],
+            motor_disable_confirmed: vec![false; dof],
             rx_empty_seq: 0,
             last_read_drained: false,
             mit_fence: None,
@@ -4496,22 +4573,33 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::StopStampChanged);
         }
 
-        // 6. Account budget attempt, transmit, and record diagnostics.
+        // 6. Account budget attempt, invalidate per-motor torque evidence BEFORE any
+        //    torque-changing write reaches the transport, transmit, and record diagnostics.
+        //    (Writes deferred or refused in steps 1-5 never reach `can.transmit` and leave
+        //    per-motor evidence intact.)
         if budgeted {
             self.record_tx_pass_attempt();
+        }
+        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
+            if frame.data == damiao::CMD_ENABLE {
+                if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
+                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                    self.motor_enable_attempted[idx] = true;
+                    self.motor_disable_boundary[idx] = None;
+                    self.motor_disable_confirmed[idx] = false;
+                    self.disable_confirmed_sticky = false;
+                }
+            } else if frame.data == damiao::CMD_DISABLE {
+                if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
+                    self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                    self.motor_disable_confirmed[idx] = false;
+                    self.disable_confirmed_sticky = false;
+                }
+            }
         }
         let t0 = self.now();
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
-        if !frame.is_extended
-            && !frame.is_rtr
-            && frame.dlc == 8
-            && frame.data == damiao::CMD_ENABLE
-        {
-            if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
-                self.last_enable_write_seq[idx] = Some(self.rx_seq);
-            }
-        }
         let wall_ns = self.now().saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
         let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
         let attempt_kind = match &res {
@@ -6472,6 +6560,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     && self.fresh_measured_position(pf.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_some()
             })
             && self.is_feedback_valid()
+            && self.enable_state() == EnableState::Enabled
             && self.motor_status.iter().all(|&st| st == 1)
         {
             return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
@@ -6499,7 +6588,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_stop_stamp = Some(self.current_stop_stamp());
         self.is_enabling = true;
         self.last_command_was_disable = false;
-        self.disable_confirmed_sticky = false;
 
         let budget_armed = match max_rx_frames {
             Some(limit) if limit > 0 => {
@@ -7301,7 +7389,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.last_enable_command_rx_seq = Some(self.rx_seq);
         self.last_command_was_disable = false;
         self.disable_confirmed_sticky = false;
-        self.last_feedback_instant.fill(None);
 
         let n = self.motor_ids.len().min(handshake::MAX_MASK_JOINTS);
         let all_mask = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
@@ -7314,37 +7401,66 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake: poll_start })
     }
 
-    /// True when joint `i`'s latest decoded feedback arrived strictly after the RX sequence
-    /// snapshot recorded right after that motor's most recent `CMD_ENABLE` `can.transmit()`
-    /// returned (including deferred and retried enable writes).
-    #[inline]
-    fn motor_feedback_after_enable_write(&self, i: usize) -> bool {
-        self.last_enable_write_seq
-            .get(i)
-            .copied()
-            .flatten()
-            .is_none_or(|seq| self.last_feedback_seq.get(i).copied().unwrap_or(0) > seq)
+    /// Effective per-motor causal torque evidence for joint `i` (accounts for RX boundary
+    /// and feedback freshness on non-sticky states).
+    fn motor_evidence_at(&self, i: usize) -> MotorTorqueEvidence {
+        if self.awaiting_rx_boundary {
+            return MotorTorqueEvidence::Unknown;
+        }
+        let Some(&ev) = self.motor_evidence.get(i) else {
+            return MotorTorqueEvidence::Unknown;
+        };
+        const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
+        match ev {
+            MotorTorqueEvidence::OffConfirmed => {
+                if self.motor_disable_confirmed.get(i).copied().unwrap_or(false) {
+                    MotorTorqueEvidence::OffConfirmed
+                } else if self
+                    .last_feedback_instant
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| self.since(t) <= FRESHNESS_LIMIT)
+                {
+                    MotorTorqueEvidence::OffConfirmed
+                } else {
+                    MotorTorqueEvidence::Unknown
+                }
+            }
+            MotorTorqueEvidence::OnConfirmed => {
+                if self
+                    .last_feedback_instant
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| self.since(t) <= FRESHNESS_LIMIT)
+                {
+                    MotorTorqueEvidence::OnConfirmed
+                } else {
+                    MotorTorqueEvidence::Unknown
+                }
+            }
+            MotorTorqueEvidence::Unknown => MotorTorqueEvidence::Unknown,
+        }
     }
 
-    /// Single authoritative post-enable-write off-reconciliation helper consulted by BOTH
-    /// [`ArmDriver::enable_state`] and [`ArmDriver::all_motors_confirmed_off_after_enable_writes`]
-    /// (called by `SupervisorInner::sync_torque_state_after_stop`). Returns `true` ONLY when
-    /// EVERY motor reported `state == 0` in fresh feedback received strictly after both the
-    /// handshake boundary and that motor's own latest `CMD_ENABLE` write; fails closed otherwise.
-    fn all_motors_confirmed_off_after_enable_writes_inner(&self) -> bool {
-        if self.awaiting_rx_boundary || self.motor_status.is_empty() || !self.is_feedback_valid() {
+    /// True when joint `i` has a verified hold mode that accepts stationary hold frames without
+    /// enable or mode-switch side effects. A `POS_FORCE` gripper whose mode verification was
+    /// cleared returns `false` without affecting arm joints.
+    fn joint_hold_mode_verified_inner(&self, i: usize) -> bool {
+        if i >= self.motor_ids.len() {
             return false;
         }
-        (0..self.motor_ids.len()).all(|i| {
-            self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-                && self.motor_feedback_after_enable_write(i)
-                && self.motor_status[i] == 0
-        })
+        if self.pos_force.as_ref().is_some_and(|pf| pf.joint == i) {
+            let mode = self.joint_modes.get(i).copied().flatten();
+            return (mode == Some(DamiaoControlMode::PosForce) && self.pos_force_verified)
+                || mode == Some(DamiaoControlMode::Mit);
+        }
+        true
     }
 
-    /// Single per-motor post-command feedback boundary shared by [`Self::enable_state`],
-    /// [`Self::fresh_state_mask`] (`poll_enable`/`poll_disable`), MIT recovery, TIMEOUT
-    /// commissioning, and `set_zero_position`.
+    /// Single per-motor post-command feedback boundary shared by [`Self::fresh_state_mask`]
+    /// (`poll_enable`/`poll_disable`), MIT recovery, and `process_rx_frame`.
     fn motor_feedback_after(
         &self,
         i: usize,
@@ -7387,8 +7503,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             unsent_mask = self.send_enable_masked(unsent_mask, true, Some(deadline))?;
         }
         let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, self.last_enable_command_rx_seq, 1);
+        let confirmed_mask = mask & !unsent_mask;
+        for i in handshake::mask_joints(confirmed_mask) {
+            if i < self.motor_evidence.len() {
+                self.motor_evidence[i] = MotorTorqueEvidence::OnConfirmed;
+            }
+        }
         let fault = if all_fresh { self.motor_status.iter().position(|&st| damiao_fault_name(st).is_some()) } else { None };
-        match window.service(self.now(), mask, all_fresh, fault) {
+        match window.service(self.now(), confirmed_mask, all_fresh && unsent_mask == 0, fault) {
             Service::Confirmed => {
                 tracing::info!("All Damiao motors confirmed enabled (state=1) in {:?}", self.since(window.started));
                 self.is_enabling = false;
@@ -7484,13 +7606,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             match self.send(tx_kind, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
-                Ok(_) => sent_any = true,
+                Ok(_) => {
+                    sent_any = true;
+                    self.motor_disable_boundary[idx] = Some((cmd_start, after_seq));
+                }
                 Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
                     if refused_err.is_none() {
                         refused_err = Some(Self::refusal_to_driver_err(r));
                     }
                 }
                 Err(r) => {
+                    // Disable transmit failed: cannot establish a verified disable boundary.
+                    self.motor_disable_boundary[idx] = None;
                     other_err = Some(Self::refusal_to_driver_err(r));
                 }
             }
@@ -7564,6 +7691,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         match window.service(self.now(), mask, all_fresh, None) {
             Service::Confirmed => {
                 tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(window.started));
+                for i in 0..self.motor_evidence.len() {
+                    self.motor_evidence[i] = MotorTorqueEvidence::OffConfirmed;
+                    self.motor_disable_confirmed[i] = true;
+                    self.motor_enable_attempted[i] = false;
+                }
                 self.disable_confirmed_sticky = true;
                 if mit_fenced { self.mit_fence = None; }
                 Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
@@ -7581,7 +7713,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     match self.send(tx_kind, None, None, false, |_| {
                         Some(damiao::build_disable_frame(id))
                     }) {
-                        Ok(_) => sent_any = true,
+                        Ok(_) => {
+                            sent_any = true;
+                            if self.motor_disable_boundary[i].is_none() {
+                                self.motor_disable_boundary[i] = Some((window.fresh_after, after_seq));
+                            }
+                        }
                         Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
                             if refused.is_none() {
                                 refused = Some(r);
@@ -7703,80 +7840,67 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
-    fn all_motors_confirmed_off_after_enable_writes(&self) -> bool {
-        self.all_motors_confirmed_off_after_enable_writes_inner()
-    }
-
     fn enable_state(&self) -> EnableState {
-        if self.awaiting_rx_boundary || self.motor_status.is_empty() {
+        if self.motor_ids.is_empty() {
             return EnableState::Unknown;
         }
-        // A disable confirmed by post-command feedback is sticky for shutdown: `enable_state()`
-        // stays `Disabled` until a later enable request (or non-zero motor feedback) arrives,
-        // even when no newer polls can be sent (e.g. after an unacknowledged MIT fence trip).
-        // Still require every motor's feedback to be strictly after its last enable write.
-        if self.disable_confirmed_sticky
-            && !self.is_enabled
-            && !self.is_enabling
-            && (0..self.motor_ids.len()).all(|i| {
-                self.motor_feedback_after_enable_write(i) && self.motor_status[i] == 0
-            })
-        {
-            return EnableState::Disabled;
+        let mut all_off = true;
+        let mut all_on = true;
+        for i in 0..self.motor_ids.len() {
+            match self.motor_evidence_at(i) {
+                MotorTorqueEvidence::OffConfirmed => all_on = false,
+                MotorTorqueEvidence::OnConfirmed => all_off = false,
+                MotorTorqueEvidence::Unknown => {
+                    all_off = false;
+                    all_on = false;
+                }
+            }
         }
-        // Concluding `Disabled` goes through the ONE shared post-enable-write helper so neither
-        // `enable_state()` nor `sync_torque_state_after_stop()` can ever trust pre-write 0x0.
-        if self.all_motors_confirmed_off_after_enable_writes_inner() {
-            return EnableState::Disabled;
-        }
-        if !self.is_feedback_valid() {
-            return EnableState::Unknown;
-        }
-        if self.is_enabled
-            && (0..self.motor_ids.len()).all(|i| {
-                self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-                    && self.motor_feedback_after_enable_write(i)
-                    && self.motor_status[i] == 1
-            })
-        {
+        if all_off {
+            EnableState::Disabled
+        } else if all_on {
             EnableState::Enabled
         } else {
             EnableState::Unknown
         }
     }
 
+    fn motor_torque_evidence_into(&self, out: &mut [MotorTorqueEvidence]) -> usize {
+        let n = self.motor_ids.len().min(out.len());
+        for (i, slot) in out[..n].iter_mut().enumerate() {
+            *slot = self.motor_evidence_at(i);
+        }
+        n
+    }
+
+    fn has_driver_fresh_position_api(&self) -> bool { true }
+
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        self.fresh_measured_position(joint, max_age)
+    }
+
+    fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+        self.joint_hold_mode_verified_inner(joint)
+    }
+
     fn has_any_joint_enabled(&self) -> bool {
-        if self.enable_state() == EnableState::Enabled {
-            return true;
-        }
-        if self.awaiting_rx_boundary || self.motor_status.is_empty() {
-            return false;
-        }
-        const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
-        (0..self.motor_ids.len()).any(|i| {
-            self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-                && self
-                    .last_feedback_instant
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|t| self.since(t) <= FRESHNESS_LIMIT)
-                && self.motor_status.get(i).copied() == Some(1)
-        })
+        (0..self.motor_ids.len()).any(|i| self.motor_evidence_at(i) == MotorTorqueEvidence::OnConfirmed)
     }
 
     fn has_known_partial_enable(&self) -> bool {
-        if self.awaiting_rx_boundary || self.motor_status.is_empty() || !self.is_feedback_valid() {
+        if self.motor_ids.is_empty() {
             return false;
         }
-        let all_known_non_fault = (0..self.motor_ids.len()).all(|i| {
-            self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-                && self.motor_feedback_after_enable_write(i)
-                && (self.motor_status[i] == 0 || self.motor_status[i] == 1)
-        });
-        all_known_non_fault
-            && self.motor_status.contains(&1)
-            && self.enable_state() != EnableState::Enabled
+        let mut has_on = false;
+        let mut has_off = false;
+        for i in 0..self.motor_ids.len() {
+            match self.motor_evidence_at(i) {
+                MotorTorqueEvidence::OnConfirmed => has_on = true,
+                MotorTorqueEvidence::OffConfirmed => has_off = true,
+                MotorTorqueEvidence::Unknown => return false,
+            }
+        }
+        has_on && has_off
     }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
@@ -8009,6 +8133,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if res.is_err() || !unconfirmed.is_empty() {
             return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
         }
+        for i in 0..self.motor_evidence.len() {
+            self.motor_evidence[i] = MotorTorqueEvidence::OffConfirmed;
+            self.motor_disable_confirmed[i] = true;
+            self.motor_enable_attempted[i] = false;
+        }
         self.last_mit_recovery_rx_seq = Some(boundary);
         self.disable_confirmed_sticky = true;
         self.mit_fence = None;
@@ -8058,8 +8187,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(none_attempted(ArmDriverError::Protocol("the TIMEOUT commissioning needs torque off".into())));
         }
         for &i in joints {
-            // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
-            let fresh = self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+            let fresh = self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed
                 && self.last_feedback_instant[i].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE);
             if !fresh || self.motor_status[i] != 0 {
                 return Err(none_attempted(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{:X}) is not confirmed disabled (state {})",
@@ -8099,8 +8227,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.is_enabled || self.is_enabling {
             return Err(ArmDriverError::Protocol(format!("joint {} (CAN ID 0x{id:X}): set-zero needs torque off", joint + 1)));
         }
-        // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
-        let fresh = self.motor_feedback_after(joint, self.last_enable_command, self.last_enable_command_rx_seq)
+        // Confirmed OffConfirmed with fresh feedback (<= ZERO_FEEDBACK_MAX_AGE).
+        let fresh = self.motor_evidence_at(joint) == MotorTorqueEvidence::OffConfirmed
             && self.last_feedback_instant[joint].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE);
         if !fresh || self.motor_status[joint] != 0 {
             return Err(ArmDriverError::HardwareFault(format!(
@@ -8405,9 +8533,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // Send disable to every unconfirmed motor; a send error on one motor must NEVER stop
         // attempts on the remaining motors. Panic-disable keeps its own deadline loop and routes
         // every frame through `send(TxKind::DisableProtective { reason: ProcessExit }, ..)`.
+        let step_start = self.last_enable_command.unwrap_or_else(|| self.now());
+        let step_after_seq = self.last_enable_command_rx_seq.unwrap_or(self.rx_seq);
         for i in unconfirmed_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            if let Err(r) = self.send(
+            match self.send(
                 TxKind::DisableProtective {
                     reason: DisableProtectiveReason::ProcessExit,
                 },
@@ -8416,12 +8546,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 false,
                 |_| Some(damiao::build_disable_frame(id)),
             ) {
-                tracing::warn!(
-                    "Panic disable TX failed for Damiao joint J{} (CAN ID 0x{:X}): {:?}",
-                    i + 1,
-                    id,
-                    r
-                );
+                Ok(_) => {
+                    if self.motor_disable_boundary[i].is_none() {
+                        self.motor_disable_boundary[i] = Some((step_start, step_after_seq));
+                    }
+                }
+                Err(r) => {
+                    tracing::warn!(
+                        "Panic disable TX failed for Damiao joint J{} (CAN ID 0x{:X}): {:?}",
+                        i + 1,
+                        id,
+                        r
+                    );
+                }
             }
         }
         if let Err(e) = self.can.flush() {
@@ -8445,10 +8582,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn unconfirmed_disable_joints(&self) -> Vec<usize> {
         (0..self.motor_ids.len())
-            .filter(|&i| {
-                !(self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
-                    && self.motor_status[i] == 0)
-            })
+            .filter(|&i| self.motor_evidence_at(i) != MotorTorqueEvidence::OffConfirmed)
             .collect()
     }
 
@@ -9525,6 +9659,54 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 if feedback.state_or_error != 0 {
                     self.disable_confirmed_sticky = false;
+                    self.motor_disable_confirmed[idx] = false;
+                }
+                // Update per-motor causal torque evidence strictly per §1:
+                // - OffConfirmed ONLY on a verified disable transaction with an RX boundary
+                //   excluding pre-disable samples, OR fresh startup 0x0 before any enable write
+                //   was ever attempted on this motor. NEVER resolve an attempted enable with an
+                //   unsolicited 0x0 frame.
+                // - OnConfirmed ONLY on a verified enable transaction (with RX boundary excluding
+                //   pre-enable samples) or while an already-completed enable transaction remains
+                //   active with no intervening disable.
+                match feedback.state_or_error {
+                    0 => {
+                        if let Some((cmd_start, boundary_seq)) = self.motor_disable_boundary[idx] {
+                            if !self.awaiting_rx_boundary && rx_at >= cmd_start && seq > boundary_seq {
+                                self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
+                                self.motor_disable_confirmed[idx] = true;
+                                self.motor_enable_attempted[idx] = false;
+                            }
+                        } else if !self.motor_enable_attempted[idx]
+                            && self.last_enable_command.is_none()
+                            && !self.awaiting_rx_boundary
+                        {
+                            self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;
+                        } else {
+                            // Unsolicited 0x0 after an enable attempt (or power dip while enabled)
+                            // MUST invalidate OnConfirmed without claiming OffConfirmed.
+                            self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                        }
+                    }
+                    1 => {
+                        let in_completed_enable = self.is_enabled
+                            && !self.last_command_was_disable
+                            && !self.awaiting_rx_boundary
+                            && self.motor_disable_boundary[idx].is_none()
+                            && self.last_enable_command.is_none_or(|cmd| rx_at >= cmd)
+                            && self.last_enable_command_rx_seq.is_none_or(|b| seq > b);
+                        if in_completed_enable {
+                            self.motor_evidence[idx] = MotorTorqueEvidence::OnConfirmed;
+                        } else if self.motor_evidence[idx] == MotorTorqueEvidence::OffConfirmed {
+                            // Motor unexpectedly reports state 1 without a verified enable
+                            // transaction: invalidate OffConfirmed to Unknown (fail closed).
+                            self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                        }
+                    }
+                    _ => {
+                        // Motor reports a fault/error state: torque state is Unknown.
+                        self.motor_evidence[idx] = MotorTorqueEvidence::Unknown;
+                    }
                 }
                 if let Some(cap) = self.refresh_capture.as_mut() {
                     if cap.joint == idx && seq > cap.boundary && rx_at >= cap.tx_at {
@@ -9565,8 +9747,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.last_feedback_instant.fill(None);
             self.pose_feedback_instant.fill(None);
             self.pf_last_fresh_feedback = None;
-            self.last_enable_command = Some(self.now());
+            let boundary_now = self.now();
+            self.last_enable_command = Some(boundary_now);
             self.last_enable_command_rx_seq = Some(self.rx_seq);
+            for slot in &mut self.motor_disable_boundary {
+                if slot.is_some() {
+                    *slot = Some((boundary_now, self.rx_seq));
+                }
+            }
         }
     }
 
@@ -9606,7 +9794,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.last_command_was_disable
             && !self.is_enabled
             && !self.is_enabling
-            && self.all_motors_confirmed_off_after_enable_writes_inner()
+            && !self.motor_ids.is_empty()
+            && (0..self.motor_ids.len()).all(|i| self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed)
         {
             self.disable_confirmed_sticky = true;
         }
@@ -9980,6 +10169,22 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false, load_feedback: false } }
 
+    fn enable_state(&self) -> EnableState { EnableState::Unknown }
+
+    fn motor_torque_evidence_into(&self, out: &mut [MotorTorqueEvidence]) -> usize {
+        let n = self.motor_ids.len().min(out.len());
+        out[..n].fill(MotorTorqueEvidence::Unknown);
+        n
+    }
+
+    fn has_driver_fresh_position_api(&self) -> bool { true }
+
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = [0.0f32; 1];
+        self.fresh_joint_positions_into(&[joint], max_age, &mut pos)
+            .then_some(pos[0])
+    }
+
     fn clock_now(&self) -> Instant {
         self.now()
     }
@@ -10243,9 +10448,14 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         Ok(())
     }
 
+    fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
+        self.set_torque(enabled)
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Unconfirmed))
+    }
+
     fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
         self.disable_torque(kind)
-            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Unconfirmed))
     }
 
     fn begin_disable_torque_budgeted(

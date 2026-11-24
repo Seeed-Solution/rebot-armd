@@ -436,6 +436,11 @@ impl SimArmDriver {
             SendGate::DisableProtective { .. } => {}
         }
         self.seq = next_seq;
+        // Invalidate torque evidence BEFORE any torque-changing write that could reach the
+        // simulator (deferred/refused writes exited above and left `enable_seq` intact).
+        if enable.is_some() {
+            self.enable_seq = next_seq;
+        }
         if serialized {
             // A lost datagram is equivalent to a lost CAN frame: the missing feedback,
             // not the write error, is what the supervisor acts on (BUS_LOSS).
@@ -632,6 +637,26 @@ impl ArmDriver for SimArmDriver {
             }
             _ => EnableState::Unknown,
         }
+    }
+
+    fn motor_torque_evidence_into(&self, out: &mut [crate::driver::MotorTorqueEvidence]) -> usize {
+        use crate::driver::MotorTorqueEvidence;
+        let ev = match self.enable_state() {
+            EnableState::Disabled => MotorTorqueEvidence::OffConfirmed,
+            EnableState::Enabled => MotorTorqueEvidence::OnConfirmed,
+            EnableState::Unknown => MotorTorqueEvidence::Unknown,
+        };
+        let n = self.dof.min(out.len());
+        out[..n].fill(ev);
+        n
+    }
+
+    fn has_driver_fresh_position_api(&self) -> bool { true }
+
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = [0.0f32; 1];
+        self.fresh_joint_positions_into(&[joint], max_age, &mut pos)
+            .then_some(pos[0])
     }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {

@@ -57,7 +57,8 @@ pub mod wasm_api;
 #[cfg(not(target_arch = "wasm32"))] pub use auth::OperatorAuth;
 #[cfg(not(target_arch = "wasm32"))] pub use driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
-    JointMode, JointTarget, RobStrideArmDriver,
+    HoldPassReport, JointHoldStatus, JointMode, JointTarget, MotorTorqueEvidence,
+    RobStrideArmDriver,
 };
 pub use gravity::{compute_gravity_torques, GravityError};
 #[cfg(not(target_arch = "wasm32"))]

@@ -124,8 +124,25 @@ impl ZeroOffsetDriver {
 impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
-    fn all_motors_confirmed_off_after_enable_writes(&self) -> bool {
-        self.inner.all_motors_confirmed_off_after_enable_writes()
+    fn motor_torque_evidence_into(&self, out: &mut [crate::driver::MotorTorqueEvidence]) -> usize {
+        self.inner.motor_torque_evidence_into(out)
+    }
+    fn has_driver_fresh_position_api(&self) -> bool {
+        self.inner.has_driver_fresh_position_api()
+    }
+    fn fresh_measured_position_for(&self, joint: usize, max_age: Duration) -> Option<f32> {
+        let mut pos = self.inner.fresh_measured_position_for(joint, max_age)?;
+        let o = self.off(joint);
+        if o != 0.0 {
+            pos -= o;
+        }
+        pos.is_finite().then_some(pos)
+    }
+    fn joint_hold_mode_verified(&self, joint: usize) -> bool {
+        self.inner.joint_hold_mode_verified(joint)
+    }
+    fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
+        self.inner.drop_pending_holds_outside_mask(hold_mask);
     }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
     fn feedback_instants(&self) -> Vec<Option<Instant>> { self.inner.feedback_instants() }
@@ -227,6 +244,26 @@ impl ArmDriver for ZeroOffsetDriver {
             t
         }));
         let r = self.inner.write_estop_hold_bounded(&m);
+        self.motor_targets = m;
+        r
+    }
+    fn write_measured_hold_masked(
+        &mut self,
+        hold_mask: u64,
+        targets: &[JointTarget],
+    ) -> Result<crate::driver::HoldPassReport, ArmDriverError> {
+        if self.offsets.iter().all(|o| *o == 0.0) {
+            return self.inner.write_measured_hold_masked(hold_mask, targets);
+        }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone(); // plain fields: no allocation
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        let r = self.inner.write_measured_hold_masked(hold_mask, &m);
         self.motor_targets = m;
         r
     }

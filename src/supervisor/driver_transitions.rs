@@ -2063,45 +2063,6 @@ impl SupervisorInner {
         }
     }
 
-    /// In Fault / EStop with torque on: fresh feedback from EVERY motor reporting Disabled
-    /// strictly after that motor's last enable write (consulted through the single shared
-    /// [`crate::driver::ArmDriver::all_motors_confirmed_off_after_enable_writes`] helper also
-    /// used by `enable_state()`) means the motors lost torque, e.g. a motor power reset during
-    /// a bus loss (real arm, 2026-11-12: all seven motors came back Disabled after BusLoss and
-    /// armd kept `is_torqued: true`). Otherwise fails closed and keeps holding. Not applied
-    /// during gravity compensation (its exit path owns the motor modes) or while a disable is
-    /// pending.
-    pub(super) fn sync_torque_state_after_stop(&mut self) {
-        if !self.is_torqued || self.disable_pending || self.gravity_comp.is_some() || !self.safety.state().is_stopped() {
-            return;
-        }
-        let Some(d) = self.driver.as_ref() else { return; };
-        let off = d.lock().is_ok_and(|drv| drv.all_motors_confirmed_off_after_enable_writes());
-        if !off || !self.hardware_feedback_fresh(Duration::from_millis(250)) { return; }
-        if let Ok(mut drv) = d.lock() { drv.set_torque_flag(false); }
-        tracing::warn!("Motors report Disabled with fresh feedback in {:?}: torque is off (is_torqued = false); the fault stays latched until clear_fault",
-            self.safety.state());
-        self.is_torqued = false;
-        self.pending_rearm = true;
-        self.output_suspended = false;
-        self.gripper_stalled = false;
-        self.gripper_high_torque_ticks = 0;
-        self.gripper_low_torque_ticks = 0;
-        self.gripper_stall_window.reset();
-        self.gripper_stall_sign = 0.0;
-        self.gripper_prev_hw_overload = false;
-        self.gripper_hold_vel_ceiling = None;
-        self.stop_motion();
-        self.servo_stream_active = false;
-        self.tracking.invalidate();
-        if self.measured_positions.iter().all(|q| q.is_finite()) {
-            self.commanded_positions = self.measured_positions.clone();
-            self.target_positions = self.measured_positions.clone();
-        }
-        self.commanded_velocities.fill(0.0);
-        self.commanded_accelerations.fill(0.0);
-    }
-
     /// Builds the common zero-allocation [`crate::safety::ClearContext`] baseline from current
     /// supervisor state. Callers fill in live driver freshness, thermal capability, hardware error,
     /// enable state, and resting-pose checks before invoking [`SafetyManager::clear_check`].

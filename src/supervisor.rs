@@ -4123,7 +4123,6 @@ impl SupervisorInner {
         {
             self.execute_stop_in_tick(StopPolicy::BusLossFallback);
         }
-        self.sync_torque_state_after_stop();
 
         // Check hardware motor faults / error flags from feedback
         if self.is_torqued {
