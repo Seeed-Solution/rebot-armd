@@ -1803,7 +1803,7 @@ async fn delayed_zero_check_and_calibration_recheck_operator_session_and_lease_e
     armd::gripper_calib::load_into(&sup_exp, &calib_path).await;
     let aid_exp = {
         let mut inner = sup_exp.inner().write().await;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.commanded_positions = INSPECT.to_vec();
         inner.measured_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
@@ -1813,7 +1813,7 @@ async fn delayed_zero_check_and_calibration_recheck_operator_session_and_lease_e
         inner.set_mock_gripper_stall_offset(Some(0.05));
         inner.acquire_lease("conn_exp").unwrap();
         let ep = inner.safety.epoch_id();
-        let (id, _) = inner.start_gripper_zero_check(&json!({"threshold_rad": 0.1, "store_offset": true}), ep).unwrap();
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check(__a, &json!({"threshold_rad": 0.1, "store_offset": true}), ep)) } }.unwrap();
         id
     };
     // Tick until zero_check reaches persisting, then wait past 200ms lease_timeout without renewing lease

@@ -1014,7 +1014,7 @@ async fn per_frame_timing_unequal_durations_exposed_in_diagnostics_tick_http_jso
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
         inner.tick(0.02);
-        inner.set_torque(true).expect("arm");
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     }
     bus.clear();
     // Warm up one tick.
@@ -1104,7 +1104,7 @@ fn legacy_supervisor_fails_closed_on_backpressured_final_release_batch() {
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     for _ in 0..3 {
         bus.with(|s| s.push_all_feedback());
         inner.tick(0.02);
@@ -1113,8 +1113,9 @@ fn legacy_supervisor_fails_closed_on_backpressured_final_release_batch() {
     // Start a gripper Open (release) while holding an object; inject ENOBUFS on the final tick.
     let epoch = inner.safety.epoch_id();
     inner.releasing = true;
-    inner
-        .start_gripper(
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).expect("admit gripper");
+    armd::SupervisorInner::start_gripper(admitted,
             GripperRequest {
                 command: GripperCommand::Open,
                 fraction: None,

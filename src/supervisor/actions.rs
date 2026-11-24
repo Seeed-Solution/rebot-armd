@@ -118,16 +118,30 @@ impl SupervisorInner {
                 }
                 old.finished_at = Some(now);
             }
+            self.record_finished_action(&old);
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
-                    if msg.capacity() > self.action_msg_spare.capacity() {
-                        self.action_msg_spare = msg;
-                    }
+                    self.recycle_action_msg_spare(msg);
                 }
             }
         }
-        if format_superseded_msg && self.action_msg_spare.capacity() < 256 {
-            self.action_msg_spare = String::with_capacity(256);
+        if format_superseded_msg {
+            // Off-RT start: ensure two 256-byte spares exist (matching `last_action` and
+            // `previous_action`) so back-to-back RT failures never allocate or free.
+            let ready = self
+                .action_msg_spares
+                .iter()
+                .filter(|s| s.as_ref().is_some_and(|b| b.capacity() >= 256))
+                .count();
+            for _ in ready..2 {
+                if let Some(slot) = self
+                    .action_msg_spares
+                    .iter_mut()
+                    .find(|s| s.as_ref().is_none_or(|b| b.capacity() < 256))
+                {
+                    *slot = Some(String::with_capacity(256));
+                }
+            }
         }
         self.next_action_id += 1;
         let id = self.next_action_id;
@@ -153,14 +167,73 @@ impl SupervisorInner {
         id
     }
 
+    /// Take a preallocated message buffer (`capacity >= min_cap` when available) for RT action
+    /// termination without allocating or freeing on `armd-control`. If the target action already
+    /// holds a smaller buffer, it is recycled into `action_msg_spares` before taking a spare.
+    pub(crate) fn take_action_msg_buf(&mut self, action_id: u64, min_cap: usize) -> String {
+        if let Some(existing) = self
+            .last_action
+            .as_mut()
+            .filter(|a| a.id == action_id)
+            .and_then(|a| a.message.take())
+        {
+            if existing.capacity() >= min_cap {
+                return existing;
+            }
+            self.recycle_action_msg_spare(existing);
+        }
+        if let Some(slot) = self
+            .action_msg_spares
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|b| b.capacity() >= min_cap))
+        {
+            return slot.take().unwrap_or_default();
+        }
+        let mut best_idx = None;
+        let mut best_cap = 0usize;
+        for (i, s) in self.action_msg_spares.iter().enumerate() {
+            if let Some(b) = s {
+                if b.capacity() > best_cap {
+                    best_cap = b.capacity();
+                    best_idx = Some(i);
+                }
+            }
+        }
+        best_idx.and_then(|i| self.action_msg_spares[i].take()).unwrap_or_default()
+    }
+
+    /// Return a `String` message buffer to `action_msg_spares` without freeing on `armd-control`
+    /// whenever a spare slot is free.
+    pub(crate) fn recycle_action_msg_spare(&mut self, mut msg: String) {
+        if msg.capacity() == 0 {
+            return;
+        }
+        msg.clear();
+        if let Some(slot) = self.action_msg_spares.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(msg);
+            return;
+        }
+        if let Some(min_slot) = self
+            .action_msg_spares
+            .iter_mut()
+            .min_by_key(|s| s.as_ref().map_or(0, String::capacity))
+        {
+            if min_slot.as_ref().is_none_or(|b| msg.capacity() > b.capacity()) {
+                *min_slot = Some(msg);
+            }
+        }
+    }
+
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
         let mut store_offset_req: Option<(f32, Option<(crate::auth::OperatorAuth, Option<String>)>)> = None;
+        let mut incoming_message = message;
+        let mut displaced_message: Option<String> = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.state = state.into();
             a.code = code.map(Into::into);
-            a.message = message;
+            displaced_message = std::mem::replace(&mut a.message, incoming_message.take());
             a.finished_at = Some(now);
             if state != "failed" || code != Some("WORKSPACE_VIOLATION") {
                 a.constraint_id = None;
@@ -193,14 +266,19 @@ impl SupervisorInner {
                     }
                 }
             }
-            tracing::info!(
-                "Action {} ({}) {}{}{}",
-                id,
-                a.kind,
-                state,
-                if code.is_some() { " " } else { "" },
-                code.unwrap_or(""),
-            );
+            if !self.rt_executor_owned {
+                tracing::info!(
+                    "Action {} ({}) {}{}{}",
+                    id,
+                    a.kind,
+                    state,
+                    if code.is_some() { " " } else { "" },
+                    code.unwrap_or(""),
+                );
+            }
+        }
+        if let Some(unused_msg) = displaced_message.or(incoming_message) {
+            self.recycle_action_msg_spare(unused_msg);
         }
         if let Some((offset_rad, operator_auth)) = store_offset_req {
             let candidate_jaw = self.gripper_calib_jaw_opening.clone();
@@ -318,6 +396,7 @@ impl SupervisorInner {
                 self.retire_macro_run(run);
             }
         }
+        self.record_finished_action_by_id(id);
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
@@ -331,24 +410,26 @@ impl SupervisorInner {
             && !self.e_stop_latched.load(Ordering::SeqCst)
     }
 
-    pub fn unload_action(&mut self) -> Result<Option<u64>, ArmError> {
-        self.park_rejection = None;
+    pub fn unload_action(admitted: Admitted<'_>) -> Result<Option<u64>, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.check_terminal_fifo_for_new_action()?;
+        this.park_rejection = None;
         // A park from the hold after a clear re-arms through the verified enable path first (fresh
         // feedback, commanded = measured); without it NormalUnload keeps holding and parks nothing.
-        if self.holding_after_clear() {
-            self.set_torque(true)?;
+        if this.holding_after_clear() {
+            this.enable_torque_inner(&proof)?;
         }
-        self.execute_stop(StopPolicy::NormalUnload);
-        if let Some(e) = self.park_rejection.take() { return Err(e.into()); }
-        if self.mit.park_after_hand_back && !self.pending_normal_unload {
+        this.execute_stop(StopPolicy::NormalUnload);
+        if let Some(e) = this.park_rejection.take() { return Err(e.into()); }
+        if this.mit.park_after_hand_back && !this.pending_normal_unload {
             // deferred behind the MIT brake and hand back: the action runs from now on
-            let id = self.begin_action("park", None);
-            self.mit.deferred_park_action = Some(id);
+            let id = this.begin_action("park", None);
+            this.mit.deferred_park_action = Some(id);
             return Ok(Some(id));
         }
-        if !self.pending_normal_unload { return Ok(None); }
-        let id = self.begin_action("park", None);
-        if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+        if !this.pending_normal_unload { return Ok(None); }
+        let id = this.begin_action("park", None);
+        if let Some(active) = this.active_trajectory.as_mut() { active.action_id = Some(id); }
         Ok(Some(id))
     }
 
@@ -374,7 +455,13 @@ impl SupervisorInner {
 
     /// Begin a macro action (`grasp`, `place`) after its first motion was planned from
     /// `input`. Its orchestrator drives it from now on. Returns its id.
-    pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+    pub fn begin_macro(admitted: Admitted<'_>, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.begin_macro_inner(&proof, kind, input, tag)
+    }
+
+    pub(crate) fn begin_macro_inner(&mut self, proof: &crate::supervisor::AdmittedProof, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         self.check_plan_fresh(input)?;
         if !self.can_admit_macro_run() {
             return Err(MotionError::MotionBusy(
@@ -383,19 +470,25 @@ impl SupervisorInner {
             .into());
         }
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun::new(id, input.epoch));
+        self.macro_run = Some(MacroRun::new(id, input.epoch, proof.stamp()));
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
 
     /// Begin a sequence run (parent macro action of kind `sequence`, no Cartesian plan needed).
-    pub fn begin_sequence_action(&mut self, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
-        self.begin_orchestrated_action("sequence", tag, epoch)
+    pub fn begin_sequence_action(admitted: Admitted<'_>, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+        Self::begin_orchestrated_action(admitted, "sequence", tag, epoch)
     }
 
     /// Begin a parent action of `kind` whose orchestrator runs outside the lock (sequence,
-    /// calib_hover): epoch, preconditions, macro run record.
-    pub fn begin_orchestrated_action(&mut self, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+    /// calib_hover): stamp, epoch, preconditions, macro run record.
+    pub fn begin_orchestrated_action(admitted: Admitted<'_>, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.begin_orchestrated_action_inner(&proof, kind, tag, epoch)
+    }
+
+    pub(crate) fn begin_orchestrated_action_inner(&mut self, proof: &crate::supervisor::AdmittedProof, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
@@ -408,7 +501,7 @@ impl SupervisorInner {
             .into());
         }
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun::new(id, epoch));
+        self.macro_run = Some(MacroRun::new(id, epoch, proof.stamp()));
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
@@ -563,9 +656,24 @@ impl SupervisorInner {
     /// Arms the RT deadline of the current child of macro `id` (the tick fails it with `code` /
     /// `message` when it still runs after `deadline`). Returns its ticket.
     pub fn arm_macro_child(&mut self, id: u64, deadline: Instant, code: &str, message: String) -> Option<ChildTicket> {
+        self.arm_macro_child_bounded(
+            id,
+            deadline,
+            crate::safety::BoundedText::new(code),
+            crate::motion::StepErrorText::new(&message),
+        )
+    }
+
+    pub(crate) fn arm_macro_child_bounded(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        code: crate::safety::BoundedText<48>,
+        message: crate::motion::StepErrorText,
+    ) -> Option<ChildTicket> {
         let m = self.macro_run.as_mut().filter(|m| m.id == id && m.children > 0)?;
         m.child.deadline = Some(deadline);
-        m.child.timeout = Some((code.to_string(), message));
+        m.child.timeout = Some((code, message));
         m.ticket()
     }
 
@@ -592,7 +700,10 @@ impl SupervisorInner {
         if self.macro_child_active_or_pending(id) { self.stop_motion(); }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
-        let (code, message) = m.child.timeout.take().unwrap_or_else(|| ("TIMEOUT".into(), "Sub-motion did not finish in time".into()));
+        let (code, message) = m.child.timeout.take().unwrap_or_else(|| (
+            crate::safety::BoundedText::new("TIMEOUT"),
+            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+        ));
         m.child.deadline = None;
         m.sub = SubState::Failed { code, message };
         true
@@ -629,7 +740,10 @@ impl SupervisorInner {
             m.child.watch.contact_tcp_z_m = z;
             if let Some(code) = guard.stop_code {
                 self.safety.mark_motion_finished();
-                m.sub = SubState::Failed { code: code.into(), message: format!("contact on J{}", joint + 1) };
+                m.sub = SubState::Failed {
+                    code: crate::safety::BoundedText::new(code),
+                    message: crate::motion::format_step_error(format_args!("contact on J{}", joint + 1)),
+                };
             } else if let Some(ticket) = ticket {
                 // Success-on-contact: motion is stopped and locked to measured immediately,
                 // while `SubState::Done` commits strictly through the shared post-output
@@ -659,7 +773,10 @@ impl SupervisorInner {
     /// `CartesianPath` takes one waypoint (`n == 1`, an end-link goal; more: `UNSUPPORTED`).
     /// `JointQuinticLimited` plans from the commanded state with `max_velocity` (0: the
     /// profile's); `duration_s` is the prepared estimate and is not enforced.
-    pub fn commit_macro_child(&mut self, primitive: &crate::rt_core::ops::Primitive, now: Instant) -> Result<crate::rt_core::broker::ActionId, &'static str> {
+    pub fn commit_macro_child(admitted: Admitted<'_>, primitive: &crate::rt_core::ops::Primitive, now: Instant) -> Result<crate::rt_core::broker::ActionId, &'static str> {
+        let (this, proof) = admitted
+            .consume()
+            .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
         use crate::rt_core::ops::Primitive;
         let Some(spec) = primitive.child().copied() else { return Err("INVALID_COMMAND"); };
         let start = match primitive {
@@ -668,23 +785,23 @@ impl SupervisorInner {
             _ => return Err("INVALID_COMMAND"),
         };
         if matches!(primitive, Primitive::CartesianPath { n, .. } if *n != 1) {
-            self.commit_child_checks(&spec, start)?;
+            this.commit_child_checks(&spec, start)?;
             return Err("UNSUPPORTED");
         }
         let primitive = *primitive;
-        self.commit_child_install(spec, start, now, move |this, id| match primitive {
+        this.commit_child_install(spec, start, now, move |this, id| match primitive {
             Primitive::JointQuinticLimited { dof, q, max_velocity, .. } => {
                 let mut limits = this.planning_limits();
                 for (i, l) in limits.iter_mut().enumerate().take(usize::from(dof)) {
                     if max_velocity[i] > 0.0 { l.max_velocity = l.max_velocity.min(max_velocity[i]); }
                 }
-                this.install_macro_quintic(id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
+                this.install_macro_quintic_inner(&proof, id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
             }
             Primitive::Gripper { fraction, speed, grasp, .. } => {
                 let command = if grasp && fraction <= 0.0 { GripperCommand::Close } else if !grasp && fraction >= 1.0 { GripperCommand::Open } else { GripperCommand::Move };
                 let request = GripperRequest { command, fraction: (command == GripperCommand::Move).then_some(f64::from(fraction)), grasp,
                     speed: f64::from(speed), timeout_s: Some(spec.timeout_s), tag: None };
-                this.start_macro_gripper(id, request).map(drop)
+                this.start_macro_gripper_learning_within_inner(&proof, id, request, crate::motion::LearnMode::Opening, None, false).map(drop)
             }
             Primitive::CartesianPath { waypoints, speed_mps, .. } => {
                 let w = waypoints[0];
@@ -693,7 +810,7 @@ impl SupervisorInner {
                 this.plan_input().and_then(|input| {
                     let speed = crate::motion::Speed { linear: f64::from(speed_mps), angular: crate::motion::DEFAULT_ANGULAR_RPS };
                     let path = crate::motion::plan_cartesian(&input, goal, speed).map_err(ArmError::from)?;
-                    this.install_macro_path(id, &input, path).map(drop)
+                    this.install_macro_path_inner(&proof, id, &input, path).map(drop)
                 })
             }
             Primitive::Replay { episode, speed, gripper, .. } => {
@@ -701,7 +818,7 @@ impl SupervisorInner {
                 let epoch = this.safety.epoch_id();
                 this.replay_input(request, epoch)
                     .and_then(crate::replay::plan)
-                    .and_then(|planned| this.install_macro_replay(id, planned).map(drop))
+                    .and_then(|planned| this.install_macro_replay_inner(&proof, id, planned).map(drop))
             }
             _ => Err(MotionError::InvalidCommand("not a child primitive".into()).into()),
         })
@@ -739,47 +856,48 @@ impl SupervisorInner {
             return Err(code(e));
         }
         let deadline = now + Duration::from_secs_f64(if spec.timeout_s.is_finite() { spec.timeout_s.clamp(0.0, 1e6) } else { 1e6 });
-        self.arm_macro_child(id, deadline, spec.timeout_code, "Sub-motion did not finish in time".into());
+        self.arm_macro_child_bounded(
+            id,
+            deadline,
+            crate::safety::BoundedText::new(spec.timeout_code),
+            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+        );
         Ok(crate::rt_core::broker::ActionId(id))
     }
 
     /// Installs a prepared Cartesian path as a sub-motion of macro action `id` (the RT
     /// commit of a `Primitive::Prepared` child: no IK). Returns its planned duration.
-    pub(crate) fn install_macro_prepared_path(&mut self, id: u64, path: JointPath, power_noted: bool) -> Result<f64, ArmError> {
-        let epoch = self.macro_sub_ready(id)?;
-        self.check_prepared_fresh(epoch)?;
-        let duration = self.start_path_motion_at(epoch, &path)?;
-        if power_noted { self.note_action_power_scale(id, path.power_scale); }
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
-        self.set_macro_sub_running(id);
+    pub(crate) fn install_macro_prepared_path(admitted: Admitted<'_>, id: u64, path: JointPath, power_noted: bool) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        let epoch = this.macro_sub_ready(id)?;
+        this.check_prepared_fresh(epoch)?;
+        let duration = this.start_path_motion_at_inner(&proof, epoch, &path)?;
+        if power_noted { this.note_action_power_scale(id, path.power_scale); }
+        this.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+        this.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }
 
     /// Installs a prepared Cartesian path borrowing directly from an immutable pinned
     /// [`crate::rt_core::broker::PlanSlotRef`] as a sub-motion of macro action `id` (zero
     /// sample/param vector copies). Returns its planned duration.
-    pub(crate) fn install_macro_prepared_path_slot(
-        &mut self,
-        id: u64,
-        dof: usize,
-        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
-        duration_s: f64,
-        power_scale: Option<f64>,
-    ) -> Result<f64, ArmError> {
-        let epoch = self.macro_sub_ready(id)?;
-        self.validate_prepared_joint_path(dof, &slot.path, duration_s)
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_macro_prepared_path_slot(admitted: Admitted<'_>, id: u64, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>, duration_s: f64, power_scale: Option<f64>) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        let epoch = this.macro_sub_ready(id)?;
+        this.validate_prepared_joint_path(dof, &slot.path, duration_s)
             .map_err(|_| ArmError::Motion(MotionError::InvalidCommand("invalid prepared Cartesian path".into())))?;
-        self.check_prepared_fresh(epoch)?;
+        this.check_prepared_fresh(epoch)?;
         let last = &slot.path.samples()[slot.path.len() - 1][..dof];
-        let duration = self.start_path_motion_slice(epoch, last, duration_s)?;
+        let duration = this.start_path_motion_slice_inner(&proof, epoch, last, duration_s)?;
         let scale = power_scale.unwrap_or(1.0);
-        if power_scale.is_some() { self.note_action_power_scale(id, scale); }
-        let arm_dof = self.config.arm_dof();
-        self.active_trajectory = Some(ActiveTrajectory::new(
+        if power_scale.is_some() { this.note_action_power_scale(id, scale); }
+        let arm_dof = this.config.arm_dof();
+        this.active_trajectory = Some(ActiveTrajectory::new(
             Some(id),
             Reference::Path(PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s)),
         ));
-        self.set_macro_sub_running(id);
+        this.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }
 
@@ -803,11 +921,16 @@ impl SupervisorInner {
     }
 
     /// Install a planned sub-motion of macro action `id`. Returns its planned duration.
-    pub fn install_macro_path(&mut self, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+    pub fn install_macro_path(admitted: Admitted<'_>, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_macro_path_inner(&proof, id, input, path)
+    }
+
+    pub(crate) fn install_macro_path_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.check_plan_fresh(input)?;
-        let duration = self.start_path_motion(input, &path)?;
+        let duration = self.start_path_motion_at_inner(proof, input.epoch, &path)?;
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
         self.set_macro_sub_running(id);
@@ -847,35 +970,31 @@ impl SupervisorInner {
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.motor_current_cap())
-            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
-            .and_then(|cap| cap.close_speed_rad_s)
+            .and_then(|drv| drv.gripper_pos_force_info())
+            .filter(|info| info.joint == gripper_idx)
+            .map(|info| info.close_speed_rad_s)
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
     /// Estimated motor ceiling torque (N·m) of the attached position-force gripper: calibrated
     /// `ceiling_torque_nm` when available, else the feedback-equivalent estimate from
-    /// `current_raw * 0.0019 N·m/raw`.
+    /// `current_raw * 0.0019 N·m/raw`. Allocation-free on `armd-control`.
     pub(crate) fn gripper_ceiling_torque_estimate(&self) -> Option<f32> {
         let gripper_idx = self.config.gripper_index()?;
         self.driver.as_ref()
             .and_then(|d| d.lock().ok())
-            .and_then(|drv| drv.motor_current_cap())
-            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
-            .and_then(|cap| {
-                cap.ceiling_torque_nm.or_else(|| {
-                    cap.current_raw
-                        .map(|raw| f32::from(raw) * crate::model::DamiaoGripperDrive::FEEDBACK_EQUIVALENT_NM_PER_RAW)
-                })
-            })
+            .and_then(|drv| drv.gripper_pos_force_info())
+            .filter(|info| info.joint == gripper_idx)
+            .and_then(|info| info.ceiling_torque_estimate_nm)
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
-    /// Effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`, `sequence`,
-    /// `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
-    /// damiao_gripper.close_speed_rad_s when pos_force)`, quantized downward to `0.01 rad/s`
-    /// when `pos_force` is active.
-    pub fn effective_planned_close_speed(&self) -> f64 {
+    /// Unquantized effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`,
+    /// `sequence`, `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
+    /// damiao_gripper.close_speed_rad_s when pos_force)`. Feed this into `GripperRequest` so
+    /// [`crate::motion::GripperMotion::try_with_close_speed_limit`] is the single wire-speed
+    /// quantization point (avoiding `raw 29 -> 0.29_f64 -> raw 28` double flooring).
+    pub(crate) fn unquantized_planned_close_speed(&self) -> f64 {
         let mut v = self.config.gripper_policy.as_ref()
             .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
         if let Some(max_v) = self.config.gripper_index()
@@ -887,9 +1006,21 @@ impl SupervisorInner {
         }
         if let Some(cap) = self.gripper_close_speed_limit() {
             v = v.min(f64::from(cap));
+        }
+        v
+    }
+
+    /// Effective closing speed (rad/s) for armd-planned closes (`grasp`, `place`, `sequence`,
+    /// `gripper_calibrate`): `min(gripper_policy.close_speed_rad_s, joint max_velocity,
+    /// damiao_gripper.close_speed_rad_s when pos_force)`, quantized once downward to `0.01 rad/s`
+    /// when `pos_force` is active (for reporting and duration estimates; never feed back into
+    /// `GripperRequest`).
+    pub fn effective_planned_close_speed(&self) -> f64 {
+        let v = self.unquantized_planned_close_speed();
+        if self.gripper_close_speed_limit().is_some() {
             let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(v);
             if raw > 0 {
-                v = f64::from(raw) / 100.0;
+                return f64::from(raw) / 100.0;
             }
         }
         v
@@ -952,15 +1083,15 @@ impl SupervisorInner {
     }
 
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
-    pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
-        self.start_macro_gripper_learning_within(id, request, crate::motion::LearnMode::Opening, None, false)
+    pub fn start_macro_gripper(admitted: Admitted<'_>, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        Self::start_macro_gripper_learning_within(admitted, id, request, crate::motion::LearnMode::Opening, None, false)
             .map(|(dur, _, _)| dur)
     }
 
     /// [`Self::start_macro_gripper`] recording the move for the baseline as `learn` allows
     /// (`gripper_calibrate` strokes: `LearnMode::Calibration`).
-    pub fn start_macro_gripper_learning(&mut self, id: u64, request: GripperRequest, learn: crate::motion::LearnMode) -> Result<f64, ArmError> {
-        self.start_macro_gripper_learning_within(id, request, learn, None, false)
+    pub fn start_macro_gripper_learning(admitted: Admitted<'_>, id: u64, request: GripperRequest, learn: crate::motion::LearnMode) -> Result<f64, ArmError> {
+        Self::start_macro_gripper_learning_within(admitted, id, request, learn, None, false)
             .map(|(dur, _, _)| dur)
     }
 
@@ -968,14 +1099,9 @@ impl SupervisorInner {
     /// `max_budget_s` is positive/finite and (for pos-force closes) covers the planned duration.
     /// Returns `(expected_duration, timeout_s, is_pos_force_close)`.
     #[doc(hidden)]
-    pub fn start_macro_gripper_within(
-        &mut self,
-        id: u64,
-        request: GripperRequest,
-        max_budget_s: Option<f64>,
-        extend_pos_force_close_timeout: bool,
-    ) -> Result<(f64, f64, bool), ArmError> {
-        self.start_macro_gripper_learning_within(
+    pub fn start_macro_gripper_within(admitted: Admitted<'_>, id: u64, request: GripperRequest, max_budget_s: Option<f64>, extend_pos_force_close_timeout: bool) -> Result<(f64, f64, bool), ArmError> {
+        Self::start_macro_gripper_learning_within(
+            admitted,
             id,
             request,
             crate::motion::LearnMode::Opening,
@@ -986,14 +1112,12 @@ impl SupervisorInner {
 
     /// [`Self::start_macro_gripper_within`] with an explicit baseline [`crate::motion::LearnMode`].
     #[doc(hidden)]
-    pub fn start_macro_gripper_learning_within(
-        &mut self,
-        id: u64,
-        request: GripperRequest,
-        learn: crate::motion::LearnMode,
-        max_budget_s: Option<f64>,
-        extend_pos_force_close_timeout: bool,
-    ) -> Result<(f64, f64, bool), ArmError> {
+    pub fn start_macro_gripper_learning_within(admitted: Admitted<'_>, id: u64, request: GripperRequest, learn: crate::motion::LearnMode, max_budget_s: Option<f64>, extend_pos_force_close_timeout: bool) -> Result<(f64, f64, bool), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.start_macro_gripper_learning_within_inner(&proof, id, request, learn, max_budget_s, extend_pos_force_close_timeout)
+    }
+
+    pub(crate) fn start_macro_gripper_learning_within_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, id: u64, request: GripperRequest, learn: crate::motion::LearnMode, max_budget_s: Option<f64>, extend_pos_force_close_timeout: bool) -> Result<(f64, f64, bool), ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
@@ -1048,7 +1172,12 @@ impl SupervisorInner {
     /// Start a joint-space quintic sub-motion of macro action `id` (sequence pose step) to
     /// `target`, planned with `limits` from the commanded state; it counts as done once settled.
     /// Returns its planned duration.
-    pub fn install_macro_quintic(&mut self, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
+    pub fn install_macro_quintic(admitted: Admitted<'_>, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_macro_quintic_inner(&proof, id, target, limits)
+    }
+
+    pub(crate) fn install_macro_quintic_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if epoch != self.safety.epoch_id() { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.action_preconditions()?;
@@ -1113,13 +1242,19 @@ impl SupervisorInner {
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
-    pub fn start_gripper(&mut self, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
-        self.start_gripper_with_baseline(request, epoch, GripperBaselineCmd::None)
+    pub fn start_gripper(admitted: Admitted<'_>, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
+        Self::start_gripper_with_baseline(admitted, request, epoch, GripperBaselineCmd::None)
     }
 
     /// [`Self::start_gripper`] with a baseline command; a reset happens only once the action is
     /// admitted (a refused action leaves the learned baseline as it was).
-    pub fn start_gripper_with_baseline(&mut self, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
+    pub fn start_gripper_with_baseline(admitted: Admitted<'_>, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
+        let (this, _proof) = admitted.consume()?;
+        this.start_gripper_with_baseline_inner(request, epoch, baseline_cmd)
+    }
+
+    fn start_gripper_with_baseline_inner(&mut self, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
         })?;
@@ -1164,16 +1299,17 @@ impl SupervisorInner {
     }
 
     /// Start a gripper zero check action. Returns (action id, expected duration).
-    pub fn start_gripper_zero_check(&mut self, body: &serde_json::Value, epoch: u64) -> Result<(u64, f64), ArmError> {
-        self.start_gripper_zero_check_with_auth(body, epoch, None)
+    pub fn start_gripper_zero_check(admitted: Admitted<'_>, body: &serde_json::Value, epoch: u64) -> Result<(u64, f64), ArmError> {
+        Self::start_gripper_zero_check_with_auth(admitted, body, epoch, None)
     }
 
-    pub fn start_gripper_zero_check_with_auth(
-        &mut self,
-        body: &serde_json::Value,
-        epoch: u64,
-        operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
-    ) -> Result<(u64, f64), ArmError> {
+    pub fn start_gripper_zero_check_with_auth(admitted: Admitted<'_>, body: &serde_json::Value, epoch: u64, operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>) -> Result<(u64, f64), ArmError> {
+        let (this, _proof) = admitted.consume()?;
+        this.start_gripper_zero_check_with_auth_inner(body, epoch, operator_auth)
+    }
+
+    fn start_gripper_zero_check_with_auth_inner(&mut self, body: &serde_json::Value, epoch: u64, operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>) -> Result<(u64, f64), ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper zero check needs a profile with a gripper joint".into())
         })?;
@@ -1235,6 +1371,7 @@ impl SupervisorInner {
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_window.reset();
         self.zero_check_params = Some(ZeroCheckParams {
             action_id: id,
             store_offset,
@@ -1331,12 +1468,7 @@ impl SupervisorInner {
             if (is_macro || is_replay) && carried { self.stop_motion(); }
             self.pending_deferred_done = None;
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
-            let mut message = self
-                .last_action
-                .as_mut()
-                .filter(|a| a.id == id)
-                .and_then(|a| a.message.take())
-                .unwrap_or_else(|| std::mem::take(&mut self.action_msg_spare));
+            let mut message = self.take_action_msg_buf(id, 256);
             message.clear();
             match cause {
                 ReconcileCause::Static(_, _, text) => message.push_str(text),
@@ -1464,6 +1596,7 @@ impl SupervisorInner {
             self.gripper_stalled = false;
             self.gripper_high_torque_ticks = 0;
             self.gripper_low_torque_ticks = 0;
+            self.gripper_stall_window.reset();
         }
         let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
         if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
@@ -1490,7 +1623,9 @@ impl SupervisorInner {
                 } else {
                     DeferredCompletionTarget::Anonymous
                 };
-                self.active_trajectory = None;
+                if let Some(old_traj) = self.active_trajectory.take() {
+                    self.retire_active_trajectory(old_traj);
+                }
                 self.commanded_velocities.fill(0.0);
                 crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 Some(DeferredActionDone {
@@ -1508,11 +1643,11 @@ impl SupervisorInner {
                     self.stop_motion();
                     self.tracking.invalidate();
                     if self.measured_positions.iter().all(|q| q.is_finite()) {
-                        self.commanded_positions = self.measured_positions.clone();
+                        crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
                     }
                     self.commanded_accelerations.fill(0.0);
-                } else {
-                    self.active_trajectory = None;
+                } else if let Some(old_traj) = self.active_trajectory.take() {
+                    self.retire_active_trajectory(old_traj);
                 }
                 if action_id.is_none() && self.park_release == Some(ParkRelease::Opening) {
                     tracing::warn!("Park release opening failed ({code}: {message}); skipping re-close and keeping held state");
@@ -1521,11 +1656,21 @@ impl SupervisorInner {
                     self.releasing = false;
                 }
                 self.commanded_velocities.fill(0.0);
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
                 if macro_sub {
-                    if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
-                } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
+                    if let Some(m) = self.macro_run.as_mut() {
+                        m.sub = SubState::Failed {
+                            code: crate::safety::BoundedText::new(code),
+                            message,
+                        };
+                    }
+                } else if let Some(id) = action_id {
+                    let mut msg = self.take_action_msg_buf(id, message.as_str().len().max(160));
+                    msg.clear();
+                    msg.push_str(message.as_str());
+                    self.finish_action(id, "failed", Some(code), Some(msg), None, None, None);
+                }
                 None
             }
         }

@@ -524,6 +524,14 @@ impl ReplayMotion {
     /// True when samples are borrowed directly from an immutable plan slot (no vector copy).
     pub fn borrows_plan_slot(&self) -> bool { matches!(self.samples, ReplaySamples::Slot { .. }) }
 
+    /// True when dropping this replay motion would free heap memory.
+    pub fn has_heap_storage(&self) -> bool {
+        matches!(self.episode, ReplayEpisode::Owned(_))
+            || matches!(self.samples, ReplaySamples::Owned(_))
+            || self.tag.is_some()
+            || matches!(&self.phase, Phase::Approach(q) if q.polynomials.is_heap())
+    }
+
     /// Recording time reached (s): 0 during the approach.
     pub fn t_s(&self) -> f64 {
         match &self.phase { Phase::Approach(_) => 0.0, Phase::Follow { t, .. } => *t, Phase::Settle(_) => self.duration }
@@ -599,8 +607,12 @@ impl ReplayMotion {
                         velocities.resize(n, 0.0);
                         return StepOut {
                             positions, velocities, progress, clear_gripper_stall: false,
-                            status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
-                                "Arm did not follow the replay for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
+                            status: StepStatus::Failed {
+                                code: "TRACKING_STALL",
+                                message: crate::motion::format_step_error(format_args!(
+                                    "Arm did not follow the replay for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped"
+                                )),
+                            },
                         };
                     }
                 } else {
@@ -679,15 +691,21 @@ impl SupervisorInner {
 
     /// Install a checked replay: plan the approach to the first frame at the planned-motion
     /// limits, then start the action. Returns (action id, expected duration).
-    pub fn install_replay(&mut self, plan: ReplayPlan) -> Result<(u64, f64), ArmError> {
-        let (motion, first, scales) = self.replay_motion(plan)?;
-        self.install_replay_motion(motion, &first, scales, true)
+    pub fn install_replay(admitted: crate::supervisor::Admitted<'_>, plan: ReplayPlan) -> Result<(u64, f64), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_replay_inner(&proof, plan)
     }
 
-    fn install_replay_motion(&mut self, motion: ReplayMotion, first: &[f32], scales: [Option<f64>; 2], log_start: bool) -> Result<(u64, f64), ArmError> {
+    fn install_replay_inner(&mut self, proof: &crate::supervisor::AdmittedProof, plan: ReplayPlan) -> Result<(u64, f64), ArmError> {
+        let (motion, first, scales) = self.replay_motion(plan)?;
+        self.install_replay_motion_inner(proof, motion, &first, scales, true)
+    }
+
+    fn install_replay_motion_inner(&mut self, proof: &crate::supervisor::AdmittedProof, motion: ReplayMotion, first: &[f32], scales: [Option<f64>; 2], log_start: bool) -> Result<(u64, f64), ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         let expected = motion.expected_duration();
         let tag = motion.tag.clone();
-        self.start_replay_motion(first)?;
+        self.start_replay_motion_inner(proof, first)?;
         let id = if log_start { self.begin_action("replay", tag) } else { self.begin_action_rt("replay") };
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
         if let Some(a) = self.last_action.as_mut() {
@@ -704,15 +722,20 @@ impl SupervisorInner {
 
     /// Install a checked replay as a sub-motion of macro action `id` (sequence replay step).
     /// Returns its expected duration.
-    pub fn install_macro_replay(&mut self, id: u64, plan: ReplayPlan) -> Result<f64, ArmError> {
-        self.macro_sub_ready_pub(id)?;
-        let (motion, first, scales) = self.replay_motion(plan)?;
-        self.install_macro_replay_motion(id, motion, &first, scales)
+    pub fn install_macro_replay(admitted: crate::supervisor::Admitted<'_>, id: u64, plan: ReplayPlan) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_macro_replay_inner(&proof, id, plan)
     }
 
-    fn install_macro_replay_motion(&mut self, id: u64, motion: ReplayMotion, first: &[f32], scales: [Option<f64>; 2]) -> Result<f64, ArmError> {
+    pub(crate) fn install_macro_replay_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, plan: ReplayPlan) -> Result<f64, ArmError> {
+        self.macro_sub_ready_pub(id)?;
+        let (motion, first, scales) = self.replay_motion(plan)?;
+        self.install_macro_replay_motion_inner(proof, id, motion, &first, scales)
+    }
+
+    fn install_macro_replay_motion_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, motion: ReplayMotion, first: &[f32], scales: [Option<f64>; 2]) -> Result<f64, ArmError> {
         let expected = motion.expected_duration();
-        self.start_replay_motion(first)?;
+        self.start_replay_motion_inner(proof, first)?;
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
         let ep: crate::model::HolderLabel = motion.episode_str().into();
         self.update_action(id, |a| {
@@ -725,7 +748,13 @@ impl SupervisorInner {
         Ok(expected)
     }
 
-    pub fn start_replay_motion(&mut self, first: &[f32]) -> Result<(), ArmError> {
+    #[doc(hidden)]
+    pub fn start_replay_motion(admitted: crate::supervisor::Admitted<'_>, first: &[f32]) -> Result<(), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.start_replay_motion_inner(&proof, first)
+    }
+
+    fn start_replay_motion_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, first: &[f32]) -> Result<(), ArmError> {
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -862,16 +891,18 @@ impl SupervisorInner {
     }
 
     /// Installs a prepared replay as a `replay` action (no RT `tracing::info!`). Returns (action id, expected duration).
-    pub(crate) fn install_prepared_replay(&mut self, prepared: (ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2])) -> Result<(u64, f64), ArmError> {
+    pub(crate) fn install_prepared_replay(admitted: crate::supervisor::Admitted<'_>, prepared: (ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2])) -> Result<(u64, f64), ArmError> {
+        let (this, proof) = admitted.consume()?;
         let (motion, first, dof, scales) = prepared;
-        self.install_replay_motion(motion, &first[..dof], scales, false)
+        this.install_replay_motion_inner(&proof, motion, &first[..dof], scales, false)
     }
 
     /// Installs a prepared replay as a sub-motion of macro action `id`. Returns its expected duration.
-    pub(crate) fn install_macro_prepared_replay(&mut self, id: u64, prepared: (ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2])) -> Result<f64, ArmError> {
-        self.macro_sub_ready_pub(id)?;
+    pub(crate) fn install_macro_prepared_replay(admitted: crate::supervisor::Admitted<'_>, id: u64, prepared: (ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2])) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.macro_sub_ready_pub(id)?;
         let (motion, first, dof, scales) = prepared;
-        self.install_macro_replay_motion(id, motion, &first[..dof], scales)
+        this.install_macro_replay_motion_inner(&proof, id, motion, &first[..dof], scales)
     }
 
     /// Checks of an install and the motion: (motion, first frame, power scales).
@@ -923,10 +954,11 @@ impl SupervisorInner {
 
     /// Check and start a replay under the caller's lock (tests, in-process callers). The WS
     /// command loads and checks the episode without the lock.
-    pub fn start_replay(&mut self, request: ReplayRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
-        let input = self.replay_input(request, epoch)?;
+    pub fn start_replay(admitted: crate::supervisor::Admitted<'_>, request: ReplayRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        let input = this.replay_input(request, epoch)?;
         let plan = plan(input)?;
-        self.install_replay(plan)
+        this.install_replay_inner(&proof, plan)
     }
 }
 
@@ -1053,7 +1085,9 @@ mod tests {
         q1[6] = -0.2;
         let mut recv = SupervisorInner::new(non_stock_cfg);
         recv.lease_enabled = false;
-        recv.set_torque(true).unwrap();
+        let stamp = recv.current_admission_stamp();
+        let admitted = recv.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
         recv.commanded_positions = q0.clone();
         recv.measured_positions = q0.clone();
         recv.target_positions = q0.clone();
@@ -1084,7 +1118,9 @@ mod tests {
         }, &frames).unwrap();
         assert!(stock_plan.tool_provenance_ok);
 
-        let err = recv.install_replay(stock_plan).unwrap_err();
+        let stamp = recv.current_admission_stamp();
+        let admitted = recv.check_admission(stamp).unwrap();
+        let err = SupervisorInner::install_replay(admitted, stock_plan).unwrap_err();
         match err {
             ArmError::Rejected { status: 409, code, .. } => assert_eq!(code, "TOOL_MISMATCH"),
             other => panic!("expected 409 TOOL_MISMATCH on cross-tool install_replay, got {other:?}"),
@@ -1111,7 +1147,9 @@ mod tests {
         q1[0] = 0.2;
         let mut recv = SupervisorInner::new(longer_cfg);
         recv.lease_enabled = false;
-        recv.set_torque(true).unwrap();
+        let stamp = recv.current_admission_stamp();
+        let admitted = recv.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
         recv.commanded_positions = q0.clone();
         recv.measured_positions = q0.clone();
         recv.target_positions = q0.clone();
@@ -1143,7 +1181,9 @@ mod tests {
         assert!(!stock_arm_only_plan.has_gripper_motion);
         assert_eq!(stock_arm_only_plan.planned_tool_digest, stock_cfg.active_tool.config_digest);
 
-        let err = recv.install_replay(stock_arm_only_plan).unwrap_err();
+        let stamp = recv.current_admission_stamp();
+        let admitted = recv.check_admission(stamp).unwrap();
+        let err = SupervisorInner::install_replay(admitted, stock_arm_only_plan).unwrap_err();
         match err {
             ArmError::Rejected { status: 409, code, .. } => assert_eq!(code, "TOOL_MISMATCH"),
             other => panic!("expected 409 TOOL_MISMATCH for cross-tool arm-only replay plan, got {other:?}"),

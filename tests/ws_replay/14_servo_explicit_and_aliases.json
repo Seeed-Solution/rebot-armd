@@ -1,0 +1,42 @@
+{
+  "id": "14_servo_explicit_and_aliases",
+  "family": "servo",
+  "description": "explicit servo, cartesian_joint_stream alias, implicit positions frame, /api/v1/motion/servo, preset>servo precedence",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","positions":[0.01,0.0,0.0,0.0,0.0,0.0,0.0],"sequence_id":1,"type":"servo"}},
+    {"op":"expect_no_control","client":"c0","wait_ms":60},
+    {"op":"send","client":"c0","frame":{"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","mode":"cartesian_joint_stream","positions":[0.02,0.0,0.0,0.0,0.0,0.0,0.0],"sequence_id":2}},
+    {"op":"expect_no_control","client":"c0","wait_ms":60},
+    {"op":"send","client":"c0","frame":{"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","positions":[0.03,0.0,0.0,0.0,0.0,0.0,0.0],"sequence_id":3}},
+    {"op":"expect_no_control","client":"c0","wait_ms":60},
+    {"op":"send","client":"c0","frame":{"body":{"targets":[0.02,0.0,0.0,0.0,0.0,0.0,0.0]},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/motion/servo","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","name":"custom","positions":[0.0,0.0,0.0,0.0,0.0,0.0,0.0],"type":"preset"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":1,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"epoch_id":1,"generation":1,"positions":[0.01,0.0,0.0,0.0,0.0,0.0,0.0],"sequence_id":1,"type":"servo"}},
+    {"ev":"no_reply","client":"c0"},
+    {"ev":"client_frame","client":"c0","frame":{"epoch_id":1,"generation":1,"mode":"cartesian_joint_stream","positions":[0.02,0.0,0.0,0.0,0.0,0.0,0.0],"sequence_id":2}},
+    {"ev":"no_reply","client":"c0"},
+    {"ev":"client_frame","client":"c0","frame":{"epoch_id":1,"generation":1,"positions":[0.03,0.0,0.0,0.0,0.0,0.0,0.0],"sequence_id":3}},
+    {"ev":"no_reply","client":"c0"},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"targets":[0.02,0.0,0.0,0.0,0.0,0.0,0.0]},"epoch_id":1,"generation":1,"path":"/api/v1/motion/servo","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":2,"safety_state":"Moving","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"epoch_id":1,"generation":1,"name":"custom","positions":[0.0,0.0,0.0,0.0,0.0,0.0,0.0],"type":"preset"}},
+    {"ev":"server_frame","client":"c0","frame":{"action_id":1,"epoch_id":1,"name":"custom","type":"preset_ack"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

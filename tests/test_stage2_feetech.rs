@@ -1210,7 +1210,7 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
     mock.lock().unwrap().provide_rx(&rx_tq1);
     mock.lock().unwrap().provide_rx(&rx_normal);
 
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
 
     // Now feed an overload status byte (0x20 in the error byte of Feetech packet)
@@ -1558,7 +1558,7 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
     mock.lock().unwrap().provide_rx(&rx_tq1);
     mock.lock().unwrap().provide_rx(&rx_normal);
 
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
 
     // Initial enable consumed polls 1 and 2. Ticks 1..7 advance polls to 9.
@@ -1620,7 +1620,7 @@ async fn test_supervisor_set_torque_and_clear_fault_sync_loads_enforcing_support
     mock.lock().unwrap().provide_rx(&rx_tq1);
     mock.lock().unwrap().provide_rx(&rx_heavy);
 
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let loads = supervisor.inner().read().await.loads.clone();
     assert!((loads[0] - 0.60).abs() < 1e-3);
@@ -1960,7 +1960,7 @@ async fn test_supervisor_clear_fault_rejects_stale_or_moving_pose_before_hardwar
     mock.lock().unwrap().provide_rx(&rx_tq1);
     mock.lock().unwrap().provide_rx(&rx_normal);
 
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
 
     // Inject hardware overload fault (0x20)
@@ -2268,7 +2268,7 @@ async fn test_feetech_supervisor_estop_abort_lifecycle() {
     let cs_tq2 = calculate_checksum(2, 3, 0x00, &[1]);
     let rx_enable = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1, 0xFF, 0xFF, 2, 3, 0x00, 1, cs_tq2];
     mock.lock().unwrap().provide_rx(&rx_enable);
-    let enable_res = supervisor.set_torque(true).await;
+    let enable_res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(enable_res.is_ok(), "set_torque(true) must succeed after clear_fault: {:?}", enable_res);
 }
 
@@ -2674,11 +2674,11 @@ async fn test_supervisor_pending_estop_count_rejects_clear_fault_set_torque_and_
     assert!(supervisor.e_stop_latched.load(Ordering::SeqCst));
 
     // 2. set_torque(true) fails with EStopActive
-    let torque_res = supervisor.set_torque(true).await;
+    let torque_res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(matches!(torque_res, Err(ArmError::Safety(SafetyError::EStopActive))));
 
     // 3. servo fails with EStopActive
-    let servo_res = supervisor.servo(vec![0.0], 1).await;
+    let servo_res = supervisor.servo(supervisor.capture_admission_stamp(), vec![0.0], 1).await;
     assert!(matches!(servo_res, Err(ArmError::Safety(SafetyError::EStopActive))));
 }
 
@@ -2920,7 +2920,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
     {
         let mut inner = supervisor.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.target_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
@@ -2946,7 +2946,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
 
     // Reverse servo command (moving towards open_rad=0.0, delta is negative)
     let rev_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3];
-    let servo_res = supervisor.servo(rev_targets, 1).await;
+    let servo_res = supervisor.servo(supervisor.capture_admission_stamp(), rev_targets, 1).await;
     assert!(servo_res.is_ok(), "Reverse servo command must be accepted");
     assert!(!supervisor.is_gripper_stalled().await, "Reverse servo command un-stalls gripper");
 
@@ -2962,7 +2962,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
 
     // Now send squeeze command (towards closed_rad=1.5, delta is positive)
     let squeeze_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8];
-    let sq_res = supervisor.servo(squeeze_targets, 1).await;
+    let sq_res = supervisor.servo(supervisor.capture_admission_stamp(), squeeze_targets, 1).await;
     assert!(sq_res.is_ok(), "Squeeze command accepted");
 
     // Tick: since 0x20 still asserted and pushing into stall, it must re-latch!
@@ -3383,7 +3383,7 @@ async fn test_apply_driver_limits_rejection_leaves_poses_unchanged_and_latches_u
     );
 
     // set_torque must also be blocked
-    let tq_err = supervisor.set_torque(true).await.unwrap_err();
+    let tq_err = supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap_err();
     assert!(
         tq_err.to_string().contains("Driver limit configuration error")
             || tq_err.to_string().contains("Motion forbidden")
@@ -3422,7 +3422,7 @@ async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware
     mock.lock().unwrap().provide_rx(&rx_tq1);
     mock.lock().unwrap().provide_rx(&rx_normal);
 
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
 
     // Initial tick with normal 0x00 feedback -> arm stays Armed/Idle

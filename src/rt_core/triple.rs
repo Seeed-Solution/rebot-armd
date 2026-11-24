@@ -67,9 +67,46 @@ impl<T> Producer<T> {
 
     /// A publication is waiting for the consumer (it may take it right after this returns).
     pub fn unconsumed(&self) -> bool { self.shared.middle.load(Ordering::Acquire) & FRESH != 0 }
+
+    /// Swaps the back slot with the middle slot WITHOUT setting `FRESH` when no publication is
+    /// pending (startup prewarming under reader contention: `Consumer::refresh` sees `FRESH == 0`
+    /// and never accesses `middle`). Returns `true` if the swap succeeded.
+    pub fn swap_unfresh(&mut self) -> bool {
+        let cur = self.shared.middle.load(Ordering::Acquire);
+        if cur & FRESH != 0 {
+            return false;
+        }
+        // Only the producer ever sets `FRESH`; since `FRESH == 0`, the consumer cannot swap
+        // `middle`, so CAS from `cur` to `self.back` is wait-free and unique.
+        if self.shared.middle.compare_exchange(cur, self.back, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            self.back = cur & INDEX;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mutably visits all 3 slots when the caller holds exclusive access to both the producer
+    /// and its paired consumer (startup prewarming only).
+    pub fn for_each_slot_mut(&mut self, consumer: &mut Consumer<T>, mut f: impl FnMut(&mut T)) {
+        assert!(Arc::ptr_eq(&self.shared, &consumer.shared), "mismatched triple-buffer endpoints");
+        for slot in &self.shared.slots {
+            // SAFETY: caller holds `&mut Producer` and `&mut Consumer` for the same `Shared`,
+            // and neither type is `Clone` or `Sync`, so no other reference to any slot exists.
+            f(unsafe { &mut *slot.get() });
+        }
+    }
 }
 
 impl<T> Consumer<T> {
+    /// True when the producer has published a newer slot not yet swapped into `front`.
+    /// Uses `Acquire` ordering so any startup state published before `Producer::publish`
+    /// (such as `StateHub::prewarm_template`) is visible before the consumer rotates `front`.
+    #[inline]
+    pub fn has_fresh(&self) -> bool {
+        self.shared.middle.load(Ordering::Acquire) & FRESH != 0
+    }
+
     /// Takes the newest published slot when there is one; false when nothing was published
     /// since the last refresh (the front slot is unchanged). Never blocks.
     pub fn refresh(&mut self) -> bool {

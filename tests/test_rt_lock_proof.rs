@@ -822,7 +822,7 @@ fn production_executor_mock_owner_zero_attempts_while_legacy_writer_held() {
 
             let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
             sup.set_lease_enabled(false).await;
-            sup.set_torque(true).await.expect("enable torque on mock arm");
+            sup.enable_torque(sup.capture_admission_stamp()).await.expect("enable torque on mock arm");
 
             // Lock-free executor-side trigger inside `before_publish`: accumulates `dt`-clamped
             // trajectory time (matching `SupervisorInner::tick_control`'s 80 ms clamp) after the
@@ -1280,7 +1280,7 @@ fn production_executor_mock_positive_control_counts_and_catches_try_read_on_armd
 
             let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
             sup.set_lease_enabled(false).await;
-            sup.set_torque(true).await.expect("enable torque on mock arm");
+            sup.enable_torque(sup.capture_admission_stamp()).await.expect("enable torque on mock arm");
 
             let inner_lock = Arc::clone(sup.inner());
             let probe_armed = Arc::new(AtomicBool::new(false));

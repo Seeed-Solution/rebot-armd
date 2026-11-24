@@ -1,0 +1,1243 @@
+//! Stage 3 PR B2: whole-release and sub-release-wake allocation counter proof.
+//!
+//! Installs [`TimedAlloc`] as this binary's global allocator and runs every measured RT executor
+//! fixture with `cfg.alloc_timing = true`, proving:
+//! 1. Per-operation (`alloc`, `alloc_zeroed`, `realloc`, `dealloc`) counting is exact and
+//!    independent of mid-release `alloc::take()` resets and the droppable `diag_tx` ring.
+//! 2. Positive controls in the release tail (after `diag_tx.push` + `hub.wake()`) and in
+//!    sub-release wakes detect exact counts for `alloc`, `alloc_zeroed`, `realloc`, and
+//!    scope-exit local destruction (`dealloc`), with disjoint release/wake windows.
+//! 3. With consumers stalled (observation hub `reader_guard`, broker poll paused, persist worker
+//!    paused, saturated diagnostic/E-stop/persistence rings), normal commits, refused commits,
+//!    pre-frame transition refusals, authorized urgent stops, terminal retirement, and saturated
+//!    observation/E-stop/persistence/diagnostics queues perform strictly zero heap operations on
+//!    `armd-control`, keep advancing publication, and reclaim payloads off-thread.
+//! 4. Known allocations in in-flight B3/A8-owned files are captured as `#[ignore]` tests with
+//!    exact `file:line` attribution and unblock conditions (affected families remain gated).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread::{self, ThreadId};
+use std::time::{Duration, Instant};
+
+use armd::diagnostics::alloc::{self, AllocCounts, TimedAlloc};
+use armd::driver::{
+    ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, TorqueOutcome,
+    TorqueProgress,
+};
+use armd::model::JointState;
+use armd::motion::{plan_cartesian, prepare_cartesian_path, resolve_goal, GoalSpec, Speed};
+use armd::rt_core::broker::{
+    Authority, ClientId, ImmediateOp, Outcome, Reply, RequestId, Submit, TransitionOp,
+};
+use armd::rt_core::executor::{
+    ExecutorClock, ExecutorConfig, ParkedAlloc, PersistTestHooks, RtExecutorHandle, TailAllocProbe,
+    DIAG_RING_CAPACITY, ESTOP_ACK_CAPACITY,
+};
+use armd::rt_core::ops::{CoreOps, PlanSlot, Primitive};
+use armd::supervisor::PendingZeroCheckPersist;
+use armd::{ArmConfig, ArmSupervisor};
+
+#[global_allocator]
+static ALLOC: TimedAlloc = TimedAlloc;
+
+// ============================================================================
+// Deterministic Scripted Clock & Allocation-Free Wake Driver
+// ============================================================================
+
+struct ScriptedClock {
+    base: Instant,
+    state: Mutex<ClockState>,
+    cv: Condvar,
+}
+
+struct ClockState {
+    now_ns: u64,
+    limit_ns: u64,
+    waiting_for_ns: Option<u64>,
+}
+
+impl ScriptedClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            state: Mutex::new(ClockState {
+                now_ns: 0,
+                limit_ns: 0,
+                waiting_for_ns: None,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn run_steps(&self, period_ns: u64, steps: u64) {
+        let mut s = self.state.lock().unwrap();
+        let target = s.limit_ns + period_ns * steps;
+        s.limit_ns = target;
+        let expect_park = target + period_ns;
+        self.cv.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.waiting_for_ns != Some(expect_park) {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "timed out waiting for scripted clock park at {expect_park} ns (now={}, limit={}, wait={:?})",
+                s.now_ns,
+                s.limit_ns,
+                s.waiting_for_ns
+            );
+            let (next, _) = self.cv.wait_timeout(s, rem).unwrap();
+            s = next;
+        }
+    }
+}
+
+impl ExecutorClock for ScriptedClock {
+    fn now(&self) -> Instant {
+        self.base + Duration::from_nanos(self.state.lock().unwrap().now_ns)
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.state.lock().unwrap().now_ns
+    }
+
+    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if s.now_ns >= target_ns {
+            self.cv.notify_all();
+            return false;
+        }
+        while !stop.load(Ordering::Acquire) && s.now_ns < target_ns && s.limit_ns < target_ns {
+            s.waiting_for_ns = Some(target_ns);
+            self.cv.notify_all();
+            s = self.cv.wait(s).unwrap();
+        }
+        s.waiting_for_ns = None;
+        if !stop.load(Ordering::Acquire) && s.now_ns < target_ns {
+            s.now_ns = target_ns;
+        }
+        self.cv.notify_all();
+        true
+    }
+
+    fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let mut s = self.state.lock().unwrap();
+        s.now_ns = s.now_ns.saturating_add(dur.as_nanos().min(u128::from(u64::MAX)) as u64);
+        self.cv.notify_all();
+    }
+
+    fn wake(&self) {
+        let _g = self.state.lock().unwrap();
+        self.cv.notify_all();
+    }
+}
+
+/// Allocation-free driver supporting real sub-release torque confirmation wakes and
+/// optionally failing torque transitions on demand (for B3-blocked ignored tests).
+struct WakeDriver {
+    dof: usize,
+    q: Vec<f32>,
+    enabled: bool,
+    rx_at: Vec<Option<Instant>>,
+    seqs: Vec<u64>,
+    pending_target: Option<(bool, Instant)>,
+    confirm_delay: Duration,
+    clock: Option<Arc<ScriptedClock>>,
+    fail_next_enable: Arc<AtomicBool>,
+}
+
+impl WakeDriver {
+    fn new(dof: usize, confirm_delay: Duration, clock: Option<Arc<ScriptedClock>>) -> (Self, Arc<AtomicBool>) {
+        let fail_next_enable = Arc::new(AtomicBool::new(false));
+        let now = clock.as_ref().map_or_else(Instant::now, |c| c.now());
+        (
+            Self {
+                dof,
+                q: vec![0.0; dof],
+                enabled: false,
+                rx_at: vec![Some(now); dof],
+                seqs: vec![1; dof],
+                pending_target: None,
+                confirm_delay,
+                clock,
+                fail_next_enable: fail_next_enable.clone(),
+            },
+            fail_next_enable,
+        )
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.as_ref().map_or_else(Instant::now, |c| c.now())
+    }
+}
+
+impl ArmDriver for WakeDriver {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: true,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        }
+    }
+
+    fn supports_rt_executor(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    fn clock_now(&self) -> Instant {
+        self.now()
+    }
+
+    fn enable_state(&self) -> EnableState {
+        if self.enabled {
+            EnableState::Enabled
+        } else {
+            EnableState::Disabled
+        }
+    }
+
+    fn is_feedback_valid(&self) -> bool {
+        true
+    }
+
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        let now = self.now();
+        self.rx_at.iter().map(|t| t.map(|t| now.saturating_duration_since(t))).collect()
+    }
+
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        self.rx_at.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.seqs.clone()
+    }
+
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        self.rx_at.clone()
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        let now = self.now();
+        out.clear();
+        for t in &self.rx_at {
+            out.push(t.map(|t| now.saturating_duration_since(t)));
+        }
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        let now = self.now();
+        self.rx_at.len() == dof
+            && self.rx_at.iter().all(|t| t.is_some_and(|t| now.saturating_duration_since(t) <= max_age))
+    }
+
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        let now = self.now();
+        out.clear();
+        for t in &self.rx_at {
+            out.push(t.map(|t| now.saturating_duration_since(t).as_millis() as u64));
+        }
+    }
+
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        out.extend_from_slice(&self.rx_at);
+    }
+
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend_from_slice(&self.seqs);
+    }
+
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+        out.extend_from_slice(&self.rx_at);
+    }
+
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let mut out = Vec::with_capacity(self.dof);
+        self.read_joint_states_into(&mut out)?;
+        Ok(out)
+    }
+
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        let now = self.now();
+        out.clear();
+        for i in 0..self.dof {
+            out.push(JointState {
+                position: self.q[i],
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 30.0,
+            });
+            self.rx_at[i] = Some(now);
+            self.seqs[i] += 1;
+        }
+        Ok(())
+    }
+
+    fn read_joint_states_budgeted(
+        &mut self,
+        out: &mut Vec<JointState>,
+        _deadline: Instant,
+        _max_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        self.read_joint_states_into(out)?;
+        Ok((self.dof as u16, false))
+    }
+
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        for (i, t) in targets.iter().enumerate().take(self.dof) {
+            self.q[i] = t.position;
+        }
+        Ok(())
+    }
+
+    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+        self.enabled = enable;
+        Ok(())
+    }
+
+    fn begin_torque_budgeted(
+        &mut self,
+        enable: bool,
+        _max_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        let wake = self.now() + self.confirm_delay;
+        self.pending_target = Some((enable, wake));
+        Ok(TorqueProgress::Pending { wake })
+    }
+
+    fn poll_torque_budgeted(
+        &mut self,
+        _deadline: Instant,
+        _max_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        let Some((target, wake)) = self.pending_target else {
+            return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+        };
+        if self.now() < wake {
+            return Ok(TorqueProgress::Pending { wake });
+        }
+        self.pending_target = None;
+        if target && self.fail_next_enable.swap(false, Ordering::AcqRel) {
+            return Err(ArmDriverError::Timeout(1));
+        }
+        self.enabled = target;
+        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+
+    fn abort_enable(&mut self) {
+        if matches!(self.pending_target, Some((true, _))) {
+            self.pending_target = None;
+        }
+    }
+
+    fn torque_transition_pending(&self) -> bool {
+        self.pending_target.is_some()
+    }
+}
+
+fn alloc_cfg(period: Duration) -> ExecutorConfig {
+    let mut cfg = ExecutorConfig::for_tests(period);
+    cfg.alloc_timing = true;
+    cfg
+}
+
+async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(pred(), "timed out waiting for predicate after {timeout:?}");
+}
+
+fn pause_hub(sup: &Arc<ArmSupervisor>) -> (mpsc::SyncSender<()>, thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = mpsc::sync_channel::<()>(1);
+    let (rel_tx, rel_rx) = mpsc::sync_channel::<()>(1);
+    let hub = sup.hub().clone();
+    let jh = thread::spawn(move || {
+        let _guard = hub.reader_guard();
+        let _ = held_tx.send(());
+        let _ = rel_rx.recv();
+    });
+    held_rx.recv_timeout(Duration::from_secs(2)).expect("acquire hub reader_guard");
+    (rel_tx, jh)
+}
+
+fn drain_broker(handle: &RtExecutorHandle) -> Vec<Reply> {
+    let mut out = Vec::new();
+    handle.broker().lock().unwrap().poll(|_, r| {
+        out.push(r);
+        true
+    });
+    out
+}
+
+fn sample_persist_job(action_id: u64, dir: &std::path::Path) -> PendingZeroCheckPersist {
+    PendingZeroCheckPersist {
+        action_id,
+        offset_rad: 0.01,
+        jaw_opening: None,
+        base_revision: 1,
+        lease_owner: None,
+        operator_auth: None,
+        write: armd::persist::PendingWrite::new(
+            dir.join(format!("gripper_calib_{action_id}.json")),
+            format!("{{\"offset_rad\":0.01,\"action\":{action_id}}}\n"),
+        ),
+        base_gripper_policy: Some(armd::model::GripperPolicy::rebot_dm()),
+        current_calib_jaw: None,
+        gripper_limit: None,
+        active_tool_is_stock: true,
+    }
+}
+
+// ============================================================================
+// 1. Per-op TimedAlloc unit verification
+// ============================================================================
+
+#[test]
+fn timed_alloc_counts_all_four_ops_independently_of_take() {
+    thread::spawn(|| {
+        // Non-opted-in thread stays zero across all four ops.
+        let p = ParkedAlloc::new_alloc(64);
+        let z = ParkedAlloc::new_alloc_zeroed(64);
+        let p = p.realloc_to(128);
+        drop(p);
+        drop(z);
+        assert_eq!(alloc::snapshot_counts(), AllocCounts::ZERO);
+
+        alloc::time_this_thread();
+        let c0 = alloc::snapshot_counts();
+        let _ = alloc::take();
+
+        let p = ParkedAlloc::new_alloc(64);
+        let c1 = alloc::snapshot_counts();
+        assert_eq!(c1.delta_since(c0), AllocCounts { alloc: 1, alloc_zeroed: 0, realloc: 0, dealloc: 0 });
+
+        // Mid-window `alloc::take()` resets AllocTotals without resetting monotonic snapshot_counts.
+        let taken = alloc::take();
+        assert_eq!(taken.calls, 1);
+        assert_eq!(alloc::take().calls, 0);
+        assert_eq!(alloc::snapshot_counts(), c1);
+
+        let z = ParkedAlloc::new_alloc_zeroed(64);
+        let c2 = alloc::snapshot_counts();
+        assert_eq!(c2.delta_since(c1), AllocCounts { alloc: 0, alloc_zeroed: 1, realloc: 0, dealloc: 0 });
+
+        let p = p.realloc_to(128);
+        let c3 = alloc::snapshot_counts();
+        assert_eq!(c3.delta_since(c2), AllocCounts { alloc: 0, alloc_zeroed: 0, realloc: 1, dealloc: 0 });
+
+        drop(p);
+        drop(z);
+        let c4 = alloc::snapshot_counts();
+        assert_eq!(c4.delta_since(c3), AllocCounts { alloc: 0, alloc_zeroed: 0, realloc: 0, dealloc: 2 });
+        assert_eq!(
+            c4.delta_since(c0),
+            AllocCounts { alloc: 1, alloc_zeroed: 1, realloc: 1, dealloc: 2 }
+        );
+    })
+    .join()
+    .unwrap();
+}
+
+// ============================================================================
+// 2. Positive controls: exact counts in release tail (incl. saturated diag) & wake
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn positive_controls_detect_exact_ops_in_release_tail_saturated_diag_and_wakes() {
+    let clock = ScriptedClock::new();
+    // 14 ms confirm delay on a 10 ms period: Step 3 starts at T, Step 2 at T+10ms returns
+    // Pending{wake: T+14ms} < deadline T+20ms, firing a real sub-release wake at T+14ms.
+    let (drv, _) = WakeDriver::new(7, Duration::from_millis(14), Some(clock.clone()));
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+
+    let rel_probe: Arc<Mutex<Option<TailAllocProbe>>> = Arc::new(Mutex::new(None));
+    let wake_probe: Arc<Mutex<Option<TailAllocProbe>>> = Arc::new(Mutex::new(None));
+    let hooks = PersistTestHooks {
+        clock: Some(clock.clone()),
+        inject_release_tail_once: Some(rel_probe.clone()),
+        inject_wake_tail_once: Some(wake_probe.clone()),
+        ..Default::default()
+    };
+
+    let period_ns = 10_000_000u64; // 10 ms
+    let handle = sup
+        .start_executor_with_hooks(alloc_cfg(Duration::from_nanos(period_ns)), hooks)
+        .await
+        .unwrap();
+
+    // Baseline: 5 clean releases -> strictly 0 heap ops from release #1 onward!
+    clock.run_steps(period_ns, 5);
+    assert_eq!(handle.stats().completed_releases.load(Ordering::Acquire), 5);
+    assert_eq!(handle.stats().release_allocs.snapshot(), AllocCounts::ZERO);
+    assert_eq!(handle.stats().wake_allocs.snapshot(), AllocCounts::ZERO);
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    // (a) Release-tail exact controls: alloc, zeroed alloc, realloc, final free, alloc+final free.
+    let park = Arc::new(Mutex::new(None::<ParkedAlloc>));
+    let run_rel_probe = |probe: TailAllocProbe| -> AllocCounts {
+        let before = handle.stats().release_allocs.snapshot();
+        *rel_probe.lock().unwrap() = Some(probe);
+        clock.run_steps(period_ns, 1);
+        let after = handle.stats().release_allocs.snapshot();
+        after.delta_since(before)
+    };
+
+    assert_eq!(
+        run_rel_probe(TailAllocProbe::AllocOnce { park: park.clone() }),
+        AllocCounts { alloc: 1, alloc_zeroed: 0, realloc: 0, dealloc: 0 }
+    );
+    let parked_for_realloc = park.lock().unwrap().take().expect("parked alloc");
+
+    assert_eq!(
+        run_rel_probe(TailAllocProbe::AllocZeroedOnce { park: park.clone() }),
+        AllocCounts { alloc: 0, alloc_zeroed: 1, realloc: 0, dealloc: 0 }
+    );
+    let _drop_zeroed_off_thread = park.lock().unwrap().take().expect("parked zeroed");
+
+    assert_eq!(
+        run_rel_probe(TailAllocProbe::ReallocOnce { existing: Some(parked_for_realloc), park: park.clone() }),
+        AllocCounts { alloc: 0, alloc_zeroed: 0, realloc: 1, dealloc: 0 }
+    );
+    let parked_for_final_free = park.lock().unwrap().take().expect("parked reallocated");
+
+    assert_eq!(
+        run_rel_probe(TailAllocProbe::FinalFreeLocal { local: Some(parked_for_final_free) }),
+        AllocCounts { alloc: 0, alloc_zeroed: 0, realloc: 0, dealloc: 1 }
+    );
+
+    let prealloc_free = ParkedAlloc::new_alloc(64);
+    assert_eq!(
+        run_rel_probe(TailAllocProbe::AllocAndFinalFreeLocal {
+            local: Some(prealloc_free),
+            park: park.clone(),
+        }),
+        AllocCounts { alloc: 1, alloc_zeroed: 0, realloc: 0, dealloc: 1 }
+    );
+    drop(park.lock().unwrap().take());
+    assert_eq!(handle.stats().wake_allocs.snapshot(), AllocCounts::ZERO);
+
+    // (b) Positive control WHILE `diag_tx` (cap 256) is saturated and dropping samples:
+    // cumulative counters outside the droppable ring MUST still record exact counts!
+    let (rel_hub, hub_jh) = pause_hub(&sup);
+    clock.run_steps(period_ns, DIAG_RING_CAPACITY as u64 + 20);
+    let dropped_before = handle.stats().diag_dropped.load(Ordering::Relaxed);
+    assert!(dropped_before >= 10, "expected diag_dropped >= 10, got {dropped_before}");
+
+    let prealloc_sat = ParkedAlloc::new_alloc(64);
+    let sat_delta = run_rel_probe(TailAllocProbe::AllocAndFinalFreeLocal {
+        local: Some(prealloc_sat),
+        park: park.clone(),
+    });
+    assert_eq!(
+        sat_delta,
+        AllocCounts { alloc: 1, alloc_zeroed: 0, realloc: 0, dealloc: 1 },
+        "cumulative counter must report exact release-tail alloc+free even when TickSample is dropped"
+    );
+    assert!(
+        handle.stats().diag_dropped.load(Ordering::Relaxed) > dropped_before,
+        "confirm the probed release's TickSample was actually dropped by the full diag ring"
+    );
+    drop(park.lock().unwrap().take());
+    rel_hub.send(()).unwrap();
+    hub_jh.join().unwrap();
+
+    // (c) Sub-release wake controls:
+    // confirm_delay = 4ms on a 10ms period -> wake fires 4ms into the release!
+    let submit_transition = |seq: u64, op: TransitionOp| -> RequestId {
+        let now = clock.now();
+        let auth = Authority {
+            lease_generation: 0,
+            epoch: sup.hub().latest().map_or(1, |s| s.obs.epoch_id),
+            stop_generation: handle.stop_requests().current(),
+            config_revision: 0,
+            parent_generation: 0,
+        };
+        handle
+            .broker()
+            .lock()
+            .unwrap()
+            .submit(ClientId(1), seq, auth, now + Duration::from_secs(5), Submit::Transition(op))
+            .unwrap()
+    };
+
+    // Normal wake -> 0 allocs/frees in BOTH release and wake windows!
+    let rel_before_clean = handle.stats().release_allocs.snapshot();
+    let wake_before_clean = handle.stats().wake_allocs.snapshot();
+    let wakes_before = handle.stats().completed_wakes.load(Ordering::Acquire);
+    let r1 = submit_transition(1, TransitionOp::TorqueOn);
+    clock.run_steps(period_ns, 3);
+    let replies1 = drain_broker(&handle);
+    assert!(replies1.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == r1)), "{replies1:?}");
+    assert!(handle.stats().completed_wakes.load(Ordering::Acquire) > wakes_before, "expected >= 1 real sub-release wake");
+    assert_eq!(handle.stats().release_allocs.snapshot().delta_since(rel_before_clean), AllocCounts::ZERO);
+    assert_eq!(handle.stats().wake_allocs.snapshot().delta_since(wake_before_clean), AllocCounts::ZERO);
+
+    // Wake tail positive control: inject 1 alloc + 1 final free in wake ->
+    // MUST increment `wake_allocs` by (1,0,0,1) AND leave `release_allocs` delta at ZERO (disjoint)!
+    let rel_before_probe = handle.stats().release_allocs.snapshot();
+    let wake_before_probe = handle.stats().wake_allocs.snapshot();
+    let wake_calls_before = handle.stats().wake_alloc_calls.load(Ordering::Acquire);
+    let total_before_probe = handle.stats().total_allocs();
+    *wake_probe.lock().unwrap() = Some(TailAllocProbe::AllocAndFinalFreeLocal {
+        local: Some(ParkedAlloc::new_alloc(64)),
+        park: park.clone(),
+    });
+    let r2 = submit_transition(2, TransitionOp::TorqueOff);
+    clock.run_steps(period_ns, 3);
+    let replies2 = drain_broker(&handle);
+    assert!(replies2.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == r2)), "{replies2:?}");
+    assert_eq!(
+        handle.stats().wake_allocs.snapshot().delta_since(wake_before_probe),
+        AllocCounts { alloc: 1, alloc_zeroed: 0, realloc: 0, dealloc: 1 }
+    );
+    assert_eq!(
+        handle.stats().release_allocs.snapshot().delta_since(rel_before_probe),
+        AllocCounts::ZERO,
+        "wake allocation must NOT double-count into release_allocs"
+    );
+    assert_eq!(
+        handle.stats().total_allocs().delta_since(total_before_probe),
+        AllocCounts { alloc: 1, alloc_zeroed: 0, realloc: 0, dealloc: 1 }
+    );
+    assert_eq!(handle.stats().wake_alloc_calls.load(Ordering::Acquire) - wake_calls_before, 2);
+    drop(park.lock().unwrap().take());
+
+    // Also verify `AllocZeroedOnce` and `ReallocOnce` in sub-release wakes.
+    let wake_before_z = handle.stats().wake_allocs.snapshot();
+    *wake_probe.lock().unwrap() = Some(TailAllocProbe::AllocZeroedOnce { park: park.clone() });
+    let r3 = submit_transition(3, TransitionOp::TorqueOn);
+    clock.run_steps(period_ns, 3);
+    let _ = drain_broker(&handle);
+    let _ = r3;
+    assert_eq!(
+        handle.stats().wake_allocs.snapshot().delta_since(wake_before_z),
+        AllocCounts { alloc: 0, alloc_zeroed: 1, realloc: 0, dealloc: 0 }
+    );
+    let z_buf = park.lock().unwrap().take().expect("parked zeroed from wake");
+
+    let wake_before_r = handle.stats().wake_allocs.snapshot();
+    *wake_probe.lock().unwrap() = Some(TailAllocProbe::ReallocOnce { existing: Some(z_buf), park: park.clone() });
+    let _r4 = submit_transition(4, TransitionOp::TorqueOff);
+    clock.run_steps(period_ns, 3);
+    let _ = drain_broker(&handle);
+    assert_eq!(
+        handle.stats().wake_allocs.snapshot().delta_since(wake_before_r),
+        AllocCounts { alloc: 0, alloc_zeroed: 0, realloc: 1, dealloc: 0 }
+    );
+    drop(park.lock().unwrap().take());
+
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 3. Stalled-consumer matrix: normal & refused commits, urgent stop, terminal
+//    retirement, contended observation prewarm, and saturated observation/diag
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_consumers_normal_refused_commits_urgent_stop_terminal_retirement_and_obs_diag_saturation() {
+    let clock = ScriptedClock::new();
+    // 14 ms confirm delay on a 10 ms period: Step 3 starts at T, Step 2 at T+10ms returns
+    // Pending{wake: T+14ms} < deadline T+20ms, firing a real sub-release wake at T+14ms.
+    let (drv, _) = WakeDriver::new(7, Duration::from_millis(14), Some(clock.clone()));
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    // Prepare a valid Cartesian path off-thread BEFORE transferring ownership.
+    let (cart_slot, start_pos, init_epoch) = {
+        let mut inner = sup.inner().write().await;
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+        inner.tick(0.02);
+        let input = inner.plan_input().unwrap();
+        let p0 = armd::motion::start_pose(&input).p;
+        let goal = resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.02, p0[1], p0[2]], r: None });
+        let path = plan_cartesian(&input, goal, Speed::default()).unwrap();
+        let snap = inner.planning_snapshot(&armd::rt_core::ops::CommitCtx {
+            arm: armd::rt_core::ids::ArmId::LOCAL,
+            boot: armd::rt_core::broker::BootId(1),
+            now: clock.now(),
+            stop_generation: 0,
+        });
+        let slot = prepare_cartesian_path(&snap, &path, None).unwrap();
+        let start = inner.commanded_positions.clone();
+        let ep = inner.safety.epoch_id();
+        (slot, start, ep)
+    };
+
+    // Hold `hub.reader_guard()` BEFORE `start_executor` to prove contended startup prewarm
+    // never blocks AND keeps release #1 onward at 0 heap ops across slot rotation!
+    let (rel_hub, hub_jh) = pause_hub(&sup);
+    let period_ns = 10_000_000u64;
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+    let seq0 = sup.hub().published_seq();
+    clock.run_steps(period_ns, 4);
+    assert!(sup.hub().published_seq() >= seq0 + 4, "publication must advance while reader_guard is held");
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "contended startup releases must not allocate");
+
+    let base_auth = |stop_gen: u64| Authority {
+        lease_generation: 0,
+        epoch: init_epoch,
+        stop_generation: stop_gen,
+        config_revision: 0,
+        parent_generation: 0,
+    };
+
+    // (a) Refused commits while consumers are stalled (expired deadline, wrong epoch, stale start).
+    let now = clock.now();
+    let expired_dl = now.checked_sub(Duration::from_millis(5)).unwrap_or(now);
+    let r_exp = handle.broker().lock().unwrap()
+        .submit(ClientId(1), 1, base_auth(0), expired_dl, Submit::Immediate(ImmediateOp::Heartbeat))
+        .unwrap();
+    let r_ep = handle.broker().lock().unwrap()
+        .submit(ClientId(1), 2, Authority { epoch: init_epoch + 99, ..base_auth(0) }, now + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOff))
+        .unwrap();
+    let mut bad_start = start_pos.clone();
+    bad_start[0] += 0.5;
+    let stale_prim = Primitive::joint_quintic(&bad_start, &start_pos, 0.2).unwrap();
+    let r_stale = handle.broker().lock().unwrap()
+        .submit(ClientId(1), 3, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| s.set(stale_prim)))
+        .unwrap();
+
+    // (b) Normal commits: prepared Cartesian path (pinned PlanSlotRef) -> superseded by JointQuintic -> authorized urgent stop!
+    let r_cart = handle.broker().lock().unwrap()
+        .submit(ClientId(1), 4, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&cart_slot).unwrap()))
+        .unwrap();
+    let mut q_jog = start_pos.clone();
+    q_jog[0] += 0.04;
+    let jog_prim = Primitive::joint_quintic(&start_pos, &q_jog, 0.2).unwrap();
+    let r_jog = handle.broker().lock().unwrap()
+        .submit(ClientId(1), 5, base_auth(0), now + Duration::from_secs(5), Submit::Install(&move |s: &mut PlanSlot| s.set(jog_prim)))
+        .unwrap();
+
+    // Advance 5 releases so all 5 descriptors commit/refuse while broker & hub stay stalled!
+    clock.run_steps(period_ns, 5);
+
+    // Issue authorized urgent stop while `r_jog` is active and all consumers stay stalled!
+    let stop_gen = handle.stop_requests().request();
+    clock.run_steps(period_ns, 4);
+    assert_eq!(handle.stop_requests().applied(), stop_gen);
+
+    // (c) Saturate diagnostics ring (> 256 releases) while observation hub + broker stay stalled!
+    clock.run_steps(period_ns, DIAG_RING_CAPACITY as u64 + 30);
+    assert!(
+        handle.stats().diag_dropped.load(Ordering::Relaxed) >= 25,
+        "expected diag_dropped >= 25 under stalled dispatcher"
+    );
+    assert!(
+        sup.hub().published_seq() >= seq0 + DIAG_RING_CAPACITY as u64 + 40,
+        "publication must keep advancing across full obs/diag/broker stall"
+    );
+    assert_eq!(sup.hub().tick_frees(), 0, "observation triple buffer must never free on RT");
+    assert_eq!(
+        handle.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "stalled consumers across commits/refusals/supersession/urgent-stop/saturation must perform 0 heap ops"
+    );
+
+    // Unstall observation hub (rotates consumer's front slot back into producer!) & poll broker:
+    rel_hub.send(()).unwrap();
+    hub_jh.join().unwrap();
+    let latest_obs = sup.hub().latest().expect("published snapshot after unstall");
+    assert!(latest_obs.meta.seq >= seq0 + DIAG_RING_CAPACITY as u64 + 40);
+
+    // Run additional releases AFTER slot 2 rotated in -> still 0 heap ops (proves off-thread front prewarm)!
+    clock.run_steps(period_ns, 6);
+    assert_eq!(
+        handle.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "post-unstall slot rotation must remain 0 heap ops on armd-control"
+    );
+
+    // Poll broker off-thread and verify exact replies + plan-slot reclamation!
+    let replies = drain_broker(&handle);
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "DEADLINE_EXPIRED" } if *request == r_exp)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "EPOCH_MISMATCH" } if *request == r_ep)), "{replies:?}");
+    assert!(replies.iter().any(|r| matches!(r, Reply::Refused { request, code: "PLAN_STALE" } if *request == r_stale)), "{replies:?}");
+    // Verify post-publish supersession ordering: Terminal(r_cart, Superseded) precedes Ack(r_jog),
+    // followed by Terminal(r_jog, Stopped)!
+    let idx_sup = replies.iter().position(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Superseded, .. } if *request == r_cart))
+        .expect("cart superseded terminal");
+    let idx_jog_ack = replies.iter().position(|r| matches!(r, Reply::Ack { request, .. } if *request == r_jog))
+        .expect("jog ack");
+    let idx_jog_stop = replies.iter().position(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Stopped, .. } if *request == r_jog))
+        .expect("jog stopped terminal");
+    assert!(idx_sup < idx_jog_ack && idx_jog_ack < idx_jog_stop, "wrong ordering: {replies:?}");
+    assert_eq!(
+        handle.broker().lock().unwrap().stats().retired,
+        3,
+        "all 3 staged plan slots (stale + superseded cart + stopped jog) must be reclaimed off-thread"
+    );
+
+    // (d) Normal completion terminal retirement + transition-busy refusal (with stalled consumers):
+    let (rel_hub2, hub_jh2) = pause_hub(&sup);
+    let now2 = clock.now();
+    let cur_q = sup.hub().try_latest();
+    let _ = cur_q;
+    // Submit TorqueOff + concurrent TorqueOn (second gets TRANSITION_BUSY pre-frame refusal!).
+    let auth2 = base_auth(stop_gen);
+    let r_off = handle.broker().lock().unwrap()
+        .submit(ClientId(1), 10, auth2, now2 + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOff))
+        .unwrap();
+    let r_busy = handle.broker().lock().unwrap()
+        .submit(ClientId(1), 11, auth2, now2 + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn))
+        .unwrap();
+    clock.run_steps(period_ns, 5);
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    rel_hub2.send(()).unwrap();
+    hub_jh2.join().unwrap();
+
+    let replies2 = drain_broker(&handle);
+    assert!(replies2.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Completed, .. } if *request == r_off)), "{replies2:?}");
+    assert!(replies2.iter().any(|r| matches!(r, Reply::Refused { request, .. } if *request == r_busy)), "{replies2:?}");
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 4. Saturated E-stop queue (64-slot ring full + overflow) & saturated
+//    persistence queue (4-slot job ring + reply saturation + off-thread reclaim)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_estop_and_persistence_queues_zero_heap_ops_and_off_thread_reclaim() {
+    // (a) Saturated E-stop queue (64-slot ring full + 12 overflows) while `hub.reader_guard()` is
+    // held. Starts already latched in `EStop` so `fill_observation` does not hit B3's
+    // `SafetyManager::fault()` String allocation (`src/safety.rs:368`); off-thread reclamation of
+    // retired heap-bearing `Arc<SafetyState::Fault>` under saturated rings is also proved in
+    // `rt_core::executor::tests::saturated_estop_and_reclaim_rings_retain_retired_fault_and_offload_on_drain_or_exit`.
+    let clock_e = ScriptedClock::new();
+    let sup_e = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let req_ctr = {
+        let mut inner = sup_e.inner().write().await;
+        inner.lease_enabled = false;
+        inner.safety.trigger_e_stop();
+        inner.requested_estop_count.clone()
+    };
+    let period_ns = 10_000_000u64;
+    let h_e = sup_e
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock_e.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+    let (rel_e, jh_e) = pause_hub(&sup_e);
+    let seq_e0 = sup_e.hub().published_seq();
+    for _ in 0..(ESTOP_ACK_CAPACITY + 12) {
+        req_ctr.fetch_add(1, Ordering::SeqCst);
+        clock_e.run_steps(period_ns, 1);
+    }
+    assert_eq!(
+        h_e.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "76 full-ring + overflow Fault E-stops must do 0 heap ops on armd-control"
+    );
+    assert!(sup_e.hub().published_seq() >= seq_e0 + ESTOP_ACK_CAPACITY as u64 + 12);
+    rel_e.send(()).unwrap();
+    jh_e.join().unwrap();
+    h_e.stop_and_join();
+
+    // (b) Saturated persistence queue: pause `armd-persist`, seed a running zero-check action for
+    // job #1 so `armd-persist` completes real `Reserve` + `Activate` after unpause, inject 6
+    // pre-built `PendingZeroCheckPersist` jobs (4 fill `persist_job_tx`, 2 are rejected into
+    // `offload_reclaim_tx` carrying `DropTid` witnesses), verify 0 heap ops on `armd-control`,
+    // advancing publication, UNCONDITIONAL off-thread drop of BOTH rejected jobs AND the Reserve
+    // payload, and full `Reserve` + `Activate` completion on disk (proving `armd-persist` was NOT
+    // terminated by unsolicited replies).
+    let dir = tempfile::tempdir().unwrap();
+    let clock_p = ScriptedClock::new();
+    let sup_p = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup_p.inner().write().await;
+        inner.lease_enabled = false;
+        inner.gripper_calib_path = Some(dir.path().join("gripper_calib_1.json"));
+        inner.last_action = Some(
+            serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "kind": "gripper_zero_check",
+                "state": "running",
+                "progress": 1.0,
+                "started_at": 0.0,
+            }))
+            .expect("valid ActionStatus"),
+        );
+    }
+    let pause_persist = Arc::new(AtomicBool::new(true));
+    let job_slot: Arc<
+        Mutex<Option<(PendingZeroCheckPersist, Option<Box<dyn std::any::Any + Send>>)>>,
+    > = Arc::new(Mutex::new(None));
+    let payload_dropped_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let rej5_dropped_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let rej6_dropped_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    struct DropTid(Arc<Mutex<Option<ThreadId>>>);
+    impl Drop for DropTid {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(thread::current().id());
+        }
+    }
+    let hooks_p = PersistTestHooks {
+        clock: Some(clock_p.clone()),
+        pause_persist_worker: Some(pause_persist.clone()),
+        inject_pending_persist_job_once: Some(job_slot.clone()),
+        payload_drop_probe: Some(Arc::new(Mutex::new(Some(Box::new(DropTid(
+            payload_dropped_on.clone(),
+        )))))),
+        ..Default::default()
+    };
+    let h_p = sup_p
+        .start_executor_with_hooks(alloc_cfg(Duration::from_nanos(period_ns)), hooks_p)
+        .await
+        .unwrap();
+    let exec_tid = h_p.executor_thread_id();
+
+    let (rel_p, jh_p) = pause_hub(&sup_p);
+    let seq_p0 = sup_p.hub().published_seq();
+    for id in 1..=6u64 {
+        let probe: Option<Box<dyn std::any::Any + Send>> = match id {
+            5 => Some(Box::new(DropTid(rej5_dropped_on.clone()))),
+            6 => Some(Box::new(DropTid(rej6_dropped_on.clone()))),
+            _ => None,
+        };
+        *job_slot.lock().unwrap() = Some((sample_persist_job(id, dir.path()), probe));
+        clock_p.run_steps(period_ns, 1);
+    }
+    assert_eq!(
+        h_p.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "saturated persist_job_tx + repeated release-tail job rejections must do 0 heap ops on armd-control"
+    );
+    assert!(sup_p.hub().published_seq() >= seq_p0 + 6);
+    assert!(rej5_dropped_on.lock().unwrap().is_none(), "rejected job #5 must remain alive while hub is paused");
+    assert!(rej6_dropped_on.lock().unwrap().is_none(), "rejected job #6 must remain alive while hub is paused");
+
+    // Unpause persistence worker & hub, allow off-thread drain, rejected-job drop, AND Reserve+Activate!
+    pause_persist.store(false, Ordering::Release);
+    rel_p.send(()).unwrap();
+    jh_p.join().unwrap();
+    let calib_1_path = dir.path().join("gripper_calib_1.json");
+    let mut ticks = 0;
+    while (rej5_dropped_on.lock().unwrap().is_none()
+        || rej6_dropped_on.lock().unwrap().is_none()
+        || payload_dropped_on.lock().unwrap().is_none()
+        || !calib_1_path.exists())
+        && ticks < 80
+    {
+        clock_p.run_steps(period_ns, 1);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        ticks += 1;
+    }
+    let obs_after = sup_p.get_observation().await;
+    h_p.stop_and_join();
+    assert_eq!(
+        h_p.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "post-unpause ticks={ticks} calib_exists={} action={:?} gripper_zero={:?} release={:?} wake={:?}",
+        calib_1_path.exists(),
+        obs_after.action,
+        obs_after.gripper_zero,
+        h_p.stats().release_allocs.snapshot(),
+        h_p.stats().wake_allocs.snapshot(),
+    );
+    let rej5_tid = rej5_dropped_on
+        .lock()
+        .unwrap()
+        .expect("rejected job #5 payload MUST drop off-thread");
+    let rej6_tid = rej6_dropped_on
+        .lock()
+        .unwrap()
+        .expect("rejected job #6 payload MUST drop off-thread");
+    let reserve_tid = payload_dropped_on
+        .lock()
+        .unwrap()
+        .expect("armd-persist Reserve payload MUST drop off-thread");
+    assert_ne!(rej5_tid, exec_tid, "rejected job #5 must not drop on armd-control");
+    assert_ne!(rej6_tid, exec_tid, "rejected job #6 must not drop on armd-control");
+    assert_ne!(reserve_tid, exec_tid, "Reserve payload must not drop on armd-control");
+    assert!(
+        calib_1_path.exists(),
+        "valid queued job #1 must complete Reserve+Activate on armd-persist after rejections"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_start_driverless_default_resting_pose_and_legacy_j6_zero_alloc() {
+    let period_ns = 10_000_000u64;
+
+    // (a) Driverless profile with `zero_reference: Some(...)` and `resting_pose: None`:
+    // default resting pose fallback must be prewarmed before release #1 (0 heap ops on release #1).
+    let mut cfg_no_rest = ArmConfig::rebot_dm();
+    cfg_no_rest.resting_pose = None;
+    let clock_a = ScriptedClock::new();
+    let sup_a = Arc::new(ArmSupervisor::new(cfg_no_rest));
+    sup_a.set_lease_enabled(false).await;
+    let h_a = sup_a
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock_a.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    clock_a.run_steps(period_ns, 5);
+    assert_eq!(h_a.stats().total_allocs(), AllocCounts::ZERO);
+    h_a.stop_and_join();
+
+    // (b) Legacy J6 detection (+90 deg in rest pose) on release #1 must format & log off-thread
+    // (0 heap ops on `armd-control`) while preserving exact JSON message formatting.
+    let clock_b = ScriptedClock::new();
+    let sup_b = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup_b.inner().write().await;
+        inner.lease_enabled = false;
+        inner.commanded_positions[5] = 1.574;
+        inner.measured_positions[5] = 1.574;
+        inner.target_positions[5] = 1.574;
+    }
+    let h_b = sup_b
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock_b.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    clock_b.run_steps(period_ns, 5);
+    assert_eq!(
+        h_b.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "legacy_j6 classification in step_zero_convention must perform 0 heap ops on armd-control"
+    );
+    h_b.stop_and_join();
+
+    // Verify off-thread JSON serialization still renders the exact legacy_j6 warning text.
+    let zc = armd::joint_zero::check_convention(
+        &[0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052],
+        &[0.0; 7],
+        &[0.15, 0.08, 0.08, 0.08, 0.08, 0.08],
+    )
+    .expect("legacy_j6 verdict");
+    let v = serde_json::to_value(zc).unwrap();
+    assert_eq!(v["status"], "legacy_j6");
+    assert!(
+        v["message"].as_str().unwrap().contains("J6 reads 90.2 deg"),
+        "unexpected legacy_j6 JSON: {v}"
+    );
+}
+
+// ============================================================================
+// 5. Post-B3 unblocked proofs (first E-stop, ClearFault refusal, LogWriter)
+//    + remaining blocked allocations (driver_transitions enable fail, A8 actions.rs).
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_idle_to_estop_transition_zero_alloc() {
+    let clock = ScriptedClock::new();
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    sup.set_lease_enabled(false).await;
+    let req_ctr = sup.inner().read().await.requested_estop_count.clone();
+    let period_ns = 10_000_000u64;
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    clock.run_steps(period_ns, 3);
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    let snap0 = sup.hub().latest().expect("initial published observation");
+    assert_eq!(snap0.obs.safety_state, armd::safety::SafetyState::Idle);
+    let epoch0 = snap0.obs.epoch_id;
+
+    req_ctr.fetch_add(1, Ordering::SeqCst);
+    clock.run_steps(period_ns, 3);
+    let snap1 = sup.hub().latest().expect("post-estop published observation");
+    assert_eq!(
+        snap1.obs.safety_state,
+        armd::safety::SafetyState::EStop,
+        "first E-stop request must transition Idle -> EStop"
+    );
+    assert!(snap1.obs.epoch_id > epoch0, "E-stop latch must advance safety epoch ({} <= {epoch0})", snap1.obs.epoch_id);
+    let counts = handle.stats().total_allocs();
+    handle.stop_and_join();
+    assert_eq!(counts, AllocCounts::ZERO, "first Idle->EStop allocated: {counts:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_fault_refusal_zero_alloc() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.temperatures[0] = 95.0;
+        inner.safety.latch(
+            armd::safety::FaultKind::ThermalTrip,
+            armd::safety::FaultDetail::from_reason(
+                armd::safety::FaultCode::ThermalTrip,
+                &armd::safety::FaultReason::ThermalTrip { joint_idx: 0, temperature: 95.0, limit: 85.0 },
+            ),
+        );
+    }
+    let handle = sup.start_executor(alloc_cfg(Duration::from_millis(5))).await.unwrap();
+    wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= 4).await;
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    let err = handle
+        .clear_fault_async()
+        .await
+        .unwrap()
+        .expect_err("expected ClearFault refusal while ThermalTrip temperature exceeds cooldown");
+    let expected = armd::safety::SafetyError::from(armd::safety::ClearFaultError::from(
+        armd::safety::ClearRefusal::TemperatureAboveThreshold,
+    ));
+    assert_eq!(err, expected, "expected exact driverless TemperatureAboveThreshold refusal");
+    let after = handle.stats().completed_releases.load(Ordering::Acquire);
+    wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= after + 2).await;
+    let snap = sup.hub().latest().expect("published observation after ClearFault refusal");
+    assert!(
+        matches!(
+            snap.obs.safety_state,
+            armd::safety::SafetyState::Fault(armd::safety::FaultReason::ThermalTrip { .. })
+        ),
+        "ThermalTrip fault must remain latched after refusal: {:?}",
+        snap.obs.safety_state
+    );
+    let counts = handle.stats().total_allocs();
+    handle.stop_and_join();
+    assert_eq!(counts, AllocCounts::ZERO, "ClearFault refusal allocated: {counts:?}");
+}
+
+#[test]
+fn logwriter_tracing_on_rt_zero_alloc() {
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    thread::spawn(|| {
+        let sink = SharedBuf::default();
+        let captured = Arc::clone(&sink.0);
+        let writer = armd::diagnostics::logwriter::NonBlocking::spawn_unregistered("b2-test", sink, 64).unwrap();
+        let sub = tracing_subscriber::fmt().with_writer(writer.clone()).with_ansi(false).finish();
+        let _guard = tracing::subscriber::set_default(sub);
+        tracing::callsite::rebuild_interest_cache();
+        let mut inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.safety.set_off_thread_reclaim(true);
+        alloc::time_this_thread();
+        let before = alloc::snapshot_counts();
+        inner.safety.trigger_e_stop();
+        let delta = alloc::snapshot_counts().delta_since(before);
+        assert_eq!(delta, AllocCounts::ZERO, "safety log via LogWriter allocated: {delta:?}");
+
+        // Verify the E-stop log event was actually queued, drained off the measured path,
+        // and delivered to the underlying writer sink.
+        let ev = inner.safety.pop_log_event().expect("deferred E-stop log event must be queued");
+        ev.emit();
+        assert!(writer.flush(Duration::from_secs(2)), "LogWriter failed to flush deferred event");
+        let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("Safety: Idle -> EStop"), "expected E-stop log in sink, got: {text:?}");
+    })
+    .join()
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "still allocates after B3: enable_step_failed allocates String via e.to_string() at src/supervisor/driver_transitions.rs:1509 and enable_failed_budgeted allocates format!()/SafetyError::ClearFaultRejected(String) at src/supervisor/driver_transitions.rs:1156,1163"]
+async fn b3_blocked_torque_transition_failure_zero_alloc() {
+    let clock = ScriptedClock::new();
+    let (drv, fail_next) = WakeDriver::new(7, Duration::from_millis(4), Some(clock.clone()));
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    let period_ns = 10_000_000u64;
+    let handle = sup
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    clock.run_steps(period_ns, 3);
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    fail_next.store(true, Ordering::Release);
+    let now = clock.now();
+    let auth = Authority {
+        lease_generation: 0,
+        epoch: sup.hub().latest().map_or(1, |s| s.obs.epoch_id),
+        stop_generation: handle.stop_requests().current(),
+        config_revision: 0,
+        parent_generation: 0,
+    };
+    let _req = handle
+        .broker()
+        .lock()
+        .unwrap()
+        .submit(ClientId(1), 1, auth, now + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn))
+        .unwrap();
+    clock.run_steps(period_ns, 4);
+    let counts = handle.stats().total_allocs();
+    handle.stop_and_join();
+    assert_eq!(counts, AllocCounts::ZERO, "transition failure allocated: {counts:?}");
+}
+
+#[test]
+#[ignore = "blocked on A8/C: gripper zero_check(store_offset=true) builds candidate and serializes JSON at src/supervisor/actions.rs:197-216 plus saturation error Strings at :222-223 (and PendingZeroCheckPersist at :233-246 when capacity is available); config commits remain gated until A8/A9"]
+fn a8_blocked_zero_check_store_offset_serialization_zero_alloc() {
+    thread::spawn(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.lease_enabled = false;
+        inner.gripper_calib_path = Some(dir.path().join("calib.json"));
+        inner.defer_zero_check_persist = true;
+        inner.persist_capacity_available = false;
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+        let epoch = inner.safety.epoch_id();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper_zero_check(
+            admitted,
+            &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}),
+            epoch,
+        )
+        .unwrap();
+        alloc::time_this_thread();
+        let before = alloc::snapshot_counts();
+        inner.finish_action(id, "done", None, None, None, None, None);
+        let delta = alloc::snapshot_counts().delta_since(before);
+        assert_eq!(delta, AllocCounts::ZERO, "zero_check(store_offset=true) allocated on RT: {delta:?}");
+    })
+    .join()
+    .unwrap();
+}

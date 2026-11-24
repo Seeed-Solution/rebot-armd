@@ -624,11 +624,11 @@ fn supervisor_tick_publish_with_damiao_tx_instrumentation_does_not_allocate() {
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, Some(2.0), Some(epoch))) } }.expect("jog");
     for _ in 0..5 {
         let _ = inner.tick_publish(0.02, 1, false);
         let _ = inner.core.hub().latest();
@@ -994,7 +994,9 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
         inner.lease_enabled = false;
         inner.tick(0.02);
-        inner.set_torque(true).expect("arm");
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).expect("arm");
         inner.rt_executor_owned = true;
         inner.safety.set_off_thread_reclaim(true);
         for _ in 0..5 {
@@ -1136,7 +1138,9 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
 
     // (e) Active gravity-comp tick on a fresh warmed-up SupervisorInner with DamiaoArmDriver<SharedNoAllocBus>.
     let (mut gc_inner, _gc_bus) = mk_rt_supervisor();
-    gc_inner.enter_gravity_comp(Default::default()).expect("enter gravity comp");
+    let stamp = gc_inner.current_admission_stamp();
+    let admitted = gc_inner.check_admission(stamp).unwrap();
+    SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
     // Advance past ramp_in_s (1.0 s) and warm up one Active tick across all triple-buffer slots.
     for _ in 0..60 {
         let _ = gc_inner.tick_publish(0.02, 1, false);
@@ -1158,9 +1162,16 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     //     — whole release must do 0 allocs, 0 frees!
     let (mut jog_inner, jog_bus) = mk_rt_supervisor();
     let epoch = jog_inner.safety.epoch_id();
-    let (_, jog_id, _) = jog_inner
-        .jog_action(vec![0.15, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(epoch), "joint_move")
-        .expect("start jog");
+    let stamp = jog_inner.current_admission_stamp();
+    let admitted = jog_inner.check_admission(stamp).unwrap();
+    let (_, jog_id, _) = SupervisorInner::jog_action(
+        admitted,
+        vec![0.15, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+        Some(1.0),
+        Some(epoch),
+        "joint_move",
+    )
+    .expect("start jog");
     // Warm up running action across all 3 triple-buffer slots before counting.
     for _ in 0..4 {
         let _ = jog_inner.tick_publish(0.02, 1, false);
@@ -1305,16 +1316,23 @@ fn rt_j7_pos_force_staleness_macro_retire_and_throttled_hold_error_zero_alloc() 
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm pos-force");
+    {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit arm");
+        SupervisorInner::enable_torque(admitted).expect("arm pos-force");
+    }
     inner.rt_executor_owned = true;
     inner.safety.set_off_thread_reclaim(true);
 
     // Start a real running RT macro (`MacroRun`) so its retirement on J7_FEEDBACK_STALE is
     // proven zero-alloc and zero-free on the control thread.
     let ep = inner.safety.epoch_id();
-    let macro_id = inner
-        .begin_sequence_action(Some("rt-j7-macro".into()), ep)
-        .expect("begin macro");
+    let macro_id = {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit macro");
+        SupervisorInner::begin_sequence_action(admitted, Some("rt-j7-macro".into()), ep)
+            .expect("begin macro")
+    };
     assert!(inner.macro_run.is_some());
 
     // Warm up triple-buffer observation slots with running macro before counting.
@@ -1443,16 +1461,23 @@ fn rt_macro_retirement_saturation_applies_admission_backpressure_with_zero_alloc
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm pos-force");
+    {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit arm");
+        SupervisorInner::enable_torque(admitted).expect("arm pos-force");
+    }
     inner.rt_executor_owned = true;
     inner.safety.set_off_thread_reclaim(true);
 
     // Fill 7 of 8 `retired_macro_runs` slots via real admission + macro stop (no off-thread drain).
     for i in 0..7 {
         let ep = inner.safety.epoch_id();
-        let _id = inner
-            .begin_sequence_action(Some(format!("fill-{i}")), ep)
-            .expect("admit while slots available");
+        let _id = {
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit fill");
+            SupervisorInner::begin_sequence_action(admitted, Some(format!("fill-{i}")), ep)
+                .expect("admit while slots available")
+        };
         if let Some(m) = inner.macro_run.as_mut() {
             m.phase = Some("approach-heap-phase".into());
             m.sub = SubState::Failed {
@@ -1467,9 +1492,12 @@ fn rt_macro_retirement_saturation_applies_admission_backpressure_with_zero_alloc
 
     // Admit the 8th (final-capacity) heap-backed MacroRun and warm triple-buffer slots.
     let ep = inner.safety.epoch_id();
-    let _last_id = inner
-        .begin_sequence_action(Some("slot-8-macro".into()), ep)
-        .expect("admit 8th macro");
+    let _last_id = {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit 8th");
+        SupervisorInner::begin_sequence_action(admitted, Some("slot-8-macro".into()), ep)
+            .expect("admit 8th macro")
+    };
     // Expire the legacy-populated `previous_action` (with `phase_ms` BTreeMap from `request_macro_stop`)
     // before measuring RT control-thread allocs/frees for the 8th macro's retirement.
     inner.previous_action = None;
@@ -1534,12 +1562,19 @@ fn rt_macro_retirement_saturation_applies_admission_backpressure_with_zero_alloc
     }
     let _ = inner.tick_publish(0.02, 1, false);
     inner.clear_fault().expect("clear J7 fault");
-    inner.set_torque(true).expect("re-arm");
+    {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit re-arm");
+        SupervisorInner::enable_torque(admitted).expect("re-arm");
+    }
     assert!(!inner.can_admit_macro_run());
     let ep_full = inner.safety.epoch_id();
-    let err = inner
-        .begin_sequence_action(Some("overflow-macro".into()), ep_full)
-        .expect_err("saturated retired_macro_runs must reject macro admission");
+    let err = {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit overflow");
+        SupervisorInner::begin_sequence_action(admitted, Some("overflow-macro".into()), ep_full)
+            .expect_err("saturated retired_macro_runs must reject macro admission")
+    };
     assert!(
         matches!(err, ArmError::Motion(MotionError::MotionBusy(_))),
         "expected MotionBusy backpressure, got {err:?}"
@@ -1552,9 +1587,12 @@ fn rt_macro_retirement_saturation_applies_admission_backpressure_with_zero_alloc
     assert_eq!(inner.retired_macro_runs_len(), 7);
     assert!(inner.can_admit_macro_run());
     let ep_ok = inner.safety.epoch_id();
-    let _ = inner
-        .begin_sequence_action(Some("post-drain-macro".into()), ep_ok)
-        .expect("admission must resume once a slot drains");
+    let _ = {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit post-drain");
+        SupervisorInner::begin_sequence_action(admitted, Some("post-drain-macro".into()), ep_ok)
+            .expect("admission must resume once a slot drains")
+    };
 }
 
 /// R2 Blocker 2 + R2 Major 1 + R2 Major 3 RT zero-alloc/zero-free regression:
@@ -1598,7 +1636,11 @@ fn rt_j7_exhausted_pool_latch_bounded_clear_and_production_log_forwarding_zero_a
     let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm pos-force");
+    {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit arm");
+        SupervisorInner::enable_torque(admitted).expect("arm pos-force");
+    }
     inner.rt_executor_owned = true;
     inner.safety.set_off_thread_reclaim(true);
 
@@ -1678,7 +1720,11 @@ fn rt_j7_exhausted_pool_latch_bounded_clear_and_production_log_forwarding_zero_a
     let mut inner2 = SupervisorInner::new(cfg).with_driver(Box::new(driver2));
     inner2.lease_enabled = false;
     inner2.tick(0.02);
-    inner2.set_torque(true).expect("arm");
+    {
+        let stamp = inner2.current_admission_stamp();
+        let admitted = inner2.check_admission(stamp).expect("admit arm");
+        SupervisorInner::enable_torque(admitted).expect("arm");
+    }
     inner2.rt_executor_owned = true;
     inner2.safety.set_off_thread_reclaim(true);
     bus2.0.lock().unwrap().mute_j7 = true;

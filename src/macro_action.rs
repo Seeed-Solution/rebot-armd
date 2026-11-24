@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use crate::api::rest::ApiError;
 use crate::kinematics::Pose;
 use crate::motion::{self, GoalFrame, GoalSpec, GripperCommand, GripperRequest, Speed};
-use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
+use crate::supervisor::{AdmissionStamp, ArmError, ArmSupervisor, SupervisorInner};
 pub use crate::rt_core::broker::ActionId;
 /// The child identity and contact guard of the RT contract (`rt_core::ops`).
 pub use crate::rt_core::ops::{ChildSpec, ChildTicket, ContactGuard};
@@ -75,7 +75,7 @@ pub enum SubState {
     Idle,
     Running,
     Done(SubDone),
-    Failed { code: String, message: String },
+    Failed { code: crate::safety::BoundedText<48>, message: crate::motion::StepErrorText },
 }
 
 /// Supervisor-side record of the running macro action.
@@ -83,6 +83,8 @@ pub enum SubState {
 pub struct MacroRun {
     pub id: u64,
     pub epoch: u64,
+    /// Admission stamp captured ONCE when the parent macro was admitted; checked on every child.
+    pub stamp: AdmissionStamp,
     /// State of the current child ([`Self::child`]).
     pub sub: SubState,
     /// `/motion/stop` arrived while no sub-motion was running.
@@ -99,8 +101,8 @@ pub struct MacroRun {
 
 impl MacroRun {
     /// A run without children.
-    pub fn new(id: u64, epoch: u64) -> Self {
-        Self { id, epoch, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None,
+    pub fn new(id: u64, epoch: u64, stamp: AdmissionStamp) -> Self {
+        Self { id, epoch, stamp, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None,
             children: 0, child: ChildRecord::default(), next_guard: None }
     }
 
@@ -124,7 +126,7 @@ pub struct ChildRecord {
     pub seq: u32,
     /// The tick fails the child (code and message of `timeout`) when it still runs after this.
     pub deadline: Option<Instant>,
-    pub timeout: Option<(String, String)>,
+    pub timeout: Option<(crate::safety::BoundedText<48>, crate::motion::StepErrorText)>,
     pub guard: Option<ContactGuard>,
     pub watch: ContactWatch,
 }
@@ -156,6 +158,8 @@ pub struct FinalApproach {
 pub struct MacroCtx {
     pub sup: Arc<ArmSupervisor>,
     pub id: u64,
+    /// Parent macro admission stamp passed into every child motion start (never re-sampled).
+    pub stamp: AdmissionStamp,
     /// Whole-action deadline.
     pub deadline: Instant,
     /// Upper bound for one sub-motion wait.
@@ -167,7 +171,36 @@ pub struct MacroCtx {
 }
 
 impl MacroCtx {
+    /// Derives a fresh single-use child [`AdmissionStamp`] preserving the parent macro's
+    /// admission-captured authority without re-sampling live owner state.
+    #[inline]
+    pub fn next_child_stamp(&self) -> AdmissionStamp {
+        self.stamp.for_macro_child()
+    }
+
     pub async fn alive(&self) -> bool { self.sup.inner().read().await.macro_alive(self.id) }
+
+    /// Map a child motion-install error under the owner write lock: admission-stamp refusal
+    /// (`STOPPED`, `LEASE_LOST`, `ESTOP_ACTIVE`, `EPOCH_MISMATCH`) cancels the parent macro
+    /// (preserving `cancelled` state and exact reason code) rather than failing it.
+    pub fn map_install_err(&self, inner: &mut SupervisorInner, e: ArmError) -> Stop {
+        use crate::safety::SafetyError;
+        if matches!(
+            e,
+            ArmError::Safety(
+                SafetyError::Stopped
+                    | SafetyError::LeaseLost
+                    | SafetyError::EStopActive
+                    | SafetyError::EpochMismatch { .. }
+            )
+        ) {
+            let api = ApiError::from(e);
+            let code = api.code.unwrap_or_else(|| api.error.clone());
+            inner.finish_macro(self.id, "cancelled", Some(&code), Some(api.message), None, None);
+            return Stop::Cancelled;
+        }
+        arm_fail(e)
+    }
 
     /// Cancelled when the action ended, a timeout failure past the deadline.
     pub async fn check(&self) -> Result<(), Stop> {
@@ -237,7 +270,7 @@ impl MacroCtx {
                 match inner.macro_child_state(ticket) {
                     None => return Err(Stop::Cancelled),
                     Some(SubState::Done(d)) => return Ok(d),
-                    Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code, message)),
+                    Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code.as_str().to_owned(), message.as_str().to_owned())),
                     Some(_) => inner.macro_child_overdue(ticket, Instant::now(), OVERDUE_GRACE),
                 }
             };
@@ -335,13 +368,17 @@ impl MacroCtx {
         let ticket = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
-            match inner.install_macro_path_same_side_with_rules(self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
+            let admitted = match inner.check_admission(self.next_child_stamp()) {
+                Ok(a) => a,
+                Err(e) => return Err(before(self.map_install_err(&mut inner, e.into()))),
+            };
+            match SupervisorInner::install_macro_path_same_side_with_rules(admitted, self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
                 Ok(l) => self.arm_child(&mut inner, phase, l * 2.0 + 5.0),
                 Err(e) => {
                     if let Some(detail) = e.workspace_detail() {
                         inner.set_action_workspace_violation(self.id, detail);
                     }
-                    return Err(before(arm_fail(e)));
+                    return Err(before(self.map_install_err(&mut inner, e)));
                 }
             }
         };
@@ -411,16 +448,19 @@ impl MacroCtx {
             let (speed, timeout_s) = if closes { (close_speed, None) } else { (1.0, Some(8.0)) };
             let request = GripperRequest { command, fraction, grasp, speed, timeout_s, tag: None };
             let remaining_s = self.deadline.duration_since(now).as_secs_f64();
-            let (duration, timeout_s, is_pos_force_close) = inner
-                .start_macro_gripper_within(self.id, request, Some(remaining_s), true)
-                .map_err(|e| match e {
-                    ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg))
-                        if msg.contains("remaining macro budget") =>
-                    {
-                        fail(self.timeout_code, format!("Phase {phase}: {msg}"))
-                    }
-                    other => arm_fail(other),
-                })?;
+            let admitted = match inner.check_admission(self.next_child_stamp()) {
+                Ok(a) => a,
+                Err(e) => return Err(self.map_install_err(&mut inner, e.into())),
+            };
+            let (duration, timeout_s, is_pos_force_close) = match SupervisorInner::start_macro_gripper_within(admitted, self.id, request, Some(remaining_s), true) {
+                Ok(v) => v,
+                Err(ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg)))
+                    if msg.contains("remaining macro budget") =>
+                {
+                    return Err(fail(self.timeout_code, format!("Phase {phase}: {msg}")));
+                }
+                Err(other) => return Err(self.map_install_err(&mut inner, other)),
+            };
             if is_pos_force_close {
                 let s = if timeout_s.is_finite() { (timeout_s + 10.0).clamp(0.0, 1e6) } else { 1e6 };
                 let deadline = (now + Duration::from_secs_f64(s)).min(self.deadline);

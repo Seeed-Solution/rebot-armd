@@ -1,0 +1,34 @@
+{
+  "id": "18_config_gripper_grasp_commissioning",
+  "family": "config",
+  "description": "gripper/calibration, grasp/setup, tool/commissioning/confirm persisted updates & rejects",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"jaw_opening":{"closed_m":0.0,"open_m":0.065},"offset_rad":0.0},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/gripper/calibration","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"table_z_m":0.02},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/grasp/setup","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"confirm":false},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/tool/commissioning/confirm","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"confirm":true,"tool_config_digest":"00","tool_id":"wrong"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/tool/commissioning/confirm","request_id":4,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"jaw_opening":{"closed_m":0.0,"open_m":0.065},"offset_rad":0.0},"epoch_id":1,"generation":1,"path":"/api/v1/gripper/calibration","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"gripper calibration body must have jaw_opening and optional offset_rad: missing field `points`","request_id":1,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"table_z_m":0.02},"epoch_id":1,"generation":1,"path":"/api/v1/grasp/setup","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","durability_confirmed":true,"epoch_id":1,"is_torqued":false,"persisted":true,"request_id":2,"revision":2,"safety_state":"Idle","setup":{"acquire_camera_down":"auto","acquire_dist_px":160.0,"align_j6":true,"align_max_angle_spread_deg":15.0,"align_min_angle_conf":0.3,"align_min_aspect":1.2,"approach_height_m":0.15,"approach_speed_mps":0.05,"camera_tilt_deg":0.0,"centre_tol_px":10.0,"descend_contact_stop_nm":null,"descend_speed_mps":0.03,"fx_px":600.0,"fy_px":600.0,"grasp_height_m":0.015,"grip_pixel_norm":[0.5,0.5],"height_grasp_fraction":0.5,"height_priors":{},"height_probe_m":0.1,"height_probe_mode":"up","height_record":["depth"],"height_sources":["probe"],"image_size_px":[640.0,360.0],"lateral_probe_m":0.04,"lift_height_m":0.12,"lost_frames":5,"lost_timeout_s":1.0,"match_dist_px":35.0,"match_iou":0.45,"max_grasp_height_m":0.06,"max_grasp_width_m":0.075,"max_iterations":10,"max_step_m":0.03,"median_frames":3,"phase_timeout_s":30.0,"post_lift_settle_ms":300,"pre_open":"auto","pre_open_margin_m":0.015,"recentre_height_m":0.0,"recentre_max_iterations":3,"recheck_tol_px":40.0,"servo_gain":0.6,"settle_delay_s":0.1,"spill_max_tilt_deg":8.0,"spill_safe_labels":["cup","bottle","wine glass","bowl","vase"],"stable_frames":3,"table_z_m":0.02,"tasks":{},"timeout_s":120.0,"width_record":[],"width_sources":["mask","depth"],"yaw_record":["depth"],"yaw_sources":["mask","box"]},"status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"confirm":false},"epoch_id":1,"generation":1,"path":"/api/v1/tool/commissioning/confirm","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"confirm must be boolean true","request_id":3,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"confirm":true,"tool_config_digest":"00","tool_id":"wrong"},"epoch_id":1,"generation":1,"path":"/api/v1/tool/commissioning/confirm","request_id":4,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"tool_id 'wrong' does not match active tool 'default'","request_id":4,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

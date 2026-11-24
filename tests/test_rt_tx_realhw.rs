@@ -80,7 +80,9 @@ impl DualRig {
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.lease_enabled = false;
         inner.tick(DT);
-        inner.set_torque(true).expect("initial arm");
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).expect("initial arm");
         // Only run warmup output ticks when the configured budget can complete a full 7-joint batch
         // in one tick; constrained-budget tests (e.g. max_frames = 4) start armed immediately.
         if tx_budget.max_frames >= 7 {
@@ -154,7 +156,9 @@ impl DualRig {
                 assert_eq!(*inner.safety.state(), SafetyState::Idle);
                 self.clock.advance(ms(20));
                 self.bus.with(|s| s.push_all_feedback());
-                inner.set_torque(true).expect("legacy re-enable");
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::enable_torque(admitted).expect("legacy re-enable");
                 for _ in 0..3 {
                     self.clock.advance(ms(20));
                     self.bus.with(|s| s.push_all_feedback());
@@ -348,10 +352,13 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
             // 1. 7-motor jog to nonzero pose across all 7 joints (including gripper).
             let jog_goal = vec![0.18, -0.15, -0.18, 0.20, -0.15, 0.22, -0.60];
             let epoch = rig.inner().safety.epoch_id();
-            let (_, jog_id, _) = rig
-                .inner_mut()
-                .jog_action(jog_goal.clone(), Some(0.5), Some(epoch), "joint_move")
-                .expect("start 7-motor jog");
+            let (_, jog_id, _) = {
+                let inner = rig.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::jog_action(admitted, jog_goal.clone(), Some(0.5), Some(epoch), "joint_move")
+            }
+            .expect("start 7-motor jog");
 
             let mut jog_done = false;
             for _ in 0..80 {
@@ -379,10 +386,13 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
             // 2. Home back to [0; 7].
             let home_goal = vec![0.0; 7];
             let epoch = rig.inner().safety.epoch_id();
-            let (_, home_id, _) = rig
-                .inner_mut()
-                .jog_action(home_goal.clone(), Some(0.5), Some(epoch), "home")
-                .expect("start 7-motor home");
+            let (_, home_id, _) = {
+                let inner = rig.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::jog_action(admitted, home_goal.clone(), Some(0.5), Some(epoch), "home")
+            }
+            .expect("start 7-motor home");
 
             let mut home_done = false;
             for _ in 0..80 {
@@ -448,8 +458,12 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
                 let mut inner = sup.inner().write().await;
                 inner.lease_enabled = false;
                 inner.tick(DT);
-                inner.set_torque(true).expect("arm");
-                inner.jog_action(vec![0.15, -0.1, -0.1, 0.1, 0.0, 0.0, 0.0], Some(0.2), None, "joint_move").unwrap();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::enable_torque(admitted).expect("arm");
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::jog_action(admitted, vec![0.15, -0.1, -0.1, 0.1, 0.0, 0.0, 0.0], Some(0.2), None, "joint_move").unwrap();
                 for _ in 0..20 {
                     clock.advance(ms(20));
                     bus.with(|s| s.push_all_feedback());
@@ -463,7 +477,7 @@ fn dual_owner_7_motor_jog_and_home_with_realistic_tx_timing_and_budget_compariso
                 s.tx_spike_step = ms(1);
             });
             reset_tx_metrics();
-            sup.home(Some(0.4), None).await.expect("ArmSupervisor::home");
+            sup.home(sup.capture_admission_stamp(), Some(0.4), None).await.expect("ArmSupervisor::home");
             let mut home_done = false;
             for _ in 0..50 {
                 clock.advance(ms(20));
@@ -654,7 +668,9 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
                 assert_eq!(*inner.safety.state(), SafetyState::Idle);
                 rig.clock.advance(ms(20));
                 rig.bus.with(|s| s.push_all_feedback());
-                inner.set_torque(true).expect("legacy re-enable");
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::enable_torque(admitted).expect("legacy re-enable");
                 assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
             }
             RigOwner::Executor { fx, broker, next_req } => {
@@ -940,9 +956,12 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             r.inner_mut().held = Some(HeldObject { label: "cup".into(), spill_safe: false });
             r.inner_mut().releasing = true;
             let epoch = r.inner().safety.epoch_id();
-            let (rel_id, _) = r
-                .inner_mut()
-                .start_gripper(
+            let (rel_id, _) = {
+                let inner = r.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::start_gripper(
+                    admitted,
                     GripperRequest {
                         command: GripperCommand::Open,
                         fraction: None,
@@ -953,7 +972,8 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                     },
                     epoch,
                 )
-                .expect("start release");
+            }
+            .expect("start release");
             (r, rel_id)
         };
         let done_tick = {
@@ -989,7 +1009,12 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
 
         // 2. Gravity-comp Exiting: deferred stiff holds must NOT advance exit_hold or switch back.
         let mut rig_gc = DualRig::new(owner, base_cfg(), None);
-        rig_gc.inner_mut().enter_gravity_comp(Default::default()).expect("enter gravity comp");
+        {
+            let inner = rig_gc.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
+        }
         rig_gc.step();
         rig_gc.inner_mut().exit_gravity_comp("REQUESTED", "test");
         assert!(rig_gc.inner().gravity_comp.is_some());
@@ -1043,10 +1068,13 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
         {
             let mut rig_mc = DualRig::new(owner, base_cfg(), None);
             let epoch = rig_mc.inner().safety.epoch_id();
-            let id = rig_mc
-                .inner_mut()
-                .begin_orchestrated_action("grasp", None, epoch)
-                .expect("begin macro");
+            let id = {
+                let inner = rig_mc.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::begin_orchestrated_action(admitted, "grasp", None, epoch)
+            }
+            .expect("begin macro");
             let mut max_res = [0.0f32; armd::rt_core::mailbox::MAX_DOF];
             max_res[1] = 2.0; // J2 contact threshold 2.0 N·m
             let guard = armd::macro_action::ContactGuard { max_residual_nm: max_res, stop_code: None };
@@ -1054,10 +1082,13 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             let mut goal = rig_mc.inner().commanded_positions.clone();
             goal[0] += 0.35;
             let limits = rig_mc.inner().planning_limits();
-            rig_mc
-                .inner_mut()
-                .install_macro_quintic(id, goal, &limits)
-                .expect("install macro child");
+            {
+                let inner = rig_mc.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::install_macro_quintic(admitted, id, goal, &limits)
+            }
+            .expect("install macro child");
             let ticket = rig_mc.inner().macro_run.as_ref().unwrap().ticket().unwrap();
             rig_mc.step();
             assert_eq!(rig_mc.inner().macro_child_state(ticket), Some(armd::macro_action::SubState::Running));
@@ -1105,7 +1136,12 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
                 ..base_cfg()
             };
             let mut rig_jt = DualRig::new(owner, cfg_jt, None);
-            rig_jt.inner_mut().enter_gravity_comp(Default::default()).expect("enter gravity comp");
+            {
+                let inner = rig_jt.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
+            }
             rig_jt.step();
             rig_jt.inner_mut().exit_gravity_comp("REQUESTED", "major2");
             // Keep arm moving for 6 ticks (120 ms > 100 ms exit_hold_ms).
@@ -1144,7 +1180,12 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             let mut cfg_s2 = base_cfg();
             cfg_s2.tx_stall_ticks = Some(4); // minimum at 50 Hz = ceil(45/20) + 1
             let mut rig_s2 = DualRig::new(owner, cfg_s2, None);
-            rig_s2.inner_mut().enter_gravity_comp(Default::default()).expect("enter gravity comp");
+            {
+                let inner = rig_s2.inner_mut();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
+            }
             rig_s2.step();
             // Inject ENOBUFS during off-tick `exit_gravity_comp` -> immediate write defers,
             // must NOT increment periodic `tx_deferral_streak`!
@@ -1998,7 +2039,9 @@ async fn legacy_control_tick_with_deadline_uses_scheduled_grid_not_started_plus_
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
         inner.tick(DT);
-        inner.set_torque(true).expect("initial arm");
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).expect("initial arm");
         for _ in 0..3 {
             clock.advance(ms(20));
             bus.with(|s| s.push_all_feedback());
@@ -2069,7 +2112,7 @@ fn enable_transition_polling_and_clear_fault_probe_obey_release_margin_cap() {
     // `release_deadline - margin`.
     let mut rig = DualRig::new(Owner::Executor, base_cfg(), None);
     // Start from torque off (Idle) so we can exercise an enable handshake under late releases.
-    rig.inner_mut().set_torque(false).expect("torque off before enable test");
+    rig.inner_mut().disable_torque().expect("torque off before enable test");
     rig.bus.with(|s| {
         s.tx_step = ms(1);
         s.tx_spike_every = 0;
@@ -2397,7 +2440,11 @@ impl DualRig {
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
         inner.lease_enabled = false;
         inner.tick(DT);
-        inner.set_torque(true).expect("initial pos-force arm");
+        {
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit initial pos-force arm");
+            SupervisorInner::enable_torque(admitted).expect("initial pos-force arm");
+        }
         bus.with(|s| {
             s.immediate_replies = false;
             s.push_all_feedback();
@@ -2472,10 +2519,13 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
         // Move away from home across all 7 joints (including J7 pos-force gripper).
         let away = vec![0.20, -0.16, -0.18, 0.22, -0.15, 0.20, -1.20];
         let ep = rig.inner().safety.epoch_id();
-        let (_, jog_id, _) = rig
-            .inner_mut()
-            .jog_action(away.clone(), Some(0.6), Some(ep), "joint_move")
-            .expect("start away jog");
+        let (_, jog_id, _) = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit away jog");
+            SupervisorInner::jog_action(admitted, away.clone(), Some(0.6), Some(ep), "joint_move")
+                .expect("start away jog")
+        };
         let mut away_done = false;
         for _ in 0..90 {
             rig.step();
@@ -2489,10 +2539,13 @@ fn dual_owner_pos_force_80ms_stall_during_home_skips_j7_refreshes_and_completes(
 
         // Start `home` back to [0; 7] and run 5 ticks so motion is in flight.
         let ep = rig.inner().safety.epoch_id();
-        let (_, home_id, _) = rig
-            .inner_mut()
-            .jog_action(vec![0.0; 7], Some(0.6), Some(ep), "home")
-            .expect("start home");
+        let (_, home_id, _) = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit home");
+            SupervisorInner::jog_action(admitted, vec![0.0; 7], Some(0.6), Some(ep), "home")
+                .expect("start home")
+        };
         for _ in 0..5 {
             rig.step();
             assert!(rig.inner().safety.state().is_operational());
@@ -2728,10 +2781,19 @@ fn dual_owner_pos_force_sustained_300ms_staleness_recoverable_j7_fault_macro_and
         // (a) Default 250 ms limit: 300 ms stale J7 during running motion -> recoverable J7_FEEDBACK_STALE.
         let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
         let ep = rig.inner().safety.epoch_id();
-        let (_, jog_id, _) = rig
-            .inner_mut()
-            .jog_action(vec![0.3, -0.2, 0.0, 0.0, 0.0, 0.0, -1.0], Some(0.3), Some(ep), "joint_move")
-            .expect("start motion");
+        let (_, jog_id, _) = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit motion");
+            SupervisorInner::jog_action(
+                admitted,
+                vec![0.3, -0.2, 0.0, 0.0, 0.0, 0.0, -1.0],
+                Some(0.3),
+                Some(ep),
+                "joint_move",
+            )
+            .expect("start motion")
+        };
         rig.step();
         rig.bus.with(|s| s.motors[6].mute_feedback = true);
 
@@ -2978,10 +3040,13 @@ fn dual_owner_pos_force_sustained_300ms_staleness_recoverable_j7_fault_macro_and
 
         // (a2) Running macro (`MacroRun`) gets exact terminal code `"J7_FEEDBACK_STALE"`.
         let ep2 = rig.inner().safety.epoch_id();
-        let macro_id = rig
-            .inner_mut()
-            .begin_sequence_action(Some("test-macro".into()), ep2)
-            .expect("begin macro");
+        let macro_id = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit macro");
+            SupervisorInner::begin_sequence_action(admitted, Some("test-macro".into()), ep2)
+                .expect("begin macro")
+        };
         assert!(rig.inner().macro_run.is_some());
         rig.bus.with(|s| s.motors[6].mute_feedback = true);
         for _ in 0..16 {
@@ -3150,7 +3215,11 @@ fn dual_owner_stopped_hold_zero_queued_stale_j7_and_dual_slot_backlog() {
             let mut inner = SupervisorInner::new(base_cfg()).with_driver(Box::new(drv));
             inner.lease_enabled = false;
             inner.tick(DT);
-            inner.set_torque(true).expect("arm");
+            {
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).expect("admit arm");
+                SupervisorInner::enable_torque(admitted).expect("arm");
+            }
             {
                 let mut d = inner.driver.as_ref().unwrap().lock().unwrap();
                 bus.with(|s| s.motors[0].no_write_ack = true);
@@ -3385,9 +3454,16 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
     }
     let mut rig = DualRig::new_pos_force(Owner::Legacy, cfg, None);
     rig.bus.with(|s| s.immediate_replies = true);
-    rig.inner_mut()
-        .enter_gravity_comp(armd::gravity_comp::GravityCompRequest::default())
+    {
+        let inner = rig.inner_mut();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit enter gravity comp");
+        SupervisorInner::enter_gravity_comp(
+            admitted,
+            armd::gravity_comp::GravityCompRequest::default(),
+        )
         .expect("enter gravity comp");
+    }
     rig.bus.with(|s| s.immediate_replies = false);
     for _ in 0..5 {
         rig.step();
@@ -3423,9 +3499,16 @@ fn pos_force_gravity_comp_and_real_flush_j7_staleness() {
         s.push_all_feedback();
     });
     rig.step();
-    rig.inner_mut()
-        .enter_gravity_comp(armd::gravity_comp::GravityCompRequest::default())
+    {
+        let inner = rig.inner_mut();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit re-enter gravity comp");
+        SupervisorInner::enter_gravity_comp(
+            admitted,
+            armd::gravity_comp::GravityCompRequest::default(),
+        )
         .expect("re-enter gravity comp");
+    }
     rig.bus.with(|s| s.immediate_replies = false);
     for _ in 0..4 {
         rig.step();
@@ -3510,9 +3593,19 @@ fn dual_owner_same_release_j7_staleness_never_masks_motion_write_or_expiry_failu
         // (a) Same-release J7 >= 250 ms + hard motion TX write failure -> DRIVER_WRITE_FAILED wins.
         let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
         let ep = rig.inner().safety.epoch_id();
-        rig.inner_mut()
-            .jog_action(vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], Some(0.6), Some(ep), "joint_move")
+        {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit motion");
+            SupervisorInner::jog_action(
+                admitted,
+                vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+                Some(0.6),
+                Some(ep),
+                "joint_move",
+            )
             .expect("start motion");
+        }
         rig.bus.with(|s| s.motors[6].mute_feedback = true);
         // Advance 11 normal ticks (220 ms < 250 ms): J7 stale-skipped, J1–J6 moving, operational.
         for _ in 0..11 {
@@ -3566,10 +3659,19 @@ fn dual_owner_same_release_j7_staleness_never_masks_motion_write_or_expiry_failu
         let b4 = TxBudget { max_frames: 4, max_duration: ms(10), frame_max_age: ms(45) };
         let mut rig_exp = DualRig::new_pos_force(owner, base_cfg(), Some(b4));
         let ep_exp = rig_exp.inner().safety.epoch_id();
-        rig_exp
-            .inner_mut()
-            .jog_action(vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], Some(0.6), Some(ep_exp), "joint_move")
+        {
+            let inner = rig_exp.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit motion");
+            SupervisorInner::jog_action(
+                admitted,
+                vec![0.3, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+                Some(0.6),
+                Some(ep_exp),
+                "joint_move",
+            )
             .expect("start motion");
+        }
         rig_exp.bus.with(|s| s.motors[6].mute_feedback = true);
         // Advance 11 ticks (220 ms): J1–J6 drain cleanly (budget 4 -> 2 deferred per tick, drain next tick).
         for _ in 0..10 {
@@ -4009,10 +4111,13 @@ fn dual_owner_mit_j1_j6_posforce_j7_80ms_stall_during_home_continues_mit_frames(
         }
 
         let ep = rig.inner().safety.epoch_id();
-        let (_, _home_id, _) = rig
-            .inner_mut()
-            .jog_action(vec![0.0; 7], Some(0.6), Some(ep), "home")
-            .expect("start MIT+PosForce home");
+        let (_, _home_id, _) = {
+            let inner = rig.inner_mut();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit MIT+PosForce home");
+            SupervisorInner::jog_action(admitted, vec![0.0; 7], Some(0.6), Some(ep), "home")
+                .expect("start MIT+PosForce home")
+        };
         for _ in 0..3 {
             rig.step();
             assert!(rig.inner().safety.state().is_operational());

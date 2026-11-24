@@ -81,12 +81,12 @@ async fn published_sample_matches_the_locked_observation_field_by_field() {
     let (l, p, c) = check("idle").await;
     compare(l, p, c);
     sup.inner().write().await.lease_enabled = false;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     let (l, p, c) = check("torqued").await;
     compare(l, p, c);
     let mut target = sup.get_config().await.home_positions.clone();
     target[0] += 0.2;
-    sup.jog(target, Some(1.0), None).await.unwrap();
+    sup.jog(sup.capture_admission_stamp(), target, Some(1.0), None).await.unwrap();
     for i in 0..5 {
         let (l, p, c) = check(if i == 0 { "jog started" } else { "jog running" }).await;
         assert!(p.action.is_some());

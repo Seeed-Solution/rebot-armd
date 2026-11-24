@@ -551,15 +551,15 @@ async fn single_bus_writer_no_tokio_entry_and_handoff_gates() {
         Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "OWNER_TRANSFERRED"
     ));
     assert!(matches!(
-        sup.set_torque(false).await,
+        sup.disable_torque().await,
         Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "OWNER_TRANSFERRED"
     ));
     assert!(matches!(
-        sup.servo(vec![0.0; 7], 0).await,
+        sup.servo(sup.capture_admission_stamp(), vec![0.0; 7], 0).await,
         Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "OWNER_TRANSFERRED"
     ));
     assert!(matches!(
-        sup.jog(vec![0.0; 7], Some(1.0), None).await,
+        sup.jog(sup.capture_admission_stamp(), vec![0.0; 7], Some(1.0), None).await,
         Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "OWNER_TRANSFERRED"
     ));
 
@@ -620,7 +620,7 @@ async fn queued_legacy_callers_cancel_rollback_and_init_failures() {
     });
     tokio::time::sleep(Duration::from_millis(15)).await;
     let sup_m1 = sup.clone();
-    let queued_set_torque = tokio::spawn(async move { sup_m1.set_torque(true).await });
+    let queued_set_torque = tokio::spawn(async move { sup_m1.enable_torque(sup_m1.capture_admission_stamp()).await });
     let sup_m2 = sup.clone();
     let queued_try_drv = tokio::spawn(async move {
         let (d, ..) = ThreadAuditDriver::new(7);
@@ -657,7 +657,7 @@ async fn queued_legacy_callers_cancel_rollback_and_init_failures() {
     assert_eq!(sup_fail.owner_mode(), OWNER_FAILED);
     assert!(sup_fail.observation().await.is_err());
     assert!(sup_fail.request_shutdown().await.is_err());
-    assert!(sup_fail.set_torque(true).await.is_err());
+    assert!(sup_fail.enable_torque(sup_fail.capture_admission_stamp()).await.is_err());
     assert!(sup_fail.start_executor(ExecutorConfig::for_tests(Duration::from_millis(5))).await.is_err());
 }
 
@@ -1304,8 +1304,12 @@ impl ExecutorClock for ScriptedExecutorClock {
         self.state.lock().unwrap().now_ns
     }
 
-    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
         let mut s = self.state.lock().unwrap();
+        if s.now_ns >= target_ns {
+            self.cv.notify_all();
+            return false;
+        }
         while !stop.load(Ordering::Acquire) && s.now_ns < target_ns && s.limit_ns < target_ns {
             s.waiting_for_ns = Some(target_ns);
             self.cv.notify_all();
@@ -1316,6 +1320,7 @@ impl ExecutorClock for ScriptedExecutorClock {
             s.now_ns = target_ns;
         }
         self.cv.notify_all();
+        true
     }
 
     fn sleep(&self, dur: Duration, stop: &AtomicBool) {
@@ -1560,7 +1565,7 @@ fn bounded_clear_fault_budgeted_deadlines_flush_estop_and_latch_preservation() {
 
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     // Inject motor 0 over-temperature error and poll -> latches hardware fault.
     raw_bus2.with(|s| {
         s.motors[0].state_override = Some(0x0A);
@@ -1605,13 +1610,13 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         sup_leg.control_tick(0.02).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    sup_leg.set_torque(true).await.expect("legacy sim enable");
+    sup_leg.enable_torque(sup_leg.capture_admission_stamp()).await.expect("legacy sim enable");
     let obs_leg = sup_leg.observation().await.unwrap();
     assert!((obs_leg.positions[0] - 0.05).abs() < 1e-3);
     assert!(obs_leg.is_torqued);
     assert!(!sup_leg.request_shutdown().await.unwrap());
     assert_eq!(sup_leg.clear_fault().await.unwrap(), SafetyState::Idle);
-    sup_leg.set_torque(false).await.expect("legacy sim disable");
+    sup_leg.disable_torque().await.expect("legacy sim disable");
     assert!(sup_leg.request_shutdown().await.unwrap());
 
     // Same trace under Executor with SimArmDriver over UDP loopback (`127.0.0.1:0`).
@@ -1720,7 +1725,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(60)).await;
     let mut saw_motion_leg = false;
@@ -1752,7 +1757,7 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     }
     let h_wd = sup_wd
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
@@ -1829,11 +1834,14 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
     let body = axum::body::to_bytes(torque_resp.into_body(), 4096).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("EXECUTOR_ROUTING_PENDING"), "{body:?}");
 
+    // Stage 3 §2 A1: `/api/v1/ws` is allowed through the executor gate (for WS E-stop and
+    // urgent Stop); a plain HTTP GET without WS upgrade headers fails WebSocket extraction
+    // rather than `503 EXECUTOR_ROUTING_PENDING`.
     let ws_resp = app
         .oneshot(Request::builder().uri("/api/v1/ws").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(ws_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(ws_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     h_wd.stop_and_join();
 }
@@ -1847,7 +1855,7 @@ async fn prepare_zero_check_supervisor(path: std::path::PathBuf) -> (Arc<ArmSupe
     let action_id = {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
@@ -1857,8 +1865,7 @@ async fn prepare_zero_check_supervisor(path: std::path::PathBuf) -> (Arc<ArmSupe
         inner.gripper_calib_path = Some(path);
         inner.set_mock_gripper_stall_offset(Some(0.05));
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner
-            .start_gripper_zero_check(&json!({"threshold_rad": 0.10, "store_offset": true}), epoch)
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check(__a, &json!({"threshold_rad": 0.10, "store_offset": true}), epoch)) } }
             .unwrap();
         id
     };
@@ -2117,7 +2124,7 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     // (i) Persistence saturation / unavailable fails immediately with PERSIST_FAILED and no stranding.
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.measured_positions = INSPECT.to_vec();
     inner.commanded_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
@@ -2129,8 +2136,7 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     inner.persist_capacity_available = false;
     let rev_before = ConfigAuthority::revision(&inner, ConfigDomain::GripperCalibration);
     let ep = inner.safety.epoch_id();
-    let (sat_id, _) = inner
-        .start_gripper_zero_check(&json!({"threshold_rad": 0.10, "store_offset": true}), ep)
+    let (sat_id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check(__a, &json!({"threshold_rad": 0.10, "store_offset": true}), ep)) } }
         .unwrap();
     for _ in 0..200 {
         inner.tick(0.02);
@@ -2583,7 +2589,7 @@ async fn two_phase_persistence_rechecks_operator_auth_before_rename_and_drops_pa
     let id_a = {
         let mut inner = sup_a.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
@@ -2593,12 +2599,11 @@ async fn two_phase_persistence_rechecks_operator_auth_before_rename_and_drops_pa
         inner.gripper_calib_path = Some(path_a.clone());
         inner.set_mock_gripper_stall_offset(Some(0.05));
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner
-            .start_gripper_zero_check_with_auth(
+        let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check_with_auth(__a,
                 &json!({"threshold_rad": 0.10, "store_offset": true}),
                 epoch,
                 Some((auth.clone(), Some(token.clone()))),
-            )
+            )) } }
             .unwrap();
         id
     };
@@ -2900,7 +2905,7 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
         match case {
             "idle" => {}
             "armed" => {
-                inner.set_torque(true).unwrap();
+                { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
             }
             "estop" => {
                 inner.safety.trigger_e_stop();
@@ -3293,7 +3298,7 @@ async fn rt_capability_gates_legacy_slcan_preservation_zero_offset_no_sleep_and_
 fn superseded_install_delivers_terminal_and_ack_strictly_after_publish() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.tick(0.02);
 
     let (mut engine, mut broker, _tw, _stop) =
@@ -3414,7 +3419,7 @@ async fn zero_alloc_steady_state_wakes_positive_control_commit_shutdown_and_stop
     // (a1) Mock steady-state enabled releases: 0 allocator calls (`lock_alloc_calls == 0`).
     let sup_mock = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     sup_mock.set_lease_enabled(false).await;
-    sup_mock.set_torque(true).await.unwrap();
+    sup_mock.enable_torque(sup_mock.capture_admission_stamp()).await.unwrap();
     let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
     cfg.alloc_timing = true;
     let h_mock = sup_mock.start_executor(cfg.clone()).await.unwrap();

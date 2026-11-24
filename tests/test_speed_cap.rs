@@ -16,7 +16,7 @@ fn jog_duration(config: ArmConfig, kind: &str) -> f64 {
     // away from home (the rest pose is all 0) so the home jog moves
     let mut inner = sim_at(config, &[0.3, -0.4, -0.6, 0.5, 0.2, 0.6, 0.0]);
     let target = if kind == "home" { inner.config.home_positions.clone() } else { INSPECT.to_vec() };
-    let (_, _, duration) = inner.jog_action(target, None, None, kind).unwrap();
+    let (_, _, duration) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, target, None, None, kind)) } }.unwrap();
     duration
 }
 

@@ -189,7 +189,7 @@ async fn test_supervisor_stop_policies() {
     let supervisor = ArmSupervisor::new(config);
 
     // 1. EStopLatch policy
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.apply_stop_policy(StopPolicy::EStopLatch).await;
     let obs = supervisor.get_observation().await;
     assert_eq!(obs.safety_state, SafetyState::EStop);
@@ -199,7 +199,7 @@ async fn test_supervisor_stop_policies() {
     supervisor.clear_fault().await.unwrap();
 
     // 2. ThermalTrip policy
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.apply_stop_policy(StopPolicy::ThermalTrip).await;
     let obs = supervisor.get_observation().await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })));
@@ -207,7 +207,7 @@ async fn test_supervisor_stop_policies() {
     supervisor.clear_fault().await.unwrap();
 
     // 3. BusLossFallback policy
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.apply_stop_policy(StopPolicy::BusLossFallback).await;
     let obs = supervisor.get_observation().await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::BusLoss)));
@@ -215,9 +215,9 @@ async fn test_supervisor_stop_policies() {
     supervisor.clear_fault().await.unwrap();
 
     // 4. NormalUnload policy
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     // Jog somewhere
-    supervisor.jog(vec![1.0, 1.0], Some(0.5), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0, 1.0], Some(0.5), None).await.unwrap();
     for _ in 0..10 { supervisor.tick(0.02).await; }
     supervisor.apply_stop_policy(StopPolicy::NormalUnload).await;
     // Step until trajectory finishes
@@ -240,8 +240,8 @@ async fn test_supervisor_watchdog_lease_timeout() {
     config.lease_timeout_ms = 50; // 50ms short timeout for test
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
-    supervisor.jog(vec![1.0], Some(1.0), None).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0], Some(1.0), None).await.unwrap();
 
     // Sleep longer than lease_timeout
     tokio::time::sleep(Duration::from_millis(70)).await;
@@ -333,14 +333,14 @@ async fn test_supervisor_torque_disable_and_estop_state_clearing() {
     config.home_positions = vec![0.0];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 1. Jog to start trajectory
-    supervisor.jog(vec![2.0], Some(1.0), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![2.0], Some(1.0), None).await.unwrap();
     for _ in 0..5 { supervisor.tick(0.02).await; }
 
     // Disabling torque while moving / mid-air must be rejected with ArmNotAtRestingPose
-    let res = supervisor.set_torque(false).await;
+    let res = supervisor.disable_torque().await;
     assert!(matches!(
         res,
         Err(ArmError::Safety(SafetyError::ArmNotAtRestingPose { .. }))
@@ -365,25 +365,25 @@ async fn test_supervisor_servo_high_frequency_teleop() {
     config.home_positions = vec![0.0];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // Rejection with mismatched epoch_id
     assert!(matches!(
-        supervisor.servo(vec![0.5], 999).await,
+        supervisor.servo(supervisor.capture_admission_stamp(), vec![0.5], 999).await,
         Err(ArmError::Safety(SafetyError::EpochMismatch { .. }))
     ));
 
     // High frequency teleop target to 0.10 (current is 0.0) with valid epoch_id = 1 (within 0.15 rad jump limit)
     // Acceleration is bounded at 5 rad/s², so the first 20ms step is 0.002 rad
     // at 0.1 rad/s rather than an instantaneous 2 rad/s velocity jump.
-    supervisor.servo(vec![0.10], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.10], 1).await.unwrap();
     let obs = supervisor.tick(0.02).await;
     assert!(obs.safety_state.is_operational());
     assert!((obs.positions[0] - 0.002).abs() < 1e-4);
     assert!((obs.velocities[0] - 0.1).abs() < 1e-3);
 
     // Dirty frame with instantaneous jump > 0.15 rad must be dropped
-    supervisor.servo(vec![0.5], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.5], 1).await.unwrap();
     let obs_dirty = supervisor.tick(0.02).await;
     assert!(obs_dirty.positions[0] < 0.15, "Dirty frame > 0.15 rad must be discarded");
 }
@@ -472,7 +472,7 @@ async fn test_supervisor_hardware_driver_mounting_and_anti_gravity_holding() {
     supervisor.set_driver(Box::new(mock)).await;
 
     // Enabling torque delegates to mounted driver and reads current physical position (0.123)
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(torque_flag.load(Ordering::SeqCst));
 
     // Tick reads telemetry from driver (measured_positions)
@@ -481,7 +481,7 @@ async fn test_supervisor_hardware_driver_mounting_and_anti_gravity_holding() {
     assert_eq!(obs.temperatures[0], 32.0);
 
     // Plan motion to 2.0 rad
-    supervisor.jog(vec![2.0], None, Some(1)).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![2.0], None, Some(1)).await.unwrap();
 
     // Advance 1 tick (20ms) - should interpolate smoothly
     let _ = supervisor.tick(0.02).await;
@@ -521,13 +521,13 @@ async fn test_supervisor_watchdog_not_renewed_on_invalid_command() {
     config.home_positions = vec![0.0];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // Sleep 60ms
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     // Send invalid jog command (epoch mismatch)
-    let bad_res = supervisor.jog(vec![0.5], Some(1.0), Some(999)).await;
+    let bad_res = supervisor.jog(supervisor.capture_admission_stamp(), vec![0.5], Some(1.0), Some(999)).await;
     assert!(bad_res.is_err());
 
     // Sleep another 50ms (total elapsed > 100ms lease timeout)
@@ -628,7 +628,7 @@ async fn test_set_torque_fails_when_feedback_unavailable() {
     supervisor.set_driver(Box::new(UnresponsiveMockDriver)).await;
 
     // Enabling torque must fail with FeedbackUnavailable because hardware hasn't returned valid angles
-    let res = supervisor.set_torque(true).await;
+    let res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(matches!(
         res,
         Err(ArmError::Safety(SafetyError::FeedbackUnavailable))
@@ -648,7 +648,7 @@ async fn test_clear_fault_noop_when_not_fault() {
     config.home_positions = vec![0.0];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let obs_before = supervisor.get_observation().await;
     assert_eq!(obs_before.safety_state, SafetyState::Armed);
@@ -682,7 +682,7 @@ async fn test_set_torque_in_estop_makes_zero_driver_calls() {
     let initial_torque_calls = set_torque_calls.load(Ordering::SeqCst);
 
     // Attempting set_torque(true) while in E-Stop must fail immediately
-    let res = supervisor.set_torque(true).await;
+    let res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(matches!(res, Err(ArmError::Safety(SafetyError::EStopActive))));
 
     // Verify driver was NEVER touched (0 read calls, 0 set_torque calls)
@@ -742,7 +742,7 @@ async fn test_enable_hardware_failure_rolls_back_and_latches_fault() {
     supervisor.set_driver(Box::new(driver)).await;
 
     // Enabling torque must fail and rollback
-    let res = supervisor.set_torque(true).await;
+    let res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(res.is_err());
 
     // 1 call to set_torque(true), followed by 1 rollback call to set_torque(false)
@@ -798,7 +798,7 @@ async fn test_stale_feedback_triggers_bus_loss_fallback() {
     supervisor.set_driver(Box::new(driver)).await;
 
     // Successfully arm first
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     let obs = supervisor.get_observation().await;
     assert_eq!(obs.safety_state, SafetyState::Armed);
 

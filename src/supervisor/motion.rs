@@ -62,7 +62,44 @@ impl SupervisorInner {
         }
     }
 
+    pub(crate) fn retire_servo_ws_min_depths(&mut self) {
+        if let Some(depths) = self.servo_ws_min_depths.take() {
+            if depths.1.is_heap() {
+                self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                    servo_ws_min_depths: Some(depths),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    pub(crate) fn retire_motion_payloads(&mut self) {
+        self.release_servo_target();
+        let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
+        let trajectory = self.active_trajectory.take().filter(|t| t.has_heap_storage());
+        self.clear_unload_settle();
+        let unload_settle = self.unload_settle.take();
+        if trajectory.is_some() || unload_settle.is_some() || servo_ws_min_depths.is_some() {
+            self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                trajectory,
+                unload_settle,
+                servo_ws_min_depths,
+            });
+        }
+    }
+
+    pub(crate) fn push_retired_stop(&mut self, retired: crate::rt_core::urgent::RetiredStopPayloads) {
+        if self.rt_executor_owned
+            && self.pending_retired_stops.len() < self.pending_retired_stops.capacity()
+        {
+            self.pending_retired_stops.push_back(retired);
+        } else {
+            drop(retired);
+        }
+    }
+
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
+    /// In RT executor mode, heap-owning motion payloads are retired off-thread (zero RT frees).
     pub fn stop_motion(&mut self) {
         // a STOP cancels a park deferred behind the MIT hand back
         if std::mem::take(&mut self.mit.park_after_hand_back) {
@@ -76,15 +113,10 @@ impl SupervisorInner {
             self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
         }
         if self.gripper_reference_active() { self.hold_gripper_at_measured(); }
-        self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
-        if let Some(old_traj) = self.active_trajectory.take() {
-            self.retire_active_trajectory(old_traj);
-        }
+        self.retire_motion_payloads();
         self.pending_deferred_done = None;
         self.pending_normal_unload = false;
-        self.clear_unload_settle();
         self.zero_check_persisting = None;
         self.end_gripper_stream();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
@@ -107,12 +139,11 @@ impl SupervisorInner {
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;
-        self.unload_settle = None;
-        self.active_trajectory = None;
+        self.retire_motion_payloads();
         self.pending_deferred_done = None;
-        self.release_servo_target();
         self.gripper_stream_target = None;
         self.gripper_stream_contact = None;
+        self.gripper_stream_contact_detector.reset();
         self.gripper_stream_lease = None;
 
         // Lock onto measured_positions only when finite and the supervisor's own coherent
@@ -243,7 +274,7 @@ impl SupervisorInner {
         }
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.retire_servo_ws_min_depths();
         self.servo_stream_active = false;
         // M1: keep output history across NormalUnload so park ramps any residual lead out smoothly
         // instead of dropping active lead in a single tick.
@@ -257,6 +288,10 @@ impl SupervisorInner {
         }
         match policy {
             StopPolicy::NormalUnload => {
+                // Exempt from `Admitted` (Invariant 1a): system-initiated stop-direction park
+                // motion (triggered by stop policy / lease watchdog / already-admitted unload)
+                // returns the arm to the resting pose and disables torque, rather than starting
+                // new client motion.
                 if self.handover_settling_since.is_some() {
                     tracing::warn!("NormalUnload rejected while handover settling; maintaining holding torque");
                     return;
@@ -451,12 +486,11 @@ impl SupervisorInner {
                 // Bus loss / disconnect: hold position locked, latch fault, advance epoch
                 // Maintain holding torque: DO NOT disable hardware torque to prevent gravitational collapse!
                 self.pending_normal_unload = false;
-                self.unload_settle = None;
-                self.active_trajectory = None;
+                self.retire_motion_payloads();
                 self.pending_deferred_done = None;
-                self.release_servo_target();
                 self.gripper_stream_target = None;
                 self.gripper_stream_contact = None;
+                self.gripper_stream_contact_detector.reset();
                 self.gripper_stream_lease = None;
                 if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
@@ -539,6 +573,7 @@ impl SupervisorInner {
             acquired_at: now,
             last_valid_motion_instant: None,
         });
+        self.sync_lease_gen_mirror();
         self.last_heartbeat = now;
         if evicted.is_some() {
             self.last_preemption = Some(now);
@@ -576,6 +611,7 @@ impl SupervisorInner {
             acquired_at: now,
             last_valid_motion_instant: None,
         });
+        self.sync_lease_gen_mirror();
         Ok(gen)
     }
 
@@ -710,12 +746,11 @@ impl SupervisorInner {
             }
             self.watchdog_park = None;
             self.pending_normal_unload = false;
-            self.unload_settle = None;
-            self.active_trajectory = None;
+            self.retire_motion_payloads();
             self.pending_deferred_done = None;
-            self.release_servo_target();
             self.gripper_stream_target = None;
             self.gripper_stream_contact = None;
+            self.gripper_stream_contact_detector.reset();
             self.gripper_stream_lease = None;
             self.servo_settled_ticks.fill(0);
             self.servo_ws_min_depths = None;
@@ -743,12 +778,65 @@ impl SupervisorInner {
             if active.client_id == client_id && active.generation == generation {
                 let valid = active.acquired_at.elapsed() < self.lease_timeout;
                 self.active_lease = None;
+                self.sync_lease_gen_mirror();
                 #[cfg(feature = "policy-runtime")]
                 self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
                 return valid;
             }
         }
         false
+    }
+
+    /// Releases whichever lease `client_id` currently holds under the owner lock, regardless of
+    /// generation (used by WS teardown so a concurrent acquire cannot outlive connection close).
+    pub fn release_lease_for_connection(&mut self, client_id: &str) -> bool {
+        if self.detached {
+            return false;
+        }
+        let Some(gen) = self
+            .active_lease
+            .as_ref()
+            .filter(|active| active.client_id == client_id)
+            .map(|active| active.generation)
+        else {
+            return false;
+        };
+        self.release_lease(client_id, gen)
+    }
+
+    /// Stops active motion FIRST if `client_id`/`generation` currently owns a valid lease, then
+    /// releases that lease (matching normal WS `release_lease` semantics). An expired lease is
+    /// dropped without cancelling a running watchdog park.
+    pub fn release_lease_and_stop(&mut self, client_id: &str, generation: u64) -> bool {
+        if self.detached {
+            return false;
+        }
+        let is_valid_owner = self.active_lease.as_ref().is_some_and(|a| {
+            a.client_id == client_id
+                && a.generation == generation
+                && a.acquired_at.elapsed() < self.lease_timeout
+        });
+        if is_valid_owner {
+            self.stop_motion();
+        }
+        self.release_lease(client_id, generation)
+    }
+
+    /// Stops active motion FIRST if `client_id` currently owns a valid lease (any generation),
+    /// then releases that lease under the owner lock.
+    pub fn release_lease_for_connection_and_stop(&mut self, client_id: &str) -> bool {
+        if self.detached {
+            return false;
+        }
+        let Some(gen) = self
+            .active_lease
+            .as_ref()
+            .filter(|active| active.client_id == client_id)
+            .map(|active| active.generation)
+        else {
+            return false;
+        };
+        self.release_lease_and_stop(client_id, gen)
     }
 
     /// Records the label a lease holder sent with `acquire_lease` (shown to other clients).
@@ -908,24 +996,24 @@ impl SupervisorInner {
 
     /// Jog from a fixed slice (RT commit path: no `to_vec()`, no `planning_limits()`
     /// allocation, no `workspace_samples` `Vec`, no `target_positions` replacement free).
-    pub(crate) fn jog_action_slice(
-        &mut self,
-        target_positions: &[f32],
-        duration_secs: Option<f64>,
-        epoch_id: Option<u64>,
-        kind: &str,
-    ) -> Result<(u64, u64, f64), ArmError> {
+    pub(crate) fn jog_action_slice(admitted: Admitted<'_>, target_positions: &[f32], duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str) -> Result<(u64, u64, f64), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.jog_action_slice_inner(&proof, target_positions, duration_secs, epoch_id, kind)
+    }
+
+    fn jog_action_slice_inner(&mut self, proof: &crate::supervisor::AdmittedProof, target_positions: &[f32], duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str) -> Result<(u64, u64, f64), ArmError> {
         use crate::rt_core::mailbox::MAX_DOF;
         if self.config.active_tool.commissioning_required {
             return Err(SafetyError::CommissioningRequired(format!("{kind} (requires speed_scale <= 0.2)")).into());
         }
         let n = target_positions.len();
         if n > MAX_DOF {
-            return self.jog_action(target_positions.to_vec(), duration_secs, epoch_id, kind);
+            return self.jog_action_with_speed_scale_inner(proof, target_positions.to_vec(), duration_secs, epoch_id, kind, None);
         }
         let Some((limits_buf, lim_n)) = self.planning_limits_inline(None) else {
-            return self.jog_action(target_positions.to_vec(), duration_secs, epoch_id, kind);
+            return self.jog_action_with_speed_scale_inner(proof, target_positions.to_vec(), duration_secs, epoch_id, kind, None);
         };
+        self.check_terminal_fifo_for_new_action()?;
         let limits = &limits_buf[..lim_n];
         let mut target = [0.0f32; MAX_DOF];
         target[..n].copy_from_slice(target_positions);
@@ -966,6 +1054,7 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }
@@ -1000,35 +1089,22 @@ impl SupervisorInner {
         Ok((self.safety.epoch_id(), id, duration))
     }
 
-    pub fn jog(
-        &mut self,
-        target_positions: Vec<f32>,
-        duration_secs: Option<f64>,
-        epoch_id: Option<u64>,
-    ) -> Result<u64, ArmError> {
-        self.jog_action(target_positions, duration_secs, epoch_id, "joint_move").map(|(epoch, _, _)| epoch)
+    pub fn jog(admitted: Admitted<'_>, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>) -> Result<u64, ArmError> {
+        Self::jog_action(admitted, target_positions, duration_secs, epoch_id, "joint_move").map(|(epoch, _, _)| epoch)
     }
 
     /// Jog that records an action of `kind` (`joint_move` or `home`).
     /// Returns (epoch, action id, planned duration).
-    pub fn jog_action(
-        &mut self,
-        target_positions: Vec<f32>,
-        duration_secs: Option<f64>,
-        epoch_id: Option<u64>,
-        kind: &str,
-    ) -> Result<(u64, u64, f64), ArmError> {
-        self.jog_action_with_speed_scale(target_positions, duration_secs, epoch_id, kind, None)
+    pub fn jog_action(admitted: Admitted<'_>, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str) -> Result<(u64, u64, f64), ArmError> {
+        Self::jog_action_with_speed_scale(admitted, target_positions, duration_secs, epoch_id, kind, None)
     }
 
-    pub fn jog_action_with_speed_scale(
-        &mut self,
-        target_positions: Vec<f32>,
-        duration_secs: Option<f64>,
-        epoch_id: Option<u64>,
-        kind: &str,
-        speed_scale: Option<f64>,
-    ) -> Result<(u64, u64, f64), ArmError> {
+    pub fn jog_action_with_speed_scale(admitted: Admitted<'_>, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, speed_scale: Option<f64>) -> Result<(u64, u64, f64), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.jog_action_with_speed_scale_inner(&proof, target_positions, duration_secs, epoch_id, kind, speed_scale)
+    }
+
+    fn jog_action_with_speed_scale_inner(&mut self, proof: &crate::supervisor::AdmittedProof, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, speed_scale: Option<f64>) -> Result<(u64, u64, f64), ArmError> {
         if let Some(s) = speed_scale {
             if !s.is_finite() || !(0.05..=1.0).contains(&s) {
                 return Err(MotionError::InvalidCommand("speed_scale must be in [0.05, 1.0]".into()).into());
@@ -1067,37 +1143,23 @@ impl SupervisorInner {
                 }
             }
         }
-        self.start_quintic(target_positions, duration_secs, epoch_id, kind, None, &limits)
+        self.start_quintic(proof, target_positions, duration_secs, epoch_id, kind, None, &limits)
     }
 
     /// Joint-space quintic to `target_positions` planned with `limits`, recorded as an
     /// action of `kind`. Returns (epoch, action id, planned duration).
-    pub(crate) fn start_quintic(
-        &mut self,
-        target_positions: Vec<f32>,
-        duration_secs: Option<f64>,
-        epoch_id: Option<u64>,
-        kind: &str,
-        tag: Option<String>,
-        limits: &[crate::model::JointLimit],
-    ) -> Result<(u64, u64, f64), ArmError> {
-        self.start_quintic_prepared(target_positions, duration_secs, epoch_id, kind, tag, limits, None)
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_quintic(&mut self, proof: &crate::supervisor::AdmittedProof, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, tag: Option<String>, limits: &[crate::model::JointLimit]) -> Result<(u64, u64, f64), ArmError> {
+        self.start_quintic_prepared(proof, target_positions, duration_secs, epoch_id, kind, tag, limits, None)
     }
 
     /// [`start_quintic`](Self::start_quintic) that installs `prepared` (planned, power-fitted
     /// and workspace-checked without the lock) when it was made from the same start, target,
     /// limits, workspace revision, tool offset and power budget; else plans and checks here.
     /// Every other check runs here either way.
-    pub(crate) fn start_quintic_prepared(
-        &mut self,
-        target_positions: Vec<f32>,
-        duration_secs: Option<f64>,
-        epoch_id: Option<u64>,
-        kind: &str,
-        tag: Option<String>,
-        limits: &[crate::model::JointLimit],
-        prepared: Option<PreparedQuintic>,
-    ) -> Result<(u64, u64, f64), ArmError> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_quintic_prepared(&mut self, _proof: &crate::supervisor::AdmittedProof, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, tag: Option<String>, limits: &[crate::model::JointLimit], prepared: Option<PreparedQuintic>) -> Result<(u64, u64, f64), ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         let mut target_positions = target_positions;
         self.config_motion_check()?;
         self.gravity_comp_motion_busy()?;
@@ -1143,6 +1205,7 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }
@@ -1263,9 +1326,15 @@ impl SupervisorInner {
 
     /// Install a planned path if nothing changed since `input` was taken.
     /// Returns (action id, expected duration).
-    pub fn install_path(&mut self, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+    pub fn install_path(admitted: Admitted<'_>, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_path_inner(&proof, input, path, kind, tag)
+    }
+
+    pub(crate) fn install_path_inner(&mut self, proof: &crate::supervisor::AdmittedProof, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         self.check_plan_fresh(input)?;
-        let duration = self.start_path_motion(input, &path)?;
+        let duration = self.start_path_motion_at_inner(proof, input.epoch, &path)?;
         let id = self.begin_action(kind, tag);
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
@@ -1332,25 +1401,23 @@ impl SupervisorInner {
     /// Installs a prepared Cartesian path borrowing directly from an immutable pinned
     /// [`crate::rt_core::broker::PlanSlotRef`] as a `move_to` action (zero allocations and
     /// zero frees on both accepted and refused commits). Returns `(action id, expected duration)`.
-    pub(crate) fn install_prepared_path_slot(
-        &mut self,
-        epoch: u64,
-        dof: usize,
-        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
-        duration_s: f64,
-        power_scale: Option<f64>,
-    ) -> Result<(u64, f64), &'static str> {
-        self.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
-        self.check_prepared_fresh_static(epoch)?;
+    pub(crate) fn install_prepared_path_slot(admitted: Admitted<'_>, epoch: u64, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>, duration_s: f64, power_scale: Option<f64>) -> Result<(u64, f64), &'static str> {
+        let (this, proof) = admitted
+            .consume()
+            .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
+        this.check_terminal_fifo_for_new_action()
+            .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
+        this.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+        this.check_prepared_fresh_static(epoch)?;
         let last = &slot.path.samples()[slot.path.len() - 1][..dof];
-        let duration = self
-            .start_path_motion_slice(epoch, last, duration_s)
+        let duration = this
+            .start_path_motion_slice_inner(&proof, epoch, last, duration_s)
             .map_err(crate::rt_core::ops::static_code)?;
-        let id = self.begin_action_rt("move_to");
+        let id = this.begin_action_rt("move_to");
         let scale = power_scale.unwrap_or(1.0);
-        if power_scale.is_some() { self.note_action_power_scale(id, scale); }
-        let arm_dof = self.config.arm_dof();
-        self.active_trajectory = Some(ActiveTrajectory::new(
+        if power_scale.is_some() { this.note_action_power_scale(id, scale); }
+        let arm_dof = this.config.arm_dof();
+        this.active_trajectory = Some(ActiveTrajectory::new(
             Some(id),
             Reference::Path(PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s)),
         ));
@@ -1371,12 +1438,14 @@ impl SupervisorInner {
 
     /// Installs a prepared Cartesian path as a `move_to` action (the RT commit: no IK).
     /// Returns (action id, expected duration).
-    pub(crate) fn install_prepared_path(&mut self, epoch: u64, path: JointPath, power_noted: bool) -> Result<(u64, f64), ArmError> {
-        self.check_prepared_fresh(epoch)?;
-        let duration = self.start_path_motion_at(epoch, &path)?;
-        let id = self.begin_action("move_to", None);
-        if power_noted { self.note_action_power_scale(id, path.power_scale); }
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+    pub(crate) fn install_prepared_path(admitted: Admitted<'_>, epoch: u64, path: JointPath, power_noted: bool) -> Result<(u64, f64), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.check_terminal_fifo_for_new_action()?;
+        this.check_prepared_fresh(epoch)?;
+        let duration = this.start_path_motion_at_inner(&proof, epoch, &path)?;
+        let id = this.begin_action("move_to", None);
+        if power_noted { this.note_action_power_scale(id, path.power_scale); }
+        this.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
         Ok((id, duration + 0.5))
     }
 
@@ -1398,21 +1467,23 @@ impl SupervisorInner {
     /// holds). `same_side`: end with the same-side approach of `move_to_precise`.
     /// Returns (action id, expected duration).
     #[allow(clippy::too_many_arguments)]
-    pub fn install_joint_goal(&mut self, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
+    pub fn install_joint_goal(admitted: Admitted<'_>, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
         same_side: Option<crate::backlash::Request>) -> Result<(u64, f64), ArmError> {
-        self.install_joint_goal_prepared(input, q, speed_scale, kind, tag, same_side, None)
+        Self::install_joint_goal_prepared(admitted, input, q, speed_scale, kind, tag, same_side, None)
     }
 
     /// [`install_joint_goal`](Self::install_joint_goal) with the quintic prepared without the
     /// lock ([`prepare_quintic`]); used when its inputs still match.
-    pub fn install_joint_goal_prepared(&mut self, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_joint_goal_prepared(admitted: Admitted<'_>, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
         same_side: Option<crate::backlash::Request>, prepared: Option<PreparedQuintic>) -> Result<(u64, f64), ArmError> {
-        self.check_plan_fresh(input)?;
-        let target = self.joint_goal_target(q);
-        let limits = self.joint_goal_limits(speed_scale);
+        let (this, proof) = admitted.consume()?;
+        this.check_plan_fresh(input)?;
+        let target = this.joint_goal_target(q);
+        let limits = this.joint_goal_limits(speed_scale);
         let (_, id, duration) = match same_side {
-            Some(request) => self.start_quintic_same_side(target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request)?,
-            None => self.start_quintic_prepared(target, None, Some(input.epoch), kind, tag, &limits, prepared)?,
+            Some(request) => this.start_quintic_same_side(&proof, target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request)?,
+            None => this.start_quintic_prepared(&proof, target, None, Some(input.epoch), kind, tag, &limits, prepared)?,
         };
         Ok((id, duration))
     }
@@ -1514,9 +1585,10 @@ impl SupervisorInner {
     }
 
     /// An authorized stop (the RT's urgent-stop generation advanced): ends client motion
-    /// like [`Self::stop_motion`], except a running watchdog park. The park belongs to the
-    /// lease watchdog, not to the client that stopped: only a new lease ([`Self::acquire_lease`],
-    /// [`Self::preempt_lease`]) takes it over. Returns false when the park was kept.
+    /// like [`Self::stop_motion`] (plus gravity-comp exit and macro cancellation), except a
+    /// running watchdog park. The park belongs to the lease watchdog, not to the client that
+    /// stopped: only a new lease ([`Self::acquire_lease`], [`Self::preempt_lease`]) takes it
+    /// over. Returns false when the park was kept.
     ///
     /// RT-safe: when keeping a watchdog park, records fields into [`crate::rt_core::ops::stop_diag`]
     /// without tracing or allocating; a normal-priority thread formats off-thread.
@@ -1525,17 +1597,27 @@ impl SupervisorInner {
             crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), park.elapsed_s, park.budget_s);
             return false;
         }
+        if self.gravity_comp.is_some() {
+            self.exit_gravity_comp("STOPPED", "Stop command");
+        }
         self.stop_motion();
+        if self.macro_run.is_some() {
+            self.request_macro_stop();
+        }
+        self.advance_stop_generation();
         true
     }
 
-    pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
-        self.start_path_motion_at(input.epoch, path)
+    /// Validates `last` under safety epoch `epoch` and activates path motion without allocating
+    /// or freeing (`target_positions` is updated in place via `copy_into`). Consumes a single-use
+    /// [`Admitted`] proof by value.
+    #[doc(hidden)]
+    pub fn start_path_motion_slice(admitted: Admitted<'_>, epoch: u64, last: &[f32], duration: f64) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.start_path_motion_slice_inner(&proof, epoch, last, duration)
     }
 
-    /// Validates `last` under safety epoch `epoch` and activates path motion without allocating
-    /// or freeing (`target_positions` is updated in place via `copy_into`).
-    pub fn start_path_motion_slice(&mut self, epoch: u64, last: &[f32], duration: f64) -> Result<f64, ArmError> {
+    pub(crate) fn start_path_motion_slice_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, epoch: u64, last: &[f32], duration: f64) -> Result<f64, ArmError> {
         self.safety.validate_motion_command(Some(epoch), last, &self.config.limits)?;
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
@@ -1546,8 +1628,8 @@ impl SupervisorInner {
         Ok(duration)
     }
 
-    /// [`Self::start_path_motion`] for a path planned under safety epoch `epoch`.
-    pub(crate) fn start_path_motion_at(&mut self, epoch: u64, path: &JointPath) -> Result<f64, ArmError> {
-        self.start_path_motion_slice(epoch, path.last_slice(), path.duration)
+    /// [`Self::start_path_motion_slice_inner`] for a path planned under safety epoch `epoch`.
+    pub(crate) fn start_path_motion_at_inner(&mut self, proof: &crate::supervisor::AdmittedProof, epoch: u64, path: &JointPath) -> Result<f64, ArmError> {
+        self.start_path_motion_slice_inner(proof, epoch, path.last_slice(), path.duration)
     }
 }

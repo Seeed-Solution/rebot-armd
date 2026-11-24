@@ -139,7 +139,7 @@ async fn test_is_at_safe_resting_pose_criteria() {
     ];
 
     let supervisor = ArmSupervisor::new(config.clone());
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 1. Initial pose at [0.0, 0.0, 0.0] with v=0: must be at safe resting pose
     assert!(supervisor.is_at_safe_resting_pose().await);
@@ -210,7 +210,7 @@ async fn test_is_at_safe_resting_pose_criteria() {
     });
     let supervisor_hw = ArmSupervisor::new(config.clone());
     supervisor_hw.set_driver(Box::new(dummy)).await;
-    supervisor_hw.set_torque(true).await.unwrap();
+    supervisor_hw.enable_torque(supervisor_hw.capture_admission_stamp()).await.unwrap();
 
     // J2 torque = 0.8 <= 1.5, J3 torque = 3.2 <= 4.5 -> OK
     assert!(supervisor_hw.is_at_safe_resting_pose().await);
@@ -250,7 +250,7 @@ async fn test_is_at_safe_resting_pose_criteria() {
     let rebot_cfg = ArmConfig::rebot_dm();
     assert_eq!(rebot_cfg.home_positions, vec![0.0; 7]);
     let supervisor_rebot = ArmSupervisor::new(rebot_cfg);
-    supervisor_rebot.set_torque(true).await.unwrap();
+    supervisor_rebot.enable_torque(supervisor_rebot.capture_admission_stamp()).await.unwrap();
     {
         let mut inner = supervisor_rebot.inner().write().await;
         // Hardware readings from docs ([0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052], legacy
@@ -280,14 +280,14 @@ async fn test_set_torque_false_safety_gates() {
     ];
 
     let supervisor = ArmSupervisor::new(config.clone());
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 1. In mid-air (not at safe resting pose): set_torque(false) must be rejected
     {
         let mut inner = supervisor.inner().write().await;
         inner.measured_positions = vec![0.5, -0.3];
     }
-    let res_midair = supervisor.set_torque(false).await;
+    let res_midair = supervisor.disable_torque().await;
     assert!(matches!(
         res_midair,
         Err(ArmError::Safety(SafetyError::ArmNotAtRestingPose { ref current, ref expected, .. }))
@@ -304,7 +304,7 @@ async fn test_set_torque_false_safety_gates() {
 
     // 2. In E-Stop: set_torque(false) must be rejected with MotionForbiddenInFaultState
     supervisor.trigger_e_stop().await;
-    let res_estop = supervisor.set_torque(false).await;
+    let res_estop = supervisor.disable_torque().await;
     assert!(matches!(
         res_estop,
         Err(ArmError::Safety(SafetyError::MotionForbiddenInFaultState(_)))
@@ -314,10 +314,10 @@ async fn test_set_torque_false_safety_gates() {
     supervisor.clear_fault().await.unwrap();
 
     // 3. In Fault (e.g. BusLoss): set_torque(false) must be rejected with MotionForbiddenInFaultState
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.apply_stop_policy(StopPolicy::BusLossFallback).await;
     assert!(matches!(supervisor.get_observation().await.safety_state, SafetyState::Fault(_)));
-    let res_fault = supervisor.set_torque(false).await;
+    let res_fault = supervisor.disable_torque().await;
     assert!(matches!(
         res_fault,
         Err(ArmError::Safety(SafetyError::MotionForbiddenInFaultState(_)))
@@ -325,7 +325,7 @@ async fn test_set_torque_false_safety_gates() {
 
     // Clear fault, arm at resting pose: now set_torque(false) succeeds
     supervisor.clear_fault().await.unwrap();
-    let res_ok = supervisor.set_torque(false).await;
+    let res_ok = supervisor.disable_torque().await;
     assert!(res_ok.is_ok());
     assert!(!supervisor.get_observation().await.is_torqued);
 }
@@ -338,7 +338,7 @@ async fn test_normal_unload_forbidden_in_estop_or_fault() {
     config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 1. In EStop: apply_stop_policy(NormalUnload) must NOT plan motion or unload
     supervisor.trigger_e_stop().await;
@@ -348,7 +348,7 @@ async fn test_normal_unload_forbidden_in_estop_or_fault() {
 
     // 2. In Fault (e.g. Watchdog): must NOT unload
     supervisor.clear_fault().await.unwrap();
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     {
         let mut inner = supervisor.inner().write().await;
         inner.safety.trigger_fault(FaultReason::WatchdogTimeout);
@@ -369,7 +369,7 @@ async fn test_clear_fault_synchronizes_positions_and_zeroes_velocities() {
     ];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 1. Simulate large divergence between commanded state and physical measured state
     {
@@ -420,16 +420,16 @@ async fn test_servo_target_dirty_jump_and_step_rate_limit() {
     config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 1. Dirty jump > 0.35 rad: must be dropped immediately
-    supervisor.servo(vec![0.40], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.40], 1).await.unwrap();
     let obs1 = supervisor.tick(0.02).await;
     assert_eq!(obs1.positions[0], 0.0, "Dirty target with jump > 0.35 rad must be dropped");
 
     // 2. Normal jump <= 0.35 rad (e.g. 0.10 rad): accepted
     // Acceleration-bounded first step: 20ms * (5 rad/s² * 20ms) = 0.002 rad
-    supervisor.servo(vec![0.10], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.10], 1).await.unwrap();
     let obs2 = supervisor.tick(0.02).await;
     assert!((obs2.positions[0] - 0.002).abs() < 1e-4, "Position step must be acceleration bounded");
     assert!((obs2.velocities[0] - 0.1).abs() < 1e-3, "Velocity must be acceleration bounded");
@@ -454,7 +454,7 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
 
     let supervisor = ArmSupervisor::new(config);
     supervisor.set_driver(Box::new(dummy)).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // Trigger BusLossFallback
     supervisor.apply_stop_policy(StopPolicy::BusLossFallback).await;
@@ -503,7 +503,7 @@ async fn test_clear_fault_hardware_failure_rejected_and_latch_retained() {
 
     let supervisor = ArmSupervisor::new(config);
     supervisor.set_driver(Box::new(dummy)).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // Trigger an underlying hardware fault (e.g. driver reported error)
     {
@@ -546,10 +546,10 @@ async fn test_normal_unload_settle_and_power_off_closed_loop() {
     ];
 
     let supervisor = ArmSupervisor::new(config);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 1. Arm is torqued, jog to an extended pose
-    supervisor.jog(vec![0.5, 0.5], Some(0.3), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.5, 0.5], Some(0.3), None).await.unwrap();
     for _ in 0..10 {
         supervisor.tick(0.02).await;
     }
@@ -607,7 +607,7 @@ async fn test_clear_fault_mutually_exclusive_branches() {
 
         let supervisor = ArmSupervisor::new(config.clone());
         supervisor.set_driver(Box::new(dummy)).await;
-        supervisor.set_torque(true).await.unwrap();
+        supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
         supervisor.trigger_e_stop().await;
         assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
@@ -633,7 +633,7 @@ async fn test_clear_fault_mutually_exclusive_branches() {
         let motor_status = dummy.motor_status.clone();
         let supervisor = ArmSupervisor::new(config.clone());
         supervisor.set_driver(Box::new(dummy)).await;
-        supervisor.set_torque(true).await.unwrap();
+        supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
         *motor_status.lock().unwrap() = vec![0, 0];
         supervisor.trigger_e_stop().await;
@@ -659,7 +659,7 @@ async fn test_clear_fault_mutually_exclusive_branches() {
         let write_count = dummy.write_count.clone();
         let supervisor = ArmSupervisor::new(config.clone());
         supervisor.set_driver(Box::new(dummy)).await;
-        supervisor.set_torque(true).await.unwrap();
+        supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
         *motor_status.lock().unwrap() = vec![1, 0];
         supervisor.trigger_e_stop().await;
@@ -684,7 +684,7 @@ async fn test_clear_fault_mutually_exclusive_branches() {
 async fn test_gripper_stall_calibration_and_idle_immunity() {
     let rebot_cfg = ArmConfig::rebot_dm();
     let supervisor = ArmSupervisor::new(rebot_cfg);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // Torques in real units (J7 TMAX 10). The hardware values below were read with the old
     // TMAX 18 mapping and are converted by 10 / 18: -0.22 -> -0.122, -0.85 -> -0.472, -0.25 -> -0.139.
@@ -716,7 +716,7 @@ async fn test_gripper_free_travel_friction_is_not_a_stall() {
     // real) at -0.36 rad/s mid-stroke. High torque while the jaw is still moving must not
     // freeze the gripper.
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.472]).await;
     for _ in 0..10 {
         {
@@ -737,18 +737,18 @@ async fn test_gripper_far_target_is_rate_limited_not_dropped() {
     // The gripper needs a far POS_VEL target to reach speed; the jump guard must not drop
     // the frame, while arm joints keep the 0.35 rad guard.
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     let epoch = supervisor.inner().read().await.safety.epoch_id();
     let mut target = vec![0.0; 7];
     target[6] = -0.8;
-    supervisor.servo(target.clone(), epoch).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), target.clone(), epoch).await.unwrap();
     let obs = supervisor.tick(0.02).await;
     assert!(obs.positions[6] < 0.0, "gripper must start moving toward a far target");
     assert!(obs.positions[6] > -0.01, "gripper step must stay acceleration bounded");
 
     target[6] = obs.positions[6];
     target[0] = 0.40;
-    supervisor.servo(target, epoch).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), target, epoch).await.unwrap();
     let obs = supervisor.tick(0.02).await;
     assert_eq!(obs.positions[0], 0.0, "arm joint jump > 0.35 rad must still be dropped");
 }

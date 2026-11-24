@@ -242,7 +242,13 @@ impl ArmSupervisor {
     /// A WS connection closed: a recording it owns is discarded after [`OWNER_LOST_DISCARD`]
     /// unless a connection with the same client id takes it back.
     pub async fn recorder_connection_closed(&self, connection: &str) {
+        if self.owner_mode() != crate::supervisor::OWNER_LEGACY {
+            return;
+        }
         let mut inner = self.inner().write().await;
+        if inner.detached {
+            return;
+        }
         if let Some(r) = inner.recording.as_mut() {
             if matches!(&r.owner, RecorderOwner::Client { connection: c, .. } if c == connection) && r.owner_lost_at.is_none() {
                 r.owner_lost_at = Some(Instant::now());
@@ -452,9 +458,18 @@ async fn monitor(lock: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInne
 // ---- lease-free WS commands ----
 
 /// Teach commands that need no motion lease (recorder ownership or nothing).
+/// WS command paths handled without holding a motion lease.
+pub const LEASE_FREE_PATHS: &[&str] = &[
+    "/api/v1/record/start",
+    "/api/v1/record/stop",
+    "/api/v1/episodes/update",
+    "/api/v1/episodes/delete",
+    "/api/v1/datasets/create",
+    "/api/v1/datasets/delete",
+];
+
 pub fn is_lease_free(path: &str) -> bool {
-    matches!(path, "/api/v1/record/start" | "/api/v1/record/stop" | "/api/v1/episodes/update" | "/api/v1/episodes/delete"
-        | "/api/v1/datasets/create" | "/api/v1/datasets/delete")
+    LEASE_FREE_PATHS.contains(&path)
 }
 
 fn str_field<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, ArmError> {

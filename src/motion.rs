@@ -1108,11 +1108,22 @@ pub struct StepCtx<'a> {
     pub gripper_force_capped: bool,
 }
 
+/// Bounded inline error text carried by [`StepStatus::Failed`] so `step_into` never allocates
+/// on `armd-control`.
+pub type StepErrorText = crate::safety::BoundedText<160>;
+
+pub(crate) fn format_step_error(args: core::fmt::Arguments<'_>) -> StepErrorText {
+    use core::fmt::Write as _;
+    let mut buf = StepErrorText::empty();
+    let _ = buf.write_fmt(args);
+    buf
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepStatus {
     Running,
     Done { settled: Option<bool>, holding: Option<bool>, gripper_gap_rad: Option<f32> },
-    Failed { code: &'static str, message: String },
+    Failed { code: &'static str, message: StepErrorText },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1190,6 +1201,233 @@ pub const GRIPPER_CONTACT_LAG_RAD: f32 = 0.30;
 pub const GRIPPER_CONTACT_SLOW_FRACTION: f32 = 0.3;
 /// J7 speed (rad/s) from contact to the contact stop.
 pub const GRIPPER_CONTACT_SPEED: f32 = 0.3;
+
+/// Net-progress stall/contact window duration (s): `base_window_s` widened at slow speeds
+/// to cover `2 * GRIPPER_STILL_PROGRESS_EPS / speed + 0.06`, capped at `GRIPPER_STALL_WINDOW_MAX_S`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn gripper_progress_window_s(speed: Option<f64>, base_window_s: f64) -> f64 {
+    match speed.filter(|v| v.is_finite() && *v > 0.0) {
+        Some(v) => base_window_s.max(
+            (2.0 * f64::from(GRIPPER_STILL_PROGRESS_EPS) / v + 0.06)
+                .min(GRIPPER_STALL_WINDOW_MAX_S),
+        ),
+        None => base_window_s,
+    }
+}
+
+/// Monotonic net-progress watermark along a travel direction (`GRIPPER_STILL_PROGRESS_EPS` =
+/// 0.002 rad). Backward rebounds or jam oscillations never reset the timer; net forward
+/// progress of at least `GRIPPER_STILL_PROGRESS_EPS` advances the watermark and resets it.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GripperProgressWindow {
+    anchor: Option<f32>,
+    dir: f32,
+    no_progress_s: f64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GripperProgressWindow {
+    pub fn reset(&mut self) {
+        self.anchor = None;
+        self.dir = 0.0;
+        self.no_progress_s = 0.0;
+    }
+
+    /// Update the monotonic watermark for measured jaw `pos` moving along `dir` (+1 or -1).
+    /// Returns `(progressed_or_reset, progress_stopped)`.
+    pub fn update(&mut self, pos: f32, dir: f32, dt: f64, window_s: f64) -> (bool, bool) {
+        if !pos.is_finite() || !dir.is_finite() || dir == 0.0 {
+            self.reset();
+            return (true, false);
+        }
+        let same_dir = self.dir == dir;
+        let no_progress = same_dir
+            && self.anchor.is_some_and(|a| (pos - a) * dir < GRIPPER_STILL_PROGRESS_EPS);
+        if no_progress {
+            self.no_progress_s += dt;
+            (false, self.no_progress_s >= window_s - 1e-9)
+        } else {
+            self.anchor = Some(pos);
+            self.dir = dir;
+            self.no_progress_s = 0.0;
+            (true, false)
+        }
+    }
+
+    /// Advance a stopped-progress sustained-tick counter (shared by supervisor stall detection
+    /// and any stopped-only guard). Returns `true` once `high_effort` has held without
+    /// `>= GRIPPER_STILL_PROGRESS_EPS` net progress for `window_s` AND for at least `needed`
+    /// consecutive ticks.
+    pub fn step_sustained(
+        &mut self,
+        high_effort: bool,
+        pos: f32,
+        dir: f32,
+        dt: f64,
+        window_s: f64,
+        ticks: &mut u32,
+        needed: u32,
+    ) -> bool {
+        if high_effort && pos.is_finite() {
+            let (progressed, stopped) = self.update(pos, dir, dt, window_s);
+            if *ticks == 0 || progressed {
+                *ticks = 1;
+                false
+            } else {
+                *ticks = ticks.saturating_add(1);
+                stopped && *ticks >= needed
+            }
+        } else {
+            *ticks = 0;
+            self.reset();
+            false
+        }
+    }
+}
+
+/// J7 measured moving-jaw torque floor (N·m): never below `contact_torque_nm`,
+/// `GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM` (0.82 N·m), or `0.9 * ceiling_torque_estimate_nm`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn moving_contact_torque_floor(
+    contact_torque_nm: Option<f32>,
+    ceiling_torque_estimate_nm: Option<f32>,
+) -> f32 {
+    let mut floor = contact_torque_nm
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.0)
+        .max(GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM);
+    if let Some(ceil) = ceiling_torque_estimate_nm.filter(|v| v.is_finite() && *v > 0.0) {
+        floor = floor.max(0.9 * ceil);
+    }
+    floor
+}
+
+/// Inputs for one tick of the shared gripper closing-contact detector ([`GripperContactDetector`]),
+/// used by every gripper path (action, grasp, place, sequence, calibration, stream).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct GripperContactInput<'a> {
+    pub baseline: Option<&'a FreeTorqueBaseline>,
+    pub contact_torque_nm: Option<f32>,
+    pub max_close_torque_nm: Option<f32>,
+    pub ceiling_torque_estimate_nm: Option<f32>,
+    /// Optional stall-preemption threshold used only once net progress has stopped (stream path).
+    pub stopped_stall_nm: Option<f32>,
+    pub measured_pos: f32,
+    /// Closing travel sign (+1.0 or -1.0).
+    pub dir: f32,
+    /// Speed (rad/s) for selecting the baseline speed band (never used as a stop shortcut).
+    pub baseline_speed: f32,
+    /// Planned or commanded closing speed (rad/s) for sizing the net-progress window.
+    pub window_speed: Option<f64>,
+    pub tau_abs: f32,
+    pub dt: f64,
+    pub torque_feedback: bool,
+    /// Path-specific gate (e.g. `self.moved` for grasp, `pushing` for stream).
+    pub active: bool,
+}
+
+/// One tick's verdict from [`GripperContactDetector::step`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GripperContactEval {
+    pub progress_stopped: bool,
+    pub triggered: bool,
+    pub threshold_nm: Option<f32>,
+    pub threshold_source: ThresholdSource,
+    pub baseline_nm: Option<f32>,
+}
+
+/// Shared gripper closing-contact detector used across every gripper path (grasp actions, macros,
+/// and servo/policy streams). No instantaneous-velocity shortcuts:
+/// - Once closing-direction net progress has stopped over the speed-adapted window
+///   (`0.10–0.50 s`, `0.002 rad` monotonic watermark), contact triggers when `|τ|` stays at or
+///   above the stopped threshold (`baseline + margin` when calibrated, `contact_torque_nm` when
+///   uncalibrated, optionally lowered to `stopped_stall_nm` on streams) for
+///   `GRIPPER_CONTACT_TICKS` (2) ticks.
+/// - While the jaw is still making net progress, contact can trigger only when `|τ|` stays at or
+///   above `max(threshold, contact_torque_nm, GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM,
+///   0.9 * ceiling_torque_estimate_nm)` for `GRIPPER_BASELINE_CONTACT_TICKS` (3) consecutive ticks.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GripperContactDetector {
+    progress: GripperProgressWindow,
+    stopped_ticks: u32,
+    moving_ticks: u32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GripperContactDetector {
+    pub fn reset(&mut self) {
+        self.progress.reset();
+        self.stopped_ticks = 0;
+        self.moving_ticks = 0;
+    }
+
+    pub fn step(&mut self, input: &GripperContactInput<'_>) -> GripperContactEval {
+        let window_s = gripper_progress_window_s(input.window_speed, 0.10);
+        let (progressed, progress_stopped) = self.progress.update(input.measured_pos, input.dir, input.dt, window_s);
+        let (base_thresh, threshold_source, baseline_nm) = match crate::gripper_baseline::closing_contact_threshold(
+            input.baseline,
+            input.measured_pos,
+            input.baseline_speed.abs(),
+            input.contact_torque_nm,
+            input.max_close_torque_nm,
+        ) {
+            None => (None, ThresholdSource::None, None),
+            Some((t, true, b)) => (Some(t), ThresholdSource::Baseline, b),
+            Some((t, false, b)) => (Some(t), ThresholdSource::Uncalibrated, b),
+        };
+        let moving_floor = moving_contact_torque_floor(
+            input.contact_torque_nm,
+            input.ceiling_torque_estimate_nm,
+        );
+        let stopped_thresh = match threshold_source {
+            ThresholdSource::Baseline => base_thresh,
+            ThresholdSource::Uncalibrated => input.contact_torque_nm,
+            ThresholdSource::ContactTorqueNm | ThresholdSource::None => None,
+        }
+        .map(|t| match input.stopped_stall_nm.filter(|v| v.is_finite() && *v > 0.0) {
+            Some(stall_nm) => t.min(stall_nm),
+            None => t,
+        });
+        let moving_thresh = match threshold_source {
+            ThresholdSource::Baseline | ThresholdSource::Uncalibrated => {
+                base_thresh.map(|t| t.max(moving_floor))
+            }
+            ThresholdSource::ContactTorqueNm | ThresholdSource::None => None,
+        };
+        let can_hit = input.torque_feedback && input.active && input.tau_abs.is_finite();
+        let stopped_hit = can_hit && stopped_thresh.is_some_and(|t| input.tau_abs >= t);
+        if stopped_hit {
+            // Seed at 1 on anchor initialization (`progressed == true`) to match
+            // `GripperProgressWindow::step_sustained` with zero 1-tick skew when `dt >= window_s`.
+            self.stopped_ticks = if progressed { 1 } else { self.stopped_ticks.saturating_add(1) };
+        } else {
+            self.stopped_ticks = 0;
+        }
+        if can_hit && moving_thresh.is_some_and(|t| input.tau_abs >= t) {
+            self.moving_ticks = self.moving_ticks.saturating_add(1);
+        } else {
+            self.moving_ticks = 0;
+        }
+        let stopped_triggered = progress_stopped && self.stopped_ticks >= GRIPPER_CONTACT_TICKS;
+        let moving_triggered = self.moving_ticks >= GRIPPER_BASELINE_CONTACT_TICKS;
+        let triggered = stopped_triggered || moving_triggered;
+        let threshold_nm = if stopped_triggered || (progress_stopped && !moving_triggered) {
+            stopped_thresh
+        } else {
+            moving_thresh
+        };
+        GripperContactEval {
+            progress_stopped,
+            triggered,
+            threshold_nm,
+            threshold_source,
+            baseline_nm,
+        }
+    }
+}
 /// Squeeze after a torque cap trip: press in from the measured position, reaching squeeze_rad
 /// in half the squeeze window (settle_ms), until |τ| reaches this fraction of the cap (or squeeze_rad past the measured position).
 pub const SQUEEZE_RAMP_FRACTION: f32 = 0.6;
@@ -1317,6 +1555,11 @@ impl PathTrajectory {
         { false }
     }
 
+    /// True when dropping this path trajectory would free heap memory.
+    pub fn has_heap_storage(&self) -> bool {
+        !self.borrows_plan_slot()
+    }
+
     pub fn duration(&self) -> f64 { self.source.duration() }
 
     fn position_at(&mut self, s: f64) -> [f32; 7] {
@@ -1356,8 +1599,12 @@ impl PathTrajectory {
                 zeros(&mut velocities, dof);
                 return StepOut {
                     positions, velocities,
-                    status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
-                        "Arm did not follow the path for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
+                    status: StepStatus::Failed {
+                        code: "TRACKING_STALL",
+                        message: format_step_error(format_args!(
+                            "Arm did not follow the path for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped"
+                        )),
+                    },
                     progress: (self.elapsed / duration) as f32, clear_gripper_stall: false,
                 };
             }
@@ -1447,12 +1694,60 @@ impl CapRamp {
     }
 }
 
+/// Bounded inline capacity for [`GripPhase::Squeeze`] torque and load samples (covers the full
+/// validated `settle_ms <= 5000` window at 50 Hz without decimation, and decimates by 2x above it).
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, PartialEq)]
+pub const GRIPPER_SQUEEZE_SAMPLE_CAP: usize = 256;
+
+/// Bounded, inline, zero-allocation sample ring for `GripPhase::Squeeze`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SqueezeSamples {
+    buf: [f32; GRIPPER_SQUEEZE_SAMPLE_CAP],
+    len: usize,
+    stride: usize,
+    offered: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SqueezeSamples {
+    fn new() -> Self {
+        Self { buf: [0.0; GRIPPER_SQUEEZE_SAMPLE_CAP], len: 0, stride: 1, offered: 0 }
+    }
+
+    fn push(&mut self, value: f32) {
+        self.offered += 1;
+        if !(self.offered - 1).is_multiple_of(self.stride) {
+            return;
+        }
+        if self.len == GRIPPER_SQUEEZE_SAMPLE_CAP {
+            for i in 0..GRIPPER_SQUEEZE_SAMPLE_CAP / 2 {
+                self.buf[i] = self.buf[2 * i];
+            }
+            self.len = GRIPPER_SQUEEZE_SAMPLE_CAP / 2;
+            self.stride = self.stride.saturating_mul(2).max(1);
+        }
+        self.buf[self.len] = value;
+        self.len += 1;
+    }
+
+    fn median_in_place(&mut self) -> f32 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        // `sort_unstable_by` sorts in place with O(1) stack space and zero heap allocation.
+        self.buf[..self.len].sort_unstable_by(|a, b| a.total_cmp(b));
+        self.buf[self.len / 2]
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // GripperMotion is already boxed; inline SqueezeSamples keeps squeeze zero-alloc
 enum GripPhase {
     Moving,
     /// Squeezing an object: hold target, advance timer while wire-stepping to `hold`,
-    /// settle timer once `hold` (or `advance_budget_s`) is reached, and samples of
+    /// settle timer once `hold` (or `advance_budget_s`) is reached, and bounded inline samples of
     /// |τ_gripper| and |load_gripper|.
     /// `ramp`: the squeeze started at the measured position after a torque cap trip and
     /// presses in (squeeze_rad over half the window) until the torque reaches SQUEEZE_RAMP_FRACTION of the cap.
@@ -1461,8 +1756,8 @@ enum GripPhase {
         advance_elapsed: f64,
         advance_budget_s: f64,
         elapsed: f64,
-        taus: Vec<f32>,
-        loads: Vec<f32>,
+        taus: SqueezeSamples,
+        loads: SqueezeSamples,
         ramp: bool,
         cap_ramp: CapRamp,
     },
@@ -1496,11 +1791,8 @@ pub struct GripperMotion {
     /// `contact + squeeze_rad` (never past it) and closes at GRIPPER_CONTACT_SPEED. Cleared
     /// again when the contact gave way (`contact_yielded`).
     pub contact_rad: Option<f32>,
-    contact_ticks: u32,
-    contact_progress_anchor: Option<f32>,
-    contact_no_progress_s: f64,
-    lag_anchor: Option<f32>,
-    lag_stalled_s: f64,
+    contact_detector: GripperContactDetector,
+    lag_window: GripperProgressWindow,
     /// Free-motion torque baseline of the active tool (snapshot at the start of the move).
     baseline: Option<FreeTorqueBaseline>,
     /// Which moves are recorded for learning ([`Self::take_learning`]).
@@ -1609,8 +1901,9 @@ impl GripperMotion {
             request, policy, limit, target, start, gripper_index, planned_speed, planned_vel_raw,
             ceiling_torque_estimate_nm: None,
             elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, still_anchor: None, moved: false, phase: GripPhase::Moving,
-            contact_rad: None, contact_ticks: 0, contact_progress_anchor: None, contact_no_progress_s: 0.0,
-            lag_anchor: None, lag_stalled_s: 0.0,
+            contact_rad: None,
+            contact_detector: GripperContactDetector::default(),
+            lag_window: GripperProgressWindow::default(),
             baseline: None, learn: LearnMode::Off, samples: None,
             last_contact: None, loaded: false, learned: None,
             extendable: false, hard_timeout_s: 0.0, progress_ref: (0.0, start),
@@ -1636,8 +1929,9 @@ impl GripperMotion {
             .max(self.timeout_s);
     }
 
-    /// Attach the driver's ceiling torque estimate (N·m) so uncalibrated moving-jaw grasp contact
-    /// scales with the configured motor current cap (`>= max(0.82 N·m, 0.9 * ceiling_estimate)`).
+    /// Attach the driver's ceiling torque estimate (N·m) so moving-jaw grasp contact (both
+    /// calibrated and uncalibrated) scales with the configured motor current cap
+    /// (`>= max(0.82 N·m, 0.9 * ceiling_estimate)`).
     pub fn with_ceiling_torque_estimate(mut self, ceiling_torque_estimate_nm: Option<f32>) -> Self {
         self.ceiling_torque_estimate_nm = ceiling_torque_estimate_nm.filter(|v| v.is_finite() && *v > 0.0);
         self
@@ -1673,17 +1967,6 @@ impl GripperMotion {
     /// True when this motion moves the jaw in the closing direction.
     pub fn is_closing(&self) -> bool {
         (self.target - self.start) * self.close_dir() > 1e-6
-    }
-
-    /// Contact torque threshold at jaw `m_g` moving at `mv` (rad/s): (threshold, source,
-    /// baseline). Off without `contact_torque_nm`.
-    fn contact_threshold(&self, m_g: f32, mv: f32) -> (Option<f32>, ThresholdSource, Option<f32>) {
-        match crate::gripper_baseline::closing_contact_threshold(self.baseline.as_ref(), m_g, mv.abs(),
-            self.policy.contact_torque_nm, self.policy.max_close_torque_nm) {
-            None => (None, ThresholdSource::None, None),
-            Some((t, true, b)) => (Some(t), ThresholdSource::Baseline, b),
-            Some((t, false, b)) => (Some(t), ThresholdSource::Uncalibrated, b),
-        }
     }
 
     /// Mark the move loaded when `at` is farther than holding_gap_rad from the target.
@@ -1820,7 +2103,9 @@ impl GripperMotion {
                 clear_gripper_stall: false,
                 status: StepStatus::Failed {
                     code: "FEEDBACK_UNAVAILABLE",
-                    message: "Gripper close stopped: torque feedback unavailable or stale while max_close_torque_nm is configured".into(),
+                    message: StepErrorText::new(
+                        "Gripper close stopped: torque feedback unavailable or stale while max_close_torque_nm is configured",
+                    ),
                 },
             };
         }
@@ -1842,9 +2127,16 @@ impl GripperMotion {
                     None => *hold,
                 };
                 if idx < positions.len() { positions[idx] = next_q; }
-                return StepOut { positions, velocities, progress: 1.0, clear_gripper_stall: false,
-                    status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
-                        "Gripper did not finish within {:.1} s (squeezing at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
+                return StepOut {
+                    positions, velocities, progress: 1.0, clear_gripper_stall: false,
+                    status: StepStatus::Failed {
+                        code: "GRIPPER_TIMEOUT",
+                        message: format_step_error(format_args!(
+                            "Gripper did not finish within {:.1} s (squeezing at {m_g:.3} rad, target {:.3} rad)",
+                            self.timeout_s, self.target
+                        )),
+                    },
+                };
             }
         }
         if let GripPhase::Squeeze { hold, advance_elapsed, advance_budget_s, elapsed, taus, loads, ramp, cap_ramp } = &mut self.phase {
@@ -1897,11 +2189,8 @@ impl GripperMotion {
             // the next torque rise or following error sets a new contact stop
             self.phase = GripPhase::Moving;
             self.contact_rad = None;
-            self.contact_ticks = 0;
-            self.contact_progress_anchor = None;
-            self.contact_no_progress_s = 0.0;
-            self.lag_anchor = None;
-            self.lag_stalled_s = 0.0;
+            self.contact_detector.reset();
+            self.lag_window.reset();
             self.still_for = 0.0;
             self.still_anchor = None;
             if idx < positions.len() { positions[idx] = m_g; }
@@ -1909,12 +2198,8 @@ impl GripperMotion {
         }
         if let GripPhase::Squeeze { elapsed, taus, loads, .. } = &mut self.phase {
             let status = if *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6 {
-                let mut sorted = taus.clone();
-                sorted.sort_by(|a, b| a.total_cmp(b));
-                let tau = sorted[sorted.len() / 2];
-                let mut sorted_loads = loads.clone();
-                sorted_loads.sort_by(|a, b| a.total_cmp(b));
-                let median_abs_load = if sorted_loads.is_empty() { 0.0 } else { sorted_loads[sorted_loads.len() / 2] };
+                let tau = taus.median_in_place();
+                let median_abs_load = loads.median_in_place();
                 let gap = (self.policy.closed_rad - m_g) * self.close_dir();
                 let holding = match self.policy.holding_mode {
                     HoldingMode::TorqueAndGap => ctx.torque_feedback && gap >= self.policy.holding_gap_rad && tau >= self.policy.holding_torque_nm,
@@ -1966,9 +2251,16 @@ impl GripperMotion {
         }
         if self.elapsed > self.timeout_s {
             if idx < positions.len() { positions[idx] = m_g; }
-            return StepOut { positions, velocities, progress: progress_of(m_g), clear_gripper_stall: clear,
-                status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
-                    "Gripper did not finish within {:.1} s (at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
+            return StepOut {
+                positions, velocities, progress: progress_of(m_g), clear_gripper_stall: clear,
+                status: StepStatus::Failed {
+                    code: "GRIPPER_TIMEOUT",
+                    message: format_step_error(format_args!(
+                        "Gripper did not finish within {:.1} s (at {m_g:.3} rad, target {:.3} rad)",
+                        self.timeout_s, self.target
+                    )),
+                },
+            };
         }
         if stalled { self.note_load(m_g); }
         if ctx.gripper_force_capped { self.loaded = true; }
@@ -1979,93 +2271,46 @@ impl GripperMotion {
         }
 
         let grasping = self.request.command == GripperCommand::Close && self.request.grasp;
-        // Unified grasp contact:
-        // - Net-progress window (`progress_window_s <= 0.50 s`, watermark >= 0.002 rad) defines
-        //   both `progress_stopped` and following-error `lag_hit`.
-        // - Calibrated (`ThresholdSource::Baseline`): torque >= learned baseline + margin (floored
-        //   at MIN_CONTACT_NM, capped at 0.85 * cap), sustained for GRIPPER_BASELINE_CONTACT_TICKS
-        //   (3) while moving or GRIPPER_CONTACT_TICKS (2) once net progress stops.
-        // - Uncalibrated (`ThresholdSource::Uncalibrated`): while moving, torque must exceed the
-        //   uncalibrated threshold floored by J7's measured-data floors (`max(uncal, contact_nm,
-        //   0.82 N·m, 0.9 * ceiling_estimate)`) for 3 ticks; once net progress stops, configured
-        //   `contact_torque_nm` (e.g. 0.60 N·m) for 2 ticks or `lag_hit` marks contact.
-        if grasping && self.contact_rad.is_none() && ctx.feedback_fresh && !stalled {
-            let progress_window_s = if self.planned_speed.is_finite() && self.planned_speed > 0.0 {
-                0.10_f64.max(
-                    (2.0 * f64::from(GRIPPER_STILL_PROGRESS_EPS) / self.planned_speed + 0.06)
-                        .min(GRIPPER_STALL_WINDOW_MAX_S),
-                )
+        // Unified grasp contact via shared `GripperContactDetector` + `GripperProgressWindow`:
+        // - Net-progress window (`progress_window_s <= 0.50 s`, watermark >= 0.002 rad) governs
+        //   both stopped torque contact and following-error `lag_hit`.
+        // - While moving, BOTH learned-baseline and uncalibrated branches enforce J7's measured
+        //   moving torque floors (`max(threshold, contact_torque_nm, 0.82 N·m, 0.9 * ceil)`)
+        //   sustained for GRIPPER_BASELINE_CONTACT_TICKS (3).
+        // - Once net progress stops, torque >= stopped threshold (`baseline + margin` when
+        //   calibrated, `contact_torque_nm` when uncalibrated) for GRIPPER_CONTACT_TICKS (2)
+        //   or `lag_hit` marks contact.
+        // Evaluate contact before an ordinary (non-cap) stall latch preempts it on the same tick:
+        // `SupervisorInner::tick` runs `gripper_stall_window` with the same net-progress window
+        // before stepping `GripperMotion`, so letting non-cap stalls run `contact_detector` keeps
+        // `contact_rad` and `last_contact` populated when a rigid stop reaches the window.
+        if grasping && self.contact_rad.is_none() && ctx.feedback_fresh && !(stalled && ctx.gripper_force_capped) {
+            let progress_window_s = gripper_progress_window_s(Some(self.planned_speed), 0.10);
+            let eval = self.contact_detector.step(&GripperContactInput {
+                baseline: self.baseline.as_ref(),
+                contact_torque_nm: self.policy.contact_torque_nm,
+                max_close_torque_nm: self.policy.max_close_torque_nm,
+                ceiling_torque_estimate_nm: self.ceiling_torque_estimate_nm,
+                stopped_stall_nm: None,
+                measured_pos: m_g,
+                dir,
+                baseline_speed: mv_g.abs(),
+                window_speed: Some(self.planned_speed),
+                tau_abs: tau_g.abs(),
+                dt: ctx.dt,
+                torque_feedback: ctx.torque_feedback,
+                active: self.moved,
+            });
+            let lag_hit = if (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD && m_g.is_finite() {
+                self.lag_window.update(m_g, dir, ctx.dt, progress_window_s).1
             } else {
-                0.10
+                self.lag_window.reset();
+                false
             };
-            if m_g.is_finite() {
-                match self.contact_progress_anchor {
-                    Some(anchor) if (m_g - anchor) * dir < GRIPPER_STILL_PROGRESS_EPS => {
-                        self.contact_no_progress_s += ctx.dt;
-                    }
-                    _ => {
-                        self.contact_progress_anchor = Some(m_g);
-                        self.contact_no_progress_s = 0.0;
-                    }
-                }
-            } else {
-                self.contact_progress_anchor = None;
-                self.contact_no_progress_s = 0.0;
-            }
-            let progress_stopped = self.contact_progress_anchor.is_some()
-                && self.contact_no_progress_s >= progress_window_s - 1e-9;
-            let (threshold, threshold_source, baseline_nm) = self.contact_threshold(m_g, mv_g);
-            let (active_thresh, active_source, active_base, torque_hit, needed) = match threshold_source {
-                ThresholdSource::Baseline => {
-                    let hit = ctx.torque_feedback && self.moved && threshold.is_some_and(|c| tau_g.abs() >= c);
-                    let needed = if progress_stopped { GRIPPER_CONTACT_TICKS } else { GRIPPER_BASELINE_CONTACT_TICKS };
-                    (threshold, ThresholdSource::Baseline, baseline_nm, hit, needed)
-                }
-                ThresholdSource::Uncalibrated => {
-                    let moving_thresh = threshold.map(|t| {
-                        let mut m = t
-                            .max(self.policy.contact_torque_nm.unwrap_or(0.0))
-                            .max(GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM);
-                        if let Some(ceil) = self.ceiling_torque_estimate_nm.filter(|v| v.is_finite() && *v > 0.0) {
-                            m = m.max(0.9 * ceil);
-                        }
-                        m
-                    });
-                    if progress_stopped {
-                        let stopped_thresh = self.policy.contact_torque_nm;
-                        let hit = ctx.torque_feedback && self.moved && stopped_thresh.is_some_and(|c| tau_g.abs() >= c);
-                        (stopped_thresh, ThresholdSource::Uncalibrated, baseline_nm, hit, GRIPPER_CONTACT_TICKS)
-                    } else {
-                        let hit = ctx.torque_feedback && self.moved && moving_thresh.is_some_and(|c| tau_g.abs() >= c);
-                        (moving_thresh, ThresholdSource::Uncalibrated, baseline_nm, hit, GRIPPER_BASELINE_CONTACT_TICKS)
-                    }
-                }
-                ThresholdSource::ContactTorqueNm | ThresholdSource::None => {
-                    (None, ThresholdSource::None, None, false, GRIPPER_CONTACT_TICKS)
-                }
-            };
-            if (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD && m_g.is_finite() {
-                match self.lag_anchor {
-                    Some(anchor) if (m_g - anchor) * dir < GRIPPER_STILL_PROGRESS_EPS => {
-                        self.lag_stalled_s += ctx.dt;
-                    }
-                    _ => {
-                        self.lag_anchor = Some(m_g);
-                        self.lag_stalled_s = 0.0;
-                    }
-                }
-            } else {
-                self.lag_anchor = None;
-                self.lag_stalled_s = 0.0;
-            }
-            let lag_hit = self.lag_anchor.is_some() && self.lag_stalled_s >= progress_window_s - 1e-9;
-            self.contact_ticks = if torque_hit { self.contact_ticks + 1 } else { 0 };
-            if lag_hit || self.contact_ticks >= needed {
+            if lag_hit || eval.triggered {
                 self.contact_rad = Some(m_g);
-                self.contact_progress_anchor = None;
-                self.contact_no_progress_s = 0.0;
-                self.lag_anchor = None;
-                self.lag_stalled_s = 0.0;
+                self.contact_detector.reset();
+                self.lag_window.reset();
                 if let Some(raw) = self.planned_vel_raw {
                     let contact_raw = crate::model::DamiaoGripperDrive::quantize_vel_raw(GRIPPER_CONTACT_SPEED).max(1);
                     let next_raw = raw.min(contact_raw);
@@ -2079,18 +2324,16 @@ impl GripperMotion {
                 self.last_contact = Some(ContactInfo {
                     at_rad: m_g,
                     torque_nm: tau,
-                    threshold_nm: active_thresh,
-                    baseline_nm: active_base,
-                    margin_nm: active_base.map(|b| tau - b),
-                    source: if torque_hit && self.contact_ticks >= needed { ContactSource::Torque } else { ContactSource::Lag },
-                    threshold_source: active_source,
+                    threshold_nm: eval.threshold_nm,
+                    baseline_nm: eval.baseline_nm,
+                    margin_nm: eval.baseline_nm.map(|b| tau - b),
+                    source: if eval.triggered { ContactSource::Torque } else { ContactSource::Lag },
+                    threshold_source: eval.threshold_source,
                 });
             }
         } else {
-            self.contact_progress_anchor = None;
-            self.contact_no_progress_s = 0.0;
-            self.lag_anchor = None;
-            self.lag_stalled_s = 0.0;
+            self.contact_detector.reset();
+            self.lag_window.reset();
         }
         let stop = self.contact_stop();
         let target = stop.unwrap_or(self.target);
@@ -2119,14 +2362,7 @@ impl GripperMotion {
         }
         if (m_g - self.start).abs() > 0.05 { self.moved = true; }
         let cmd_at_target = idx < positions.len() && (positions[idx] - target).abs() < 1e-4;
-        let still_window_s = if self.planned_speed.is_finite() && self.planned_speed > 0.0 {
-            SETTLE_HOLD_S.max(
-                (2.0 * f64::from(GRIPPER_STILL_PROGRESS_EPS) / self.planned_speed + 0.06)
-                    .min(GRIPPER_STALL_WINDOW_MAX_S),
-            )
-        } else {
-            SETTLE_HOLD_S
-        };
+        let still_window_s = gripper_progress_window_s(Some(self.planned_speed), SETTLE_HOLD_S);
         let travel_dir = if (target - self.start) >= 0.0 { 1.0_f32 } else { -1.0_f32 };
         if m_g.is_finite() && (self.moved || cmd_at_target) {
             let no_net_progress = match self.still_anchor {
@@ -2176,8 +2412,8 @@ impl GripperMotion {
                     advance_elapsed: 0.0,
                     advance_budget_s,
                     elapsed: 0.0,
-                    taus: Vec::new(),
-                    loads: Vec::new(),
+                    taus: SqueezeSamples::new(),
+                    loads: SqueezeSamples::new(),
                     ramp,
                     cap_ramp,
                 };
@@ -2195,10 +2431,10 @@ impl GripperMotion {
             } else {
                 StepStatus::Failed {
                     code: "GRIPPER_TIMEOUT",
-                    message: format!(
+                    message: format_step_error(format_args!(
                         "Gripper stalled short of target (at {m_g:.3} rad, target {:.3} rad)",
                         self.target
-                    ),
+                    )),
                 }
             }
         } else if self.request.command != GripperCommand::Seek && still && ((m_g - self.target).abs() < SETTLE_POS_RAD as f32
@@ -2257,6 +2493,25 @@ impl ActiveTrajectory {
         a.span = Some((0.0, total));
         a.then = Some(then);
         a
+    }
+
+    /// True when dropping this trajectory would free heap memory (used to retire
+    /// heap-owning pre-handoff trajectories off-thread on RT urgent stops).
+    pub fn has_heap_storage(&self) -> bool {
+        if self.motion_limits.is_some() {
+            return true;
+        }
+        if self.then.as_ref().is_some_and(|q| q.polynomials.is_heap()) {
+            return true;
+        }
+        match &self.reference {
+            Reference::Quintic(q) => q.polynomials.is_heap(),
+            Reference::Path(p) => p.has_heap_storage(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Reference::Gripper(_) => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Reference::Replay(r) => r.has_heap_storage(),
+        }
     }
     /// Action progress of this leg's `progress` (0..1) over the whole motion.
     pub fn overall_progress(&self, progress: f32) -> f32 {
@@ -2556,6 +2811,28 @@ pub struct MacroMotionDiag {
 
 impl ActionStatus {
     pub fn is_running(&self) -> bool { self.state == "running" }
+
+    /// Zero-allocation empty shell used to place a preallocated string spare into
+    /// `ActionStatus::message` before `clone_from` on `armd-control`.
+    pub(crate) fn blank() -> Self {
+        Self {
+            id: 0, kind: crate::model::HolderLabel::new(""), tag: None,
+            state: crate::model::HolderLabel::new(""), code: None, message: None, progress: 0.0,
+            started_at: 0.0, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
+            task: None, phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
+            episode: None, t_s: None, power_scale: None,
+            sequence_id: None, step_index: None, step_type: None, repeat_index: None, repeats: None, failed_step: None, episodes: Vec::new(),
+            align: None, align_turn_rad: None, angle_spread_deg: None, orientation: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None, depth_anchor: None, object_depth_m: None, object_length_m: None, jaw_clear: None, border: None, border_shift_px: None, probe_mode: None, lateral_baseline_m: None, lateral_baseline_err_mm: None, height_estimates: Vec::new(), yaw_estimates: Vec::new(), width_estimates: Vec::new(),
+            recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
+            descend_contact: None, descend_contact_height_m: None, post_lift: None,
+            pre_open: None, pre_open_m: None, held_width_m: None,
+            stop_rad: None, offset_rad: None, pass: None,
+            approach: None, approach_reason: None, approach_signs: None, approach_flipped: None,
+            phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
+            constraint_id: None, geometry_id: None, violation_phase: None, reason: None,
+            durability_confirmed: None, durability_warning: None, policy_stats: None, measurement: None,
+        }
+    }
 }
 
 /// One evaluated source, reported in `ActionStatus.height_estimates` / `yaw_estimates` /

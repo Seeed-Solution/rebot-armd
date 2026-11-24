@@ -133,6 +133,23 @@ impl SupervisorInner {
     }
 
     /// Full workspace sweep check for a servo streaming or braking tick.
+    /// Pre-warms `ws_eval_bufs` before `armd-control` enters `SCHED_FIFO` so the first
+    /// braking tick after an RT urgent stop performs zero heap allocations.
+    pub fn prewarm_rt_buffers(&mut self) {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        if let Some((ws, cam)) = self.workspace_policy() {
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            );
+            eval.recycle(&mut bufs);
+        }
+        self.ws_eval_bufs = bufs;
+    }
+
     pub fn servo_step_workspace(&mut self, next: &[f32], phase: &str) -> Result<(), SafetyError> {
         // the evaluator's vectors are reused from tick to tick (no allocation in the tick)
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
@@ -210,13 +227,20 @@ impl SupervisorInner {
     }
 
     pub fn validate_servo_lease(&mut self, client_id: &str, generation: u64) -> bool {
-        if self.detached {
+        self.validate_lease_at(client_id, generation, Instant::now())
+    }
+
+    /// Owner-serialized lease validation at `now`: verifies non-detached state, non-zero
+    /// generation, matching connection identity, and non-expiry at `now`, updating
+    /// `last_valid_motion_instant` on success. Zero allocations and zero frees.
+    pub fn validate_lease_at(&mut self, client_id: &str, generation: u64, now: Instant) -> bool {
+        if self.detached || generation == 0 || client_id.is_empty() {
             return false;
         }
         if let Some(ref mut active) = self.active_lease {
-            let not_expired = active.acquired_at.elapsed() < self.lease_timeout;
-            if not_expired && active.generation == generation && !client_id.is_empty() && active.client_id == client_id {
-                active.last_valid_motion_instant = Some(Instant::now());
+            let not_expired = now.saturating_duration_since(active.acquired_at) < self.lease_timeout;
+            if not_expired && active.generation == generation && active.client_id == client_id {
+                active.last_valid_motion_instant = Some(now);
                 true
             } else {
                 false
@@ -313,18 +337,24 @@ impl SupervisorInner {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
+                    self.gripper_stall_window.reset();
                 }
             }
         }
     }
 
-    pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
-        self.servo_slice(&targets, epoch_id)
+    pub fn servo(admitted: Admitted<'_>, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+        Self::servo_slice(admitted, &targets, epoch_id)
     }
 
     /// [`Self::servo`] from a slice: no allocation once the servo buffers hold a target
     /// (the latest-target path consumes through it).
-    pub fn servo_slice(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
+    pub fn servo_slice(admitted: Admitted<'_>, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
+        let (this, _proof) = admitted.consume()?;
+        this.servo_slice_inner(targets_in, epoch_id)
+    }
+
+    fn servo_slice_inner(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
         if targets_in.len() > crate::rt_core::mailbox::MAX_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
         let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         let targets = &mut buf[..targets_in.len()];
@@ -774,11 +804,13 @@ impl SupervisorInner {
         Ok(())
     }
 
-    /// Install an exclusive streaming `PolicyRun` after lease, epoch, driver gate, and mutual exclusion checks.
-    pub fn begin_policy_run(
-        &mut self,
-        req: crate::policy_runtime::PolicyRunStart,
-    ) -> Result<u64, ArmError> {
+    /// Install an exclusive streaming `PolicyRun` after stamp, lease, epoch, driver gate, and mutual exclusion checks.
+    pub fn begin_policy_run(admitted: Admitted<'_>, req: crate::policy_runtime::PolicyRunStart) -> Result<u64, ArmError> {
+        let (this, _proof) = admitted.consume()?;
+        this.begin_policy_run_inner(req)
+    }
+
+    fn begin_policy_run_inner(&mut self, req: crate::policy_runtime::PolicyRunStart) -> Result<u64, ArmError> {
         use crate::policy_runtime::{PolicyMode, PolicyRun, DEFAULT_MAX_FIRST_STEP_RAD};
 
         self.check_policy_start_preconditions_with(
@@ -861,6 +893,7 @@ impl SupervisorInner {
                 v.min(DEFAULT_MAX_FIRST_STEP_RAD)
             });
 
+        self.check_terminal_fifo_for_new_action()?;
         let action_id = self.begin_action("policy", req.tag);
         let run = PolicyRun {
             action_id,
@@ -927,6 +960,10 @@ impl SupervisorInner {
 
     /// [`Self::policy_step_with_vision`] from a slice: no allocation on an accepted step once
     /// the run's buffers hold a target (the latest-target path consumes through it).
+    ///
+    /// Exempt from `Admitted` (Invariant 1b): continuation step of a policy run that was already
+    /// admitted via `begin_policy_run(Admitted<'_>, ...)`; gated by the active run's
+    /// `action_id`, authorization generation, epoch, lease, and E-stop/Stop termination.
     pub fn policy_step_slice(
         &mut self,
         action_id: u64,
@@ -1464,6 +1501,10 @@ pub mod targets {
             SafetyError::FaultActive(_) => "FAULT_ACTIVE",
             SafetyError::NotArmed(_) => "NOT_ARMED",
             SafetyError::OwnerTransferred => "OWNER_TRANSFERRED",
+            SafetyError::Stopped => "STOPPED",
+            SafetyError::LeaseLost => "LEASE_LOST",
+            SafetyError::TerminalsBusy => "TERMINALS_BUSY",
+            SafetyError::StampAlreadyConsumed => "STAMP_REUSED",
             _ => "SAFETY_ERROR",
         }
     }
@@ -1663,18 +1704,35 @@ pub mod targets {
 
     impl SupervisorInner {
         /// Consume the servo frames of the connection holding lease `lease_generation`
-        /// (replaces the authorized stream; called when a connection gets the lease).
-        pub fn authorize_servo_stream(&mut self, lease_generation: u64) {
-            self.core.authorize_stream(TargetAuthority { stream: Some(servo_stream(lease_generation)), ..TargetAuthority::default() });
+        /// (replaces the authorized stream; requires a single-use [`Admitted`] proof).
+        pub fn authorize_servo_stream(admitted: crate::supervisor::Admitted<'_>, lease_generation: u64) -> Result<(), SafetyError> {
+            let (this, proof) = admitted.consume()?;
+            let stamp = proof.stamp();
+            if lease_generation == 0 || stamp.lease_gen != lease_generation {
+                return Err(SafetyError::LeaseLost);
+            }
+            this.core.authorize_stream(TargetAuthority { stream: Some(servo_stream(lease_generation)), ..TargetAuthority::default() });
+            Ok(())
         }
 
         /// After a policy run of `action_id`: hand the targets back to the lease holder's
-        /// servo stream (none without a lease) when the run's stream was authorized.
+        /// servo stream (none without a lease or under E-stop) when the run's stream was authorized.
         #[cfg(feature = "policy-runtime")]
         pub(in crate::supervisor) fn end_policy_stream(&mut self, action_id: u64) {
             if self.core.target_authority().stream != Some(policy_stream(action_id)) { return; }
             match self.active_lease.as_ref().map(|l| l.generation) {
-                Some(g) => self.authorize_servo_stream(g),
+                Some(g) => {
+                    let stamp = crate::supervisor::AdmissionStamp::for_rt_internal(
+                        self.current_stop_gen(),
+                        self.safety.epoch_id(),
+                        g,
+                    );
+                    if let Ok(admitted) = self.check_admission(stamp) {
+                        let _ = Self::authorize_servo_stream(admitted, g);
+                    } else {
+                        self.core.revoke_stream();
+                    }
+                }
                 None => self.core.revoke_stream(),
             }
         }
@@ -1740,7 +1798,14 @@ pub mod targets {
             if self.core.motion_inhibited_by_config() { return Err(Refusal::code("CONFIG_BUSY")); }
             if policy { return self.consume_policy_target(frame, ctx.now); }
             if self.calibration_busy { return Err(Refusal::code("CALIBRATION_BUSY")); }
-            self.servo_slice(frame.positions(), frame.authority.epoch).map_err(|e| {
+            self.sync_stop_generation(ctx.stop_generation);
+            let stamp = crate::supervisor::AdmissionStamp::for_rt_internal(
+                frame.authority.stop_generation,
+                frame.authority.epoch,
+                frame.authority.lease_generation,
+            );
+            let admitted = self.check_admission(stamp).map_err(|e| Refusal::code(safety_code(&e)))?;
+            Self::servo_slice(admitted, frame.positions(), frame.authority.epoch).map_err(|e| {
                 let joint = match &e {
                     SafetyError::SoftLimitExceeded { joint, .. } => self.config.limits.iter().position(|l| &l.name == joint).map(|i| i as u8),
                     _ => None,

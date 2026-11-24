@@ -68,7 +68,7 @@ fn mit_is_refused_when_the_executor_is_not_real_time() {
         memory_locked: Some(false), memory_lock: Some("failed: Cannot allocate memory".into()), errors: vec![],
     }));
     bus.with(|s| s.tx_log.clear());
-    let err = inner.set_torque(true).expect_err("MIT refused");
+    let err = { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect_err("MIT refused");
     assert!(err.to_string().contains("MIT_UNQUALIFIED") && err.to_string().contains("RT executor"), "{err}");
     assert!(!inner.is_torqued);
     assert_eq!(bus.tx_log().iter().filter(|f| f.data == damiao::CMD_ENABLE).count(), 0, "no enable frame");
