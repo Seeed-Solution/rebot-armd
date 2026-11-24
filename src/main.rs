@@ -247,6 +247,7 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
             expected_dof.unwrap()
         ));
     }
+    config.resolve_control_modes_for_follower(follower)?;
     Ok(config)
 }
 
@@ -463,6 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
     let config = apply_cli_tool(config, cli.tool.as_deref())?;
+    config.resolve_control_modes_for_follower(follower)?;
     if follower == "mock" && cli.follower_port.is_some() {
         return Err("--follower-port requires a hardware follower".into());
     }
@@ -1130,6 +1132,25 @@ mod shutdown_tests {
         let rs = resolve_follower_config("rebot-rs", Some(profile)).unwrap();
         assert_eq!(rs.dof, 6);
         assert!(rs.kinematics.is_some() && rs.workspace.is_some());
+
+        // Pre-transport validation rejects unsupported vendor bindings and conflicts.
+        let dir = tempfile::tempdir().unwrap();
+        let bad_rs = dir.path().join("bad_rs_mode.json");
+        let mut val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(profile).unwrap()).unwrap();
+        val["urdf"] = serde_json::json!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ReBot_Arm_RS.urdf"));
+        val["control_mode"] = serde_json::json!([
+            {"mode": "position"},
+            null, null, null, null, null
+        ]);
+        std::fs::write(&bad_rs, serde_json::to_string_pretty(&val).unwrap()).unwrap();
+        let err = resolve_follower_config("rebot-rs", Some(bad_rs.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("does not support control mode 'position'"), "{err}");
+
+        // Cross-vendor profile (Feetech profile passed to rebot-rs) fails before transport open.
+        let so101 = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/so_arm101.json");
+        let err = resolve_follower_config("rebot-rs", Some(so101)).unwrap_err();
+        assert!(err.contains("conflicts with feetech"), "{err}");
     }
 
     #[test]
