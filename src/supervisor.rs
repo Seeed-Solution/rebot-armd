@@ -6982,7 +6982,8 @@ impl TerminalBroadcaster {
 }
 
 /// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
-pub(crate) struct TerminalSubscription {
+#[doc(hidden)]
+pub struct TerminalSubscription {
     broadcaster: Arc<TerminalBroadcaster>,
     id: u64,
 }
@@ -7037,9 +7038,6 @@ pub struct ArmSupervisor {
     legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
     /// Unique identifier for this daemon/supervisor instance (changes across restarts).
     instance_id: String,
-    /// Off-RT sidecar store of completed/failed `measure_multiview` measurements keyed by action ID
-    /// when `OWNER_EXECUTOR` is active (never touched by `armd-control`; bounded to 16 entries).
-    executor_measurements: std::sync::Mutex<std::collections::HashMap<u64, serde_json::Value>>,
     /// Off-RT sidecar store of `calib_hover` jobs when `OWNER_EXECUTOR` is active (never touched
     /// by `armd-control`; bounded to `calib_hover::KEEP_JOBS`).
     executor_hover_jobs: std::sync::Mutex<Vec<crate::calib_hover::HoverJob>>,
@@ -7237,27 +7235,17 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             instance_id,
-            executor_measurements: std::sync::Mutex::new(std::collections::HashMap::new()),
             executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Owner-aware storage of a `measure_multiview` measurement payload for action `id`.
-    /// Never touches `SupervisorLock` when `OWNER_EXECUTOR` is active.
+    /// On `OWNER_EXECUTOR`, stores in `self.hub` (never touching `SupervisorLock` or `armd-control`)
+    /// so `StateHub::refresh` attaches `action.measurement` into every published observation and
+    /// delivered terminal identically to the Legacy owner.
     pub async fn record_action_measurement(&self, id: u64, value: serde_json::Value) {
         if self.owner_mode() == OWNER_EXECUTOR {
-            let mut map = self
-                .executor_measurements
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.insert(id, value);
-            while map.len() > 16 {
-                if let Some(&oldest) = map.keys().min() {
-                    map.remove(&oldest);
-                } else {
-                    break;
-                }
-            }
+            self.hub.record_action_measurement(id, value);
         } else {
             self.inner()
                 .write()
@@ -7270,11 +7258,7 @@ impl ArmSupervisor {
     /// Never touches `SupervisorLock` when `OWNER_EXECUTOR` is active.
     pub async fn action_measurement(&self, id: u64) -> Option<serde_json::Value> {
         if self.owner_mode() == OWNER_EXECUTOR {
-            self.executor_measurements
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&id)
-                .cloned()
+            self.hub.action_measurement(id)
         } else {
             let inner = self.inner().read().await;
             inner
@@ -7674,6 +7658,15 @@ impl ArmSupervisor {
         self.terminals.subscriber_count.load(Ordering::Acquire)
     }
 
+    /// Test-only hook: subscribe to the lossless `TerminalBroadcaster` terminal stream.
+    #[doc(hidden)]
+    pub fn test_subscribe_action_terminals(
+        &self,
+        sink: impl Fn(&ArmObservation) -> bool + Send + Sync + 'static,
+    ) -> TerminalSubscription {
+        self.subscribe_action_terminals(sink)
+    }
+
     #[doc(hidden)]
     pub fn inner(&self) -> &Arc<SupervisorLock<SupervisorInner>> {
         &self.inner
@@ -7702,7 +7695,8 @@ impl ArmSupervisor {
             Err(_) => {
                 if self.owner_mode() == OWNER_EXECUTOR {
                     if let Some(h) = self.executor_handle() {
-                        if let Ok(obs) = h.observation_async().await {
+                        if let Ok(mut obs) = h.observation_async().await {
+                            self.hub.attach_action_measurement(&mut obs);
                             return obs;
                         }
                     }
@@ -7717,7 +7711,8 @@ impl ArmSupervisor {
                 }
                 drop(inner);
                 if let Some(h) = self.executor_handle() {
-                    if let Ok(obs) = h.observation_async().await {
+                    if let Ok(mut obs) = h.observation_async().await {
+                        self.hub.attach_action_measurement(&mut obs);
                         return obs;
                     }
                 }

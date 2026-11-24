@@ -439,6 +439,10 @@ pub struct StateHub {
     /// Revision-tagged slow-changing planning environment published off-thread (never touched
     /// on `armd-control`; read by off-thread action preparation and macro orchestrators).
     prep_env: Mutex<Option<Arc<super::requests::actions::ActionPrepEnv>>>,
+    /// Bounded off-RT sidecar store of `measure_multiview` measurement payloads keyed by action
+    /// ID (never touched on `armd-control`; bounded to 16 entries). Attached in [`Self::refresh`]
+    /// to `obs.action` and `obs.previous_action` before any snapshot or terminal is delivered.
+    action_measurements: Mutex<std::collections::HashMap<u64, serde_json::Value>>,
     /// Number of off-RT readers currently waiting to acquire `self.state` inside `latest()`.
     latest_waiters: AtomicUsize,
 }
@@ -462,6 +466,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         tick_frees: AtomicU64::new(0),
         prewarm_template: OnceLock::new(),
         prep_env: Mutex::new(None),
+        action_measurements: Mutex::new(std::collections::HashMap::new()),
         latest_waiters: AtomicUsize::new(0),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
@@ -521,7 +526,9 @@ impl StateHub {
                 // copied, not moved: the slot keeps its memory for the tick to fill again (the
                 // tick neither allocates nor frees observations)
                 if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
-                    let snap = Snapshot { meta, obs: obs.clone(), rt: slot.rt.clone() };
+                    let mut obs = obs.clone();
+                    self.attach_action_measurement(&mut obs);
+                    let snap = Snapshot { meta, obs, rt: slot.rt.clone() };
                     st.latest = Some(Arc::new(snap));
                 }
             }
@@ -577,6 +584,103 @@ impl StateHub {
     /// Reads the latest published off-RT revision-tagged planning environment.
     pub fn prep_env(&self) -> Option<Arc<super::requests::actions::ActionPrepEnv>> {
         self.prep_env.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Records an off-RT measurement payload for action `id` (bounded to 16 entries) and patches
+    /// the cached latest snapshot if it already carries `id` without a measurement. Never called
+    /// on `armd-control`; lock order is strictly `state -> action_measurements` (never nested in
+    /// reverse).
+    pub fn record_action_measurement(&self, id: u64, value: serde_json::Value) {
+        {
+            let mut map = self
+                .action_measurements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.insert(id, value.clone());
+            while map.len() > 16 {
+                if let Some(&oldest) = map.keys().min() {
+                    map.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(latest) = st.latest.as_ref() {
+            let needs_patch = latest
+                .obs
+                .action
+                .as_ref()
+                .is_some_and(|a| a.id == id && a.measurement.is_none())
+                || latest
+                    .obs
+                    .previous_action
+                    .as_ref()
+                    .is_some_and(|a| a.id == id && a.measurement.is_none());
+            if needs_patch {
+                let mut snap = (**latest).clone();
+                if let Some(a) = snap
+                    .obs
+                    .action
+                    .as_mut()
+                    .filter(|a| a.id == id && a.measurement.is_none())
+                {
+                    a.measurement = Some(value.clone());
+                }
+                if let Some(a) = snap
+                    .obs
+                    .previous_action
+                    .as_mut()
+                    .filter(|a| a.id == id && a.measurement.is_none())
+                {
+                    a.measurement = Some(value);
+                }
+                st.latest = Some(Arc::new(snap));
+            }
+        }
+    }
+
+    /// Reads back the off-RT sidecar measurement payload recorded for action `id`, if present.
+    pub fn action_measurement(&self, id: u64) -> Option<serde_json::Value> {
+        self.action_measurements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+    }
+
+    /// Populates `obs.action.measurement` and `obs.previous_action.measurement` from the off-RT
+    /// sidecar store when missing.
+    pub fn attach_action_measurement(&self, obs: &mut ArmObservation) {
+        let need_cur = obs.action.as_ref().is_some_and(|a| a.measurement.is_none());
+        let need_prev = obs
+            .previous_action
+            .as_ref()
+            .is_some_and(|a| a.measurement.is_none());
+        if !need_cur && !need_prev {
+            return;
+        }
+        let map = self
+            .action_measurements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        if let Some(a) = obs.action.as_mut().filter(|a| a.measurement.is_none()) {
+            if let Some(v) = map.get(&a.id) {
+                a.measurement = Some(v.clone());
+            }
+        }
+        if let Some(a) = obs
+            .previous_action
+            .as_mut()
+            .filter(|a| a.measurement.is_none())
+        {
+            if let Some(v) = map.get(&a.id) {
+                a.measurement = Some(v.clone());
+            }
+        }
     }
 }
 

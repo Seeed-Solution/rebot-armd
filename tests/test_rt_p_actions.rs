@@ -3484,3 +3484,250 @@ fn r2_m3_macro_parent_deadline_stops_output_pre_tx_with_no_advance() {
             if *request == r_b && *action == parent
     )));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_m6_multiview_measurement_published_before_terminal_on_both_owners() {
+    // M6: on BOTH Legacy and Executor owners, `record_action_measurement(id, value)` before
+    // terminal commit MUST populate `obs.action.measurement` (and `obs.previous_action.measurement`
+    // if a subsequent action starts) BEFORE the terminal is delivered via `TerminalBroadcaster`,
+    // `subscribe_telemetry`, `sup.observation()`, and `sup.get_observation()`.
+    let payload = json!({
+        "method": "motion_stereo",
+        "table_z_m": 0.01,
+        "objects": [{"label": "mug", "height_m": 0.085, "views_used": 3}]
+    });
+
+    // --- 1) Legacy owner ---
+    {
+        let cfg = ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            SupervisorInner::enable_torque(a).unwrap();
+            inner.tick(DT);
+        }
+        sup.start_dispatcher().unwrap();
+        let delivered = Arc::new(Mutex::new(Vec::<armd::ArmObservation>::new()));
+        let delivered_sink = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            delivered_sink.lock().unwrap().push(obs.clone());
+            true
+        });
+
+        let id = {
+            let mut inner = sup.inner().write().await;
+            let ep = inner.safety.epoch_id();
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            SupervisorInner::begin_orchestrated_action(a, "measure_multiview", None, ep).unwrap()
+        };
+        sup.record_action_measurement(id, payload.clone()).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.finish_macro(id, "done", None, None, None, None);
+        }
+        sup.tick(DT).await;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let term = loop {
+            if let Some(obs) = delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|o| o.action.as_ref().is_some_and(|a| a.id == id))
+                .cloned()
+            {
+                break obs;
+            }
+            assert!(Instant::now() < deadline, "legacy terminal not delivered");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(
+            term.action.as_ref().and_then(|a| a.measurement.as_ref()),
+            Some(&payload),
+            "legacy terminal must carry action.measurement"
+        );
+        let obs = sup.observation().await.unwrap();
+        assert_eq!(obs.action.as_ref().and_then(|a| a.measurement.as_ref()), Some(&payload));
+        let obs2 = sup.get_observation().await;
+        assert_eq!(obs2.action.as_ref().and_then(|a| a.measurement.as_ref()), Some(&payload));
+    }
+
+    // --- 2) Executor owner ---
+    {
+        let cfg = ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        sup.set_lease_enabled(false).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            SupervisorInner::enable_torque(a).unwrap();
+            inner.tick(DT);
+        }
+        sup.start_dispatcher().unwrap();
+        let handle = sup
+            .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(
+                Duration::from_millis(20),
+            ))
+            .await
+            .unwrap();
+        let sink_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink_fired_c = Arc::clone(&sink_fired);
+        handle.attach_external_reply_sink(Arc::new(move |_cid, reply| {
+            if matches!(reply, Reply::Terminal { outcome: Outcome::Completed, .. }) {
+                sink_fired_c.store(true, std::sync::atomic::Ordering::Release);
+            }
+            armd::rt_core::broker::DeliveryDecision::Delivered
+        }));
+
+        let delivered = Arc::new(Mutex::new(Vec::<armd::ArmObservation>::new()));
+        let delivered_sink = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            delivered_sink.lock().unwrap().push(obs.clone());
+            true
+        });
+        let mut tel_rx = sup.subscribe_telemetry().unwrap();
+
+        let wait_pub = Instant::now() + Duration::from_secs(3);
+        while sup.hub().published_seq() == 0 {
+            assert!(Instant::now() < wait_pub);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut adm = sup.capture_admission_stamp();
+        adm.connection_id = 88;
+        let snap = ActionSnapshot::capture(&sup, adm, Instant::now() + DEFAULT_ACTION_DEADLINE)
+            .await
+            .unwrap();
+        let boot = handle.boot();
+        let mut spec = BeginMacroSpec::new(MacroKind::MeasureMultiview, boot);
+        spec.admission_request_id = adm.request_id;
+        let (id, _) = armd::macro_action::begin_macro_executor(
+            &sup,
+            &snap.stamp,
+            spec,
+            Instant::now() + DEFAULT_ACTION_DEADLINE,
+        )
+        .await
+        .unwrap();
+
+        // Publish sidecar measurement BEFORE finishing the macro (exact measure_multiview.rs:2637 order).
+        sup.record_action_measurement(id, payload.clone()).await;
+
+        // Even before terminal commit, `sup.observation()` reflects the recorded measurement on the running action.
+        let running_obs = sup.observation().await.unwrap();
+        assert_eq!(
+            running_obs.action.as_ref().and_then(|a| a.measurement.as_ref()),
+            Some(&payload),
+            "executor observation must reflect action.measurement immediately after record_action_measurement"
+        );
+
+        let ctx = armd::macro_action::MacroCtx {
+            sup: sup.clone(),
+            id,
+            stamp: adm,
+            deadline: Instant::now() + Duration::from_secs(30),
+            phase_timeout_s: 30.0,
+            timeout_code: "MEASURE_TIMEOUT",
+            timeout_message: String::new(),
+        };
+        ctx.finish(
+            armd::rt_core::requests::actions::FinishState::Done,
+            None,
+            None,
+            None,
+            None,
+            HeldUpdate::Unchanged,
+        )
+        .await;
+
+        // Wait for TerminalBroadcaster to deliver the terminal observation for `id`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let term = loop {
+            if let Some(obs) = delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|o| o.action.as_ref().is_some_and(|a| a.id == id))
+                .cloned()
+            {
+                break obs;
+            }
+            assert!(Instant::now() < deadline, "executor terminal not delivered");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(
+            term.action.as_ref().map(|a| (a.kind.as_str(), a.state.as_str())),
+            Some(("measure_multiview", "done"))
+        );
+        assert_eq!(
+            term.action.as_ref().and_then(|a| a.measurement.as_ref()),
+            Some(&payload),
+            "M6: executor terminal observation MUST carry action.measurement before delivery"
+        );
+
+        // `sup.observation()`, `sup.get_observation()`, and telemetry stream must ALL carry it.
+        let obs = sup.observation().await.unwrap();
+        assert_eq!(obs.action.as_ref().and_then(|a| a.measurement.as_ref()), Some(&payload));
+        let obs2 = sup.get_observation().await;
+        assert_eq!(obs2.action.as_ref().and_then(|a| a.measurement.as_ref()), Some(&payload));
+        let mut saw_tel_measurement = false;
+        while let Ok(o) = tel_rx.try_recv() {
+            if o.action.as_ref().is_some_and(|a| a.id == id && !a.is_running() && a.measurement.as_ref() == Some(&payload)) {
+                saw_tel_measurement = true;
+            }
+        }
+        assert!(saw_tel_measurement, "telemetry stream must also carry action.measurement on executor");
+
+        // Starting a subsequent action pushes `id` to `previous_action`; measurement must remain attached!
+        let mut adm2 = sup.capture_admission_stamp();
+        adm2.connection_id = 89;
+        let snap2 = ActionSnapshot::capture(&sup, adm2, Instant::now() + DEFAULT_ACTION_DEADLINE)
+            .await
+            .unwrap();
+        let mut spec2 = BeginMacroSpec::new(MacroKind::Grasp, boot);
+        spec2.admission_request_id = adm2.request_id;
+        let (id2, _) = armd::macro_action::begin_macro_executor(
+            &sup,
+            &snap2.stamp,
+            spec2,
+            Instant::now() + DEFAULT_ACTION_DEADLINE,
+        )
+        .await
+        .unwrap();
+        assert_ne!(id2, id);
+        let wait_prev = Instant::now() + Duration::from_secs(3);
+        let obs_after = loop {
+            let o = sup.observation().await.unwrap();
+            if o.action.as_ref().is_some_and(|a| a.id == id2) {
+                break o;
+            }
+            assert!(Instant::now() < wait_prev);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(
+            obs_after.previous_action.as_ref().and_then(|a| a.measurement.as_ref()),
+            Some(&payload),
+            "previous_action.measurement must remain attached on executor after next action starts"
+        );
+
+        handle.stop_and_join();
+    }
+}
