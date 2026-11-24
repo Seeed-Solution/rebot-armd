@@ -165,7 +165,14 @@ impl SupervisorInner {
         if self.shutdown_committed || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
             return Some(reason("ESTOP_ACTIVE", "E-stop is latched"));
         }
-        if let SafetyState::Fault(r) = self.safety.state() { return Some(reason("FAULT_ACTIVE", format!("Fault active: {r:?}"))); }
+        if let SafetyState::Fault(r) = self.safety.state() {
+            return Some(match r {
+                FaultReason::CanTxStalled => reason("FAULT_ACTIVE", "Fault active: CanTxStalled"),
+                FaultReason::BusLoss => reason("FAULT_ACTIVE", "Fault active: BusLoss"),
+                FaultReason::WatchdogTimeout => reason("FAULT_ACTIVE", "Fault active: WatchdogTimeout"),
+                _ => reason("FAULT_ACTIVE", format!("Fault active: {r:?}")),
+            });
+        }
         if self.handover_settling_since.is_some() { return Some(reason("HANDOVER_SETTLING", "Arm is settling after a control handover")); }
         if !self.is_torqued || self.pending_rearm || self.disable_pending || self.output_suspended
             || !self.safety.state().is_operational() {

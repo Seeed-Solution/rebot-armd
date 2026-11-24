@@ -59,6 +59,9 @@ struct VirtualBusState {
     tx_script: VecDeque<(TxRule, Duration)>,
     default_rule: TxRule,
     default_step: Duration,
+    /// Optional periodic TX spike: every Nth transmit (when > 0) adds `tx_spike_step` to clock.
+    tx_spike_every: usize,
+    tx_spike_step: Duration,
     flush_error: Option<TxRule>,
     clock: MockClock,
     on_tx: Option<Arc<dyn Fn(usize, &CanFrame) + Send + Sync>>,
@@ -85,6 +88,8 @@ impl VirtualBusState {
             tx_script: VecDeque::new(),
             default_rule: TxRule::Ok,
             default_step: Duration::ZERO,
+            tx_spike_every: 0,
+            tx_spike_step: Duration::ZERO,
             flush_error: None,
             clock,
             on_tx: None,
@@ -225,12 +230,15 @@ impl CanTransport for VirtualBus {
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let (rule, step, spin, cb, attempt_idx) = {
             let mut s = self.0.lock().unwrap();
-            let (rule, step) = s
+            let (rule, mut step) = s
                 .tx_script
                 .pop_front()
                 .unwrap_or((s.default_rule, s.default_step));
             let idx = s.tx_attempts;
             s.tx_attempts += 1;
+            if s.tx_spike_every > 0 && (idx + 1).is_multiple_of(s.tx_spike_every) {
+                step += s.tx_spike_step;
+            }
             s.tx_log.push(*frame);
             (rule, step, s.cpu_spin_iters, s.on_tx.clone(), idx)
         };

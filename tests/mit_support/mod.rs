@@ -175,6 +175,8 @@ pub struct FakeBusState {
     /// Every transmit reports WouldBlock (stalled controller); each attempt advances the clock
     /// by `stall_step`.
     pub tx_stall: bool,
+    /// Every transmit reports ENOBUFS (`TransportError::NoBufferSpace`).
+    pub tx_enobufs: bool,
     /// Only register writes (0x7FF, opcode 0x55) report WouldBlock (never reach the bus).
     pub stall_reg_writes: bool,
     pub stall_step: Duration,
@@ -185,6 +187,11 @@ pub struct FakeBusState {
     /// Fake time each dequeued frame / each transmit takes (slow host, queued controller).
     pub rx_step: Duration,
     pub tx_step: Duration,
+    /// Periodic TX latency spike: every Nth transmit (when > 0) adds `tx_spike_step` to clock.
+    pub tx_spike_every: usize,
+    pub tx_spike_step: Duration,
+    /// Total transmit attempts seen on this bus (incremented before each transmit check).
+    pub tx_attempts: usize,
     /// The next `n` flushes fail.
     pub fail_flushes: usize,
     /// The 0xCC status poll refreshes the motor watchdog (unknown on the device).
@@ -374,12 +381,16 @@ impl FakeBus {
             tx_lost: false,
             tx_error: false,
             tx_stall: false,
+            tx_enobufs: false,
             stall_reg_writes: false,
             stall_step: Duration::from_millis(1),
             fail_tx_after: None,
             fail_tx_ids: Vec::new(),
             rx_step: Duration::ZERO,
             tx_step: Duration::ZERO,
+            tx_spike_every: 0,
+            tx_spike_step: Duration::ZERO,
+            tx_attempts: 0,
             fail_flushes: 0,
             poll_feeds_watchdog: false,
             follow_commands: true,
@@ -400,7 +411,15 @@ impl CanTransport for FakeBus {
     fn supports_nonblocking_rt(&self) -> bool { true }
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let mut s = self.0.lock().unwrap();
-        if let Some(c) = &s.clock { c.advance(s.tx_step); }
+        let idx = s.tx_attempts;
+        s.tx_attempts += 1;
+        let mut step = s.tx_step;
+        if s.tx_spike_every > 0 && (idx + 1).is_multiple_of(s.tx_spike_every) {
+            step += s.tx_spike_step;
+        }
+        if !step.is_zero() {
+            if let Some(c) = &s.clock { c.advance(step); }
+        }
         let t = s.now();
         if s.record_tx_log {
             s.tx_log.push(*frame);
@@ -409,6 +428,9 @@ impl CanTransport for FakeBus {
         if let Some(h) = s.on_tx.clone() { h(); }
         if s.stall_reg_writes && frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
             return Err(TransportError::WouldBlock);
+        }
+        if s.tx_enobufs {
+            return Err(TransportError::NoBufferSpace);
         }
         if s.tx_stall {
             if let Some(c) = &s.clock { c.advance(s.stall_step); }
