@@ -163,6 +163,29 @@ impl CanTransport for ZeroAllocBus {
             }
             return Ok(());
         }
+        if frame.id == 0x7FF && frame.data[2] == damiao::REG_READ {
+            let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+            let rid = frame.data[3];
+            if let Some(m) = s.motors.iter().find(|m| m.id == id) {
+                let val: Option<[u8; 4]> = match rid {
+                    damiao::RID_CTRL_MODE => Some(damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+                    damiao::RID_PMAX => Some(m.limits.p_max.to_le_bytes()),
+                    damiao::RID_VMAX => Some(m.limits.v_max.to_le_bytes()),
+                    damiao::RID_TMAX => Some(m.limits.t_max.to_le_bytes()),
+                    _ => None,
+                };
+                if let Some(v) = val {
+                    let [lo, hi] = id.to_le_bytes();
+                    let reply = CanFrame::new_standard(
+                        0x10 + id,
+                        &[lo, hi, damiao::REG_READ, rid, v[0], v[1], v[2], v[3]],
+                    )
+                    .unwrap();
+                    s.rx.push_back((reply, Some(now)));
+                }
+            }
+            return Ok(());
+        }
         if let Some((idx, m)) = s.motors.iter_mut().enumerate().find(|(_, m)| u32::from(m.id) == frame.id) {
             if frame.data == damiao::CMD_ENABLE {
                 if (drop_enable_mask & (1 << idx)) == 0 {
@@ -217,6 +240,7 @@ fn build_armed_fixture(q_j2: f32) -> (ReleaseFixture<SupervisorInner>, Broker<Pl
         s.push_all_feedback();
     });
     drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
     let mut inner = SupervisorInner::new(ArmConfig {
         lease_timeout_ms: 600_000,
         ..ArmConfig::rebot_dm()
@@ -525,6 +549,7 @@ fn rt_enable_failure_with_motor_fault_and_failed_hold_ticks_zero_alloc() {
             s.push_all_feedback();
         });
         drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
         drv.set_torque(false).unwrap();
         let mut inner = SupervisorInner::new(ArmConfig {
             lease_timeout_ms: 600_000,

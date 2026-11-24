@@ -5885,3 +5885,134 @@ fn e3_feetech_delayed_torque_read_rejected_and_delayed_position_never_fresh() {
         assert!(t2 > t1, "distinct reply arrivals must carry distinct receive timestamps");
     }
 }
+
+/// Rule E4: Damiao mode evidence.
+/// A Damiao hold is sent ONLY in a VERIFIED mode, from a CTRL_MODE readback after this daemon
+/// start. If the mode is not verified, the joint is unheld (`UnheldNoVerifiedMode`, 0 frames),
+/// never assumed `PosVel`.
+#[test]
+fn e4_damiao_unverified_mode_unheld_never_assumed_posvel() {
+    use armd::driver::{DamiaoControlMode, JointHoldStatus, JointTarget};
+
+    // 1. Fresh DamiaoArmDriver after daemon start (no CTRL_MODE readback yet, even with
+    //    `with_control_mode(PosVel)`): every joint MUST be unverified, reported
+    //    `UnheldNoVerifiedMode`, and transmit ZERO hold frames!
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&limits(), clock.clone());
+    bus.with(|s| {
+        s.follow_commands = false;
+        for m in &mut s.motors {
+            m.q = 0.25;
+            m.enabled = false;
+        }
+        s.push_all_feedback();
+    });
+    let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits())
+        .unwrap()
+        .with_control_mode(DamiaoControlMode::PosVel);
+    // Establish empty-queue receive bound first, then deliver fresh position feedback.
+    dm.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    dm.read_joint_states().unwrap();
+    for j in 0..7 {
+        assert!(
+            !dm.joint_hold_mode_verified(j),
+            "fresh driver without CTRL_MODE readback must NOT claim verified hold mode on J{}",
+            j + 1
+        );
+    }
+    let targets: Vec<JointTarget> = (0..7).map(|_| JointTarget::position(0.25)).collect();
+    bus.clear_log();
+    let report = dm.write_measured_hold_masked(0b111_1111, &targets).unwrap();
+    assert!(!report.sent_any, "unverified driver must transmit ZERO hold frames");
+    assert_eq!(
+        report.joint_status[..7],
+        [JointHoldStatus::UnheldNoVerifiedMode; 7],
+        "unverified joints must be reported UnheldNoVerifiedMode, never assumed PosVel"
+    );
+    assert!(
+        bus.tx_log().iter().all(|f| !(0x101..=0x107).contains(&f.id) && !(1..=7).contains(&f.id)),
+        "unverified mode must emit ZERO POS_VEL or MIT hold frames: {:?}",
+        bus.tx_log()
+    );
+
+    // 2. Startup `check_mapping_ranges()` with J3 silent (no CTRL_MODE readback on J3) and
+    //    J1, J2, J4..J7 answering CTRL_MODE=2: J3 MUST remain unheld (`UnheldNoVerifiedMode`,
+    //    0 frames to J3) while answering peers ARE held!
+    bus.with(|s| {
+        s.motors[2].silent = true;
+    });
+    let _ = dm.check_mapping_ranges();
+    assert!(!dm.joint_hold_mode_verified(2), "silent J3 must remain unverified");
+    for j in [0, 1, 3, 4, 5, 6] {
+        assert!(
+            dm.joint_hold_mode_verified(j),
+            "J{} answered CTRL_MODE=2 readback and must be verified",
+            j + 1
+        );
+    }
+    bus.with(|s| {
+        s.motors[2].silent = false;
+        s.push_all_feedback();
+    });
+    dm.read_joint_states().unwrap();
+    bus.clear_log();
+    let report2 = dm.write_measured_hold_masked(0b111_1111, &targets).unwrap();
+    assert!(report2.sent_any);
+    assert_eq!(
+        report2.joint_status[2],
+        JointHoldStatus::UnheldNoVerifiedMode,
+        "silent J3 must stay UnheldNoVerifiedMode even after receiving fresh position feedback"
+    );
+    for j in [0, 1, 3, 4, 5, 6] {
+        assert_eq!(report2.joint_status[j], JointHoldStatus::Held);
+    }
+    let hold_ids: Vec<u32> = bus
+        .tx_log()
+        .iter()
+        .filter(|f| (0x101..=0x107).contains(&f.id) || (1..=7).contains(&f.id))
+        .map(|f| f.id)
+        .collect();
+    assert!(
+        !hold_ids.contains(&0x103) && !hold_ids.contains(&3),
+        "unverified J3 must receive ZERO hold frames, got {hold_ids:?}"
+    );
+    assert_eq!(hold_ids.len(), 6, "only the 6 verified peers may receive hold frames: {hold_ids:?}");
+
+    // 3. Supervisor `FailedHold` propagates `UnheldNoVerifiedMode` into `joint_hold_status()` and
+    //    `ENABLE_FAILED` fault message when J3 provides fresh feedback but never answers
+    //    `RID_CTRL_MODE`; once J3 subsequently answers causal `CTRL_MODE` readback, J3 becomes held!
+    bus.with(|s| {
+        s.motors[2].regs.remove(&damiao::RID_CTRL_MODE);
+        s.motors[2].drop_torque_frames = 10; // fail enable so supervisor enters FailedHold
+        s.push_all_feedback();
+    });
+    let mut inner = SupervisorInner::new(ArmConfig {
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    })
+    .with_driver(Box::new(dm));
+    inner.lease_enabled = false;
+    assert!(enable_torque_admitted(&mut inner).is_err());
+    assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
+    assert_eq!(
+        inner.joint_hold_status()[2],
+        JointHoldStatus::UnheldNoVerifiedMode,
+        "supervisor must report unverified J3 as UnheldNoVerifiedMode"
+    );
+    let fault_msg = inner.safety.fault().expect("ENABLE_FAILED").message;
+    assert!(
+        fault_msg.contains("J3:unk/unheld(no_mode)"),
+        "ENABLE_FAILED fault message must report J3 unheld(no_mode): {fault_msg}"
+    );
+    // Tick while J3 mode is still unverified -> J3 receives ZERO hold frames while peers hold.
+    bus.with(|s| s.push_all_feedback());
+    bus.clear_log();
+    inner.tick(0.02);
+    assert_eq!(inner.joint_hold_status()[2], JointHoldStatus::UnheldNoVerifiedMode);
+    assert!(
+        !bus.tx_log().iter().any(|f| f.id == 0x103 || f.id == 3),
+        "FailedHold tick must emit ZERO hold frames for unverified J3"
+    );
+}
