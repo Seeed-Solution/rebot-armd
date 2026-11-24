@@ -754,9 +754,10 @@ mod tests {
         let mixed_release = json!({"type": "release_lease", "positions": null});
         let mixed_acquire = json!({"type": "acquire_lease", "client_id": "a", "mode": "cartesian_joint_stream"});
         let clean_release = json!({"type": "release_lease"});
-        assert!(q.try_push(mixed_release.clone(), stamp).is_ok());
-        assert!(q.try_push(mixed_acquire.clone(), stamp).is_ok());
-        assert!(q.try_push(clean_release.clone(), stamp).is_ok());
+        let now = std::time::Instant::now();
+        assert!(q.try_push(mixed_release.clone(), stamp, now).is_ok());
+        assert!(q.try_push(mixed_acquire.clone(), stamp, now).is_ok());
+        assert!(q.try_push(clean_release.clone(), stamp, now).is_ok());
 
         let replies = q.drain_cancellable("STOPPED", Some(7));
         assert_eq!(replies.len(), 2, "both mixed-field lease frames must cancel like baseline");

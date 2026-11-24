@@ -117,7 +117,7 @@ pub(super) fn format_command_lease_lost(request_id: &Value, epoch_id: u64) -> Va
     })
 }
 
-fn format_command_epoch_mismatch(request_id: &Value, epoch_id: u64) -> Value {
+pub(super) fn format_command_epoch_mismatch(request_id: &Value, epoch_id: u64) -> Value {
     json!({
         "type": "command_reject",
         "request_id": request_id,
@@ -129,7 +129,7 @@ fn format_command_epoch_mismatch(request_id: &Value, epoch_id: u64) -> Value {
     })
 }
 
-fn format_command_invalid_request_id(request_id: &Value) -> Value {
+pub(super) fn format_command_invalid_request_id(request_id: &Value) -> Value {
     json!({
         "type": "command_reject",
         "request_id": request_id,
@@ -140,7 +140,7 @@ fn format_command_invalid_request_id(request_id: &Value) -> Value {
     })
 }
 
-fn format_command_ack_state(
+pub(super) fn format_command_ack_state(
     request_id: &Value,
     epoch_id: u64,
     safety_state: &crate::safety::SafetyState,
@@ -163,7 +163,7 @@ fn format_command_ack_state(
     })
 }
 
-fn format_command_reject_api(request_id: &Value, error: ApiError, epoch_id: u64) -> Value {
+pub(super) fn format_command_reject_api(request_id: &Value, error: ApiError, epoch_id: u64) -> Value {
     let mut reply = rejection(error, "command_reject", epoch_id);
     reply["request_id"] = request_id.clone();
     reply

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use axum::{extract::{ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade}, State}, response::IntoResponse};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -1212,6 +1212,7 @@ impl ConnectionTasks {
 struct QueuedOrdinary {
     value: Value,
     stamp: crate::supervisor::AdmissionStamp,
+    received_at: Instant,
 }
 
 struct OrdinaryQueueInner {
@@ -1236,12 +1237,21 @@ impl OrdinaryQueue {
         }
     }
 
-    fn try_push(&self, value: Value, stamp: crate::supervisor::AdmissionStamp) -> Result<(), Value> {
+    fn try_push(
+        &self,
+        value: Value,
+        stamp: crate::supervisor::AdmissionStamp,
+        received_at: Instant,
+    ) -> Result<(), Value> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.closed || g.items.len() >= ORDINARY_IN_CAPACITY {
             return Err(value);
         }
-        g.items.push_back(QueuedOrdinary { value, stamp });
+        g.items.push_back(QueuedOrdinary {
+            value,
+            stamp,
+            received_at,
+        });
         drop(g);
         self.notify.notify_one();
         Ok(())
@@ -2420,7 +2430,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 continue;
             }
 
-            // Capture AdmissionStamp ONCE in the reader before queuing (never re-sampled downstream).
+            // Capture AdmissionStamp and ingress timestamp ONCE in the reader before queuing
+            // (never re-sampled downstream).
+            let received_at = Instant::now();
             let stamp = crate::supervisor::AdmissionStamp {
                 stop_gen: reader_supervisor.stop_generation(),
                 estop_epoch: value
@@ -2435,7 +2447,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 request_id: crate::supervisor::next_admission_request_id(),
             };
             // Every other frame goes onto the connection's bounded ordinary queue (non-blocking).
-            if let Err(value) = reader_ordinary_queue.try_push(value, stamp) {
+            if let Err(value) = reader_ordinary_queue.try_push(value, stamp, received_at) {
                 if let Some(reply) = backlog_full_reject(&value) {
                     reader_writer.try_send_ordinary_control(reply);
                     if reader_writer.is_writer_closed() {
@@ -2471,6 +2483,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         // the operator session of this connection: from the upgrade request, updated by `auth` messages in reader
         let ws_auth = worker_ws_auth;
         let mut last_sequence: Option<u64> = None;
+        let mut streaming_servo = crate::supervisor::targets::ServoStream::new();
+        let mut cmd_servo = crate::supervisor::targets::ServoStream::new();
+        let servo_reply_sink: Arc<dyn Fn(Value) + Send + Sync> = {
+            let w = worker_writer.clone();
+            Arc::new(move |reply| {
+                let _ = w.try_send_ordinary_control(reply);
+            })
+        };
         let mut last_ordinary_request: Option<u64> = None;
         // Delayed acks (sent after a state-file write) come back here and are stamped with
         // the current epoch and enqueued; the writer task enforces wire epoch monotonicity.
@@ -2543,7 +2563,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     None => break,
                 }
             };
-            let QueuedOrdinary { value, stamp } = queued;
+            let QueuedOrdinary {
+                value,
+                stamp,
+                received_at,
+            } = queued;
             if worker_reg_rx.borrow().is_none() {
                 let _ = worker_reg_rx.wait_for(|v| v.is_some()).await;
             }
@@ -2574,6 +2598,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                     if let Some(response) = response {
                         if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                            if let Some(g) = response.get("generation").and_then(Value::as_u64) {
+                                streaming_servo.lease_granted(g);
+                                cmd_servo.lease_granted(g);
+                            }
                             let delay_ms = TEST_LEASE_GRANTED_DELAY_MS.load(Ordering::Relaxed);
                             if delay_ms > 0 {
                                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2643,6 +2671,31 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // `ArmCore` is not owned by the legacy supervisor lock.
             if owner_mode != crate::supervisor::OWNER_LEGACY {
                 if owner_mode == crate::supervisor::OWNER_EXECUTOR {
+                    if let Some(opt_reply) = servo::handle_executor_ws_servo(
+                        frame_kind,
+                        &value,
+                        stamp,
+                        received_at,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &mut streaming_servo,
+                        &mut cmd_servo,
+                        &mut last_sequence,
+                        &mut last_ordinary_request,
+                        &recv_supervisor,
+                        &servo_reply_sink,
+                    )
+                    .await
+                    {
+                        if let Some(reply) = opt_reply {
+                            if !worker_writer.send_ordinary_control(reply).await {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(opt_reply) = config::handle_executor_ws_command(
                         frame_kind,
                         entry,
@@ -3047,6 +3100,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
     worker_task.abort();
     let _ = worker_task.await;
+    if let Some(handle) = supervisor.executor_handle() {
+        handle.unregister_servo_connection(conn_id);
+    }
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
     auth_task.abort();

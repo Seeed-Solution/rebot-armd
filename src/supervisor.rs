@@ -11077,6 +11077,9 @@ impl ArmSupervisor {
         match self.owner_mode() {
             OWNER_EXECUTOR => {
                 if let Some(handle) = self.executor_handle() {
+                    if local_gen > 0 {
+                        handle.close_servo(local_gen);
+                    }
                     handle.enqueue_disconnect_detached(conn);
                 } else {
                     self.enqueue_pending_disconnect(conn);
@@ -11192,6 +11195,15 @@ impl ArmSupervisor {
                 if let Some(handle) = self.executor_handle() {
                     self.forward_pending_disconnects_to_executor(&handle);
                     if let Ok(outcome) = handle.disconnect_connection_async(conn).await {
+                        if let LeaseOutcome::Disconnected {
+                            displaced_generation,
+                            ..
+                        } = outcome
+                        {
+                            if displaced_generation > 0 {
+                                handle.close_servo(displaced_generation);
+                            }
+                        }
                         return outcome;
                     }
                 }
@@ -11398,7 +11410,18 @@ impl ArmSupervisor {
                     .await
                     .map_err(Self::map_broker_dispatch_err)?
                 {
-                    Reply::Lease { outcome, .. } => Ok(outcome),
+                    Reply::Lease { outcome, .. } => {
+                        if let crate::rt_core::requests::lease::LeaseOutcome::Granted {
+                            evicted_generation,
+                            ..
+                        } = outcome
+                        {
+                            if evicted_generation > 0 {
+                                handle.close_servo(evicted_generation);
+                            }
+                        }
+                        Ok(outcome)
+                    }
                     Reply::Refused { code, .. } => Err(Self::map_lease_install_err(code)),
                     _ => Err(ArmError::Internal("Unexpected broker reply for LeasePreempt".into())),
                 }
@@ -11459,7 +11482,18 @@ impl ArmSupervisor {
                     .await
                     .map_err(Self::map_broker_dispatch_err)?
                 {
-                    Reply::Lease { outcome, .. } => Ok(outcome),
+                    Reply::Lease { outcome, .. } => {
+                        if let crate::rt_core::requests::lease::LeaseOutcome::Released {
+                            displaced_generation,
+                            ..
+                        } = outcome
+                        {
+                            if displaced_generation > 0 {
+                                handle.close_servo(displaced_generation);
+                            }
+                        }
+                        Ok(outcome)
+                    }
                     Reply::Refused { code, .. } => Err(Self::map_lease_install_err(code)),
                     _ => Err(ArmError::Internal("Unexpected broker reply for LeaseRelease".into())),
                 }
@@ -11924,6 +11958,30 @@ impl ArmSupervisor {
             }
             _ => Err(executor_unavailable()),
         }
+    }
+
+    /// Fast-path lock-free check whether E-stop is currently latched.
+    pub(crate) fn is_estop_latched(&self) -> bool {
+        self.e_stop_latched.load(Ordering::SeqCst)
+    }
+
+    /// Fast-path latest published snapshot for high-rate executor WS servo intake: returns the
+    /// current `StateHub` snapshot without waiting once the executor has published at least once,
+    /// falling back to `fresh_snapshot(None)` only before the first post-handoff publish.
+    pub(crate) async fn latest_executor_snapshot(
+        &self,
+    ) -> Result<Arc<crate::rt_core::publish::Snapshot>, ArmError> {
+        if self.owner_mode() != OWNER_EXECUTOR {
+            return Err(executor_unavailable());
+        }
+        let want = self.executor_base_gen.load(Ordering::Acquire).saturating_add(1);
+        let now = Instant::now();
+        if let Some(s) = self.hub.latest() {
+            if Self::answers(&s, want, now) {
+                return Ok(s);
+            }
+        }
+        self.fresh_snapshot(None).await
     }
 
     fn executor_lease_active(&self) -> bool {
