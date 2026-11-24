@@ -566,7 +566,8 @@ pub(super) async fn complete_macro_check(
     recv_generation: &AtomicU64,
     recv_deps: &crate::grasp::GraspDeps,
     worker_closing: &AtomicBool,
-) -> Option<Value> {
+    command_reply_pending: &Arc<AtomicBool>,
+) -> Option<(Value, Option<CommandReplyGateGuard>)> {
     let owner_transferred = || {
         let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
         if let Some(s) = recv_supervisor.hub().latest() {
@@ -578,8 +579,9 @@ pub(super) async fn complete_macro_check(
         return None;
     }
     if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
-        return Some(owner_transferred());
+        return Some((owner_transferred(), None));
     }
+    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let mut inner = recv_supervisor.inner().write().await;
     if worker_closing.load(Ordering::SeqCst) {
         drop(inner);
@@ -587,9 +589,9 @@ pub(super) async fn complete_macro_check(
     }
     if inner.detached {
         drop(inner);
-        return Some(owner_transferred());
+        return Some((owner_transferred(), None));
     }
-    Some(if let Err(err) = inner.preflight_admission(stamp) {
+    let reply = if let Err(err) = inner.preflight_admission(stamp) {
         command_reject(&inner, &request_id, ArmError::from(err).into())
     } else {
         match joined {
@@ -612,7 +614,8 @@ pub(super) async fn complete_macro_check(
                 }
             }
         }
-    })
+    };
+    Some((reply, Some(gate)))
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -636,7 +639,8 @@ pub(super) async fn complete_pending_plan(
     recv_connection: &str,
     recv_generation: &AtomicU64,
     worker_closing: &Arc<AtomicBool>,
-) -> Option<Option<Value>> {
+    command_reply_pending: &Arc<AtomicBool>,
+) -> Option<(Option<Value>, Option<CommandReplyGateGuard>)> {
     use crate::rt_core::requests::actions as req;
     let PendingPlan {
         request_id,
@@ -684,6 +688,10 @@ pub(super) async fn complete_pending_plan(
     if worker_closing.load(Ordering::SeqCst) {
         return None;
     }
+    // M2: Keep the per-connection reply gate closed from BEFORE acquiring the install lock until
+    // the caller enqueues `command_ack` onto `ordinary_tx` so terminals (e.g. from an immediate
+    // Stop) can never overtake the ACK for gripper / move_to_pose / move_to / replay.
+    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let mut inner = recv_supervisor.inner().write().await;
     if worker_closing.load(Ordering::SeqCst) {
         return None;
@@ -698,19 +706,22 @@ pub(super) async fn complete_pending_plan(
         if let Some(s) = recv_supervisor.hub().latest() {
             r["epoch_id"] = json!(s.obs.epoch_id);
         }
-        return Some(Some(r));
+        return Some((Some(r), None));
     }
     if let Some(hook) = inner.before_install_hook.take() {
         hook(&mut inner);
     }
     if let Err(err) = inner.preflight_admission(stamp) {
-        return Some(Some(command_reject(
-            &inner,
-            &request_id,
-            ArmError::from(err).into(),
-        )));
+        return Some((
+            Some(command_reject(
+                &inner,
+                &request_id,
+                ArmError::from(err).into(),
+            )),
+            None,
+        ));
     }
-    Some(match prepared {
+    let reply = match prepared {
         Ok(None) => None,
         Err(e) => {
             let label = if is_replay {
@@ -787,7 +798,9 @@ pub(super) async fn complete_pending_plan(
                 }
             },
         ),
-    })
+    };
+    let keep_gate = reply.is_some().then_some(gate);
+    Some((reply, keep_gate))
 }
 
 /// Spawn a tracked macro planning/preflight task and return its [`MacroCheck`] handle.
@@ -860,7 +873,8 @@ pub(super) async fn complete_pending_replay(
     recv_connection: &str,
     recv_generation: &AtomicU64,
     worker_closing: &Arc<AtomicBool>,
-) -> Option<Option<Value>> {
+    command_reply_pending: &Arc<AtomicBool>,
+) -> Option<(Option<Value>, Option<CommandReplyGateGuard>)> {
     let cancel = worker_closing.clone();
     let plan_conn = recv_connection.to_string();
     let planned = tokio::task::spawn_blocking(move || {
@@ -878,6 +892,7 @@ pub(super) async fn complete_pending_replay(
     if worker_closing.load(Ordering::SeqCst) {
         return None;
     }
+    let gate = CommandReplyGateGuard::enter(command_reply_pending, recv_supervisor.hub());
     let mut inner = recv_supervisor.inner().write().await;
     if worker_closing.load(Ordering::SeqCst) {
         return None;
@@ -887,15 +902,18 @@ pub(super) async fn complete_pending_replay(
         if let Some(s) = recv_supervisor.hub().latest() {
             r["epoch_id"] = json!(s.obs.epoch_id);
         }
-        Some(Some(r))
+        Some((Some(r), None))
     } else if let Err(err) = inner.preflight_admission(stamp) {
-        Some(Some(command_reject(
-            &inner,
-            &request_id,
-            ArmError::from(err).into(),
-        )))
+        Some((
+            Some(command_reject(
+                &inner,
+                &request_id,
+                ArmError::from(err).into(),
+            )),
+            None,
+        ))
     } else {
-        Some(match planned {
+        let reply = match planned {
             Ok(None) => None,
             Err(e) => Some(command_reject(
                 &inner,
@@ -919,7 +937,9 @@ pub(super) async fn complete_pending_replay(
                     }
                 },
             ),
-        })
+        };
+        let keep_gate = reply.is_some().then_some(gate);
+        Some((reply, keep_gate))
     }
 }
 

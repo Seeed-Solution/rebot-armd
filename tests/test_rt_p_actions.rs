@@ -3232,3 +3232,133 @@ async fn r2_m1_executor_macro_refused_503_without_reply_sink_and_commits_with_ho
     );
     handle.stop_and_join();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_m2_legacy_gripper_and_move_to_pose_ack_precedes_stop_terminal() {
+    use futures_util::StreamExt;
+    use serde_json::Value;
+    struct ResetDelay;
+    impl Drop for ResetDelay {
+        fn drop(&mut self) {
+            armd::api::ws::TEST_DEFERRED_ACK_DELAY_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _reset = ResetDelay;
+
+    let (addr, sup) = common::spawn_server(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 60_000,
+        ..ArmConfig::rebot_dm()
+    })
+    .await;
+    sup.start_dispatcher().unwrap();
+    let mut pose_q = INSPECT.to_vec();
+    pose_q[0] += 0.08;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let s = inner.current_admission_stamp();
+        let a = inner.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+        armd::poses::save(&mut inner, &json!({"name": "m2_pose", "positions": pose_q})).unwrap();
+    }
+    sup.tick(DT).await;
+
+    let (mut ws, gen) = common::controller(addr).await;
+    common::drain(&mut ws, 40).await;
+
+    armd::api::ws::TEST_DEFERRED_ACK_DELAY_MS.store(120, std::sync::atomic::Ordering::SeqCst);
+
+    for (req_id, path, body, expected_kind) in [
+        (101u64, "/api/v1/action/gripper", json!({"command": "open", "speed": 1.0}), "gripper"),
+        (102u64, "/api/v1/action/move_to_pose", json!({"name": "m2_pose", "speed_scale": 1.0}), "move_to_pose"),
+    ] {
+        let epoch = sup.inner().read().await.safety.epoch_id();
+        let prev_id = sup
+            .inner()
+            .read()
+            .await
+            .last_action
+            .as_ref()
+            .map_or(0, |a| a.id);
+
+        common::send(
+            &mut ws,
+            json!({
+                "type": "command",
+                "request_id": req_id,
+                "generation": gen,
+                "epoch_id": epoch,
+                "path": path,
+                "body": body,
+            }),
+        )
+        .await;
+
+        // Wait until the deferred install commits the new action under the supervisor lock,
+        // while TEST_DEFERRED_ACK_DELAY_MS holds back the ACK from ordinary_tx.
+        let mut installed_id = None;
+        let wait_dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < wait_dl {
+            if let Some(a) = sup.inner().read().await.last_action.as_ref() {
+                if a.id > prev_id && a.kind == expected_kind && a.is_running() {
+                    installed_id = Some(a.id);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let action_id = installed_id.expect("deferred action must install before delay expires");
+
+        // Immediately commit a Stop right after install (BEFORE the 120ms ACK delay finishes!)
+        // so `TerminalBroadcaster` receives the `cancelled` terminal while the ACK is still pending.
+        {
+            let mut inner = sup.inner().write().await;
+            assert!(inner.authorized_stop(), "Stop must cancel the newly installed {expected_kind}");
+        }
+        sup.tick(DT).await;
+
+        // Read WS frames in wire order: ACK for `action_id` MUST arrive strictly BEFORE any
+        // terminal observation (`state != "running"`) for `action_id`!
+        let mut saw_ack = false;
+        let mut saw_cancelled_terminal = false;
+        let read_dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < read_dl && !(saw_ack && saw_cancelled_terminal) {
+            let remaining = read_dl.saturating_duration_since(Instant::now());
+            let frame = tokio::time::timeout(remaining, ws.next())
+                .await
+                .expect("timed out waiting for ACK + cancelled terminal")
+                .expect("ws stream ended")
+                .expect("ws error")
+                .into_text()
+                .unwrap();
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            if v.get("type").and_then(Value::as_str) == Some("command_ack")
+                && v.get("request_id").and_then(Value::as_u64) == Some(req_id)
+            {
+                assert_eq!(v.get("action_id").and_then(Value::as_u64), Some(action_id));
+                assert!(
+                    !saw_cancelled_terminal,
+                    "M2 violation for {expected_kind}: cancelled terminal overtook command_ack!"
+                );
+                saw_ack = true;
+            }
+            if let Some(act) = v.get("action") {
+                if act.get("id").and_then(Value::as_u64) == Some(action_id)
+                    && act.get("state").and_then(Value::as_str) == Some("cancelled")
+                {
+                    assert!(
+                        saw_ack,
+                        "M2 violation for {expected_kind}: cancelled terminal arrived BEFORE command_ack! frame={v}"
+                    );
+                    assert_eq!(act.get("code").and_then(Value::as_str), Some("STOPPED"));
+                    saw_cancelled_terminal = true;
+                }
+            }
+        }
+        assert!(saw_ack, "must receive command_ack for {expected_kind}");
+        assert!(saw_cancelled_terminal, "must receive cancelled terminal for {expected_kind}");
+    }
+}
