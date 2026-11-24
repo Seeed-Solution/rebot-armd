@@ -433,6 +433,8 @@ pub struct SupervisorInner {
     pub joint_zero_offsets: Vec<f32>,
     /// Zero check against the profile's `zero_reference` (`zero_convention`).
     pub zero_convention: crate::joint_zero::ZeroConvention,
+    /// Pending `legacy_j6` warning deferred from `armd-control` to off-thread log formatting.
+    pub(crate) pending_legacy_j6_log: Option<crate::joint_zero::ZeroConvention>,
     /// Run the zero check on the next tick with fresh feedback and torque off (startup, after
     /// torque went off, after a zero).
     pub zero_check_pending: bool,
@@ -786,6 +788,7 @@ impl SupervisorInner {
             calibration_load_error: None,
             joint_zero_offsets: vec![0.0; dof],
             zero_convention: Default::default(),
+            pending_legacy_j6_log: None,
             zero_check_pending: true,
             zero_check_prev_torqued: false,
             profile_camera_mount,
@@ -904,7 +907,7 @@ impl SupervisorInner {
         schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
         if let Some(t) = schema.capabilities.teach.as_mut() { t.episodes = self.episodes.enabled(); }
         schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
-        schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(&self.zero_convention).ok());
+        schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(self.zero_convention).ok());
         schema
     }
 
@@ -1242,10 +1245,11 @@ impl SupervisorInner {
         obs
     }
 
-    /// Pre-warms RT-owned scratch/history buffers and empty triple-buffer observation slots for
-    /// the RT executor before the first release runs (nonblocking under reader contention; leaves
-    /// `published_seq` unchanged).
+    /// Pre-warms RT-owned scratch/history buffers, static fallback policies, and empty
+    /// triple-buffer observation slots for the RT executor before the first release runs
+    /// (nonblocking under reader contention; leaves `published_seq` unchanged).
     pub(crate) fn prewarm_observation_slots(&mut self) {
+        let _ = Self::default_rebot_dm_resting_pose();
         let dof = self.config.dof;
         let arm_dof = self.config.arm_dof();
         self.still_anchor_positions.reserve(dof);
@@ -1376,11 +1380,15 @@ impl SupervisorInner {
         })
     }
 
-    fn resting_policy(&self) -> Option<&RestingPosePolicy> {
+    fn default_rebot_dm_resting_pose() -> &'static RestingPosePolicy {
         static DEFAULT_REBOT_DM: std::sync::OnceLock<RestingPosePolicy> = std::sync::OnceLock::new();
+        DEFAULT_REBOT_DM.get_or_init(RestingPosePolicy::rebot_dm)
+    }
+
+    fn resting_policy(&self) -> Option<&RestingPosePolicy> {
         match &self.config.resting_pose {
             Some(policy) => Some(policy),
-            None if self.driver.is_none() => Some(DEFAULT_REBOT_DM.get_or_init(RestingPosePolicy::rebot_dm)),
+            None if self.driver.is_none() => Some(Self::default_rebot_dm_resting_pose()),
             None => None,
         }
     }
@@ -5317,7 +5325,6 @@ impl ArmSupervisor {
             },
             waited_for: log.last_release.map(holder),
             longest_hold: log.longest.map(holder),
-            wake_lateness_ns,
             late,
         };
         let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());

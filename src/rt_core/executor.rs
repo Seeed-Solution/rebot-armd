@@ -45,12 +45,13 @@ pub const ESTOP_ACK_CAPACITY: usize = 64;
 /// Bounded capacity of the off-thread fault-state `Arc<SafetyState>` reclamation ring.
 pub const RECLAIM_STATE_CAPACITY: usize = 64;
 /// Capacity of the persistence reply ring (`armd-control` -> `armd-persist` / `OffThreadSinks`).
+/// Strictly carries 1-to-1 `PersistCmd` replies (never unsolicited job reclamation).
 pub const PERSIST_REP_CAPACITY: usize = 8;
-/// Lock-free SPSC capacity for clean-exit reclamation when consumer rings remain full at teardown.
-/// Sized strictly >= sum of all bounded owner queues + retained slots + pending E-stop acks +
-/// retired safety states (`17 maint + 6 persist + 64 pending_estop_acks + 64 retired`).
-const EXIT_RECLAIM_CAPACITY: usize =
-    MAINT_QUEUE_CAPACITY + 1 + 6 + ESTOP_ACK_CAPACITY + RECLAIM_STATE_CAPACITY;
+/// Lock-free SPSC capacity for off-thread reclamation (runtime rejected persistence jobs,
+/// deferred `legacy_j6` warnings, and clean-exit overflow payloads when consumer rings stay full).
+/// Sized strictly >= `17 maint + 6 persist + 12 runtime jobs/logs + 64 pending_estop_acks + 64 retired`.
+const OFFLOAD_RECLAIM_CAPACITY: usize =
+    MAINT_QUEUE_CAPACITY + 1 + 6 + 12 + ESTOP_ACK_CAPACITY + RECLAIM_STATE_CAPACITY;
 
 /// Startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -795,9 +796,11 @@ pub struct PersistTestHooks {
     /// Positive control: exact one-shot heap probe run in the sub-release wake tail (strictly AFTER
     /// `service_wake` / ack / reclaim drains) whose `local` drops at wake-scope local destruction.
     pub inject_wake_tail_once: Option<Arc<Mutex<Option<TailAllocProbe>>>>,
-    /// Injects one pre-built `PendingZeroCheckPersist` into `core.pending_zero_check_persist` on the
-    /// next release (tests executor release-tail `persist_job_tx` saturation with 0 allocations in `actions.rs`).
-    pub inject_pending_persist_job_once: Option<Arc<Mutex<Option<PendingZeroCheckPersist>>>>,
+    /// Injects one pre-built `(PendingZeroCheckPersist, Option<drop_probe>)` on the next release
+    /// (tests executor release-tail `persist_job_tx` saturation and off-thread rejected-job drop
+    /// with 0 allocations in `actions.rs`).
+    pub inject_pending_persist_job_once:
+        Option<Arc<Mutex<Option<(PendingZeroCheckPersist, Option<Box<dyn Any + Send>>)>>>>,
     /// Runs on `armd-control` while handling `MaintenanceOp::CommitShutdown` before replying.
     pub on_commit_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Overrides `PANIC_DISABLE_TIMEOUT` for deterministic deadline-observer tests.
@@ -850,7 +853,6 @@ enum PersistCmd {
     },
 }
 
-#[allow(clippy::large_enum_variant)] // inline in preallocated SPSC ring: boxing would allocate on armd-control
 enum PersistReply {
     Reserved {
         reservation: Option<Reservation>,
@@ -867,19 +869,21 @@ enum PersistReply {
         _returned_msg: Option<String>,
         _returned_warning: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
-        _returned_job: Option<PendingZeroCheckPersist>,
     },
 }
 
-/// Lock-free SPSC clean-exit handoff for bounded owner payloads when consumer rings remain full
-/// at teardown; guaranteed nonblocking on `armd-control` and dropped off-thread in `OffThreadSinks`.
+/// Dedicated bounded lock-free SPSC off-thread reclamation & deferred-log ring drained
+/// continuously by `OffThreadSinks::drain_all()` (separate from `persist_rep_tx` so unsolicited
+/// reclamation never breaks `armd-persist`'s 1-to-1 command/reply protocol).
 #[allow(dead_code, clippy::large_enum_variant)] // inline in preallocated SPSC ring: boxing would allocate on armd-control
-enum ExitReclaim {
+enum OffloadReclaim {
     MaintReply(MaintReply),
     PersistReply(PersistReply),
-    PersistJob(PendingZeroCheckPersist),
+    PersistJob(PendingZeroCheckPersist, Option<Box<dyn Any + Send>>),
+    Probe(Box<dyn Any + Send>),
     SafetyState(Arc<SafetyState>),
     Buf(String),
+    LogLegacyJ6(crate::joint_zero::ZeroConvention),
 }
 
 /// Off-thread consumer sinks drained by `armd-dispatch`, `tick_stats()`, and `shutdown_and_join()`.
@@ -890,7 +894,7 @@ pub(crate) struct OffThreadSinks {
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
-    exit_reclaim_rx: Mutex<Consumer<ExitReclaim>>,
+    offload_reclaim_rx: Mutex<Consumer<OffloadReclaim>>,
 }
 
 impl OffThreadSinks {
@@ -926,9 +930,16 @@ impl OffThreadSinks {
             }
         }
         {
-            let mut rx = self.exit_reclaim_rx.lock().unwrap_or_else(|e| e.into_inner());
+            let mut rx = self.offload_reclaim_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(item) = rx.pop() {
-                drop(item);
+                match item {
+                    OffloadReclaim::LogLegacyJ6(zc) => {
+                        if let Some(msg) = zc.message() {
+                            tracing::warn!("Joint zero check: {msg}");
+                        }
+                    }
+                    other => drop(other),
+                }
             }
         }
     }
@@ -1287,7 +1298,8 @@ pub(crate) fn spawn_executor(
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
-    let (exit_reclaim_tx, exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
+    let (offload_reclaim_tx, offload_reclaim_rx) =
+        RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
     let estop_overflow_gen = Arc::new(AtomicU64::new(0));
     let control_stop = Arc::new(AtomicBool::new(false));
@@ -1308,7 +1320,7 @@ pub(crate) fn spawn_executor(
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
-        exit_reclaim_rx: Mutex::new(exit_reclaim_rx),
+        offload_reclaim_rx: Mutex::new(offload_reclaim_rx),
     });
 
     // Spawn dedicated persistence worker first so its thread handle can be woken on job push.
@@ -1365,7 +1377,7 @@ pub(crate) fn spawn_executor(
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
-                exit_reclaim_tx,
+                offload_reclaim_tx,
                 persist_wake,
                 e_stop_latched,
                 hub_clone,
@@ -1455,10 +1467,10 @@ struct ControlState {
     persist_rep_tx: Producer<PersistReply>,
     /// Retained persistence reply if `persist_rep_tx` was temporarily full (flushed before popping).
     pending_persist_reply: Option<PersistReply>,
-    /// Retained persistence job if `persist_job_tx` and `persist_rep_tx` were both saturated.
-    retained_persist_job: Option<PendingZeroCheckPersist>,
-    /// Lock-free SPSC handoff used ONLY on clean exit when consumer rings remain full.
-    exit_reclaim_tx: Producer<ExitReclaim>,
+    /// Retained rejected persistence job if `persist_job_tx` and `offload_reclaim_tx` were both saturated.
+    retained_persist_job: Option<(PendingZeroCheckPersist, Option<Box<dyn Any + Send>>)>,
+    /// Dedicated bounded lock-free SPSC off-thread reclamation & deferred-log ring.
+    offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     persist_granted: Option<(u64, ConfigDomain)>,
     next_persist_req: u64,
@@ -1517,19 +1529,19 @@ impl ControlState {
     }
 
     /// Clean-exit E-stop drain: moves any remaining pending E-stop acks / retired fault arcs into
-    /// `estop_ack_tx`, `reclaim_state_tx`, or lock-free `exit_reclaim_tx` so nothing drops on RT.
+    /// `estop_ack_tx`, `reclaim_state_tx`, or lock-free `offload_reclaim_tx` so nothing drops on RT.
     fn drain_estop_and_retired_stopped(&mut self, core: &mut SupervisorInner) {
         self.emit_estop_ack_if_advanced(core);
         while let Some(ack) = core.pending_estop_acks.pop_front() {
             self.estop_overflow_gen.fetch_max(ack.last_gen, Ordering::Release);
             if let Err(rtrb::PushError::Full(state)) = self.reclaim_state_tx.push(ack.state) {
-                let _ = self.exit_reclaim_tx.push(ExitReclaim::SafetyState(state));
+                let _ = self.offload_reclaim_tx.push(OffloadReclaim::SafetyState(state));
             }
         }
         self.drain_retired_states(core);
         while let Some(arc) = core.safety.pop_retired_state_arc() {
             if let Err(rtrb::PushError::Full(state)) = self.reclaim_state_tx.push(arc) {
-                let _ = self.exit_reclaim_tx.push(ExitReclaim::SafetyState(state));
+                let _ = self.offload_reclaim_tx.push(OffloadReclaim::SafetyState(state));
             }
         }
     }
@@ -1640,15 +1652,15 @@ impl ControlState {
         }
     }
 
-    fn push_maint_reply_or_exit_reclaim(&mut self, reply: MaintReply) {
+    fn push_maint_reply_or_offload(&mut self, reply: MaintReply) {
         if let Err(rtrb::PushError::Full(reply)) = self.maint_rep_tx.push(reply) {
-            let _ = self.exit_reclaim_tx.push(ExitReclaim::MaintReply(reply));
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::MaintReply(reply));
         }
     }
 
     fn drain_maintenance_stopped(&mut self) {
         if let Some(reply) = self.pending_maint_reply.take() {
-            self.push_maint_reply_or_exit_reclaim(MaintReply {
+            self.push_maint_reply_or_offload(MaintReply {
                 id: reply.id,
                 result: MaintenanceResult::Stopped,
                 returned_offsets: reply.returned_offsets,
@@ -1661,7 +1673,7 @@ impl ControlState {
                 MaintenanceOp::ProbeOwnedPayload { payload } => (None, Some(payload)),
                 _ => (None, None),
             };
-            self.push_maint_reply_or_exit_reclaim(MaintReply {
+            self.push_maint_reply_or_offload(MaintReply {
                 id: req.id,
                 result: MaintenanceResult::Stopped,
                 returned_offsets,
@@ -1686,55 +1698,54 @@ impl ControlState {
         }
     }
 
-    fn push_persist_reply_or_exit_reclaim(&mut self, reply: PersistReply) {
+    fn push_persist_reply_or_offload(&mut self, reply: PersistReply) {
         if let Err(rtrb::PushError::Full(reply)) = self.persist_rep_tx.push(reply) {
-            let _ = self.exit_reclaim_tx.push(ExitReclaim::PersistReply(reply));
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::PersistReply(reply));
         }
     }
 
     fn flush_retained_persist(&mut self, core: &SupervisorInner) {
-        let mut woke = false;
+        let mut woke_persist = false;
+        let mut woke_hub = false;
         if let Some(reply) = self.pending_persist_reply.take() {
             match self.persist_rep_tx.push(reply) {
-                Ok(()) => woke = true,
+                Ok(()) => {
+                    woke_persist = true;
+                    woke_hub = true;
+                }
                 Err(rtrb::PushError::Full(reply)) => {
                     self.pending_persist_reply = Some(reply);
                 }
             }
         }
-        if let Some(job) = self.retained_persist_job.take() {
-            if !self.persist_rep_tx.is_full() {
-                let _ = self.persist_rep_tx.push(PersistReply::Done {
-                    _returned_policy: None,
-                    _returned_jaw: None,
-                    _returned_code: None,
-                    _returned_msg: None,
-                    _returned_warning: None,
-                    _returned_probe: None,
-                    _returned_job: Some(job),
-                });
-                woke = true;
-            } else {
-                self.retained_persist_job = Some(job);
+        if let Some((job, probe)) = self.retained_persist_job.take() {
+            match self.offload_reclaim_tx.push(OffloadReclaim::PersistJob(job, probe)) {
+                Ok(()) => woke_hub = true,
+                Err(rtrb::PushError::Full(OffloadReclaim::PersistJob(job, probe))) => {
+                    self.retained_persist_job = Some((job, probe));
+                }
+                Err(_) => unreachable!(),
             }
         }
-        if woke {
+        if woke_persist {
             self.persist_wake.unpark();
+        }
+        if woke_hub {
             core.core.hub().wake();
         }
     }
 
     /// Exit-path persistence drain: returns any queued `PersistCmd` heap payloads off-thread
-    /// via `persist_rep_tx` (falling back to lock-free `exit_reclaim_tx` if full) and wakes
+    /// via `persist_rep_tx` (falling back to lock-free `offload_reclaim_tx` if full) and wakes
     /// `armd-persist` WITHOUT performing any unpublished live state mutations.
     fn drain_persistence_stopped(&mut self, core: &SupervisorInner) {
         let mut woke = false;
         if let Some(reply) = self.pending_persist_reply.take() {
-            self.push_persist_reply_or_exit_reclaim(reply);
+            self.push_persist_reply_or_offload(reply);
             woke = true;
         }
-        if let Some(job) = self.retained_persist_job.take() {
-            let _ = self.exit_reclaim_tx.push(ExitReclaim::PersistJob(job));
+        if let Some((job, probe)) = self.retained_persist_job.take() {
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::PersistJob(job, probe));
             woke = true;
         }
         while let Ok(cmd) = self.persist_cmd_rx.pop() {
@@ -1774,7 +1785,6 @@ impl ControlState {
                     _returned_msg: Some(message),
                     _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
-                    _returned_job: None,
                 },
                 PersistCmd::Activate {
                     new_policy,
@@ -1790,29 +1800,27 @@ impl ControlState {
                     _returned_msg: Some(msg_buf),
                     _returned_warning: warning,
                     _returned_probe: self.take_reply_probe(),
-                    _returned_job: None,
                 },
             };
-            self.push_persist_reply_or_exit_reclaim(reply);
+            self.push_persist_reply_or_offload(reply);
             woke = true;
         }
         self.persist_granted = None;
         if self.disconnect_code_buf.is_some() || self.disconnect_msg_buf.is_some() {
             let code = self.disconnect_code_buf.take();
             let msg = self.disconnect_msg_buf.take();
-            self.push_persist_reply_or_exit_reclaim(PersistReply::Done {
+            self.push_persist_reply_or_offload(PersistReply::Done {
                 _returned_policy: None,
                 _returned_jaw: None,
                 _returned_code: code,
                 _returned_msg: msg,
                 _returned_warning: None,
                 _returned_probe: None,
-                _returned_job: None,
             });
             woke = true;
         }
         if let Some(buf) = self.sat_msg_buf.take() {
-            let _ = self.exit_reclaim_tx.push(ExitReclaim::Buf(buf));
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::Buf(buf));
             woke = true;
         }
         if woke {
@@ -1830,17 +1838,17 @@ impl ControlState {
         if let Some(hook) = self.hooks.after_abandoned_check_before_pop.as_ref() {
             hook();
         }
-        // Capacity rule: pop `persist_cmd_rx` only while `persist_rep_tx` retains >= 3 free slots
-        // (1 for this command's reply + 1 reserved for one-shot disconnect + 1 for release-tail
-        // job rejection), so no `PersistReply` is ever dropped on `armd-control`.
-        while self.pending_persist_reply.is_none() && self.persist_rep_tx.slots() >= 3 {
+        // Capacity rule: pop `persist_cmd_rx` only while `persist_rep_tx` retains >= 2 free slots
+        // (1 for this command's 1-to-1 reply + 1 reserved for post-abandonment disconnect), so no
+        // `PersistReply` is ever dropped on `armd-control`. Rejected jobs use `offload_reclaim_tx`.
+        while self.pending_persist_reply.is_none() && self.persist_rep_tx.slots() >= 2 {
             let Ok(cmd) = self.persist_cmd_rx.pop() else { break; };
             self.handle_persist_cmd(core, ctx, cmd);
         }
         if abandoned
             && self.persist_cmd_rx.is_empty()
             && self.pending_persist_reply.is_none()
-            && self.persist_rep_tx.slots() >= 2
+            && !self.persist_rep_tx.is_full()
         {
             if let Some((action_id, domain)) = self.persist_granted.take() {
                 let active_rev = ConfigAuthority::revision(core, domain);
@@ -1865,7 +1873,6 @@ impl ControlState {
                             _returned_msg: old_msg,
                             _returned_warning: None,
                             _returned_probe: None,
-                            _returned_job: None,
                         },
                         core,
                     );
@@ -1876,11 +1883,19 @@ impl ControlState {
 
     /// Release-tail handler when `persist_job_tx.push(job)` fails: marks the action failed without
     /// heap allocation (recycling `sat_msg_buf` or updating inline `HolderLabel`s when depleted)
-    /// and returns `job` off-thread via `persist_rep_tx` or `retained_persist_job`.
-    fn reject_saturated_persist_job(&mut self, core: &mut SupervisorInner, job: PendingZeroCheckPersist) {
+    /// and offloads `(job, probe)` via dedicated `offload_reclaim_tx` (NEVER `persist_rep_tx`,
+    /// preserving strict 1-to-1 `PersistCmd`/`PersistReply` protocol framing with `armd-persist`).
+    fn reject_saturated_persist_job(
+        &mut self,
+        core: &mut SupervisorInner,
+        job: PendingZeroCheckPersist,
+        probe: Option<Box<dyn Any + Send>>,
+    ) {
         let mut returned_msg: Option<String> = None;
-        let can_offload_msg = !self.persist_rep_tx.is_full() || self.pending_persist_reply.is_none();
-        if let Some(id) = core.zero_check_persisting.take() {
+        let can_offload_msg = self.offload_reclaim_tx.slots() >= 2;
+        if core.zero_check_persisting == Some(job.action_id) {
+            core.zero_check_persisting = None;
+            let id = job.action_id;
             const SAT_MSG: &str = "Persistence queue saturated";
             if can_offload_msg {
                 if let Some(buf) = self.sat_msg_buf.take() {
@@ -1906,37 +1921,16 @@ impl ControlState {
                 Self::fail_zero_check_inline_only(core, id, SAT_MSG);
             }
         }
-        if !self.persist_rep_tx.is_full() {
-            self.push_persist_reply_or_retain(
-                PersistReply::Done {
-                    _returned_policy: None,
-                    _returned_jaw: None,
-                    _returned_code: None,
-                    _returned_msg: returned_msg,
-                    _returned_warning: None,
-                    _returned_probe: None,
-                    _returned_job: Some(job),
-                },
-                core,
-            );
-        } else if self.pending_persist_reply.is_none() {
-            self.pending_persist_reply = Some(PersistReply::Done {
-                _returned_policy: None,
-                _returned_jaw: None,
-                _returned_code: None,
-                _returned_msg: returned_msg,
-                _returned_warning: None,
-                _returned_probe: None,
-                _returned_job: Some(job),
-            });
-        } else {
-            // `can_offload_msg` was false so `returned_msg` is guaranteed `None`; retain `job`
-            // until `flush_retained_persist` drains a slot (if an adversarial hook replaces an
-            // existing retained job, offload the old one via lock-free `exit_reclaim_tx`).
-            debug_assert!(returned_msg.is_none());
-            if let Some(prev) = self.retained_persist_job.replace(job) {
-                let _ = self.exit_reclaim_tx.push(ExitReclaim::PersistJob(prev));
+        if let Some(m) = returned_msg {
+            let _ = self.offload_reclaim_tx.push(OffloadReclaim::Buf(m));
+        }
+        match self.offload_reclaim_tx.push(OffloadReclaim::PersistJob(job, probe)) {
+            Ok(()) => core.core.hub().wake(),
+            Err(rtrb::PushError::Full(OffloadReclaim::PersistJob(job, probe))) => {
+                debug_assert!(self.retained_persist_job.is_none());
+                self.retained_persist_job = Some((job, probe));
             }
+            Err(_) => unreachable!(),
         }
     }
 
@@ -2019,7 +2013,6 @@ impl ControlState {
                         _returned_msg: old_msg,
                         _returned_warning: None,
                         _returned_probe: probe,
-                        _returned_job: None,
                     },
                     core,
                 );
@@ -2209,7 +2202,6 @@ impl ControlState {
                         _returned_msg: old_msg,
                         _returned_warning: None,
                         _returned_probe: probe,
-                        _returned_job: None,
                     },
                     core,
                 );
@@ -2263,7 +2255,6 @@ impl ControlState {
                             _returned_msg: old_msg,
                             _returned_warning: warning,
                             _returned_probe: probe,
-                            _returned_job: None,
                         },
                         core,
                     );
@@ -2305,7 +2296,6 @@ impl ControlState {
                             _returned_msg: Some(msg_buf),
                             _returned_warning: unused_warning,
                             _returned_probe: probe,
-                            _returned_job: None,
                         },
                         core,
                     );
@@ -2348,7 +2338,6 @@ impl ControlState {
                             _returned_msg: old_msg,
                             _returned_warning: warning,
                             _returned_probe: probe,
-                            _returned_job: None,
                         },
                         core,
                     );
@@ -2709,7 +2698,7 @@ fn control_thread_main(
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
-    exit_reclaim_tx: Producer<ExitReclaim>,
+    offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
     e_stop_latched: Arc<AtomicBool>,
     hub: Arc<StateHub>,
@@ -2784,7 +2773,7 @@ fn control_thread_main(
         persist_rep_tx,
         pending_persist_reply: None,
         retained_persist_job: None,
-        exit_reclaim_tx,
+        offload_reclaim_tx,
         persist_wake,
         persist_granted: None,
         next_persist_req: 0,
@@ -2892,8 +2881,30 @@ fn control_thread_main(
                     core.defer_zero_check_persist = true;
                     core.persist_capacity_available = !state.persist_job_tx.is_abandoned()
                         && state.persist_job_tx.slots() > 0
-                        && !state.persist_rep_tx.is_full()
+                        && !state.offload_reclaim_tx.is_full()
                         && state.retained_persist_job.is_none();
+                    let mut injected_job_probe: Option<Box<dyn Any + Send>> = None;
+                    if core.pending_zero_check_persist.is_none()
+                        && state.retained_persist_job.is_none()
+                    {
+                        if let Some((injected, probe)) = state
+                            .hooks
+                            .inject_pending_persist_job_once
+                            .as_ref()
+                            .and_then(|slot| slot.lock().ok().and_then(|mut g| g.take()))
+                        {
+                            if core.zero_check_persisting.is_none()
+                                && core
+                                    .last_action
+                                    .as_ref()
+                                    .is_some_and(|a| a.id == injected.action_id && a.is_running())
+                            {
+                                core.zero_check_persisting = Some(injected.action_id);
+                            }
+                            core.pending_zero_check_persist = Some(injected);
+                            injected_job_probe = probe;
+                        }
+                    }
                     core.begin_tick_phases(body_start);
 
                     let report = engine.step_with_pre_commit(
@@ -2914,6 +2925,11 @@ fn control_thread_main(
                         },
                     );
                     if control_stop.load(Ordering::Acquire) {
+                        if let Some(p) = injected_job_probe.take() {
+                            if state.offload_reclaim_tx.push(OffloadReclaim::Probe(p)).is_ok() {
+                                core.core.hub().wake();
+                            }
+                        }
                         state.flush_pending_maint_reply(&core);
                         state.emit_estop_ack_if_advanced(&mut core);
                         state.drain_retired_states(&mut core);
@@ -2922,22 +2938,24 @@ fn control_thread_main(
                     let (phases, body_end) = core.take_tick_phases();
                     let body_end = body_end.unwrap_or_else(now_inst);
                     core.defer_zero_check_persist = false;
-                    if core.pending_zero_check_persist.is_none() {
-                        if let Some(injected) = state
-                            .hooks
-                            .inject_pending_persist_job_once
-                            .as_ref()
-                            .and_then(|slot| slot.lock().ok().and_then(|mut g| g.take()))
-                        {
-                            core.pending_zero_check_persist = Some(injected);
-                        }
-                    }
                     if let Some(job) = core.pending_zero_check_persist.take() {
                         match state.persist_job_tx.push(job) {
-                            Ok(()) => state.persist_wake.unpark(),
-                            Err(rtrb::PushError::Full(job)) => {
-                                state.reject_saturated_persist_job(&mut core, job);
+                            Ok(()) => {
+                                state.persist_wake.unpark();
+                                if let Some(p) = injected_job_probe.take() {
+                                    if state.offload_reclaim_tx.push(OffloadReclaim::Probe(p)).is_ok() {
+                                        core.core.hub().wake();
+                                    }
+                                }
                             }
+                            Err(rtrb::PushError::Full(job)) => {
+                                state.reject_saturated_persist_job(&mut core, job, injected_job_probe.take());
+                            }
+                        }
+                    }
+                    if let Some(zc) = core.pending_legacy_j6_log.take() {
+                        if state.offload_reclaim_tx.push(OffloadReclaim::LogLegacyJ6(zc)).is_ok() {
+                            core.core.hub().wake();
                         }
                     }
                     // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
@@ -2984,7 +3002,6 @@ fn control_thread_main(
                         },
                         waited_for: None,
                         longest_hold: None,
-                        wake_lateness_ns,
                         late: !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1)),
                     };
                     if diag_tx.push(sample).is_err() {
@@ -3439,7 +3456,8 @@ mod tests {
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
-        let (exit_reclaim_tx, _exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
+        let (offload_reclaim_tx, _offload_reclaim_rx) =
+            RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
         let probe_dropped_on = Arc::new(Mutex::new(None::<ThreadId>));
         struct DropTracker(Arc<Mutex<Option<ThreadId>>>);
@@ -3471,7 +3489,7 @@ mod tests {
             persist_rep_tx,
             pending_persist_reply: None,
             retained_persist_job: None,
-            exit_reclaim_tx,
+            offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: Some((action_id, ConfigDomain::GripperCalibration)),
             next_persist_req: 1,
@@ -3530,7 +3548,8 @@ mod tests {
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (_, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, _) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
-        let (exit_reclaim_tx, mut exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
+        let (offload_reclaim_tx, mut offload_reclaim_rx) =
+            RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
 
         // Fill both `estop_ack_tx` and `reclaim_state_tx` to 100% capacity.
         for g in 1..=2 {
@@ -3559,7 +3578,7 @@ mod tests {
             persist_rep_tx,
             pending_persist_reply: None,
             retained_persist_job: None,
-            exit_reclaim_tx,
+            offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
             next_persist_req: 0,
@@ -3592,7 +3611,7 @@ mod tests {
         assert!(weak_a.upgrade().is_some(), "fault_a must stay alive in reclaim_state_tx");
         assert!(weak_b.upgrade().is_some(), "fault_b must stay alive in pending_estop_acks");
 
-        // Clean-exit drain while both rings remain full moves fault_b into lock-free `exit_reclaim_tx`.
+        // Clean-exit drain while both rings remain full moves fault_b into lock-free `offload_reclaim_tx`.
         state.drain_estop_and_retired_stopped(&mut core);
         assert!(core.pending_estop_acks.is_empty());
         assert!(weak_b.upgrade().is_some(), "fault_b must stay alive until off-thread drain");
@@ -3600,7 +3619,7 @@ mod tests {
         // Off-thread drain drops both cleanly.
         while let Ok(a) = estop_ack_rx.pop() { drop(a); }
         while let Ok(a) = reclaim_state_rx.pop() { drop(a); }
-        while let Ok(item) = exit_reclaim_rx.pop() { drop(item); }
+        while let Ok(item) = offload_reclaim_rx.pop() { drop(item); }
         assert!(weak_a.upgrade().is_none(), "fault_a dropped off-thread");
         assert!(weak_b.upgrade().is_none(), "fault_b dropped off-thread");
     }
@@ -3615,22 +3634,28 @@ mod tests {
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (mut persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(PERSIST_REP_CAPACITY);
-        let (exit_reclaim_tx, mut exit_reclaim_rx) = RingBuffer::<ExitReclaim>::new(EXIT_RECLAIM_CAPACITY);
+        let (mut offload_reclaim_tx, mut offload_reclaim_rx) = RingBuffer::<OffloadReclaim>::new(2);
 
-        // Fill `maint_rep_tx` to full (2/2) and `persist_rep_tx` to slots() == 2 (6/8).
+        // Fill `maint_rep_tx` to full (2/2), `persist_rep_tx` to slots() == 1 (7/8),
+        // and `offload_reclaim_tx` to full (2/2) to exercise retained-job fallback.
         for id in 1..=2 {
             maint_rep_tx.push(MaintReply { id, result: MaintenanceResult::ProbeReturned, returned_offsets: None, returned_probe: None }).unwrap();
         }
-        for _ in 0..(PERSIST_REP_CAPACITY - 2) {
+        for _ in 0..(PERSIST_REP_CAPACITY - 1) {
             persist_rep_tx.push(PersistReply::Done {
                 _returned_policy: None, _returned_jaw: None, _returned_code: None,
-                _returned_msg: None, _returned_warning: None, _returned_probe: None, _returned_job: None,
+                _returned_msg: None, _returned_warning: None, _returned_probe: None,
             }).unwrap();
         }
-        assert_eq!(persist_rep_tx.slots(), 2);
+        assert_eq!(persist_rep_tx.slots(), 1);
+        for _ in 0..2 {
+            offload_reclaim_tx.push(OffloadReclaim::Buf(String::new())).unwrap();
+        }
+        assert!(offload_reclaim_tx.is_full());
 
         let maint_probe_dropped = Arc::new(AtomicBool::new(false));
         let persist_probe_dropped = Arc::new(AtomicBool::new(false));
+        let rejected_probe_dropped = Arc::new(AtomicBool::new(false));
         struct FlagDrop(Arc<AtomicBool>);
         impl Drop for FlagDrop { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
 
@@ -3666,7 +3691,7 @@ mod tests {
             persist_rep_tx,
             pending_persist_reply: None,
             retained_persist_job: None,
-            exit_reclaim_tx,
+            offload_reclaim_tx,
             persist_wake: thread::current(),
             persist_granted: None,
             next_persist_req: 0,
@@ -3680,25 +3705,62 @@ mod tests {
         state.service_one_maintenance(&mut core, &ctx, Instant::now() + Duration::from_millis(20));
         state.service_persistence(&mut core, &ctx);
         assert!(!maint_probe_dropped.load(Ordering::SeqCst), "maint payload must not drop under full reply ring");
-        assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must not drop when slots() < 3");
+        assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must not drop when slots() < 2");
 
-        // Fill remaining 2 slots of `persist_rep_tx` so exit drain must spill into `exit_reclaim_tx`.
-        for _ in 0..2 {
-            state.persist_rep_tx.push(PersistReply::Done {
-                _returned_policy: None, _returned_jaw: None, _returned_code: None,
-                _returned_msg: None, _returned_warning: None, _returned_probe: None, _returned_job: None,
-            }).unwrap();
-        }
+        // Saturated persist job rejection NEVER writes an unsolicited PersistReply onto `persist_rep_tx`:
+        // when `offload_reclaim_tx` is also full, it retains the job until a slot opens.
+        let sample_job = PendingZeroCheckPersist {
+            action_id: 7,
+            offset_rad: 0.01,
+            jaw_opening: None,
+            base_revision: 0,
+            lease_owner: None,
+            operator_auth: None,
+            write: crate::persist::PendingWrite::new(
+                std::path::PathBuf::from("/tmp/armd-unused-test.json"),
+                "{}".to_string(),
+            ),
+            base_gripper_policy: Some(crate::model::GripperPolicy::rebot_dm()),
+            current_calib_jaw: None,
+            gripper_limit: None,
+            active_tool_is_stock: true,
+        };
+        state.reject_saturated_persist_job(
+            &mut core,
+            sample_job,
+            Some(Box::new(FlagDrop(rejected_probe_dropped.clone()))),
+        );
+        assert_eq!(state.persist_rep_tx.slots(), 1, "rejected persist job must never touch persist_rep_tx");
+        assert!(state.retained_persist_job.is_some(), "full offload_reclaim_tx must retain rejected job");
+        assert!(!rejected_probe_dropped.load(Ordering::SeqCst), "rejected job probe must not drop on RT");
+
+        // Draining offload_reclaim_rx lets flush_retained_persist hand off the rejected job off-thread.
+        while let Ok(item) = offload_reclaim_rx.pop() { drop(item); }
+        state.flush_retained_persist(&core);
+        assert!(state.retained_persist_job.is_none());
+        assert!(!rejected_probe_dropped.load(Ordering::SeqCst), "rejected job probe must remain alive until off-thread drain");
+        while let Ok(item) = offload_reclaim_rx.pop() { drop(item); }
+        assert!(rejected_probe_dropped.load(Ordering::SeqCst), "rejected job probe must drop off-thread");
+
+        // Swap in a full-sized offload ring and fill the last slot of `persist_rep_tx` so exit drain
+        // spills into `offload_reclaim_tx` without dropping anything on RT.
+        let (full_offload_tx, mut full_offload_rx) =
+            RingBuffer::<OffloadReclaim>::new(OFFLOAD_RECLAIM_CAPACITY);
+        state.offload_reclaim_tx = full_offload_tx;
+        state.persist_rep_tx.push(PersistReply::Done {
+            _returned_policy: None, _returned_jaw: None, _returned_code: None,
+            _returned_msg: None, _returned_warning: None, _returned_probe: None,
+        }).unwrap();
         assert!(state.persist_rep_tx.is_full());
         state.drain_maintenance_stopped();
         state.drain_persistence_stopped(&core);
-        assert!(!maint_probe_dropped.load(Ordering::SeqCst), "maint payload must stay alive in exit_reclaim_tx");
-        assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must stay alive in exit_reclaim_tx");
+        assert!(!maint_probe_dropped.load(Ordering::SeqCst), "maint payload must stay alive in offload_reclaim_tx");
+        assert!(!persist_probe_dropped.load(Ordering::SeqCst), "persist payload must stay alive in offload_reclaim_tx");
 
         // Off-thread drain drops everything cleanly.
         while let Ok(r) = maint_rep_rx.pop() { drop(r); }
         while let Ok(r) = persist_rep_rx.pop() { drop(r); }
-        while let Ok(item) = exit_reclaim_rx.pop() { drop(item); }
+        while let Ok(item) = full_offload_rx.pop() { drop(item); }
         assert!(maint_probe_dropped.load(Ordering::SeqCst));
         assert!(persist_probe_dropped.load(Ordering::SeqCst));
     }

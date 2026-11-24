@@ -99,6 +99,14 @@ impl<T> Producer<T> {
 }
 
 impl<T> Consumer<T> {
+    /// True when the producer has published a newer slot not yet swapped into `front`.
+    /// Uses `Acquire` ordering so any startup state published before `Producer::publish`
+    /// (such as `StateHub::prewarm_template`) is visible before the consumer rotates `front`.
+    #[inline]
+    pub fn has_fresh(&self) -> bool {
+        self.shared.middle.load(Ordering::Acquire) & FRESH != 0
+    }
+
     /// Takes the newest published slot when there is one; false when nothing was published
     /// since the last refresh (the front slot is unchanged). Never blocks.
     pub fn refresh(&mut self) -> bool {

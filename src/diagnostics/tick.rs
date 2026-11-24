@@ -335,9 +335,6 @@ pub struct TickSample {
     pub waited_for: Option<Holder>,
     /// The longest other hold since the previous tick (may differ from `waited_for`).
     pub longest_hold: Option<Holder>,
-    /// Raw wakeup lateness (ns) used for exact `> 1 / 5 / 10 ms` threshold classification.
-    #[serde(skip)]
-    pub wake_lateness_ns: u64,
     #[serde(skip)]
     pub late: bool,
 }
@@ -361,9 +358,6 @@ pub struct TickStats {
     next: usize,
     late_count: u64,
     ticks: u64,
-    wake_lateness_over_1ms: u64,
-    wake_lateness_over_5ms: u64,
-    wake_lateness_over_10ms: u64,
     tx_totals: TxTotals,
 }
 
@@ -542,9 +536,6 @@ impl Default for TickStats {
             next: 0,
             late_count: 0,
             ticks: 0,
-            wake_lateness_over_1ms: 0,
-            wake_lateness_over_5ms: 0,
-            wake_lateness_over_10ms: 0,
             tx_totals: TxTotals::default(),
         }
     }
@@ -636,9 +627,6 @@ pub struct TickWindow {
     rows: Vec<TickSample>,
     late_count: u64,
     ticks: u64,
-    wake_lateness_over_1ms: u64,
-    wake_lateness_over_5ms: u64,
-    wake_lateness_over_10ms: u64,
     tx_totals: TxTotals,
 }
 
@@ -649,15 +637,6 @@ impl TickStats {
         self.len = (self.len + 1).min(TICK_WINDOW);
         self.ticks += 1;
         if s.late { self.late_count += 1; }
-        let raw_ns = if s.wake_lateness_ns > 0 {
-            s.wake_lateness_ns
-        } else {
-            u64::from(s.wake_lateness_us).saturating_mul(1_000)
-        };
-        let (_, over_1ms, over_5ms, over_10ms) = classify_wake_lateness_ns(raw_ns);
-        if over_1ms { self.wake_lateness_over_1ms += 1; }
-        if over_5ms { self.wake_lateness_over_5ms += 1; }
-        if over_10ms { self.wake_lateness_over_10ms += 1; }
         self.tx_totals.frames = self.tx_totals.frames.saturating_add(u64::from(s.usage.tx_frames));
         self.tx_totals.would_block = self.tx_totals.would_block.saturating_add(u64::from(s.usage.tx_would_block));
         self.tx_totals.enobufs = self.tx_totals.enobufs.saturating_add(u64::from(s.usage.tx_enobufs));
@@ -674,9 +653,6 @@ impl TickStats {
             rows,
             late_count: self.late_count,
             ticks: self.ticks,
-            wake_lateness_over_1ms: self.wake_lateness_over_1ms,
-            wake_lateness_over_5ms: self.wake_lateness_over_5ms,
-            wake_lateness_over_10ms: self.wake_lateness_over_10ms,
             tx_totals: self.tx_totals,
         }
     }
@@ -715,9 +691,9 @@ impl TickWindow {
             post_us: self.col(|r| r.post_us),
             period_us: self.col(|r| r.period_us),
             wake_lateness_us: self.col(|r| r.wake_lateness_us),
-            wake_lateness_over_1ms: self.wake_lateness_over_1ms,
-            wake_lateness_over_5ms: self.wake_lateness_over_5ms,
-            wake_lateness_over_10ms: self.wake_lateness_over_10ms,
+            wake_lateness_over_1ms: 0,
+            wake_lateness_over_5ms: 0,
+            wake_lateness_over_10ms: 0,
             skipped_releases: 0,
             diag_dropped: 0,
             owner_mode: "legacy",
