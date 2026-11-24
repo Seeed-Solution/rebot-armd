@@ -101,8 +101,12 @@ impl ExecutorClock for ScriptedClock {
         self.state.lock().unwrap().now_ns
     }
 
-    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
         let mut s = self.state.lock().unwrap();
+        if s.now_ns >= target_ns {
+            self.cv.notify_all();
+            return false;
+        }
         while !stop.load(Ordering::Acquire) && s.now_ns < target_ns && s.limit_ns < target_ns {
             s.waiting_for_ns = Some(target_ns);
             self.cv.notify_all();
@@ -113,6 +117,7 @@ impl ExecutorClock for ScriptedClock {
             s.now_ns = target_ns;
         }
         self.cv.notify_all();
+        true
     }
 
     fn sleep(&self, dur: Duration, stop: &AtomicBool) {

@@ -112,8 +112,12 @@ impl ExecutorClock for LatenessClock {
         self.state.lock().unwrap().now_ns
     }
 
-    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
         let mut s = self.state.lock().unwrap();
+        if s.now_ns >= target_ns {
+            self.cv.notify_all();
+            return false;
+        }
         while !stop.load(Ordering::Acquire) && s.remaining_releases == 0 {
             s.waiting_for_ns = Some(target_ns);
             self.cv.notify_all();
@@ -122,13 +126,14 @@ impl ExecutorClock for LatenessClock {
         s.waiting_for_ns = None;
         if stop.load(Ordering::Acquire) {
             self.cv.notify_all();
-            return;
+            return true;
         }
         s.remaining_releases -= 1;
         let lateness = s.lateness_queue_ns.pop_front().unwrap_or(0);
         s.now_ns = target_ns.max(s.now_ns).saturating_add(lateness);
         s.completed_sleeps += 1;
         self.cv.notify_all();
+        true
     }
 
     fn sleep(&self, dur: Duration, stop: &AtomicBool) {
@@ -2286,8 +2291,8 @@ async fn completion_published_strictly_last_never_visible_during_tail_both_owner
     impl ExecutorClock for TailBarrierClock {
         fn now(&self) -> Instant { self.inner.now() }
         fn now_ns(&self) -> u64 { self.inner.now_ns() }
-        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
-            self.inner.sleep_until_ns(target_ns, stop);
+        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
+            self.inner.sleep_until_ns(target_ns, stop)
         }
         fn sleep(&self, dur: Duration, stop: &AtomicBool) {
             self.inner.sleep(dur, stop);
@@ -2437,5 +2442,281 @@ async fn completion_published_strictly_last_never_visible_during_tail_both_owner
         let after_stop = sup.tick_stats();
         assert!(!after_stop.loop_active);
         assert_eq!(after_stop.in_flight_release_us, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loop_exit_and_wait_boundary_skip_accounting_both_owners() {
+    /// Wrapper clock that advances `now_ns` inside `sleep()` and optionally flips `stop`
+    /// immediately after advancing (simulating post-commit preemption followed by shutdown
+    /// before the next sleep entry).
+    struct BoundaryDelayClock {
+        inner: Arc<LatenessClock>,
+        stop_after_sleep: Mutex<Option<Arc<AtomicBool>>>,
+    }
+
+    impl BoundaryDelayClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: LatenessClock::new(),
+                stop_after_sleep: Mutex::new(None),
+            })
+        }
+    }
+
+    impl ExecutorClock for BoundaryDelayClock {
+        fn now(&self) -> Instant { self.inner.now() }
+        fn now_ns(&self) -> u64 { self.inner.now_ns() }
+        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
+            self.inner.sleep_until_ns(target_ns, stop)
+        }
+        fn sleep(&self, dur: Duration, _stop: &AtomicBool) {
+            let add_ns = dur.as_nanos().min(u128::from(u64::MAX)) as u64;
+            self.inner.advance_ns(add_ns);
+            if let Some(flag) = self.stop_after_sleep.lock().unwrap().take() {
+                flag.store(true, Ordering::Release);
+            }
+        }
+        fn wake(&self) { self.inner.wake(); }
+    }
+
+    // ---- (1) Legacy owner: all boundary & loop-exit cases ----
+    // (1a) Post-commit exact-deadline equality (20 ms on 20 ms grid) & 25 ms preemption on CONTINUATION
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+            });
+        });
+
+        // Exact-deadline equality: now_ns == next_ns after release #1 seals -> 1 skip, no spin, release #2 runs.
+        loop_stats.before_sleep_delay_once_ns.store(20_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+        let s1 = sup.tick_stats();
+        assert_eq!(s1.releases_total, 1);
+        assert_eq!(s1.skipped_releases, 1, "exact now_ns == next_ns must account 1 skip: {s1:?}");
+
+        // 25 ms post-commit preemption on continuation -> +1 skip (total 2), release #2 runs cleanly.
+        loop_stats.before_sleep_delay_once_ns.store(25_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+        let s2 = sup.tick_stats();
+        assert_eq!(s2.releases_total, 2);
+        assert_eq!(s2.skipped_releases, 2, "25 ms post-commit preemption must account +1 skip: {s2:?}");
+
+        // Clean release #3 followed by late stop during genuine sleep -> 0 extra skips!
+        clock.run_schedule(&[0]);
+        clock.advance_ns(50_000_000);
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+        let s3 = sup.tick_stats();
+        assert_eq!(s3.releases_total, 3);
+        assert_eq!(s3.skipped_releases, 2, "clean stop during genuine sleep must add 0 skips: {s3:?}");
+        assert!(!s3.loop_active);
+    }
+
+    // (1b) Legacy owner: post-commit 25 ms preemption + immediate stop -> loop-exit final pass accounts 1 skip!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = BoundaryDelayClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+            });
+        });
+
+        *clock.stop_after_sleep.lock().unwrap() = Some(stop.clone());
+        loop_stats.before_sleep_delay_once_ns.store(25_000_000, Ordering::Release);
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.inner.cv.notify_all();
+        }
+        jh.join().unwrap();
+        let snap = sup.tick_stats();
+        assert_eq!(snap.releases_total, 1);
+        assert_eq!(snap.skipped_releases, 1, "loop-exit final accounting pass must count tail-crossed deadline: {snap:?}");
+        assert!(!snap.loop_active);
+    }
+
+    // (1c) Legacy owner: stop before first release -> 0 skips (even if clock jumped past first deadline).
+    {
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |_| {});
+        });
+        // Wait for loop to park on first deadline, advance clock past it, then stop.
+        {
+            let mut s = clock.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while s.waiting_for_ns.is_none() && Instant::now() < deadline {
+                s = clock.cv.wait_timeout(s, Duration::from_millis(20)).unwrap().0;
+            }
+            assert!(s.waiting_for_ns.is_some());
+        }
+        clock.advance_ns(50_000_000);
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+        assert_eq!(loop_stats.releases_total.load(Ordering::Acquire), 0);
+        assert_eq!(loop_stats.skipped_releases.load(Ordering::Acquire), 0);
+        assert!(!loop_stats.is_loop_active());
+    }
+
+    // ---- (2) Executor owner: all boundary & loop-exit cases ----
+    // (2a) Exact-deadline equality + 25 ms post-commit preemption on continuation + clean stop during sleep
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(20));
+        cfg.alloc_timing = true;
+        let handle = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        handle.stats().before_sleep_delay_once_ns.store(20_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+        let s1 = sup.tick_stats();
+        assert_eq!(s1.releases_total, 1);
+        assert_eq!(s1.skipped_releases, 1, "executor exact now_ns == next_ns must account 1 skip: {s1:?}");
+
+        handle.stats().before_sleep_delay_once_ns.store(25_000_000, Ordering::Release);
+        clock.run_schedule(&[0]);
+        let s2 = sup.tick_stats();
+        assert_eq!(s2.releases_total, 2);
+        assert_eq!(s2.skipped_releases, 2, "executor 25 ms post-commit preemption must account +1 skip: {s2:?}");
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+        clock.run_schedule(&[0]);
+        clock.advance_ns(50_000_000);
+        handle.stop_and_join();
+        let s3 = sup.tick_stats();
+        assert_eq!(s3.releases_total, 3);
+        assert_eq!(s3.skipped_releases, 2, "executor clean stop during genuine sleep must add 0 skips: {s3:?}");
+        assert!(!s3.loop_active);
+    }
+
+    // (2b) Executor owner: post-commit 25 ms preemption + stop -> loop-exit final pass accounts 1 skip!
+    {
+        struct StopOnBoundaryClock {
+            inner: Arc<LatenessClock>,
+            trigger_stop: AtomicBool,
+            entered_sleep: Mutex<bool>,
+            cv: Condvar,
+        }
+        impl ExecutorClock for StopOnBoundaryClock {
+            fn now(&self) -> Instant { self.inner.now() }
+            fn now_ns(&self) -> u64 { self.inner.now_ns() }
+            fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
+                self.inner.sleep_until_ns(target_ns, stop)
+            }
+            fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+                let add_ns = dur.as_nanos().min(u128::from(u64::MAX)) as u64;
+                self.inner.advance_ns(add_ns);
+                if self.trigger_stop.swap(false, Ordering::AcqRel) {
+                    stop.store(true, Ordering::Release);
+                    let mut g = self.entered_sleep.lock().unwrap();
+                    *g = true;
+                    self.cv.notify_all();
+                }
+            }
+            fn wake(&self) { self.inner.wake(); }
+        }
+
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = Arc::new(StopOnBoundaryClock {
+            inner: LatenessClock::new(),
+            trigger_stop: AtomicBool::new(true),
+            entered_sleep: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        handle.stats().before_sleep_delay_once_ns.store(25_000_000, Ordering::Release);
+        {
+            let mut s = clock.inner.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.inner.cv.notify_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_exited() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(handle.is_exited(), "executor should exit after stop set in post-commit boundary");
+        handle.stop_and_join();
+        let snap = sup.tick_stats();
+        assert_eq!(snap.releases_total, 1);
+        assert_eq!(snap.skipped_releases, 1, "executor loop-exit final pass must count tail-crossed deadline: {snap:?}");
+        assert!(!snap.loop_active);
+    }
+
+    // (2c) Executor owner: stop before first release -> 0 skips!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let mut s = clock.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while s.waiting_for_ns.is_none() && Instant::now() < deadline {
+                s = clock.cv.wait_timeout(s, Duration::from_millis(20)).unwrap().0;
+            }
+            assert!(s.waiting_for_ns.is_some());
+        }
+        clock.advance_ns(50_000_000);
+        handle.stop_and_join();
+        let snap = sup.tick_stats();
+        assert_eq!(snap.releases_total, 0);
+        assert_eq!(snap.skipped_releases, 0);
+        assert!(!snap.loop_active);
     }
 }

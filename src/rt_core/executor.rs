@@ -347,6 +347,11 @@ pub struct ExecutorStats {
     /// and strictly BEFORE final timestamp, sample amendment, and completion publication (0 in production).
     #[doc(hidden)]
     pub post_stats_delay_once_ns: AtomicU64,
+    /// Optional one-shot test delay (ns) injected strictly AFTER completion publication and right
+    /// BEFORE wait-entry (`sleep_until_ns`) / loop-exit check to test post-commit preemption
+    /// accounting on both continuation and shutdown (0 in production).
+    #[doc(hidden)]
+    pub before_sleep_delay_once_ns: AtomicU64,
     /// Cumulative count of off-thread `diag_amend_rx` amendments whose target sample had already
     /// been evicted from `LockFreeTickStats` (merged into `stats_writer_drops` as explicit coverage loss).
     pub amend_missed: AtomicU64,
@@ -402,6 +407,22 @@ impl ExecutorStats {
         }
         self.in_flight_start_mono_ns.store(0, Ordering::Relaxed);
         self.loop_active.store(false, Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Records scheduled deadlines crossed at a release-wait boundary after the prior release
+    /// sealed (separate `skipped_releases` event under `stats_seq`; never rewrites sealed
+    /// release durations or prior marker baselines).
+    #[inline]
+    pub fn record_boundary_skips(&self, skipped_delta: u64) {
+        if skipped_delta == 0 {
+            return;
+        }
+        let s0 = self.stats_seq.load(Ordering::Relaxed);
+        self.stats_seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        let skips = self.skipped_releases.load(Ordering::Relaxed).saturating_add(skipped_delta);
+        self.skipped_releases.store(skips, Ordering::Relaxed);
         self.stats_seq.store(s0.wrapping_add(2), Ordering::Release);
     }
 
@@ -1058,7 +1079,9 @@ impl EstopRegistry {
 pub trait ExecutorClock: Send + Sync {
     fn now(&self) -> Instant;
     fn now_ns(&self) -> u64;
-    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool);
+    /// Sleeps until `target_ns` (or until `stop` is set). Returns `false` without sleeping if
+    /// `now_ns() >= target_ns` on entry, or `true` if the thread genuinely slept/parked.
+    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool;
     fn sleep(&self, dur: Duration, stop: &AtomicBool);
     fn wake(&self) {}
 }
@@ -3339,11 +3362,11 @@ fn control_thread_main(
     let now_ns_fn = || -> u64 {
         clock_hook.as_ref().map_or_else(mono_now_ns, |c| c.now_ns())
     };
-    let sleep_until = |target_ns: u64| {
+    let sleep_until = |target_ns: u64| -> bool {
         if let Some(c) = clock_hook.as_ref() {
-            c.sleep_until_ns(target_ns, &control_stop);
+            c.sleep_until_ns(target_ns, &control_stop)
         } else {
-            sleep_until_ns(target_ns);
+            sleep_until_ns(target_ns)
         }
     };
     let sleep_dur = |d: Duration| {
@@ -3367,6 +3390,8 @@ fn control_thread_main(
     let mut last_release_start = now_inst();
     let mut publish_gen = initial_generation;
     let mut panicked = false;
+    let mut ran_any_release = false;
+    let mut stopped_cleanly = true;
 
     // Compile-time check: only `Copy` state crosses from Window 1 (whole release) into Window 2
     // (sub-release wakes) and the single release-completion point, ensuring zero uncounted destruction.
@@ -3375,12 +3400,23 @@ fn control_thread_main(
         assert_copy::<(TickSample, Option<(super::ops::ReleaseReport, Instant, u64)>)>();
     };
 
-    while !control_stop.load(Ordering::Acquire) {
-        let scheduled_ns = releases.next_ns();
-        sleep_until(scheduled_ns);
-        if control_stop.load(Ordering::Acquire) {
-            break;
-        }
+    loop {
+        let scheduled_ns = match wait_for_next_release(
+            &control_stop,
+            &mut releases,
+            &stats,
+            ran_any_release,
+            &now_ns_fn,
+            &sleep_until,
+            &sleep_dur,
+        ) {
+            WaitOutcome::Wake { scheduled_ns } => scheduled_ns,
+            WaitOutcome::Stop { stopped_cleanly: clean } => {
+                stopped_cleanly = clean;
+                break;
+            }
+        };
+        ran_any_release = true;
 
         // Sample actual wake time FIRST — right after sleep returns and stop check,
         // strictly before allocation bookkeeping (`WholeReleaseAllocGuard`) and `UsageMark::now()`
@@ -3635,7 +3671,7 @@ fn control_thread_main(
                                 .as_nanos()
                                 .min(u128::from(u64::MAX)) as u64,
                         );
-                        sleep_until(wake_ns.min(next_release_ns));
+                        let _ = sleep_until(wake_ns.min(next_release_ns));
                     }
                     if control_stop.load(Ordering::Acquire) {
                         break;
@@ -3838,6 +3874,15 @@ fn control_thread_main(
         }
     }
 
+    // Loop-exit final accounting pass (normal shutdown): if the loop exited after a release
+    // without entering a genuine sleep, account any scheduled deadlines crossed in the tail.
+    let exit_skips = if !panicked && ran_any_release && !stopped_cleanly {
+        releases.advance_overrun(now_ns_fn())
+    } else {
+        0
+    };
+    stats.finalize_loop_exit(exit_skips);
+
     if !panicked && teardown_disable.requested.load(Ordering::Acquire) {
         let disable_timeout = state
             .hooks
@@ -3894,9 +3939,13 @@ fn mono_now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// Sleeps until the absolute monotonic time `at_ns` (returns at once when it has passed).
+/// Sleeps until the absolute monotonic time `at_ns`. Returns `false` without sleeping if
+/// `mono_now_ns() >= at_ns` already on entry, or `true` if `clock_nanosleep` actually ran.
 #[cfg(target_os = "linux")]
-fn sleep_until_ns(at_ns: u64) {
+fn sleep_until_ns(at_ns: u64) -> bool {
+    if mono_now_ns() >= at_ns {
+        return false;
+    }
     // SAFETY: timespec is plain old data; all-zero is valid
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     ts.tv_sec = (at_ns / 1_000_000_000) as _;
@@ -3905,7 +3954,7 @@ fn sleep_until_ns(at_ns: u64) {
         // SAFETY: `ts` is valid; the remaining-time pointer is unused with TIMER_ABSTIME.
         let rc = unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
         if rc != libc::EINTR {
-            return;
+            return true;
         }
     }
 }
@@ -3917,10 +3966,68 @@ fn mono_now_ns() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sleep_until_ns(at_ns: u64) {
+fn sleep_until_ns(at_ns: u64) -> bool {
     let now = mono_now_ns();
-    if at_ns > now {
-        thread::sleep(Duration::from_nanos(at_ns - now));
+    if now >= at_ns {
+        return false;
+    }
+    thread::sleep(Duration::from_nanos(at_ns - now));
+    true
+}
+
+enum WaitOutcome {
+    Wake { scheduled_ns: u64 },
+    Stop { stopped_cleanly: bool },
+}
+
+/// Shared wait-entry transition for both `control_thread_main` and `run_periodic_with_clock`.
+/// Ensures deadlines crossed after completion publication are accounted consistently whether
+/// the loop continues or stops, without spinning on an expired first deadline or fabricating
+/// skips on a clean stop during genuine sleep.
+#[inline]
+fn wait_for_next_release(
+    stop: &AtomicBool,
+    releases: &mut Releases,
+    stats: &ExecutorStats,
+    ran_any_release: bool,
+    now_ns: &impl Fn() -> u64,
+    sleep_until: &impl Fn(u64) -> bool,
+    sleep_dur: &impl Fn(Duration),
+) -> WaitOutcome {
+    loop {
+        if ran_any_release && stats.before_sleep_delay_once_ns.load(Ordering::Relaxed) != 0 {
+            let delay_ns = stats.before_sleep_delay_once_ns.swap(0, Ordering::AcqRel);
+            if delay_ns > 0 {
+                sleep_dur(Duration::from_nanos(delay_ns));
+            }
+        }
+        if stop.load(Ordering::Acquire) {
+            return WaitOutcome::Stop {
+                stopped_cleanly: !ran_any_release,
+            };
+        }
+        let scheduled_ns = releases.next_ns();
+        let actually_slept = sleep_until(scheduled_ns);
+        if !actually_slept {
+            if !ran_any_release {
+                if stop.load(Ordering::Acquire) {
+                    return WaitOutcome::Stop { stopped_cleanly: true };
+                }
+                return WaitOutcome::Wake { scheduled_ns };
+            }
+            let crossed = releases.advance_overrun(now_ns());
+            if crossed > 0 {
+                stats.record_boundary_skips(crossed);
+            }
+            if stop.load(Ordering::Acquire) {
+                return WaitOutcome::Stop { stopped_cleanly: true };
+            }
+            continue;
+        }
+        if stop.load(Ordering::Acquire) {
+            return WaitOutcome::Stop { stopped_cleanly: true };
+        }
+        return WaitOutcome::Wake { scheduled_ns };
     }
 }
 
@@ -4036,18 +4143,37 @@ pub fn run_periodic_with_clock(
 
     let now_inst = || clock.map_or_else(Instant::now, ExecutorClock::now);
     let now_ns = || clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
+    let sleep_until = |target_ns: u64| -> bool {
+        if let Some(c) = clock {
+            c.sleep_until_ns(target_ns, stop)
+        } else {
+            sleep_until_ns(target_ns)
+        }
+    };
+    let sleep_dur = |d: Duration| {
+        if let Some(c) = clock {
+            c.sleep(d, stop);
+        } else {
+            thread::sleep(d);
+        }
+    };
     let mut releases = Releases::start_at(now_ns(), period);
     let mut last = now_inst();
-    while !stop.load(Ordering::Acquire) {
-        let scheduled_ns = releases.next_ns();
-        if let Some(c) = clock {
-            c.sleep_until_ns(scheduled_ns, stop);
-        } else {
-            sleep_until_ns(scheduled_ns);
-        }
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
+    let mut ran_any_release = false;
+    let stopped_cleanly = loop {
+        let scheduled_ns = match wait_for_next_release(
+            stop,
+            &mut releases,
+            stats,
+            ran_any_release,
+            &now_ns,
+            &sleep_until,
+            &sleep_dur,
+        ) {
+            WaitOutcome::Wake { scheduled_ns } => scheduled_ns,
+            WaitOutcome::Stop { stopped_cleanly } => break stopped_cleanly,
+        };
+        ran_any_release = true;
         let actual_ns = now_ns();
         let woke = now_inst();
         let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
@@ -4160,7 +4286,16 @@ pub fn run_periodic_with_clock(
             wake_skipped.saturating_add(overrun_skipped),
             0,
         );
-    }
+    };
+
+    // Loop-exit final accounting pass (normal shutdown): if the loop exited after a release
+    // without entering a genuine sleep, account any scheduled deadlines crossed in the tail.
+    let exit_skips = if ran_any_release && !stopped_cleanly {
+        releases.advance_overrun(now_ns())
+    } else {
+        0
+    };
+    stats.finalize_loop_exit(exit_skips);
 }
 
 #[cfg(test)]

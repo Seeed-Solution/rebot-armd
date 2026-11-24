@@ -2954,18 +2954,22 @@ async fn executor_clear_fault_carries_epoch_and_refuses_after_newer_estop() {
         fn now_ns(&self) -> u64 {
             self.state.lock().unwrap().0
         }
-        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+        fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) -> bool {
             let mut g = self.state.lock().unwrap();
+            if g.0 >= target_ns {
+                return false;
+            }
             g.1 += 1;
             self.cv.notify_all();
             while !stop.load(Ordering::Acquire) && g.0 < target_ns {
                 g = self.cv.wait_timeout(g, Duration::from_millis(5)).unwrap().0;
             }
             g.1 -= 1;
+            true
         }
         fn sleep(&self, dur: Duration, stop: &AtomicBool) {
             let target = self.now_ns().saturating_add(dur.as_nanos() as u64);
-            self.sleep_until_ns(target, stop);
+            let _ = self.sleep_until_ns(target, stop);
         }
         fn wake(&self) {
             self.cv.notify_all();
