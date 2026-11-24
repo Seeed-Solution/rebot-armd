@@ -772,28 +772,50 @@ impl MacroCtx {
         };
         let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
         let rules_for_pre = effective_rules.clone();
-        let (input, planned) = tokio::task::spawn_blocking(move || {
-            let p = motion::plan_cartesian_opts(&input, goal, speed, opts).map(|direct| {
-                let pre = match &plan {
-                    Some(Ok(plan)) => crate::backlash::plan_cartesian_pre(&input, &direct, plan,
-                        rules_for_pre.as_ref(), speed, opts),
-                    Some(Err(Some(r))) => crate::backlash::Pre::Direct((*r).to_string()),
-                    _ => crate::backlash::Pre::Off,
-                };
-                (direct, pre, plan.and_then(Result::ok))
-            });
-            (input, p)
+        let hard_limits = snap.env.config.limits.clone();
+        let commissioning_required = snap.env.config.active_tool.commissioning_required;
+        let torque_or_power_hold = snap.owner.torque_or_power_hold;
+        let (input, resolved) = tokio::task::spawn_blocking(move || {
+            let r: Result<req::ResolvedCartesianLegs, ArmError> =
+                motion::plan_cartesian_opts(&input, goal, speed, opts)
+                    .map_err(ArmError::from)
+                    .and_then(|direct| {
+                        let pre = match &plan {
+                            Some(Ok(plan)) => crate::backlash::plan_cartesian_pre(
+                                &input,
+                                &direct,
+                                plan,
+                                rules_for_pre.as_ref(),
+                                speed,
+                                opts,
+                            ),
+                            Some(Err(Some(r))) => crate::backlash::Pre::Direct((*r).to_string()),
+                            _ => crate::backlash::Pre::Off,
+                        };
+                        let plan_ok = plan.and_then(Result::ok);
+                        req::resolve_cartesian_legs_with_rules(
+                            &input,
+                            &hard_limits,
+                            direct,
+                            pre,
+                            plan_ok.as_ref(),
+                            rules_for_pre.as_ref(),
+                            commissioning_required,
+                            torque_or_power_hold,
+                        )
+                    });
+            (input, r)
         }).await
             .map_err(|e| before(fail("INTERNAL", format!("planner task failed: {e}"))))?;
-        let (path, pre, plan) = match planned {
+        let resolved = match resolved {
             Ok(p) => p,
             Err(e) => {
                 if !self.is_executor() {
-                    if let motion::MotionError::WorkspaceViolation { ref detail, .. } = e {
-                        self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
+                    if let Some(detail) = e.workspace_detail() {
+                        self.sup.inner().write().await.set_action_workspace_violation(self.id, detail);
                     }
                 }
-                return Err(before(arm_fail(e.into())));
+                return Err(before(arm_fail(e)));
             }
         };
         let mut child_stamp = snap.stamp.for_child(ActionId(self.id), self.deadline);
@@ -802,7 +824,7 @@ impl MacroCtx {
         child_stamp.grasp_setup_revision = None;
         child_stamp.gripper_calib_revision = None;
         child_stamp.calibration_revision = None;
-        child_stamp.power_budget_revision = None;
+        child_stamp.power_budget_revision = Some(snap.env.power_budget_revision);
 
         let ticket = if self.is_executor() {
             let m = snap.owner.macro_state;
@@ -810,16 +832,10 @@ impl MacroCtx {
                 .then(|| m.child_seq.checked_add(1))
                 .flatten()
                 .ok_or_else(|| before(Stop::Cancelled))?;
-            let (chosen_path, approach_then) = req::resolve_cartesian_rt_legs(
-                &path,
-                &pre,
-                plan.as_ref(),
-                input.power.as_ref(),
-                &input.arm,
-            );
+            let approach_then = resolved.approach_leg.as_ref().map(|l| l.staged);
             let leg2_s = approach_then.map_or(0.0, |l| l.duration_s);
             let timeout_s =
-                ((chosen_path.duration + leg2_s + 0.5) * 2.0 + 5.0).min(self.phase_timeout_s);
+                ((resolved.path.duration + leg2_s + 0.5) * 2.0 + 5.0).min(self.phase_timeout_s);
             let child_spec = ChildSpec {
                 ticket: ChildTicket {
                     parent: ActionId(self.id),
@@ -831,8 +847,8 @@ impl MacroCtx {
             };
             let slot = req::prepare_child_cartesian_slot_with_approach(
                 &snap.commanded_positions,
-                chosen_path,
-                input.power.as_ref().map(|_| chosen_path.power_scale),
+                &resolved.path,
+                input.power.as_ref().map(|_| resolved.path.power_scale),
                 approach_then,
                 child_spec,
             )
@@ -870,10 +886,7 @@ impl MacroCtx {
                     spec: child_spec,
                     start: snap.commanded_positions.clone(),
                     input: input.clone(),
-                    direct: path,
-                    pre,
-                    approach_plan: plan,
-                    rules: effective_rules,
+                    resolved,
                 },
             ) {
                 Ok(v) => v,
@@ -946,7 +959,7 @@ impl MacroCtx {
         child_stamp.sequences_revision = None;
         child_stamp.grasp_setup_revision = None;
         child_stamp.gripper_calib_revision = None;
-        child_stamp.power_budget_revision = None;
+        child_stamp.power_budget_revision = Some(snap.env.power_budget_revision);
 
         let ticket = if self.is_executor() {
             let m = snap.owner.macro_state;
@@ -964,6 +977,16 @@ impl MacroCtx {
                 &limits,
             )
             .map_err(|e| before(arm_fail(e.into())))?;
+            let (traj, power_scale) = req::fit_quintic_power_off_lock(
+                traj,
+                &snap.commanded_positions,
+                &snap.commanded_velocities,
+                &target,
+                &limits,
+                snap.env.power_budget.as_ref(),
+                &snap.env.config.arm_model,
+            )
+            .map_err(|e| before(arm_fail(e)))?;
             let max_vel: Vec<f32> = limits.iter().map(|l| l.max_velocity).collect();
             let timeout_s = ((traj.duration + motion::SETTLE_MAX_S) * 2.0 + 5.0).min(self.phase_timeout_s);
             let child_spec = ChildSpec {
@@ -980,7 +1003,7 @@ impl MacroCtx {
                 &target,
                 &max_vel,
                 traj.duration,
-                None,
+                power_scale,
                 child_spec,
             )
             .map_err(|c| before(fail(c, format!("failed to stage joint child for {phase}: {c}"))))?;
@@ -1060,7 +1083,7 @@ impl MacroCtx {
         child_stamp.sequences_revision = None;
         child_stamp.grasp_setup_revision = None;
         child_stamp.gripper_calib_revision = None;
-        child_stamp.power_budget_revision = None;
+        child_stamp.power_budget_revision = Some(snap.env.power_budget_revision);
         let tool_digest = snap.env.tool_digest_hash;
 
         let ticket = if self.is_executor() {
@@ -1178,7 +1201,7 @@ impl MacroCtx {
         child_stamp.poses_revision = None;
         child_stamp.sequences_revision = None;
         child_stamp.grasp_setup_revision = None;
-        child_stamp.gripper_calib_revision = None;
+        child_stamp.gripper_calib_revision = Some(snap.env.gripper_calib_revision);
         child_stamp.calibration_revision = None;
         child_stamp.power_budget_revision = None;
 

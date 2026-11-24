@@ -3717,6 +3717,7 @@ impl SupervisorInner {
             .map(|m| PublishedMacroState {
                 active_id: m.id,
                 alive: !m.stop_requested
+                    && !m.finishing
                     && self
                         .last_action
                         .as_ref()
@@ -3755,6 +3756,7 @@ impl SupervisorInner {
             gravity_comp_active: self.gravity_comp.is_some(),
             policy_busy,
             zero_check_persisting: self.zero_check_persisting.is_some(),
+            torque_or_power_hold: self.torque_guard.hold.is_some() || self.power.gov.hold.is_some(),
             held,
             macro_state,
         }

@@ -1316,6 +1316,28 @@ impl ActionSnapshot {
 // ---------------------------------------------------------------------------------------
 // Off-thread prepared payloads (shared by Legacy and Executor)
 
+/// Pre-validated second-leg same-side approach quintic (shared identically by Legacy and RT Executor).
+#[derive(Debug, Clone)]
+pub struct PreparedApproachLeg {
+    pub seg: crate::trajectory::MultiJointQuinticTrajectory,
+    pub target: Vec<f32>,
+    pub power_scale: Option<f64>,
+    pub staged: StagedQuinticLeg,
+}
+
+/// Off-thread-validated Cartesian leg selection shared identically by Legacy and RT Executor:
+/// either two-leg `(cp.path, Some(leg2))` or direct fallback `(direct, None)`, with `DescentRules`
+/// (`table` + `from_above`), commissioning TCP speed cap, power fit, and swept workspace enforced
+/// on the EXACT returned legs (and returning `Err(WorkspaceViolation)` if a direct fallback crosses
+/// the table envelope).
+#[derive(Debug, Clone)]
+pub struct ResolvedCartesianLegs {
+    pub path: JointPath,
+    pub approach_leg: Option<PreparedApproachLeg>,
+    pub outcome: Option<backlash::Outcome>,
+    pub expected_duration_s: f64,
+}
+
 /// Prepared linear Cartesian move (`move_to` / `move_relative`).
 #[derive(Debug, Clone)]
 pub struct PreparedCartesianAction {
@@ -1323,71 +1345,233 @@ pub struct PreparedCartesianAction {
     pub stamp: ActionStamp,
     pub start: Vec<f32>,
     pub input: PlanInput,
-    pub direct: JointPath,
-    pub pre: backlash::Pre,
-    pub approach_plan: Option<backlash::Plan>,
-    pub rules: Option<backlash::DescentRules>,
+    pub resolved: ResolvedCartesianLegs,
     pub tag: Option<String>,
     pub expected_duration_s: f64,
 }
 
-/// Resolves `(path_to_stage, approach_then)` for RT staging so `backlash::Pre::Ready(cp)` is
-/// NEVER staged without its second-leg final approach segment; falls back cleanly to `direct`.
-pub fn resolve_cartesian_rt_legs<'a>(
-    direct: &'a JointPath,
-    pre: &'a backlash::Pre,
-    approach_plan: Option<&backlash::Plan>,
-    power_budget: Option<&PowerBudget>,
+fn segment_peak_tcp_speed_mps_off_lock(
+    traj: &crate::trajectory::MultiJointQuinticTrajectory,
     arm: &crate::chain::ArmModel,
-) -> (&'a JointPath, Option<StagedQuinticLeg>) {
-    if let (backlash::Pre::Ready(cp), Some(plan)) = (pre, approach_plan) {
-        let dof = cp.path.dof;
-        if dof > 0 && dof <= MAX_DOF && cp.target.len() == dof {
-            let zeros = vec![0.0f32; dof];
-            if let Ok(seg) = crate::trajectory::TrajectoryPlanner::plan(
-                cp.path.last_slice(),
-                &zeros,
-                &cp.target,
-                &zeros,
-                Some(backlash::MIN_SEGMENT_S),
-                &plan.seg_limits,
-            ) {
-                if let Ok((seg, power_scale)) = fit_quintic_power_off_lock(
-                    seg,
-                    cp.path.last_slice(),
-                    &zeros,
-                    &cp.target,
-                    &plan.seg_limits,
-                    power_budget,
-                    arm,
-                ) {
-                    let mut target = [0.0f32; MAX_DOF];
-                    target[..dof].copy_from_slice(&cp.target);
-                    return (
-                        &cp.path,
-                        Some(StagedQuinticLeg {
-                            target,
-                            duration_s: seg.duration,
-                            power_scale,
-                        }),
-                    );
+    tcp_offset: [f64; 3],
+) -> f64 {
+    let n = ((traj.duration / 0.005).ceil() as usize).clamp(8, 512);
+    let dt = traj.duration / n as f64;
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    let mut prev = arm
+        .fk_f32(&traj.sample(0.0).positions)
+        .map(|e| motion::end_to_tcp(&e, &tcp_offset).p);
+    let mut max_mps = 0.0f64;
+    for k in 1..=n {
+        let t = (k as f64 * dt).min(traj.duration);
+        let cur = arm
+            .fk_f32(&traj.sample(t).positions)
+            .map(|e| motion::end_to_tcp(&e, &tcp_offset).p);
+        if let (Some(p0), Some(p1)) = (prev, cur) {
+            let d = crate::kinematics::norm(&crate::kinematics::sub(&p1, &p0));
+            max_mps = max_mps.max(d / dt);
+        }
+        prev = cur;
+    }
+    max_mps
+}
+
+fn arm_err_code_str(e: ArmError) -> String {
+    let api = crate::api::rest::ApiError::from(e);
+    api.code.unwrap_or(api.error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_approach_segment_off_lock(
+    start: &[f32],
+    target: &[f32],
+    seg_limits: &[JointLimit],
+    hard_limits: &[JointLimit],
+    ws: Option<&WorkspacePolicy>,
+    cam: &crate::model::CameraMount,
+    arm: &crate::chain::ArmModel,
+    tcp_offset: [f64; 3],
+    power_budget: Option<&PowerBudget>,
+    commissioning_required: bool,
+    rules: Option<&backlash::DescentRules>,
+) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>, Vec<Vec<f32>>), String> {
+    let dof = start.len();
+    if dof == 0 || dof > MAX_DOF || target.len() != dof || hard_limits.len() != dof {
+        return Err("segment: invalid DOF".into());
+    }
+    for (label, qs) in [("pre_target", start), ("segment", target)] {
+        for (q, lim) in qs.iter().zip(hard_limits) {
+            if !q.is_finite() || *q < lim.min_position || *q > lim.max_position {
+                return Err(format!("{label}: OUT_OF_LIMITS"));
+            }
+        }
+    }
+    let zeros = vec![0.0f32; dof];
+    let mut traj = TrajectoryPlanner::plan(
+        start,
+        &zeros,
+        target,
+        &zeros,
+        Some(backlash::MIN_SEGMENT_S),
+        seg_limits,
+    )
+    .map_err(|e| format!("segment: {e}"))?;
+    if commissioning_required {
+        let cap_mps = 0.2 * motion::MAX_LINEAR_MPS;
+        let max_tcp_mps = segment_peak_tcp_speed_mps_off_lock(&traj, arm, tcp_offset);
+        if max_tcp_mps > cap_mps + 1e-6 {
+            let min_dur = (traj.duration * (max_tcp_mps / cap_mps) * 1.02).max(backlash::MIN_SEGMENT_S);
+            traj = TrajectoryPlanner::plan(start, &zeros, target, &zeros, Some(min_dur), seg_limits)
+                .map_err(|e| format!("segment: {e}"))?;
+        }
+    }
+    let (traj, power_scale) = fit_quintic_power_off_lock(
+        traj,
+        start,
+        &zeros,
+        target,
+        seg_limits,
+        power_budget,
+        arm,
+    )
+    .map_err(|e| format!("segment: {}", arm_err_code_str(e)))?;
+    let seg_samples = if let Some(ws) = ws {
+        workspace_samples_and_check_off_lock(&traj, start, ws, cam, arm, tcp_offset)
+            .map_err(|e| format!("segment: {}", arm_err_code_str(e)))?
+    } else {
+        (0..=20)
+            .map(|k| traj.sample(traj.duration * k as f64 / 20.0).positions)
+            .collect()
+    };
+    if let Some(points) = rules.map(|r| r.from_above.as_slice()).filter(|p| !p.is_empty()) {
+        if let Some(z_target) = backlash::lowest_z(arm, points, target) {
+            for q in &seg_samples {
+                if backlash::lowest_z(arm, points, q)
+                    .is_some_and(|z| z < z_target - backlash::BELOW_TOL_M)
+                {
+                    return Err("from_below: fitted segment passes below the target height".into());
                 }
             }
         }
     }
-    (direct, None)
+    Ok((traj, power_scale, seg_samples))
+}
+
+/// **Single off-thread Cartesian leg selector** shared by standalone `move_to`/`move_relative` and
+/// `MacroCtx::move_arm_staged_in_with_table_guarded` across BOTH Legacy and RT Executor owners.
+///
+/// Validates the exact fitted second-leg quintic against soft limits, commissioning TCP cap, power
+/// budget, swept workspace keepout, `rules.from_above`, and `rules.table`; on any fallback to
+/// `direct` (or when `Pre::Off`/`Pre::Direct`), validates `direct` against `rules.table`, returning
+/// `Err(MotionError::WorkspaceViolation)` if `direct` crosses the measured table envelope.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_cartesian_legs_with_rules(
+    input: &PlanInput,
+    hard_limits: &[JointLimit],
+    direct: JointPath,
+    pre: backlash::Pre,
+    approach_plan: Option<&backlash::Plan>,
+    rules: Option<&backlash::DescentRules>,
+    commissioning_required: bool,
+    torque_or_power_hold_active: bool,
+) -> Result<ResolvedCartesianLegs, ArmError> {
+    let check_direct_table = |path: &JointPath| -> Result<(), ArmError> {
+        if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
+            backlash::check_table_clear(&input.arm, points, *bound, path.q.iter().map(|q| q.as_slice()))
+                .map_err(|v| ArmError::from(v.into_motion_error()))?;
+        }
+        Ok(())
+    };
+    let direct_fallback = |direct: JointPath, reason: Option<String>| -> Result<ResolvedCartesianLegs, ArmError> {
+        check_direct_table(&direct)?;
+        let expected_duration_s = direct.duration + 0.5;
+        Ok(ResolvedCartesianLegs {
+            path: direct,
+            approach_leg: None,
+            outcome: reason.map(backlash::Outcome::direct),
+            expected_duration_s,
+        })
+    };
+
+    let (cp, plan) = match (pre, approach_plan) {
+        (backlash::Pre::Ready(cp), Some(plan)) => (cp, plan),
+        (backlash::Pre::Direct(reason), _) => return direct_fallback(direct, Some(reason)),
+        _ => return direct_fallback(direct, None),
+    };
+    if torque_or_power_hold_active {
+        return direct_fallback(direct, Some("segment: a torque or power hold is in force".into()));
+    }
+    let dof = cp.path.dof;
+    let seg_res = validate_approach_segment_off_lock(
+        cp.path.last_slice(),
+        &cp.target,
+        &plan.seg_limits,
+        hard_limits,
+        input.ws.as_ref(),
+        &input.cam,
+        &input.arm,
+        input.tcp_offset,
+        input.power.as_ref(),
+        commissioning_required,
+        rules,
+    );
+    let (seg, seg_scale, seg_samples) = match seg_res {
+        Ok(v) => v,
+        Err(reason) => return direct_fallback(direct, Some(reason)),
+    };
+    if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
+        if let Err(reason) = backlash::table_clear_iter(
+            &input.arm,
+            points,
+            *bound,
+            cp.path
+                .q
+                .iter()
+                .map(|q| q.as_slice())
+                .chain(seg_samples.iter().map(Vec::as_slice)),
+        ) {
+            return direct_fallback(direct, Some(reason));
+        }
+    }
+    let mut target_arr = [0.0f32; MAX_DOF];
+    target_arr[..dof].copy_from_slice(&cp.target[..dof]);
+    let staged = StagedQuinticLeg {
+        target: target_arr,
+        duration_s: seg.duration,
+        power_scale: seg_scale,
+    };
+    let flipped: Vec<String> = cp
+        .flipped
+        .iter()
+        .map(|&j| {
+            plan.joint_names
+                .get(j)
+                .cloned()
+                .unwrap_or_else(|| j.to_string())
+        })
+        .collect();
+    let outcome = backlash::Outcome::same_side(&cp.signs, plan.arm_dof, flipped);
+    let expected_duration_s = cp.path.duration + 0.5 + seg.duration;
+    Ok(ResolvedCartesianLegs {
+        path: cp.path,
+        approach_leg: Some(PreparedApproachLeg {
+            seg,
+            target: cp.target,
+            power_scale: seg_scale,
+            staged,
+        }),
+        outcome: Some(outcome),
+        expected_duration_s,
+    })
 }
 
 impl PreparedCartesianAction {
     /// Stages this prepared Cartesian path into a broker [`PlanSlot`] (no IK on RT).
     pub fn to_plan_slot(&self, child: Option<ChildSpec>) -> Result<PlanSlot, &'static str> {
-        let (path, approach_then) = resolve_cartesian_rt_legs(
-            &self.direct,
-            &self.pre,
-            self.approach_plan.as_ref(),
-            self.input.power.as_ref(),
-            &self.input.arm,
-        );
+        let path = &self.resolved.path;
+        let approach_then = self.resolved.approach_leg.as_ref().map(|l| l.staged);
         if self.start.len() != path.dof || self.start.len() > MAX_DOF {
             return Err("INVALID_COMMAND");
         }
@@ -1411,6 +1595,8 @@ impl PreparedCartesianAction {
 }
 
 /// Prepared joint move (`move_to` / `move_relative` `path: "joint"` or `move_to_pose`).
+/// Both legs (when same-side approach applies) are planned, power-fitted, and workspace-checked
+/// off-thread so Legacy and RT Executor install the EXACT same motion without lock-time planning.
 #[derive(Debug, Clone)]
 pub struct PreparedJointAction {
     pub kind: PreparedActionKind,
@@ -1419,9 +1605,9 @@ pub struct PreparedJointAction {
     pub target: Vec<f32>,
     pub limits: Vec<JointLimit>,
     pub speed_scale: f64,
-    pub prepared_quintic: Option<PreparedQuintic>,
-    pub approach_use: &'static str,
-    pub same_side: Option<backlash::Request>,
+    pub prepared_quintic: PreparedQuintic,
+    pub approach_leg: Option<PreparedApproachLeg>,
+    pub approach_outcome: Option<backlash::Outcome>,
     pub tag: Option<String>,
     pub expected_duration_s: f64,
     pub settle: bool,
@@ -1431,21 +1617,24 @@ impl PreparedJointAction {
     /// Stages this prepared joint move into a broker [`PlanSlot`] (zero-alloc on RT).
     pub fn to_plan_slot(&self, child: Option<ChildSpec>) -> Result<PlanSlot, &'static str> {
         let dof = self.start.len();
-        if dof == 0 || dof > MAX_DOF || self.target.len() != dof || self.limits.len() != dof {
+        if dof == 0
+            || dof > MAX_DOF
+            || self.prepared_quintic.target.len() != dof
+            || self.limits.len() != dof
+        {
             return Err("INVALID_COMMAND");
         }
         let mut start = [0.0f32; MAX_DOF];
         let mut target = [0.0f32; MAX_DOF];
         let mut max_velocity = [0.0f32; MAX_DOF];
         start[..dof].copy_from_slice(&self.start);
-        target[..dof].copy_from_slice(&self.target);
+        target[..dof].copy_from_slice(&self.prepared_quintic.target);
         for (i, l) in self.limits.iter().enumerate() {
             max_velocity[i] = l.max_velocity;
         }
-        let (duration_s, power_scale) = match &self.prepared_quintic {
-            Some(p) => (p.traj.duration, p.power_scale),
-            None => (self.expected_duration_s, None),
-        };
+        let duration_s = self.prepared_quintic.traj.duration;
+        let power_scale = self.prepared_quintic.power_scale;
+        let approach_then = self.approach_leg.as_ref().map(|l| l.staged);
         let mut slot = PlanSlot::default();
         slot.set(Primitive::Action(StagedAction::Joint {
             child,
@@ -1457,7 +1646,7 @@ impl PreparedJointAction {
             max_velocity,
             power_scale,
             settle: self.settle,
-            approach_then: None,
+            approach_then,
         }));
         Ok(slot)
     }
@@ -1834,52 +2023,8 @@ pub fn prepare_saved_pose(
         target[g] = pose.positions[g];
     }
     let limits = snap.env.planning_limits(Some(speed_scale));
-    let zero_v = vec![0.0f32; cfg.dof];
-    // Plan quintic + power-fit + swept workspace OFF-LOCK.
-    let traj = TrajectoryPlanner::plan(
-        &snap.commanded_positions,
-        &snap.commanded_velocities,
-        &target,
-        &zero_v,
-        None,
-        &limits,
-    )?;
-    let (traj, power_scale) = fit_quintic_power_off_lock(
-        traj,
-        &snap.commanded_positions,
-        &snap.commanded_velocities,
-        &target,
-        &limits,
-        snap.env.power_budget.as_ref(),
-        &cfg.arm_model,
-    )?;
-    if let Some(ws) = snap.env.workspace_policy.as_ref() {
-        check_quintic_workspace_off_lock(
-            &traj,
-            &snap.commanded_positions,
-            ws,
-            &cfg.camera_mount,
-            &cfg.arm_model,
-            cfg.tcp_offset,
-        )?;
-    }
-    let base_duration = traj.duration;
-    let prepared_quintic = Some(PreparedQuintic {
-        start: snap.commanded_positions.clone(),
-        v0: snap.commanded_velocities.clone(),
-        target: target.clone(),
-        limits: limits.clone(),
-        workspace_revision: snap.env.workspace_revision,
-        tcp_offset: cfg.tcp_offset,
-        power: snap.env.power_budget.clone(),
-        checked_workspace: snap.env.workspace_policy.is_some(),
-        traj,
-        power_scale,
-    });
-    let use_same_side = !matches!(
-        snap.env.approach_plan("move_to_pose", approach),
-        Err(None)
-    );
+    let (prepared_quintic, approach_leg, approach_outcome, expected_duration_s) =
+        prepare_joint_motion_off_lock(snap, &target, &limits, "move_to_pose", approach)?;
     let mut stamp = snap.stamp;
     stamp.parent_generation = 0;
     stamp.sequences_revision = None;
@@ -1894,10 +2039,10 @@ pub fn prepare_saved_pose(
         limits,
         speed_scale,
         prepared_quintic,
-        approach_use: "move_to_pose",
-        same_side: use_same_side.then_some(approach),
+        approach_leg,
+        approach_outcome,
         tag,
-        expected_duration_s: base_duration,
+        expected_duration_s,
         settle: true,
     })
 }
@@ -2167,7 +2312,19 @@ fn prepare_move_common(
                 Err(Some(r)) => backlash::Pre::Direct((*r).to_string()),
                 Err(None) => backlash::Pre::Off,
             };
-            let expected_duration_s = direct.duration + 0.5;
+            let approach_ok = approach.ok();
+            let resolved = resolve_cartesian_legs_with_rules(
+                &input,
+                &snap.env.config.limits,
+                direct,
+                pre,
+                approach_ok.as_ref(),
+                None,
+                snap.env.config.active_tool.commissioning_required,
+                snap.owner.torque_or_power_hold,
+            )
+            .map_err(no_hint)?;
+            let expected_duration_s = resolved.expected_duration_s;
             Ok(PreparedMoveAction::Cartesian(PreparedCartesianAction {
                 kind: if relative {
                     PreparedActionKind::MoveRelativeLinear
@@ -2177,10 +2334,7 @@ fn prepare_move_common(
                 stamp,
                 start: snap.commanded_positions.clone(),
                 input,
-                direct,
-                pre,
-                approach_plan: approach.ok(),
-                rules: None,
+                resolved,
                 tag,
                 expected_duration_s,
             }))
@@ -2205,26 +2359,16 @@ fn prepare_move_common(
                 jsnap.arm_dof,
                 jsnap.gripper_index,
             );
-            let prepared_quintic = if same_side {
-                None
+            let approach_req = if same_side {
+                request
             } else {
-                crate::supervisor::prepare_quintic(&input, &jsnap, &q)
+                // Plain `move_to` (not `precise` and default profile request) never applies `move_to_precise`.
+                backlash::Request::Profile
             };
-            let expected_duration_s = prepared_quintic.as_ref().map_or_else(
-                || {
-                    let zeros = vec![0.0f32; snap.env.config.dof];
-                    TrajectoryPlanner::plan(
-                        &jsnap.start,
-                        &jsnap.v0,
-                        &target,
-                        &zeros,
-                        None,
-                        &jsnap.limits,
-                    )
-                    .map_or(1.0, |t| t.duration)
-                },
-                |p| p.traj.duration,
-            );
+            let approach_use = if same_side { "move_to_precise" } else { "" };
+            let (prepared_quintic, approach_leg, approach_outcome, expected_duration_s) =
+                prepare_joint_motion_off_lock(snap, &target, &jsnap.limits, approach_use, approach_req)
+                    .map_err(no_hint)?;
             Ok(PreparedMoveAction::Joint(PreparedJointAction {
                 kind: if relative {
                     PreparedActionKind::MoveRelativeJoint
@@ -2237,8 +2381,8 @@ fn prepare_move_common(
                 limits: jsnap.limits,
                 speed_scale,
                 prepared_quintic,
-                approach_use: "move_to_precise",
-                same_side: same_side.then_some(request),
+                approach_leg,
+                approach_outcome,
                 tag,
                 expected_duration_s,
                 settle: false,
@@ -2391,7 +2535,7 @@ pub fn prepare_child_replay_slot(
     Ok(slot)
 }
 
-fn fit_quintic_power_off_lock(
+pub(crate) fn fit_quintic_power_off_lock(
     traj: crate::trajectory::MultiJointQuinticTrajectory,
     start: &[f32],
     v0: &[f32],
@@ -2413,14 +2557,14 @@ fn fit_quintic_power_off_lock(
     )
 }
 
-fn check_quintic_workspace_off_lock(
+fn workspace_samples_and_check_off_lock(
     traj: &crate::trajectory::MultiJointQuinticTrajectory,
     start: &[f32],
     ws: &WorkspacePolicy,
     cam: &crate::model::CameraMount,
     arm: &crate::chain::ArmModel,
     tcp_offset: [f64; 3],
-) -> Result<(), ArmError> {
+) -> Result<Vec<Vec<f32>>, ArmError> {
     let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
     let at = |t: f64| traj.sample(t).positions;
     let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
@@ -2445,7 +2589,162 @@ fn check_quintic_workspace_off_lock(
         start,
         samples.iter().map(Vec::as_slice),
     )?;
-    Ok(())
+    Ok(samples)
+}
+
+fn check_quintic_workspace_off_lock(
+    traj: &crate::trajectory::MultiJointQuinticTrajectory,
+    start: &[f32],
+    ws: &WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    arm: &crate::chain::ArmModel,
+    tcp_offset: [f64; 3],
+) -> Result<(), ArmError> {
+    workspace_samples_and_check_off_lock(traj, start, ws, cam, arm, tcp_offset).map(|_| ())
+}
+
+fn build_prepared_quintic_off_lock(
+    snap: &ActionSnapshot,
+    target: &[f32],
+    limits: &[JointLimit],
+) -> Result<PreparedQuintic, ArmError> {
+    let cfg = &snap.env.config;
+    for (p, l) in target.iter().zip(&cfg.limits) {
+        if !p.is_finite() {
+            return Err(SafetyError::InvalidValue.into());
+        }
+        if *p < l.min_position || *p > l.max_position {
+            return Err(SafetyError::SoftLimitExceeded {
+                joint: l.name.clone(),
+                value: *p,
+                min: l.min_position,
+                max: l.max_position,
+            }
+            .into());
+        }
+    }
+    let zero_v = vec![0.0f32; cfg.dof];
+    let traj = TrajectoryPlanner::plan(
+        &snap.commanded_positions,
+        &snap.commanded_velocities,
+        target,
+        &zero_v,
+        None,
+        limits,
+    )?;
+    let (traj, power_scale) = fit_quintic_power_off_lock(
+        traj,
+        &snap.commanded_positions,
+        &snap.commanded_velocities,
+        target,
+        limits,
+        snap.env.power_budget.as_ref(),
+        &cfg.arm_model,
+    )?;
+    if let Some(ws) = snap.env.workspace_policy.as_ref() {
+        check_quintic_workspace_off_lock(
+            &traj,
+            &snap.commanded_positions,
+            ws,
+            &cfg.camera_mount,
+            &cfg.arm_model,
+            cfg.tcp_offset,
+        )?;
+    }
+    Ok(PreparedQuintic {
+        start: snap.commanded_positions.clone(),
+        v0: snap.commanded_velocities.clone(),
+        target: target.to_vec(),
+        limits: limits.to_vec(),
+        workspace_revision: snap.env.workspace_revision,
+        tcp_offset: cfg.tcp_offset,
+        power: snap.env.power_budget.clone(),
+        checked_workspace: snap.env.workspace_policy.is_some(),
+        traj,
+        power_scale,
+    })
+}
+
+/// **Single off-thread joint motion planner** (shared by `move_to_pose` and `move_to`/`move_relative`
+/// `path: "joint"` across BOTH Legacy and RT Executor owners): resolves and validates both legs
+/// when same-side backlash approach applies, or falls back cleanly to a validated direct quintic.
+#[allow(clippy::type_complexity)]
+fn prepare_joint_motion_off_lock(
+    snap: &ActionSnapshot,
+    target: &[f32],
+    limits: &[JointLimit],
+    approach_use: &str,
+    request: backlash::Request,
+) -> Result<(PreparedQuintic, Option<PreparedApproachLeg>, Option<backlash::Outcome>, f64), ArmError> {
+    let cfg = &snap.env.config;
+    let approach_plan = if approach_use.is_empty() {
+        Err(None)
+    } else {
+        snap.env.approach_plan(approach_use, request)
+    };
+    let direct_fallback = |reason: Option<String>| -> Result<_, ArmError> {
+        let pq = build_prepared_quintic_off_lock(snap, target, limits)?;
+        let dur = pq.traj.duration;
+        Ok((pq, None, reason.map(backlash::Outcome::direct), dur))
+    };
+    let plan = match approach_plan {
+        Ok(p) => p,
+        Err(None) => return direct_fallback(None),
+        Err(Some(r)) => return direct_fallback(Some(r.to_string())),
+    };
+    if snap.owner.torque_or_power_hold {
+        return direct_fallback(Some("segment: a torque or power hold is in force".into()));
+    }
+    let delta = plan.policy.delta_rad();
+    let (pre, signs) = match backlash::pre_target(target, &plan.joints, delta, &cfg.limits) {
+        Ok(x) => x,
+        Err(r) => return direct_fallback(Some(format!("pre_target: {r}"))),
+    };
+    let mut seg_limits = plan.seg_limits.clone();
+    for (seg, lim) in seg_limits.iter_mut().zip(limits) {
+        seg.max_velocity = seg.max_velocity.min(lim.max_velocity);
+    }
+    let (seg, seg_scale, _) = match validate_approach_segment_off_lock(
+        &pre,
+        target,
+        &seg_limits,
+        &cfg.limits,
+        snap.env.workspace_policy.as_ref(),
+        &cfg.camera_mount,
+        &cfg.arm_model,
+        cfg.tcp_offset,
+        snap.env.power_budget.as_ref(),
+        cfg.active_tool.commissioning_required,
+        None,
+    ) {
+        Ok(x) => x,
+        Err(r) => return direct_fallback(Some(r)),
+    };
+    let leg1 = match build_prepared_quintic_off_lock(snap, &pre, limits) {
+        Ok(pq) => pq,
+        Err(e) => return direct_fallback(Some(format!("pre_target: {}", arm_err_code_str(e)))),
+    };
+    let dof = target.len();
+    let mut target_arr = [0.0f32; MAX_DOF];
+    target_arr[..dof].copy_from_slice(target);
+    let staged = StagedQuinticLeg {
+        target: target_arr,
+        duration_s: seg.duration,
+        power_scale: seg_scale,
+    };
+    let total_dur = leg1.traj.duration + seg.duration;
+    let outcome = backlash::Outcome::same_side(&signs, plan.arm_dof, Vec::new());
+    Ok((
+        leg1,
+        Some(PreparedApproachLeg {
+            seg,
+            target: target.to_vec(),
+            power_scale: seg_scale,
+            staged,
+        }),
+        Some(outcome),
+        total_dur,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2471,13 +2770,16 @@ pub fn install_move_cartesian(
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
-            SupervisorInner::install_path_same_side_with_rules(
+            let approach_seg = prep
+                .resolved
+                .approach_leg
+                .map(|l| (l.seg, l.target, l.power_scale));
+            SupervisorInner::install_resolved_path(
                 admitted,
                 &prep.input,
-                prep.direct,
-                prep.pre,
-                prep.approach_plan.as_ref(),
-                prep.rules.as_ref(),
+                prep.resolved.path,
+                approach_seg,
+                prep.resolved.outcome.as_ref(),
                 prep.kind.action_kind_str(),
                 prep.tag,
             )
@@ -2653,28 +2955,41 @@ pub fn install_move_joint(
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
             let (this, proof) = admitted.consume()?;
-            let (_, id, duration) = match prep.same_side {
-                Some(req) => this.start_quintic_same_side(
-                    &proof,
-                    prep.target,
-                    Some(stamp.admission.estop_epoch),
-                    prep.kind.action_kind_str(),
-                    prep.tag,
-                    &prep.limits,
-                    prep.approach_use,
-                    req,
-                )?,
-                None => this.start_quintic_prepared(
-                    &proof,
-                    prep.target,
-                    None,
-                    Some(stamp.admission.estop_epoch),
-                    prep.kind.action_kind_str(),
-                    prep.tag,
-                    &prep.limits,
-                    prep.prepared_quintic,
-                )?,
+            let leg1_target = prep.prepared_quintic.target.clone();
+            let (_, id, d1) = this.start_quintic_prepared(
+                &proof,
+                leg1_target,
+                None,
+                Some(stamp.admission.estop_epoch),
+                prep.kind.action_kind_str(),
+                prep.tag,
+                &prep.limits,
+                Some(prep.prepared_quintic),
+            )?;
+            let duration = if let Some(leg) = prep.approach_leg {
+                let d2 = leg.seg.duration;
+                if let Some(active) = this.active_trajectory.take() {
+                    let mut wrapped =
+                        ActiveTrajectory::with_approach(active.action_id, active.reference, leg.seg);
+                    wrapped.motion_limits = active.motion_limits;
+                    this.active_trajectory = Some(wrapped);
+                }
+                this.target_positions = leg.target;
+                if let Some(s) = leg.power_scale {
+                    this.note_action_power_scale(id, s);
+                }
+                if let Some(a) = this.last_action.as_mut().filter(|a| a.id == id) {
+                    a.phase = Some(HolderLabel::new("move"));
+                }
+                d1 + d2
+            } else {
+                d1
             };
+            if let Some(outcome) = prep.approach_outcome {
+                if let Some(a) = this.last_action.as_mut().filter(|a| a.id == id) {
+                    outcome.apply(a);
+                }
+            }
             Ok((id, duration))
         }
         JointInstallPayload::Rt {
@@ -3307,15 +3622,12 @@ fn install_begin_macro_committed(
 pub enum MacroChildPayload {
     /// RT broker pinned slot (`StagedAction::{Cartesian, Joint, Gripper, Replay}`).
     Slot(PlanSlotRef<PlanSlot>),
-    /// Legacy prepared Cartesian child (optional same-side approach + table clearance rules).
+    /// Legacy prepared Cartesian child (off-thread resolved path + optional same-side leg).
     LegacyCartesian {
         spec: ChildSpec,
         start: Vec<f32>,
         input: PlanInput,
-        direct: JointPath,
-        pre: backlash::Pre,
-        approach_plan: Option<backlash::Plan>,
-        rules: Option<backlash::DescentRules>,
+        resolved: ResolvedCartesianLegs,
     },
     /// Legacy prepared joint-quintic child (`sequence` pose step / `measure_multiview`).
     LegacyJoint {
@@ -3383,10 +3695,7 @@ pub fn install_macro_child(
             spec,
             start,
             input,
-            direct,
-            pre,
-            approach_plan,
-            rules,
+            resolved,
         } => {
             let parent_id = precheck_macro_child(inner, stamp, ctx, &spec, &start)
                 .map_err(|r| r.into_arm_error(inner))?;
@@ -3398,14 +3707,16 @@ pub fn install_macro_child(
                     return Err(r.into_arm_error(inner));
                 }
             };
-            let dur = match SupervisorInner::install_macro_path_same_side_with_rules(
+            let approach_seg = resolved
+                .approach_leg
+                .map(|l| (l.seg, l.target, l.power_scale));
+            let dur = match SupervisorInner::install_resolved_macro_path(
                 admitted,
                 parent_id,
                 &input,
-                direct,
-                pre,
-                approach_plan.as_ref(),
-                rules.as_ref(),
+                resolved.path,
+                approach_seg,
+                resolved.outcome.as_ref(),
             ) {
                 Ok(d) => d,
                 Err(e) => {

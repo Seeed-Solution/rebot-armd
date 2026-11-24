@@ -107,6 +107,7 @@ pub struct PublishedOwnerMeta {
     pub gravity_comp_active: bool,
     pub policy_busy: bool,
     pub zero_check_persisting: bool,
+    pub torque_or_power_hold: bool,
     pub held: Option<PublishedHeld>,
     pub macro_state: PublishedMacroState,
 }
@@ -136,6 +137,7 @@ impl Default for PublishedOwnerMeta {
             gravity_comp_active: false,
             policy_busy: false,
             zero_check_persisting: false,
+            torque_or_power_hold: false,
             held: None,
             macro_state: PublishedMacroState::default(),
         }
