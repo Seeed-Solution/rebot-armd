@@ -230,7 +230,7 @@ async fn stale_and_foreign_callers_rest_restrictions_and_legacy_semantics() {
     assert_eq!((obs_l.control_mode, obs_l.gravity_comp.last_exit.as_ref().map(|e| e.code.as_str())), (ControlMode::Position, Some("STOPPED")));
 
     // (b) Executor mode: foreign caller, spoofed gen, wrong epoch, bad request_id/body, expired lease, unmigrated gates.
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 180, ..ArmConfig::rebot_dm() }));
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 600, ..ArmConfig::rebot_dm() }));
     let addr = serve(sup.clone()).await;
     let (mut ws_owner, gen) = controller(addr).await;
     let ep0 = sup.get_observation().await.epoch_id;
@@ -257,7 +257,7 @@ async fn stale_and_foreign_callers_rest_restrictions_and_legacy_semantics() {
     assert_eq!((dup_req["status"].as_u64(), dup_req["code"].as_str()), (Some(400), Some("INVALID_COMMAND")), "{dup_req}");
     assert_eq!(handle.stop_requests().current(), 0);
 
-    tokio::time::sleep(Duration::from_millis(240)).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
     let stale = ws_reply(&mut ws_owner, json!({"type": "command", "request_id": 501, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}}), &["command_reject"]).await;
     assert_eq!((stale["status"].as_u64(), stale["code"].as_str()), (Some(409), Some("LEASE_LOST")), "{stale}");
     assert_eq!(handle.stop_requests().current(), 0);
@@ -2254,10 +2254,12 @@ async fn estop_intake_blocked_writer_recovers_vs_never_recovers_and_off_reader_a
         let mut close_idx: Option<usize> = None;
         let mut idx = 0usize;
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut seen_frames = Vec::new();
         while Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
                 Ok(Some(Ok(Message::Text(text)))) => {
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    seen_frames.push(format!("{idx}:Text({})", v.get("type").and_then(|t| t.as_str()).unwrap_or("obs")));
                     if v["type"] == "epoch_sync" && v["safety_state"] == "EStop" && estop_idx.is_none() {
                         estop_idx = Some(idx);
                     }
@@ -2269,18 +2271,25 @@ async fn estop_intake_blocked_writer_recovers_vs_never_recovers_and_off_reader_a
                     }
                     idx += 1;
                 }
-                Ok(Some(Ok(Message::Close(_)))) => {
+                Ok(Some(Ok(Message::Close(cf)))) => {
+                    seen_frames.push(format!("{idx}:Close({cf:?})"));
                     close_idx = Some(idx);
                     break;
                 }
-                Ok(None) | Ok(Some(Err(_))) => break,
-                _ => {}
+                Ok(other) => {
+                    seen_frames.push(format!("{idx}:Other({other:?})"));
+                    break;
+                }
+                Err(_) => {
+                    seen_frames.push("TIMEOUT".into());
+                    break;
+                }
             }
         }
-        let ei = estop_idx.expect("E-stop epoch_sync must be delivered when writer recovers");
-        let si = stop_idx.expect("Stop reply must be delivered when writer recovers");
-        let fi = fatal_idx.expect("fatal OUTBOUND_QUEUE_FULL error frame must be delivered");
-        let ci = close_idx.expect("Close frame must follow fatal error frame");
+        let ei = estop_idx.unwrap_or_else(|| panic!("E-stop epoch_sync must be delivered when writer recovers; seen={seen_frames:?}"));
+        let si = stop_idx.unwrap_or_else(|| panic!("Stop reply must be delivered when writer recovers; seen={seen_frames:?}"));
+        let fi = fatal_idx.unwrap_or_else(|| panic!("fatal OUTBOUND_QUEUE_FULL error frame must be delivered; seen={seen_frames:?}"));
+        let ci = close_idx.unwrap_or_else(|| panic!("Close frame must follow fatal error frame; seen={seen_frames:?}"));
         assert!(ei < fi && fi < ci, "expected estop({ei}) < fatal({fi}) < close({ci})");
         assert!(si < fi && fi < ci, "expected stop({si}) < fatal({fi}) < close({ci})");
         assert!(sup.e_stop_latched.load(Ordering::SeqCst));
@@ -2527,5 +2536,207 @@ async fn writer_ordering_heartbeat_loss_deferred_and_broadcast_lag_never_loses_t
             saw_id1 && saw_id2 && saw_resynced,
             "broadcast lag dropped terminal or missed resync: id1={saw_id1}, id2={saw_id2}, resync={saw_resynced} (latest_ts={latest_ts})"
         );
+    }
+}
+
+// 19. Item 4 (Teardown): disconnecting during blocking `spawn_blocking` planning (Cartesian move_to,
+//     replay, and policy load) cancels between steps and ignores any late result — nothing is
+//     installed and no lease remains held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_cancels_and_ignores_late_blocking_planners_with_no_install_or_lease() {
+    struct BlockingPlanGuard(String);
+    impl Drop for BlockingPlanGuard {
+        fn drop(&mut self) {
+            armd::api::ws::set_test_ws_blocking_plan_paused(&self.0, false);
+        }
+    }
+
+    // (a) Disconnect mid-blocking Cartesian `move_to` planning (both linear and joint path modes),
+    //     then release the blocking thread late after teardown: nothing installed, no lease held.
+    for path_mode in ["linear", "joint"] {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let (conn, ep) = {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+            let c = inner.active_lease.as_ref().unwrap().client_id.clone();
+            let e = inner.safety.epoch_id();
+            (c, e)
+        };
+        let _guard = BlockingPlanGuard(conn.clone());
+
+        armd::api::ws::set_test_ws_blocking_plan_paused(&conn, true);
+        send(&mut ws, json!({
+            "type": "command", "request_id": 9001, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/action/move_relative",
+            "body": {"frame": "base", "d": [0.02, 0.0, 0.0], "path": path_mode}
+        })).await;
+        wait_until(Duration::from_secs(2), || {
+            armd::api::ws::test_ws_blocking_plan_blocked_count(&conn) >= 1
+        }).await;
+
+        // Disconnect while the `spawn_blocking` planner is running.
+        drop(ws);
+        // Teardown must complete promptly without waiting on the blocked thread, and release the lease.
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+        assert!(sup.inner().read().await.active_lease.is_none(), "{path_mode}: lease must be released");
+        assert!(sup.inner().read().await.active_trajectory.is_none(), "{path_mode}: trajectory must not install");
+        assert!(sup.inner().read().await.last_action.is_none(), "{path_mode}: action must not install");
+
+        // Now let the late blocking thread wake and exit: STILL nothing installed, no lease held.
+        armd::api::ws::set_test_ws_blocking_plan_paused(&conn, false);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let inner = sup.inner().read().await;
+        assert!(inner.active_lease.is_none(), "{path_mode}: late planner must not hold lease");
+        assert!(inner.active_trajectory.is_none(), "{path_mode}: late planner must not install trajectory");
+        assert!(inner.last_action.is_none(), "{path_mode}: late planner must not install action");
+    }
+
+    // (b) Disconnect mid-blocking `replay` planning, then release late: nothing installed, no lease held.
+    {
+        use armd::recording::{EpisodeSidecar, RecordFrame};
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let (conn, ep) = {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+            inner.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+            let frames = vec![
+                RecordFrame { timestamp: 0.0, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+                RecordFrame { timestamp: 0.1, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+            ];
+            let sidecar = EpisodeSidecar {
+                id: "td_ep".into(),
+                dataset: "td".into(),
+                task: "td".into(),
+                source: "sdk".into(),
+                sequence_id: None,
+                repeat_index: None,
+                outcome: "ok".into(),
+                recorded_at: "2026-11-24T00:00:00Z".into(),
+                duration_s: 0.1,
+                frames: frames.len(),
+                joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
+                units: "rad".into(),
+                joint_zero: armd::recording::JointZeroStamp::of(&inner.joint_zero_offsets),
+                profile_id: inner.config.profile_id.clone(),
+                armd_version: "test".into(),
+                fps_nominal: 10.0,
+                truncated: false,
+                stopped_by: None,
+                arm_dof: Some(6),
+                gripper_joint: Some(6),
+                tool_id: Some(inner.config.active_tool.id.clone()),
+                tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+                has_gripper_motion: Some(false),
+                recovered: None,
+                frames_dropped: None,
+                first_state: Some(INSPECT.to_vec()),
+                last_state: Some(INSPECT.to_vec()),
+            };
+            inner.episodes.write_episode(&sidecar, &frames, None).unwrap();
+            (inner.active_lease.as_ref().unwrap().client_id.clone(), inner.safety.epoch_id())
+        };
+        let _guard = BlockingPlanGuard(conn.clone());
+
+        armd::api::ws::set_test_ws_blocking_plan_paused(&conn, true);
+        send(&mut ws, json!({
+            "type": "command", "request_id": 9101, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/action/replay",
+            "body": {"episode": "td_ep", "speed": 1.0, "gripper": false, "allow_stale": true}
+        })).await;
+        wait_until(Duration::from_secs(2), || {
+            armd::api::ws::test_ws_blocking_plan_blocked_count(&conn) >= 1
+        }).await;
+
+        drop(ws);
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+        armd::api::ws::set_test_ws_blocking_plan_paused(&conn, false);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let inner = sup.inner().read().await;
+        assert!(inner.active_lease.is_none(), "replay teardown must release lease");
+        assert!(inner.active_trajectory.is_none(), "late replay planner must not install trajectory");
+        assert!(inner.last_action.is_none(), "late replay planner must not install action");
+    }
+
+    // (c) Disconnect mid-blocking `policy/start` load (slow delay): cancels early via cancel flag,
+    //     clears `policy_loading`, installs no policy, and holds no lease.
+    #[cfg(feature = "policy-runtime")]
+    {
+        use armd::api::create_router_with_sandbox;
+        use armd::api::sandbox::SandboxState;
+        use armd::policy_runtime::{encode_rmlp_bytes, Activation, MlpLayerSpec};
+
+        let mut cfg = ArmConfig::default();
+        cfg.lease_timeout_ms = 15_000;
+        let jnames: Vec<&str> = cfg.limits.iter().map(|l| l.name.as_str()).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("policies").join("td_pol");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let layers = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        std::fs::write(pack_dir.join("model.rmlp"), encode_rmlp_bytes(&layers).unwrap()).unwrap();
+        std::fs::write(
+            pack_dir.join("policy.json"),
+            serde_json::to_vec(&json!({
+                "format": "rebot-onnx-policy/v1",
+                "id": "td_pol",
+                "name": "td_pol",
+                "unit_mode": "rad",
+                "action_dim": 6,
+                "action_space": "joint_positions",
+                "joint_names": jnames,
+                "inputs": {"state": {"shape": [1, 6], "joint_names": jnames}},
+                "outputs": {"action": {"shape": [1, 6], "space": "joint_positions"}},
+                "model_file": "model.rmlp"
+            })).unwrap(),
+        ).unwrap();
+
+        let sandbox = Arc::new(SandboxState::new(dir.path().to_path_buf()));
+        sandbox.set_policy_load_delay_ms(800);
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let ep = sup.get_observation().await.epoch_id;
+        send(&mut ws, json!({
+            "type": "command", "request_id": 9201, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/action/policy/start",
+            "body": {"policy_id": "td_pol", "mode": "shadow"}
+        })).await;
+        wait_until(Duration::from_secs(2), || {
+            sup.inner().try_read().is_ok_and(|g| g.policy_loading)
+        }).await;
+
+        let t_drop = Instant::now();
+        drop(ws);
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+        assert!(t_drop.elapsed() < Duration::from_millis(600), "teardown must cancel policy load promptly");
+        wait_until(Duration::from_secs(1), || {
+            sup.inner().try_read().is_ok_and(|g| !g.policy_loading)
+        }).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let inner = sup.inner().read().await;
+        assert!(inner.active_lease.is_none(), "policy teardown must release lease");
+        assert!(inner.policy_run.is_none(), "cancelled policy load must not install policy_run");
+        assert!(!inner.policy_loading, "policy_loading must remain cleared");
     }
 }

@@ -63,6 +63,71 @@ static TEST_WS_WORKER_BEFORE_LOCK_CONNS: LazyLock<Mutex<HashMap<String, usize>>>
 static TEST_WS_WORKER_BEFORE_LOCK_UNPAUSE: LazyLock<tokio::sync::Notify> =
     LazyLock::new(tokio::sync::Notify::new);
 
+static TEST_WS_BLOCKING_PLAN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TEST_WS_BLOCKING_PLAN_STATE: LazyLock<(Mutex<HashMap<String, usize>>, std::sync::Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashMap::new()), std::sync::Condvar::new()));
+
+/// Test hook: pause or unpause `spawn_blocking` planners for a specific connection ID so tests
+/// can disconnect deterministically mid-planning and then release a late blocking result.
+pub fn set_test_ws_blocking_plan_paused(connection_id: &str, paused: bool) {
+    let (lock, cvar) = &*TEST_WS_BLOCKING_PLAN_STATE;
+    {
+        let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if paused {
+            map.entry(connection_id.to_owned()).or_insert(0);
+        } else {
+            map.remove(connection_id);
+        }
+        TEST_WS_BLOCKING_PLAN_ACTIVE.store(!map.is_empty(), Ordering::Release);
+    }
+    if !paused {
+        cvar.notify_all();
+    }
+}
+
+/// Test hook: number of `spawn_blocking` planner threads currently paused for `connection_id`.
+pub fn test_ws_blocking_plan_blocked_count(connection_id: &str) -> usize {
+    TEST_WS_BLOCKING_PLAN_STATE
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(connection_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn maybe_pause_blocking_plan(connection_id: &str) {
+    if !TEST_WS_BLOCKING_PLAN_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let (lock, cvar) = &*TEST_WS_BLOCKING_PLAN_STATE;
+    let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !map.contains_key(connection_id) {
+        return;
+    }
+    if let Some(c) = map.get_mut(connection_id) {
+        *c += 1;
+    }
+    while map.contains_key(connection_id) {
+        map = cvar.wait(map).unwrap_or_else(|e| e.into_inner());
+    }
+    if let Some(c) = map.get_mut(connection_id) {
+        *c = c.saturating_sub(1);
+    }
+}
+
+fn sleep_cancellable_ms(delay_ms: u64, cancel: &AtomicBool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(delay_ms);
+    while std::time::Instant::now() < deadline {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(rem.min(Duration::from_millis(5)));
+    }
+    !cancel.load(Ordering::Acquire)
+}
+
 /// Test hook: pause or unpause the ordinary worker right after popping a frame and before
 /// acquiring `supervisor.inner().write()` for a specific connection ID.
 pub fn set_test_ws_worker_before_lock_paused(connection_id: &str, paused: bool) {
@@ -681,7 +746,12 @@ async fn send_best_effort_close(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     frame: CloseFrame,
 ) {
-    let _ = tokio::time::timeout(Duration::from_millis(50), sender.send(Message::Close(Some(frame)))).await;
+    let _ = tokio::time::timeout(Duration::from_millis(50), async {
+        let _ = sender.send(Message::Close(Some(frame))).await;
+        let _ = sender.flush().await;
+        let _ = sender.close().await;
+    })
+    .await;
 }
 
 async fn send_timeout_close(
@@ -833,6 +903,11 @@ async fn flush_urgent_then_fatal_and_close(
                 .await
                 .is_ok()
         {
+            let _ = tokio::time::timeout(Duration::from_millis(50), async {
+                let _ = sender.flush().await;
+                let _ = sender.close().await;
+            })
+            .await;
             return;
         }
     }
@@ -1981,6 +2056,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
 
+            // When fatal close is already in progress, keep draining inbound bytes so closing the
+            // TCP fd does not emit RST over unread flood traffic; still latch urgent E-stop.
+            if reader_writer.is_fatal() && kind != "estop" && kind != "e_stop" {
+                continue;
+            }
+
             // `auth` is classified in O(1) on the reader and verified off-reader by `auth_task`
             // so `OperatorAuth::sessions` table scans never stall urgent E-stop/Stop intake.
             if kind == "auth" {
@@ -1988,7 +2069,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         reader_writer.trigger_fatal(FatalClose::outbound_queue_full());
-                        break;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
@@ -2216,7 +2296,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             if let Err(value) = reader_ordinary_queue.try_push(value, stamp) {
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
                 if let Some(reply) = backlog_full_reject(kind, &value) {
-                    if !reader_writer.try_send_ordinary_control(reply) {
+                    if !reader_writer.try_send_ordinary_control(reply) && !reader_writer.is_fatal() {
                         break;
                     }
                 }
@@ -2309,11 +2389,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
                         r
                     };
-                    let reply = if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
+                    let reply = if worker_closing.load(Ordering::SeqCst) {
+                        break;
+                    } else if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
                         owner_transferred()
                     } else {
                         let mut inner = recv_supervisor.inner().write().await;
-                        if inner.detached {
+                        if worker_closing.load(Ordering::SeqCst) {
+                            drop(inner);
+                            break;
+                        } else if inner.detached {
                             drop(inner);
                             owner_transferred()
                         } else if let Err(err) = inner.check_admission_stamp(stamp) {
@@ -2736,7 +2821,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
 
                 // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
-                // so the control tick is never blocked by it; install re-checks everything.
+                // so the control tick is never blocked by it; cancellable between steps and
+                // late results after teardown are ignored before installing anything.
                 if let Some((plan, generation)) = pending_plan.take() {
                     let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach, joint, seeds } = plan;
                     if let Some(joint) = joint {
@@ -2745,15 +2831,33 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         // ... and the quintic's plan, power fit and swept-workspace check, which
                         // the install reuses when the arm and the workspace did not change
                         let JointGoal { speed_scale, same_side, snapshot } = joint;
+                        let cancel = worker_closing.clone();
+                        let plan_conn = recv_connection.clone();
                         let solved = tokio::task::spawn_blocking(move || {
+                            maybe_pause_blocking_plan(&plan_conn);
+                            if cancel.load(Ordering::Acquire) {
+                                return None;
+                            }
                             let q = motion::solve_goal_joints(&input, &goal, opts, &seeds);
+                            if cancel.load(Ordering::Acquire) {
+                                return None;
+                            }
                             let prepared = match (&q, same_side) {
                                 (Ok(q), None) => crate::supervisor::prepare_quintic(&input, &snapshot, q),
                                 _ => None,
                             };
-                            (input, q.map(|q| (q, prepared)))
+                            if cancel.load(Ordering::Acquire) {
+                                return None;
+                            }
+                            Some((input, q.map(|q| (q, prepared))))
                         }).await;
+                        if worker_closing.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let mut inner = recv_supervisor.inner().write().await;
+                        if worker_closing.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if inner.detached {
                             let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
                             if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
@@ -2763,10 +2867,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if let Err(err) = inner.check_admission_stamp(stamp) {
                                 response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
                             } else {
-                                response = Some(match solved {
-                                    Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                                    Ok((_, Err(error))) => command_reject(&inner, &request_id, ArmError::from(error).into()),
-                                    Ok((input, Ok((q, prepared)))) => {
+                                response = match solved {
+                                    Ok(None) => None,
+                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
+                                    Ok(Some((_, Err(error)))) => Some(command_reject(&inner, &request_id, ArmError::from(error).into())),
+                                    Ok(Some((input, Ok((q, prepared))))) => Some(
                                         if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                             json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                                         } else {
@@ -2775,26 +2880,47 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                 Err(error) => command_reject(&inner, &request_id, error.into()),
                                             }
                                         }
-                                    }
-                                });
+                                    ),
+                                };
                             }
                         }
                     } else {
+                        let cancel = worker_closing.clone();
+                        let plan_conn = recv_connection.clone();
                         let planned = tokio::task::spawn_blocking(move || {
+                            maybe_pause_blocking_plan(&plan_conn);
+                            if cancel.load(Ordering::Acquire) {
+                                return None;
+                            }
                             let result = motion::plan_cartesian_opts(&input, goal, speed, opts);
+                            if cancel.load(Ordering::Acquire) {
+                                return None;
+                            }
                             let pre = match (&approach, &result) {
                                 (Ok(plan), Ok(direct)) => crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, opts),
                                 (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
                                 _ => crate::backlash::Pre::Off,
                             };
+                            if cancel.load(Ordering::Acquire) {
+                                return None;
+                            }
                             // a branch flip: would the joint-space move reach the goal (hint)?
                             let joint_goal = match &result {
                                 Err(motion::MotionError::IkBranchFlip { .. }) => motion::solve_goal_joints(&input, &goal, opts, &seeds).ok(),
                                 _ => None,
                             };
-                            (input, result.map(|path| (path, pre, approach.ok())).map_err(|e| (e, joint_goal)))
+                            if cancel.load(Ordering::Acquire) {
+                                return None;
+                            }
+                            Some((input, result.map(|path| (path, pre, approach.ok())).map_err(|e| (e, joint_goal))))
                         }).await;
+                        if worker_closing.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let mut inner = recv_supervisor.inner().write().await;
+                        if worker_closing.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if inner.detached {
                             let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
                             if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
@@ -2804,14 +2930,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if let Err(err) = inner.check_admission_stamp(stamp) {
                                 response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
                             } else {
-                                response = Some(match planned {
-                                    Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                                    Ok((_, Err((error, joint_goal)))) => {
+                                response = match planned {
+                                    Ok(None) => None,
+                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
+                                    Ok(Some((_, Err((error, joint_goal))))) => {
                                         let mut api: ApiError = ArmError::from(error).into();
                                         if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(motion::JOINT_PATH_HINT); }
-                                        command_reject(&inner, &request_id, api)
+                                        Some(command_reject(&inner, &request_id, api))
                                     }
-                                    Ok((input, Ok((path, pre, approach)))) => {
+                                    Ok(Some((input, Ok((path, pre, approach))))) => Some(
                                         if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                             json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                                         } else {
@@ -2820,8 +2947,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                 Err(error) => command_reject(&inner, &request_id, error.into()),
                                             }
                                         }
-                                    }
-                                });
+                                    ),
+                                };
                             }
                         }
                     }
@@ -2833,16 +2960,37 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // (lease re-check, then begin), while later ordinary commands stay in the bounded queue.
                 if let Some((request_id, pending, generation)) = pending_macro.take() {
                     let source = recv_deps.source.clone();
+                    let cancel = worker_closing.clone();
+                    let plan_conn = recv_connection.clone();
                     let (res_tx, res_rx) = tokio::sync::oneshot::channel();
                     let abort = worker_tasks.spawn_abortable(async move {
                         let planned_res = async {
-                            let mut planned = tokio::task::spawn_blocking(move || pending.plan()).await
+                            let cancel_blk = cancel.clone();
+                            let mut planned = tokio::task::spawn_blocking(move || {
+                                maybe_pause_blocking_plan(&plan_conn);
+                                if cancel_blk.load(Ordering::Acquire) {
+                                    return Err(ArmError::Safety(SafetyError::Stopped));
+                                }
+                                let out = pending.plan()?;
+                                if cancel_blk.load(Ordering::Acquire) {
+                                    return Err(ArmError::Safety(SafetyError::Stopped));
+                                }
+                                Ok(out)
+                            }).await
                                 .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(ArmError::Safety(SafetyError::Stopped));
+                            }
                             // grasp task requirements: checked without the lock, before the action begins
                             if let PlannedMacro::Grasp(g) = &mut planned { crate::grasp::preflight(source.as_ref(), g).await?; }
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(ArmError::Safety(SafetyError::Stopped));
+                            }
                             Ok(planned)
                         }.await;
-                        let _ = res_tx.send(planned_res);
+                        if !cancel.load(Ordering::Acquire) {
+                            let _ = res_tx.send(planned_res);
+                        }
                     });
                     macro_check = Some(MacroCheck {
                         request_id,
@@ -2852,10 +3000,29 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         rx: res_rx,
                     });
                 }
-                // Replay: the episode is read and checked without the lock; install re-checks.
+                // Replay: the episode is read and checked without the lock; cancellable and late
+                // results after teardown are ignored before installing anything.
                 if let Some((request_id, input, generation)) = pending_replay.take() {
-                    let planned = tokio::task::spawn_blocking(move || crate::replay::plan(input)).await;
+                    let cancel = worker_closing.clone();
+                    let plan_conn = recv_connection.clone();
+                    let planned = tokio::task::spawn_blocking(move || {
+                        maybe_pause_blocking_plan(&plan_conn);
+                        if cancel.load(Ordering::Acquire) {
+                            return None;
+                        }
+                        let out = crate::replay::plan(input);
+                        if cancel.load(Ordering::Acquire) {
+                            return None;
+                        }
+                        Some(out)
+                    }).await;
+                    if worker_closing.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let mut inner = recv_supervisor.inner().write().await;
+                    if worker_closing.load(Ordering::SeqCst) {
+                        break;
+                    }
                     if inner.detached {
                         let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while checking replay"});
                         if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
@@ -2863,10 +3030,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     } else if let Err(err) = inner.check_admission_stamp(stamp) {
                         response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
                     } else {
-                        response = Some(match planned {
-                            Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("replay check task failed: {e}")).into()),
-                            Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
-                            Ok(Ok(plan)) => {
+                        response = match planned {
+                            Ok(None) => None,
+                            Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("replay check task failed: {e}")).into())),
+                            Ok(Some(Err(error))) => Some(command_reject(&inner, &request_id, error.into())),
+                            Ok(Some(Ok(plan))) => Some(
                                 if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                                 } else {
@@ -2875,8 +3043,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         Err(error) => command_reject(&inner, &request_id, error.into()),
                                     }
                                 }
-                            }
-                        });
+                            ),
+                        };
                     }
                 }
                 #[cfg(feature = "policy-runtime")]
@@ -2927,10 +3095,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             None
                         };
                         let sandbox_load = sandbox_c.clone();
+                        let cancel_policy = ws_closed_c.clone();
+                        let plan_conn = conn.clone();
                         let prepared = tokio::task::spawn_blocking(move || {
+                            maybe_pause_blocking_plan(&plan_conn);
                             let delay_ms = sandbox_load.policy_load_delay_ms();
-                            if delay_ms > 0 {
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            if delay_ms > 0 && !sleep_cancellable_ms(delay_ms, &cancel_policy) {
+                                return Err(ArmError::Safety(SafetyError::Stopped));
+                            }
+                            if cancel_policy.load(Ordering::Acquire) {
+                                return Err(ArmError::Safety(SafetyError::Stopped));
                             }
                             let dir = sandbox_load.policy_dir(&policy_id_load).ok_or_else(|| ArmError::Rejected {
                                 status: 404,
@@ -2938,6 +3112,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 message: format!("Policy pack '{policy_id_load}' not found"),
                             })?;
                             let mut prepared_policy = crate::policy_runtime::prepare_policy(&dir, &config).map_err(ArmError::from)?;
+                            if cancel_policy.load(Ordering::Acquire) {
+                                return Err(ArmError::Safety(SafetyError::Stopped));
+                            }
                             let infer_delay_ms = sandbox_load.policy_infer_delay_ms();
                             if infer_delay_ms > 0 {
                                 prepared_policy = prepared_policy.with_infer_delay(std::time::Duration::from_millis(infer_delay_ms));
@@ -2969,10 +3146,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             } else {
                                 None
                             };
+                            if cancel_policy.load(Ordering::Acquire) {
+                                return Err(ArmError::Safety(SafetyError::Stopped));
+                            }
                             // speed gate: measured here, off the supervisor lock and the control tick
                             let warmup = prepared_policy
                                 .warmup(crate::policy_runtime::WARMUP_INFERENCES, crate::policy_runtime::WARMUP_MAX_TOTAL)
                                 .map_err(ArmError::from)?;
+                            if cancel_policy.load(Ordering::Acquire) {
+                                return Err(ArmError::Safety(SafetyError::Stopped));
+                            }
                             let speed = crate::policy_runtime::SpeedGateReport::new(warmup, effective_fps);
                             Ok::<_, ArmError>((prepared_policy, effective_fps, verified_release_gate, speed))
                         }).await;
@@ -3218,10 +3401,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     heartbeat_slot.close();
 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
-    if !matches!(first_exit, FirstExit::Reader) {
-        reader_task.abort();
-        let _ = reader_task.await;
-    }
     if !matches!(first_exit, FirstExit::Worker) {
         worker_task.abort();
         let _ = worker_task.await;
@@ -3234,8 +3413,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         auth_task.abort();
         let _ = auth_task.await;
     }
+    let fatal_close = fatal_triggered.load(Ordering::Acquire);
+    if !fatal_close && !matches!(first_exit, FirstExit::Reader) {
+        reader_task.abort();
+        let _ = (&mut reader_task).await;
+    }
     if !matches!(first_exit, FirstExit::Writer) {
-        if fatal_triggered.load(Ordering::Acquire) {
+        if fatal_close {
             let grace = ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT);
             if tokio::time::timeout(grace, &mut writer_task).await.is_err() {
                 writer_task.abort();
@@ -3244,6 +3428,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         } else {
             writer_task.abort();
             let _ = writer_task.await;
+        }
+    }
+    if fatal_close && !matches!(first_exit, FirstExit::Reader) {
+        // Keep draining unread inbound bytes briefly after sending Close+FIN so TCP close does
+        // not emit RST over flooded client buffers and wipe the flushed urgent/fatal frames.
+        if tokio::time::timeout(Duration::from_millis(50), &mut reader_task).await.is_err() {
+            reader_task.abort();
+            let _ = reader_task.await;
         }
     }
     // Wait up to bounded grace for tracked child tasks (urgent E-stop/Stop, macro preflight, etc.),
