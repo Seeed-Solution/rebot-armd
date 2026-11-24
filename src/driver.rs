@@ -3380,6 +3380,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Sequence number of the last processed RX frame, and of each joint's last feedback.
     rx_seq: u64,
     last_feedback_seq: Vec<u64>,
+    /// Per-motor `rx_seq` snapshot taken immediately after the most recent enable-direction write
+    /// (`CMD_ENABLE`) to that motor returns from `can.transmit`. Already-off (`0x0`/`0xD`)
+    /// evidence counts only when `last_feedback_seq[joint] > last_enable_write_seq[joint]`.
+    last_enable_write_seq: Vec<Option<u64>>,
     /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
     mit_fence: Option<Duration>,
     /// Per joint: when its last confirmed command started out (the earliest frame of it, never
@@ -3900,6 +3904,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             clock,
             rx_seq: 0,
             last_feedback_seq: vec![0; dof],
+            last_enable_write_seq: vec![None; dof],
             rx_empty_seq: 0,
             last_read_drained: false,
             mit_fence: None,
@@ -4232,12 +4237,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// True when `joint` has fresh (`<= 100 ms` receive instant AND receive-queue bound)
-    /// feedback proving the motor is already physically off: disabled (`0x0`) or measured
+    /// feedback that arrived strictly after the most recent enable-direction write (`CMD_ENABLE`)
+    /// to that motor, proving the motor is already physically off: disabled (`0x0`) or measured
     /// command-timeout watchdog expired (`0xD`). Sending `CMD_DISABLE` to such a motor
     /// changes nothing physically, so `DisableRequested` is allowed to that motor regardless
     /// of arm pose (send-time check per motor).
     #[inline]
     fn motor_freshly_physically_off(&self, joint: usize) -> bool {
+        if self.awaiting_rx_boundary {
+            return false;
+        }
         let fresh = self
             .last_feedback_instant
             .get(joint)
@@ -4250,7 +4259,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 .copied()
                 .flatten()
                 .is_some_and(|b| self.since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+        let after_enable_write = self
+            .last_enable_write_seq
+            .get(joint)
+            .copied()
+            .flatten()
+            .is_none_or(|seq| self.last_feedback_seq.get(joint).copied().unwrap_or(0) > seq);
         fresh
+            && after_enable_write
             && self
                 .motor_status
                 .get(joint)
@@ -4446,6 +4462,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let t0 = self.now();
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
+        if !frame.is_extended
+            && !frame.is_rtr
+            && frame.dlc == 8
+            && frame.data == damiao::CMD_ENABLE
+        {
+            if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
+                self.last_enable_write_seq[idx] = Some(self.rx_seq);
+            }
+        }
         let wall_ns = self.now().saturating_duration_since(t0).as_nanos().min(u128::from(u64::MAX)) as u64;
         let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
         let attempt_kind = match &res {
@@ -10817,5 +10842,144 @@ mod tx_chokepoint_tests {
             })
             .is_ok());
         assert_eq!(bus.tx_len(), 1);
+    }
+
+    #[test]
+    fn deferred_and_retried_enable_write_invalidates_older_already_off_feedback() {
+        let limits = damiao::DamiaoLimits::default();
+        let (bus, clock) = TestBus::new();
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3])
+            .with_joint_limits(vec![limits.clone(); 3])
+            .unwrap();
+        // Limit each tick to 1 frame so motor 2 & 3 enables are deferred to subsequent polls.
+        drv.set_tx_budget(TxBudget {
+            max_frames: 1,
+            max_duration: Duration::from_millis(10),
+            ..TxBudget::default()
+        });
+        let safety_stopped = Arc::new(AtomicBool::new(false));
+        let mut arm_joints = [0usize; crate::rt_core::mailbox::MAX_DOF];
+        arm_joints[0] = 0;
+        arm_joints[1] = 1;
+        arm_joints[2] = 2;
+        drv.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: Arc::clone(&safety_stopped),
+            has_resting_pose: true,
+            arm_joints,
+            arm_joints_len: 3,
+            rest_positions: [0.0; crate::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+
+        // Initial raised pose feedback (0x0) + observed empty RX queue.
+        drv.read_joint_states().unwrap();
+        for id in 1..=3 {
+            bus.push_feedback(id, 0.50, 0x0, &limits);
+        }
+        drv.read_joint_states().unwrap();
+
+        // Tick 1: begin_torque(true) transmits CMD_ENABLE to motor 1 only; motors 2 & 3 are deferred.
+        bus.clear_tx();
+        let p1 = drv.begin_torque(true).expect("enable starts");
+        assert!(matches!(p1, TorqueProgress::Pending { .. }));
+        assert_eq!(bus.tx_len(), 1, "budget=1 sends CMD_ENABLE to motor 1 only");
+
+        // While motor 2's enable is deferred, fresh pre-write 0x0 feedback arrives for motor 2
+        // (and raised 0x1 for motor 1) at a raised pose!
+        clock.advance(Duration::from_millis(5));
+        bus.push_feedback(1, 0.50, 0x1, &limits);
+        bus.push_feedback(2, 0.50, 0x0, &limits);
+        bus.push_feedback(3, 0.50, 0x0, &limits);
+
+        // Tick 2: poll_torque drains the 0x0 feedback for motor 2, then transmits the DEFERRED
+        // CMD_ENABLE to motor 2 (updating last_enable_write_seq[1] right after can.transmit!).
+        bus.clear_tx();
+        let dl = clock.now() + Duration::from_millis(5);
+        let p2 = drv.poll_torque(dl).expect("poll sends deferred enable to motor 2");
+        assert!(matches!(p2, TorqueProgress::Pending { .. }));
+        assert_eq!(bus.tx_len(), 1, "deferred CMD_ENABLE sent to motor 2");
+
+        // Immediately latch E-stop at the raised pose before motor 2 replies to its deferred enable.
+        // Motor 2's cached status is still fresh 0x0 from BEFORE the deferred enable write!
+        safety_stopped.store(true, Ordering::SeqCst);
+        bus.clear_tx();
+        let t_dis = clock.now();
+        // Motor 2 MUST be refused (pre-write 0x0 cannot satisfy already-off exception).
+        assert!(matches!(
+            drv.send(TxKind::DisableRequested { joint: 1, started_at: t_dis }, None, None, false, |d| {
+                Some(damiao::build_disable_frame(d.motor_ids[1]))
+            }),
+            Err(TxRefusal::TorqueOffWouldDrop)
+        ));
+        assert_eq!(bus.tx_len(), 0, "zero disable frames to motor 2 after deferred enable");
+
+        // Motor 3 was NEVER written CMD_ENABLE yet, and has fresh 0x0 feedback -> allowed!
+        assert!(drv
+            .send(TxKind::DisableRequested { joint: 2, started_at: t_dis }, None, None, false, |d| {
+                Some(damiao::build_disable_frame(d.motor_ids[2]))
+            })
+            .is_ok());
+        assert_eq!(bus.tx_len(), 1, "unwritten 0x0 motor 3 still qualifies for already-off");
+
+        // Once motor 2 actually emits a NEW 0x0 reply strictly after its enable write, it qualifies.
+        clock.advance(Duration::from_millis(5));
+        bus.push_feedback(2, 0.50, 0x0, &limits);
+        drv.read_joint_states().unwrap();
+        bus.clear_tx();
+        assert!(drv
+            .send(TxKind::DisableRequested { joint: 1, started_at: t_dis }, None, None, false, |d| {
+                Some(damiao::build_disable_frame(d.motor_ids[1]))
+            })
+            .is_ok());
+        assert_eq!(bus.tx_len(), 1, "post-write 0x0 feedback restores already-off qualification");
+
+        // Part 2: Retried enable (`Service::Retry` at +25 ms) ALSO invalidates pre-retry 0x0!
+        let (bus_r, clock_r) = TestBus::new();
+        let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2])
+            .with_joint_limits(vec![limits.clone(); 2])
+            .unwrap();
+        let stopped_r = Arc::new(AtomicBool::new(false));
+        let mut arm_r = [0usize; crate::rt_core::mailbox::MAX_DOF];
+        arm_r[0] = 0;
+        arm_r[1] = 1;
+        drv_r.set_stopped_disable_gate(StoppedDisableGate {
+            safety_stopped: Arc::clone(&stopped_r),
+            has_resting_pose: true,
+            arm_joints: arm_r,
+            arm_joints_len: 2,
+            rest_positions: [0.0; crate::rt_core::mailbox::MAX_DOF],
+            rest_pose_tolerance_rad: 0.05,
+        });
+        drv_r.read_joint_states().unwrap();
+        bus_r.push_feedback(1, 0.50, 0x0, &limits);
+        bus_r.push_feedback(2, 0.50, 0x0, &limits);
+        drv_r.read_joint_states().unwrap();
+        assert!(matches!(drv_r.begin_torque(true).unwrap(), TorqueProgress::Pending { .. }));
+        // Motor 1 confirms 0x1; motor 2 replies 0x0 at +20 ms (before the 25 ms retry).
+        clock_r.advance(Duration::from_millis(20));
+        bus_r.push_feedback(1, 0.50, 0x1, &limits);
+        bus_r.push_feedback(2, 0.50, 0x0, &limits);
+        let dl_r1 = clock_r.now() + Duration::from_millis(5);
+        assert!(matches!(drv_r.poll_torque(dl_r1).unwrap(), TorqueProgress::Pending { .. }));
+        // At +30 ms, poll_torque issues the RETRIED CMD_ENABLE to motor 2 (updating seq!).
+        clock_r.advance(Duration::from_millis(10));
+        bus_r.clear_tx();
+        let dl_r2 = clock_r.now() + Duration::from_millis(5);
+        assert!(matches!(drv_r.poll_torque(dl_r2).unwrap(), TorqueProgress::Pending { .. }));
+        assert_eq!(bus_r.tx_len(), 1, "retried CMD_ENABLE sent to motor 2");
+        // Immediately stop at raised pose before post-retry reply: old 0x0 at +20 ms MUST be refused!
+        stopped_r.store(true, Ordering::SeqCst);
+        bus_r.clear_tx();
+        assert!(matches!(
+            drv_r.send(
+                TxKind::DisableRequested { joint: 1, started_at: clock_r.now() },
+                None,
+                None,
+                false,
+                |d| Some(damiao::build_disable_frame(d.motor_ids[1])),
+            ),
+            Err(TxRefusal::TorqueOffWouldDrop)
+        ));
+        assert_eq!(bus_r.tx_len(), 0, "zero disable frames to motor 2 after retried enable");
     }
 }
