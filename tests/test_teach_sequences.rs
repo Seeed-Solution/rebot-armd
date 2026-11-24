@@ -104,16 +104,46 @@ struct Rig {
     _tmp: tempfile::TempDir,
     a: String,
     b: String,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        for t in self.tasks.drain(..) { t.abort(); }
+    }
 }
 
 impl Rig {
     async fn new() -> Self {
+        Self::new_paced(Duration::from_millis(1)).await
+    }
+
+    async fn new_paced(tick_period: Duration) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let supervisor = Arc::new(ArmSupervisor::new(profile()));
         supervisor.set_episodes_dir(Some(tmp.path().join("episodes"))).await;
         armd::sequences::load_into(&supervisor, &tmp.path().join("sequences.json")).await;
-        let (ws, generation, epoch, sup, addr) = common::torqued_rig(supervisor, &INSPECT).await;
-        let mut rig = Rig { ws, generation, epoch, sup, addr, _tmp: tmp, a: String::new(), b: String::new() };
+        let router = armd::create_router(supervisor.clone(), armd::OperatorAuth::disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let ticker = supervisor.clone();
+        let tick_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick_period);
+            loop { interval.tick().await; ticker.tick(0.02).await; }
+        });
+        let (mut ws, generation) = common::controller(addr).await;
+        let epoch = supervisor.get_observation().await.epoch_id;
+        let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        {
+            let mut inner = supervisor.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+        }
+        let epoch = supervisor.get_observation().await.epoch_id;
+        let mut rig = Rig { ws, generation, epoch, sup: supervisor, addr, _tmp: tmp, a: String::new(), b: String::new(), tasks: vec![srv, tick_task] };
         rig.a = rig.rpc("/api/v1/poses/save", json!({"name": "A", "positions": A})).await["pose"]["id"].as_str().unwrap().to_string();
         rig.b = rig.rpc("/api/v1/poses/save", json!({"name": "B", "positions": B})).await["pose"]["id"].as_str().unwrap().to_string();
         rig
@@ -139,16 +169,31 @@ impl Rig {
     async fn wait(&mut self, id: u64, max_s: f64, mut each: impl FnMut(&armd::motion::ActionStatus)) -> (armd::motion::ActionStatus, Vec<(u32, usize)>) {
         let until = Instant::now() + Duration::from_secs_f64(max_s);
         let mut seen: Vec<(u32, usize)> = Vec::new();
+        let mut rx = self.sup.subscribe_telemetry().ok();
+        let mut last_drain = Instant::now();
         loop {
             assert!(Instant::now() < until, "action {id} did not end in {max_s} s");
-            common::drain(&mut self.ws, 2).await;
-            let a = self.sup.inner().read().await.last_action.clone().filter(|a| a.id == id).expect("the action");
-            if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
-                if seen.last() != Some(&(r, k)) { seen.push((r, k)); }
+            if last_drain.elapsed() > Duration::from_millis(100) {
+                common::drain(&mut self.ws, 1).await;
+                last_drain = Instant::now();
             }
-            each(&a);
-            if !a.is_running() { return (a, seen); }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let obs = match rx.as_mut() {
+                Some(rx) => match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                    Ok(Ok(obs)) => obs,
+                    _ => self.sup.get_observation().await,
+                },
+                None => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    self.sup.get_observation().await
+                }
+            };
+            if let Some(a) = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id) {
+                if let (Some(r), Some(k)) = (a.repeat_index, a.step_index) {
+                    if seen.last() != Some(&(r, k)) { seen.push((r, k)); }
+                }
+                each(&a);
+                if !a.is_running() { return (a, seen); }
+            }
         }
     }
 
@@ -336,7 +381,9 @@ async fn run_pins_pose_revisions_and_refuses_stale_data() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_saves_one_episode_per_repeat_and_discards_an_aborted_repeat() {
-    let mut rig = Rig::new().await;
+    // Episode timestamps use wall clock, so pace at 4 ms (~5x real time): each ~5.6 s repeat
+    // records > 0.5 s wall duration and > 20 frames while finishing 5x faster.
+    let mut rig = Rig::new_paced(Duration::from_millis(4)).await;
     let (a, b) = (rig.a.clone(), rig.b.clone());
     let ep = rig.episode(0.15, 0.6).await;
     let sid = rig.save("rec", json!([{"type": "pose", "pose_id": a}, {"type": "replay", "episode_id": ep, "speed": 1.0, "gripper": false},
@@ -369,7 +416,7 @@ async fn record_saves_one_episode_per_repeat_and_discards_an_aborted_repeat() {
     rig.sup.discard_recording().await.unwrap();
 
     // stop during the second repeat: its episode is discarded, the first is kept
-    let sid2 = rig.save("rec wait", json!([{"type": "pose", "pose_id": a}, {"type": "wait", "s": 1.0}])).await;
+    let sid2 = rig.save("rec wait", json!([{"type": "pose", "pose_id": a}, {"type": "wait", "s": 0.5}])).await;
     let (id, _) = rig.run(json!({"id": sid2, "repeat": 3, "record": {"dataset": "default"}})).await;
     let mut stopped = false;
     let until = Instant::now() + Duration::from_secs(20);
