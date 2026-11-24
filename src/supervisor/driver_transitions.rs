@@ -16,6 +16,16 @@ pub const DISABLE_CONFIRM_SERVICE: Duration = Duration::from_millis(2);
 /// Upper wall-clock bound for last-chance hardware disable attempts on panic or forced teardown.
 pub const PANIC_DISABLE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Bounded stack-only validated driver limits probed read-only before `clear_check` and committed
+/// only after `clear_check` passes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CandidateDriverLimits {
+    dof: usize,
+    min: [f32; crate::rt_core::mailbox::MAX_DOF],
+    max: [f32; crate::rt_core::mailbox::MAX_DOF],
+    vel: [f32; crate::rt_core::mailbox::MAX_DOF],
+}
+
 /// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanicDisableOutcome {
@@ -439,7 +449,7 @@ impl SupervisorInner {
         );
     }
 
-    pub(super) fn apply_feedback(
+    pub(crate) fn apply_feedback(
         measured_positions: &mut [f32],
         measured_velocities: &mut [f32],
         torques: &mut [f32],
@@ -499,7 +509,12 @@ impl SupervisorInner {
                     );
                     self.driver_config_error = Some(reason.clone());
                     if trigger_fault {
-                        self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                        self.safety.latch(
+                            crate::safety::FaultKind::JointLimit,
+                            crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
+                                buf.push_str(&reason);
+                            }),
+                        );
                     }
                     return;
                 }
@@ -512,7 +527,12 @@ impl SupervisorInner {
                     );
                     self.driver_config_error = Some(reason.clone());
                     if trigger_fault {
-                        self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                        self.safety.latch(
+                            crate::safety::FaultKind::JointLimit,
+                            crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
+                                buf.push_str(&reason);
+                            }),
+                        );
                     }
                     return;
                 }
@@ -524,7 +544,12 @@ impl SupervisorInner {
                         );
                         self.driver_config_error = Some(reason.clone());
                         if trigger_fault {
-                            self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                            self.safety.latch(
+                                crate::safety::FaultKind::JointLimit,
+                                crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
+                                    buf.push_str(&reason);
+                                }),
+                            );
                         }
                         return;
                     }
@@ -560,7 +585,12 @@ impl SupervisorInner {
             let reason = format!("Driver limits violated config invariants: {err}");
             self.driver_config_error = Some(reason.clone());
             if trigger_fault {
-                self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                self.safety.latch(
+                    crate::safety::FaultKind::JointLimit,
+                    crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
+                        buf.push_str(&reason);
+                    }),
+                );
             }
             return;
         }
@@ -569,22 +599,257 @@ impl SupervisorInner {
     }
 
     pub fn reapply_driver_limits(&mut self) -> bool {
-        let limits = if let Some(ref d) = self.driver {
-            if let Ok(drv) = d.lock() {
-                let vel: Vec<_> = (0..self.config.dof).map(|i| drv.max_command_velocity(i)).collect();
-                let pos: Vec<_> = (0..self.config.dof).map(|i| drv.position_limits(i)).collect();
-                Some((vel, pos))
+        const MAX_DOF: usize = crate::rt_core::mailbox::MAX_DOF;
+        let dof = self.config.dof;
+        if dof <= MAX_DOF {
+            let mut vel = [None::<f32>; MAX_DOF];
+            let mut pos = [None::<(f32, f32)>; MAX_DOF];
+            let locked = self.driver.as_ref().is_some_and(|d| {
+                d.lock().is_ok_and(|drv| {
+                    for i in 0..dof {
+                        vel[i] = drv.max_command_velocity(i);
+                        pos[i] = drv.position_limits(i);
+                    }
+                    true
+                })
+            });
+            if locked {
+                self.apply_extracted_driver_limits_inner(&vel[..dof], &pos[..dof], false);
+                self.driver_config_error.is_none()
             } else {
-                None
+                false
             }
         } else {
+            let limits = if let Some(ref d) = self.driver {
+                if let Ok(drv) = d.lock() {
+                    let vel: Vec<_> = (0..dof).map(|i| drv.max_command_velocity(i)).collect();
+                    let pos: Vec<_> = (0..dof).map(|i| drv.position_limits(i)).collect();
+                    Some((vel, pos))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((vel_limits, pos_limits)) = limits {
+                self.apply_extracted_driver_limits_inner(&vel_limits, &pos_limits, false);
+                self.driver_config_error.is_none()
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Pure read-only validation of driver position/velocity limits into bounded stack storage
+    /// (zero allocations, zero mutations to `self`).
+    #[allow(clippy::result_large_err)] // inline bounded text avoids RT heap allocation
+    pub(crate) fn probe_driver_limits_bounded(
+        &self,
+    ) -> Result<CandidateDriverLimits, crate::safety::BoundedText<256>> {
+        use crate::safety::BoundedText;
+        const MAX_DOF: usize = crate::rt_core::mailbox::MAX_DOF;
+        let dof = self.config.dof;
+        if dof > MAX_DOF || self.config.limits.len() != dof || self.config.home_positions.len() != dof {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("driver limit retry exceeds bounded RT DOF")));
+        }
+        let mut vel_limits = [None::<f32>; MAX_DOF];
+        let mut pos_limits = [None::<(f32, f32)>; MAX_DOF];
+        let locked = self.driver.as_ref().is_some_and(|d| {
+            d.lock().is_ok_and(|drv| {
+                for i in 0..dof {
+                    vel_limits[i] = drv.max_command_velocity(i);
+                    pos_limits[i] = drv.position_limits(i);
+                }
+                true
+            })
+        });
+        if !locked {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("driver unavailable while revalidating limits")));
+        }
+
+        let mut cand_min = [0.0f32; MAX_DOF];
+        let mut cand_max = [0.0f32; MAX_DOF];
+        let mut cand_vel = [0.0f32; MAX_DOF];
+        for i in 0..dof {
+            let limit = &self.config.limits[i];
+            let mut new_vel = limit.max_velocity;
+            if let Some(max) = vel_limits[i] {
+                if max.is_finite() && max > 0.0 {
+                    new_vel = new_vel.min(max);
+                }
+            }
+            if !new_vel.is_finite() || new_vel <= 0.0 {
+                let mut msg = BoundedText::<256>::empty();
+                let _ = core::fmt::write(&mut msg, format_args!("Driver limits violated config invariants: Joint {i} max_velocity must be positive finite"));
+                return Err(msg);
+            }
+            let mut new_min = limit.min_position;
+            let mut new_max = limit.max_position;
+            if let Some((d_min, d_max)) = pos_limits[i] {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    let mut msg = BoundedText::<256>::empty();
+                    let _ = core::fmt::write(
+                        &mut msg,
+                        format_args!("Driver position limits [{d_min:.4}, {d_max:.4}] for joint '{}' are invalid", limit.name),
+                    );
+                    return Err(msg);
+                }
+                new_min = new_min.max(d_min);
+                new_max = new_max.min(d_max);
+                if !new_min.is_finite() || !new_max.is_finite() || new_max - new_min < 1e-2 {
+                    let mut msg = BoundedText::<256>::empty();
+                    let _ = core::fmt::write(
+                        &mut msg,
+                        format_args!(
+                            "Driver position limits [{d_min:.4}, {d_max:.4}] for joint '{}' conflict with profile limits [{:.4}, {:.4}] (intersected range < 0.01)",
+                            limit.name, limit.min_position, limit.max_position
+                        ),
+                    );
+                    return Err(msg);
+                }
+                if let Some(pos) = self.config.resting_pose.as_ref().and_then(|r| r.positions.as_ref()).and_then(|p| p.get(i).copied()) {
+                    if !pos.is_finite() || pos < new_min || pos > new_max {
+                        let mut msg = BoundedText::<256>::empty();
+                        let _ = core::fmt::write(
+                            &mut msg,
+                            format_args!(
+                                "Driver position limits [{d_min:.4}, {d_max:.4}] for joint '{}' conflict with resting pose position {pos:.4}",
+                                limit.name
+                            ),
+                        );
+                        return Err(msg);
+                    }
+                }
+            }
+            let home = self.config.home_positions[i];
+            if !home.is_finite() || home < new_min || home > new_max {
+                return Err(BoundedText::new(
+                    "Driver limits violated config invariants: Home positions must be finite and within joint limits",
+                ));
+            }
+            cand_min[i] = new_min;
+            cand_max[i] = new_max;
+            cand_vel[i] = new_vel;
+        }
+        if let (Some(g), Some(dg)) = (self.config.gripper_index(), &self.config.damiao_gripper) {
+            if dg.mode == crate::model::DamiaoGripperMode::PosForce
+                && crate::model::DamiaoGripperDrive::quantize_vel_raw(cand_vel[g]) == 0
+            {
+                let mut msg = BoundedText::<256>::empty();
+                let _ = core::fmt::write(
+                    &mut msg,
+                    format_args!("Driver limits violated config invariants: Joint {g} max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"),
+                );
+                return Err(msg);
+            }
+        }
+        if let Some(gp) = &self.config.gripper_policy {
+            let ok = self.config.gripper_index().is_some_and(|g_idx| {
+                let (lo, hi) = (cand_min[g_idx], cand_max[g_idx]);
+                let in_lim = |v: f32| v.is_finite() && v >= lo && v <= hi;
+                in_lim(gp.closed_rad)
+                    && in_lim(gp.open_rad)
+                    && gp.jaw_opening.as_ref().is_none_or(|jo| jo.points.iter().all(|&[q, _]| in_lim(q)))
+            });
+            if !ok {
+                return Err(BoundedText::new(
+                    "Driver limits violated config invariants: Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)",
+                ));
+            }
+        }
+        if self.driver_config_error.is_some() && self.retired_driver_config_error.is_some() {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("driver config error reclamation pending")));
+        }
+
+        Ok(CandidateDriverLimits {
+            dof,
+            min: cand_min,
+            max: cand_max,
+            vel: cand_vel,
+        })
+    }
+
+    /// Commits validated candidate driver limits in place and retires any previous error string
+    /// off-thread (zero heap ops; invoked ONLY after `clear_check` passes).
+    pub(crate) fn commit_driver_limits_bounded(&mut self, cand: &CandidateDriverLimits) {
+        for i in 0..cand.dof {
+            self.config.limits[i].min_position = cand.min[i];
+            self.config.limits[i].max_position = cand.max[i];
+            self.config.limits[i].max_velocity = cand.vel[i];
+        }
+        if let Some(prev) = self.driver_config_error.take() {
+            if self.retired_driver_config_error.is_none() {
+                self.retired_driver_config_error = Some(prev);
+            } else {
+                self.driver_config_error = Some(prev);
+            }
+        }
+    }
+
+    /// Pure read-only check of measured positions against either validated candidate limits (if
+    /// `driver_config_error` just resolved) or current `self.config.limits` (zero heap allocations).
+    fn joint_limit_clear_violation_with_candidates(
+        &self,
+        cand: Option<&CandidateDriverLimits>,
+    ) -> Option<crate::safety::JointLimitClearViolation> {
+        use crate::safety::{BoundedText, JointLimitClearViolation as V};
+        if let Some(c) = cand {
+            if self.measured_positions.len() != c.dof || self.config.limits.len() != c.dof {
+                return Some(V::FeedbackIncomplete {
+                    measured_len: self.measured_positions.len(),
+                    dof: c.dof,
+                });
+            }
+            for i in 0..c.dof {
+                let q = self.measured_positions[i];
+                let joint_name = BoundedText::new(&self.config.limits[i].name);
+                if !q.is_finite() {
+                    return Some(V::NonFinite {
+                        joint_idx: i as u16,
+                        joint_name,
+                        value: q,
+                    });
+                }
+                if q < c.min[i] - JOINT_LIMIT_CLEAR_MARGIN_RAD
+                    || q > c.max[i] + JOINT_LIMIT_CLEAR_MARGIN_RAD
+                {
+                    return Some(V::OutOfBounds {
+                        joint_idx: i as u16,
+                        joint_name,
+                        value: q,
+                        min: c.min[i],
+                        max: c.max[i],
+                        margin: JOINT_LIMIT_CLEAR_MARGIN_RAD,
+                    });
+                }
+            }
             None
-        };
-        if let Some((vel_limits, pos_limits)) = limits {
-            self.apply_extracted_driver_limits_inner(&vel_limits, &pos_limits, false);
-            self.driver_config_error.is_none()
         } else {
-            false
+            self.joint_limit_clear_violation()
+        }
+    }
+
+    /// Bounded, zero-allocation retry of driver limits for the RT executor `clear_fault` path.
+    #[allow(dead_code)]
+    pub(crate) fn reapply_driver_limits_bounded(&mut self) -> Option<crate::safety::BoundedText<256>> {
+        match self.probe_driver_limits_bounded() {
+            Ok(cand) => {
+                self.commit_driver_limits_bounded(&cand);
+                None
+            }
+            Err(err) => Some(err),
         }
     }
 
@@ -603,7 +868,7 @@ impl SupervisorInner {
         self.motor_errors = errors;
     }
 
-    pub(super) fn states_valid(
+    pub(crate) fn states_valid(
         states: &[crate::model::JointState],
         caps: DriverCapabilities,
         dof: usize,
@@ -855,7 +1120,12 @@ impl SupervisorInner {
             }
         }
         let err_msg = format!("Hardware torque enable failed: {}", e);
-        self.safety.trigger_fault_coded(FaultCode::EnableFailed, FaultReason::Other(err_msg.clone()));
+        self.safety.latch(
+            crate::safety::FaultKind::Other,
+            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
+                buf.push_str(&err_msg);
+            }),
+        );
         SafetyError::ClearFaultRejected(err_msg)
     }
 
@@ -884,7 +1154,12 @@ impl SupervisorInner {
             }
         }
         let err_msg = format!("Hardware torque enable failed: {}", e);
-        self.safety.trigger_fault_coded(FaultCode::EnableFailed, FaultReason::Other(err_msg.clone()));
+        self.safety.latch(
+            crate::safety::FaultKind::Other,
+            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
+                buf.push_str(&err_msg);
+            }),
+        );
         SafetyError::ClearFaultRejected(err_msg)
     }
 
@@ -1110,7 +1385,12 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+                    let _ = core::fmt::write(buf, format_args!("{error}"));
+                }),
+            );
             return Err(error);
         }
         self.torque_off_finish()
@@ -1235,9 +1515,12 @@ impl SupervisorInner {
     /// A disable step failed: `disable_pending` stays set and `DRIVER_WRITE_FAILED` latches
     /// (as in `torque_off`).
     fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
-        let message = format!("Torque disable transmission failed: {e}");
+        let detail = crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+            buf.push_str("Torque disable transmission failed: ");
+            e.write_bounded(buf);
+        });
         let code = crate::driver::handshake::rt_progress(false, Err(e)).err().unwrap_or("HARDWARE_FAULT");
-        self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(message));
+        self.safety.latch(crate::safety::FaultKind::Other, detail);
         code
     }
 
@@ -1362,8 +1645,10 @@ impl SupervisorInner {
                         self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e))
                     }
                     Some(false) => {
-                        self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(
-                            "Torque disable has not been confirmed by fresh hardware feedback".into()));
+                        self.safety.latch(
+                            crate::safety::FaultKind::Other,
+                            crate::safety::FaultDetail::Static(crate::safety::StaticFault::DisableUnconfirmed),
+                        );
                         Err("FEEDBACK_UNCONFIRMED")
                     }
                 };
@@ -1408,34 +1693,218 @@ impl SupervisorInner {
         self.commanded_accelerations.fill(0.0);
     }
 
+    /// Builds the common zero-allocation [`crate::safety::ClearContext`] baseline from current
+    /// supervisor state. Callers fill in live driver freshness, thermal capability, hardware error,
+    /// enable state, and resting-pose checks before invoking [`SafetyManager::clear_check`].
+    pub(crate) fn build_clear_context_base(
+        &self,
+        driver_config_error_override: Option<crate::safety::BoundedText<256>>,
+    ) -> crate::safety::ClearContext {
+        use crate::safety::{BoundedText, ClearContext};
+        let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+        let thermal_below = !self.temperatures.is_empty()
+            && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+        let cooldown_elapsed_ms = if thermal_below {
+            self.thermal_below_since
+                .map_or(0, |since| since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+        } else {
+            0
+        };
+        // An expired lease counts as NO lease for the WatchdogTimeout heartbeat condition.
+        let has_active_lease = self.is_lease_active();
+        let lease_heartbeat_fresh =
+            has_active_lease && self.last_heartbeat.elapsed() <= self.lease_timeout;
+        ClearContext {
+            expected_epoch: None,
+            pending_estop: self.estop_request_unapplied(),
+            shutdown_committed: self.shutdown_committed,
+            driver_config_error: driver_config_error_override
+                .or_else(|| self.driver_config_error.as_deref().map(BoundedText::new)),
+            gravity_comp_unconfirmed: self.gravity_comp_blocks_clear(),
+            disable_pending: self.disable_pending,
+            has_driver: self.driver.is_some(),
+            feedback_fresh: self.driver.is_none(),
+            thermal_sensor_available: self.driver.is_none(),
+            thermal_below_threshold: thermal_below,
+            thermal_cooldown_elapsed_ms: cooldown_elapsed_ms,
+            thermal_cooldown_required_ms: self.thermal_cooldown_duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            has_active_lease,
+            lease_heartbeat_fresh,
+            joint_limit_violation: self.joint_limit_clear_violation(),
+            enable_state_known: self.driver.is_none(),
+            hardware_reset_required: false,
+            hardware_reset_sent: false,
+            hardware_error: None,
+            resting_pose_violation: None,
+            resting_feedback_missing: false,
+            mit_modes_uncertain: false,
+            mit_lost_unsupported: false,
+        }
+    }
+
+    /// Builds [`crate::safety::ClearContext`] for the MIT expiry recovery path (checks every
+    /// recorded kind including `ThermalTrip`, `BusLoss`, `WatchdogTimeout`, `JointLimit`,
+    /// `CollisionLatched`, `Estop`, `Other`, while deferring motor-timeout disable to recovery).
+    pub(crate) fn build_mit_recovery_clear_context(&self) -> crate::safety::ClearContext {
+        let mut ctx = self.build_clear_context_base(None);
+        if let Some(ref d) = self.driver {
+            if let Ok(drv) = d.lock() {
+                ctx.mit_modes_uncertain = self.mit.owner == crate::mit::MitOwner::Lost && drv.joint_modes_uncertain();
+                ctx.thermal_sensor_available = drv.capabilities().temperature_feedback;
+                ctx.feedback_fresh = self.feedback_numeric_valid
+                    && drv.is_feedback_valid()
+                    && drv.feedback_all_within(self.config.dof, Duration::from_millis(250));
+                ctx.enable_state_known = true;
+            }
+        }
+        ctx
+    }
+
+    /// Pure read-only probe of driver limits for legacy `clear_fault` (`dof > MAX_DOF` fallback
+    /// clones candidate config without mutating `self`; `dof <= MAX_DOF` uses the bounded stack probe).
+    #[allow(clippy::result_large_err)] // inline bounded text avoids RT heap allocation
+    fn probe_driver_limits_legacy(
+        &self,
+    ) -> Result<Option<CandidateDriverLimits>, crate::safety::BoundedText<256>> {
+        if self.driver_config_error.is_none() {
+            return Ok(None);
+        }
+        if self.config.dof <= crate::rt_core::mailbox::MAX_DOF {
+            return self.probe_driver_limits_bounded().map(Some);
+        }
+        use crate::safety::BoundedText;
+        let dof = self.config.dof;
+        let Some(ref d) = self.driver else {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("driver unavailable while revalidating limits")));
+        };
+        let Ok(drv) = d.lock() else {
+            return Err(self
+                .driver_config_error
+                .as_deref()
+                .map(BoundedText::new)
+                .unwrap_or_else(|| BoundedText::new("driver unavailable while revalidating limits")));
+        };
+        let mut candidate = self.config.clone();
+        for (i, limit) in candidate.limits.iter_mut().enumerate().take(dof) {
+            if let Some(max) = drv.max_command_velocity(i) {
+                if max.is_finite() && max > 0.0 {
+                    limit.max_velocity = limit.max_velocity.min(max);
+                }
+            }
+            if let Some((d_min, d_max)) = drv.position_limits(i) {
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    return Err(BoundedText::new(&format!(
+                        "Driver position limits [{d_min:.4}, {d_max:.4}] for joint '{}' are invalid",
+                        limit.name
+                    )));
+                }
+                let new_min = limit.min_position.max(d_min);
+                let new_max = limit.max_position.min(d_max);
+                if !new_min.is_finite() || !new_max.is_finite() || new_max - new_min < 1e-2 {
+                    return Err(BoundedText::new(&format!(
+                        "Driver position limits [{d_min:.4}, {d_max:.4}] for joint '{}' conflict with profile limits [{:.4}, {:.4}] (intersected range < 0.01)",
+                        limit.name, limit.min_position, limit.max_position
+                    )));
+                }
+                if let Some(pos) = candidate.resting_pose.as_ref().and_then(|r| r.positions.as_ref()).and_then(|p| p.get(i).copied()) {
+                    if pos < new_min || pos > new_max {
+                        return Err(BoundedText::new(&format!(
+                            "Driver position limits [{d_min:.4}, {d_max:.4}] for joint '{}' conflict with resting pose position {pos:.4}",
+                            limit.name
+                        )));
+                    }
+                }
+                limit.min_position = new_min;
+                limit.max_position = new_max;
+            }
+        }
+        drop(drv);
+        if let Err(err) = candidate.validate() {
+            return Err(BoundedText::new(&format!("Driver limits violated config invariants: {err}")));
+        }
+        Ok(None)
+    }
+
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
-        if self.shutdown_committed {
-            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+        self.clear_fault_for_epoch(None)
+    }
+
+    /// Clear fault, optionally requiring an exact safety epoch (`expected_epoch`).
+    /// `SafetyManager::clear_check` runs FIRST before any motor reset, driver limit mutation,
+    /// concurrent E-stop consumption, or other side effect.
+    pub fn clear_fault_for_epoch(&mut self, expected_epoch: Option<u64>) -> Result<SafetyState, SafetyError> {
+        use crate::safety::ClearRefusal;
+        let had_driver_config_error = self.driver_config_error.is_some();
+        let (candidate_limits, driver_err_override, clear_driver_err_field) = match self.probe_driver_limits_legacy() {
+            Ok(cand) => (cand, None, had_driver_config_error),
+            Err(err) => (None, Some(err), false),
+        };
+        let apply_estop_refusal = |this: &mut Self| -> SafetyError {
+            this.consume_pending_estop();
+            if let Some(received) = expected_epoch {
+                if received != this.safety.epoch_id() {
+                    return SafetyError::EpochMismatch {
+                        expected: this.safety.epoch_id(),
+                        received,
+                    };
+                }
+            }
+            SafetyError::EStopActive
+        };
+        let commit_probed_limits = |this: &mut Self| {
+            if let Some(ref cand) = candidate_limits {
+                this.commit_driver_limits_bounded(cand);
+            } else if clear_driver_err_field {
+                this.reapply_driver_limits();
+            }
+        };
+
+        // Run `clear_check` FIRST on universal blockers (pending E-stop, epoch, shutdown,
+        // driver config error, gravity comp, disable_pending, uncertain MIT modes) before ANY
+        // side effect (no `consume_pending_estop`, no driver limit mutation, no motor reset,
+        // no MIT fence ack).
+        let mit_modes_uncertain = self.mit.owner == crate::mit::MitOwner::Lost
+            && self
+                .driver
+                .as_ref()
+                .and_then(|d| d.lock().ok())
+                .is_some_and(|drv| drv.joint_modes_uncertain());
+        let mut pre_ctx = self.build_clear_context_base(driver_err_override);
+        if clear_driver_err_field && driver_err_override.is_none() {
+            pre_ctx.driver_config_error = None;
         }
-        Self::check_concurrent_estop(self)?;
-        if self.driver_config_error.is_some() {
-            self.reapply_driver_limits();
+        pre_ctx.expected_epoch = expected_epoch;
+        pre_ctx.pending_estop = self.estop_request_unapplied();
+        pre_ctx.mit_modes_uncertain = mit_modes_uncertain;
+        pre_ctx.feedback_fresh = true;
+        pre_ctx.thermal_sensor_available = true;
+        pre_ctx.thermal_below_threshold = true;
+        pre_ctx.thermal_cooldown_elapsed_ms = pre_ctx.thermal_cooldown_required_ms;
+        pre_ctx.lease_heartbeat_fresh = true;
+        pre_ctx.joint_limit_violation = None;
+        pre_ctx.enable_state_known = true;
+        if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+            if refusal == ClearRefusal::EStopActive {
+                return Err(apply_estop_refusal(self));
+            }
+            return Err(refusal.into_safety_error());
         }
-        if let Some(ref err) = self.driver_config_error {
-            return Err(SafetyError::ClearFaultRejected(format!("Driver limit configuration error: {err}")));
+        if !self.safety.state().is_stopped() && !self.safety.has_latched_fault() {
+            commit_probed_limits(self);
+            return Ok(self.safety.state().clone());
         }
-        if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
-        if self.gravity_comp_blocks_clear() {
-            return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
-        }
-        if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
+
         if self.mit.owner == crate::mit::MitOwner::Lost {
-            // the operator's clearance lets the driver poll again (fresh feedback for the checks
-            // below); writes stay refused until the rearm's confirmed enable
-            if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) { drv.acknowledge_mit_fence_trip(); }
-        }
-        if self.mit.owner == crate::mit::MitOwner::Lost
-            && self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.joint_modes_uncertain())) {
-            return Err(SafetyError::ClearFaultRejected("MIT tracking: the control mode of a joint is uncertain after a failed switch; \
-                check the arm and power-cycle the motors".into()));
-        }
-        if self.mit.owner == crate::mit::MitOwner::Lost {
-            // decided from feedback read for this request, never from the cache
+            // Only after universal `clear_check` passed: allow read-only `0xCC` status poll
+            // (writes stay refused until rearm's confirmed enable).
+            if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) {
+                drv.acknowledge_mit_fence_trip();
+            }
+            // Decided from feedback read for this request, never from the cache.
             let fresh = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
                 Some(mut drv) => drv.mit_fresh_status(),
                 None => Err("no driver".into()),
@@ -1443,34 +1912,126 @@ impl SupervisorInner {
             let st = fresh.map_err(|e| SafetyError::ClearFaultRejected(format!(
                 "MIT tracking: fresh feedback is required before clearing ({e}); nothing was sent")))?;
             if st.iter().any(|&c| c >= 8) || (st.contains(&0) && st.contains(&1)) {
-                if !std::mem::take(&mut self.mit.recovery_confirmed) {
-                    return Err(SafetyError::ClearFaultRejected(format!("{}: {}", crate::mit::RECOVERY_CONFIRM_CODE, crate::mit::RECOVERY_WARNING)));
+                // Sync the fresh readback from mit_fresh_status into supervisor state before clear_check.
+                let synced = self.driver.as_ref().and_then(|d| {
+                    d.lock().ok().and_then(|mut drv| {
+                        let states = drv.read_joint_states().ok()?;
+                        let loads = drv.joint_loads();
+                        let caps = drv.capabilities();
+                        let fresh = drv.is_feedback_valid()
+                            && drv.feedback_all_within(self.config.dof, Duration::from_millis(250))
+                            && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                        if fresh {
+                            Some((states, loads, caps.temperature_feedback))
+                        } else {
+                            None
+                        }
+                    })
+                });
+                if let Some((states, loads, temp_fb)) = synced {
+                    self.feedback_numeric_valid = true;
+                    Self::apply_feedback(
+                        &mut self.measured_positions,
+                        &mut self.measured_velocities,
+                        &mut self.torques,
+                        &mut self.temperatures,
+                        &mut self.loads,
+                        self.config.dof,
+                        &states,
+                        loads.as_deref(),
+                    );
+                    if temp_fb {
+                        let temps_copy = self.temperatures.clone();
+                        self.update_thermal_cooldown_from_temps(&temps_copy);
+                    } else {
+                        self.thermal_below_since = None;
+                    }
+                } else {
+                    self.thermal_below_since = None;
                 }
-                return self.mit_expiry_recovery();
+                let mut mit_ctx = self.build_mit_recovery_clear_context();
+                if clear_driver_err_field && driver_err_override.is_none() {
+                    mit_ctx.driver_config_error = None;
+                }
+                mit_ctx.expected_epoch = expected_epoch;
+                mit_ctx.pending_estop = self.estop_request_unapplied();
+                mit_ctx.joint_limit_violation =
+                    self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
+                if let Err(refusal) = self.safety.clear_check(&mit_ctx) {
+                    if refusal == ClearRefusal::EStopActive {
+                        return Err(apply_estop_refusal(self));
+                    }
+                    return Err(refusal.into_safety_error());
+                }
+                if !std::mem::take(&mut self.mit.recovery_confirmed) {
+                    return Err(SafetyError::ClearFaultRejected(format!(
+                        "{}: {}",
+                        crate::mit::RECOVERY_CONFIRM_CODE,
+                        crate::mit::RECOVERY_WARNING
+                    )));
+                }
+                commit_probed_limits(self);
+                return self.mit_expiry_recovery_for_epoch(expected_epoch);
             }
         }
-        let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
+
+        let mut ctx;
         if let Some(ref d) = self.driver {
-            let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-            let disabling = drv.clear_fault_disables_joints();
-            if (self.is_torqued || drv.has_any_joint_enabled() || drv.enable_state() != EnableState::Disabled)
-                && disabling.iter().any(|&j| j < self.config.arm_dof())
-            {
-                let states = drv.read_joint_states().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-                let ages = drv.feedback_ages();
-                let loads = drv.joint_loads();
-                let max_age = self.resting_policy().map(|p| Duration::from_millis(p.feedback_max_age_ms)).unwrap_or(Duration::from_millis(250));
-                if !drv.is_feedback_valid()
-                    || ages.len() != self.config.dof
-                    || !ages.iter().all(|a| a.is_some_and(|t| t <= max_age))
-                    || !Self::states_valid(&states, drv.capabilities(), self.config.dof, loads.as_deref())
-                {
-                    return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before checking resting pose support".into()));
+            let mut ws_bufs = std::mem::take(&mut self.ws_eval_bufs);
+            let mut drv = match d.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    self.ws_eval_bufs = ws_bufs;
+                    return Err(SafetyError::FeedbackUnavailable);
                 }
+            };
+            // Pure read-only telemetry & status snapshot FIRST — ZERO motor resets or side effects.
+            let states = match drv.read_joint_states() {
+                Ok(s) => s,
+                Err(e) => {
+                    drop(drv);
+                    self.ws_eval_bufs = ws_bufs;
+                    return Err(SafetyError::ClearFaultRejected(e.to_string()));
+                }
+            };
+            let ages = drv.feedback_ages();
+            let loads = drv.joint_loads();
+            let caps = drv.capabilities();
+            let disabling = drv.clear_fault_disables_joints();
+            let hw_fault = drv.check_hardware_status().is_err();
+            let mut state = drv.enable_state();
+            let mut partial = drv.has_known_partial_enable();
+            let mut any_enabled = drv.has_any_joint_enabled();
+            let fb_valid = drv.is_feedback_valid();
+            let states_ok = Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+            let fb_fresh = fb_valid
+                && ages.len() == self.config.dof
+                && !ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)))
+                && states_ok;
+            let needs_resting_check = (self.is_torqued || any_enabled || state != EnableState::Disabled)
+                && disabling.iter().any(|&j| j < self.config.arm_dof());
+            let max_rest_age = self
+                .resting_policy()
+                .map(|p| Duration::from_millis(p.feedback_max_age_ms))
+                .unwrap_or(Duration::from_millis(250));
+            let resting_fb_ok = fb_valid
+                && ages.len() == self.config.dof
+                && ages.iter().all(|a| a.is_some_and(|t| t <= max_rest_age))
+                && states_ok;
+
+            if fb_fresh {
                 self.feedback_numeric_valid = true;
-                self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
-                    .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-                self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, drv.as_ref(), &mut self.scratch.fb);
+                self.last_can_feedback_instant = ages
+                    .iter()
+                    .copied()
+                    .try_fold(Duration::ZERO, |m, a| a.map(|t| m.max(t)))
+                    .and_then(|age| Instant::now().checked_sub(age));
+                self.core.poll_feedback(
+                    &mut self.joint_feedback_queue_bounds,
+                    self.config.dof,
+                    drv.as_ref(),
+                    &mut self.scratch.fb,
+                );
                 Self::apply_feedback(
                     &mut self.measured_positions,
                     &mut self.measured_velocities,
@@ -1481,67 +2042,133 @@ impl SupervisorInner {
                     &states,
                     loads.as_deref(),
                 );
-                if let Some(reason) = self.resting_pose_support_violation_with_driver(Some(drv.as_ref())) {
-                    return Err(SafetyError::ClearFaultRejected(format!(
-                        "Cannot disable faulted supporting arm joint away from resting pose ({reason}); support the arm at rest first"
-                    )));
+            }
+            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+            let thermal_below = fb_fresh
+                && caps.temperature_feedback
+                && !states.is_empty()
+                && states.iter().all(|s| s.temperature.is_finite() && s.temperature <= threshold);
+            // Cooldown accrues ONLY while temperature feedback is fresh; stale/unavailable temp resets it.
+            if thermal_below {
+                self.thermal_below_since.get_or_insert_with(Instant::now);
+            } else {
+                self.thermal_below_since = None;
+            }
+
+            let mut resting_feedback_missing = false;
+            let mut resting_pose_violation = None;
+            if needs_resting_check {
+                if !resting_fb_ok {
+                    resting_feedback_missing = true;
+                } else {
+                    resting_pose_violation =
+                        self.resting_pose_support_violation_bounded(Some(drv.as_ref()), &ages, &mut ws_bufs);
                 }
             }
-            // Clearing a latched motor error requires a later feedback observation, not a cleared cache.
-            if drv.check_hardware_status().is_err() {
-                drv.clear_fault().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-                return Err(SafetyError::ClearFaultRejected("Hardware reset sent; wait for fresh fault-free feedback before retrying".into()));
+            let enable_known = state != EnableState::Unknown || partial;
+            drop(drv);
+            self.ws_eval_bufs = ws_bufs;
+
+            ctx = self.build_clear_context_base(driver_err_override);
+            if clear_driver_err_field && driver_err_override.is_none() {
+                ctx.driver_config_error = None;
             }
-            let states = drv.read_joint_states().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-            let ages = drv.feedback_ages();
-            let loads = drv.joint_loads();
-            if !drv.is_feedback_valid() || ages.len() != self.config.dof
-                || ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)))
-                || !Self::states_valid(&states, drv.capabilities(), self.config.dof, loads.as_deref()) {
-                return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before resetting a fault".into()));
+            ctx.expected_epoch = expected_epoch;
+            ctx.pending_estop = self.estop_request_unapplied();
+            ctx.feedback_fresh = fb_fresh;
+            ctx.thermal_sensor_available = caps.temperature_feedback;
+            ctx.thermal_below_threshold = thermal_below;
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
+            ctx.resting_feedback_missing = resting_feedback_missing;
+            ctx.resting_pose_violation = resting_pose_violation;
+            ctx.hardware_reset_required = hw_fault;
+            ctx.enable_state_known = enable_known;
+
+            // Evaluate `clear_check` FIRST over EVERY recorded kind before any motor reset or
+            // `refresh_enable_state` side effect.
+            match self.safety.clear_check(&ctx) {
+                Ok(()) => {}
+                Err(ClearRefusal::EStopActive) => return Err(apply_estop_refusal(self)),
+                Err(ClearRefusal::HardwareResetRequired) => {
+                    // Explicitly modeled exception: every OTHER recorded kind's condition passed,
+                    // so transmitting the motor fault reset is now permitted; re-evaluate
+                    // `clear_check` immediately after the reset.
+                    let reset_res = {
+                        let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                        drv.clear_fault()
+                    };
+                    ctx.hardware_reset_required = false;
+                    ctx.pending_estop = self.estop_request_unapplied();
+                    match reset_res {
+                        Ok(()) => ctx.hardware_reset_sent = true,
+                        Err(e) => ctx.hardware_error = Some(clear_fault_driver_error(&e)),
+                    }
+                    let post_refusal = self.safety.clear_check(&ctx).unwrap_err();
+                    if post_refusal == ClearRefusal::EStopActive {
+                        return Err(apply_estop_refusal(self));
+                    }
+                    return Err(post_refusal.into_safety_error());
+                }
+                Err(ClearRefusal::EnableStateUnknown) if fb_fresh && !hw_fault && !partial => {
+                    // Every other condition passed; probe enable state once and re-run clear_check.
+                    {
+                        let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                        let _ = drv.refresh_enable_state();
+                        state = drv.enable_state();
+                        partial = drv.has_known_partial_enable();
+                        any_enabled = drv.has_any_joint_enabled();
+                    }
+                    ctx.enable_state_known = state != EnableState::Unknown || partial;
+                    ctx.pending_estop = self.estop_request_unapplied();
+                    if let Err(refusal) = self.safety.clear_check(&ctx) {
+                        if refusal == ClearRefusal::EStopActive {
+                            return Err(apply_estop_refusal(self));
+                        }
+                        return Err(refusal.into_safety_error());
+                    }
+                }
+                Err(refusal) => return Err(refusal.into_safety_error()),
             }
-            drv.check_hardware_status().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-            if thermal && (!drv.capabilities().temperature_feedback || states.iter().any(|state|
-                !state.temperature.is_finite() || state.temperature > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C)) {
-                return Err(SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into()));
-            }
-            let mut state = drv.enable_state();
-            let mut partial = drv.has_known_partial_enable();
-            let mut any_enabled = drv.has_any_joint_enabled();
-            if state == EnableState::Unknown && !partial {
-                let _ = drv.refresh_enable_state();
-                state = drv.enable_state();
-                partial = drv.has_known_partial_enable();
-                any_enabled = drv.has_any_joint_enabled();
-            }
-            if state == EnableState::Unknown && !partial {
-                return Err(SafetyError::ClearFaultRejected("Hardware enable state is unknown; reset remains latched".into()));
-            }
-            self.feedback_numeric_valid = true;
-            self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
-                .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-            self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, drv.as_ref(), &mut self.scratch.fb);
-            Self::apply_feedback(
-                &mut self.measured_positions,
-                &mut self.measured_velocities,
-                &mut self.torques,
-                &mut self.temperatures,
-                &mut self.loads,
-                self.config.dof,
-                &states,
-                loads.as_deref(),
-            );
+            commit_probed_limits(self);
             self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
-        } else if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
-            return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
+        } else {
+            let temps_copy = self.temperatures.clone();
+            self.update_thermal_cooldown_from_temps(&temps_copy);
+            ctx = self.build_clear_context_base(driver_err_override);
+            if clear_driver_err_field && driver_err_override.is_none() {
+                ctx.driver_config_error = None;
+            }
+            ctx.expected_epoch = expected_epoch;
+            ctx.pending_estop = self.estop_request_unapplied();
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
+            if let Err(refusal) = self.safety.clear_check(&ctx) {
+                if refusal == ClearRefusal::EStopActive {
+                    return Err(apply_estop_refusal(self));
+                }
+                return Err(refusal.into_safety_error());
+            }
+            commit_probed_limits(self);
         }
-        self.clear_fault_finish()
+        self.clear_fault_finish(&ctx)
     }
 
-    fn clear_fault_finish(&mut self) -> Result<SafetyState, SafetyError> {
+    fn clear_fault_finish(&mut self, ctx: &crate::safety::ClearContext) -> Result<SafetyState, SafetyError> {
+        self.clear_fault_finish_bounded(ctx).map_err(SafetyError::from)
+    }
+
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    fn clear_fault_finish_bounded(
+        &mut self,
+        ctx: &crate::safety::ClearContext,
+    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        use crate::safety::{ClearFaultError, ClearRefusal};
         if self.shutdown_committed {
-            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+            return Err(ClearFaultError::Rejected(ClearRefusal::ShutdownCommitted));
         }
+        // Single authoritative clear_check FIRST before mutating/resetting state.
+        self.safety.clear_check(ctx).map_err(ClearFaultError::Rejected)?;
         self.pending_rearm = true;
         if self.mit.owner == crate::mit::MitOwner::Lost {
             // cleared: a rearm (fresh readback, base modes restored) and a fresh handover follow
@@ -1562,9 +2189,19 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
-        Self::check_concurrent_estop(self)?;
+        if self.consume_pending_estop() {
+            if let Some(received) = ctx.expected_epoch {
+                if received != self.safety.epoch_id() {
+                    return Err(ClearFaultError::EpochMismatch {
+                        expected: self.safety.epoch_id(),
+                        received,
+                    });
+                }
+            }
+            return Err(ClearFaultError::EStopActive);
+        }
         let was_estop = *self.safety.state() == SafetyState::EStop;
-        let state = self.safety.clear_fault()?;
+        let state = self.safety.clear_with_check(ctx).map_err(ClearFaultError::from)?;
         self.handover_settling_since = None;
         if !was_estop && self.e_stop_latched.load(Ordering::SeqCst) {
             self.apply_stop_policy(StopPolicy::EStopLatch);
@@ -1574,111 +2211,341 @@ impl SupervisorInner {
         }
         self.e_stop_latched.store(false, Ordering::SeqCst);
         self.shutdown_refused_unknown = false;
-        Self::check_concurrent_estop(self)?;
+        if self.consume_pending_estop() {
+            return Err(ClearFaultError::EStopActive);
+        }
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
         Ok(state)
     }
 
-    /// Bounded fault clearing for the RT executor: uses Step 2's already-polled feedback
-    /// (zero extra `read_joint_states()` calls), refuses `MitOwner::Lost`, and sends hardware
-    /// resets only via [`ArmDriver::clear_fault_budgeted`] while preserving the reset latch
-    /// rule (a reset write never clears the fault on the same call).
-    pub fn clear_fault_executor(&mut self, deadline: Instant) -> Result<SafetyState, SafetyError> {
-        if self.shutdown_committed {
-            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+    fn measured_workspace_violation_bounded(
+        &self,
+        bufs: &mut crate::chain::EvalBufs,
+    ) -> Option<crate::safety::WorkspaceSupportViolation> {
+        use crate::safety::{BoundedText, WorkspaceSupportViolation};
+        let (ws, cam) = self.workspace_policy()?;
+        if self.config.arm_model.frames_f32(&self.measured_positions).is_none() {
+            return Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new("invalid"),
+                reason: BoundedText::new("non-finite or incomplete joint positions"),
+            });
         }
-        Self::check_concurrent_estop(self)?;
-        if self.driver_config_error.is_some() {
-            self.reapply_driver_limits();
+        if ws.self_collision_enabled && !ws.link_capsules.is_empty() && !ws.self_collision_pairs.is_empty()
+            && (!ws.self_collision_min_clearance_m.is_finite() || ws.self_collision_min_clearance_m < 0.0)
+        {
+            return Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new("invalid"),
+                reason: BoundedText::new("invalid self_collision_min_clearance_m"),
+            });
         }
-        if let Some(ref err) = self.driver_config_error {
-            return Err(SafetyError::ClearFaultRejected(format!("Driver limit configuration error: {err}")));
+        if let Some(cap) = ws.link_capsules.iter().find(|c| self.config.arm_model.resolve_frame(&c.frame).is_none()) {
+            let mut reason = BoundedText::<128>::empty();
+            let _ = core::fmt::write(&mut reason, format_args!("unknown frame '{}' for capsule '{}'", cap.frame, cap.id));
+            return Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new("invalid"),
+                reason,
+            });
         }
-        if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
-        if self.gravity_comp_blocks_clear() {
-            return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
+        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            &self.config.arm_model, ws, cam, self.config.tcp_offset, bufs,
+        );
+        let mut buf = eval.alloc_buf_in(bufs);
+        let violation = match eval.eval_into_in(&self.measured_positions, &mut buf, &mut bufs.world_caps, "clear_fault") {
+            Err(f) => Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new(&f.limit),
+                reason: BoundedText::new(f.detail.reason.as_deref().unwrap_or("invalid joint positions")),
+            }),
+            Ok(()) => buf.as_slice().iter().enumerate()
+                .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)
+                .map(|(slot, &clr)| describe_workspace_slot_bounded(&eval, ws, cam, self.config.tcp_offset, slot, clr)),
+        };
+        crate::chain::WorkspaceEvaluator::recycle_buf(buf, bufs);
+        eval.recycle(bufs);
+        violation
+    }
+
+    /// Allocation-free bounded equivalent of [`Self::resting_pose_support_violation_with_driver`].
+    pub(crate) fn resting_pose_support_violation_bounded(
+        &self,
+        drv: Option<&dyn ArmDriver>,
+        ages: &[Option<Duration>],
+        bufs: &mut crate::chain::EvalBufs,
+    ) -> Option<crate::safety::RestingSupportViolation> {
+        use crate::safety::{RestingSupportJointItem as Item, RestingSupportViolation as V, MAX_RESTING_SUPPORT_ITEMS};
+        let dof = self.config.dof;
+        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
+            return Some(V::FeedbackLengthMismatch);
         }
-        if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
-        if self.mit.owner == crate::mit::MitOwner::Lost {
-            return Err(SafetyError::ClearFaultRejected("UNSUPPORTED: MIT lost recovery requires legacy path".into()));
+        let Some(policy) = self.config.resting_pose.as_ref() else { return Some(V::NoRestingPoseConfigured); };
+        if self.driver.is_some() {
+            let Some(driver) = drv else { return Some(V::DriverFeedbackUnavailable); };
+            let caps = driver.capabilities();
+            if !caps.velocity_feedback { return Some(V::DriverLacksVelocityFeedback); }
+            if !policy.support_torque_limits.is_empty() && !caps.torque_feedback { return Some(V::DriverLacksTorqueFeedback); }
+            if !policy.support_load_limits.is_empty() && !caps.load_feedback { return Some(V::DriverLacksLoadFeedback); }
+            let max_age = Duration::from_millis(policy.feedback_max_age_ms);
+            if !self.feedback_numeric_valid || ages.len() != dof || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age)) {
+                return Some(V::FeedbackTooOld { max_age_ms: policy.feedback_max_age_ms });
+            }
         }
-        let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
+        let mut items = [None; MAX_RESTING_SUPPORT_ITEMS];
+        let mut len = 0usize;
+        let mut overflowed = 0u16;
+        for (i, &v) in self.measured_velocities.iter().enumerate().take(dof) {
+            let limit = policy.max_velocity_of(i);
+            if !v.is_finite() || v.abs() > limit {
+                if len < MAX_RESTING_SUPPORT_ITEMS {
+                    items[len] = Some(Item::JointMoving { joint: i as u16, velocity: v, limit });
+                    len += 1;
+                } else {
+                    overflowed = overflowed.saturating_add(1);
+                }
+            }
+        }
+        let mut total = 0.0;
+        let rest = self.config.resting_positions();
+        for (i, &tol) in policy.position_tolerances.iter().enumerate().take(dof) {
+            let dev = (self.measured_positions[i] - rest[i]).abs();
+            if !dev.is_finite() || dev > tol {
+                if len < MAX_RESTING_SUPPORT_ITEMS {
+                    items[len] = Some(Item::JointOffHome { joint: i as u16, deviation: dev, limit: tol });
+                    len += 1;
+                } else {
+                    overflowed = overflowed.saturating_add(1);
+                }
+            }
+            total += dev;
+        }
+        if len == 0 && total > policy.max_total_deviation {
+            items[0] = Some(Item::TotalDeviation { total, limit: policy.max_total_deviation });
+            len = 1;
+        }
+        if self.driver.is_some() {
+            for &(i, max_tau) in &policy.support_torque_limits {
+                if i >= dof { return Some(V::SupportTorqueIndexOutOfRange { index: i }); }
+                let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
+                if !tau.is_finite() || tau.abs() > max_tau {
+                    if len < MAX_RESTING_SUPPORT_ITEMS {
+                        items[len] = Some(Item::JointTorque { joint: i as u16, torque: tau, limit: max_tau });
+                        len += 1;
+                    } else {
+                        overflowed = overflowed.saturating_add(1);
+                    }
+                }
+            }
+            for &(i, max_load) in &policy.support_load_limits {
+                if i >= dof { return Some(V::SupportLoadIndexOutOfRange { index: i }); }
+                let load = self.loads.get(i).copied().unwrap_or(f32::NAN);
+                if !load.is_finite() || load.abs() > max_load {
+                    if len < MAX_RESTING_SUPPORT_ITEMS {
+                        items[len] = Some(Item::JointLoad { joint: i as u16, load, limit: max_load });
+                        len += 1;
+                    } else {
+                        overflowed = overflowed.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let mut workspace = self.measured_workspace_violation_bounded(bufs);
+        if workspace.is_some() && len >= MAX_RESTING_SUPPORT_ITEMS {
+            workspace = None;
+            overflowed = overflowed.saturating_add(1);
+        }
+        (len > 0 || workspace.is_some()).then_some(V::Failures { items, len: len as u8, overflowed, workspace })
+    }
+
+    /// Bounded, allocation-free fault clearing for the RT executor; refusal text is rendered off-thread.
+    /// `SafetyManager::clear_check` runs FIRST before any concurrent-E-stop mutation, driver limit
+    /// commit, motor reset, or other side effect.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    pub fn clear_fault_executor_bounded(&mut self, deadline: Instant) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        use crate::safety::{ClearFaultError as E, ClearRefusal as R};
+        let had_driver_config_error = self.driver_config_error.is_some();
+        let (candidate_limits, driver_err_override) = if had_driver_config_error {
+            match self.probe_driver_limits_bounded() {
+                Ok(cand) => (Some(cand), None),
+                Err(err) => (None, Some(err)),
+            }
+        } else {
+            (None, None)
+        };
+        let is_stopped_or_latched = self.safety.state().is_stopped() || self.safety.has_latched_fault();
+
+        if !is_stopped_or_latched {
+            let mut ctx = self.build_clear_context_base(driver_err_override);
+            if candidate_limits.is_some() {
+                ctx.driver_config_error = None;
+            }
+            ctx.pending_estop = self.estop_request_unapplied();
+            ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
+            if let Err(refusal) = self.safety.clear_check(&ctx) {
+                if refusal == R::EStopActive {
+                    self.consume_pending_estop();
+                    return Err(E::EStopActive);
+                }
+                return Err(E::from(refusal));
+            }
+            if let Some(ref cand) = candidate_limits {
+                self.commit_driver_limits_bounded(cand);
+            }
+            return Ok(self.safety.state().clone());
+        }
+
+        let mut ctx;
         if let Some(ref d) = self.driver {
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
-            let mut drv = match d.lock() {
+            let mut ws_bufs = std::mem::take(&mut self.ws_eval_bufs);
+            let drv = match d.lock() {
                 Ok(g) => g,
                 Err(_) => {
                     self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::FeedbackUnavailable);
+                    self.ws_eval_bufs = ws_bufs;
+                    return Err(E::FeedbackUnavailable);
                 }
             };
-            let disabling = drv.clear_fault_disables_joints();
-            if (self.is_torqued || drv.has_any_joint_enabled() || drv.enable_state() != EnableState::Disabled)
-                && disabling.iter().any(|&j| j < self.config.arm_dof())
-            {
-                drv.feedback_ages_into(&mut scratch_ages);
-                let max_age = self.resting_policy().map(|p| Duration::from_millis(p.feedback_max_age_ms)).unwrap_or(Duration::from_millis(250));
-                if !self.feedback_numeric_valid
-                    || !drv.is_feedback_valid()
-                    || scratch_ages.len() != self.config.dof
-                    || !scratch_ages.iter().all(|a| a.is_some_and(|t| t <= max_age))
-                {
-                    drop(drv);
-                    self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before checking resting pose support".into()));
-                }
-                if let Some(reason) = self.resting_pose_support_violation_with_driver(Some(drv.as_ref())) {
-                    drop(drv);
-                    self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::ClearFaultRejected(format!(
-                        "Cannot disable faulted supporting arm joint away from resting pose ({reason}); support the arm at rest first"
-                    )));
-                }
-            }
-            // Clearing a latched motor error requires a later fresh feedback observation.
-            if drv.check_hardware_status().is_err() {
-                let now = Instant::now();
-                if now >= deadline {
-                    drop(drv);
-                    self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::ClearFaultRejected("Clear fault budget expired".into()));
-                }
-                let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
-                let r = drv.clear_fault_budgeted(drv_deadline);
-                drop(drv);
-                self.scratch.ages = scratch_ages;
-                r.map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-                return Err(SafetyError::ClearFaultRejected("Hardware reset sent; wait for fresh fault-free feedback before retrying".into()));
-            }
+            // Pure read-only driver snapshot FIRST — ZERO motor resets or mutations.
             drv.feedback_ages_into(&mut scratch_ages);
             let ages_valid = scratch_ages.len() == self.config.dof
                 && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)));
             let fb_valid = drv.is_feedback_valid();
-            let hw_status = drv.check_hardware_status();
+            let hw_fault = drv.has_hardware_fault();
             let temp_fb = drv.capabilities().temperature_feedback;
             let state = drv.enable_state();
             let partial = drv.has_known_partial_enable();
             let any_enabled = drv.has_any_joint_enabled();
+            let needs_resting_check = (self.is_torqued || any_enabled || state != EnableState::Disabled)
+                && drv.clear_fault_disables_arm_joint(self.config.arm_dof());
+            let mut resting_feedback_missing = false;
+            let mut resting_pose_violation = None;
+            if needs_resting_check {
+                let max_age = self
+                    .config
+                    .resting_pose
+                    .as_ref()
+                    .map(|p| Duration::from_millis(p.feedback_max_age_ms))
+                    .unwrap_or(Duration::from_millis(250));
+                if !self.feedback_numeric_valid
+                    || !fb_valid
+                    || scratch_ages.len() != self.config.dof
+                    || !scratch_ages.iter().all(|a| a.is_some_and(|t| t <= max_age))
+                {
+                    resting_feedback_missing = true;
+                } else {
+                    resting_pose_violation = self.resting_pose_support_violation_bounded(
+                        Some(drv.as_ref()),
+                        &scratch_ages,
+                        &mut ws_bufs,
+                    );
+                }
+            }
             drop(drv);
             self.scratch.ages = scratch_ages;
-            if !self.feedback_numeric_valid || !fb_valid || !ages_valid {
-                return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before resetting a fault".into()));
+            self.ws_eval_bufs = ws_bufs;
+
+            let fb_fresh = self.feedback_numeric_valid && fb_valid && ages_valid;
+            // Cooldown accrues ONLY while temperature feedback is fresh; stale/unavailable temp resets it.
+            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+            let thermal_below = fb_fresh
+                && temp_fb
+                && !self.temperatures.is_empty()
+                && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold);
+            if thermal_below {
+                self.thermal_below_since.get_or_insert_with(Instant::now);
+            } else {
+                self.thermal_below_since = None;
             }
-            hw_status.map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-            if thermal && (!temp_fb || self.temperatures.iter().any(|t|
-                !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C))
-            {
-                return Err(SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into()));
+
+            ctx = self.build_clear_context_base(driver_err_override);
+            if candidate_limits.is_some() {
+                ctx.driver_config_error = None;
             }
-            if state == EnableState::Unknown && !partial {
-                return Err(SafetyError::ClearFaultRejected("Hardware enable state is unknown; reset remains latched".into()));
+            ctx.pending_estop = self.estop_request_unapplied();
+            ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
+            ctx.feedback_fresh = fb_fresh;
+            ctx.thermal_sensor_available = temp_fb;
+            ctx.thermal_below_threshold = thermal_below;
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
+            ctx.resting_feedback_missing = resting_feedback_missing;
+            ctx.resting_pose_violation = resting_pose_violation;
+            ctx.hardware_reset_required = hw_fault;
+            ctx.enable_state_known = state != EnableState::Unknown || partial;
+
+            // Evaluate `clear_check` FIRST over EVERY recorded kind before any motor reset or
+            // concurrent E-stop / config mutation.
+            match self.safety.clear_check(&ctx) {
+                Ok(()) => {}
+                Err(R::EStopActive) => {
+                    self.consume_pending_estop();
+                    return Err(E::EStopActive);
+                }
+                Err(R::HardwareResetRequired) => {
+                    // Explicitly modeled exception: every OTHER recorded kind's condition passed,
+                    // so a budgeted motor reset is now permitted; re-evaluate `clear_check` after.
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(E::Rejected(R::BudgetExpired));
+                    }
+                    let reset_res = {
+                        let mut drv = d.lock().map_err(|_| E::FeedbackUnavailable)?;
+                        let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
+                        drv.clear_fault_budgeted(drv_deadline)
+                    };
+                    ctx.hardware_reset_required = false;
+                    ctx.pending_estop = self.estop_request_unapplied();
+                    match reset_res {
+                        Ok(()) => ctx.hardware_reset_sent = true,
+                        Err(e) => ctx.hardware_error = Some(clear_fault_driver_error(&e)),
+                    }
+                    let post_refusal = self.safety.clear_check(&ctx).unwrap_err();
+                    if post_refusal == R::EStopActive {
+                        self.consume_pending_estop();
+                        return Err(E::EStopActive);
+                    }
+                    return Err(E::from(post_refusal));
+                }
+                Err(refusal) => return Err(E::from(refusal)),
+            }
+            if let Some(ref cand) = candidate_limits {
+                self.commit_driver_limits_bounded(cand);
             }
             self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
-        } else if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
-            return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
+        } else {
+            // Driverless simulation mode: update cooldown clock in place (0 alloc).
+            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+            if !self.temperatures.is_empty()
+                && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
+            {
+                self.thermal_below_since.get_or_insert_with(Instant::now);
+            } else {
+                self.thermal_below_since = None;
+            }
+            ctx = self.build_clear_context_base(driver_err_override);
+            if candidate_limits.is_some() {
+                ctx.driver_config_error = None;
+            }
+            ctx.pending_estop = self.estop_request_unapplied();
+            ctx.mit_lost_unsupported = self.mit.owner == crate::mit::MitOwner::Lost;
+            ctx.joint_limit_violation =
+                self.joint_limit_clear_violation_with_candidates(candidate_limits.as_ref());
+            if let Err(refusal) = self.safety.clear_check(&ctx) {
+                if refusal == R::EStopActive {
+                    self.consume_pending_estop();
+                    return Err(E::EStopActive);
+                }
+                return Err(E::from(refusal));
+            }
+            if let Some(ref cand) = candidate_limits {
+                self.commit_driver_limits_bounded(cand);
+            }
         }
-        self.clear_fault_finish()
+        self.clear_fault_finish_bounded(&ctx)
+    }
+
+    /// Bounded fault clearing for the RT executor rendered into [`SafetyError`] for direct callers.
+    pub fn clear_fault_executor(&mut self, deadline: Instant) -> Result<SafetyState, SafetyError> {
+        self.clear_fault_executor_bounded(deadline).map_err(SafetyError::from)
     }
 
     /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
@@ -1724,4 +2591,78 @@ impl SupervisorInner {
             Some(d) => d.lock().is_ok_and(|drv| drv.is_feedback_valid()),
         }
     }
+}
+
+fn clear_fault_driver_error(e: &crate::driver::ArmDriverError) -> crate::safety::ClearFaultDriverError {
+    e.to_clear_fault_error()
+}
+
+fn describe_workspace_slot_bounded(
+    eval: &crate::chain::WorkspaceEvaluator<'_>,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    tcp_offset: [f64; 3],
+    slot: usize,
+    clr: f64,
+) -> crate::safety::WorkspaceSupportViolation {
+    use crate::kinematics as k;
+    use crate::safety::{BoundedText, WorkspaceSupportViolation as W};
+    use core::fmt::Write as _;
+
+    let depth = -clr;
+    if slot >= eval.self_collision_slot_start {
+        let pi = slot - eval.self_collision_slot_start;
+        let (id_a, id_b) = ws.self_collision_pairs.get(pi).map_or(("?", "?"), |[a, b]| (a.as_str(), b.as_str()));
+        let (mut cid, mut gid, mut limit) = (BoundedText::empty(), BoundedText::empty(), BoundedText::empty());
+        let _ = write!(&mut cid, "self_collision:{id_a}:{id_b}");
+        let _ = write!(&mut gid, "capsule:{id_a}");
+        let _ = write!(&mut limit, "self_collision '{id_a}' vs '{id_b}'");
+        let ia = ws.link_capsules.iter().position(|c| c.id == id_a);
+        let ib = ws.link_capsules.iter().position(|c| c.id == id_b);
+        let point = match (ia, ib) { (Some(a), Some(b)) if a != b => eval.num_end_pts + a, _ => 0 };
+        let bound = f64::from(ws.self_collision_min_clearance_m);
+        return W::Constraint { limit, point, cid, gid, depth, value: bound + clr, bound };
+    }
+    if eval.has_reach && slot >= eval.num_geoms * eval.slots_per_geom {
+        let reach_idx = slot - eval.num_geoms * eval.slots_per_geom;
+        let bound = f64::from(ws.max_reach_m.unwrap_or(0.0));
+        let (point, gid) = if reach_idx == 0 {
+            (0, BoundedText::new("end_origin"))
+        } else {
+            let tcp_f32 = tcp_offset.map(|v| v as f32);
+            let pt = ws.check_points_end_m.iter()
+                .position(|c| (c[0] - tcp_f32[0]).abs() <= 1e-6 && (c[1] - tcp_f32[1]).abs() <= 1e-6 && (c[2] - tcp_f32[2]).abs() <= 1e-6)
+                .map_or(0, |i| i + 1);
+            (pt, BoundedText::new("tcp_origin"))
+        };
+        return W::Constraint { limit: BoundedText::new("reach"), point, cid: BoundedText::new("max_reach"), gid, depth, value: bound - clr, bound };
+    }
+    let (gi, ci) = (slot / eval.slots_per_geom, slot % eval.slots_per_geom);
+    let mut gid = BoundedText::empty();
+    if gi == 0 {
+        gid.push_str("end_origin");
+    } else if gi < eval.num_end_pts {
+        if cam.offset_m.is_some() && gi + 1 == eval.num_end_pts { gid.push_str("camera_mount"); }
+        else { let _ = write!(&mut gid, "end_point:{gi}"); }
+    } else {
+        let _ = write!(&mut gid, "capsule:{}", ws.link_capsules[gi - eval.num_end_pts].id);
+    }
+    let (mut limit, mut cid) = (BoundedText::empty(), BoundedText::empty());
+    let (value, bound) = if ci == 0 {
+        limit.push_str("floor"); cid.push_str("floor_z");
+        let b = f64::from(ws.floor_z_m); (b + clr, b)
+    } else if ci <= 3 {
+        let ax = ci - 1;
+        limit.push_str(k::BOX_LIMITS[ax][0]); cid.push_str(k::BOX_CONSTRAINT_IDS[ax][0]);
+        let b = f64::from(ws.box_min_m[ax]); (b + clr, b)
+    } else if ci <= 6 {
+        let ax = ci - 4;
+        limit.push_str(k::BOX_LIMITS[ax][1]); cid.push_str(k::BOX_CONSTRAINT_IDS[ax][1]);
+        let b = f64::from(ws.box_max_m[ax]); (b - clr, b)
+    } else {
+        let name = ws.keepout_boxes.get(ci - 7).map_or("?", |b| b.name.as_str());
+        let _ = write!(&mut limit, "keepout '{name}'"); let _ = write!(&mut cid, "keepout:{name}");
+        (depth, 0.0)
+    };
+    W::Constraint { limit, point: gi, cid, gid, depth, value, bound }
 }

@@ -300,6 +300,7 @@ impl SupervisorInner {
     pub(super) fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
         if let Some(g_idx) = self.config.gripper_index() {
             self.gripper_stream_target = targets.get(g_idx).copied().filter(|t| t.is_finite());
+            self.gripper_stream_lease = self.active_lease.as_ref().map(|l| l.generation);
             if self.gripper_stalled && targets.len() > g_idx && self.commanded_positions.len() > g_idx {
                 let delta = targets[g_idx] - self.commanded_positions[g_idx];
                 let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
@@ -484,7 +485,7 @@ impl SupervisorInner {
         &mut self,
         pending: crate::tracking::PendingFallback,
         gravity_output_enabled: bool,
-    ) -> Option<String> {
+    ) -> Option<crate::mit::OutputErrorText> {
         let crate::tracking::PendingFallback { step, ramp, prev_confirmed, other_depths } = pending;
         match step {
             Ok(fb) => {
@@ -529,7 +530,7 @@ impl SupervisorInner {
                     }
                     Some(Err(e)) => {
                         self.tracking.invalidate();
-                        Some(e.to_string())
+                        Some(e)
                     }
                     None => {
                         self.tracking.invalidate();
@@ -547,16 +548,16 @@ impl SupervisorInner {
                         }
                     }
                 }
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
                 self.tracking.invalidate();
-                if !self.safety.state().is_stopped() {
-                    self.safety.trigger_fault_coded(
-                        FaultCode::ServoNoBrake,
-                        FaultReason::Other(format!("Joint tracking fallback cannot brake within the limits: {why}")),
-                    );
-                }
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::formatted(FaultCode::ServoNoBrake, |buf| {
+                        let _ = core::fmt::write(buf, format_args!("Joint tracking fallback cannot brake within the limits: {why}"));
+                    }),
+                );
                 None
             }
         }
@@ -569,11 +570,17 @@ impl SupervisorInner {
         self.fail_live_policy_from_control("SERVO_INFEASIBLE",
             format!("Joint {} has an infeasible servo braking state", joint_idx + 1));
         let limit = &self.config.limits[joint_idx];
-        let reason = FaultReason::Other(format!(
-            "Joint '{}' has an invalid or infeasible servo braking state (q={}, v={}, limits=[{}, {}], vmax={}, amax={})",
-            limit.name, self.commanded_positions[joint_idx], self.commanded_velocities[joint_idx],
-            limit.min_position, limit.max_position, limit.max_velocity, limit.max_acceleration,
-        ));
+        let q = self.commanded_positions[joint_idx];
+        let v = self.commanded_velocities[joint_idx];
+        let detail = crate::safety::FaultDetail::formatted(FaultCode::ServoNoBrake, |buf| {
+            let _ = core::fmt::write(
+                buf,
+                format_args!(
+                    "Joint '{}' has an invalid or infeasible servo braking state (q={q}, v={v}, limits=[{}, {}], vmax={}, amax={})",
+                    limit.name, limit.min_position, limit.max_position, limit.max_velocity, limit.max_acceleration,
+                ),
+            );
+        });
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -581,8 +588,8 @@ impl SupervisorInner {
         self.tracking.invalidate();
         self.active_trajectory = None;
         self.commanded_velocities.fill(0.0);
-        self.target_positions = self.commanded_positions.clone();
-        self.safety.trigger_fault_coded(FaultCode::ServoNoBrake, reason);
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+        self.safety.latch(crate::safety::FaultKind::Other, detail);
     }
 }
 

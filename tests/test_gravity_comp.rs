@@ -378,7 +378,7 @@ async fn model_error_20_percent_sags_and_exits_to_hold() {
     let exit_tick = exit_tick.expect("exit");
     let at_exit = r.q();
     let obs = r.sup.get_observation().await;
-    let exit_code = obs.gravity_comp.last_exit.as_ref().unwrap().code.clone();
+    let exit_code = obs.gravity_comp.last_exit.as_ref().unwrap().code;
     assert!(exit_code == "GRAVITY_COMP_SAG" || exit_code == "GRAVITY_COMP_OVERSPEED", "{exit_code}");
     until_position(&r, 20, true).await;
     r.ticks(25).await;

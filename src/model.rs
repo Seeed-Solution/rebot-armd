@@ -719,9 +719,21 @@ pub struct GripperPolicy {
     /// when the stream ends. Gripper actions (grasp) keep their own contact handling. Absent: off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_contact_speed_rad_s: Option<f32>,
+    /// J7 speed (rad/s) of closing gripper steps that armd plans itself: grasp, place and
+    /// sequence closes and moves, and every closing stroke of `gripper_calibrate`. Absent:
+    /// [`DEFAULT_CLOSE_SPEED_RAD_S`]. A gripper action keeps its own `speed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_speed_rad_s: Option<f32>,
 }
 
+/// Default `gripper_policy.close_speed_rad_s` (rad/s): the grasp contact speed
+/// (`motion::GRIPPER_CONTACT_SPEED`).
+pub const DEFAULT_CLOSE_SPEED_RAD_S: f32 = 0.3;
+
 impl GripperPolicy {
+    /// `close_speed_rad_s` or [`DEFAULT_CLOSE_SPEED_RAD_S`] (rad/s).
+    pub fn close_speed(&self) -> f64 { f64::from(self.close_speed_rad_s.unwrap_or(DEFAULT_CLOSE_SPEED_RAD_S)) }
+
     /// Thresholds from the MIT-mode project; holding torque and squeeze need verification in POS_VEL.
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
@@ -749,6 +761,7 @@ impl GripperPolicy {
             // the grasp contact speed (motion::GRIPPER_CONTACT_SPEED): one 20 ms tick adds
             // 0.006 rad of lead, 0.18 N·m on a 30 N·m/rad contact
             stream_contact_speed_rad_s: Some(0.3),
+            close_speed_rad_s: None,
         }
     }
 
@@ -835,6 +848,9 @@ pub fn validate_effective_gripper_policy_with_mode(
         || !positive(g.stream_contact_speed_rad_s)
     {
         return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm, max_lead_rad and stream_contact_speed_rad_s must be positive".into());
+    }
+    if g.close_speed_rad_s.is_some_and(|v| !(v.is_finite() && v > 0.0 && v <= 2.0)) {
+        return Err("Invalid gripper policy: close_speed_rad_s must be in (0, 2] rad/s".into());
     }
     if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
         if contact >= cap {
@@ -2177,12 +2193,19 @@ impl ArmConfig {
             }
         }
         if let (Some(g), Some(dg)) = (self.gripper_index(), &self.damiao_gripper) {
-            if dg.mode == DamiaoGripperMode::PosForce
-                && self.limits.get(g).is_some_and(|l| DamiaoGripperDrive::quantize_vel_raw(l.max_velocity) == 0)
-            {
-                return Err(format!(
-                    "Joint {g} max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
-                ));
+            if dg.mode == DamiaoGripperMode::PosForce {
+                if self.limits.get(g).is_some_and(|l| DamiaoGripperDrive::quantize_vel_raw(l.max_velocity) == 0) {
+                    return Err(format!(
+                        "Joint {g} max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
+                    ));
+                }
+                if let Some(gp) = &self.gripper_policy {
+                    if DamiaoGripperDrive::quantize_vel_raw_f64(gp.close_speed()) == 0 {
+                        return Err(
+                            "gripper_policy.close_speed_rad_s encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)".into()
+                        );
+                    }
+                }
             }
         }
         if self.home_positions.iter().zip(&self.limits).any(|(p, l)| !p.is_finite() || *p < l.min_position || *p > l.max_position) {
@@ -2393,6 +2416,25 @@ pub struct GripperObs {
     /// Torque cap trips since start.
     #[serde(default)]
     pub force_limit_trips: u64,
+    /// Learned free-motion torque of the jaw (`crate::gripper_baseline`); absent from older armd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<GripperBaselineObs>,
+}
+
+/// `observation.gripper.baseline`: state of the learned free-motion torque baseline.
+/// Stored inline (`HolderLabel`) so `fill_observation` does zero heap allocations per tick.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct GripperBaselineObs {
+    /// `"unlearned"`, `"learning"` or `"learned"`.
+    pub state: HolderLabel,
+    /// Unloaded moves learned per direction.
+    pub close_moves: u64,
+    pub open_moves: u64,
+    /// Moves with a position bin rejected as an outlier (not learned).
+    pub rejected_moves: u64,
+    /// Last grasp contact verdict: torque, threshold, baseline and margin (|τ| − baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_contact: Option<crate::gripper_baseline::ContactInfo>,
 }
 
 /// A short label stored inline (at most [`HolderLabel::CAPACITY`] bytes): a lease holder's
@@ -2487,6 +2529,23 @@ impl<'de> Deserialize<'de> for HolderLabel {
     }
 }
 
+/// Reusable heap `String` buffer parked on an [`ArmObservation`] slot while `safety_state`
+/// does not own a string (`Idle`, `Armed`, `EStop`, `ThermalTrip`, `BusLoss`, `WatchdogTimeout`).
+/// Ignored by `PartialEq` and `serde`; cloned empty for off-thread snapshots so only RT
+/// triple-buffer slots carry preallocated capacity.
+#[derive(Debug, Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) struct SafetyTextSpare(String);
+
+impl PartialEq for SafetyTextSpare {
+    fn eq(&self, _other: &Self) -> bool { true }
+}
+
+impl Clone for SafetyTextSpare {
+    fn clone(&self) -> Self { Self(String::new()) }
+    fn clone_from(&mut self, _source: &Self) {}
+}
+
 /// Full arm telemetry / observation
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArmObservation {
@@ -2575,7 +2634,16 @@ pub struct ArmObservation {
     /// Active or most recent policy-runtime run; omitted when none has run or feature disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyObservation>,
+    /// Monotonic count of deferred safety log events dropped on overflow (never reset); omitted while zero.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub safety_log_dropped: u64,
+    /// Preallocated string buffer moved into/out of `safety_state` (`FaultReason::Other` /
+    /// `JointLimitExceeded`) so RT `fill_observation` transitions perform 0 heap allocations or drops.
+    #[serde(skip)]
+    pub(crate) safety_text_spare: SafetyTextSpare,
 }
+
+fn is_zero_u64(v: &u64) -> bool { *v == 0 }
 
 impl ArmObservation {
     /// An observation with every field empty (filled by `SupervisorInner::fill_observation`).
@@ -2588,12 +2656,82 @@ impl ArmObservation {
             action: None, previous_action: None, control_mode: ControlMode::default(), gravity_comp: GravityCompObservation::default(),
             driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
-            loads: None, policy: None,
+            loads: None, policy: None, safety_log_dropped: 0,
+            safety_text_spare: SafetyTextSpare(String::new()),
+        }
+    }
+
+    /// Blank observation for an RT triple-buffer slot with preallocated `safety_state` text capacity.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn blank_rt() -> Self {
+        let mut obs = Self::blank();
+        obs.safety_text_spare = SafetyTextSpare(String::with_capacity(crate::safety::SAFETY_LOG_TEXT_CAPACITY));
+        obs
+    }
+
+    /// Updates `self.safety_state` to match `next`, recycling any owned `String` buffer between
+    /// `self.safety_state` and `self.safety_text_spare` so transitions perform 0 heap ops on RT slots.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_safety_state(&mut self, next: &SafetyState) {
+        use crate::safety::FaultReason;
+        if self.safety_state == *next {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.safety_state, SafetyState::Idle);
+        let existing_buf = match prev {
+            SafetyState::Fault(FaultReason::Other(s)) => Some(s),
+            SafetyState::Fault(FaultReason::JointLimitExceeded { joint_name, .. }) => Some(joint_name),
+            _ => None,
+        };
+        match next {
+            SafetyState::Fault(FaultReason::Other(src)) => {
+                let mut buf = existing_buf.unwrap_or_else(|| std::mem::take(&mut self.safety_text_spare.0));
+                buf.clear();
+                buf.push_str(src);
+                self.safety_state = SafetyState::Fault(FaultReason::Other(buf));
+            }
+            SafetyState::Fault(FaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max }) => {
+                let mut buf = existing_buf.unwrap_or_else(|| std::mem::take(&mut self.safety_text_spare.0));
+                buf.clear();
+                buf.push_str(joint_name);
+                self.safety_state = SafetyState::Fault(FaultReason::JointLimitExceeded {
+                    joint_idx: *joint_idx,
+                    joint_name: buf,
+                    value: *value,
+                    min: *min,
+                    max: *max,
+                });
+            }
+            other => {
+                if let Some(mut buf) = existing_buf {
+                    buf.clear();
+                    if self.safety_text_spare.0.capacity() == 0 {
+                        self.safety_text_spare.0 = buf;
+                    }
+                }
+                self.safety_state = match other {
+                    SafetyState::Booting => SafetyState::Booting,
+                    SafetyState::Idle => SafetyState::Idle,
+                    SafetyState::Armed => SafetyState::Armed,
+                    SafetyState::Moving => SafetyState::Moving,
+                    SafetyState::EStop => SafetyState::EStop,
+                    SafetyState::Fault(FaultReason::BusLoss) => SafetyState::Fault(FaultReason::BusLoss),
+                    SafetyState::Fault(FaultReason::WatchdogTimeout) => SafetyState::Fault(FaultReason::WatchdogTimeout),
+                    SafetyState::Fault(FaultReason::ThermalTrip { joint_idx, temperature, limit }) => {
+                        SafetyState::Fault(FaultReason::ThermalTrip {
+                            joint_idx: *joint_idx,
+                            temperature: *temperature,
+                            limit: *limit,
+                        })
+                    }
+                    SafetyState::Fault(FaultReason::Other(_) | FaultReason::JointLimitExceeded { .. }) => unreachable!(),
+                };
+            }
         }
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, safety_log_dropped, safety_text_spare });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -2701,25 +2839,21 @@ pub enum ControlMode {
 }
 
 /// A code with a human-readable message (entry blocker or exit reason).
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+/// Inline storage keeps observation publishing (`fill_observation`) allocation-free on the control thread.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ModeReason {
-    /// Static text in every case but formatted messages: building one does not allocate.
-    pub code: std::borrow::Cow<'static, str>,
-    pub message: std::borrow::Cow<'static, str>,
+    pub code: crate::safety::BoundedText<48>,
+    pub message: crate::safety::BoundedText<256>,
 }
 
-crate::fieldwise_clone!(ModeReason { code, message });
-
 /// Why the last gravity-compensation session ended.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct GravityCompExit {
-    pub code: String,
-    pub message: String,
+    pub code: HolderLabel,
+    pub message: HolderLabel,
     /// Observation timestamp of the exit (s).
     pub at: f64,
 }
-
-crate::fieldwise_clone!(GravityCompExit { code, message, at });
 
 /// Gravity-compensation state published with every observation.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -2875,6 +3009,11 @@ pub struct Capabilities {
     /// Absent (false) from older armd.
     #[serde(default)]
     pub grasp_measure: bool,
+    /// Grasp dry run `strategy: "adaptive"` (pose selection over approach directions and
+    /// contacts, `pose_preferences`, `evidence`, `budget_ms`): `grasp` on a 6-DOF arm. Absent
+    /// (false) from older armd.
+    #[serde(default)]
+    pub grasp_select: bool,
     /// Action `/api/v1/action/measure_multiview` (lease, operator session): motion-stereo object
     /// measurement from views around the object (`ActionStatus.measurement`); same value as `grasp`.
     /// Absent (false) from older armd.
@@ -3204,6 +3343,7 @@ impl Capabilities {
             yaw_outward: arm_with_gripper && kin,
             move_path_joint: arm_with_gripper && kin,
             grasp_measure: grasp,
+            grasp_select: grasp && config.arm_dof() == 6,
             measure_multiview: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),

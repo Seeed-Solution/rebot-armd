@@ -106,6 +106,7 @@ impl SupervisorInner {
         self.workspace_revision += 1;
         self.servo_ws_min_depths = None;
         self.keepout.revision += 1;
+        self.prepare_workspace_eval_bufs();
         Ok(())
     }
 }

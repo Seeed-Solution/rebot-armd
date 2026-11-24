@@ -13,6 +13,9 @@
 //! - Occlusion: each view may carry image rectangles it cannot see through (the gripper jaws);
 //!   grid cells under them are not observed by that view and do not vote there (a cell no view
 //!   observes takes the majority of all views).
+//! - Alignment: each view's mask is moved by at most `align_max_m` per axis (1 mm steps) to the
+//!   shift with the best IoU against the reference view (the one agreeing best with the others),
+//!   absorbing pose and calibration residuals before the vote.
 //! - Agreement: pairwise IoU over the cells both views observe; the largest group of at least
 //!   `min_views` views with every pair at `min_iou` or more is kept (ties: the higher mean IoU).
 //! - Fusion: a cell is occupied when more than half of the kept views that observe it see it
@@ -65,11 +68,17 @@ pub struct FootprintParams {
     pub tolerance: f64,
     /// Sides differing by less than this fraction of the long side: yaw indeterminate.
     pub square_ratio: f64,
+    /// Largest shift (m, per axis) a view's mask may be moved to align with the reference view
+    /// before the vote (pose and calibration residuals); 0: no alignment.
+    pub align_max_m: f64,
 }
+
+/// [`FootprintParams::align_max_m`] in grid cells.
+fn align_cells(p: &FootprintParams) -> usize { if p.cell_m > 0.0 { (p.align_max_m / p.cell_m).round().max(0.0) as usize } else { 0 } }
 
 impl Default for FootprintParams {
     fn default() -> Self {
-        Self { cell_m: 0.001, max_extent_m: 0.5, min_views: 2, min_iou: 0.6, max_ray_angle_deg: 70.0, tolerance: 0.10, square_ratio: 0.10 }
+        Self { cell_m: 0.001, max_extent_m: 0.5, min_views: 2, min_iou: 0.6, max_ray_angle_deg: 70.0, tolerance: 0.10, square_ratio: 0.10, align_max_m: 0.003 }
     }
 }
 
@@ -106,6 +115,12 @@ pub struct Footprint {
     pub max_ray_angle_deg: f64,
     /// Silhouettes not used: (view, reason).
     pub rejected: Vec<(usize, String)>,
+    /// Shift applied to each fused view's mask before the vote (m, in-plane axes e1, e2).
+    pub view_shifts_m: Vec<[f64; 2]>,
+    /// Diagnostic: the fused region's tip-to-tip span (its diameter) and its extent
+    /// perpendicular to that line (m); `width_m` stays the minimum-area rectangle's.
+    pub chord_length_m: f64,
+    pub chord_width_m: f64,
 }
 
 /// An orthonormal frame of the table plane: unit normal `n` (up), offset `d` (height = n . x + d),
@@ -221,18 +236,20 @@ pub struct Grid {
 }
 
 impl Grid {
-    /// Covering all `polys` with a one-cell margin; None when empty or larger than `max_extent`.
-    pub fn covering(polys: &[&[[f64; 2]]], cell: f64, max_extent: f64) -> Option<Self> {
+    /// Covering all `polys` with a margin of `margin` cells (at least one); None when empty or
+    /// larger than `max_extent`.
+    pub fn covering(polys: &[&[[f64; 2]]], cell: f64, max_extent: f64, margin: usize) -> Option<Self> {
+        let mg = margin.max(1) as f64;
         let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
         for p in polys.iter().flat_map(|p| p.iter()) {
             for k in 0..2 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); }
         }
         if !(lo[0].is_finite() && hi[0].is_finite() && lo[1].is_finite() && hi[1].is_finite()) || cell <= 0.0 { return None; }
         if hi[0] - lo[0] > max_extent || hi[1] - lo[1] > max_extent { return None; }
-        let u0 = (lo[0] / cell).floor() * cell - cell;
-        let v0 = (lo[1] / cell).floor() * cell - cell;
-        let nu = ((hi[0] - u0) / cell).ceil() as usize + 2;
-        let nv = ((hi[1] - v0) / cell).ceil() as usize + 2;
+        let u0 = (lo[0] / cell).floor() * cell - mg * cell;
+        let v0 = (lo[1] / cell).floor() * cell - mg * cell;
+        let nu = ((hi[0] - u0) / cell).ceil() as usize + 1 + mg as usize;
+        let nv = ((hi[1] - v0) / cell).ceil() as usize + 1 + mg as usize;
         Some(Self { u0, v0, cell, nu, nv })
     }
 
@@ -385,7 +402,7 @@ struct Masks {
 
 fn rasterize_all(proj: &[&Projected], p: &FootprintParams) -> Option<Masks> {
     let polys: Vec<&[[f64; 2]]> = proj.iter().map(|q| q.poly.as_slice()).collect();
-    let grid = Grid::covering(&polys, p.cell_m, p.max_extent_m)?;
+    let grid = Grid::covering(&polys, p.cell_m, p.max_extent_m, align_cells(p) + 1)?;
     let occ = proj.iter().map(|q| grid.rasterize(&q.poly)).collect();
     let obs = proj.iter().map(|q| {
         let mut hidden = vec![false; grid.nu * grid.nv];
@@ -419,6 +436,70 @@ fn fuse(m: &Masks, keep: &[usize]) -> Vec<bool> {
         }
         if seen > 0 { 2 * votes > seen } else { 2 * all > keep.len() }
     }).collect()
+}
+
+/// `mask` moved by (di, dj) cells; cells moved in from outside take `fill`.
+fn shifted(g: &Grid, mask: &[bool], di: i64, dj: i64, fill: bool) -> Vec<bool> {
+    let (nu, nv) = (g.nu as i64, g.nv as i64);
+    let mut out = vec![fill; mask.len()];
+    for j in 0..nv {
+        let sj = j - dj;
+        if sj < 0 || sj >= nv { continue; }
+        for i in 0..nu {
+            let si = i - di;
+            if si < 0 || si >= nu { continue; }
+            out[(j * nu + i) as usize] = mask[(sj * nu + si) as usize];
+        }
+    }
+    out
+}
+
+/// Aligns every view's masks to the reference view (the one agreeing best with the others): the
+/// shift within +-`max` cells per axis with the highest IoU, the smallest such shift on ties.
+/// Returns the shifts (cells).
+fn align(m: &mut Masks, max: usize) -> Vec<[i64; 2]> {
+    let n = m.occ.len();
+    let mut shifts = vec![[0i64; 2]; n];
+    if max == 0 || n < 2 { return shifts; }
+    let r = (0..n).max_by(|&a, &b| {
+        let s = |x: usize| (0..n).filter(|&y| y != x).map(|y| iou(m, x, y)).sum::<f64>();
+        s(a).total_cmp(&s(b))
+    }).unwrap_or(0);
+    let mx = max as i64;
+    let mut cand: Vec<[i64; 2]> = (-mx..=mx).flat_map(|a| (-mx..=mx).map(move |b| [a, b])).collect();
+    cand.sort_by_key(|s| s[0] * s[0] + s[1] * s[1]);
+    for i in (0..n).filter(|&i| i != r) {
+        let (occ0, obs0) = (m.occ[i].clone(), m.obs[i].clone());
+        let mut best = (iou(m, r, i), [0i64, 0]);
+        for s in cand.iter().skip(1) {
+            m.occ[i] = shifted(&m.grid, &occ0, s[0], s[1], false);
+            m.obs[i] = shifted(&m.grid, &obs0, s[0], s[1], true);
+            let v = iou(m, r, i);
+            if v > best.0 + 1e-9 { best = (v, *s); }
+        }
+        m.occ[i] = shifted(&m.grid, &occ0, best.1[0], best.1[1], false);
+        m.obs[i] = shifted(&m.grid, &obs0, best.1[0], best.1[1], true);
+        shifts[i] = best.1;
+    }
+    shifts
+}
+
+/// Tip-to-tip span of a convex hull (its diameter) and its extent perpendicular to that line.
+pub fn chord_extent(hull: &[[f64; 2]]) -> Option<(f64, f64)> {
+    let mut best = (0.0, 0, 0);
+    for i in 0..hull.len() {
+        for j in i + 1..hull.len() {
+            let d = d2(hull[i], hull[j]);
+            if d > best.0 { best = (d, i, j); }
+        }
+    }
+    if best.0 <= 0.0 { return None; }
+    let (a, b) = (hull[best.1], hull[best.2]);
+    let len = best.0.sqrt();
+    let (ux, uy) = ((b[0] - a[0]) / len, (b[1] - a[1]) / len);
+    let t: Vec<f64> = hull.iter().map(|p| -(p[0] - a[0]) * uy + (p[1] - a[1]) * ux).collect();
+    let w = t.iter().copied().fold(f64::NEG_INFINITY, f64::max) - t.iter().copied().fold(f64::INFINITY, f64::min);
+    Some((len, w))
 }
 
 /// The largest group of views with every pair at `min_iou` or more; ties: higher mean IoU.
@@ -467,7 +548,8 @@ pub fn footprint(cams: &[Camera], sils: &[Silhouette], plane: [f64; 4], height_m
         return Err(format!("{} silhouettes projected (minimum {})", ok_proj.len(), p.min_views));
     }
     let refs: Vec<&Projected> = ok_proj.iter().collect();
-    let m = rasterize_all(&refs, p).ok_or("footprint_too_large")?;
+    let mut m = rasterize_all(&refs, p).ok_or("footprint_too_large")?;
+    let shifts = align(&mut m, align_cells(p));
     let n = refs.len();
     let mut ious = vec![vec![1.0; n]; n];
     for a in 0..n { for b in a + 1..n { let v = iou(&m, a, b); ious[a][b] = v; ious[b][a] = v; } }
@@ -478,6 +560,9 @@ pub fn footprint(cams: &[Camera], sils: &[Silhouette], plane: [f64; 4], height_m
     }
     let fused = fuse(&m, &keep);
     let rect = mask_rect(&m.grid, &fused).ok_or("empty_fused_footprint")?;
+    // the chord diagnostic on the same hull as the rectangle (centres, grown by one cell)
+    let (chord_length_m, chord_width_m) = chord_extent(&convex_hull(&mask_outline_points(&m.grid, &fused)))
+        .map_or((0.0, 0.0), |(l, w)| (l + m.grid.cell, w + m.grid.cell));
     if rect.long <= 0.0 || rect.short <= 0.0 { return Err("empty_fused_footprint".into()); }
     let (a_long, a_short) = rect.axes();
     let view_spans_m: Vec<[f64; 2]> = keep.iter().map(|&k| {
@@ -536,15 +621,18 @@ pub fn footprint(cams: &[Camera], sils: &[Silhouette], plane: [f64; 4], height_m
         height_sensitivity_m: sens,
         max_ray_angle_deg: keep.iter().map(|&k| refs[k].angle).fold(0.0, f64::max),
         rejected,
+        view_shifts_m: keep.iter().map(|&k| [shifts[k][0] as f64 * m.grid.cell, shifts[k][1] as f64 * m.grid.cell]).collect(),
+        chord_length_m,
+        chord_width_m,
     })
 }
 
 // ---- contours of binary masks ----
 
 /// Exterior contour of the largest 4-connected component of a binary mask (`w` x `h`, row-major,
-/// non-zero = set), traced along pixel edges: vertices at pixel corners (x, y in pixel units, the
-/// mask's top-left corner at 0, 0), clockwise in image coordinates, corners only. Empty when the
-/// mask is empty.
+/// non-zero = set): one vertex per boundary pixel edge, at its midpoint (x, y in pixel units, the
+/// mask's top-left corner at 0, 0), clockwise in image coordinates (rebot-vision's tracing without
+/// logits). Empty when the mask is empty.
 pub fn trace_exterior(mask: &[u8], w: usize, h: usize) -> Vec<[f64; 2]> {
     let Some(lab) = largest_component(mask, w, h) else { return Vec::new() };
     trace_component(&lab, w, h)
@@ -605,21 +693,19 @@ fn trace_component(m: &[u8], w: usize, h: usize) -> Vec<[f64; 2]> {
     for _ in 0..limit {
         let (fl, fr) = ahead(x, y, d);
         let nd = if !fr { (d + 1) % 4 } else if fl { (d + 3) % 4 } else { d };
-        if nd != d { out.push([x as f64, y as f64]); }
         d = nd;
         if !fr || fl {
             // turned: the step is taken from the same vertex in the new direction next round
             if x == sx && y == sy && d == 0 && !out.is_empty() { break; }
             continue;
         }
+        // one boundary step: the midpoint of the pixel edge (the 0.5 level between the inside and
+        // the outside pixel centre of a binary mask; no half-pixel overshoot at corners)
+        out.push([x as f64 + 0.5 * D[d].0 as f64, y as f64 + 0.5 * D[d].1 as f64]);
         x += D[d].0;
         y += D[d].1;
         if x == sx && y == sy && d == 0 { break; }
     }
-    // the start vertex is a corner (top-left of the first pixel): make it the first vertex
-    if let Some(k) = out.iter().position(|p| p[0] == sx as f64 && p[1] == sy as f64) { out.rotate_left(k); }
-    out.dedup();
-    if out.len() > 1 && out.first() == out.last() { out.pop(); }
     out
 }
 
@@ -648,7 +734,12 @@ pub fn simplify_closed(input: &[[f64; 2]], eps: f64, max_vertices: usize) -> Vec
     dp(&poly, 0, far, e, &mut keep);
     dp_wrap(&poly, far, e, &mut keep);
     let mut out: Vec<[f64; 2]> = poly.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
-    if out.len() < 3 { out = poly; }
+    if out.len() < 3 {
+        // a thin outline can lose all but its two extremes: add the vertex farthest from their chord
+        let bi = (1..poly.len()).filter(|&k| k != far)
+            .max_by(|&a, &b| seg_dist(poly[a], poly[0], poly[far]).total_cmp(&seg_dist(poly[b], poly[0], poly[far]))).unwrap_or(1);
+        out = poly.iter().enumerate().filter(|(k, _)| *k == 0 || *k == far || *k == bi).map(|(_, p)| *p).collect();
+    }
     subsample(&out, cap)
 }
 
@@ -948,6 +1039,31 @@ mod tests {
     }
 
     #[test]
+    fn alignment_undoes_small_misregistration_and_chord_spans_tip_to_tip() {
+        let h = 0.01;
+        let out: Vec<Vec3> = box_corners([0.3, 0.0], 0.10, 0.04, 0.0, 0.0)[..4].iter().map(|x| [x[0], x[1], 0.5 * h]).collect();
+        // two views (both must vote): view 1 misregistered by 2.5 mm across the box
+        let cams = views([0.3, 0.0, 0.0], 2, 0.3, 5.0);
+        let mut sils: Vec<Silhouette> = cams.iter().enumerate().map(|(k, c)| silhouette(c, &out, k)).collect();
+        let a = cams[1].project(&[0.3, 0.0, 0.5 * h]).unwrap();
+        let b = cams[1].project(&[0.3, 0.0025, 0.5 * h]).unwrap();
+        for p in &mut sils[1].poly_px { p[0] += b[0] - a[0]; p[1] += b[1] - a[1]; }
+        let plane = [0.0, 0.0, 1.0, 0.0];
+        let off = footprint(&cams, &sils, plane, h, &FootprintParams { align_max_m: 0.0, ..FootprintParams::default() }).unwrap();
+        let on = footprint(&cams, &sils, plane, h, &FootprintParams::default()).unwrap();
+        assert!(off.width_m < 0.0385, "{off:?}");
+        assert_eq!(off.view_shifts_m, vec![[0.0, 0.0], [0.0, 0.0]]);
+        assert!((on.width_m - 0.04).abs() < 0.0015 && (on.length_m - 0.10).abs() < 0.0015, "{on:?}");
+        assert_eq!(on.view_shifts_m.len(), 2);
+        assert!(on.view_shifts_m.iter().all(|s| s[0].abs() <= 0.003 + 1e-12 && s[1].abs() <= 0.003 + 1e-12));
+        // a rectangle: the chord is its diagonal and the perpendicular extent its height on it
+        let rect = [[0.0, 0.0], [0.10, 0.0], [0.10, 0.04], [0.0, 0.04]];
+        let (l, w) = chord_extent(&rect).unwrap();
+        let d = 0.10f64.hypot(0.04);
+        assert!((l - d).abs() < 1e-12 && (w - 2.0 * 0.10 * 0.04 / d).abs() < 1e-12);
+    }
+
+    #[test]
     fn occluded_cells_do_not_vote() {
         let h = 0.02;
         let out: Vec<Vec3> = box_corners([0.3, 0.0], 0.08, 0.03, 0.0, 0.0)[..4].iter().map(|x| [x[0], x[1], 0.5 * h]).collect();
@@ -1005,12 +1121,14 @@ mod tests {
         m[4 * w] = 1;
         m[4 * w + 5] = 1;
         let c = trace_exterior(&m, w, h);
-        assert_eq!(c, vec![[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [1.0, 3.0], [1.0, 5.0], [0.0, 5.0]]);
-        assert!((polygon_area2(&c).abs() * 0.5 - 11.0).abs() < 1e-12);
+        let s = simplify_closed(&c, 0.01, 128);
+        assert_eq!(s, vec![[0.5, 0.0], [2.5, 0.0], [3.0, 0.5], [3.0, 2.5], [2.5, 3.0], [1.5, 3.0], [1.0, 3.5], [1.0, 4.5], [0.5, 5.0], [0.0, 4.5], [0.0, 0.5]]);
+        // 11 pixels, 5 convex corners cut by a triangle of 1/8, the concave one filled by 1/8
+        assert!((polygon_area2(&s).abs() * 0.5 - (11.0 - 4.0 * 0.125)).abs() < 1e-12);
         // diagonal neighbours are separate components
         let mut d = vec![0u8; 4];
         d[0] = 1; d[3] = 1;
-        assert_eq!(trace_exterior(&d, 2, 2).len(), 4);
+        assert_eq!(trace_exterior(&d, 2, 2), vec![[1.5, 1.0], [2.0, 1.5], [1.5, 2.0], [1.0, 1.5]]);
         assert!(trace_exterior(&[0u8; 4], 2, 2).is_empty());
         // a disk: many staircase vertices, simplified under the cap
         let (w, h) = (101, 101);

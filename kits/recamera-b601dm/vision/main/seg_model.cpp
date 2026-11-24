@@ -185,7 +185,8 @@ ma_err_t SegModel::postprocess() {
                 det.grasp_width_px = static_cast<float>(cs.width_px);
             }
             // the outline before mask_buf_ is reused: crop cells -> input pixels -> normalised input
-            det.contour = rv::mask_exterior_contour(mask_buf_.data(), crop_w, crop_h, crop_w);
+            det.contour = rv::mask_exterior_contour(mask_buf_.data(), crop_w, crop_h, crop_w, rv::kMaxContourVertices, 0.7f,
+                                                   acc_buf_.data(), crop_w);
             rv::CellToFrame map;
             map.cell_w = iw / static_cast<float>(proto_w);
             map.cell_h = ih / static_cast<float>(proto_h);

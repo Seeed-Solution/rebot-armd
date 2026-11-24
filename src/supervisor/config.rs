@@ -96,13 +96,17 @@ impl SupervisorInner {
             drop(drv);
             if pos.iter().any(Option::is_some) { self.reapply_driver_limits(); }
         }
+        let mut gripper_zero_moved = false;
         for (i, (o, n)) in old.iter().zip(offsets).enumerate() {
             let d = o - n;
             if d == 0.0 { continue; }
+            if Some(i) == self.config.gripper_index() { gripper_zero_moved = true; }
             for v in [&mut self.measured_positions, &mut self.commanded_positions, &mut self.target_positions] {
                 if let Some(p) = v.get_mut(i) { *p += d; }
             }
         }
+        // the free-motion baseline is indexed by jaw position: a new gripper zero invalidates it
+        if gripper_zero_moved && self.gripper_baseline.is_some() { self.reset_gripper_baseline(); }
         if old.len() > 5 && offsets.len() > 5 && old[5] != offsets[5] {
             self.zero_convention = Default::default();
         }
@@ -119,21 +123,22 @@ impl SupervisorInner {
     /// off and fresh feedback, an arm in the rest pose with J6 about +-90 deg from the reference is
     /// reported as `legacy_j6`. Never moves the arm. A `legacy_j6` verdict stays until a zero of J6.
     pub(super) fn step_zero_convention(&mut self) {
+        const REBOT_DM_TOL: [f32; 6] = [0.15, 0.08, 0.08, 0.08, 0.08, 0.08];
+        const DEFAULT_TOL: [f32; 6] = [0.08; 6];
         if self.zero_check_prev_torqued && !self.is_torqued { self.zero_check_pending = true; }
         self.zero_check_prev_torqued = self.is_torqued;
         if !self.zero_check_pending || self.is_torqued || self.calibration_busy { return; }
-        if self.config.zero_reference.is_none() {
-            self.zero_check_pending = false;
-            return;
-        }
+        if self.config.zero_reference.is_none() { self.zero_check_pending = false; return; }
         if let Some(d) = self.driver.as_ref() {
             if !d.lock().is_ok_and(|drv| drv.is_feedback_valid()) { return; }
         }
+        let tol: &[f32] = match &self.config.resting_pose {
+            Some(p) => &p.position_tolerances,
+            None if self.driver.is_none() => &REBOT_DM_TOL,
+            None => &DEFAULT_TOL,
+        };
         self.zero_check_pending = false;
-        let rest = self.config.home_positions.as_slice();
-        let default_tol = [0.08f32; 6];
-        let tol = self.resting_policy().map_or(&default_tol[..], |p| p.position_tolerances.as_slice());
-        let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, rest, tol) else { return; };
+        let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, &self.config.home_positions, tol) else { return; };
         if self.zero_convention.status == "legacy_j6" && v.status != "legacy_j6" { return; }
         if v.status == "legacy_j6" && self.zero_convention.status != "legacy_j6" {
             if self.rt_executor_owned {
@@ -230,6 +235,7 @@ impl SupervisorInner {
         let tilt = f64::from(self.config.camera_mount.tilt_deg);
         if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
         self.refresh_effective_floor();
+        self.prepare_workspace_eval_bufs();
     }
 
     /// Install the kinematic correction of the built-in model (calibration apply / restore /

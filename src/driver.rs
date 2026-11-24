@@ -229,6 +229,63 @@ pub enum ArmDriverError {
     TxQueueFull { queued: usize, new: usize, capacity: usize },
 }
 
+impl ArmDriverError {
+    /// Writes this error's exact `Display` output into `out` without heap allocation.
+    ///
+    /// Lives alongside [`ArmDriverError`] and delegates to its `Display` implementation so every
+    /// variant (including future variants) renders identically to API/log text without a second
+    /// match table to keep in sync.
+    pub fn write_bounded<const N: usize>(&self, out: &mut crate::safety::BoundedText<N>) {
+        match self {
+            Self::Transport(TransportError::Io(io_err)) => {
+                if let Some(code) = io_err.raw_os_error() {
+                    let _ = core::fmt::write(
+                        out,
+                        format_args!(
+                            "Transport error: I/O error: {}",
+                            crate::transport::format_os_error(Some(code), io_err.kind())
+                        ),
+                    );
+                    return;
+                }
+                let _ = core::fmt::write(out, format_args!("{self}"));
+            }
+            _ => {
+                let _ = core::fmt::write(out, format_args!("{self}"));
+            }
+        }
+    }
+
+    /// Converts this error into a bounded, allocation-free [`crate::safety::ClearFaultDriverError`]
+    /// whose off-thread `Display` output matches [`ArmDriverError`]'s `Display` verbatim.
+    pub fn to_clear_fault_error(&self) -> crate::safety::ClearFaultDriverError {
+        use crate::safety::{BoundedText, ClearFaultDriverError as C};
+        match self {
+            Self::Transport(TransportError::Timeout) => C::TransportTimeout,
+            Self::Transport(TransportError::WouldBlock) => C::TransportWouldBlock,
+            Self::Transport(TransportError::NotOpen) => C::TransportNotOpen,
+            Self::Transport(TransportError::ChecksumMismatch { expected, actual }) => {
+                C::TransportChecksumMismatch { expected: *expected, actual: *actual }
+            }
+            Self::Transport(TransportError::FrameTooShort { expected, actual }) => {
+                C::TransportFrameTooShort { expected: *expected, actual: *actual }
+            }
+            Self::JointCountMismatch { expected, actual } => {
+                C::JointCountMismatch { expected: *expected, actual: *actual }
+            }
+            Self::Timeout(id) => C::JointTimeout(*id),
+            Self::EstopInhibited => C::EstopInhibited,
+            Self::Protocol(s) => C::Protocol(BoundedText::new(s)),
+            Self::HardwareFault(s) => C::HardwareFault(BoundedText::new(s)),
+            other => {
+                let mut buf = BoundedText::empty();
+                other.write_bounded(&mut buf);
+                C::Formatted(buf)
+            }
+        }
+    }
+}
+
 /// Outcome of a bounded target write ([`ArmDriver::write_joint_targets_bounded`]) or pending
 /// queue drain ([`DamiaoArmDriver::drain_pending_tx`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,6 +469,16 @@ pub trait ArmDriver: Send {
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool {
         out.clear();
         match self.motor_status() { Some(s) => { out.extend_from_slice(&s); true } None => false }
+    }
+    /// True when [`Self::clear_fault_disables_joints`] includes any joint index `< arm_dof`,
+    /// without allocating a `Vec`.
+    fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool {
+        self.clear_fault_disables_joints().into_iter().any(|j| j < arm_dof)
+    }
+    /// True when [`Self::check_hardware_status`] would report a hardware fault, without
+    /// allocating a formatted error string.
+    fn has_hardware_fault(&self) -> bool {
+        self.check_hardware_status().is_err()
     }
 
     /// Fixed device-side velocity ceiling, when the active output mode has one.
@@ -1756,6 +1823,20 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             .filter(|(i, &s)| s != 0 && !self.is_benign_gripper_overload(*i, s))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool {
+        self.motor_status
+            .iter()
+            .enumerate()
+            .any(|(i, &s)| i < arm_dof && s != 0 && !self.is_benign_gripper_overload(i, s))
+    }
+
+    fn has_hardware_fault(&self) -> bool {
+        self.motor_status
+            .iter()
+            .enumerate()
+            .any(|(i, &s)| s != 0 && !self.is_benign_gripper_overload(i, s))
     }
 
     fn has_known_partial_enable(&self) -> bool {
@@ -7592,6 +7673,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.feedback_queue_bound); }
     fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.last_feedback_instant); }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { out.clear(); out.extend_from_slice(&self.motor_status); true }
+    fn clear_fault_disables_arm_joint(&self, _arm_dof: usize) -> bool { false }
+    fn has_hardware_fault(&self) -> bool {
+        self.motor_status.iter().any(|&st| damiao_fault_name(st).is_some())
+    }
     fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
         out.clear();
         out.extend_from_slice(&self.recovery_written_joints);
@@ -8166,6 +8251,12 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             }
         }
         Ok(())
+    }
+
+    fn clear_fault_disables_arm_joint(&self, _arm_dof: usize) -> bool { false }
+
+    fn has_hardware_fault(&self) -> bool {
+        self.fault_flags.iter().any(|&flags| flags != 0)
     }
 
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> {

@@ -302,6 +302,15 @@ impl Serialize for Holder {
     }
 }
 
+/// Release-event bitflags recorded on [`TickSample::release_flags`] by the RT executor.
+pub const RELEASE_FLAG_SAFETY_LATCH: u32 = 1 << 0;
+pub const RELEASE_FLAG_ESTOP_APPLIED: u32 = 1 << 1;
+pub const RELEASE_FLAG_CLEAR_OK: u32 = 1 << 2;
+pub const RELEASE_FLAG_CLEAR_REFUSED: u32 = 1 << 3;
+pub const RELEASE_FLAG_INJECT_ALLOC: u32 = 1 << 4;
+pub const RELEASE_FLAG_THERMAL_TRIP: u32 = 1 << 5;
+pub const RELEASE_FLAG_WATCHDOG_LATCH: u32 = 1 << 6;
+
 /// One tick, µs. Serialized as the breakdown of `max_tick` / `max_lock`.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct TickSample {
@@ -337,6 +346,18 @@ pub struct TickSample {
     pub longest_hold: Option<Holder>,
     #[serde(skip)]
     pub late: bool,
+    /// Monotonic RT executor release sequence (`1`-based; `0` outside RT executor).
+    #[serde(skip)]
+    pub release_seq: u64,
+    /// Safety epoch at the end of this release (`0` outside RT executor).
+    #[serde(skip)]
+    pub safety_epoch: u64,
+    /// Maintenance request id serviced during this release (`0` when none).
+    #[serde(skip)]
+    pub maint_req_id: u64,
+    /// Bitmask of `RELEASE_FLAG_*` safety events executed during this release.
+    #[serde(skip)]
+    pub release_flags: u32,
 }
 
 /// Cumulative since-boot TX event totals kept by [`TickStats`].
@@ -526,6 +547,12 @@ pub struct TickSnapshot {
     /// Control thread scheduling; None until the control thread reported it (tests).
     pub control_thread: Option<ControlThreadSched>,
     pub observation_cache: ObservationCacheStats,
+    /// Monotonic count of deferred safety log events dropped on overflow (never reset).
+    #[serde(default)]
+    pub safety_log_dropped: u64,
+    /// Monotonic count of log lines dropped by registered non-blocking log writers (never reset).
+    #[serde(default)]
+    pub log_writer_dropped: u64,
 }
 
 impl Default for TickStats {
@@ -736,6 +763,8 @@ impl TickWindow {
             },
             control_thread: None,
             observation_cache: ObservationCacheStats::default(),
+            safety_log_dropped: 0,
+            log_writer_dropped: 0,
         }
     }
 }

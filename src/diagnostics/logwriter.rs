@@ -10,23 +10,72 @@
 //! next line it writes.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Lines waiting for the writer thread (about 150 B each).
 pub const QUEUE_LINES: usize = 1024;
+/// Maximum formatted line length carried inline without heap allocation.
+pub const INLINE_LINE_BYTES: usize = 512;
+/// Extra channel slots reserved for [`NonBlocking::flush`] tokens so flushes do not steal line slots.
+const FLUSH_HEADROOM: usize = 8;
 
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids heap allocation on log writes
+enum LinePayload {
+    Inline {
+        buf: [u8; INLINE_LINE_BYTES],
+        len: u16,
+    },
+    Heap(Vec<u8>),
+}
+
+impl LinePayload {
+    #[inline]
+    fn from_slice(src: &[u8]) -> Self {
+        if src.len() <= INLINE_LINE_BYTES {
+            let mut buf = [0u8; INLINE_LINE_BYTES];
+            buf[..src.len()].copy_from_slice(src);
+            Self::Inline {
+                buf,
+                len: src.len() as u16,
+            }
+        } else {
+            Self::Heap(src.to_vec())
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { buf, len } => &buf[..usize::from(*len)],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)] // inline LinePayload avoids heap allocation on log writes
 enum Msg {
-    Line(Vec<u8>),
+    Line(LinePayload),
     Flush(SyncSender<()>),
+}
+
+struct CloseOnExit(Arc<AtomicBool>);
+
+impl Drop for CloseOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// `MakeWriter` for a tracing fmt layer; cheap to clone.
 #[derive(Clone)]
 pub struct NonBlocking {
     tx: SyncSender<Msg>,
+    capacity: usize,
+    queued: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -44,32 +93,69 @@ impl NonBlocking {
         Ok(w)
     }
 
-    fn spawn_unregistered(name: &str, mut sink: impl Write + Send + 'static, capacity: usize) -> io::Result<Self> {
-        let (tx, rx) = sync_channel::<Msg>(capacity);
+    /// Starts an unregistered writer thread with a fixed queue capacity (useful for isolated tests).
+    pub fn spawn_unregistered(name: &str, mut sink: impl Write + Send + 'static, capacity: usize) -> io::Result<Self> {
+        let (tx, rx) = sync_channel::<Msg>(capacity.saturating_add(FLUSH_HEADROOM).max(1));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
-        let dropped_w = dropped.clone();
+        let queued_w = Arc::clone(&queued);
+        let closed_w = Arc::clone(&closed);
+        let dropped_w = Arc::clone(&dropped);
         std::thread::Builder::new().name(name.into()).spawn(move || {
+            let _close_guard = CloseOnExit(closed_w);
+            let mut reported: u64 = 0;
+            let report_dropped = |sink: &mut dyn Write, reported: &mut u64| {
+                let total = dropped_w.load(Ordering::Relaxed);
+                let delta = total.saturating_sub(*reported);
+                if delta > 0 {
+                    let _ = writeln!(sink, "armd log: {delta} lines dropped (log writer busy)");
+                    *reported = total;
+                }
+            };
             while let Ok(msg) = rx.recv() {
                 match msg {
                     Msg::Line(line) => {
-                        let lost = dropped_w.swap(0, Ordering::Relaxed);
-                        if lost > 0 {
-                            let _ = writeln!(sink, "armd log: {lost} lines dropped (log writer busy)");
-                        }
-                        let _ = sink.write_all(&line);
+                        queued_w.fetch_sub(1, Ordering::AcqRel);
+                        report_dropped(&mut sink, &mut reported);
+                        let _ = sink.write_all(line.as_bytes());
                     }
                     Msg::Flush(done) => {
+                        report_dropped(&mut sink, &mut reported);
                         let _ = sink.flush();
                         let _ = done.send(());
                     }
                 }
             }
+            report_dropped(&mut sink, &mut reported);
             let _ = sink.flush();
         })?;
-        Ok(Self { tx, dropped })
+        Ok(Self { tx, capacity, queued, closed, dropped })
     }
 
-    /// Lines dropped since the writer last reported them.
+    #[inline]
+    fn try_reserve(&self) -> bool {
+        if self.capacity == 0 || self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut cur = self.queued.load(Ordering::Relaxed);
+        loop {
+            if cur >= self.capacity {
+                return false;
+            }
+            match self.queued.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(next) => cur = next,
+            }
+        }
+    }
+
+    /// Monotonic total lines dropped since this writer started (never reset).
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -94,6 +180,15 @@ impl NonBlocking {
     }
 }
 
+/// Monotonic total lines dropped across every writer registered with [`NonBlocking::spawn`].
+pub fn total_dropped() -> u64 {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .fold(0u64, |acc, w| acc.saturating_add(w.dropped()))
+}
+
 /// Flushes every writer started with [`NonBlocking::spawn`] (before the process exits).
 pub fn flush_all(timeout: Duration) {
     let all = registry().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -116,7 +211,13 @@ pub struct LineWriter<'a>(&'a NonBlocking);
 
 impl Write for LineWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.0.tx.try_send(Msg::Line(buf.to_vec())).is_err() {
+        if !self.0.try_reserve() {
+            self.0.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(buf.len());
+        }
+        let payload = LinePayload::from_slice(buf);
+        if self.0.tx.try_send(Msg::Line(payload)).is_err() {
+            self.0.queued.fetch_sub(1, Ordering::AcqRel);
             self.0.dropped.fetch_add(1, Ordering::Relaxed);
         }
         Ok(buf.len())
@@ -184,7 +285,9 @@ mod tests {
         let reported: u64 = text.lines().filter_map(|l| l.strip_prefix("armd log: ")?.strip_suffix(" lines dropped (log writer busy)")).map(|n| n.parse::<u64>().unwrap()).sum();
         assert!(written.windows(2).all(|p| p[0] < p[1]), "{text}");
         assert_eq!(written.len() as u64 + reported, 20, "every line is written or counted: {text}");
-        assert_eq!(w.dropped(), 0);
+        // Counter is strictly monotonic and never reset after flush/report.
+        assert_eq!(w.dropped(), reported);
+        assert!(w.dropped() >= 15);
     }
 
     /// The path the control tick takes (`tracing::info!` inside `finish_action`) through a

@@ -76,14 +76,18 @@ using Contour = std::vector<std::array<float, 2>>;
 
 /**
  * Exterior contour of the largest 4-connected component of a binary mask (`w` x `h`, `stride`
- * bytes per row, non-zero = set), traced along the cell edges: vertices at cell corners in cell
- * units of the mask (its top-left corner at 0, 0), clockwise in image coordinates. Simplified by
+ * bytes per row, non-zero = set), in cell units of the mask (its top-left corner at 0, 0),
+ * clockwise in image coordinates. Every boundary step between an inside and an outside cell gives
+ * one vertex on the line between their centres: where the mask crosses 0.5 when `logits` (the
+ * mask logits, `logit_stride` floats per row, > 0 inside) are given, linearly interpolated (the
+ * marching-squares 0.5 level, no half-cell outward bias at corners); else the cell edge's midpoint.
+ * Simplified by
  * one Douglas-Peucker pass at `eps_cells` (an outline over 2048 vertices is first subsampled to
  * 2048, bounding the work), then subsampled to at most `max_vertices`; at least 3 vertices for any
  * non-empty mask. Empty for an empty mask.
  */
 Contour mask_exterior_contour(const uint8_t* m, int w, int h, int stride, int max_vertices = kMaxContourVertices,
-                              float eps_cells = 0.7f);
+                              float eps_cells = 0.7f, const float* logits = nullptr, int logit_stride = 0);
 
 /**
  * Where mask cells land in the detection's normalised frame: cell (u, v) of a crop starting at
