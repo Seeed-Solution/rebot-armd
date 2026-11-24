@@ -18,11 +18,8 @@ use super::SupervisorInner;
 use crate::safety::SafetyError;
 
 /// Maximum feedback age accepted for proving the arm is at the rest pose while stopped.
-pub const STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
-/// Upper bound on periodic and handshake retries completing a stopped torque-off request that
-/// was authorized at the rest pose. Once elapsed, the request ends and any new disable request
-/// must pass a fresh rest-pose check.
-pub const STOPPED_DISABLE_RETRY_BOUND: Duration = Duration::from_secs(1);
+pub const STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE: Duration =
+    crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE;
 
 /// Zero-allocation refusal reason from [`SupervisorInner::may_disable_torque_while_stopped`].
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -424,7 +424,6 @@ impl SupervisorInner {
                         limit: self.config.max_temperature,
                     },
                 );
-                self.stopped_disable_retry_until = None;
                 let thermal_disable = crate::driver::DisableKind::DisableProtective {
                     reason: crate::driver::DisableProtectiveReason::Thermal,
                 };

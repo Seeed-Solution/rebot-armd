@@ -432,9 +432,15 @@ fn stopped_torque_off_tx_failure_zero_alloc() {
         "failed ImmediateOp::TorqueOff while already stopped must allocate 0"
     );
 
-    // Expiring the 1 s stopped-disable retry bound on RT must end retries with 0 allocs and
-    // resume normal E-stop hold without sending disable frames or mutating EStop / epoch.
-    fx.core.stopped_disable_retry_until = Some(std::time::Instant::now() - Duration::from_millis(1));
+    // Expiring the single 1 s request lifetime checked inside `send` must end retries with
+    // 0 allocs and resume normal E-stop hold without sending disable frames or mutating EStop/epoch.
+    // Refresh the empty-queue RX bound at t+980 ms before crossing the 1 s boundary so feedback
+    // itself is provably fresh (<= 25 ms) and ONLY the 1 s request lifetime triggers refusal.
+    clock.advance(Duration::from_millis(980));
+    fx.core.last_disable_attempt = Some(std::time::Instant::now());
+    bus.with(|s| s.push_all_feedback());
+    let _ = fx.step();
+    clock.advance(Duration::from_millis(25));
     fx.core.last_disable_attempt = Some(std::time::Instant::now() - Duration::from_millis(300));
     bus.with(|s| {
         s.tx_would_block = false;
@@ -442,11 +448,11 @@ fn stopped_torque_off_tx_failure_zero_alloc() {
     });
     let (_exp_rep, a5, f5) = counted(|| fx.step());
     clock.advance(RELEASE);
-    assert!(!fx.core.disable_pending, "1 s bound expiry must clear disable_pending");
-    assert!(fx.core.stopped_disable_retry_until.is_none());
+    assert!(!fx.core.disable_pending, "1 s lifetime expiry in send must clear disable_pending");
+    assert!(fx.core.active_disable_kind().is_none());
     assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
     assert_eq!(fx.core.safety.epoch_id(), epoch_before);
-    assert_eq!((a5, f5), (0, 0), "expiring 1 s stopped-disable retry bound must allocate 0");
+    assert_eq!((a5, f5), (0, 0), "expiring 1 s stopped-disable request lifetime in send must allocate 0");
 }
 
 #[test]

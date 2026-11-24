@@ -339,10 +339,6 @@ pub struct SupervisorInner {
     /// The torque transition the RT started and serves from `poll_hardware` (None: none).
     pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
     pub last_disable_attempt: Option<Instant>,
-    /// Bounded 1 s retry deadline for a stopped torque-off request authorized at the rest pose
-    /// (`None` for protective cuts such as thermal trip / shutdown or when no stopped disable
-    /// request is active).
-    pub stopped_disable_retry_until: Option<Instant>,
     /// Active background/transition disable intent carried into driver sends and periodic retries.
     pub(crate) active_disable_kind: Option<crate::driver::DisableKind>,
     pub(crate) last_stopped_torque_off_refusal: Option<StoppedTorqueOffRefusal>,
@@ -923,7 +919,6 @@ impl SupervisorInner {
             disable_pending: false,
             torque_transition: None,
             last_disable_attempt: None,
-            stopped_disable_retry_until: None,
             active_disable_kind: None,
             last_stopped_torque_off_refusal: None,
             output_suspended: false,
@@ -2217,7 +2212,6 @@ impl SupervisorInner {
         }
         let unknown = self.driver_enable_state_unknown();
         if unknown && self.shutdown_refused_unknown && (!self.is_torqued || self.disable_pending) {
-            self.stopped_disable_retry_until = None;
             let exit_kind = crate::driver::DisableKind::DisableProtective {
                 reason: crate::driver::DisableProtectiveReason::ProcessExit,
             };
@@ -3408,31 +3402,21 @@ impl SupervisorInner {
         // Thermal protection remains active while stopped or shutdown is unconfirmed.
         self.check_thermal_protection(false);
         // (a torque transition in flight confirms its own disable: `service_torque_transition`)
-        if !self.confirm_background_disable_if_ready() {
-            if self
-                .stopped_disable_retry_until
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                // Bounded 1 s retry window for a stopped torque-off request authorized at rest
-                // elapsed: end the request (keeping `is_torqued`, latch, fault record, and epoch)
-                // so any new disable request must pass a fresh rest-pose check.
-                self.disable_pending = false;
-                self.stopped_disable_retry_until = None;
-                self.active_disable_kind = None;
-                self.last_disable_attempt = None;
-            } else if self
+        // Retries pass the original `DisableKind` (`started_at`) back into the driver transmit
+        // choke point, which enforces Rule A′ and the single 1 s total request lifetime at send time.
+        if !self.confirm_background_disable_if_ready()
+            && self
                 .last_disable_attempt
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
-            {
-                let kind = self.active_disable_kind.unwrap_or_else(|| {
-                    crate::driver::DisableKind::DisableRequested {
-                        started_at: self.driver_clock_now(),
-                    }
-                });
-                if let Err(e) = self.request_disable_bounded(kind) {
-                    if !e.refused_by_chokepoint && !self.safety.deferred_logging() {
-                        tracing::warn!("Torque shutdown remains unconfirmed: {}", e.message.as_str());
-                    }
+        {
+            let kind = self.active_disable_kind.unwrap_or_else(|| {
+                crate::driver::DisableKind::DisableRequested {
+                    started_at: self.driver_clock_now(),
+                }
+            });
+            if let Err(e) = self.request_disable_bounded(kind) {
+                if !e.refused_by_chokepoint && !self.safety.deferred_logging() {
+                    tracing::warn!("Torque shutdown remains unconfirmed: {}", e.message.as_str());
                 }
             }
         }
