@@ -458,6 +458,38 @@ pub trait CoreOps {
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Executes one lease lifecycle request (`LeaseAcquire`, `LeasePreempt`, `LeaseRelease`, `LeaseDisconnect`).
+    fn commit_lease(
+        &mut self,
+        _d: &Descriptor,
+        _req: super::requests::lease::LeaseRequest,
+        _ctx: &CommitCtx,
+    ) -> Result<super::requests::lease::LeaseOutcome, &'static str> {
+        Err("NOT_WIRED")
+    }
+    /// Applies one priority connection lifecycle command (`Open` / `Disconnect`) at the owner.
+    fn handle_conn_lifecycle(
+        &mut self,
+        cmd: super::requests::lease::LifecycleCmd,
+        _now: Instant,
+    ) -> super::requests::lease::LifecycleReply {
+        use super::requests::lease::{LeaseOutcome, LifecycleCmd, LifecycleReply};
+        match cmd {
+            LifecycleCmd::Open { seq, conn_id } => LifecycleReply::Opened {
+                seq,
+                conn_id,
+                result: Ok(()),
+            },
+            LifecycleCmd::Disconnect { seq, connection } => LifecycleReply::Disconnected {
+                seq,
+                conn_id: connection.id(),
+                outcome: LeaseOutcome::Disconnected {
+                    released: false,
+                    displaced_generation: 0,
+                },
+            },
+        }
+    }
     /// Installs a [`Primitive::Prepared`] with its slot's `path` after rechecking its stamp
     /// (as `commit_primitive`); no IK and no file I/O. Default: `UNSUPPORTED`.
     fn commit_prepared(&mut self, _d: &Descriptor, _primitive: &Primitive, _path: &PreparedPath, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
@@ -710,14 +742,18 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
 }
 
 impl SupervisorInner {
-    /// The lease valid at `now` (its generation names its holder).
+    /// The lease valid at `now` (unexpired and unfenced; its generation names its holder).
     fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
-        self.active_lease.as_ref().filter(|l| now.saturating_duration_since(l.acquired_at) < self.lease_timeout)
+        self.active_lease.as_ref().filter(|l| {
+            l.generation > self.fenced_lease_generation
+                && now.saturating_duration_since(l.acquired_at) < self.lease_timeout
+        })
     }
 
-    /// The stamp checks every commit shares: identity, deadline, the current authority, and
-    /// a lease when leases are enforced.
+    /// The stamp checks every commit shares: connection liveness, identity, deadline, current
+    /// authority, and a lease when leases are enforced.
     fn check_commit(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_client_connection_live(d.stamp.client.0, false)?;
         if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
         if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
         Ok(())
@@ -726,6 +762,7 @@ impl SupervisorInner {
     /// Stop-direction variant of [`Self::check_commit`]: exempt from `stop_generation` checks
     /// so an authorized Stop never blocks a queued torque disable.
     fn check_commit_stop_direction(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_client_connection_live(d.stamp.client.0, false)?;
         if let Some(code) = d.stamp.check_stop_direction(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
         if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
         Ok(())
@@ -932,24 +969,17 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        if matches!(op, ImmediateOp::Heartbeat) {
+            return super::requests::lease::install_broker_heartbeat(self, d, ctx)
+                .map(|()| Committed::authorized(d, None));
+        }
         match op {
             ImmediateOp::TorqueOff => self.check_commit_stop_direction(d, ctx)?,
-            ImmediateOp::Heartbeat | ImmediateOp::TorqueOn => self.check_commit(d, ctx)?,
+            ImmediateOp::TorqueOn => self.check_commit(d, ctx)?,
+            ImmediateOp::Heartbeat => unreachable!(),
         }
         let r = match op {
-            // renews the lease the command was admitted under, if it is still valid at the
-            // commit instant (a queued renewal cannot resurrect an expired lease)
-            ImmediateOp::Heartbeat => {
-                let generation = d.stamp.authority.lease_generation;
-                match self.active_lease.as_mut().filter(|l| l.generation == generation && generation != 0) {
-                    Some(l) => {
-                        l.acquired_at = ctx.now;
-                        self.last_heartbeat = ctx.now;
-                        Ok(())
-                    }
-                    None => return Err(if generation == 0 { "NO_LEASE" } else { "LEASE_LOST" }),
-                }
-            }
+            ImmediateOp::Heartbeat => unreachable!(),
             ImmediateOp::TorqueOn => {
                 if self.driver.is_some() {
                     return Err("UNSUPPORTED");
@@ -975,6 +1005,23 @@ impl CoreOps for SupervisorInner {
             }
         };
         r.map(|_| Committed::authorized(d, None)).map_err(static_code)
+    }
+
+    fn commit_lease(
+        &mut self,
+        d: &Descriptor,
+        req: super::requests::lease::LeaseRequest,
+        ctx: &CommitCtx,
+    ) -> Result<super::requests::lease::LeaseOutcome, &'static str> {
+        super::requests::lease::commit_lease_descriptor(self, d, req, ctx)
+    }
+
+    fn handle_conn_lifecycle(
+        &mut self,
+        cmd: super::requests::lease::LifecycleCmd,
+        now: Instant,
+    ) -> super::requests::lease::LifecycleReply {
+        super::requests::lease::apply_conn_lifecycle(self, cmd, now)
     }
 
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
@@ -1331,6 +1378,8 @@ pub struct ReleaseEngine {
     stop: StopRequests,
     urgent_stops: Option<UrgentStopIntake>,
     urgent_replies_flushed: bool,
+    conn_lifecycle: Option<super::requests::lease::ConnLifecycleIntake>,
+    lifecycle_replies_flushed: bool,
     active: Option<Installed>,
     /// The driver transition in flight.
     transition: Option<Installed>,
@@ -1351,6 +1400,8 @@ impl ReleaseEngine {
                 stop: stop.clone(),
                 urgent_stops: None,
                 urgent_replies_flushed: false,
+                conn_lifecycle: None,
+                lifecycle_replies_flushed: false,
                 active: None,
                 transition: None,
                 releases: 0,
@@ -1366,6 +1417,34 @@ impl ReleaseEngine {
     /// checkpoint (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`), and sub-release wakes.
     pub fn attach_urgent_stops(&mut self, intake: UrgentStopIntake) {
         self.urgent_stops = Some(intake);
+    }
+
+    /// Attaches the dedicated priority connection lifecycle intake (`Open` / `Disconnect`),
+    /// drained at Step 1, every checkpoint, and sub-release wakes, with replies flushed after Step 6 publish.
+    pub fn attach_conn_lifecycle(&mut self, intake: super::requests::lease::ConnLifecycleIntake) {
+        self.conn_lifecycle = Some(intake);
+    }
+
+    pub fn has_pending_lifecycle_replies(&self) -> bool {
+        self.conn_lifecycle
+            .as_ref()
+            .is_some_and(super::requests::lease::ConnLifecycleIntake::has_pending_replies)
+    }
+
+    pub fn flush_lifecycle_replies(&mut self) -> bool {
+        self.conn_lifecycle
+            .as_mut()
+            .is_some_and(super::requests::lease::ConnLifecycleIntake::flush_replies)
+    }
+
+    pub fn take_lifecycle_replies_flushed(&mut self) -> bool {
+        std::mem::take(&mut self.lifecycle_replies_flushed)
+    }
+
+    pub fn drain_conn_lifecycle_stopped(&mut self, flush_existing: bool) -> bool {
+        self.conn_lifecycle
+            .as_mut()
+            .is_some_and(|intake| intake.drain_stopped(flush_existing))
     }
 
     pub fn has_pending_urgent_stop_replies(&self) -> bool {
@@ -1420,10 +1499,12 @@ impl ReleaseEngine {
         true
     }
 
-    /// Applies any pending urgent E-stop, bounded urgent `Stop` handoffs (authorized against
-    /// the owner's lease at `now`), and/or direct `StopRequests`; true when any applied.
+    /// Applies any pending urgent E-stop, priority connection lifecycle (`Open`/`Disconnect`),
+    /// bounded urgent `Stop` handoffs (authorized against the owner's lease at `now`), and/or
+    /// direct `StopRequests`; true when any urgent stop applied.
     pub fn apply_pending_urgent_at<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> bool {
         let estop = core.apply_estop();
+        let _lifecycle = self.drain_conn_lifecycle_at(core, now);
         let urgent_handoff = if let Some(intake) = self.urgent_stops.as_mut() {
             let stops = &self.stop;
             intake.drain_requests(|req| core.handle_urgent_stop(req, stops, now))
@@ -1432,6 +1513,15 @@ impl ReleaseEngine {
         };
         let stop = self.apply_pending_stop(core);
         estop || urgent_handoff || stop
+    }
+
+    /// Drains pending priority connection lifecycle commands (`Open` / `Disconnect`) at `now`.
+    fn drain_conn_lifecycle_at<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> bool {
+        if let Some(intake) = self.conn_lifecycle.as_mut() {
+            intake.drain_requests(|cmd| core.handle_conn_lifecycle(cmd, now))
+        } else {
+            false
+        }
     }
 
     /// Applies any pending urgent E-stop and/or authorized-stop requests at `Instant::now()`.
@@ -1512,64 +1602,88 @@ impl ReleaseEngine {
         if stopping {
             // Single publication boundary: publish any Step 1-2b state changes (such as an E-stop
             // or finished transition) strictly BEFORE delivering terminals, maintenance replies,
-            // urgent stop replies, or E-stop acknowledgements.
+            // lifecycle replies, urgent stop replies, or E-stop acknowledgements.
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
+            }
+            if self.flush_lifecycle_replies() {
+                self.lifecycle_replies_flushed = true;
             }
             if let Some((t, outcome)) = finished_transition {
                 self.intake.terminal(t, outcome);
             }
             return report;
         }
-        // 3. Urgent recheck + at most one ordinary command
+        // 3. Urgent recheck + at most one ordinary command (replies deferred until strictly AFTER Step 6 publish)
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(core, Checkpoint::BeforeCommit, &mut now_fn, &mut report);
         let mut superseded_and_ack: Option<(Installed, super::broker::Reply)> = None;
+        let mut deferred_step3_reply: Option<super::broker::Reply> = None;
         if let Some(t) = self.intake.take() {
             let d = *t.descriptor();
-            let result = match d.kind {
-                CommandKind::Install { .. } => match t.plan() {
-                    None => Err("PLAN_RETIRED"),
-                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
-                        Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
-                        None => Err("PLAN_RETIRED"),
-                    },
-                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
-                },
-                CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
-                CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
-            };
-            report.command = Some((d.stamp.request, match result {
-                Ok(c) => {
-                    let install = matches!(d.kind, CommandKind::Install { .. });
-                    let supersedes = install && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
-                    if supersedes {
-                        t.ack_deferred(c).map(|(acked, ack_reply)| {
-                            let old = self.active.take().expect("checked active.is_some()");
-                            superseded_and_ack = Some((old, ack_reply));
-                            if let Some(i) = acked.installed {
-                                self.active = Some(i);
-                            }
-                            acked.commit_seq
-                        })
-                    } else {
-                        t.ack(c).map(|acked| {
-                            match acked.installed {
-                                Some(i) if install => self.active = Some(i),
-                                Some(i) => self.transition = Some(i),
-                                None => {}
-                            }
-                            acked.commit_seq
-                        })
-                    }
+            match d.kind {
+                CommandKind::Lease(req) => {
+                    let result = core.commit_lease(&d, req, &ctx);
+                    report.command = Some((d.stamp.request, match result {
+                        Ok(outcome) => {
+                            let (commit_seq, reply) = t.ack_lease_deferred(outcome);
+                            deferred_step3_reply = Some(reply);
+                            Ok(commit_seq)
+                        }
+                        Err(code) => {
+                            deferred_step3_reply = Some(t.refuse_deferred(code));
+                            Err(code)
+                        }
+                    }));
                 }
-                Err(code) => {
-                    t.refuse(code);
-                    Err(code)
+                _ => {
+                    let result = match d.kind {
+                        CommandKind::Install { .. } => match t.plan() {
+                            None => Err("PLAN_RETIRED"),
+                            Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
+                                Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
+                                None => Err("PLAN_RETIRED"),
+                            },
+                            Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
+                        },
+                        CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
+                        CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
+                        CommandKind::Lease(_) => unreachable!(),
+                    };
+                    report.command = Some((d.stamp.request, match result {
+                        Ok(c) => {
+                            let install = matches!(d.kind, CommandKind::Install { .. });
+                            let supersedes = install && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
+                            if supersedes {
+                                t.ack_deferred(c).map(|(acked, ack_reply)| {
+                                    let old = self.active.take().expect("checked active.is_some()");
+                                    superseded_and_ack = Some((old, ack_reply));
+                                    if let Some(i) = acked.installed {
+                                        self.active = Some(i);
+                                    }
+                                    acked.commit_seq
+                                })
+                            } else {
+                                t.ack_deferred(c).map(|(acked, ack_reply)| {
+                                    match acked.installed {
+                                        Some(i) if install => self.active = Some(i),
+                                        Some(i) => self.transition = Some(i),
+                                        None => {}
+                                    }
+                                    deferred_step3_reply = Some(ack_reply);
+                                    acked.commit_seq
+                                })
+                            }
+                        }
+                        Err(code) => {
+                            deferred_step3_reply = Some(t.refuse_deferred(code));
+                            Err(code)
+                        }
+                    }));
                 }
-            }));
+            }
         }
         // 4. Unconditional urgent recheck + consume at most one latest target
         let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
@@ -1584,9 +1698,12 @@ impl ReleaseEngine {
         let timestamp = core.advance_output_with_deadline(dt, publish_generation, out_ctx.now, release_deadline);
         // 6. Publish
         core.publish(timestamp, publish_generation);
-        // 7. Deliver urgent stop replies and terminals strictly AFTER publish
+        // 7. Deliver urgent stop replies, lifecycle replies, Step 3 replies, and terminals strictly AFTER publish
         if self.flush_urgent_stop_replies() {
             self.urgent_replies_flushed = true;
+        }
+        if self.flush_lifecycle_replies() {
+            self.lifecycle_replies_flushed = true;
         }
         if let Some((t, outcome)) = finished_transition {
             self.intake.terminal(t, outcome);
@@ -1594,6 +1711,9 @@ impl ReleaseEngine {
         if let Some((old, ack_reply)) = superseded_and_ack {
             self.intake.terminal(old, Outcome::Superseded);
             self.intake.emit_reply(ack_reply);
+        }
+        if let Some(reply) = deferred_step3_reply {
+            self.intake.emit_reply(reply);
         }
         if let Some(action) = self.active() {
             if let Some(outcome) = core.action_outcome(action) {
@@ -1607,9 +1727,9 @@ impl ReleaseEngine {
     }
 
     /// Runs one sub-release transition wake on `core` (no full feedback poll, no output step).
-    /// When the transition completes or an urgent stop applies on this wake, publishes the
-    /// updated state at `publish_generation` BEFORE delivering replies/terminals and returns `true`.
-    /// Refusal-only urgent stops still flush their replies promptly without publishing.
+    /// When the transition completes, a lifecycle command mutated state, or an urgent stop applies
+    /// on this wake, publishes the updated state at `publish_generation` BEFORE delivering
+    /// replies/terminals and returns `true`.
     pub fn service_wake<O: CoreOps>(
         &mut self,
         core: &mut O,
@@ -1619,15 +1739,19 @@ impl ReleaseEngine {
         report: &mut ReleaseReport,
     ) -> bool {
         let urgent_applied = self.apply_pending_urgent_at(core, now);
+        let lifecycle_pending = self.has_pending_lifecycle_replies();
         if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
         report.poll = core.poll_transition_wake_for_release(&budget, release_deadline);
         let finished = self.take_finished_transition(report);
-        if urgent_applied || finished.is_some() {
+        if urgent_applied || lifecycle_pending || finished.is_some() {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
             if self.flush_urgent_stop_replies() {
                 self.urgent_replies_flushed = true;
+            }
+            if self.flush_lifecycle_replies() {
+                self.lifecycle_replies_flushed = true;
             }
             if let Some((t, outcome)) = finished {
                 self.intake.terminal(t, outcome);
@@ -1698,6 +1822,11 @@ impl<O: CoreOps> ReleaseFixture<O> {
     /// Attaches a bounded urgent-stop intake for deterministic fixture tests.
     pub fn attach_urgent_stops(&mut self, intake: UrgentStopIntake) {
         self.engine.attach_urgent_stops(intake);
+    }
+
+    /// Attaches a priority connection lifecycle intake for deterministic fixture tests.
+    pub fn attach_conn_lifecycle(&mut self, intake: super::requests::lease::ConnLifecycleIntake) {
+        self.engine.attach_conn_lifecycle(intake);
     }
 
     /// The fixture's virtual clock (clone it to advance time from a test).

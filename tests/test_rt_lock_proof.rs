@@ -155,11 +155,7 @@ fn wait_broker_reply(
     while Instant::now() < deadline {
         let mut found = None;
         handle.broker().lock().unwrap().poll(|_, r| {
-            let matches_req = match r {
-                Reply::Ack { request, .. }
-                | Reply::Refused { request, .. }
-                | Reply::Terminal { request, .. } => request == req,
-            };
+            let matches_req = r.request() == req;
             if matches_req && found.is_none() {
                 found = accept(r);
             }

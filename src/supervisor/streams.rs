@@ -1391,7 +1391,7 @@ impl SupervisorInner {
         }
     }
 
-    pub(super) fn terminate_policy_run(
+    pub(crate) fn terminate_policy_run(
         &mut self,
         stop_reason: &str,
         action_state: &str,

@@ -228,6 +228,8 @@ pub enum CommandKind {
     Immediate(ImmediateOp),
     /// Start a driver transition; a terminal reply follows the ACK.
     Transition(TransitionOp),
+    /// Lease lifecycle operation (`Acquire`, `Preempt`, `Release`, `Disconnect`); single `Reply::Lease` or `Refused`.
+    Lease(super::requests::lease::LeaseRequest),
 }
 
 impl CommandKind {
@@ -264,6 +266,12 @@ pub enum Outcome {
 pub enum Reply {
     /// Committed: `commit_seq` is the RT commit sequence, `action` the committed action.
     Ack { request: RequestId, commit_seq: u64, action: Option<ActionId> },
+    /// Lease lifecycle outcome (`CommandKind::Lease`).
+    Lease {
+        request: RequestId,
+        commit_seq: u64,
+        outcome: super::requests::lease::LeaseOutcome,
+    },
     /// Not committed (nothing changed on the RT side; a plan slot was retired).
     Refused { request: RequestId, code: &'static str },
     /// The physical completion of an acknowledged action; `children`: the child primitives
@@ -273,7 +281,12 @@ pub enum Reply {
 
 impl Reply {
     pub fn request(&self) -> RequestId {
-        match self { Self::Ack { request, .. } | Self::Refused { request, .. } | Self::Terminal { request, .. } => *request }
+        match self {
+            Self::Ack { request, .. }
+            | Self::Lease { request, .. }
+            | Self::Refused { request, .. }
+            | Self::Terminal { request, .. } => *request,
+        }
     }
 }
 
@@ -600,6 +613,7 @@ pub enum Submit<'a, P> {
     Install(&'a dyn Fn(&mut P)),
     Immediate(ImmediateOp),
     Transition(TransitionOp),
+    Lease(super::requests::lease::LeaseRequest),
 }
 
 /// Capacities of one broker (tests use tiny ones).
@@ -741,6 +755,7 @@ impl<P> Broker<P> {
             },
             Submit::Immediate(op) => CommandKind::Immediate(op),
             Submit::Transition(op) => CommandKind::Transition(op),
+            Submit::Lease(req) => CommandKind::Lease(req),
         };
         self.next_request += 1;
         let request = RequestId(self.next_request);
@@ -769,12 +784,12 @@ impl<P> Broker<P> {
             // request, one terminal per acknowledged install (anything else is counted)
             let Some(p) = self.pending.get_mut(&request) else { self.stats.unexpected += 1; continue; };
             let expected = match reply {
-                Reply::Ack { .. } | Reply::Refused { .. } => p.ack,
+                Reply::Ack { .. } | Reply::Lease { .. } | Reply::Refused { .. } => p.ack,
                 Reply::Terminal { .. } => p.terminal && !p.ack,
             };
             if !expected { self.stats.unexpected += 1; continue; }
             match reply {
-                Reply::Ack { .. } => {
+                Reply::Ack { .. } | Reply::Lease { .. } => {
                     self.stats.acked += 1;
                     p.ack = false;
                     self.reserved -= 1;
@@ -924,6 +939,33 @@ impl<P> Taken<'_, P> {
             _ => None,
         };
         Ok((Acked { commit_seq, installed }, reply))
+    }
+
+    /// Records a lease commit without emitting the reply yet (emitted in Step 7 strictly after
+    /// Step 6 `StateHub` publication via [`RtIntake::emit_reply`]).
+    pub fn ack_lease_deferred(
+        mut self,
+        outcome: super::requests::lease::LeaseOutcome,
+    ) -> (u64, Reply) {
+        self.answered = true;
+        let intake = &mut *self.intake;
+        intake.commit_seq += 1;
+        let commit_seq = intake.commit_seq;
+        let request = self.d.stamp.request;
+        (commit_seq, Reply::Lease { request, commit_seq, outcome })
+    }
+
+    /// Refuses the command without emitting the reply yet (retires any plan slot now; the
+    /// `Reply::Refused` is emitted in Step 7 strictly after Step 6 publication).
+    pub fn refuse_deferred(mut self, code: &'static str) -> Reply {
+        self.answered = true;
+        if let CommandKind::Install { plan } = self.d.kind {
+            self.intake.plans.retire(plan);
+        }
+        Reply::Refused {
+            request: self.d.stamp.request,
+            code,
+        }
     }
 
     /// Refuses the command with `code`; retires its plan slot.

@@ -618,7 +618,7 @@ impl SupervisorInner {
 
     /// A new lease owner takes over from a running watchdog park: the park's
     /// motion is cancelled like any other queued motion and the arm brakes to a hold.
-    pub(super) fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
+    pub(crate) fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
         if self.watchdog_park.take().is_some() && self.pending_normal_unload {
             if !self.rt_executor_owned {
                 tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
