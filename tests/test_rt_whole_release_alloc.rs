@@ -1041,13 +1041,12 @@ async fn cold_start_driverless_default_resting_pose_and_legacy_j6_zero_alloc() {
 }
 
 // ============================================================================
-// 5. Blocked on in-flight branches (B3 / A8) — DO NOT fix in B2!
-//    Affected families remain gated until B3/A8 land and pass these proofs.
+// 5. Post-B3 unblocked proofs (first E-stop, ClearFault refusal, LogWriter)
+//    + remaining blocked allocations (driver_transitions enable fail, A8 actions.rs).
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked on B3: first Idle/Armed -> EStop allocates FaultInfo.message String in src/safety.rs:368 (called via src/supervisor.rs:1294) and traces at src/safety.rs:349; unblock after B3 eliminates RT FaultInfo String allocation and defers safety logging"]
-async fn b3_blocked_first_idle_to_estop_transition_zero_alloc() {
+async fn first_idle_to_estop_transition_zero_alloc() {
     let clock = ScriptedClock::new();
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     sup.set_lease_enabled(false).await;
@@ -1071,7 +1070,54 @@ async fn b3_blocked_first_idle_to_estop_transition_zero_alloc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked on B3: torque enable/disable failure allocates error/fault Strings and Arc<SafetyState::Fault> in src/supervisor/driver_transitions.rs:1229-1241,1365-1366 and src/safety.rs:414-416,369; hardware drivers stay gated by validate_startup_owner until A9; unblock after B3 removes RT fault/error String construction"]
+async fn clear_fault_refusal_zero_alloc() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.temperatures[0] = 95.0;
+        inner.safety.latch(
+            armd::safety::FaultKind::ThermalTrip,
+            armd::safety::FaultDetail::from_reason(
+                armd::safety::FaultCode::ThermalTrip,
+                &armd::safety::FaultReason::ThermalTrip { joint_idx: 0, temperature: 95.0, limit: 85.0 },
+            ),
+        );
+    }
+    let handle = sup.start_executor(alloc_cfg(Duration::from_millis(5))).await.unwrap();
+    wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= 4).await;
+    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+
+    let res = handle.clear_fault_async().await.unwrap();
+    assert!(res.is_err(), "expected ClearFault refusal while ThermalTrip temperature exceeds cooldown");
+    let after = handle.stats().completed_releases.load(Ordering::Acquire);
+    wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= after + 2).await;
+    let counts = handle.stats().total_allocs();
+    handle.stop_and_join();
+    assert_eq!(counts, AllocCounts::ZERO, "ClearFault refusal allocated: {counts:?}");
+}
+
+#[test]
+fn logwriter_tracing_on_rt_zero_alloc() {
+    thread::spawn(|| {
+        let writer = armd::diagnostics::logwriter::NonBlocking::spawn("b2-test", std::io::sink()).unwrap();
+        let sub = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
+        let _guard = tracing::subscriber::set_default(sub);
+        tracing::callsite::rebuild_interest_cache();
+        let mut inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.safety.set_off_thread_reclaim(true);
+        alloc::time_this_thread();
+        let before = alloc::snapshot_counts();
+        inner.safety.trigger_e_stop();
+        let delta = alloc::snapshot_counts().delta_since(before);
+        assert_eq!(delta, AllocCounts::ZERO, "safety log via LogWriter allocated: {delta:?}");
+    })
+    .join()
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "still allocates after B3: enable_step_failed allocates String via e.to_string() at src/supervisor/driver_transitions.rs:1509 and enable_failed_budgeted allocates format!()/SafetyError::ClearFaultRejected(String) at src/supervisor/driver_transitions.rs:1156,1163"]
 async fn b3_blocked_torque_transition_failure_zero_alloc() {
     let clock = ScriptedClock::new();
     let (drv, fail_next) = WakeDriver::new(7, Duration::from_millis(4), Some(clock.clone()));
@@ -1109,50 +1155,8 @@ async fn b3_blocked_torque_transition_failure_zero_alloc() {
     assert_eq!(counts, AllocCounts::ZERO, "transition failure allocated: {counts:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked on B3: clear_fault_executor refusals allocate SafetyError::ClearFaultRejected(String) in src/supervisor/driver_transitions.rs:1589-1679 and src/safety.rs:436-440; unblock after B3 replaces RT Strings with typed bounded refusals"]
-async fn b3_blocked_clear_fault_refusal_zero_alloc() {
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    {
-        let mut inner = sup.inner().write().await;
-        inner.lease_enabled = false;
-        inner.disable_pending = true;
-        inner.safety.trigger_e_stop();
-    }
-    let handle = sup.start_executor(alloc_cfg(Duration::from_millis(5))).await.unwrap();
-    wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= 4).await;
-    assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
-
-    let res = handle.clear_fault_async().await.unwrap();
-    assert!(res.is_err(), "expected ClearFault refusal while disable_pending");
-    let after = handle.stats().completed_releases.load(Ordering::Acquire);
-    wait_until(Duration::from_secs(1), || handle.stats().completed_releases.load(Ordering::Acquire) >= after + 2).await;
-    let counts = handle.stats().total_allocs();
-    handle.stop_and_join();
-    assert_eq!(counts, AllocCounts::ZERO, "ClearFault refusal allocated: {counts:?}");
-}
-
 #[test]
-#[ignore = "blocked on B3: LogWriter::write copies bytes via buf.to_vec() in src/diagnostics/logwriter.rs:119 on RT tracing events (src/safety.rs:349,414,440; src/supervisor/actions.rs:186); unblock after B3 defers RT log formatting off-thread"]
-fn b3_blocked_logwriter_tracing_on_rt_zero_alloc() {
-    thread::spawn(|| {
-        let writer = armd::diagnostics::logwriter::NonBlocking::spawn("b2-test", std::io::sink()).unwrap();
-        let sub = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).finish();
-        let _guard = tracing::subscriber::set_default(sub);
-        tracing::callsite::rebuild_interest_cache();
-        let mut inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
-        alloc::time_this_thread();
-        let before = alloc::snapshot_counts();
-        inner.safety.trigger_e_stop();
-        let delta = alloc::snapshot_counts().delta_since(before);
-        assert_eq!(delta, AllocCounts::ZERO, "safety log via LogWriter allocated: {delta:?}");
-    })
-    .join()
-    .unwrap();
-}
-
-#[test]
-#[ignore = "blocked on A8/C: gripper zero_check(store_offset=true) serializes JSON and allocates PendingZeroCheckPersist/error Strings on RT in src/supervisor/actions.rs:196-245; config commits remain gated until A8/A9"]
+#[ignore = "blocked on A8/C: gripper zero_check(store_offset=true) serializes JSON and allocates PendingZeroCheckPersist/error Strings on RT in src/supervisor/actions.rs:197-246; config commits remain gated until A8/A9"]
 fn a8_blocked_zero_check_store_offset_serialization_zero_alloc() {
     thread::spawn(|| {
         let dir = tempfile::tempdir().unwrap();
