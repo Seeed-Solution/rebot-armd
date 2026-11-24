@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 
 /// `env_var` when set, else `default`.
@@ -113,6 +113,21 @@ impl StagedWrite {
     /// Phase 1 (outside supervisor lock): create a unique temp file in `path`'s parent directory,
     /// write `content`, and `sync_all()`. Official file is untouched.
     pub fn stage(path: PathBuf, content: String) -> Result<StagedWrite, String> {
+        if TEST_STAGE_PAUSE_ARMED.load(Ordering::Acquire) {
+            let hook = TEST_STAGE_PAUSE.get().and_then(|m| {
+                let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                if g.as_ref().is_some_and(|(target, _, _)| *target == path) {
+                    TEST_STAGE_PAUSE_ARMED.store(false, Ordering::Release);
+                    g.take()
+                } else {
+                    None
+                }
+            });
+            if let Some((_, entered_tx, release_rx)) = hook {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            }
+        }
         let delay = TEST_WRITE_DELAY_MS.load(Ordering::Relaxed);
         if delay > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay));
@@ -309,6 +324,31 @@ static REVISION: AtomicU64 = AtomicU64::new(0);
 /// Extra delay (ms) before each write on the writer thread; 0 in normal use. Tests set it to
 /// make "the ack follows later replies" deterministic.
 pub static TEST_WRITE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+type StagePauseHook = (PathBuf, mpsc::SyncSender<()>, mpsc::Receiver<()>);
+static TEST_STAGE_PAUSE_ARMED: AtomicBool = AtomicBool::new(false);
+static TEST_STAGE_PAUSE: OnceLock<std::sync::Mutex<Option<StagePauseHook>>> = OnceLock::new();
+
+/// Test hook: pauses the next [`StagedWrite::stage`] call targeting `target_path` until the
+/// returned release sender is signalled (or dropped), signalling `entered_rx` once staging starts.
+#[doc(hidden)]
+pub fn arm_test_stage_pause(target_path: PathBuf) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let slot = TEST_STAGE_PAUSE.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((target_path, entered_tx, release_rx));
+    TEST_STAGE_PAUSE_ARMED.store(true, Ordering::Release);
+    (entered_rx, release_tx)
+}
+
+/// Clears any armed [`arm_test_stage_pause`] hook (for RAII test cleanup).
+#[doc(hidden)]
+pub fn clear_test_stage_pause() {
+    TEST_STAGE_PAUSE_ARMED.store(false, Ordering::Release);
+    if let Some(slot) = TEST_STAGE_PAUSE.get() {
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
 
 /// A write prepared under the supervisor lock and carried out after it is released.
 #[derive(Debug, Clone)]

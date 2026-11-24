@@ -456,6 +456,13 @@ impl crate::supervisor::SupervisorInner {
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn store_qualification(sup: &crate::supervisor::ArmSupervisor, deps: &crate::calibration::CalibrationDeps,
     file: crate::calibration::CalibrationFile, check: &crate::calibration::LeaseCheck) -> Result<Value, CalibError> {
+    if sup.owner_mode() != crate::supervisor::OWNER_LEGACY {
+        return Err(CalibError::new(
+            409,
+            "EXECUTOR_UNSUPPORTED",
+            format!("{QUALIFICATION_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
+        ));
+    }
     {
         let mut inner = sup.inner().write().await;
         check(&mut inner)?;

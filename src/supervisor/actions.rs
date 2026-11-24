@@ -28,31 +28,24 @@ impl SupervisorInner {
         self.table_still_anchor_positions.clear();
     }
 
-    pub fn check_table_capture_stillness(&self) -> Result<(), ArmError> {
+    /// Zero-allocation stillness check backing [`Self::check_table_capture_stillness`].
+    pub(crate) fn check_table_capture_stillness_static(&self) -> Result<(), &'static str> {
         if !self.feedback_numeric_valid {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires valid joint feedback".into(),
-            ).into());
+            return Err("table_z_from_tcp requires valid joint feedback");
         }
         if self.driver.is_some() && !self.hardware_feedback_fresh(Duration::from_millis(250)) {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires fresh joint feedback".into(),
-            ).into());
+            return Err("table_z_from_tcp requires fresh joint feedback");
         }
         if self.active_trajectory.is_some()
             || self.servo_target.is_some()
             || self.commanded_velocities.iter().any(|v| v.abs() > 1e-3)
         {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires the arm to be stationary".into(),
-            ).into());
+            return Err("table_z_from_tcp requires the arm to be stationary");
         }
         if self.measured_velocities.len() != self.config.dof
             || self.measured_velocities.iter().any(|v| !v.is_finite() || v.abs() > 0.02)
         {
-            return Err(MotionError::InvalidCommand(
-                "table_z_from_tcp requires measured joint velocities <= 0.02 rad/s".into(),
-            ).into());
+            return Err("table_z_from_tcp requires measured joint velocities <= 0.02 rad/s");
         }
         if self.driver.is_some() || self.still_window_ever_moved {
             let settled = if self.driver.is_some() {
@@ -75,12 +68,15 @@ impl SupervisorInner {
                         .all(|(m, a)| m.is_finite() && (m - a).abs() <= UNLOAD_STILL_POSITION_SPAN_RAD)
             };
             if !settled {
-                return Err(MotionError::InvalidCommand(
-                    "table_z_from_tcp requires the arm to remain still for at least 0.2 s with fresh distinct hardware samples".into(),
-                ).into());
+                return Err("table_z_from_tcp requires the arm to remain still for at least 0.2 s with fresh distinct hardware samples");
             }
         }
         Ok(())
+    }
+
+    pub fn check_table_capture_stillness(&self) -> Result<(), ArmError> {
+        self.check_table_capture_stillness_static()
+            .map_err(|msg| MotionError::InvalidCommand(msg.into()).into())
     }
 
     /// Start a new action record; a running one is cancelled as SUPERSEDED.
@@ -224,10 +220,24 @@ impl SupervisorInner {
         }
     }
 
+    pub(crate) fn retire_zero_check_ctx(&mut self, ctx: Box<ZeroCheckPersistContext>) {
+        if self.retired_zero_check_ctx.len() < self.retired_zero_check_ctx.capacity() {
+            self.retired_zero_check_ctx.push_back(ctx);
+        } else {
+            // Only reachable if off-thread drain was never attached (standalone legacy tests).
+            drop(ctx);
+        }
+    }
+
+    pub(crate) fn pop_retired_zero_check_ctx(&mut self) -> Option<Box<ZeroCheckPersistContext>> {
+        self.retired_zero_check_ctx.pop_front()
+    }
+
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
-        let mut store_offset_req: Option<(f32, Option<(crate::auth::OperatorAuth, Option<String>)>)> = None;
+        let mut store_offset_req: Option<(f32, Box<ZeroCheckPersistContext>)> = None;
+        let mut retired_ctx: Option<Box<ZeroCheckPersistContext>> = None;
         let mut incoming_message = message;
         let mut displaced_message: Option<String> = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
@@ -245,28 +255,33 @@ impl SupervisorInner {
             if settled.is_some() { a.settled = settled; }
             if holding.is_some() { a.holding = holding; }
             if gap.is_some() { a.gripper_gap_rad = gap; }
-            if a.kind == "gripper_zero_check" {
-                if let Some(params) = self.zero_check_params.take().filter(|p| p.action_id == id) {
-                    if state == "done" {
-                        let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
-                        let offset_rad = stop_rad - params.base_closed_rad;
-                        let pass = offset_rad.abs() <= params.threshold_rad;
-                        a.stop_rad = Some(stop_rad);
-                        a.offset_rad = Some(offset_rad);
-                        a.pass = Some(pass);
-                        self.gripper_zero_checked = true;
-                        self.last_zero_check_offset = Some(offset_rad);
-                        if params.store_offset {
-                            if offset_rad.abs() <= 0.5 {
-                                store_offset_req = Some((offset_rad, params.operator_auth));
-                            } else {
-                                tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
+            if a.kind == "gripper_zero_check"
+                && self.zero_check_params.as_ref().is_some_and(|p| p.action_id == id)
+            {
+                let params = self.zero_check_params.take().expect("checked action_id match");
+                let mut unused_ctx = params.persist_ctx;
+                if state == "done" {
+                    let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
+                    let offset_rad = stop_rad - params.base_closed_rad;
+                    let pass = offset_rad.abs() <= params.threshold_rad;
+                    a.stop_rad = Some(stop_rad);
+                    a.offset_rad = Some(offset_rad);
+                    a.pass = Some(pass);
+                    self.gripper_zero_checked = true;
+                    self.last_zero_check_offset = Some(offset_rad);
+                    if params.store_offset {
+                        if offset_rad.abs() <= 0.5 {
+                            if let Some(ctx) = unused_ctx.take() {
+                                store_offset_req = Some((offset_rad, ctx));
                             }
+                        } else if !self.rt_executor_owned && !self.defer_zero_check_persist {
+                            tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
                         }
                     }
                 }
+                retired_ctx = unused_ctx;
             }
-            if !self.rt_executor_owned {
+            if !self.rt_executor_owned && !self.defer_zero_check_persist {
                 tracing::info!(
                     "Action {} ({}) {}{}{}",
                     id,
@@ -280,106 +295,53 @@ impl SupervisorInner {
         if let Some(unused_msg) = displaced_message.or(incoming_message) {
             self.recycle_action_msg_spare(unused_msg);
         }
-        if let Some((offset_rad, operator_auth)) = store_offset_req {
-            let candidate_jaw = self.gripper_calib_jaw_opening.clone();
-            match self.build_gripper_calibration_candidate(Some(offset_rad), candidate_jaw.clone()) {
-                Err(e) => {
-                    tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
+        if let Some(ctx) = retired_ctx {
+            self.retire_zero_check_ctx(ctx);
+        }
+        if let Some((offset_rad, mut ctx)) = store_offset_req {
+            if self.defer_zero_check_persist {
+                // Zero-allocation RT path: candidate validation and JSON serialization run
+                // completely off `armd-control` (on `armd-persist` or the legacy async worker).
+                if !self.persist_capacity_available {
                     if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                        a.state = "failed".into();
-                        a.code = Some("INVALID_CALIBRATION".into());
-                        a.message = Some(format!("Gripper calibration rejected: {e}"));
-                    }
-                }
-                Ok((cand, _)) => {
-                    let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
-                    let file = crate::gripper_calib::GripperCalibFile {
-                        offset_rad: Some(offset_rad),
-                        jaw_opening: candidate_jaw.clone(),
-                        ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
-                        stale: self.gripper_calib_stale.clone(),
-                        tool_id: Some(self.config.active_tool.id.clone()),
-                        tool_config_digest: Some(self.config.active_tool.config_digest.clone()),
-                    };
-                    let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-                    if self.defer_zero_check_persist {
-                        if !self.persist_capacity_available {
-                            tracing::warn!("Persistence worker unavailable or saturated; failing zero_check(store_offset=true) cleanly");
-                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = "failed".into();
-                                a.code = Some("PERSIST_FAILED".into());
-                                a.message = Some("Persistence channel unavailable or saturated".into());
-                            }
-                        } else {
-                            // Hold action as running until atomic persist-before-commit completes outside the lock.
-                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = crate::model::HolderLabel::new("running");
-                                a.finished_at = None;
-                            }
-                            self.zero_check_persisting = Some(id);
-                            let gripper_limit = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx)).cloned();
-                            self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
-                                action_id: id,
-                                offset_rad,
-                                jaw_opening: candidate_jaw,
-                                base_revision: self.gripper_calib_revision,
-                                lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
-                                operator_auth,
-                                write: crate::persist::PendingWrite::new(path, text),
-                                base_gripper_policy: self.base_gripper_policy.clone().or_else(|| self.config.gripper_policy.clone()),
-                                current_calib_jaw: self.gripper_calib_jaw_opening.clone(),
-                                gripper_limit,
-                                active_tool_is_stock: self.config.active_tool.is_stock,
-                            });
-                        }
-                    } else {
-                        let auth_ok = operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-                        if !auth_ok {
-                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = "failed".into();
-                                a.code = Some("OPERATOR_REQUIRED".into());
-                                a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
-                            }
-                        } else {
-                            match crate::persist::StagedWrite::stage(path, text) {
-                                Err(e) => {
-                                    tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
-                                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                        a.state = "failed".into();
-                                        a.code = Some("PERSIST_FAILED".into());
-                                        a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                                    }
-                                }
-                                Ok(staged) => match staged.rename_only() {
-                                    Err(e) => {
-                                        tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
-                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                            a.state = "failed".into();
-                                            a.code = Some("PERSIST_FAILED".into());
-                                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                                        }
-                                    }
-                                    Ok(dir_sync) => {
-                                        self.commit_gripper_calibration_candidate(cand);
-                                        self.gripper_calib_revision += 1;
-                                        let outcome = dir_sync.sync_parent_dir();
-                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                            match outcome {
-                                                crate::persist::PublishOutcome::Published => {
-                                                    a.durability_confirmed = Some(true);
-                                                }
-                                                crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
-                                                    a.durability_confirmed = Some(false);
-                                                    a.durability_warning = Some(w);
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                            }
+                        a.state = crate::model::HolderLabel::new("failed");
+                        a.code = Some(crate::model::HolderLabel::new("PERSIST_FAILED"));
+                        let mut msg = std::mem::take(&mut ctx.sat_msg_buf);
+                        msg.clear();
+                        msg.push_str("Persistence channel unavailable or saturated");
+                        if let Some(old_msg) = a.message.replace(msg) {
+                            ctx.sat_msg_buf = old_msg;
                         }
                     }
+                    self.retire_zero_check_ctx(ctx);
+                } else {
+                    // Hold action as running until atomic persist-before-commit completes off-thread.
+                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                        a.state = crate::model::HolderLabel::new("running");
+                        a.finished_at = None;
+                    }
+                    self.zero_check_persisting = Some(id);
+                    let lease_owner = self
+                        .active_lease
+                        .as_ref()
+                        .map(|l| (crate::model::HolderLabel::new(&l.client_id), l.generation));
+                    self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
+                        action_id: id,
+                        offset_rad,
+                        base_revision: self.gripper_calib_revision,
+                        lease_owner,
+                        estop_epoch: self.safety.epoch_id(),
+                        stop_gen: self.current_stop_gen(),
+                        deadline: Instant::now() + crate::supervisor::config::CONFIG_PROPOSAL_BUDGET,
+                        ctx,
+                    });
                 }
+            } else {
+                // Non-deferred legacy path (direct `SupervisorInner::tick` tests): route through
+                // the EXACT same common commit state machine (`reserve -> serialize + stage + fsync
+                // -> fresh authority recheck -> rename -> parent-dir fsync -> authority recheck
+                // -> activate`, with dir-sync failure entering `Reconciling`).
+                crate::rt_core::requests::config::commit_zero_check_sync(self, id, offset_rad, ctx);
             }
         }
         if holding == Some(false) { self.held = None; }
@@ -1453,12 +1415,17 @@ impl SupervisorInner {
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
         self.gripper_stall_window.reset();
+        let persist_ctx = if store_offset {
+            Some(Box::new(ZeroCheckPersistContext::from_inner(self, operator_auth)))
+        } else {
+            None
+        };
         self.zero_check_params = Some(ZeroCheckParams {
             action_id: id,
             store_offset,
             threshold_rad,
             base_closed_rad,
-            operator_auth,
+            persist_ctx,
         });
         Ok((id, duration))
     }

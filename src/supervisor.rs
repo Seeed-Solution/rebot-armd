@@ -21,7 +21,7 @@ use crate::motion::{
 
 // supervisor leaf modules (armd 1.6 RT-core foundation)
 mod driver_transitions;
-mod config;
+pub(crate) mod config;
 mod motion;
 mod streams;
 mod actions;
@@ -913,6 +913,8 @@ pub struct SupervisorInner {
     pub unload_settle: Option<UnloadSettle>,
     /// Set while a park started by the lease watchdog is running.
     pub watchdog_park: Option<WatchdogPark>,
+    /// Inline reason the lease watchdog held position instead of starting a park (0 heap ops).
+    pub watchdog_park_blocked_reason: Option<crate::model::HolderLabel>,
     /// Set when the last park was refused because its path enters a keep-out box.
     pub park_rejection: Option<SafetyError>,
     /// Bumped on every change of the workspace rule inputs (keep-out boxes, camera mount);
@@ -945,6 +947,9 @@ pub struct SupervisorInner {
     /// A motor zero runs (`crate::motor_zero`, with `calibration_busy`): torque on and
     /// clear_fault are refused too.
     pub motor_zero_busy: bool,
+    /// Cached raw driver position limits (updated off-RT / on bounded driver-limit commits) so
+    /// RT gripper calibration validation never acquires the driver mutex on `armd-control`.
+    pub(crate) cached_driver_pos_limits: [Option<(f32, f32)>; crate::rt_core::mailbox::MAX_DOF],
     /// `calibration.json` was rejected at startup (message; cleared by a successful apply / restore).
     pub calibration_load_error: Option<String>,
     /// Joint zero offsets in effect (motor - joint, rad, one per joint; calibration.json
@@ -1010,6 +1015,8 @@ pub struct SupervisorInner {
     pub handover_settling_since: Option<Instant>,
     /// Running gravity-compensation session (`src/gravity_comp.rs`).
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
+    /// Retired gravity-compensation session waiting for off-thread drop (never dropped on RT).
+    pub(crate) retired_gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
     pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
     /// Keep-out source and file (`src/keepout.rs`).
     pub keepout: crate::keepout::Keepout,
@@ -1065,6 +1072,8 @@ pub struct SupervisorInner {
     pub driver_config_error: Option<String>,
     /// Previous `driver_config_error` string retired on the RT thread for off-thread deallocation.
     pub(crate) retired_driver_config_error: Option<String>,
+    /// Non-recoverable configuration persistence fault latched after bounded reconciliation fails.
+    pub(crate) config_reconcile_fault: Option<crate::safety::BoundedText<256>>,
     /// Required continuous duration below `max_temperature - THERMAL_CLEAR_MARGIN_C` before
     /// `ThermalTrip` may clear (default `Duration::ZERO`).
     pub thermal_cooldown_duration: Duration,
@@ -1094,6 +1103,8 @@ pub struct SupervisorInner {
     pub zero_check_persisting: Option<u64>,
     /// Pending disk persist + commit payload produced by finish_action during ArmSupervisor::tick.
     pub pending_zero_check_persist: Option<PendingZeroCheckPersist>,
+    /// Retired `ZeroCheckPersistContext` payloads waiting for off-thread drop (never dropped on RT).
+    pub(crate) retired_zero_check_ctx: std::collections::VecDeque<Box<ZeroCheckPersistContext>>,
     /// Whether operator auth is enforced (exposed in GET /api/v1/safety/describe).
     pub operator_auth_enforced: bool,
     /// Path to persisted tool commissioning confirmations (`tool_commissioning.json`).
@@ -1409,6 +1420,75 @@ pub struct GripperCalibrationCandidate {
     driver_config_error: Option<String>,
 }
 
+/// Pre-captured heap context for `gripper_zero_check(store_offset=true)` persistence,
+/// allocated once at action start so `finish_action` on `armd-control` performs zero heap
+/// allocations and zero frees.
+#[derive(Clone)]
+pub struct ZeroCheckPersistContext {
+    pub path: PathBuf,
+    pub jaw_opening: Option<crate::model::JawOpening>,
+    pub stale: Option<crate::calibration::CalibrationStale>,
+    pub tool_id: String,
+    pub tool_config_digest: String,
+    pub active_tool_is_stock: bool,
+    pub base_gripper_policy: Option<crate::model::GripperPolicy>,
+    pub gripper_limit: Option<crate::model::JointLimit>,
+    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    /// Pre-allocated scratch buffer reused on saturation failure without allocating on RT.
+    pub sat_msg_buf: String,
+}
+
+impl ZeroCheckPersistContext {
+    /// Captures all heap-backed calibration persistence inputs off the RT completion path.
+    pub fn from_inner(
+        inner: &SupervisorInner,
+        operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    ) -> Self {
+        let path = inner
+            .gripper_calib_path
+            .clone()
+            .unwrap_or_else(crate::gripper_calib::path_from_env);
+        let gripper_limit = inner
+            .config
+            .gripper_index()
+            .and_then(|idx| inner.config.limits.get(idx))
+            .cloned();
+        Self {
+            path,
+            jaw_opening: inner.gripper_calib_jaw_opening.clone(),
+            stale: inner.gripper_calib_stale.clone(),
+            tool_id: inner.config.active_tool.id.clone(),
+            tool_config_digest: inner.config.active_tool.config_digest.clone(),
+            active_tool_is_stock: inner.config.active_tool.is_stock,
+            base_gripper_policy: inner
+                .base_gripper_policy
+                .clone()
+                .or_else(|| inner.config.gripper_policy.clone()),
+            gripper_limit,
+            operator_auth,
+            sat_msg_buf: String::with_capacity(64),
+        }
+    }
+
+    /// Serializes `GripperCalibFile` off the control thread into a [`crate::persist::PendingWrite`].
+    pub fn serialize_write(&self, offset_rad: f32) -> crate::persist::PendingWrite {
+        let file = crate::gripper_calib::GripperCalibFile {
+            offset_rad: Some(offset_rad),
+            jaw_opening: self.jaw_opening.clone(),
+            ts: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+            stale: self.stale.clone(),
+            tool_id: Some(self.tool_id.clone()),
+            tool_config_digest: Some(self.tool_config_digest.clone()),
+        };
+        let text = serde_json::to_string_pretty(&file).unwrap_or_default();
+        crate::persist::PendingWrite::new(self.path.clone(), text)
+    }
+}
+
 /// Parameters of a running gripper zero check action.
 #[derive(Clone)]
 pub struct ZeroCheckParams {
@@ -1416,7 +1496,7 @@ pub struct ZeroCheckParams {
     pub store_offset: bool,
     pub threshold_rad: f32,
     pub base_closed_rad: f32,
-    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    pub persist_ctx: Option<Box<ZeroCheckPersistContext>>,
 }
 
 /// Deferred atomic persist-before-commit job for `gripper_zero_check(store_offset=true)`.
@@ -1424,15 +1504,12 @@ pub struct ZeroCheckParams {
 pub struct PendingZeroCheckPersist {
     pub action_id: u64,
     pub offset_rad: f32,
-    pub jaw_opening: Option<crate::model::JawOpening>,
     pub base_revision: u64,
-    pub lease_owner: Option<(String, u64)>,
-    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
-    pub write: crate::persist::PendingWrite,
-    pub base_gripper_policy: Option<crate::model::GripperPolicy>,
-    pub current_calib_jaw: Option<crate::model::JawOpening>,
-    pub gripper_limit: Option<crate::model::JointLimit>,
-    pub active_tool_is_stock: bool,
+    pub lease_owner: Option<(crate::model::HolderLabel, u64)>,
+    pub estop_epoch: u64,
+    pub stop_gen: u64,
+    pub deadline: Instant,
+    pub ctx: Box<ZeroCheckPersistContext>,
 }
 
 /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`).
@@ -1713,6 +1790,7 @@ impl SupervisorInner {
             pending_normal_unload: false,
             unload_settle: None,
             watchdog_park: None,
+            watchdog_park_blocked_reason: None,
             park_rejection: None,
             workspace_revision: 0,
             calibration: None,
@@ -1725,6 +1803,7 @@ impl SupervisorInner {
             hover_jobs: Vec::new(),
             calibration_busy: false,
             motor_zero_busy: false,
+            cached_driver_pos_limits: [None; crate::rt_core::mailbox::MAX_DOF],
             calibration_load_error: None,
             joint_zero_offsets: vec![0.0; dof],
             zero_convention: Default::default(),
@@ -1762,6 +1841,7 @@ impl SupervisorInner {
             last_evicted: None,
             handover_settling_since: None,
             gravity_comp: None,
+            retired_gravity_comp: None,
             gravity_comp_last_exit: None,
             keepout: crate::keepout::Keepout::default(),
             poses: crate::poses::PoseStore::default(),
@@ -1791,6 +1871,7 @@ impl SupervisorInner {
             mock_gripper_object: None,
             driver_config_error: None,
             retired_driver_config_error: None,
+            config_reconcile_fault: None,
             thermal_cooldown_duration: Duration::ZERO,
             thermal_cooldown: ThermalCooldown::default(),
             zero_check_params: None,
@@ -1803,6 +1884,7 @@ impl SupervisorInner {
             tick_phases_us: [0; 5],
             zero_check_persisting: None,
             pending_zero_check_persist: None,
+            retired_zero_check_ctx: std::collections::VecDeque::with_capacity(4),
             operator_auth_enforced: false,
             tool_commissioning_path: None,
             tool_commissioning_confirmed_at: None,
@@ -2023,7 +2105,7 @@ impl SupervisorInner {
         Ok(())
     }
 
-    fn is_stamp_consumed(&self, request_id: u64) -> bool {
+    pub(crate) fn is_stamp_consumed(&self, request_id: u64) -> bool {
         if request_id == 0 {
             return true;
         }
@@ -2035,7 +2117,7 @@ impl SupervisorInner {
         }
     }
 
-    fn record_consumed_stamp(&mut self, request_id: u64) {
+    pub(crate) fn record_consumed_stamp(&mut self, request_id: u64) {
         if request_id == 0 {
             return;
         }
@@ -2636,6 +2718,7 @@ impl SupervisorInner {
         self.policy_observation_into(&mut out.policy);
         #[cfg(not(feature = "policy-runtime"))]
         { out.policy = None; }
+        out.watchdog_park_blocked_reason = self.watchdog_park_blocked_reason;
         out.safety_log_dropped = self.safety.log_dropped().saturating_add(self.safety_log_ring_dropped);
     }
 
@@ -5782,6 +5865,7 @@ impl SupervisorInner {
             // rigid lock at the current position and latch the fault, keeping torque on.
             match self.watchdog_park_blocker_bounded() {
                 None => {
+                    self.watchdog_park_blocked_reason = None;
                     tracing::warn!("Watchdog: lease expired while torqued, parking");
                     self.apply_stop_policy(StopPolicy::NormalUnload);
                     if self.pending_normal_unload {
@@ -5789,11 +5873,14 @@ impl SupervisorInner {
                         tracing::info!("Watchdog park budget {:.2} s (planned {:.2} s)", budget.as_secs_f64(), self.unload_planned_duration.unwrap_or(0.0));
                         self.watchdog_park = Some(WatchdogPark { elapsed_s: 0.0, budget_s: budget.as_secs_f64(), grace_granted: false });
                     } else {
-                        self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("watchdog park could not be planned"));
+                        let reason = crate::safety::BoundedText::new("watchdog park could not be planned");
+                        self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(reason.as_str()));
+                        self.safety.log_watchdog_park_blocked(reason);
                         self.latch_watchdog_fault();
                     }
                 }
                 Some(reason) => {
+                    self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(reason.as_str()));
                     if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::WatchdogTimeout) {
                         self.safety.log_watchdog_park_blocked(reason);
                     }
@@ -7452,6 +7539,13 @@ pub struct ArmSupervisor {
     obs_waits: AtomicU64,
     obs_unavailable: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Off-RT published configuration snapshot for REST readers and off-thread prepare (never touched on RT).
+    published_config: Arc<crate::rt_core::requests::config::PublishedConfigHub>,
+    /// Test-only hooks for deterministic config-commit failure injection across both owners.
+    config_commit_hooks: std::sync::Mutex<crate::rt_core::requests::config::ConfigCommitTestHooks>,
+    /// Monotonic mirror of committed `SequenceStore::revision` (Release-updated on activate
+    /// BEFORE unpinning reserved replay episodes so concurrent episode deletes are linearizable).
+    sequences_revision: Arc<AtomicU64>,
     /// Single-owner slot (`Legacy` -> `Transferring` -> `Executor` | `Failed`).
     /// Lock order: always `self.inner` before `self.owner`.
     owner: std::sync::Mutex<OwnerSlot>,
@@ -7626,6 +7720,7 @@ impl ArmSupervisor {
         inner.lease_gen_mirror = lease_gen_mirror.clone();
         inner.terminals = Some(Arc::clone(&terminals));
         let template_obs = inner.current_observation();
+        let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
@@ -7656,6 +7751,14 @@ impl ArmSupervisor {
             obs_waits: AtomicU64::new(0),
             obs_unavailable: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            published_config: Arc::new(crate::rt_core::requests::config::PublishedConfigHub::new(
+                initial_pub_cfg,
+                0,
+            )),
+            config_commit_hooks: std::sync::Mutex::new(
+                crate::rt_core::requests::config::ConfigCommitTestHooks::default(),
+            ),
+            sequences_revision: Arc::new(AtomicU64::new(0)),
             owner: std::sync::Mutex::new(OwnerSlot::Legacy),
             owner_mode: AtomicU8::new(OWNER_LEGACY),
             executor_base_gen: AtomicU64::new(0),
@@ -7664,6 +7767,128 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             instance_id,
+        }
+    }
+
+    /// Current live `SequenceStore::revision` mirror used to linearize episode deletes against
+    /// concurrent `Sequences` save commits without blocking on `config_write_mutex`.
+    pub fn sequences_revision(&self) -> u64 {
+        self.sequences_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_sequences_revision(&self, rev: u64) {
+        self.sequences_revision.store(rev, Ordering::Release);
+    }
+
+    /// Checks on the single live owner (`Legacy` or `Executor`) whether episode `id` is free of
+    /// saved, running, or reserved sequence references (`409 IN_USE` otherwise).
+    pub async fn check_episode_delete_allowed(&self, id: &str) -> Result<(), ArmError> {
+        use crate::rt_core::requests::config::{ConfigReply, ConfigRequest};
+        if self.owner_mode() == OWNER_LEGACY {
+            let inner = self.inner.read().await;
+            inner.episode_delete_allowed(id)?;
+            if inner.episodes.is_pinned(id) {
+                return Err(ArmError::detailed(
+                    409,
+                    "IN_USE",
+                    format!("Episode '{id}' is reserved by an in-progress sequence save"),
+                    serde_json::json!({"sequences": ["pending_save"]}),
+                ));
+            }
+            return Ok(());
+        }
+        match self
+            .dispatch_config_request_owned_reliable(ConfigRequest::CheckEpisodeDeleteAllowed(
+                crate::model::HolderLabel::new(id),
+            ))
+            .await
+        {
+            Ok(ConfigReply::EpisodeDeleteAllowed(true)) => Ok(()),
+            Ok(ConfigReply::EpisodeDeleteAllowed(false)) => {
+                let mut users = self
+                    .published_config()
+                    .await
+                    .map(|p| p.sequences.using_episode(id))
+                    .unwrap_or_default();
+                if users.is_empty() {
+                    users.push("pending_save".to_string());
+                }
+                Err(ArmError::detailed(
+                    409,
+                    "IN_USE",
+                    format!("Episode '{id}' is used by {} sequence(s)", users.len()),
+                    serde_json::json!({"sequences": users}),
+                ))
+            }
+            Err(e) => Err(e.to_arm_error()),
+            _ => Err(ArmError::Internal("unexpected CheckEpisodeDeleteAllowed reply".into())),
+        }
+    }
+
+    /// Linearizably verifies episode `id` is unreferenced (saved, running, or reserved) on the
+    /// live owner and removes it from the `EpisodeStore` catalog. Returns `Ok(true)` if removed,
+    /// `Ok(false)` if absent, or `Err(409 IN_USE)` if referenced or pinned by a sequence save.
+    pub async fn take_episode_for_delete(&self, id: &str) -> Result<bool, ArmError> {
+        use crate::recording::store::TakeEpisodeOutcome;
+        loop {
+            let rev0 = self.sequences_revision();
+            self.check_episode_delete_allowed(id).await?;
+            let store = self.episode_store().await;
+            match store.take_if_unpinned_and_rev_matches(id, &self.sequences_revision, rev0) {
+                TakeEpisodeOutcome::Removed => return Ok(true),
+                TakeEpisodeOutcome::NotFound => return Ok(false),
+                TakeEpisodeOutcome::Pinned => {
+                    let mut users = self
+                        .published_config()
+                        .await
+                        .map(|p| p.sequences.using_episode(id))
+                        .unwrap_or_default();
+                    if users.is_empty() {
+                        users.push("pending_save".to_string());
+                    }
+                    return Err(ArmError::detailed(
+                        409,
+                        "IN_USE",
+                        format!("Episode '{id}' is used by {} sequence(s)", users.len()),
+                        serde_json::json!({"sequences": users}),
+                    ));
+                }
+                TakeEpisodeOutcome::SequenceRevisionChanged => continue,
+            }
+        }
+    }
+
+    /// Linearizably verifies every episode in `dataset` is unreferenced (saved, running, or
+    /// reserved) and atomically removes all of them from the `EpisodeStore` catalog.
+    pub async fn take_dataset_episodes_for_delete(&self, dataset: &str) -> Result<Vec<String>, ArmError> {
+        use crate::recording::store::TakeDatasetOutcome;
+        loop {
+            let rev0 = self.sequences_revision();
+            let store = self.episode_store().await;
+            let ids = store.episodes_of(dataset);
+            for id in &ids {
+                self.check_episode_delete_allowed(id).await?;
+            }
+            match store.take_dataset_if_unpinned_and_rev_matches(&ids, &self.sequences_revision, rev0) {
+                TakeDatasetOutcome::Removed(taken) => return Ok(taken),
+                TakeDatasetOutcome::Pinned(pinned_id) => {
+                    let mut users = self
+                        .published_config()
+                        .await
+                        .map(|p| p.sequences.using_episode(&pinned_id))
+                        .unwrap_or_default();
+                    if users.is_empty() {
+                        users.push("pending_save".to_string());
+                    }
+                    return Err(ArmError::detailed(
+                        409,
+                        "IN_USE",
+                        format!("Episode '{pinned_id}' is used by {} sequence(s)", users.len()),
+                        serde_json::json!({"sequences": users}),
+                    ));
+                }
+                TakeDatasetOutcome::SequenceRevisionChanged => continue,
+            }
         }
     }
 
@@ -7836,10 +8061,18 @@ impl ArmSupervisor {
             });
         }
         if let Some(ref d) = guard.driver {
+            let mut cached_pos = [None; crate::rt_core::mailbox::MAX_DOF];
+            let dof = guard.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
             let cap_res = match d.lock() {
-                Ok(drv) => drv.supports_rt_executor(),
+                Ok(drv) => {
+                    for (i, slot) in cached_pos.iter_mut().take(dof).enumerate() {
+                        *slot = drv.position_limits(i);
+                    }
+                    drv.supports_rt_executor()
+                }
                 Err(_) => Err("driver mutex poisoned"),
             };
+            guard.cached_driver_pos_limits = cached_pos;
             if let Err(reason) = cap_res {
                 restore_legacy(&mut rollback);
                 return Err(ArmError::Rejected {
@@ -7858,6 +8091,10 @@ impl ArmSupervisor {
         guard.prepare_workspace_eval_bufs();
 
         let initial_gen = self.inner.generation();
+        self.published_config.publish(
+            crate::rt_core::requests::config::PublishedConfig::from_inner(&guard),
+            initial_gen,
+        );
         let shell = SupervisorInner::detached_shell(
             &guard.config,
             self.e_stop_latched.clone(),
@@ -7872,6 +8109,7 @@ impl ArmSupervisor {
             cfg,
             initial_gen,
             Arc::clone(&self.config_write_mutex),
+            Arc::clone(&self.published_config),
             Arc::clone(&self.estop_reg),
             Arc::clone(&self.tick_stats),
             Arc::clone(&self.control_sched),
@@ -7898,6 +8136,7 @@ impl ArmSupervisor {
                 Err(ArmError::Internal(msg))
             }
             Err((None, msg)) => {
+                self.published_config.set_available(false);
                 {
                     let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
                     *slot = OwnerSlot::Failed;
@@ -7914,11 +8153,244 @@ impl ArmSupervisor {
         Arc::clone(&self.config_write_mutex)
     }
 
-    pub async fn set_operator_auth_enforced(&self, enforced: bool) {
-        let mut inner = self.inner.write().await;
-        if self.check_legacy_under_guard(&inner).is_ok() {
-            inner.operator_auth_enforced = enforced;
+    pub fn published_config_hub(&self) -> &Arc<crate::rt_core::requests::config::PublishedConfigHub> {
+        &self.published_config
+    }
+
+    /// Returns the latest published configuration snapshot without touching `SupervisorLock`
+    /// in `OWNER_EXECUTOR` mode. Fails closed with `503 CONFIG_UNAVAILABLE` if ownership is
+    /// transitioning or failed.
+    pub async fn published_config(
+        &self,
+    ) -> Result<Arc<crate::rt_core::requests::config::PublishedConfig>, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(crate::rt_core::requests::config::config_unavailable());
+                };
+                if handle.is_exited() {
+                    return Err(crate::rt_core::requests::config::config_unavailable());
+                }
+                self.published_config
+                    .latest()
+                    .ok_or_else(crate::rt_core::requests::config::config_unavailable)
+            }
+            OWNER_LEGACY => {
+                let current_gen = self.inner.generation();
+                let (cached, cached_gen) = self.published_config.latest_with_gen();
+                if cached_gen == current_gen {
+                    return Ok(cached);
+                }
+                let inner = self.inner.read().await;
+                if inner.detached {
+                    drop(inner);
+                    if self.owner_mode() == OWNER_EXECUTOR {
+                        let Some(handle) = self.executor_handle() else {
+                            return Err(crate::rt_core::requests::config::config_unavailable());
+                        };
+                        if handle.is_exited() {
+                            return Err(crate::rt_core::requests::config::config_unavailable());
+                        }
+                        return self
+                            .published_config
+                            .latest()
+                            .ok_or_else(crate::rt_core::requests::config::config_unavailable);
+                    }
+                    return Err(crate::rt_core::requests::config::config_unavailable());
+                }
+                let gen = self.inner.generation();
+                let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
+                drop(inner);
+                Ok(self.published_config.publish_if_newer(snap, gen))
+            }
+            _ => Err(crate::rt_core::requests::config::config_unavailable()),
         }
+    }
+
+    /// Routes one [`ConfigRequest`] through the active single owner (`Legacy` write lock or
+    /// `Executor` `MaintenanceOp::Config`) using the identical owner-side handler.
+    pub async fn dispatch_config_request(
+        &self,
+        req: crate::rt_core::requests::config::ConfigRequest,
+    ) -> Result<
+        crate::rt_core::requests::config::ConfigReply,
+        crate::rt_core::requests::config::ConfigError,
+    > {
+        use crate::rt_core::executor::OwnerError;
+        use crate::rt_core::requests::config::{
+            handle_config_exchange, ConfigError, ConfigExchange,
+        };
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(ConfigError::OwnerStopped);
+                };
+                handle.call_config_async(req).await.map_err(|e| match e {
+                    OwnerError::QueueFull => ConfigError::OwnerQueueFull,
+                    _ => ConfigError::OwnerStopped,
+                })
+            }
+            OWNER_LEGACY => {
+                let mut ex = ConfigExchange::new(req);
+                let mut inner = self.inner.write().await;
+                if inner.detached {
+                    drop(inner);
+                    let req = ex.req.take().expect("request still present");
+                    if self.owner_mode() == OWNER_EXECUTOR {
+                        let Some(handle) = self.executor_handle() else {
+                            return Err(ConfigError::OwnerStopped);
+                        };
+                        return handle.call_config_async(req).await.map_err(|e| match e {
+                            OwnerError::QueueFull => ConfigError::OwnerQueueFull,
+                            _ => ConfigError::OwnerStopped,
+                        });
+                    }
+                    return Err(ConfigError::OwnerStopped);
+                }
+                let ctx = crate::rt_core::ops::CommitCtx {
+                    arm: inner.core.id(),
+                    boot: crate::rt_core::broker::BootId::process(),
+                    now: Instant::now(),
+                    stop_generation: inner.current_stop_gen(),
+                };
+                handle_config_exchange(&mut inner, &ctx, &mut ex);
+                drop(inner);
+                ex.reply.take().ok_or(ConfigError::OwnerStopped)
+            }
+            _ => Err(ConfigError::OwnerStopped),
+        }
+    }
+
+    /// Dispatches a `ConfigRequest` that must survive transient `MaintenanceOp` queue
+    /// backpressure (used for `Persisted`, `Activate`, `Release`, `VerifyAuthority`,
+    /// `CalibrationRevert`, and `SetCalibrationBusy(false)` cleanup).
+    ///
+    /// Retries `ConfigError::OwnerQueueFull` with short bounded backoff while the owner is
+    /// still alive; returns immediately on any non-backpressure outcome or `OwnerStopped`.
+    pub async fn dispatch_config_request_reliable(
+        &self,
+        mut build_req: impl FnMut() -> crate::rt_core::requests::config::ConfigRequest,
+    ) -> Result<
+        crate::rt_core::requests::config::ConfigReply,
+        crate::rt_core::requests::config::ConfigError,
+    > {
+        use crate::rt_core::requests::config::ConfigError;
+        let mut backoff_ms = 1u64;
+        loop {
+            match self.dispatch_config_request(build_req()).await {
+                Err(ConfigError::OwnerQueueFull) => {
+                    if self.owner_mode() == OWNER_EXECUTOR
+                        && self.executor_handle().is_none_or(|h| h.is_exited())
+                    {
+                        return Err(ConfigError::OwnerStopped);
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(10);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Dispatches a one-shot non-Clone `ConfigRequest` (e.g., carrying a unique `Reservation`
+    /// token or `ConfigCandidate`) with guaranteed retry across transient `OwnerQueueFull`.
+    /// When the executor queue is full, `MaintClient::call_config_retryable_async` returns the
+    /// exact untouched `ConfigRequest` so ownership is never lost.
+    pub async fn dispatch_config_request_owned_reliable(
+        &self,
+        mut req: crate::rt_core::requests::config::ConfigRequest,
+    ) -> Result<
+        crate::rt_core::requests::config::ConfigReply,
+        crate::rt_core::requests::config::ConfigError,
+    > {
+        use crate::rt_core::requests::config::{
+            handle_config_exchange, ConfigError, ConfigExchange,
+        };
+        let mut backoff_ms = 1u64;
+        loop {
+            match self.owner_mode() {
+                OWNER_EXECUTOR => {
+                    let Some(handle) = self.executor_handle() else {
+                        return Err(ConfigError::OwnerStopped);
+                    };
+                    if handle.is_exited() {
+                        return Err(ConfigError::OwnerStopped);
+                    }
+                    match handle.call_config_try_async(req).await {
+                        Ok(reply) => return Ok(reply),
+                        Err((returned_req, crate::rt_core::executor::OwnerError::QueueFull)) => {
+                            req = returned_req;
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(10);
+                        }
+                        Err((_, _)) => return Err(ConfigError::OwnerStopped),
+                    }
+                }
+                OWNER_LEGACY => {
+                    let mut ex = ConfigExchange::new(req);
+                    let mut inner = self.inner.write().await;
+                    if inner.detached {
+                        drop(inner);
+                        req = ex.req.take().expect("request still present");
+                        continue;
+                    }
+                    let ctx = crate::rt_core::ops::CommitCtx {
+                        arm: inner.core.id(),
+                        boot: crate::rt_core::broker::BootId::process(),
+                        now: Instant::now(),
+                        stop_generation: inner.current_stop_gen(),
+                    };
+                    handle_config_exchange(&mut inner, &ctx, &mut ex);
+                    drop(inner);
+                    return ex.reply.take().ok_or(ConfigError::OwnerStopped);
+                }
+                _ => return Err(ConfigError::OwnerStopped),
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_config_commit_test_hooks(
+        &self,
+        hooks: crate::rt_core::requests::config::ConfigCommitTestHooks,
+    ) {
+        *self
+            .config_commit_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = hooks;
+    }
+
+    #[doc(hidden)]
+    pub fn config_commit_test_hooks(
+        &self,
+    ) -> crate::rt_core::requests::config::ConfigCommitTestHooks {
+        self.config_commit_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Current monotonic stop generation across both `Legacy` and `Executor` owners (lock-free).
+    pub fn current_stop_gen(&self) -> u64 {
+        let legacy = self.stop_gen.load(Ordering::Acquire);
+        self.executor_handle()
+            .map_or(legacy, |h| legacy.max(h.stop_requests().current()))
+    }
+
+    pub async fn set_operator_auth_enforced(&self, enforced: bool) {
+        if self.owner_mode() == OWNER_LEGACY {
+            let mut inner = self.inner.write().await;
+            if self.check_legacy_under_guard(&inner).is_ok() {
+                inner.operator_auth_enforced = enforced;
+                let snap = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
+                let gen = self.inner.generation();
+                drop(inner);
+                self.published_config.publish(snap, gen);
+                return;
+            }
+        }
+        self.published_config
+            .update(|cfg| cfg.operator_auth_enforced = enforced);
     }
 
     /// Every tick's observation, forwarded by the dispatcher thread (started here when it
@@ -9000,226 +9472,13 @@ impl ArmSupervisor {
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);
+            let pub_hub = Arc::clone(&self.published_config);
+            let hooks = self.config_commit_test_hooks();
             tokio::spawn(async move {
-                let _cw = cw_lock.lock().await;
-                let path = job.write.path.clone();
-                let text = job.write.text.clone();
-                let staged_res = tokio::task::spawn_blocking(move || {
-                    crate::persist::StagedWrite::stage(path, text)
-                }).await;
-                let staged = match staged_res {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
-                        tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
-                        let mut inner = sup_inner.write().await;
-                        if inner.zero_check_persisting == Some(job.action_id) {
-                            inner.zero_check_persisting = None;
-                        }
-                        let now = inner.now_s();
-                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                            a.state = "failed".into();
-                            a.code = Some("PERSIST_FAILED".into());
-                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                            a.finished_at = Some(now);
-                        }
-                        inner.record_finished_action_by_id(job.action_id);
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Gripper calibration stage task failed: {e}");
-                        let mut inner = sup_inner.write().await;
-                        if inner.zero_check_persisting == Some(job.action_id) {
-                            inner.zero_check_persisting = None;
-                        }
-                        let now = inner.now_s();
-                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                            a.state = "failed".into();
-                            a.code = Some("PERSIST_FAILED".into());
-                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                            a.finished_at = Some(now);
-                        }
-                        inner.record_finished_action_by_id(job.action_id);
-                        return;
-                    }
-                };
-
-                let dir_sync = {
-                    let mut inner = sup_inner.write().await;
-                    let still_persisting = inner.zero_check_persisting == Some(job.action_id);
-                    let action_running = inner.last_action.as_ref().is_some_and(|a| a.id == job.action_id && a.is_running());
-                    let auth_ok = job.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-                    let lease_ok = match &job.lease_owner {
-                        None => true,
-                        Some((c, g)) => inner.active_lease.as_ref().is_some_and(|l| {
-                            l.acquired_at.elapsed() < inner.lease_timeout && l.client_id == *c && l.generation == *g
-                        }),
-                    };
-                    let rev_ok = inner.gripper_calib_revision == job.base_revision;
-
-                    if !still_persisting || !action_running || !lease_ok {
-                        staged.abort();
-                        if inner.zero_check_persisting == Some(job.action_id) {
-                            inner.zero_check_persisting = None;
-                        }
-                        if action_running {
-                            let now = inner.now_s();
-                            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                                a.state = "cancelled".into();
-                                a.code = Some(if !lease_ok { "LEASE_LOST" } else { "CANCELLED" }.into());
-                                a.message = Some(if !lease_ok {
-                                    "Control lease lost or expired before gripper calibration persisted".into()
-                                } else {
-                                    "Gripper zero check cancelled before calibration persisted".into()
-                                });
-                                a.finished_at = Some(now);
-                            }
-                            inner.record_finished_action_by_id(job.action_id);
-                        }
-                        return;
-                    }
-
-                    if !auth_ok {
-                        staged.abort();
-                        if inner.zero_check_persisting == Some(job.action_id) {
-                            inner.zero_check_persisting = None;
-                        }
-                        let now = inner.now_s();
-                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                            a.state = "failed".into();
-                            a.code = Some("OPERATOR_REQUIRED".into());
-                            a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
-                            a.finished_at = Some(now);
-                        }
-                        inner.record_finished_action_by_id(job.action_id);
-                        return;
-                    }
-
-                    if !rev_ok {
-                        staged.abort();
-                        if inner.zero_check_persisting == Some(job.action_id) {
-                            inner.zero_check_persisting = None;
-                        }
-                        let now = inner.now_s();
-                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                            a.state = "failed".into();
-                            a.code = Some("POLICY_REVISION_MISMATCH".into());
-                            a.message = Some("Gripper calibration revision changed concurrently".into());
-                            a.finished_at = Some(now);
-                        }
-                        inner.record_finished_action_by_id(job.action_id);
-                        return;
-                    }
-
-                    // Build complete validated candidate BEFORE atomic rename so memory commit is infallible.
-                    let cand = match inner.build_gripper_calibration_candidate(Some(job.offset_rad), job.jaw_opening.clone()) {
-                        Ok((cand, _)) => cand,
-                        Err(e) => {
-                            staged.abort();
-                            if inner.zero_check_persisting == Some(job.action_id) {
-                                inner.zero_check_persisting = None;
-                            }
-                            let now = inner.now_s();
-                            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                                a.state = "failed".into();
-                                a.code = Some("INVALID_CALIBRATION".into());
-                                a.message = Some(format!("Gripper calibration rejected: {e}"));
-                                a.finished_at = Some(now);
-                            }
-                            inner.record_finished_action_by_id(job.action_id);
-                            return;
-                        }
-                    };
-
-                    // Re-verify operator session & lease (not expired) immediately before atomic rename
-                    // because OperatorAuth or lease timeout can expire during driver limit validation.
-                    let auth_still_ok = job.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
-                    let lease_still_ok = match &job.lease_owner {
-                        None => true,
-                        Some((c, g)) => inner.active_lease.as_ref().is_some_and(|l| {
-                            l.acquired_at.elapsed() < inner.lease_timeout && l.client_id == *c && l.generation == *g
-                        }),
-                    };
-                    if !lease_still_ok {
-                        staged.abort();
-                        if inner.zero_check_persisting == Some(job.action_id) {
-                            inner.zero_check_persisting = None;
-                        }
-                        let now = inner.now_s();
-                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                            a.state = "cancelled".into();
-                            a.code = Some("LEASE_LOST".into());
-                            a.message = Some("Control lease lost or expired before gripper calibration persisted".into());
-                            a.finished_at = Some(now);
-                        }
-                        inner.record_finished_action_by_id(job.action_id);
-                        return;
-                    }
-                    if !auth_still_ok {
-                        staged.abort();
-                        if inner.zero_check_persisting == Some(job.action_id) {
-                            inner.zero_check_persisting = None;
-                        }
-                        let now = inner.now_s();
-                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                            a.state = "failed".into();
-                            a.code = Some("OPERATOR_REQUIRED".into());
-                            a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
-                            a.finished_at = Some(now);
-                        }
-                        inner.record_finished_action_by_id(job.action_id);
-                        return;
-                    }
-
-                    let dir_sync = match staged.rename_only() {
-                        Ok(ds) => ds,
-                        Err(e) => {
-                            tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
-                            if inner.zero_check_persisting == Some(job.action_id) {
-                                inner.zero_check_persisting = None;
-                            }
-                            let now = inner.now_s();
-                            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
-                                a.state = "failed".into();
-                                a.code = Some("PERSIST_FAILED".into());
-                                a.message = Some(format!("Failed to persist gripper calibration: {e}"));
-                                a.finished_at = Some(now);
-                            }
-                            inner.record_finished_action_by_id(job.action_id);
-                            return;
-                        }
-                    };
-
-                    // Infallible commit after atomic rename; keep zero_check_persisting set while parent dir fsync runs outside lock.
-                    inner.commit_gripper_calibration_candidate(cand);
-                    inner.gripper_calib_revision += 1;
-                    dir_sync
-                };
-
-                let outcome = tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
-                    .await
-                    .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
-                let mut inner = sup_inner.write().await;
-                if inner.zero_check_persisting == Some(job.action_id) {
-                    inner.zero_check_persisting = None;
-                }
-                let now = inner.now_s();
-                if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id) {
-                    if a.is_running() {
-                        a.state = "done".into();
-                        a.progress = 1.0;
-                        a.finished_at = Some(now);
-                    }
-                    match outcome {
-                        crate::persist::PublishOutcome::Published => {
-                            a.durability_confirmed = Some(true);
-                        }
-                        crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
-                            a.durability_confirmed = Some(false);
-                            a.durability_warning = Some(w);
-                        }
-                    }
-                }
-                inner.record_finished_action_by_id(job.action_id);
+                crate::rt_core::requests::config::run_legacy_zero_check_commit(
+                    sup_inner, cw_lock, pub_hub, hooks, job,
+                )
+                .await;
             });
         }
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
@@ -9437,6 +9696,14 @@ impl ArmSupervisor {
             );
         snap.log_writer_dropped = crate::diagnostics::logwriter::total_dropped();
         snap
+    }
+
+    /// Thread-CPU-time percentiles of lock-held tick execution over the current tick window
+    /// (`CLOCK_THREAD_CPUTIME_ID` on Linux, excluding off-CPU OS preemption under host load).
+    #[doc(hidden)]
+    pub fn tick_lock_cpu_us(&self) -> crate::diagnostics::tick::Percentiles {
+        self.drain_diag();
+        self.tick_stats.window().lock_cpu_us()
     }
 
     pub async fn set_mock_gripper_stall_offset(&self, offset: Option<f32>) {

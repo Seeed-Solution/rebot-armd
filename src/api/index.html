@@ -109,7 +109,7 @@ body.ui-simple .only-expert, body.ui-expert .only-simple { display: none !import
 .seg.off button, .seg button:disabled { cursor: not-allowed; }
 .seg.off { opacity: .45; filter: saturate(0); }
 .seg.off button.on { background: transparent; box-shadow: none; }
-body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
+body.locked .pose-go { cursor: not-allowed; }
 
 /* ---------- buttons ---------- */
 .btn {
@@ -213,6 +213,9 @@ body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 .op-head h3 { margin: 0; font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
 .btn.op-estop { flex: none; min-height: 36px; padding: 0 12px; font-size: 13px; font-weight: 700; color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); touch-action: none; }
 .btn.op-estop:hover { color: #fff; background: var(--sc-estop); filter: brightness(1.06); }
+.preempt-head-acts { display: flex; align-items: center; gap: 6px; flex: none; }
+.btn.op-stop { flex: none; min-height: 36px; padding: 0 12px; font-size: 13px; font-weight: 600; color: #92400e; background: #fef3c7; border-color: #f59e0b; touch-action: none; }
+.btn.op-stop:hover { color: #92400e; background: #fde68a; border-color: #d97706; }
 .op-why { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.45; color: var(--sc-status-warning-fg); }
 .op-why:empty, .op-err:empty, .op-retry:empty { display: none; }
 .op-retry { margin: -4px 0 0; font-size: 12px; color: var(--sc-color-text-secondary); }
@@ -1050,7 +1053,6 @@ body.stopped .lock-note { color: var(--sc-status-danger-fg); background: var(--s
 .grip-key:active { transform: scale(.95); }
 .grip-key.pulse::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 2px solid var(--sc-color-primary); animation: ripple .8s ease-out; pointer-events: none; }
 @keyframes ripple { from { transform: scale(1); opacity: .9; } to { transform: scale(1.5); opacity: 0; } }
-body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .preset { opacity: .55; filter: saturate(.6); }
 .move-hint { font-size: 12px; color: var(--sc-color-text-tertiary); text-align: center; min-height: 18px; margin-top: -4px; }
 .move-hint.bad { color: var(--sc-status-warning-fg); }
 .move-hint:empty { display: none; }
@@ -1134,7 +1136,6 @@ body.mode-stick .jog-list, body.mode-cart .jog-list { display: none; }
 .jbtn.pressed { background: var(--sc-color-primary-dark); color: #fff; }
 .jbtn.pressed svg, .jbtn.pressed kbd { color: #fff; }
 .jbtn.at-limit { opacity: .4; }
-body.locked .jbtn { opacity: .5; }
 
 /* joysticks */
 .stick-zone { display: none; grid-template-columns: 1fr auto 1fr; align-items: center; justify-items: center; gap: 12px; }
@@ -1158,7 +1159,6 @@ body.mode-stick .stick-zone { display: grid; }
 .pad .dir.b { bottom: 5px; left: 50%; transform: translateX(-50%); }
 .pad .dir.l { left: 6px; top: 50%; transform: translateY(-50%); }
 .pad .dir.r { right: 6px; top: 50%; transform: translateY(-50%); }
-body.locked .pad { opacity: .5; }
 .stick-cap { font-size: 11px; color: var(--sc-color-text-secondary); text-align: center; line-height: 1.5; }
 .stick-cap .ttl { display: block; font-weight: 600; color: var(--sc-color-text); font-size: 12px; }
 .stick-cap b { color: var(--sc-color-primary-dark); }
@@ -1208,7 +1208,6 @@ input[type=range] { -webkit-appearance: none; appearance: none; height: 6px; bor
   background: linear-gradient(to right, var(--sc-color-primary) var(--v, 0%), #e5ecd9 var(--v, 0%)); }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 2px solid var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
 input[type=range]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #fff; border: 2px solid var(--sc-color-primary-dark); }
-body.locked .cart-zone .jbtn, body.locked .grip-slider { opacity: .5; }
 
 /* ---------- expert side cards ---------- */
 .kv { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 0 16px 12px; }
@@ -1304,10 +1303,25 @@ body.op-locked .tool-item[data-op] > b::after { content: "\00a0🔒"; font-size:
 .btn-preempt .preempt-lbl { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
 .btn-preempt .preempt-lbl small { font-size: 11px; font-weight: 500; opacity: .85; }
 .btn-preempt .preempt-lbl small:empty { display: none; }
+.lease-status { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; padding: 4px 8px; border-radius: var(--sc-radius-md); background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); min-width: 0; }
+.lease-status[hidden] { display: none; }
+.lease-status .lease-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: currentColor; }
+.lease-status #lease-status-txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lease-status.is-own { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
+.lease-status.is-other, .lease-status.is-released { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); }
+.lease-status.is-readonly, .lease-status.is-checking { background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); }
+.lease-released { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border: 1px solid #ffd591; font-size: 12px; line-height: 1.45; }
+.lease-released[hidden] { display: none; }
+.lease-released #lease-released-txt { white-space: normal; overflow-wrap: anywhere; }
+.lease-released-acts { display: flex; align-items: center; gap: 6px; }
+.lease-released-acts .btn-primary { flex: 1 1 auto; min-height: 32px; padding: 4px 10px; font-size: 12px; justify-content: center; }
+.lease-released-x { flex: none; min-width: 30px; min-height: 32px; padding: 0 8px; justify-content: center; }
 .btn-preempt[hidden], .preempt-modal[hidden], .preempt-cooldown[hidden] { display: none; }
 .preempt-modal { position: fixed; inset: 0; z-index: 1050; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(15, 23, 42, 0.38); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); animation: tin .15s ease; }
 .preempt-dialog { width: min(420px, 100%); padding: 20px 20px 16px; border-radius: 16px; background: #fff; border: 1px solid var(--sc-color-border-neutral); box-shadow: 0 20px 48px rgba(0, 0, 0, 0.18); }
+.preempt-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .preempt-dialog h3 { margin: 0 0 10px; font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
+.preempt-head h3 { margin: 0; }
 .preempt-dialog p { margin: 0 0 12px; font-size: 14px; line-height: 1.6; color: var(--sc-color-text-secondary); }
 .preempt-cooldown { padding: 8px 10px; border-radius: var(--sc-radius-md); font-size: 13px !important; color: var(--sc-status-warning-fg) !important; background: var(--sc-status-warning-bg); }
 .preempt-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
@@ -1510,7 +1524,6 @@ body::before {
 .grip-key:active { transform: scale(.94); }
 .grip-key.pulse::after { border: 0; background: radial-gradient(closest-side, rgba(140, 192, 32, 0.45), transparent); animation: bloom .7s ease-out; }
 @keyframes bloom { from { transform: scale(.9); opacity: 1; } to { transform: scale(1.7); opacity: 0; } }
-body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .preset { opacity: .5; filter: saturate(.4); }
 
 /* expert surfaces follow the same glass */
 .jrow, .cart-read > div, .kv > div { background: rgba(255, 255, 255, 0.45); border: 1px solid rgba(255, 255, 255, 0.7); border-radius: 12px; }
@@ -1653,6 +1666,11 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .ext-banner { display: none; } /* camera stays unobstructed; #act-chip in the HUD opens #task */
   /* the capsule is as wide as the Enable + E-stop row; the hand-guide switch takes that width and its short label */
   body.ui-simple .safety { width: max-content; }
+  body.ui-simple .lease-status { width: 0; min-width: 100%; box-sizing: border-box; padding: 2px 8px; font-size: 11px; border-radius: 10px; background: rgba(255,255,255,0.65); color: #1f2937; }
+  body.ui-simple .lease-status.is-own { background: rgba(239,252,232,0.85); color: var(--sc-status-normal-fg); }
+  body.ui-simple .lease-status.is-other, body.ui-simple .lease-status.is-released { background: rgba(255,247,230,0.9); color: var(--sc-status-warning-fg); }
+  body.ui-simple .lease-released { width: 0; min-width: 100%; box-sizing: border-box; font-size: 11px; padding: 6px 8px; border-radius: 12px; background: rgba(255,247,230,0.92); color: var(--sc-status-warning-fg); }
+  body.ui-simple .btn.btn-park-off, body.ui-simple .btn.btn-preempt { width: 0; min-width: 100%; box-sizing: border-box; margin-top: 0; border-radius: 16px; }
   body.ui-simple .gc-sw { width: 0; min-width: 100%; }
   body.ui-simple .gc-sw .sw-text { min-width: 0; }
   body.ui-simple .gc-sw .gc-long { display: none; }
@@ -1793,6 +1811,51 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   body.ui-simple .vz.hot { color: #d9f99d; }
 }
 
+@media (orientation: landscape) and (max-height: 410px) {
+  :root { --disc: 132px; }
+  body.ui-simple .safety { top: 6px; gap: 3px; padding: 3px; border-radius: 20px; }
+  body.ui-simple .sw, body.ui-simple .btn-stop, body.ui-simple .btn-estop { min-height: 36px; }
+  body.ui-simple .lease-status { padding: 1px 7px; font-size: 10px; line-height: 1.25; }
+  body.ui-simple .lease-released { padding: 4px 7px; font-size: 10px; }
+  body.ui-simple .btn.btn-park-off { min-height: 30px; padding: 0 10px; font-size: 12px; }
+  body.ui-simple .btn.btn-park-off small { display: none; }
+  body.ui-simple .btn.btn-preempt { min-height: 30px; padding: 2px 10px; font-size: 12px; }
+  body.ui-simple .view-switch { top: calc(6px + var(--safety-h, 50px) + var(--tb-below, 0px) + 4px + 3px); }
+  body.ui-simple .pose-card { --pc-top: calc(6px + var(--safety-h, 50px) + var(--tb-below, 0px) + 4px); }
+  body.ui-simple .pose-btn { min-height: 34px; bottom: calc(16px + var(--disc) + 6px); }
+  body.ui-simple .move-hint { top: 48px; padding: 2px 10px; font-size: 11px; line-height: 1.3; }
+  body.ui-simple .toasts { top: 92px; }
+  body.ui-simple .toast { padding: 7px 10px; font-size: 12px; line-height: 1.35; }
+}
+
+/* Single visual-state rule for all control inputs driven by pageHasControl() -> body.controls-unavailable */
+body.controls-unavailable .disc,
+body.controls-unavailable .pad,
+body.controls-unavailable .pose-btn,
+body.controls-unavailable .grip-key,
+body.controls-unavailable .preset,
+body.controls-unavailable .jbtn,
+body.controls-unavailable .cart-zone .jbtn,
+body.controls-unavailable .grip-slider,
+body.controls-unavailable #btn-home,
+body.controls-unavailable .gc-sw {
+  opacity: .5;
+  filter: saturate(.25);
+}
+body.controls-unavailable .pose-go { opacity: .45; filter: saturate(0); }
+body.controls-unavailable .disc .knob,
+body.controls-unavailable .pad .knob,
+body.ui-simple.controls-unavailable .disc .knob {
+  background: rgba(148, 163, 184, 0.55);
+  border-color: rgba(255, 255, 255, 0.4);
+  box-shadow: inset 0 2px 4px rgba(255, 255, 255, 0.3), 0 4px 12px rgba(0, 0, 0, 0.16);
+}
+body.controls-unavailable .grip-slider input[type=range] {
+  background: linear-gradient(to right, rgba(148, 163, 184, 0.7) var(--v, 0%), #e2e8f0 var(--v, 0%));
+}
+body.controls-unavailable .grip-slider input[type=range]::-webkit-slider-thumb { border-color: #94a3b8; }
+body.controls-unavailable .grip-slider input[type=range]::-moz-range-thumb { border-color: #94a3b8; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
@@ -1815,7 +1878,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
 }
 </style>
 </head>
-<body class="ui-simple offline locked">
+<body class="ui-simple offline locked controls-unavailable">
 <!-- shared SVG defs (arrowheads for the part icons) -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
@@ -2097,6 +2160,10 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
             <span><span data-i18n="estop">急停</span><small>E-STOP</small></span>
           </button>
         </div>
+        <div class="lease-status" id="lease-status" role="status" aria-live="polite" hidden>
+          <i class="lease-dot" aria-hidden="true"></i>
+          <span id="lease-status-txt">--</span>
+        </div>
         <!-- after a fault / E-stop clear with the motors still holding: park and torque off (the enable switch resumes) -->
         <button class="btn op-inline" id="op-inline" type="button" data-i18n="op.inline" hidden>🔒 复位需要操作员权限 · 解锁并复位</button>
         <button class="btn btn-park-off" id="btn-park-off" type="button" hidden>
@@ -2119,6 +2186,13 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
         <div class="tool-comm-banner" id="tool-comm-banner" role="status" aria-live="polite" hidden>
           <b id="tool-comm-title"></b>
           <small id="tool-comm-sub" data-i18n="tool.comm.hint">需先完成工具调试/标定后再执行常规运动。</small>
+        </div>
+        <div class="lease-released" id="lease-released" role="status" aria-live="polite" hidden>
+          <span id="lease-released-txt"></span>
+          <div class="lease-released-acts">
+            <button class="btn btn-primary" id="btn-retake" type="button" data-i18n="lease.retake">重新获取控制权</button>
+            <button class="btn lease-released-x" id="btn-retake-x" type="button" data-i18n-aria="ext.dismiss" aria-label="关闭提示">×</button>
+          </div>
         </div>
         <button class="btn btn-preempt" id="btn-preempt" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3"/><path d="M17 17H6l3 3"/></svg>
@@ -2315,13 +2389,36 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
 </div>
 <div class="toasts" id="toasts"></div>
 <div class="preempt-modal" id="preempt-modal" hidden>
-  <div class="preempt-dialog" role="dialog" aria-modal="true" aria-labelledby="preempt-title">
-    <h3 id="preempt-title" data-i18n="preempt.title">接管控制权确认</h3>
-    <p data-i18n="preempt.body">当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。</p>
+  <div class="preempt-dialog" role="dialog" aria-modal="true" aria-labelledby="preempt-title" aria-describedby="preempt-body">
+    <div class="preempt-head">
+      <h3 id="preempt-title" data-i18n="preempt.title">接管控制权确认</h3>
+      <div class="preempt-head-acts">
+        <button class="btn op-stop" id="preempt-stop" type="button" data-i18n="stop" data-i18n-aria="stop.aria" aria-label="停止运动并保持位置">停止</button>
+        <button class="btn op-estop" id="preempt-estop" type="button" data-i18n="estop" data-i18n-aria="estop.aria" aria-label="紧急停止">急停</button>
+      </div>
+    </div>
+    <p class="preempt-body" id="preempt-body" data-i18n="preempt.body">当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。</p>
+    <p class="preempt-cooldown" id="preempt-changed" role="alert" hidden></p>
     <p class="preempt-cooldown" id="preempt-cooldown" hidden></p>
     <div class="preempt-actions">
-      <button class="btn" id="preempt-cancel" data-i18n="cancel">取消</button>
-      <button class="btn btn-primary" id="preempt-confirm" data-op="lease.force" data-op-mode="move" data-op-again="op.again.take" data-i18n="preempt.confirm">确认接管</button>
+      <button class="btn" id="preempt-cancel" type="button" data-i18n="cancel">取消</button>
+      <button class="btn btn-primary" id="preempt-confirm" type="button" data-op="lease.force" data-op-mode="move" data-op-again="op.again.take" data-i18n="preempt.confirm">确认接管</button>
+    </div>
+  </div>
+</div>
+<div class="preempt-modal" id="take-modal" hidden>
+  <div class="preempt-dialog" role="dialog" aria-modal="true" aria-labelledby="take-title" aria-describedby="take-body">
+    <div class="preempt-head">
+      <h3 id="take-title" data-i18n="take.title">获取控制权？</h3>
+      <div class="preempt-head-acts">
+        <button class="btn op-stop" id="take-stop" type="button" data-i18n="stop" data-i18n-aria="stop.aria" aria-label="停止运动并保持位置">停止</button>
+        <button class="btn op-estop" id="take-estop" type="button" data-i18n="estop" data-i18n-aria="estop.aria" aria-label="紧急停止">急停</button>
+      </div>
+    </div>
+    <p id="take-body" data-i18n="take.body">当前页面处于只读观察模式，尚未持有机械臂控制权。获取控制权后将允许本页发送运动或力矩指令；如果机械臂正在执行看门狗自动停靠，获取控制权会取消自动停靠。确认获取控制权？</p>
+    <div class="preempt-actions">
+      <button class="btn" id="take-cancel" type="button" data-i18n="cancel">取消</button>
+      <button class="btn btn-primary" id="take-confirm" type="button" data-i18n="take.confirm">获取控制权</button>
     </div>
   </div>
 </div>
@@ -2539,7 +2636,10 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
   <div class="op-dialog" role="dialog" aria-modal="true" aria-labelledby="op-h" aria-describedby="op-why">
     <div class="op-head">
       <h3 id="op-h" data-i18n="op.title">操作员权限</h3>
-      <button class="btn op-estop" id="op-estop" type="button" data-i18n="estop" data-i18n-aria="estop.aria" aria-label="紧急停止">急停</button>
+      <div class="preempt-head-acts">
+        <button class="btn op-stop" id="op-stop" type="button" data-i18n="stop" data-i18n-aria="stop.aria" aria-label="停止运动并保持位置">停止</button>
+        <button class="btn op-estop" id="op-estop" type="button" data-i18n="estop" data-i18n-aria="estop.aria" aria-label="紧急停止">急停</button>
+      </div>
     </div>
     <p class="op-why" id="op-why"></p>
     <p class="op-retry" id="op-retry"></p>
@@ -2692,16 +2792,35 @@ const I18N = {
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障',
     'mit.recovery.confirm': '电机指令超时已到期。清除故障会关闭所有关节的力矩，机械臂会像收纳断电一样下落。请先托住机械臂或让它处于支撑位，再在提示消失前点一次确认。',
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
+    'en.armed_readonly': '力矩已开 · 未控制', 'en.sub_readonly': '按住 0.6 秒：先确认控制权，再停靠卸力',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
     'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
     'estop': '急停', 'estop.aria': '紧急停止',
     'stop': '停止', 'stop.sub': '保持位置', 'stop.aria': '停止运动并保持位置',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who} 正在控制机械臂',
-    'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
+    'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.cockpit_id': '另一个驾驶舱页面（{id}）', 'who.unnamed': '未命名客户端', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
     'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制', 'lock.col_hold': '碰撞保护中：自动恢复前运动控制已锁定（急停可用）',
     'preempt.btn': '接管控制权', 'preempt.title': '接管控制权确认',
     'preempt.body': '当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。',
+    'preempt.body.who': '当前由 {who} 持有控制权。确认强制接管机械臂控制权？接管后对方将失去控制，正在进行的运动将被平稳悬停保持；开启操作员认证时需先解锁。',
+    'preempt.changed': '注意：控制方已变更为 {who}，请确认后再点击「确认接管」。',
+    'preempt.cleared': '原控制方已释放控制权，无需强制接管：可长按「使能」或在操作时确认获取',
+    'preempt.stale': '遥测已过期或重连中，恢复新鲜遥测后方可确认接管',
     'preempt.confirm': '确认接管', 'preempt.taking': '接管中…', 'preempt.cool': '刚刚发生过控制权交接，请 {s} 秒后再试', 'cancel': '取消',
+    'lease.checking': '连接中 · 检查控制方…', 'lease.releasing': '释放控制权中…', 'lease.refreshing': '确认控制状态中…',
+    'lease.readonly': '只读 · 无控制方', 'lease.own': '控制中 · 本页', 'lease.other': '只读 · 控制方：{who}',
+    'lease.released.tag': '控制权已释放',
+    'lease.released.reconnect': '连接中断后已重连，控制权已释放。确认现场后点击「重新获取控制权」。',
+    'lease.released.expired': '租约超时，控制权已释放。确认现场后点击「重新获取控制权」。',
+    'lease.released.other': '控制权已释放，当前由 {who} 控制。可等对方释放后再点击「重新获取控制权」，或点击下方「接管控制权」。',
+    'lease.retake': '重新获取控制权',
+    'lease.t.own': '本页控制', 'lease.t.readonly': '只读（无持有者）', 'lease.t.released': '已释放（只读）', 'lease.t.checking': '检查中…',
+    'take.title': '获取控制权？',
+    'take.body': '当前页面处于只读观察模式，尚未持有机械臂控制权。获取控制权后将允许本页发送运动或力矩指令；如果机械臂正在执行看门狗自动停靠，获取控制权会取消自动停靠。确认获取控制权？',
+    'take.body.released': '控制权先前已释放，当前页面处于只读模式。获取控制权后将允许发送运动或力矩指令（会取消进行中的看门狗自动停靠）。确认重新获取控制权？',
+    'take.confirm': '获取控制权', 'take.taking': '获取中…',
+    'toast.take_acquired': '已获取控制权，请再次操作', 'toast.retake_ok': '已重新获取控制权', 'err.take_cancelled': '已取消获取控制权，当前保持只读模式',
+    'ready.readonly': '只读观察 · 无控制方（首次操控将询问是否获取控制权）', 'ready.released': '控制权已释放 · 只读观察（点击「重新获取控制权」恢复）',
     'pre.home': '原点', 'pre.home.d': '回到配置零位', 'pre.inspect': '观察', 'pre.inspect.d': '俯视工作区', 'pre.park': '收纳', 'pre.park.d': '停靠并卸力',
     'pn.home': '复位原点', 'pn.inspect': '观察位', 'pn.park': '收纳位', 'pn.default': '预设目标',
     'pose.btn': '姿态 / Pose', 'pose.aria': '姿态模式（点击锁定，按住 Shift 临时切换）', 'pose.locked': '姿态已锁定，点击返回平移', 'pose.shift': '松开 Shift 返回平移', 'pose.hint': '点击锁定姿态模式；按住 Shift 临时切换',
@@ -2784,13 +2903,13 @@ const I18N = {
     'err.epoch': '控制状态已变化，请检查状态后重新操作', 'err.settling': '机械臂正在交接停稳中，请稍候片刻再操作', 'err.settling2': '机械臂正在交接停稳中，请稍候...', 'err.settling3': '机械臂正在交接停稳中，请稍候再试',
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
-    'err.rejected': '指令被拒绝', 'err.nolease': '当前页面没有控制权，请等待控制连接就绪', 'err.cmdtimeout': '设备未在时限内确认指令，请检查实际状态',
+    'err.rejected': '指令被拒绝', 'err.rejected_fix': '指令被拒绝：{why}。请检查控制状态后重试', 'err.telemetry_stale': '遥测数据已过期，等待新鲜遥测后再试', 'err.nolease': '当前页面没有控制权（只读模式）：请长按「使能」或确认获取控制权后再试', 'err.cmdtimeout': '设备未在时限内确认指令，请检查实际状态',
     'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'act.running': '外部控制：移动中', 'act.done': '外部控制：完成', 'act.failed': '外部控制：失败（{code}）', 'act.cancelled': '外部控制：已取消（{code}）', 'err.disconnected': '控制连接已断开或控制权已变化',
     'toast.lease_preempted': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式',
-    'toast.lease_expired': '⚠️ 连接中断，控制权已释放；机械臂若处于上电状态会自动收回停靠',
-    'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；下次操作时自动取回', 'toast.lease_busy': '{who} 正在控制，本页面为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
-    'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
-    'toast.homing': '回零中', 'toast.stop_unconfirmed': '停止未确认，请使用急停', 'toast.stopped': '已停止，位置保持', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
+    'toast.lease_expired': '⚠️ 连接中断，控制权已释放；若机械臂带力矩，armd 将执行看门狗停靠或保持锁存，请检查现场后点击「重新获取控制权」',
+    'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；需要控制时请长按「使能」或在提示中确认获取后再次操作', 'toast.lease_busy': '{who} 正在持有控制权，本页面为观察模式：请等对方释放，或点击「接管控制权」', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
+    'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_rejected_fix': '接管请求被拒绝：{why}。请检查当前控制状态后重试', 'toast.take_owner_transferred': '接管失败：控制方已发生变更，请确认当前控制方后重新点击「接管控制权」', 'toast.take_ambiguous': '控制权确认异常（缺少有效租约编号），已重置为只读连接，请检查状态后重试', 'toast.take_timeout': '获取/接管控制权超时：未收到设备确认，已重置为只读连接，请检查状态后重试', 'toast.release_timeout': '释放控制权确认超时：已重置为只读连接，请检查控制状态', 'toast.release_inactive': '当前连接已不持有控制权，已刷新只读状态', 'toast.refresh_timeout': '释放后确认控制方超时：已重置为只读连接，请检查状态后重试', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
+    'toast.homing': '回零中', 'toast.stop_no_control': '当前页面未持有控制权，未能向机械臂发送停止；如需立即停机请按急停', 'toast.stop_unconfirmed': '停止未确认，请使用急停', 'toast.stopped': '已停止，位置保持', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
     'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
     'toast.stow_failed': '收起失败: ', 'toast.stow_unconfirmed': '设备未确认收纳，请检查机械臂状态', 'toast.parked_off': '已收纳并关闭力矩',
     'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
@@ -2938,16 +3057,35 @@ const I18N = {
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault',
     'mit.recovery.confirm': 'A motor command timeout expired. Clearing turns torque off on every joint and the arm drops like a park torque-off. Support the arm or bring it to rest, then tap again while this warning is shown to confirm.',
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
+    'en.armed_readonly': 'Torque on · not in control', 'en.sub_readonly': 'Hold 0.6 s: confirm control, then park & torque off',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
     'en.park_off': 'Park and turn torque off', 'en.park_off.sub': 'Hold 0.6 s: move to the rest pose, then torque off', 'toast.reset_holding': 'Reset done; the motors still hold the arm. Hold Enable to resume, or hold "Park and turn torque off"',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
     'stop': 'Stop', 'stop.sub': 'HOLD', 'stop.aria': 'Stop motion and hold position',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
-    'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
+    'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.cockpit_id': 'another cockpit page ({id})', 'who.unnamed': 'an unnamed client', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
     'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control', 'lock.col_hold': 'Collision hold: motion controls locked until it resumes (E-stop available)',
-    'preempt.btn': 'Take over control', 'preempt.title': 'Confirm take over',
+    'preempt.btn': 'Take control', 'preempt.title': 'Confirm take over',
     'preempt.body': 'Another device or window holds control. Take over control of the arm? The previous window will switch to observer mode and any motion in progress will be held steady.',
+    'preempt.body.who': '{who} currently holds control. Force take control of the arm? The current holder will lose control and any motion in progress will be held steady. Operator unlock is required when auth is enforced.',
+    'preempt.changed': 'Note: holder changed to {who}. Review before clicking Take control again.',
+    'preempt.cleared': 'The previous holder released control; no force takeover needed. Hold Enable or act to take control.',
+    'preempt.stale': 'Telemetry is stale or reconnecting; wait for fresh telemetry before taking over.',
     'preempt.confirm': 'Take over', 'preempt.taking': 'Taking over…', 'preempt.cool': 'Control was just handed over. Try again in {s} s', 'cancel': 'Cancel',
+    'lease.checking': 'Connecting · checking holder…', 'lease.releasing': 'Releasing control…', 'lease.refreshing': 'Checking holder…',
+    'lease.readonly': 'Read-only · No holder', 'lease.own': 'In control · This page', 'lease.other': 'Read-only · Held by {who}',
+    'lease.released.tag': 'Control released',
+    'lease.released.reconnect': 'Control released after reconnecting. Check the arm, then click "Take control".',
+    'lease.released.expired': 'Control released after lease timeout. Check the arm, then click "Take control".',
+    'lease.released.other': 'Control was released and is now held by {who}. Wait for release to use "Take control", or use the force takeover button below.',
+    'lease.retake': 'Take control',
+    'lease.t.own': 'This page', 'lease.t.readonly': 'Read-only (none)', 'lease.t.released': 'Released (read-only)', 'lease.t.checking': 'Checking…',
+    'take.title': 'Take control?',
+    'take.body': 'This page is in read-only mode and does not hold the control lease. Taking control allows motion or torque commands and cancels any automatic watchdog park in progress. Take control?',
+    'take.body.released': 'Control was previously released and this page is read-only. Taking control allows motion or torque commands (and cancels any watchdog park in progress). Take control again?',
+    'take.confirm': 'Take control', 'take.taking': 'Taking…',
+    'toast.take_acquired': 'Control acquired — repeat your action', 'toast.retake_ok': 'Control acquired', 'err.take_cancelled': 'Cancelled taking control; staying read-only',
+    'ready.readonly': 'Read-only · no holder (first action asks "Take control?")', 'ready.released': 'Control released · read-only (click "Take control" to resume)',
     'pre.home': 'Home', 'pre.home.d': 'Go to zero pose', 'pre.inspect': 'Inspect', 'pre.inspect.d': 'Look down at workspace', 'pre.park': 'Park', 'pre.park.d': 'Park and turn torque off',
     'pn.home': 'home pose', 'pn.inspect': 'inspect pose', 'pn.park': 'park pose', 'pn.default': 'preset',
     'pose.btn': 'Pose', 'pose.aria': 'Pose mode (tap to lock, hold Shift to toggle temporarily)', 'pose.locked': 'Pose locked, tap to return to translate', 'pose.shift': 'Release Shift to return to translate', 'pose.hint': 'Tap to lock pose mode; hold Shift to toggle temporarily',
@@ -3029,13 +3167,13 @@ const I18N = {
     'err.epoch': 'Control state changed, check the state and retry', 'err.settling': 'Arm is settling after handover, wait a moment and retry', 'err.settling2': 'Arm is settling after handover, please wait...', 'err.settling3': 'Arm is settling after handover, retry shortly',
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
-    'err.rejected': 'Command rejected', 'err.nolease': 'This page has no control lease, wait for the control connection', 'err.cmdtimeout': 'Device did not confirm the command in time, check the actual state',
+    'err.rejected': 'Command rejected', 'err.rejected_fix': 'Request rejected: {why}. Check control status and try again', 'err.telemetry_stale': 'Telemetry is stale; wait for fresh telemetry and try again', 'err.nolease': 'This page has no control lease (read-only): hold Enable or take control first, then retry', 'err.cmdtimeout': 'Device did not confirm the command in time, check the actual state',
     'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target outside the safe workspace (floor/boundary), rejected', 'act.running': 'External control: moving', 'act.done': 'External control: done', 'act.failed': 'External control: failed ({code})', 'act.cancelled': 'External control: cancelled ({code})', 'err.disconnected': 'Control connection lost or lease changed',
     'toast.lease_preempted': '⚠️ Control was taken over by another device, this page is now an observer',
-    'toast.lease_expired': '⚠️ Connection dropped, so control was released. If the arm was torqued, it parked itself',
-    'toast.lease_released': 'This page released control', 'toast.lease_idle': 'Idle for {s} s, control released; it is taken back on the next input', 'toast.lease_busy': '{who} is in control, this page is an observer', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
-    'toast.take_rejected': 'Take over rejected: ', 'toast.take_timeout': 'Take over timed out, reconciling lease...', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
-    'toast.homing': 'Homing', 'toast.stop_unconfirmed': 'Stop not confirmed, use the E-stop', 'toast.stopped': 'Stopped, holding position', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
+    'toast.lease_expired': '⚠️ Connection dropped, so control was released. If torqued, armd runs its watchdog park or holds; check the arm and click "Take control" to resume',
+    'toast.lease_released': 'This page released control', 'toast.lease_idle': 'Idle for {s} s, control released. Hold Enable or confirm "Take control?" and repeat when you need control', 'toast.lease_busy': '{who} holds control (observer mode): wait for it to release, or click "Take control"', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
+    'toast.take_rejected': 'Take over rejected: ', 'toast.take_rejected_fix': 'Take over rejected: {why}. Check control status and try again', 'toast.take_owner_transferred': 'Take over failed: control moved to another holder; review the current holder and click "Take control" again', 'toast.take_ambiguous': 'Control grant was malformed (missing valid lease generation); reconnecting read-only — check status and retry', 'toast.take_timeout': 'Control request timed out: no reply from armd. Reconnecting read-only; check status and try again', 'toast.release_timeout': 'Release confirmation timed out: reconnecting read-only; check control status', 'toast.release_inactive': 'This connection no longer held control; refreshed read-only status', 'toast.refresh_timeout': 'Checking holder after release timed out: reconnecting read-only; check status and try again', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
+    'toast.homing': 'Homing', 'toast.stop_no_control': 'This page does not hold control, so Stop was not sent; press E-Stop to halt immediately', 'toast.stop_unconfirmed': 'Stop not confirmed, use the E-stop', 'toast.stopped': 'Stopped, holding position', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
     'toast.reset_ok': 'Reset done, hold Enable to take control', 'toast.parked': 'Parked and powered off safely', 'toast.unload_unconfirmed': 'Safe unload not confirmed, torque may still be held, check the state',
     'toast.stow_failed': 'Stow failed: ', 'toast.stow_unconfirmed': 'Device did not confirm park, check the arm', 'toast.parked_off': 'Parked and torque off',
     'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
@@ -3050,7 +3188,7 @@ const I18N = {
     'op.why.calib': 'Calibration needs operator access', 'op.why.poses': 'Saving or changing poses and motions needs operator access', 'op.why.rec': 'Recording and managing episodes needs operator access', 'op.why.safety': 'Changing safety settings (keep-out boxes, collision guard) needs operator access',
     'op.why.sandbox': 'The simulation sandbox needs operator access', 'op.why.vision': 'Switching the vision mode (YOLO / ArUco / depth) needs operator access',
     'op.why.calib_open': 'The calibration wizard switches the vision to ArUco, stores calibration data and writes the calibration; these steps need operator access. Without an unlock the wizard opens, but those steps are refused.',
-    'op.skip': 'Not now', 'op.why.renew': 'The operator session ends soon: enter the PIN for a new session; the running flow and its captured data stay as they are.', 'op.renew_warn': 'The operator session ends in {m} min; calibration and similar flows need it to store their results.', 'op.renew_btn': 'Renew (enter PIN)', 'op.again.take': 'Unlocked. Tap "Take over control" again to confirm.', 'op.again': 'Unlocked. Actions that move the arm do not run by themselves; tap again.',
+    'op.skip': 'Not now', 'op.why.renew': 'The operator session ends soon: enter the PIN for a new session; the running flow and its captured data stay as they are.', 'op.renew_warn': 'The operator session ends in {m} min; calibration and similar flows need it to store their results.', 'op.renew_btn': 'Renew (enter PIN)', 'op.again.take': 'Unlocked. Tap "Take control" again to confirm.', 'op.again': 'Unlocked. Actions that move the arm do not run by themselves; tap again.',
     'ec.lease_busy': 'Another client holds control: ask it to release, or take over on this page', 'ec.lease_lost': 'Another client took control: check the arm, then try again',
     'ec.not_armed': 'Torque is off: tap Enable first', 'ec.rate': 'Too many wrong PINs: wait, then try again', 'ec.insecure': 'Credentials are not sent over plain http to another host: work on the device, or enable insecure auth as documented',
     'ec.vision_down': 'The vision service does not answer: check that rebot-vision runs, then try again', 'ec.vision_timeout': 'The vision service did not answer in time: try again shortly', 'op.why.take': 'Forcing a takeover of control needs operator access', 'op.why.default': 'This action needs operator access', 'op.retry': 'The action continues after the unlock.',
@@ -3702,7 +3840,7 @@ CFG.view = {
    ================================================================= */
 const S = {
   obs: null, obsAt: 0, epoch: null,
-  dof: 7,
+  dof: 7, schemaLoaded: false,
   limits: [
     { min_position: -3.14159, max_position: 3.14159, max_velocity: 2.0 },
     { min_position: -2.0944, max_position: 2.0944, max_velocity: 2.0 },
@@ -3727,6 +3865,12 @@ const S = {
   gripCmdAt: 0,
   servoTarget: null, servoLastAt: 0, servoInflight: false,
   leaseGeneration: null,      // WS motion lease generation granted by armd (null = not held)
+  wsObsSeen: false,           // true after at least one valid observation accepted on current S.ws
+  obsWs: null,                // WebSocket instance that last accepted observation is bound to
+  obsTs: -Infinity,           // last accepted observation timestamp
+  minObsTs: -Infinity,        // post-release monotonic floor so pre-release WS frames cannot overwrite REST snapshot
+  controlEpoch: 0,            // monotonic local control-intent epoch
+  leaseReleased: null,        // null | { reason: 'reconnect' | 'expired' }
   lastIntentAt: 0,            // Date.now() of the last control input (idle lease release)
   preemptCooldownUntil: 0,    // Date.now() until which the preempt confirm button stays disabled
   sequenceId: 0,              // per-connection monotonic servo frame id
@@ -3759,8 +3903,8 @@ const C = {
   stepIdx: 1,
   lastTick: 0, lastInput: 0, tailUntil: 0, stallSince: 0,
   gripJog: 0,                 // -1 (close) .. +1 (open) continuous rate jog
-  status: 'idle', msg: '', solveUs: null, inflight: false, sending: false, gripDrag: false,
-  cartHoldActive: false, cartActionId: null, cartActionUntil: 0, stopPending: false, stepInflight: false, stepActionId: null,
+  status: 'idle', msg: '', solveUs: null, restInflight: false, sending: false, gripDrag: false, gripGestureBlocked: false,
+  cartHoldActive: false, cartActionId: null, cartActionUntil: 0, cartReq: null, stepActionId: null,
 };
 
 /* =================================================================
@@ -3834,8 +3978,12 @@ function rejectPendingCommands(message) {
   pendingCommands.clear();
 }
 function syncEpoch(epoch) {
-  if (typeof epoch !== 'number') return;
-  if (S.epoch != null && S.epoch !== epoch) rejectPendingCommands(t('err.epoch'));
+  if (!Number.isSafeInteger(epoch) || epoch < 0) return;
+  if (S.epoch != null && epoch < S.epoch) return;
+  if (S.epoch != null && S.epoch !== epoch) {
+    rejectPendingCommands(t('err.epoch'));
+    invalidateControlIntents();
+  }
   S.epoch = epoch;
 }
 function rpcError(response) {
@@ -3856,23 +4004,62 @@ function rpcError(response) {
 }
 /* A command refused with OPERATOR_REQUIRED opens the operator dialog with the reason for `path`. The few
    user-initiated, repeatable ones (opCanRetry) run once more after the unlock; every other one fails as before. */
-function commandRPC(path, body, acquire = true, timeoutMs = 2000) {
-  return commandRPCOnce(path, body, acquire, timeoutMs).catch((e) => {
+let motionIntentSeq = 0;
+const MOTION_START_PATHS = new Set(['/api/v1/motion/home', '/api/v1/motion/jog', '/api/v1/motion/servo', '/api/v1/motion/unload', '/api/v1/action/move_to', '/api/v1/action/move_to_pose', '/api/v1/action/move_relative', '/api/v1/action/run_sequence', '/api/v1/action/replay', '/api/v1/action/gripper', '/api/v1/action/gripper_zero_check', '/api/v1/action/gripper_calibrate', '/api/v1/action/measure_multiview', '/api/v1/action/calib_hover']);
+const isMotionStartingCommand = (path, body) => MOTION_START_PATHS.has(path) || (path === '/api/v1/action/grasp' && !(body && body.dry_run === true)) || (path === '/api/v1/torque' && !!(body && body.enable === true)) || (path === '/api/v1/mode/gravity_comp' && !(body && body.enable === false));
+function commandRPC(path, body, acquire = true, timeoutMs = 2000, opts = null) {
+  const snap = { ws: S.ws, epoch: S.epoch, controlEpoch: S.controlEpoch, leaseGen: S.leaseGeneration, faultKey: path === '/api/v1/safety/clear_fault' ? mitFaultKey() : null };
+  return commandRPCOnce(path, body, acquire, timeoutMs, opts).catch(async (e) => {
+    if (path === '/api/v1/safety/clear_fault' && e?.code === 'CLEAR_FAULT_REJECTED' && /heartbeat/i.test(e.message || '')) {
+      const retryGen = S.leaseGeneration;
+      if (S.ws !== snap.ws || retryGen == null || (snap.leaseGen != null && retryGen !== snap.leaseGen)) throw cancelledError();
+      sendHeartbeat(S.ws);
+      await new Promise((r) => setTimeout(r, 60));
+      if (S.ws !== snap.ws || S.epoch !== snap.epoch || S.controlEpoch !== snap.controlEpoch || S.leaseGeneration !== retryGen || (snap.faultKey != null && mitFaultKey() !== snap.faultKey)) throw cancelledError();
+      return commandRPCOnce(path, body, false, timeoutMs, opts);
+    }
     if (e.code !== 'OPERATOR_REQUIRED') throw e;
+    const expectedGen = snap.leaseGen != null ? snap.leaseGen : S.leaseGeneration;
     const unlocked = opRequire(path, body);
     if (!opCanRetry(path, body)) throw e;
     return unlocked.then(async (ok) => {
       if (!ok) throw e;
       await wsOpen(5000);
-      return commandRPCOnce(path, body, acquire, timeoutMs);
+      if ((opts && opts.controlSnap && !isControlSnapValid(opts.controlSnap))
+        || S.ws !== snap.ws || S.epoch !== snap.epoch || S.controlEpoch !== snap.controlEpoch || S.leaseGeneration !== expectedGen) throw cancelledError();
+      return commandRPCOnce(path, body, acquire, timeoutMs, opts);
     });
   });
 }
-function commandRPCOnce(path, body, acquire = true, timeoutMs = 2000) {
-  // First control input: acquire the lease, then send. A stop needs no lease of ours:
-  // without one this page has nothing running to stop.
-  if (acquire && S.leaseGeneration == null && path !== '/api/v1/motion/stop' && S.ws && S.ws.readyState === 1) {
-    return ensureLease().then(() => commandRPCOnce(path, body, false, timeoutMs));
+function commandRPCOnce(path, body, acquire = true, timeoutMs = 2000, opts = null) {
+  const isDryRunGrasp = path === '/api/v1/action/grasp' && !!(body && body.dry_run === true);
+  if (isDryRunGrasp) {
+    if (!S.ws || S.ws.readyState !== 1) return Promise.reject(Object.assign(new Error(t('err.disconnected')), { code: 'CONNECTION' }));
+    const request_id = ++nextRequestId, ws = S.ws;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { pendingCommands.delete(request_id); reject(Object.assign(new Error(t('err.cmdtimeout')), { code: 'COMMAND_TIMEOUT' })); }, timeoutMs);
+      pendingCommands.set(request_id, { resolve, reject, timer, ws });
+      const payload = { type: 'command', request_id, path, body: body || {}, client_id: CLIENT_ID };
+      if (S.leaseGeneration != null) payload.generation = S.leaseGeneration;
+      if (S.epoch != null) payload.epoch_id = S.epoch;
+      try { ws.send(JSON.stringify(payload)); } catch (error) { clearTimeout(timer); pendingCommands.delete(request_id); reject(error); }
+    });
+  }
+  if (opts && opts.controlSnap && !isControlSnapValid(opts.controlSnap)) return Promise.reject(cancelledError());
+  if (path === '/api/v1/motion/stop') {
+    if (!S.ws || S.ws.readyState !== 1 || S.leaseGeneration == null || S.epoch == null) return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
+  } else if (acquire && S.leaseGeneration == null) {
+    if (opts && opts.directLease) {
+      const snap = { ws: S.ws, epoch: S.epoch, controlEpoch: S.controlEpoch, faultKey: path === '/api/v1/safety/clear_fault' ? mitFaultKey() : null };
+      return acquireLeaseDirect().then(async () => {
+        if (path === '/api/v1/safety/clear_fault' && S.faultCode === 'WATCHDOG_TIMEOUT') {
+          await new Promise((r) => setTimeout(r, 40));
+        }
+        if (S.ws !== snap.ws || S.epoch !== snap.epoch || S.controlEpoch !== snap.controlEpoch || (snap.faultKey != null && mitFaultKey() !== snap.faultKey)) throw cancelledError();
+        return commandRPCOnce(path, body, false, timeoutMs, opts);
+      });
+    }
+    return requireLeaseOrPrompt();
   }
   if (!S.ws || S.ws.readyState !== 1 || S.leaseGeneration == null || S.epoch == null) {
     return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
@@ -3885,16 +4072,16 @@ function commandRPCOnce(path, body, acquire = true, timeoutMs = 2000) {
       reject(Object.assign(new Error(t('err.cmdtimeout')), { code: 'COMMAND_TIMEOUT' }));
     }, timeoutMs);
     pendingCommands.set(request_id, { resolve, reject, timer, ws });
-    try { ws.send(JSON.stringify({ type: 'command', request_id, path, body: body || {}, generation: S.leaseGeneration, epoch_id: S.epoch, client_id: CLIENT_ID })); }
+    try { ws.send(JSON.stringify({ type: 'command', request_id, path, body: body || {}, generation: S.leaseGeneration, epoch_id: S.epoch, client_id: CLIENT_ID })); if (isMotionStartingCommand(path, body)) motionIntentSeq++; }
     catch (error) { clearTimeout(timer); pendingCommands.delete(request_id); reject(error); }
   });
 }
-async function api(path, body, { quiet = false, method = 'POST' } = {}) {
+async function api(path, body, { quiet = false, method = 'POST', directLease = false } = {}) {
   if (method === 'POST' && actuatorPaths.has(path)) {
-    try { const data = await commandRPC(path, body); syncEpoch(data.epoch_id); return data; }
-    catch (error) { if (!quiet) toast(error.message, 'err', error.code); throw error; }
+    try { const data = await commandRPC(path, body, true, 2000, directLease ? { directLease: true } : null); syncEpoch(data.epoch_id); return data; }
+    catch (error) { if (!quiet && !isCancelledErr(error)) toast(error.message, 'err', error.code); throw error; }
   }
-  const t0 = performance.now();
+  const t0 = performance.now(), reqWs = S.ws;
   S.lastReqAt = Date.now();
   let res;
   const controller = new AbortController();
@@ -3922,7 +4109,7 @@ async function api(path, body, { quiet = false, method = 'POST' } = {}) {
     else if (!quiet) toast(err.message, 'err', err.code);
     throw err;
   }
-  if (data) syncEpoch(data.epoch_id);
+  if (data && method !== 'GET' && S.ws === reqWs) syncEpoch(data.epoch_id);
   return data;
 }
 
@@ -3944,10 +4131,21 @@ function parseState(s) {
   return { name: 'Unknown', detail: '' };
 }
 const isLive = () => S.obs && Date.now() - S.obsAt < CFG.staleMs;
+const obsFresh = () => !!(S.ws && S.ws.readyState === 1 && S.wsObsSeen && S.obsWs === S.ws && isLive());
+const canSendStop = () => !!(S.ws && S.ws.readyState === 1 && S.leaseGeneration != null && S.epoch != null);
 const isOperational = () => S.state === 'Armed' || S.state === 'Moving';
 // collision guard protective stop (observation.collision.active): enabled, but motion commands are held
 const colHold = () => !!(S.obs && S.obs.collision && S.obs.collision.active);
 const canMove = () => isOperational() && !colHold();
+const CONTROL_INPUT_SEL = '.disc, .pad, .preset, #btn-home, #btn-pose, #s-grip, #grip-range, .jbtn, .pose-go, #btn-gc';
+const pageHasControl = () => !!(isLive() && isOperational() && !colHold() && S.leaseGeneration != null);
+function syncControlInputsUi(active) {
+  document.body.classList.toggle('controls-unavailable', !active);
+  const state = active ? 'active' : 'unavailable';
+  for (const el of document.querySelectorAll(CONTROL_INPUT_SEL)) {
+    if (el.dataset.controlState !== state) el.dataset.controlState = state;
+  }
+}
 const isStopped = () => S.state === 'EStop' || S.state === 'Fault';
 const gripFrac = (rad) => clamp((rad - CFG.gripClosed) / (CFG.gripOpen - CFG.gripClosed), 0, 1);
 const gripRad = () => CFG.gripClosed + (S.grip ?? 0) * (CFG.gripOpen - CFG.gripClosed);
@@ -3961,12 +4159,78 @@ const gripNoWindup = (frac, measuredRad) => {
 /* =================================================================
    Telemetry WebSocket (50 Hz) + heartbeat
    ================================================================= */
-let wsOpenedOnce = false;
+let wsOpenedOnce = false, wsReconnectTimer = null;
+const VALID_SAFETY_STR = new Set(['Booting', 'Idle', 'Armed', 'Moving', 'EStop']), VALID_FAULT_STR = new Set(['BusLoss', 'WatchdogTimeout', 'CanTxStalled']);
+const isPlainObj = (v) => !!(v && typeof v === 'object' && !Array.isArray(v));
+function isValidSafetyState(s) {
+  if (typeof s === 'string') return VALID_SAFETY_STR.has(s);
+  if (!isPlainObj(s) || Object.keys(s).length !== 1 || !('Fault' in s)) return false;
+  const r = s.Fault;
+  if (typeof r === 'string') return VALID_FAULT_STR.has(r);
+  if (!isPlainObj(r)) return false;
+  const rk = Object.keys(r), k = rk[0], v = r[k];
+  if (rk.length !== 1) return false;
+  if (k === 'Other') return typeof v === 'string';
+  if (k === 'JointLimitExceeded') return isPlainObj(v) && Number.isSafeInteger(v.joint_idx) && v.joint_idx >= 0 && typeof v.joint_name === 'string' && Number.isFinite(v.value) && Number.isFinite(v.min) && Number.isFinite(v.max);
+  return k === 'ThermalTrip' && isPlainObj(v) && Number.isSafeInteger(v.joint_idx) && v.joint_idx >= 0 && Number.isFinite(v.temperature) && Number.isFinite(v.limit);
+}
+const isCompleteObservation = (o) => isPlainObj(o) && Array.isArray(o.positions) && (S.schemaLoaded && S.dof > 0 ? o.positions.length === S.dof : o.positions.length > 0) && o.positions.every(Number.isFinite) && Number.isFinite(o.timestamp) && Number.isSafeInteger(o.epoch_id) && o.epoch_id >= 0 && isValidSafetyState(o.safety_state) && (o.lease_holder === null || typeof o.lease_holder === 'string');
+const clearReconnectTimer = () => { if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; } };
+const scheduleReconnect = (delayMs = 1500) => { clearReconnectTimer(); wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; if (!S.ws) connectWS(); }, delayMs); };
+function retireSocket(ws, { reconnect = false, markReleased = false, toastExpired = false } = {}) {
+  if (!ws || S.ws !== ws) return;
+  const hadLease = S.leaseGeneration != null;
+  if (markReleased && hadLease) S.leaseReleased = { reason: 'reconnect' };
+  if (toastExpired && hadLease) toast(t('toast.lease_expired'), 'warn');
+  S.ws = null; S.wsObsSeen = false; S.obsWs = null; S.obsTs = -Infinity; S.minObsTs = -Infinity; S.epoch = null;
+  ws.onclose = null; ws.onerror = null; try { ws.close(); } catch (_) {}
+  S.detections = []; S.detLastReceivedAt = 0; clearOverlayCanvas();
+  if (leaseOp) { const op = leaseOp; leaseOp = null; if (op.timer) clearTimeout(op.timer); if (op.reject) op.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' })); }
+  invalidateControlIntents({ dropOp: true }); resetLease();
+  if (reconnect) scheduleReconnect(1500);
+}
+function applyObservation(o, fromWs) {
+  S.obs = o; S.obsAt = Date.now(); if (fromWs) S.wsCount++;
+  if (preemptModalOpen() && !leaseOp && S.leaseGeneration == null) {
+    const cur = (o.lease_holder === null || o.lease_holder === CLIENT_ID) ? null : o.lease_holder;
+    if (cur == null) { closePreemptModal(); toast(t('preempt.cleared'), 'info'); }
+    else if (cur !== preemptTargetHolder) { preemptTargetHolder = cur; preemptChangedAck = true; preemptChangedUntil = Date.now() + 800; renderPreemptModal(); }
+  }
+  mitRecoveryObserve(); detHoldOnObs(o); depthOnObs(o); gcOnObs(o);
+  renderMotionLimit(o); tkOnObs(o); renderPower(o); graspOnObs(o); msOnObs(o); epOnObs(o); teachOnObs(o);
+  syncEpoch(o.epoch_id);
+  const st = parseState(o.safety_state), wasStopped = isStopped();
+  S.state = st.name; S.fault = st.detail; S.faultCode = o.fault && typeof o.fault.code === 'string' ? o.fault.code : null;
+  if (isStopped() && !wasStopped) { invalidateControlIntents(); resetPoseMode(); }
+  if (S.presetRunning) {
+    const presetAge = S.preset?.startedAt ? (Date.now() - S.preset.startedAt) : 0;
+    const speedsNearZero = Array.isArray(o.velocities) && o.velocities.every((v) => Math.abs(v) < 0.05);
+    if (st.name === 'EStop' || st.name === 'Fault' || (st.name === 'Armed' && o.action?.state !== 'running' && presetAge > 500) || (presetAge > 1000 && speedsNearZero)) { S.presetRunning = false; S.preset = null; }
+  }
+  if (fromWs && o.detections && !(performance.now() < (S.detHoldUntil || 0))) { S.detections = parseDetections(o.detections, [o.width, o.height]); S.detSource = 'telemetry_ws'; S.detLastReceivedAt = performance.now(); }
+  if (o.positions.length > GRIP && S.grip == null) S.grip = gripFrac(o.positions[GRIP]);
+}
+function acceptObservation(o, fromWs, ws = S.ws) {
+  if (!ws || S.ws !== ws || !isCompleteObservation(o)) return 'invalid';
+  if (S.epoch != null && o.epoch_id < S.epoch) return 'stale';
+  const ts = o.timestamp;
+  if (fromWs) {
+    if ((S.minObsTs !== -Infinity && ts <= S.minObsTs) || (S.obsTs !== -Infinity && ts <= S.obsTs)) return 'stale';
+    S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; applyObservation(o, true); return 'applied';
+  }
+  S.minObsTs = Math.max(S.minObsTs, ts);
+  if (!S.wsObsSeen || S.obsWs !== ws || ts > S.obsTs) { S.wsObsSeen = true; S.obsWs = ws; S.obsTs = ts; applyObservation(o, false); return 'applied'; }
+  if (ts === S.obsTs && S.obs && S.obs.lease_holder === CLIENT_ID && o.lease_holder !== CLIENT_ID) S.obs = { ...S.obs, lease_holder: o.lease_holder };
+  return 'stale';
+}
 function connectWS() {
+  clearReconnectTimer();
+  if (S.ws) retireSocket(S.ws, { reconnect: false, markReleased: true });
+  S.wsObsSeen = false; S.obsWs = null; S.obsTs = -Infinity; S.minObsTs = -Infinity; S.epoch = null;
+  invalidateControlIntents({ dropOp: true });
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/api/v1/ws`);
   S.ws = ws;
-  clearActiveAcquire();
   resetLease();
   S.sequenceId = 0;
   ws.onopen = () => {
@@ -3974,7 +4238,7 @@ function connectWS() {
     if (wsOpenedOnce) loadAuthStatus();
     wsOpenedOnce = true;
   };
-  // No acquire on open: the lease is taken on the first control input (ensureLease).
+  // Never acquire_lease on open: the page connects read-only until explicit Enable or operator confirmation.
   ws.onmessage = (ev) => {
     let o; try { o = JSON.parse(ev.data); } catch (_) { return; }
     if (S.ws !== ws) return;
@@ -3991,6 +4255,7 @@ function connectWS() {
       onAcquireResponse(ws, o);
       return;
     }
+    if (o.type === 'lease_released') { onLeaseReleased(ws, o); return; }
     if (o.type === 'auth_ack') {
       if (OP.ack && OP.ack.ws === ws && OP.ack.seq === o.seq) OP.ack.done(o);
       return;
@@ -4000,6 +4265,8 @@ function connectWS() {
       return;
     }
     if (o.type === 'epoch_sync') {
+      if (!Number.isSafeInteger(o.epoch_id) || o.epoch_id < 0 || (S.epoch != null && o.epoch_id < S.epoch)) return;
+      if (o.safety_state !== undefined && !isValidSafetyState(o.safety_state)) return;
       syncEpoch(o.epoch_id);
       if (o.safety_state) {
         const st = parseState(o.safety_state);
@@ -4055,48 +4322,7 @@ function connectWS() {
       toast(msg, 'err');
       return;
     }
-    if (!Array.isArray(o.positions)) return;
-    S.obs = o; S.obsAt = Date.now(); S.wsCount++;
-    mitRecoveryObserve();
-    detHoldOnObs(o);
-    depthOnObs(o);
-    gcOnObs(o);
-    renderMotionLimit(o);
-    tkOnObs(o); // after renderMotionLimit: the banner reuses the #ml-chip text
-    renderPower(o);
-    graspOnObs(o);
-    msOnObs(o);
-    epOnObs(o);
-    teachOnObs(o);
-    syncEpoch(o.epoch_id);
-    const st = parseState(o.safety_state);
-    const wasStopped = isStopped();
-    S.state = st.name; S.fault = st.detail;
-    S.faultCode = o.fault && typeof o.fault.code === 'string' ? o.fault.code : null;
-    if (isStopped() && !wasStopped) {
-      S.streamActive = false; S.servoTarget = null;
-      releaseAll(); resetPoseMode();
-      C.tailUntil = 0; C.lastInput = -Infinity; S.gripCmdAt = 0;
-    }
-    if (S.presetRunning) {
-      const presetAge = S.preset?.startedAt ? (Date.now() - S.preset.startedAt) : 0;
-      const speedsNearZero = Array.isArray(o.velocities) && o.velocities.every((v) => Math.abs(v) < 0.05);
-      const isArmed = st.name === 'Armed';
-      const noTraj = o.action?.state !== 'running';
-      if (st.name === 'EStop' || st.name === 'Fault' || (isArmed && noTraj && presetAge > 500) || (presetAge > 1000 && speedsNearZero)) {
-        S.presetRunning = false;
-        S.preset = null;
-      }
-    }
-    if (o.detections && !(performance.now() < (S.detHoldUntil || 0))) {
-      const parsed = parseDetections(o.detections, [o.width, o.height]);
-      S.detections = parsed;
-      S.detSource = 'telemetry_ws';
-      S.detLastReceivedAt = performance.now();
-    }
-    if (o.positions.length > GRIP && S.grip == null) {
-      S.grip = gripFrac(o.positions[GRIP]);
-    }
+    acceptObservation(o, true, ws);
   };
   ws.onclose = () => onSocketClose(ws);
   ws.onerror = () => {
@@ -4117,209 +4343,359 @@ function leaseLossKey(reason) {
 function onLeaseLost(ws, o) {
   // Only a loss of the generation this page holds demotes it; a stale notice for an older generation is ignored.
   if (o.generation != null ? o.generation === S.leaseGeneration : S.leaseGeneration != null) {
+    if (o.reason !== 'released' && o.reason !== 'preempted') S.leaseReleased = { reason: 'expired' };
+    if (typeof S.controlEpoch === 'number') S.controlEpoch++;
     resetLease();
+    if (typeof onLeaseLostCleanup === 'function') onLeaseLostCleanup();
     toast(t(leaseLossKey(o.reason)), 'warn');
   }
 }
-// A stale socket's late close must never reset the lease or close the modal of the current socket.
-function onSocketClose(ws) {
-  if (S.ws !== ws) return;
-  // armd drops a lease when its socket closes; the arm parks itself if it was torqued.
-  if (S.leaseGeneration != null) toast(t('toast.lease_expired'), 'warn');
-  S.ws = null;
-  S.detections = [];
-  S.detLastReceivedAt = 0;
-  clearOverlayCanvas();
-  if (activeAcquire && activeAcquire.ws === ws) clearActiveAcquire();
-  closePreemptModal();
-  resetLease();
-  setTimeout(connectWS, 1500);
-}
-// Lease state: not held + no pending retry timer. An in-flight acquire is owned by activeAcquire.
+function onLeaseLostCleanup() { invalidateControlIntents(); }
+function onSocketClose(ws) { retireSocket(ws, { reconnect: true, markReleased: true, toastExpired: true }); }
 function resetLease() {
   rejectPendingCommands(t('err.disconnected'));
-  S.streamActive = false;
-  S.servoTarget = null;
-  S.leaseGeneration = null;
-  releaseAll();
-  resetPoseMode();
-  C.tailUntil = 0; C.lastInput = -Infinity;
-  S.gripCmdAt = 0;
-  settleLeaseWaiters(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
+  S.leaseGeneration = null; S.hb.at = 0; S.hb.n = 0; S.hb.hz = 0;
+  releaseAll({ sendStop: false }); resetPoseMode();
 }
 
-/* ---------- acquire_lease lifecycle: one request in flight, matched by (ws, seq) ---------- */
-let acquireSeq = 0;
-let activeAcquire = null; // { ws, seq, force, timer }
-function clearActiveAcquire() {
-  if (activeAcquire && activeAcquire.timer) clearTimeout(activeAcquire.timer);
-  activeAcquire = null;
+/* ---------- single exclusive leaseOp lifecycle, physical-key gate & stop dispatch ---------- */
+const STOP_BTN_SEL = '#btn-stop, #btn-estop, .head-stop, .head-estop, .op-stop, .op-estop, #grasp-stop, #ms-stop, #ep-stop, #tch-stop, #tch-pick-stop, #cwiz-stop, #cwiz-find-stop';
+const isDeliberateStopTarget = (el) => !!(el && el.closest && el.closest(STOP_BTN_SEL));
+const bindStopButton = (el, opts, before = null) => { if (!el) return; const run = () => { if (before) before(); stopMotion(opts); }; el.addEventListener('pointerdown', (e) => { if (e.button === 0 || e.pointerType !== 'mouse') { e.preventDefault(); run(); } }); el.addEventListener('click', (e) => { if (e.detail === 0) run(); }); };
+const bindEstopButton = (el) => { if (!el) return; el.addEventListener('pointerdown', (e) => { if (e.button === 0 || e.pointerType !== 'mouse') { e.preventDefault(); eStop(); } }); el.addEventListener('click', (e) => { if (e.detail === 0) eStop(); }); };
+const holdCancels = [], heldCodes = new Set(), suppressedCodes = new Set();
+const suppressHeldConfirmKeys = () => { for (const c of ['Enter', 'NumpadEnter']) if (heldCodes.has(c)) suppressedCodes.add(c); };
+let acquireSeq = 0, leaseOp = null, leaseModalReturnFocus = null;
+const takeModalOpen = () => !!$('take-modal') && !$('take-modal').hidden;
+const preemptModalOpen = () => !!$('preempt-modal') && !$('preempt-modal').hidden;
+const leaseModalOrPending = () => !!(takeModalOpen() || preemptModalOpen() || leaseOp);
+const isCancelledErr = (e) => !!(e && (e.cancelled || e.code === 'CONTROL_CANCELLED'));
+const cancelledError = () => Object.assign(new Error(t('err.take_cancelled')), { code: 'CONTROL_CANCELLED', cancelled: true });
+const leaseUnavailableError = () => (S.ws && S.ws.readyState === 1 && !obsFresh() ? Object.assign(new Error(t('err.telemetry_stale')), { code: 'TELEMETRY_STALE' }) : Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
+function cancelPendingAcquire() {
+  if (leaseOp && leaseOp.kind === 'acquire') {
+    leaseOp.cancelled = true;
+    if (leaseOp.reject) { const rej = leaseOp.reject; leaseOp.reject = leaseOp.resolve = null; rej(cancelledError()); }
+  }
 }
-// Who holds the lease, from the observation: null when this page holds it or nobody does.
-// armd publishes the holder's acquire_lease client_id label (this page's own is CLIENT_ID).
+function restoreLeaseModalFocus() {
+  if (takeModalOpen() || preemptModalOpen() || opIsOpen()) return;
+  const f = leaseModalReturnFocus; leaseModalReturnFocus = null;
+  if (f && typeof f.focus === 'function' && document.contains(f)) { try { f.focus({ preventScroll: true }); } catch (_) {} }
+}
+const dismissTakeModal = () => { cancelPendingAcquire(); closeTakeModal(); };
+const dismissPreemptModal = () => { cancelPendingAcquire(); closePreemptModal(); };
+const captureControlSnap = () => ({ ws: S.ws, leaseGen: S.leaseGeneration, epoch: S.obs && typeof S.obs.epoch_id === 'number' ? S.obs.epoch_id : S.epoch, controlEpoch: S.controlEpoch, stopped: false });
+function isControlSnapValid(snap) {
+  if (!snap || snap.leaseGen == null) return false;
+  const curEpoch = S.obs && typeof S.obs.epoch_id === 'number' ? S.obs.epoch_id : S.epoch;
+  return S.ws === snap.ws && S.leaseGeneration === snap.leaseGen && curEpoch === snap.epoch && S.controlEpoch === snap.controlEpoch;
+}
+function invalidateControlIntents({ dropOp = false, keepReleaseOp = false } = {}) {
+  S.controlEpoch++;
+  for (const fn of holdCancels) { try { fn(); } catch (_) {} }
+  closeTakeModal(); closePreemptModal(); releaseAll({ sendStop: false });
+  if (leaseOp && leaseOp.kind === 'acquire') {
+    if (dropOp) { const op = leaseOp; leaseOp = null; if (op.timer) clearTimeout(op.timer); if (op.reject) op.reject(cancelledError()); }
+    else cancelPendingAcquire();
+  } else if (dropOp && leaseOp && !(keepReleaseOp && leaseOp.kind === 'release')) {
+    if (leaseOp.timer) clearTimeout(leaseOp.timer); leaseOp = null;
+  }
+}
 function leaseOther() {
-  if (S.leaseGeneration != null || !S.obs) return null;
+  if (S.leaseGeneration != null || !S.obs || !obsFresh() || leaseOp) return null;
   const h = S.obs.lease_holder;
-  return h == null || h === CLIENT_ID ? null : h;
+  return (h == null || h === CLIENT_ID) ? null : h;
 }
 function leaseHolderText(h) {
   if (h == null) return t('who.other');
+  if (h === '') return t('who.unnamed');
   if (/^rebot-policy/.test(h)) return t('who.policy', { id: h });
   if (/^rebot-(app|teleop)/.test(h)) return t('who.app', { id: h });
   if (/^rebot-(mcp|companion)/.test(h)) return t('who.agent', { id: h });
   if (/^cyclops_/.test(h)) return t('who.wizard', { id: h });
   if (/^web-/.test(h)) return t('who.cockpit');
-  return h ? t('who.named', { id: h }) : t('who.other');
+  return t('who.named', { id: h });
 }
-const leaseBusyError = (h) => Object.assign(new Error(t('toast.lease_busy', { who: leaseHolderText(h) })), { code: 'LEASE_ACTIVE' });
-// Lazy acquire: resolves once this page holds the lease. One acquire_lease in flight; every
-// caller waiting meanwhile gets its result. Rejects when another client holds the lease.
-let leaseWaiters = [];
-function ensureLease() {
-  S.lastIntentAt = Date.now();
-  if (S.leaseGeneration != null) return Promise.resolve();
+const leaseHolderDetail = (h) => (typeof h === 'string' && /^web-/.test(h) ? t('who.cockpit_id', { id: h }) : leaseHolderText(h));
+const leaseBusyError = (h) => Object.assign(new Error(t('toast.lease_busy', { who: leaseHolderDetail(h) })), { code: 'LEASE_ACTIVE' });
+
+function acquireLeaseDirect() {
+  const snap = { ws: S.ws, epoch: S.epoch, controlEpoch: S.controlEpoch };
+  if (S.leaseGeneration != null) return Promise.resolve(S.leaseGeneration);
+  if (!obsFresh()) return Promise.reject(leaseUnavailableError());
+  if (leaseOp) return Promise.reject(cancelledError());
   const other = leaseOther();
   if (other != null) return Promise.reject(leaseBusyError(other));
-  if (!S.ws || S.ws.readyState !== 1) return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
-  return new Promise((resolve, reject) => {
-    leaseWaiters.push({ resolve, reject });
-    if (!activeAcquire) startAcquire(S.ws, false);
+  return new Promise((resolve, reject) => { startAcquireOp(S.ws, false, { resolve, reject }); }).then((gen) => {
+    if (S.ws !== snap.ws || S.epoch !== snap.epoch || S.controlEpoch !== snap.controlEpoch) throw cancelledError();
+    return gen;
   });
 }
-function settleLeaseWaiters(error) {
-  const waiters = leaseWaiters;
-  leaseWaiters = [];
-  for (const w of waiters) { if (error) w.reject(error); else w.resolve(); }
+function promptTakeControl() {
+  if (S.leaseGeneration != null || leaseModalOrPending()) return;
+  if (!obsFresh()) { const err = leaseUnavailableError(); toast(err.message, 'err', err.code); return; }
+  const other = leaseOther();
+  if (other != null) { toast(leaseBusyError(other).message, 'err', 'LEASE_ACTIVE'); return; }
+  releaseAll({ sendStop: false }); openTakeModal();
 }
-// Release an idle lease: no control input for CFG.leaseIdleMs, torque off (armd parks a torqued
-// arm when its lease is released), and nothing running: action, gravity compensation, preset,
-// stream, held input, pending command or a moving arm.
+function requireLeaseOrPrompt() {
+  if (S.leaseGeneration != null) return Promise.resolve(S.leaseGeneration);
+  if (leaseModalOrPending()) return Promise.reject(cancelledError());
+  if (!obsFresh()) return Promise.reject(leaseUnavailableError());
+  const other = leaseOther();
+  if (other != null) return Promise.reject(leaseBusyError(other));
+  promptTakeControl();
+  return Promise.reject(cancelledError());
+}
+function requireLeaseSyncOrPrompt(onError) {
+  if (S.leaseGeneration != null) return captureControlSnap();
+  if (leaseModalOrPending()) return null;
+  if (!obsFresh()) { const err = leaseUnavailableError(); if (onError) onError(err); else toast(err.message, 'err', err.code); return null; }
+  const other = leaseOther();
+  if (other != null) { const err = leaseBusyError(other); if (onError) onError(err); else toast(err.message, 'err', err.code); return null; }
+  promptTakeControl();
+  return null;
+}
 function leaseIdleReleasable() {
   const o = S.obs;
   if (!o || !isLive() || S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1) return false;
   if (Date.now() - S.lastIntentAt < CFG.leaseIdleMs) return false;
   if (o.is_torqued || o.disable_pending || o.enable_state === 'Enabled') return false;
   if (o.action?.state === 'running' || o.control_mode === 'gravity_comp' || o.gravity_comp?.phase) return false;
-  if (S.presetRunning || S.streamActive || S.servoTarget || unloading || GR.sending || activeAcquire || pendingCommands.size) return false;
+  if (S.presetRunning || S.streamActive || S.servoTarget || unloading || GR.sending || leaseOp || pendingCommands.size) return false;
   if (commandVector().some((x) => x !== 0) || Object.values(cartVelocity()).some((x) => x !== 0) || cartGripVel() !== 0) return false;
   if (S.state === 'Moving' || !Array.isArray(o.velocities) || o.velocities.some((v) => !(Math.abs(v) < 0.05))) return false;
   return true;
 }
-setInterval(() => {
-  if (!leaseIdleReleasable()) return;
-  const ws = S.ws;
-  try { ws.send(JSON.stringify({ type: 'release_lease', client_id: CLIENT_ID, generation: S.leaseGeneration })); } catch (_) { return; }
-  resetLease();
-  toast(t('toast.lease_idle', { s: Math.round(CFG.leaseIdleMs / 1000) }), 'info');
-}, 250);
-// The only sender of acquire_lease. force=true only from the preempt confirm button.
-function startAcquire(ws, force = false) {
-  if (!ws || ws.readyState !== 1 || S.ws !== ws) return;
-  if (activeAcquire && activeAcquire.timer) clearTimeout(activeAcquire.timer);
+setInterval(() => { if (leaseIdleReleasable()) sendReleaseLease('toast.lease_idle', { s: Math.round(CFG.leaseIdleMs / 1000) }); }, 250);
+
+// The SOLE sender of acquire_lease in the entire file. force=true only from #preempt-confirm.
+function startAcquireOp(ws, force = false, { resolve = null, reject = null } = {}) {
+  if (!ws || S.ws !== ws || !obsFresh() || leaseOp) {
+    if (reject) reject(leaseOp ? cancelledError() : leaseUnavailableError());
+    return false;
+  }
   const seq = ++acquireSeq;
-  const req = { ws, seq, force, timer: null };
-  req.timer = setTimeout(() => onAcquireTimeout(req), CFG.leaseAckTimeoutMs);
-  activeAcquire = req;
-  ws.send(JSON.stringify({ type: 'acquire_lease', seq, client_id: CLIENT_ID, force }));
-  renderPreemptModal();
+  const op = { kind: 'acquire', ws, seq, force: !!force, cancelled: false, timer: null, resolve, reject };
+  op.timer = setTimeout(() => {
+    if (leaseOp !== op || S.ws !== ws) return;
+    clearTimeout(op.timer); toast(t('toast.take_timeout'), 'warn');
+    retireSocket(ws, { reconnect: true, markReleased: false });
+  }, CFG.leaseAckTimeoutMs);
+  leaseOp = op;
+  try { ws.send(JSON.stringify({ type: 'acquire_lease', seq, client_id: CLIENT_ID, force: !!force })); }
+  catch (e) { clearTimeout(op.timer); leaseOp = null; if (reject) reject(e); renderPreemptModal(); renderTakeModal(); return false; }
+  renderPreemptModal(); renderTakeModal();
+  return true;
 }
 function onAcquireResponse(ws, msg) {
-  if (!activeAcquire || activeAcquire.ws !== ws || S.ws !== ws || activeAcquire.seq !== msg.seq) return;
-  const req = activeAcquire;
-  clearTimeout(activeAcquire.timer);
-  activeAcquire = null;
-  if (msg.type === 'lease_granted') {
-    if (typeof msg.generation !== 'number') {
-      settleLeaseWaiters(Object.assign(new Error(t('err.rejected')), { code: 'LEASE_REJECTED' }));
-      renderPreemptModal(); return;
-    }
-    S.leaseGeneration = msg.generation;
-    S.lastIntentAt = Date.now();
-    closePreemptModal();
-    // a lazy acquire on input is silent; a takeover is confirmed
-    if (req.force) toast(t('toast.took'), 'ok');
-    settleLeaseWaiters(null);
+  if (S.ws !== ws) return;
+  const validGen = typeof msg.generation === 'number' && Number.isSafeInteger(msg.generation) && msg.generation > 0;
+  const correlated = !!(leaseOp && leaseOp.kind === 'acquire' && leaseOp.ws === ws && typeof msg.seq === 'number' && leaseOp.seq === msg.seq);
+  if (msg.type === 'lease_granted' && (!validGen || !correlated)) {
+    const pending = leaseOp && leaseOp.ws === ws ? leaseOp : null;
+    let rej = null;
+    if (pending) { clearTimeout(pending.timer); rej = pending.reject; pending.reject = pending.resolve = null; leaseOp = null; }
+    closePreemptModal(); closeTakeModal();
+    if (rej) rej(Object.assign(new Error(t('toast.take_ambiguous')), { code: 'LEASE_REJECTED' }));
+    else toast(t('toast.take_ambiguous'), 'warn', 'LEASE_REJECTED');
+    retireSocket(ws, { reconnect: true, markReleased: false });
     return;
   }
-  // lease_rejected
+  if (!correlated) return;
+  const op = leaseOp;
+  clearTimeout(op.timer);
+  if (op.cancelled) {
+    leaseOp = null;
+    if (msg.type === 'lease_granted') startReleaseOp(ws, msg.generation, null, null);
+    renderPreemptModal(); renderTakeModal();
+    return;
+  }
+  leaseOp = null;
+  if (msg.type === 'lease_granted') {
+    S.leaseGeneration = msg.generation; sendHeartbeat(ws); S.lastIntentAt = Date.now(); S.leaseReleased = null;
+    closePreemptModal(); closeTakeModal();
+    if (op.force) toast(t('toast.took'), 'ok');
+    if (op.resolve) op.resolve(msg.generation);
+    return;
+  }
   if (msg.error === 'preemption_cooldown') {
-    // Never auto-resend force: the operator confirms again after the countdown.
-    const remaining = Math.max(0, Number(msg.remaining_ms) || 0);
-    S.preemptCooldownUntil = Date.now() + remaining;
-    openPreemptModal();
-    settleLeaseWaiters(leaseBusyError(S.obs?.lease_holder));
+    S.preemptCooldownUntil = Date.now() + Math.max(0, Number(msg.remaining_ms) || 0);
+    closeTakeModal(); if (!preemptModalOpen()) openPreemptModal(); else renderPreemptModal();
+    if (op.reject) op.reject(leaseBusyError(S.obs?.lease_holder));
     return;
   }
   if (msg.error === 'controller_busy') {
-    if (req.force) { closePreemptModal(); toast(t('toast.take_failed'), 'err'); }
+    if (op.force) { closePreemptModal(); toast(t('toast.take_failed'), 'err'); }
     const busy = leaseBusyError(S.obs?.lease_holder);
-    if (!req.force) toastOnce(busy);
-    settleLeaseWaiters(busy);
-    renderPreemptModal();
+    if (!op.force && !op.reject) toastOnce(busy);
+    if (op.reject) op.reject(busy);
+    renderPreemptModal(); renderTakeModal();
     return;
   }
-  // OPERATOR_REQUIRED: the operator dialog gives the reason (not armd's English text); after the unlock the user
-  // confirms the takeover again: a forced takeover is never resent by itself
-  if (req.force) { closePreemptModal(); if (msg.code !== 'OPERATOR_REQUIRED') toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
+  const why = msg.message || msg.error || t('unknown_reason');
+  if (op.force) {
+    closePreemptModal();
+    if (msg.code !== 'OPERATOR_REQUIRED') {
+      if (msg.code === 'OWNER_TRANSFERRED' || msg.error === 'owner_transferred') toast(t('toast.take_owner_transferred'), 'err', msg.code || 'OWNER_TRANSFERRED');
+      else toast(t('toast.take_rejected_fix', { why }), 'err', msg.code || 'LEASE_REJECTED');
+    }
+  }
   if (msg.code === 'OPERATOR_REQUIRED') opRequire('lease.force', undefined, { retry: false }).then((ok) => { if (ok) toast(t('op.again.take'), 'info'); });
-  settleLeaseWaiters(Object.assign(new Error(t('err.rejected') + ': ' + (msg.message || msg.error || t('unknown_reason'))), { code: 'LEASE_REJECTED' }));
-  renderPreemptModal();
+  if (op.reject) op.reject(Object.assign(new Error(t('err.rejected_fix', { why })), { code: msg.code || 'LEASE_REJECTED' }));
+  renderPreemptModal(); renderTakeModal();
 }
-function onAcquireTimeout(req) {
-  if (activeAcquire !== req || S.ws !== req.ws) return;
-  activeAcquire = null;
-  if (!req.force) {
-    settleLeaseWaiters(Object.assign(new Error(t('err.cmdtimeout')), { code: 'COMMAND_TIMEOUT' }));
-    return;
-  }
-  // Forced acquire timed out: the server may or may not have granted it. Reconcile with a plain
-  // acquire (idempotent lease_granted if we own it, controller_busy otherwise); never retry force.
-  closePreemptModal();
-  toast(t('toast.take_timeout'), 'warn');
-  startAcquire(req.ws, false);
+function startReleaseOp(ws, generation, toastKey = null, toastArgs = null) {
+  if (!ws || ws.readyState !== 1 || S.ws !== ws) return false;
+  S.leaseGeneration = null; S.hb.at = 0; S.hb.n = 0; S.hb.hz = 0;
+  const op = { kind: 'release', ws, cancelled: false, timer: null, toastKey, toastArgs };
+  op.timer = setTimeout(() => {
+    if (leaseOp !== op || S.ws !== ws) return;
+    clearTimeout(op.timer); toast(t('toast.release_timeout'), 'warn'); retireSocket(ws, { reconnect: true, markReleased: false });
+  }, CFG.leaseAckTimeoutMs);
+  leaseOp = op;
+  try { ws.send(JSON.stringify({ type: 'release_lease', client_id: CLIENT_ID, generation })); }
+  catch (_) { clearTimeout(op.timer); leaseOp = null; retireSocket(ws, { reconnect: true, markReleased: false }); return false; }
+  return true;
 }
-/* ---------- preempt confirmation modal ---------- */
-let preemptTick = null;
+function sendReleaseLease(toastKey = null, toastArgs = null) {
+  if (S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1 || leaseOp) return false;
+  const ws = S.ws, gen = S.leaseGeneration;
+  invalidateControlIntents({ keepReleaseOp: true }); resetLease();
+  return startReleaseOp(ws, gen, toastKey, toastArgs);
+}
+function onLeaseReleased(ws, msg) {
+  if (!leaseOp || leaseOp.kind !== 'release' || leaseOp.ws !== ws || S.ws !== ws) return;
+  const prev = leaseOp; clearTimeout(prev.timer);
+  if (prev.toastKey) toast(msg.success === true ? t(prev.toastKey, prev.toastArgs) : t('toast.release_inactive'), msg.success === true ? 'info' : 'warn');
+  const op = { kind: 'refresh', ws, cancelled: false, timer: null };
+  const fail = () => { if (leaseOp !== op || S.ws !== ws) return; clearTimeout(op.timer); toast(t('toast.refresh_timeout'), 'warn'); retireSocket(ws, { reconnect: true, markReleased: false }); };
+  op.timer = setTimeout(fail, CFG.leaseAckTimeoutMs);
+  leaseOp = op;
+  fetch('/api/v1/observation', { cache: 'no-store' }).then(async (res) => {
+    if (leaseOp !== op || S.ws !== ws) return;
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const obs = await res.json();
+    if (leaseOp !== op || S.ws !== ws) return;
+    if (!isCompleteObservation(obs)) throw new Error('invalid observation');
+    clearTimeout(op.timer); leaseOp = null; acceptObservation(obs, false, ws);
+    if (typeof toolsRenderRelease === 'function' && !$('sset').hidden) toolsRenderRelease();
+  }).catch(fail);
+}
+function openTakeModal() {
+  if (S.leaseGeneration != null || leaseOp || preemptModalOpen()) return;
+  if (!takeModalOpen() && !preemptModalOpen()) leaseModalReturnFocus = document.activeElement;
+  $('take-modal').hidden = false; renderTakeModal(); $('take-cancel').focus({ preventScroll: true });
+}
+function closeTakeModal() { const was = takeModalOpen(); if ($('take-modal')) $('take-modal').hidden = true; if (was) { suppressHeldConfirmKeys(); restoreLeaseModalFocus(); } }
+function renderTakeModal() {
+  if (!takeModalOpen()) return;
+  const acquiring = !!(leaseOp && leaseOp.kind === 'acquire' && !leaseOp.force), btn = $('take-confirm');
+  setText($('take-body'), t(S.leaseReleased ? 'take.body.released' : 'take.body'));
+  btn.disabled = acquiring || (!!leaseOp && !acquiring) || !obsFresh() || leaseOther() != null;
+  setText(btn, acquiring ? t('take.taking') : t('take.confirm'));
+}
+$('take-cancel').addEventListener('click', dismissTakeModal);
+$('take-modal').addEventListener('click', (e) => { if (e.target === e.currentTarget) dismissTakeModal(); });
+bindStopButton($('take-stop')); bindEstopButton($('take-estop'));
+$('take-confirm').addEventListener('click', () => {
+  if (leaseOp || !obsFresh()) return;
+  const other = leaseOther();
+  if (other != null) { closeTakeModal(); toast(leaseBusyError(other).message, 'err', 'LEASE_ACTIVE'); return; }
+  const btn = $('take-confirm'); btn.disabled = true; setText(btn, t('take.taking'));
+  acquireLeaseDirect().then(() => toast(t('toast.take_acquired'), 'info')).catch((e) => { closeTakeModal(); if (!isCancelledErr(e)) toast(e.message, 'err', e.code); });
+});
+$('btn-retake').addEventListener('click', () => {
+  if (leaseModalOrPending() || !obsFresh()) return;
+  const other = leaseOther();
+  if (other != null) { toast(leaseBusyError(other).message, 'err', 'LEASE_ACTIVE'); return; }
+  acquireLeaseDirect().then(() => toast(t('toast.retake_ok'), 'ok')).catch((e) => { if (!isCancelledErr(e)) toast(e.message, 'err', e.code); });
+});
+$('btn-retake-x').addEventListener('click', () => { S.leaseReleased = null; });
+
+let preemptTick = null, preemptTargetHolder = null, preemptChangedAck = false, preemptChangedUntil = 0;
 function openPreemptModal() {
-  $('preempt-modal').hidden = false;
-  renderPreemptModal();
+  const cur = leaseOther();
+  if (cur == null) { toast(t('preempt.cleared'), 'info'); return; }
+  if (!takeModalOpen() && !preemptModalOpen()) leaseModalReturnFocus = document.activeElement;
+  preemptTargetHolder = cur; preemptChangedAck = false; preemptChangedUntil = 0;
+  $('preempt-changed').hidden = true; setText($('preempt-changed'), '');
+  $('preempt-modal').hidden = false; closeTakeModal(); renderPreemptModal(); $('preempt-cancel').focus({ preventScroll: true });
   if (!preemptTick) preemptTick = setInterval(renderPreemptModal, 200);
 }
 function closePreemptModal() {
-  $('preempt-modal').hidden = true;
-  clearInterval(preemptTick);
-  preemptTick = null;
+  const was = preemptModalOpen();
+  if ($('preempt-modal')) $('preempt-modal').hidden = true;
+  preemptTargetHolder = null; preemptChangedAck = false; preemptChangedUntil = 0;
+  if ($('preempt-changed')) { $('preempt-changed').hidden = true; setText($('preempt-changed'), ''); }
+  clearInterval(preemptTick); preemptTick = null;
+  if (was) { suppressHeldConfirmKeys(); restoreLeaseModalFocus(); }
 }
 function renderPreemptModal() {
-  if ($('preempt-modal').hidden) return;
-  const left = S.preemptCooldownUntil - Date.now();
-  const forcing = !!(activeAcquire && activeAcquire.force);
-  const btn = $('preempt-confirm');
-  const note = $('preempt-cooldown');
-  btn.disabled = left > 0 || forcing;
-  setText(btn, forcing ? t('preempt.taking') : t('preempt.confirm'));
-  note.hidden = left <= 0;
-  if (left > 0) setText(note, t('preempt.cool', { s: Math.ceil(left / 1000) }));
-}
-$('btn-preempt').addEventListener('click', () => {
-  if (S.leaseGeneration != null || leaseOther() == null) return;
-  openPreemptModal();
-});
-$('preempt-cancel').addEventListener('click', closePreemptModal);
-$('preempt-modal').addEventListener('click', (e) => { if (e.target === e.currentTarget) closePreemptModal(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('preempt-modal').hidden) closePreemptModal(); });
-$('preempt-confirm').addEventListener('click', () => {
-  if (S.preemptCooldownUntil > Date.now() || (activeAcquire && activeAcquire.force)) return;
-  if (!S.ws || S.ws.readyState !== 1) { toast(t('toast.ws_not_ready'), 'err'); return; }
-  startAcquire(S.ws, true);
-});
-setInterval(() => {
-  // Lease renewal. Stops when the tab is hidden so armd's watchdog can take over.
-  if (S.ws && S.ws.readyState === 1 && S.epoch != null && S.leaseGeneration != null && !document.hidden) {
-    S.ws.send(JSON.stringify({ type: 'heartbeat', client_id: CLIENT_ID, generation: S.leaseGeneration, epoch_id: S.epoch, timestamp_ms: Date.now() }));
-    S.hb.n++; S.hb.at = Date.now();
+  if (!preemptModalOpen()) return;
+  const forcing = !!(leaseOp && leaseOp.kind === 'acquire' && leaseOp.force), fresh = obsFresh();
+  if (!forcing && !leaseOp && fresh) {
+    const cur = leaseOther();
+    if (cur == null) { closePreemptModal(); toast(t('preempt.cleared'), 'info'); return; }
+    if (cur !== preemptTargetHolder) { preemptTargetHolder = cur; preemptChangedAck = true; preemptChangedUntil = Date.now() + 800; }
   }
-}, CFG.heartbeatMs);
+  const whoDetail = leaseHolderDetail(preemptTargetHolder);
+  setText($('preempt-body'), t('preempt.body.who', { who: whoDetail }));
+  const chg = $('preempt-changed'); chg.hidden = !preemptChangedAck;
+  if (preemptChangedAck) setText(chg, t('preempt.changed', { who: whoDetail }));
+  const now = Date.now(), left = S.preemptCooldownUntil - now, chgWait = preemptChangedUntil - now;
+  const btn = $('preempt-confirm'), note = $('preempt-cooldown');
+  btn.disabled = !fresh || left > 0 || chgWait > 0 || forcing || (!!leaseOp && !forcing);
+  setText(btn, forcing ? t('preempt.taking') : t('preempt.confirm'));
+  if (!forcing && !leaseOp && !fresh) { note.hidden = false; setText(note, t('preempt.stale')); }
+  else { note.hidden = left <= 0; if (left > 0) setText(note, t('preempt.cool', { s: Math.ceil(left / 1000) })); }
+}
+$('btn-preempt').addEventListener('click', () => { if (S.leaseGeneration == null && !leaseModalOrPending() && leaseOther() != null) openPreemptModal(); });
+$('preempt-cancel').addEventListener('click', dismissPreemptModal);
+$('preempt-modal').addEventListener('click', (e) => { if (e.target === e.currentTarget) dismissPreemptModal(); });
+bindStopButton($('preempt-stop')); bindEstopButton($('preempt-estop'));
+$('preempt-confirm').addEventListener('click', () => {
+  if (S.preemptCooldownUntil > Date.now() || preemptChangedUntil > Date.now() || leaseOp) return;
+  if (!obsFresh()) { toast(t('toast.ws_not_ready'), 'err'); renderPreemptModal(); return; }
+  const cur = leaseOther();
+  if (cur == null) { closePreemptModal(); toast(t('preempt.cleared'), 'info'); return; }
+  if (cur !== preemptTargetHolder) { preemptTargetHolder = cur; preemptChangedAck = true; preemptChangedUntil = Date.now() + 800; renderPreemptModal(); return; }
+  startAcquireOp(S.ws, true);
+});
+window.addEventListener('keydown', (e) => {
+  const opOpen = opIsOpen(), modalOpen = opOpen || takeModalOpen() || preemptModalOpen();
+  if (e.key === ' ' || e.code === 'Space') {
+    const typing = !modalOpen && e.target && (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'password' || e.target.type === 'number')));
+    if (!typing) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); if (!e.repeat) eStop(); return; }
+  }
+  if (e.code) heldCodes.add(e.code);
+  if (e.code && suppressedCodes.has(e.code)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); return; }
+  if (!modalOpen) return;
+  if (e.key === 'Escape') {
+    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); suppressedCodes.add(e.code || 'Escape');
+    if (opOpen) closeOperatorModal(false); else { if (takeModalOpen()) dismissTakeModal(); if (preemptModalOpen()) dismissPreemptModal(); }
+    return;
+  }
+  if (e.repeat && (e.code === 'Enter' || e.code === 'NumpadEnter' || e.key === 'Enter')) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); return; }
+  if (e.key === 'Tab') {
+    const m = opOpen ? $('op-modal') : preemptModalOpen() ? $('preempt-modal') : $('take-modal');
+    const f = [...m.querySelectorAll('button:not([hidden]):not([disabled]), input:not([hidden]):not([disabled])')].filter((x) => x.offsetParent !== null);
+    if (!f.length) return;
+    const i = f.indexOf(document.activeElement);
+    if (i < 0) { e.preventDefault(); (e.shiftKey ? f[f.length - 1] : f[0]).focus({ preventScroll: true }); }
+    else if (e.shiftKey && i === 0) { e.preventDefault(); f[f.length - 1].focus({ preventScroll: true }); }
+    else if (!e.shiftKey && i === f.length - 1) { e.preventDefault(); f[0].focus({ preventScroll: true }); }
+  }
+}, true);
+window.addEventListener('keyup', (e) => { if (e.code) { heldCodes.delete(e.code); suppressedCodes.delete(e.code); } }, true);
+window.addEventListener('blur', () => { heldCodes.clear(); suppressedCodes.clear(); });
+function sendHeartbeat(ws = S.ws) {
+  if (!ws || ws.readyState !== 1 || S.ws !== ws || S.epoch == null || S.leaseGeneration == null || document.hidden) return false;
+  try { ws.send(JSON.stringify({ type: 'heartbeat', client_id: CLIENT_ID, generation: S.leaseGeneration, epoch_id: S.epoch, timestamp_ms: Date.now() })); S.hb.n++; S.hb.at = Date.now(); return true; }
+  catch (_) { return false; }
+}
+setInterval(() => { sendHeartbeat(); }, CFG.heartbeatMs);
 setInterval(() => { S.hz = S.wsCount; S.wsCount = 0; S.hb.hz = S.hb.n; S.hb.n = 0; }, 1000);
 setInterval(() => {
   // RTT probe when no other request has measured it recently
@@ -6224,7 +6600,7 @@ const CWF = { n: 35, preDeg: 0.5, maxRate: 0.25, settleRad: 0.003, settleMs: 500
   gen: { dists: [0.20, 0.24, 0.28, 0.32, 0.36, 0.40], tilts: [0, 12, 24, 36], azimuths: 8, rolls: [0, 20, -20], minMarkers: 8, clearance: 0.10, distRange: [0.2, 0.4] } };
 const CW_SPEED = { linear: 0.03, angular: 0.3 };
 const CWZ = { open: false, step: 'board', CW: null, markerMm: 25, thickMm: 0.5, board: null, views: [], plan: [], idx: 0, target: 20,
-  runAll: false, running: false, stopReq: false, lease: null, epoch: null, ownAction: null, est: null, refined: false, solve: null, dry: null, applied: null,
+  runAll: false, running: false, stopReq: false, lease: null, epoch: null, controlSnap: null, ownAction: null, est: null, refined: false, solve: null, dry: null, applied: null,
   status: '', statusKind: '', armedUntil: 0, resetArm: null, previewQ: null, busy: false, live: null,
   mode: 'camera', place: 0, saved: [], solving: null, settled: true,
   sessionId: null, sessionAt: null, sessionWarn: '', sessions: null, loaded: null, verify: null, X0: null };
@@ -6248,11 +6624,25 @@ function cwLiveCount() {
 }
 // why a running wizard must stop now (null: carry on); CW.runAbortReason has the rules
 function cwAbortReason() {
+  if (CWZ.controlSnap && !isControlSnapValid(CWZ.controlSnap)) {
+    if (CWZ.stopReq || S.controlEpoch !== CWZ.controlSnap.controlEpoch) return 'stop';
+    if (S.ws !== CWZ.controlSnap.ws || S.leaseGeneration !== CWZ.controlSnap.leaseGen) return 'lease';
+    return 'epoch';
+  }
   const o = S.obs || {};
   return CWZ.CW.runAbortReason({ stopReq: CWZ.stopReq, hidden: document.hidden, live: !!isLive() && !!S.ws && S.ws.readyState === 1,
     lease0: CWZ.lease, lease: S.leaseGeneration, epoch0: CWZ.epoch, epoch: typeof o.epoch_id === 'number' ? o.epoch_id : S.epoch,
     state: S.state, fault: o.fault || null, hold: colHold(),
     action: o.action ? o.action.id : null, actionState: o.action ? o.action.state : null, ownAction: CWZ.ownAction });
+}
+function cwScopedStop(snap) {
+  return () => {
+    if (!snap || snap.stopped || S.ws !== snap.ws || S.leaseGeneration !== snap.leaseGen) return Promise.resolve();
+    const curEpoch = S.obs && typeof S.obs.epoch_id === 'number' ? S.obs.epoch_id : S.epoch;
+    if (curEpoch !== snap.epoch) return Promise.resolve();
+    snap.stopped = true;
+    return api('/api/v1/motion/stop', {}, { quiet: true });
+  };
 }
 const cwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function cwGuardedWait(cond, timeoutMs) {
@@ -6270,13 +6660,20 @@ async function cwGuardedWait(cond, timeoutMs) {
 // public action boundary. throws { code, phase } on failure:
 // phase 'reject' (command_reject / no ack, nothing started) or 'action' (the started action failed)
 async function cwMove(T) {
+  if (CWZ.controlSnap && !isControlSnapValid(CWZ.controlSnap)) {
+    throw CWZ.CW.runAbort(cwAbortReason() || 'stop');
+  }
   const CW = CWZ.CW;
   const off = S.tcpOffset || [0, 0, 0];
   let ack;
   try {
     ack = await commandRPC('/api/v1/action/move_to', {
-      position: CW.apply(T, off), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed: CW_SPEED, tag: 'calib-wizard' });
-  } catch (e) { throw Object.assign(e, { phase: 'reject' }); }
+      position: CW.apply(T, off), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed: CW_SPEED, tag: 'calib-wizard' },
+      true, 2000, CWZ.controlSnap ? { controlSnap: CWZ.controlSnap } : null);
+  } catch (e) {
+    if (isCancelledErr(e)) throw CW.runAbort(cwAbortReason() || 'stop');
+    throw Object.assign(e, { phase: 'reject' });
+  }
   const id = ack && ack.action_id;
   if (id == null) throw Object.assign(new Error('move_to ack without action_id'), { code: 'NO_ACTION_ID', phase: 'reject' });
   CWZ.ownAction = id;
@@ -6382,12 +6779,11 @@ function cwCheckFromHere(T) {
 async function cwRun() {
   if (CWZ.running || CWZ.idx >= CWZ.plan.length) return;
   if (!canMove()) { cwSetStatus(lockReason(), 'warn'); return; }
+  const snap = requireLeaseSyncOrPrompt((e) => cwSetStatus(t('cw.cap.aborted', { why: e.message }), 'warn'));
+  if (!snap) return;
   CWZ.running = true; CWZ.stopReq = false;
   try {
-    await ensureLease();
-    CWZ.lease = S.leaseGeneration;
-    CWZ.epoch = S.obs && typeof S.obs.epoch_id === 'number' ? S.obs.epoch_id : S.epoch;
-    CWZ.ownAction = null;
+    CWZ.lease = snap.leaseGen; CWZ.epoch = snap.epoch; CWZ.controlSnap = snap; CWZ.ownAction = null;
     const CW = CWZ.CW;
     const res = await CW.runPoses(CWZ, cwFine() ? cwFineIo() : {
       abortReason: cwAbortReason,
@@ -6407,19 +6803,20 @@ async function cwRun() {
         }
         cwRender();
       },
-      stop: () => api('/api/v1/motion/stop', {}, { quiet: true }),
+      stop: cwScopedStop(snap),
       skipWhy: (kind, d) => (kind === 'move' ? t('cw.skip.move', { code: d }) : t('cw.skip.transition', { r: d })),
     }, { runAll: CWZ.runAll });
     cwSetStatus(res === 'done' ? t('cw.cap.done') : '', res === 'done' ? 'ok' : '');
     if (res === 'done') cwSessionUpload(); // a placement's capture finished
   } catch (e) {
+    if (isCancelledErr(e)) return;
     const why = e.code === 'ABORTED' ? t('cw.abort.' + e.why) + (e.detail ? ' (' + e.detail + ')' : '') : e.message;
     cwSetStatus(t('cw.cap.aborted', { why }) + (cwFine() && CWZ.idx < CWZ.plan.length ? ' · ' + t('cw.f.kept', { n: cwFineAccepted(CWZ.place) }) : ''), 'warn');
-  } finally { CWZ.running = false; CWZ.stopReq = false; cwRender(); cwV3Sync(); }
+  } finally { CWZ.running = false; CWZ.stopReq = false; CWZ.controlSnap = null; cwRender(); cwV3Sync(); }
 }
 function cwStop() {
   CWZ.stopReq = true;
-  api('/api/v1/motion/stop', {}, { quiet: true }).catch(() => {});
+  stopMotion();
   cwRender();
 }
 function cwSolve() {
@@ -6529,12 +6926,18 @@ function cwFineCheck(i) {
 // joint-space move to model angles q (J1..J6) with /api/v1/motion/jog; waits for the action record (or, when the
 // ack carries no action id, for the joints to arrive). Throws { code, phase } like cwMove.
 async function cwJog(q) {
+  if (CWZ.controlSnap && !isControlSnapValid(CWZ.controlSnap)) {
+    throw CWZ.CW.runAbort(cwAbortReason() || 'stop');
+  }
   const pos = S.obs.positions, m = toMotor6(q), full = [...m, ...pos.slice(6)];
   const dq = Math.max(...m.map((v, i) => Math.abs(v - pos[i])));
   const dur = Math.max(1.5, dq / CWF.maxRate);
   let ack;
-  try { ack = await commandRPC('/api/v1/motion/jog', { target_positions: full, duration_secs: dur }); }
-  catch (e) { throw Object.assign(e, { phase: 'reject' }); }
+  try { ack = await commandRPC('/api/v1/motion/jog', { target_positions: full, duration_secs: dur }, true, 2000, CWZ.controlSnap ? { controlSnap: CWZ.controlSnap } : null); }
+  catch (e) {
+    if (isCancelledErr(e)) throw CWZ.CW.runAbort(cwAbortReason() || 'stop');
+    throw Object.assign(e, { phase: 'reject' });
+  }
   const id = ack && ack.action_id;
   if (id == null) {
     await cwGuardedWait(() => S.obs.positions.slice(0, 6).every((v, i) => Math.abs(v - m[i]) < 0.01), dur * 1000 + 10000);
@@ -6592,7 +6995,7 @@ function cwFineIo() {
       v.frames.forEach((f, k) => CWZ.views.push({ ...f, pose: i, frame: k, ds: CWZ.place, settled: v.settled }));
     },
     after: () => cwRender(),
-    stop: () => api('/api/v1/motion/stop', {}, { quiet: true }),
+    stop: cwScopedStop(CWZ.controlSnap),
     skipWhy: (kind, d) => (kind === 'move' ? t('cw.skip.move', { code: d }) : t('cw.skip.transition', { r: d })),
   };
 }
@@ -6682,15 +7085,19 @@ function dockOnVideo(bar, avoidSel = DOCK_AVOID) {
 async function cwJogCapture() { cwJogMode(false); await cwBootstrap(); }
 // hand-guide: enter with the cockpit switch's checks; exit locks the pose
 function cwHandGuide() {
-  if (CWZ.busy || (CWZ.search && CWZ.search.running)) return;
+  if (CWZ.busy || (CWZ.search && CWZ.search.running) || leaseModalOrPending()) return;
   if (gcOn()) { gcExit(); cwSetStatus(t('cw.find.gc.exiting')); return; }
   const why = gcBlockText();
   if (why) { cwSetStatus(t('gc.enter_fail') + why, 'warn'); return; }
+  if (S.leaseGeneration == null) {
+    requireLeaseOrPrompt().catch((err) => { if (!isCancelledErr(err)) cwSetStatus(t('gc.enter_fail') + err.message, 'warn'); });
+    return;
+  }
   releaseAll();
   cwSetStatus(t('gc.entering'));
   api('/api/v1/mode/gravity_comp', { enable: true }, { quiet: true })
     .then(() => cwSetStatus(t('cw.find.gc.on'), 'ok'))
-    .catch((err) => { const k = 'gc.b.' + err.code; cwSetStatus(t('gc.enter_fail') + (t(k) !== k ? t(k) : err.message), 'warn'); });
+    .catch((err) => { if (isCancelledErr(err)) return; const k = 'gc.b.' + err.code; cwSetStatus(t('gc.enter_fail') + (t(k) !== k ? t(k) : err.message), 'warn'); });
 }
 const cwGcSupported = () => { const gc = S.obs && S.obs.gravity_comp; return !!(gc && gc.supported) && (S.caps ? S.caps.gravity_comp !== false : true); };
 // table height for the search: the board of the last estimate, else the grasp setup, else 0
@@ -6731,7 +7138,18 @@ async function cwSearch() {
   if (!canMove()) { cwSetStatus(lockReason(), 'warn'); return; }
   if (cwGcBusy()) { cwSetStatus(t('cw.find.why.gc'), 'warn'); return; }
   if (!isLive() || !S.obs || !Array.isArray(S.obs.positions)) { cwSetStatus(t('calib.e.offline'), 'warn'); return; }
-  const CW = await cwLoad();
+  const snap = requireLeaseSyncOrPrompt((e) => cwSetStatus(t('cw.find.aborted', { k: 0, n: 0, why: e.message }), 'warn'));
+  if (!snap) return;
+  CWZ.lease = snap.leaseGen; CWZ.epoch = snap.epoch; CWZ.controlSnap = snap; CWZ.ownAction = null;
+  let CW;
+  try {
+    CW = await cwLoad();
+    if (!isControlSnapValid(snap)) throw cancelledError();
+  } catch (e) {
+    CWZ.controlSnap = null;
+    if (!isCancelledErr(e)) cwSetStatus(t('cw.find.aborted', { k: 0, n: 0, why: e.message }), 'warn');
+    return;
+  }
   CWZ.board ||= cwBoard();
   CWZ.running = true; CWZ.stopReq = false; CWZ.status = '';
   const se = CWZ.search = { running: true, k: 0, n: 0, phase: 'scan', found: null };
@@ -6739,7 +7157,9 @@ async function cwSearch() {
   const min = CW.GATES.minMarkers, { lo, hi } = modelLimits6();
   try {
     const X = (CWZ.est && CWZ.est.X) || (CWZ.saved[0] && CWZ.saved[0].est.X) || (await cwNominalMount()).X;
+    if (!isControlSnapValid(snap)) throw cancelledError();
     const K = (CWZ.est && CWZ.est.K) || CW.NOMINAL, z = await cwTableZ();
+    if (!isControlSnapValid(snap)) throw cancelledError();
     const plane = { p: [0, 0, z], n: [0, 0, 1] };
     const q0 = cwModelQ(S.obs.positions), Tc0 = CW.mul(calGripper(S.obs.positions), X);
     const seed = cwGroundPoint(Tc0, K, K.cx, K.cy, z);
@@ -6747,9 +7167,6 @@ async function cwSearch() {
     const plan = cwSearchGrid(seed, A).map(([x, y]) => ({ c: [x, y], T: cwSearchPose(x, y, z, X, q0), state: 'pending' })).filter((p) => p.T);
     se.n = plan.length;
     if (!plan.length) throw CW.runAbort('nopose', 'IK');
-    await ensureLease();
-    CWZ.lease = S.leaseGeneration;
-    CWZ.epoch = S.obs && typeof S.obs.epoch_id === 'number' ? S.obs.epoch_id : S.epoch;
     CWZ.ownAction = null;
     const st = { plan, idx: 0 };
     let found = null;
@@ -6766,7 +7183,7 @@ async function cwSearch() {
         se.last = m;
       },
       after: () => { if (found && se.phase === 'scan') st.idx = st.plan.length; cwRender(); },
-      stop: () => api('/api/v1/motion/stop', {}, { quiet: true }),
+      stop: cwScopedStop(snap),
       skipWhy: (kind, d) => (kind === 'move' ? t('cw.skip.move', { code: d }) : t('cw.skip.transition', { r: d })),
     };
     try { await CW.runPoses(st, io, { runAll: true }); }
@@ -6779,6 +7196,7 @@ async function cwSearch() {
     const g = cwGroundPoint(CW.mul(calGripper(found.v.joints), X), K, u, v, z);
     const T2 = g && cwSearchPose(g[0], g[1], z, X, cwModelQ(S.obs.positions));
     if (T2 && io.check(T2).ok) {
+      if (!isControlSnapValid(snap)) throw cancelledError();
       se.phase = 'aim'; cwRender();
       const st2 = { plan: [{ c: g, T: T2, state: 'pending' }], idx: 0 };
       await CW.runPoses(st2, io, { runAll: false });
@@ -6786,9 +7204,10 @@ async function cwSearch() {
     }
     cwSetStatus(t('cw.find.found', { k: se.found.k, n: plan.length, m: se.found.m }), 'ok');
   } catch (e) {
+    if (isCancelledErr(e)) return;
     const why = e.code === 'ABORTED' ? t('cw.abort.' + e.why) + (e.detail ? ' (' + e.detail + ')' : '') : e.message;
     cwSetStatus(t('cw.find.aborted', { k: se.k, n: se.n, why }), 'warn');
-  } finally { se.running = false; CWZ.running = false; CWZ.stopReq = false; cwRender(); }
+  } finally { se.running = false; CWZ.running = false; CWZ.stopReq = false; CWZ.controlSnap = null; cwRender(); }
 }
 // solve: worker, else sliced on this thread
 async function cwFineSolveRun(data, onProgress) {
@@ -6942,7 +7361,7 @@ async function cwFinePark() {
       return !o.is_torqued;
     }, 60000);
     cwSetStatus(S.obs && S.obs.is_torqued ? t('cw.f.torque') : t('cw.f.parked'), S.obs && S.obs.is_torqued ? 'warn' : 'ok');
-  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  } catch (e) { if (isCancelledErr(e)) { cwSetStatus(''); return; } cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
   finally { CWZ.busy = false; cwRender(); }
 }
 // wait without the run-abort rules (parking is outside a run)
@@ -6956,7 +7375,10 @@ async function cwReview() {
   try {
     CWZ.dry = await commandRPC('/api/v1/calibration/apply', { ...cwApplyBody(), dry_run: true }, true, 15000);
     cwSetStatus('');
-  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  } catch (e) {
+    if (isCancelledErr(e)) { if (CWZ.dry == null) CWZ.step = 'solve'; cwSetStatus(''); return; }
+    cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn');
+  }
   finally { CWZ.busy = false; cwRender(); }
 }
 async function cwApply() {
@@ -6980,6 +7402,7 @@ async function cwApply() {
     if (cwFine()) loadSchema(); // the corrected model (kinematics_correction) for CALM / VIK
     toolsLoadStatus(); // a new calibration clears `stale`
   } catch (e) {
+    if (isCancelledErr(e)) { cwSetStatus(''); return; }
     if (e.code === 'KINEMATICS_ARMED') cwSetStatus(t('cw.f.armed'), 'warn');
     else cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message + (e.step ? ' (' + e.step + ')' : '') }), 'warn');
   }
@@ -6999,7 +7422,7 @@ async function cwRestore() {
     toolsLoadStatus();
     cwSetStatus(t('cw.app.restored', { b: name }), 'ok');
     if (cwFine()) loadSchema();
-  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  } catch (e) { if (isCancelledErr(e)) { cwSetStatus(''); return; } cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
   finally { CWZ.busy = false; cwRender(); }
 }
 // ---- self-service verification (T20): fingertip sticker and hover acceptance (fine mode, armd calibration_verify)
@@ -7034,7 +7457,7 @@ async function cwvCloseGripper() {
     const g = cwvGrip();
     CWZ.status = '';
     if (g != null && g > CWV_GRIP_CLOSED) cwSetStatus(t('cw.tip.open', { f: g.toFixed(2) }), 'warn');
-  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  } catch (e) { if (isCancelledErr(e)) { cwSetStatus(''); return; } cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
   finally { CWZ.busy = false; cwRender(); }
 }
 function cwvReset() { Object.assign(CWV, { tip: null, tipBusy: false, roi: null, frames: 0, plan: null, job: null, eval: null, confirm: null, confirmJob: null, phase: '', fp: null, xfp: null, edge: null, toolId: null, base: null }); clearInterval(CWV.poll); CWV.poll = null; }
@@ -7144,7 +7567,7 @@ async function cwvTipMeasure() {
     CWV.edge = d2.after && d2.after.tool ? d2.after.tool.edge_to_low_m : null;
     CWV.tool = tool; CWV.toolId = toolId;
     cwSetStatus(t('cw.tip.ok', { mm: (res.tip_cam_m.map((v) => (v * 1000).toFixed(1))).join(', ') }), 'ok');
-  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  } catch (e) { if (isCancelledErr(e)) { cwSetStatus(''); return; } cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
   finally { CWV.tipBusy = false; cwRender(); }
 }
 // re-observe the stationary board at the current pose with the candidate camera -> T_base_board
@@ -7178,6 +7601,9 @@ function cwvBody(points) {
 }
 async function cwvStart(confirm = false, resume = null) {
   if (CWZ.busy) return;
+  const snap = requireLeaseSyncOrPrompt((e) => cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'));
+  if (!snap) return;
+  CWZ.controlSnap = snap; CWZ.lease = snap.leaseGen; CWZ.epoch = snap.epoch;
   CWZ.busy = true; CWV.phase = confirm ? 'confirm' : 'hover';
   try {
     cwvGripCheck();
@@ -7187,15 +7613,24 @@ async function cwvStart(confirm = false, resume = null) {
       if (CWV.job && CWV.job.candidate_fingerprint && CWV.job.candidate_fingerprint !== CWV.fp) {
         throw Object.assign(new Error(t('cw.hov.fpchanged')), { code: 'FINGERPRINT' });
       }
-      const dr = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, tool: CWV.tool, dry_run: true }, true, 15000);
+      const dr = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, tool: CWV.tool, dry_run: true }, true, 15000, { controlSnap: snap });
+      if (!isControlSnapValid(snap)) throw cancelledError();
       if (!dr.after || dr.after.fingerprint !== CWV.fp) throw Object.assign(new Error(t('cw.hov.fpchanged')), { code: 'FINGERPRINT' });
-      if (!(S.obs && S.obs.is_torqued)) { await commandRPC('/api/v1/torque', { enable: true }, true, 5000); await cwSleep(800); }
+      if (!(S.obs && S.obs.is_torqued)) {
+        await commandRPC('/api/v1/torque', { enable: true }, true, 5000, { controlSnap: snap });
+        if (!isControlSnapValid(snap)) throw cancelledError();
+        await cwSleep(800);
+        if (!isControlSnapValid(snap)) throw cancelledError();
+      }
       const { kLive, ch } = cwvCand();
       CWV.phase = 'view';
       await cwMove(CWZ.CW.kinPose(ch, CWV.base.q, kLive));
+      if (!isControlSnapValid(snap)) throw cancelledError();
       await cwSettle();
+      if (!isControlSnapValid(snap)) throw cancelledError();
       CWV.phase = 'hover';
       const b = await cwvBoardNow();
+      if (!isControlSnapValid(snap)) throw cancelledError();
       const d = Math.hypot(...[0, 1, 2].map((k) => b.Tbb[k][3] - CWV.plan.Tbb[k][3]));
       if (d > 0.003) throw Object.assign(new Error(t('cw.hov.moved', { mm: (d * 1000).toFixed(1) })), { code: 'BOARD_MOVED' });
       body = { resume, candidate_fingerprint: CWV.fp };
@@ -7209,13 +7644,15 @@ async function cwvStart(confirm = false, resume = null) {
       CWV.confirmPlan = cp;
       body = cwvBody(cp.points);
     } else body = cwvBody(CWV.plan.points);
+    if (!isControlSnapValid(snap)) throw cancelledError();
     cwvGripCheck();
-    const ack = await commandRPC(CALIB_HOVER_PATH, body, true, 8000);
+    const ack = await commandRPC(CALIB_HOVER_PATH, body, true, 8000, { controlSnap: snap });
+    if (!isControlSnapValid(snap)) throw cancelledError();
     const id = ack.job_id;
     if (confirm) { CWV.confirmJob = { id, state: 'running' }; CWV.confirm = null; } else { CWV.job = { id, state: 'running' }; CWV.eval = null; CWV.confirm = null; }
     cwvPoll();
-  } catch (e) { CWV.phase = ''; cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
-  finally { CWZ.busy = false; cwRender(); }
+  } catch (e) { CWV.phase = ''; if (isCancelledErr(e)) { cwSetStatus(''); return; } cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  finally { CWZ.busy = false; CWZ.controlSnap = null; cwRender(); }
 }
 const CALIB_HOVER_PATH = '/api/v1/action/calib_hover';
 // the job lives on the device: poll it (a lost WebSocket only pauses the page; armd ends or parks on its own)
@@ -7398,7 +7835,7 @@ function cwV3Sync() {
 }
 // rendering
 function cwEl(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-function cwBtn(label, fn, { cls = '', disabled = false, id = '', op = '', opMode = '' } = {}) { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.disabled = disabled; if (op) { b.dataset.op = op; if (opMode) b.dataset.opMode = opMode; } b.addEventListener('click', fn); return b; }
+function cwBtn(label, fn, { cls = '', disabled = false, id = '', op = '', opMode = '' } = {}) { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.disabled = disabled; if (op) { b.dataset.op = op; if (opMode) b.dataset.opMode = opMode; } if (fn) b.addEventListener('click', fn); return b; }
 const cwFmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '--');
 /* Failed checks of a solve: what stays as it was, then one line per cause with the failed checks and what to change. */
 const CW_GATE_HINT = { rms: 'img', view_rms: 'img', sigma: 'img', views: 'views', markers: 'views', coverage: 'views', kin_views: 'views',
@@ -7702,7 +8139,7 @@ function cwRender() {
     fd.append(
       cwBtn(t('cw.find.jog'), () => cwJogMode(true), { id: 'cwiz-find-jog', disabled: searching || gc }),
       cwBtn(gc ? t('gc.exit') : t('cw.find.hand'), cwHandGuide, { id: 'cwiz-find-hand', cls: gc ? 'on' : '', disabled: searching || CWZ.busy || (!gc && !cwGcSupported()) }),
-      searching ? cwBtn(t('cw.cap.stop'), cwStop, { id: 'cwiz-find-stop', cls: 'cwiz-stop' })
+      searching ? (() => { const b = cwBtn(t('cw.cap.stop'), null, { id: 'cwiz-find-stop', cls: 'cwiz-stop' }); bindStopButton(b, undefined, () => { CWZ.stopReq = true; cwRender(); }); return b; })()
         : cwBtn(t('cw.find.search'), cwSearch, { id: 'cwiz-find-search', disabled: CWZ.busy || gc }));
     body.appendChild(fd);
     if (gc) {
@@ -7840,13 +8277,11 @@ function initCwiz() {
   $('cwiz-close').addEventListener('click', () => cwOpen(false));
   $('cwiz-min').addEventListener('click', () => { if (CWZ.jog) { cwJogMode(false); return; } $('cwiz-panel').classList.toggle('min'); cwFitSteps(); });
   $('cwiz-adv').addEventListener('click', () => { if (CWZ.running) { toast(t('cw.busy'), 'warn'); return; } cwOpen(false); calOpen(true); });
-  $('cwiz-stop').addEventListener('click', cwStop);
+  bindStopButton($('cwiz-stop'), undefined, () => { CWZ.stopReq = true; cwRender(); });
   $('cwiz-jog-cap').addEventListener('click', cwJogCapture);
   $('cwiz-jog-back').addEventListener('click', () => cwJogMode(false));
   for (const ev of ['resize', 'scroll']) window.addEventListener(ev, () => { if (CWZ.jog) cwJogPlace(); }, { passive: true });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && CWZ.open && !CWZ.running) cwOpen(false); });
-  // a hidden page aborts a run at once (the run loop also checks it)
-  document.addEventListener('visibilitychange', () => { if (document.hidden && CWZ.running) api('/api/v1/motion/stop', {}, { quiet: true }).catch(() => {}); });
   i18nHooks.push(cwRender);
 }
 
@@ -7939,6 +8374,8 @@ async function loadSchema() {
       const oldDof = S.dof;
       S.limits = sc.limits;
       S.dof = sc.dof || sc.limits.length;
+      S.schemaLoaded = true;
+      if (S.obs && !isCompleteObservation(S.obs)) { S.obs = null; S.wsObsSeen = false; S.obsWs = null; }
       // mirror the server's Cartesian floor so the cockpit stops at the same height
       if (sc.workspace && Number.isFinite(sc.workspace.floor_z_m)) CFG.cart.zMin = sc.workspace.floor_z_m;
       GRIP = Number.isInteger(sc.gripper_joint) ? sc.gripper_joint : S.dof - 1;
@@ -7978,8 +8415,9 @@ function faultText() {
 }
 function lockReason() {
   if (!isLive()) return t('lock.offline');
+  if (!obsFresh()) return t('lease.checking');
   const other = leaseOther();
-  if (other != null) return t('lock.observer_who', { who: leaseHolderText(other) });
+  if (other != null) return t('lock.observer_who', { who: leaseHolderDetail(other) });
   if (S.state === 'EStop') return t('lock.estop');
   if (S.state === 'Fault') { const ft = faultText(); return ft ? t('lock.fault_coded', ft) : t('lock.fault'); }
   if (isOperational() && colHold()) return t('lock.col_hold');
@@ -8040,6 +8478,8 @@ function bindHold(btn, j, s) {
     e.preventDefault();
     if (pid !== null) return;
     if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+    if (leaseModalOrPending()) return;
+    if (S.leaseGeneration == null) { promptTakeControl(); return; }
     pid = e.pointerId;
     try { btn.setPointerCapture(pid); } catch (_) {}
     btn.classList.add('pressed');
@@ -8115,6 +8555,7 @@ function renderJogRows() {
       zero: mid.querySelector('.zero'), mark: mid.querySelector('.mark'),
     };
   });
+  syncControlInputsUi(pageHasControl());
 }
 renderJogRows();
 
@@ -8128,6 +8569,7 @@ function renderGripCol() {
   const val = document.createElement('div');
   val.className = 'gval'; val.id = 'grip-val'; val.textContent = '--%';
   col.append(open, val, close);
+  syncControlInputsUi(pageHasControl());
 }
 renderGripCol();
 
@@ -8156,6 +8598,8 @@ class Pad {
   }
   begin(x, y) {
     if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return false; }
+    if (leaseModalOrPending()) return false;
+    if (S.leaseGeneration == null) { promptTakeControl(); return false; }
     this.el.classList.add('dragging'); this.move(x, y);
     return true;
   }
@@ -8234,9 +8678,9 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.preventDefault(); stopMotion(); }
     return;
   }
-  // Space triggers E-Stop; Escape triggers Stop regardless of slider focus
-  if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); eStop(); return; }
+  // Escape triggers Stop regardless of slider focus (Space E-Stop is handled in the top-most capture listener)
   if (e.key === 'Escape') { e.preventDefault(); stopMotion(); return; }
+  if (takeModalOpen() || preemptModalOpen()) return;
   // Ignore any hotkey pressed with modifier keys (Ctrl, Meta/Cmd, Alt)
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
@@ -8245,10 +8689,14 @@ window.addEventListener('keydown', (e) => {
   if (cm[e.code] || CART_CODES[e.code]) {
     e.preventDefault();
     if (isLocked()) { flashLock(); return; }
+    if (leaseModalOrPending()) return;
+    if (S.leaseGeneration == null) { promptTakeControl(); return; }
     S.keys.add(e.code); return;
   }
   if (e.code === 'KeyG') {
     if (!S.obs || !canMove()) { flashLock(); return; }
+    if (leaseModalOrPending()) return;
+    if (S.leaseGeneration == null) { promptTakeControl(); return; }
     S.grip = (S.grip ?? 0) > 0.5 ? 0 : 1;
     S.gripCmdAt = Date.now();
     commandGrip();
@@ -8260,7 +8708,19 @@ window.addEventListener('keyup', (e) => {
   S.keys.delete(e.code);
   if (e.key === 'Control' || e.key === 'Meta' || e.key === 'Alt') releaseAll();
 });
-function releaseAll() {
+const isSameLease = (snap) => !!(snap && snap.leaseGen != null && S.ws === snap.ws && S.leaseGeneration === snap.leaseGen);
+const hasActiveCartReq = () => !!(C.cartReq && isSameLease(C.cartReq.snap));
+const hasRunningStep = () => !!(C.stepActionId != null && S.obs?.action?.id === C.stepActionId && S.obs?.action?.state === 'running');
+function clearLocalMotionTargets() {
+  S.streamActive = false; S.servoTarget = null; C.tailUntil = 0; C.lastInput = -Infinity;
+  C.cartHoldActive = false; C.cartActionId = null; C.cartActionUntil = 0; C.stepActionId = null;
+  C.gripJog = 0; C.gripDrag = false; C.gripGestureBlocked = true; S.gripCmdAt = 0;
+  const gr = $('grip-range');
+  if (S.obs && Array.isArray(S.obs.positions) && S.obs.positions.length > GRIP) { S.grip = gripFrac(S.obs.positions[GRIP]); if (gr) { const g = Math.round(S.grip * 100); gr.value = String(g); gr.style.setProperty('--v', g + '%'); } } else S.grip = null;
+  if (gr && document.activeElement === gr) gr.blur();
+  if (S.obs && Array.isArray(S.obs.positions) && S.obs.positions.length >= 5) cartSync(S.obs.positions);
+}
+function releaseAll({ sendStop = true } = {}) {
   S.keys.clear();
   C.gripJog = 0;
   for (const p of pads) if (p.active()) p.end();
@@ -8270,48 +8730,46 @@ function releaseAll() {
   for (const k in C.hold) { C.hold[k][0] = 0; C.hold[k][1] = 0; }
   if (C.cmd) C.goal = { ...C.cmd }; // drop any queued step that has not been executed yet
   if (C.T) C.Tg = C.T;
-  if (C.stepInflight || (C.stepActionId != null && S.obs?.action?.id === C.stepActionId && S.obs?.action?.state === 'running')) {
-    C.cartHoldActive = true;
-  }
-  requestMotionStop();
+  if (hasRunningStep()) C.cartHoldActive = true;
+  if (sendStop) requestMotionStop();
+  else clearLocalMotionTargets();
 }
 function requestMotionStop() {
-  if ((!S.streamActive && !C.cartHoldActive && !C.inflight) || S.presetRunning) return;
-  S.streamActive = false;
-  S.servoTarget = null;
-  C.tailUntil = 0; C.lastInput = -Infinity;
-  S.gripCmdAt = 0;
-  if (C.inflight || C.stepInflight) C.stopPending = true;
-  C.cartHoldActive = false;
-  C.cartActionId = null;
-  C.cartActionUntil = 0;
-  C.stepActionId = null;
-  if (S.obs && S.obs.positions.length >= 5) cartSync(S.obs.positions);
-  api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+  const activeReq = hasActiveCartReq() ? C.cartReq : null, unstoppedReq = !!(activeReq && !activeReq.stopPending);
+  const shouldStop = (S.streamActive || C.cartHoldActive || unstoppedReq || hasRunningStep()) && !S.presetRunning && S.leaseGeneration != null;
+  if (activeReq) { activeReq.stopPending = true; activeReq.stopIntent = motionIntentSeq; }
+  clearLocalMotionTargets();
+  if (shouldStop) {
+    api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => {
+      if (!isCancelledErr(e) && e?.code !== 'LEASE_REQUIRED' && e?.code !== 'LEASE_LOST') toastOnce(e);
+    });
+  }
 }
 function stopWhenInputsReleased() {
   queueMicrotask(() => {
     if (commandVector().some((v) => v !== 0) || Object.values(cartVelocity()).some((v) => v !== 0) || cartGripVel() !== 0) return;
+    const activeReq = hasActiveCartReq() ? C.cartReq : null;
+    if ((!S.streamActive && !C.cartHoldActive && !(activeReq && !activeReq.stopPending) && !hasRunningStep()) || S.presetRunning) return;
     requestMotionStop();
   });
 }
+function handleBackgroundHide() {
+  const wizNeedStop = CWZ.controlSnap ? !CWZ.controlSnap.stopped : !!CWZ.running, activeReq = hasActiveCartReq() ? C.cartReq : null;
+  const needStop = !!(wizNeedStop || S.streamActive || C.cartHoldActive || hasRunningStep() || (activeReq && !activeReq.stopPending));
+  if (activeReq) { activeReq.stopPending = true; activeReq.stopIntent = motionIntentSeq; } if (CWZ.controlSnap) CWZ.controlSnap.stopped = true;
+  releaseAll({ sendStop: false }); invalidateControlIntents(); resetPoseMode();
+  if (needStop && canSendStop()) api('/api/v1/motion/stop', {}, { quiet: true }).catch(() => {});
+}
 for (const event of ['pointerup', 'pointercancel', 'mouseup', 'touchend', 'touchcancel', 'keyup']) window.addEventListener(event, stopWhenInputsReleased);
-window.addEventListener('blur', () => { releaseAll(); resetPoseMode(); });
+window.addEventListener('blur', () => { if (document.hidden) handleBackgroundHide(); else { releaseAll(); resetPoseMode(); } });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    releaseAll();
-    resetPoseMode();
+    handleBackgroundHide();
   } else {
     loadAuthStatus();
     // Returning from background/sleep: refresh telemetry & reconnect if half-open
     if (!S.ws || S.ws.readyState !== WebSocket.OPEN || Date.now() - S.obsAt > 1500) {
-      if (S.ws) {
-        const old = S.ws;
-        S.ws = null;
-        old.onclose = null;
-        old.onerror = null;
-        try { old.close(); } catch (_) {}
-      }
+      if (S.ws) retireSocket(S.ws, { reconnect: false, markReleased: true });
       connectWS();
       loadSchema();
     }
@@ -8362,9 +8820,11 @@ setInterval(() => {
   const v = commandVector();
   const moving = v.some((x) => x !== 0);
   const now = performance.now();
+  if (leaseModalOrPending()) { S.servoTarget = null; return; }
   if (S.presetRunning) return;
   if (gcOn()) { S.servoTarget = null; gcInput(v); return; } // hand-guiding: no servo frames
   if (!moving || !isLive() || !canMove() || S.epoch == null) { S.servoTarget = null; return; }
+  if (S.leaseGeneration == null) { S.servoTarget = null; promptTakeControl(); return; }
   const pos = S.obs.positions;
   if (!S.servoTarget || now - S.servoLastAt > 300) {
     S.servoTarget = pos.slice(0, S.dof);
@@ -8394,7 +8854,7 @@ setInterval(() => {
 
 }, CFG.servoPeriodMs);
 let lastErrAt = 0;
-function toastOnce(e) { if (Date.now() - lastErrAt > 2000) { lastErrAt = Date.now(); toast(e.message, 'err', e.code); } }
+function toastOnce(e) { if (isCancelledErr(e)) return; if (Date.now() - lastErrAt > 2000) { lastErrAt = Date.now(); toast(e.message, 'err', e.code); } }
 
 /* =================================================================
    5-DOF cartesian teleop: XYZ + wrist pitch -> client IK -> joint stream
@@ -8570,10 +9030,14 @@ function clampJ5(x) {
 }
 function cartKick() { C.lastInput = performance.now(); C.tailUntil = C.lastInput + CFG.cart.tailMs; }
 function cartStep(ax, s) {
+  if (leaseModalOrPending()) return;
+  if (S.leaseGeneration == null) { promptTakeControl(); return; }
   if (isSoArmProfile()) {
     const n = CFG.cart.steps[C.stepIdx];
     if (ax === 'x' || ax === 'y' || ax === 'z') {
-      C.stepInflight = true;
+      if (C.cartReq) return;
+      const req = { snap: captureControlSnap(), stopPending: false, stopIntent: null };
+      C.cartReq = req;
       commandRPC('/api/v1/action/move_relative', {
         frame: 'base',
         d: [
@@ -8583,15 +9047,13 @@ function cartStep(ax, s) {
         ],
       }).then((ack) => {
         syncEpoch(ack?.epoch_id);
-        C.stepActionId = ack?.action_id ?? null;
-        if (C.stopPending) {
-          C.stopPending = false;
-          C.stepActionId = null;
-          api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+        if (req.stopPending) {
+          req.stopPending = false; C.stepActionId = null; C.cartHoldActive = false; C.cartActionId = null; C.cartActionUntil = 0;
+          if (isSameLease(req.snap) && S.epoch === req.snap.epoch && motionIntentSeq === req.stopIntent) api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+        } else if (isControlSnapValid(req.snap)) {
+          C.stepActionId = ack?.action_id ?? null;
         }
-      }).catch(toastOnce).finally(() => {
-        C.stepInflight = false;
-      });
+      }).catch(toastOnce).finally(() => { if (C.cartReq === req) C.cartReq = null; });
     } else if (ax === 'p' || ax === 'r') {
       const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : (S.home || []);
       const jIdx = ax === 'p' ? 3 : 4;
@@ -8622,12 +9084,13 @@ function cartStep(ax, s) {
 }
 
 function cartSend(t) {
+  if (leaseModalOrPending() || S.leaseGeneration == null) return;
   if (CFG.cart.tx === 'rest') {
-    if (C.inflight) return;
-    C.inflight = true;
+    if (C.restInflight) return;
+    C.restInflight = true; S.streamActive = true;
     api('/api/v1/motion/servo', { targets: t, epoch_id: S.epoch }, { quiet: true })
       .catch((e) => { if (e.code && e.code !== 'EPOCH_MISMATCH') toastOnce(e); })
-      .finally(() => { C.inflight = false; });
+      .finally(() => { C.restInflight = false; });
     return;
   }
   sendServoFrame(t);
@@ -8635,9 +9098,9 @@ function cartSend(t) {
 
 // The only WS servo sender. Never sends without a granted lease generation.
 function sendServoFrame(positions) {
-  if (gcOn()) return false; // the server would answer MOTION_BUSY
+  if (gcOn() || leaseModalOrPending()) return false; // the server would answer MOTION_BUSY
   if (!S.ws || S.ws.readyState !== 1) return false;
-  if (S.leaseGeneration == null) { ensureLease().catch(toastOnce); return false; } // first frame of an input: acquire
+  if (S.leaseGeneration == null) { promptTakeControl(); return false; }
   S.streamActive = true;
   S.lastIntentAt = Date.now();
   S.ws.send(JSON.stringify({
@@ -8648,6 +9111,7 @@ function sendServoFrame(positions) {
     epoch_id: S.epoch,
     positions,
   }));
+  motionIntentSeq++;
   return true;
 }
 
@@ -8668,6 +9132,13 @@ function cartTick() {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
     return;
   }
+  if (leaseModalOrPending() || S.leaseGeneration == null) {
+    const v = cartVelocity();
+    const gv = cartGripVel();
+    if ((v.x || v.y || v.z || v.p || v.r || gv !== 0) && !leaseModalOrPending()) promptTakeControl();
+    cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
+    return;
+  }
   if (isSoArmProfile()) {
     const tcp = S.obs.tcp;
     if (tcp && Array.isArray(tcp.xyz_m)) {
@@ -8678,10 +9149,12 @@ function cartTick() {
     const gv = cartGripVel();
     const scale = speedScale();
     const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
-    const gripStalled = Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
-    const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
+    const gripStalled = S.gripCmdAt > 0 && Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
+    if (gripStalled) S.gripCmdAt = 0;
+    const gripMoving = (S.gripCmdAt > 0 && gripErr > 0.015 && !gripStalled) || gv !== 0;
     const hasInput = v.x || v.y || v.z || v.p || v.r || gripMoving;
     if (hasInput) cartKick();
+    else if (now > C.tailUntil) { S.streamActive = false; S.gripCmdAt = 0; }
 
     if (pos.length > GRIP && gv) {
       const cur = S.grip ?? gripFrac(pos[GRIP]);
@@ -8699,10 +9172,10 @@ function cartTick() {
     if (v.x || v.y || v.z) {
       C.status = 'ok';
       C.msg = '';
-      if (!C.inflight && !actionBusy && !S.presetRunning) {
-        C.inflight = true;
+      if (!C.cartReq && !actionBusy && !S.presetRunning) {
+        const req = { snap: captureControlSnap(), stopPending: false, stopIntent: null };
+        C.cartReq = req;
         C.cartHoldActive = true;
-        C.stopPending = false;
         const stepM = scale * 0.015;
         const speed = {
           linear: clamp(0.05 * scale, 0.01, 0.15),
@@ -8714,22 +9187,18 @@ function cartTick() {
           speed,
         }).then((ack) => {
           syncEpoch(ack?.epoch_id);
-          C.cartActionId = ack?.action_id ?? null;
-          C.cartActionUntil = performance.now() + Math.min(400, (ack?.expected_duration_s || 0.2) * 1000);
-          if (C.stopPending) {
-            C.stopPending = false;
-            C.cartHoldActive = false;
-            C.cartActionId = null;
-            C.cartActionUntil = 0;
-            api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+          if (req.stopPending) {
+            req.stopPending = false; C.stepActionId = null; C.cartHoldActive = false; C.cartActionId = null; C.cartActionUntil = 0;
+            if (isSameLease(req.snap) && S.epoch === req.snap.epoch && motionIntentSeq === req.stopIntent) api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+          } else if (isControlSnapValid(req.snap)) {
+            C.cartActionId = ack?.action_id ?? null;
+            C.cartActionUntil = performance.now() + Math.min(400, (ack?.expected_duration_s || 0.2) * 1000);
           }
         }).catch((e) => {
           if (e && e.code === 'MOTION_BUSY') return;
           C.cartHoldActive = false;
           toastOnce(e);
-        }).finally(() => {
-          C.inflight = false;
-        });
+        }).finally(() => { if (C.cartReq === req) C.cartReq = null; });
       }
     }
 
@@ -8745,7 +9214,7 @@ function cartTick() {
       if (t.length > GRIP) t[GRIP] = gripRad();
       t = clampTarget(t);
       C.sending = true;
-      if (!S.presetRunning && !(v.x || v.y || v.z) && !C.inflight && !actionBusy) cartSend(t);
+      if (!S.presetRunning && !(v.x || v.y || v.z) && !C.cartReq && !actionBusy) cartSend(t);
     }
     return;
   }
@@ -8753,13 +9222,15 @@ function cartTick() {
   const gv = cartGripVel();
   const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
   // stopped = no new command for 1.2 s AND the jaw is no longer moving (a full stroke takes ~4 s)
-  const gripStalled = Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
-  const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
+  const gripStalled = S.gripCmdAt > 0 && Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
+  if (gripStalled) S.gripCmdAt = 0;
+  const gripMoving = (S.gripCmdAt > 0 && gripErr > 0.015 && !gripStalled) || gv !== 0;
   const input = v.x || v.y || v.z || v.p || v.r || gripMoving;
   if (input) cartKick();
   const settling = now - C.lastInput < CFG.cart.settleMs;
   const pending = !C.goal || C.goal.x !== C.cmd.x || C.goal.y !== C.cmd.y || C.goal.z !== C.cmd.z || C.goal.pitch !== C.cmd.pitch;
   if (!C.goal || (!input && !pending && !settling && now > C.tailUntil)) {
+    S.streamActive = false; S.gripCmdAt = 0;
     cartSync(pos); // idle: track the real arm so the next command starts from where it is
     if (C.status !== 'ok' && C.status !== 'idle' && now - C.lastInput > 1500) { C.status = 'idle'; C.msg = ''; }
     return;
@@ -8896,17 +9367,26 @@ function cartTickView() {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
     return;
   }
+  if (leaseModalOrPending() || S.leaseGeneration == null) {
+    const v = cartVelocity();
+    const gv = cartGripVel();
+    if ((v.x || v.y || v.z || v.p || v.r || gv !== 0) && !leaseModalOrPending()) promptTakeControl();
+    cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
+    return;
+  }
   const v = cartVelocity();
   const gv = cartGripVel();
   const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
-  const gripStalled = Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
-  const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
+  const gripStalled = S.gripCmdAt > 0 && Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
+  if (gripStalled) S.gripCmdAt = 0;
+  const gripMoving = (S.gripCmdAt > 0 && gripErr > 0.015 && !gripStalled) || gv !== 0;
   const motion = v.x || v.y || v.z || v.p || v.r;
   const input = motion || gripMoving;
   if (input) cartKick();
   const settling = now - C.lastInput < CFG.cart.settleMs;
   const pending = C.Tg !== C.T || C.wq[0] !== 0 || C.wq[1] !== 0;
   if (!C.Tg || (!input && !pending && !settling && now > C.tailUntil)) {
+    S.streamActive = false; S.gripCmdAt = 0;
     cartSync(pos); // idle: track the real arm so the next command starts from where it is
     if (C.status !== 'ok' && C.status !== 'idle' && now - C.lastInput > 1500) { C.status = 'idle'; C.msg = ''; }
     return;
@@ -9026,6 +9506,8 @@ function cartButton(parent, ax, s, label, sub, arrow) {
     e.preventDefault();
     if (pid !== null) return;
     if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+    if (leaseModalOrPending()) return;
+    if (S.leaseGeneration == null) { promptTakeControl(); return; }
     pid = e.pointerId;
     try { b.setPointerCapture(pid); } catch (_) {}
     b.classList.add('pressed'); buzz(8);
@@ -9064,13 +9546,39 @@ function cartButton(parent, ax, s, label, sub, arrow) {
   seg.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setStep(Number(b.dataset.i)); });
 
   const gr = $('grip-range');
+  const snapGripRange = () => {
+    const g = S.obs && Array.isArray(S.obs.positions) && S.obs.positions.length > GRIP
+      ? Math.round(gripFrac(S.obs.positions[GRIP]) * 100) : 0;
+    gr.value = String(g);
+    gr.style.setProperty('--v', g + '%');
+  };
   gr.addEventListener('pointerdown', (e) => {
     if (isLocked()) { e.preventDefault(); toast(lockReason(), 'err'); flashLock(); return; }
+    if (leaseModalOrPending()) { e.preventDefault(); return; }
+    if (S.leaseGeneration == null) { e.preventDefault(); promptTakeControl(); return; }
+    C.gripGestureBlocked = false;
     C.gripDrag = true;
+  });
+  gr.addEventListener('keydown', (e) => {
+    const isSliderKey = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(e.key);
+    if (!isSliderKey) return;
+    if (isLocked()) { e.preventDefault(); toast(lockReason(), 'err'); flashLock(); return; }
+    if (leaseModalOrPending()) { e.preventDefault(); return; }
+    if (S.leaseGeneration == null) {
+      e.preventDefault();
+      if (!e.repeat) promptTakeControl();
+      return;
+    }
+    if (e.repeat && C.gripGestureBlocked) { e.preventDefault(); return; }
+    if (!e.repeat) C.gripGestureBlocked = false;
   });
   for (const ev of ['pointerup', 'pointercancel', 'blur']) gr.addEventListener(ev, () => { C.gripDrag = false; });
   gr.addEventListener('input', () => {
-    if (isLocked()) return;
+    if (isLocked() || leaseModalOrPending() || S.leaseGeneration == null || C.gripGestureBlocked) {
+      snapGripRange();
+      if (!isLocked() && !leaseModalOrPending() && S.leaseGeneration == null && !C.gripGestureBlocked) promptTakeControl();
+      return;
+    }
     S.grip = Number(gr.value) / 100;
     S.gripCmdAt = Date.now();
     cartKick();
@@ -9108,6 +9616,10 @@ new Pad($('pad-sz'), { axes: 'y', onChange: (v) => { C.axes.sz = v[1]; } });
 new Pad($('pad-sgrip'), {
   axes: 'y',
   onChange: (v) => {
+    if (v[1] !== 0 && (leaseModalOrPending() || S.leaseGeneration == null)) {
+      C.gripJog = 0;
+      return;
+    }
     C.gripJog = v[1]; // +1 is open, -1 is close
     if (v[1] !== 0) {
       S.gripCmdAt = Date.now();
@@ -9169,6 +9681,8 @@ function jogTo(target) {
   return api('/api/v1/motion/jog', { target_positions: clampTarget(target), epoch_id: S.epoch }).catch(() => {});
 }
 function commandGrip() {
+  if (leaseModalOrPending()) return;
+  if (S.leaseGeneration == null) { promptTakeControl(); return; }
   if (gcOn()) { gcGrip(S.grip > 0.5 ? -1 : 1); return; }
   if (!S.obs || !canMove()) { flashLock(); return; }
   if (S.mode === 'cart') { S.gripCmdAt = Date.now(); cartKick(); return; } // the cartesian stream carries J6
@@ -9179,26 +9693,27 @@ function commandGrip() {
   jogTo(t);
 }
 function home() {
+  if (leaseModalOrPending()) return;
   if (gcOn()) { gcSticksOff(); return; }
   if (!canMove()) { toast(lockReason(), 'err'); flashLock(); return; }
   api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast(t('toast.homing'), 'ok')).catch(() => {});
 }
-function stopMotion() {
-  buzz([20]);
-  releaseAll();
-  resetPoseMode();
-  if (S.leaseGeneration == null) {
-    toast(t('toast.stopped'), 'ok');
-    return;
-  }
+function stopMotion({ okKey = 'toast.stopped', okLevel = 'ok' } = {}) {
+  const snap = { ws: S.ws, gen: S.leaseGeneration, epoch: S.epoch }, activeReq = hasActiveCartReq() ? C.cartReq : null;
+  if (CWZ.controlSnap) CWZ.controlSnap.stopped = true;
+  buzz([20]); invalidateControlIntents(); resetPoseMode();
+  const stopIntent = ++motionIntentSeq;
+  if (activeReq) { activeReq.stopPending = true; activeReq.stopIntent = stopIntent; }
+  if (!snap.ws || snap.ws.readyState !== 1 || snap.gen == null || snap.epoch == null) { toast(t('toast.stop_no_control'), 'warn'); return; }
   const sendStop = (retries = 2) => {
+    if (motionIntentSeq !== stopIntent) return;
+    if (S.ws !== snap.ws || S.leaseGeneration !== snap.gen || S.epoch !== snap.epoch) { toast(t('toast.stop_no_control'), 'warn'); return; }
     api('/api/v1/motion/stop', {}, { quiet: true })
-      .then(() => toast(t('toast.stopped'), 'ok'))
+      .then(() => { if (motionIntentSeq === stopIntent) toast(t(okKey), okLevel); })
       .catch((e) => {
-        if (e && (e.code === 'LEASE_REQUIRED' || e.code === 'LEASE_LOST')) {
-          toast(t('toast.stopped'), 'ok');
-          return;
-        }
+        if (motionIntentSeq !== stopIntent) return;
+        if (S.ws !== snap.ws || S.leaseGeneration !== snap.gen || S.epoch !== snap.epoch
+          || (e && (e.code === 'LEASE_REQUIRED' || e.code === 'LEASE_LOST' || isCancelledErr(e)))) { toast(t('toast.stop_no_control'), 'warn'); return; }
         if (retries > 0) setTimeout(() => sendStop(retries - 1), 100);
         else toast(t('toast.stop_unconfirmed'), 'err');
       });
@@ -9207,7 +9722,7 @@ function stopMotion() {
 }
 function eStop() {
   buzz([30, 40, 30]);
-  releaseAll();
+  invalidateControlIntents();
   resetPoseMode();
   // Fast-path: WebSocket emergency frame
   if (S.ws && S.ws.readyState === WebSocket.OPEN) {
@@ -9232,8 +9747,8 @@ function eStop() {
     }
   }, 50);
 }
-$('btn-stop').addEventListener('pointerdown', (e) => { e.preventDefault(); stopMotion(); });
-$('btn-estop').addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
+bindStopButton($('btn-stop'));
+bindEstopButton($('btn-estop'));
 $('btn-home').addEventListener('click', home);
 /* a compact Stop and E-stop in the head of every drawer / sheet, shown while an open drawer covers the cockpit E-stop or it is off
    screen (phones: the bottom sheet; tablets and desktop: the side drawer over the right column). A touch screen has no
@@ -9256,11 +9771,11 @@ function estopPinSync() {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'btn head-estop'; b.hidden = true;
     b.dataset.i18n = 'estop'; b.dataset.i18nAria = 'estop.aria'; b.textContent = t('estop'); b.setAttribute('aria-label', t('estop.aria'));
-    b.addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
+    bindEstopButton(b);
     const s = document.createElement('button');
     s.type = 'button'; s.className = 'btn head-stop'; s.hidden = true;
     s.dataset.i18n = 'stop'; s.dataset.i18nAria = 'stop.aria'; s.textContent = t('stop'); s.setAttribute('aria-label', t('stop.aria'));
-    s.addEventListener('pointerdown', (e) => { e.preventDefault(); stopMotion(); });
+    bindStopButton(s);
     const acts = h.querySelector('.cwiz-head-acts');
     if (acts) { acts.prepend(b); acts.prepend(s); } else { h.insertBefore(s, h.lastElementChild); h.insertBefore(b, h.lastElementChild); }
   }
@@ -9408,14 +9923,16 @@ function mitRecoveryObserve() {
     mitRecovery = null;
   }
 }
-function clearFault() {
+function clearFault(opts) {
   // the fault this tap is about, read now: a later observation may already show another fault
   const tapKey = mitFaultKey();
   const confirmed = !!tapKey && !!mitRecovery && mitRecovery.el.isConnected && mitRecovery.key === tapKey;
   if (mitRecovery) { mitRecovery.el.remove(); mitRecovery = null; }
-  return api('/api/v1/safety/clear_fault', confirmed ? { mit_recovery: 'torque_off_all' } : undefined, { quiet: true })
+  const apiOpts = opts && opts.directLease ? { quiet: true, directLease: true } : { quiet: true };
+  return api('/api/v1/safety/clear_fault', confirmed ? { mit_recovery: 'torque_off_all' } : undefined, apiOpts)
     .then((d) => toast(t(d && d.is_torqued ? 'toast.reset_holding' : (confirmed ? 'mit.recovery.done' : 'toast.reset_ok')), 'ok'))
     .catch((e) => {
+      if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return;
       if (e && e.code === 'MIT_RECOVERY_CONFIRM_REQUIRED') {
         // arm only if the fault is still the one this tap was sent for (else drop the late reply)
         if (tapKey && mitFaultKey() === tapKey) mitRecovery = { el: toast(t('mit.recovery.confirm'), 'err', e.code), key: tapKey };
@@ -9455,6 +9972,7 @@ async function controlledUnload() {
       toast(t('toast.unload_unconfirmed'), 'err');
     }
   } catch (e) {
+    if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return;
     toast(t('toast.stow_failed') + (e.message || t('toast.stow_unconfirmed')), 'err', e.code);
   } finally { unloading = false; }
 }
@@ -9467,6 +9985,7 @@ async function disableTorque({ fallback = true } = {}) {
     toast(t('toast.parked_off'), 'ok');
     return true;
   } catch (e) {
+    if (e && (e.cancelled || e.code === 'CONTROL_CANCELLED')) return false;
     const notAtRest = e.status === 409 && (e.code === 'ARM_NOT_AT_RESTING_POSE' || e.code === 'ArmNotAtRestingPose' || /ArmNotAtRestingPose/i.test(e.message || ''));
     if (notAtRest && fallback) {
       toast(t('toast.in_air'), 'err');
@@ -9486,33 +10005,40 @@ async function disableTorque({ fallback = true } = {}) {
   let timer = null;
   let inflight = false;
   const cancel = () => { clearTimeout(timer); timer = null; btn.classList.remove('holding'); };
+  holdCancels.push(cancel);
   btn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    if (inflight) return;
+    if (inflight || leaseModalOrPending()) return;
+    if (!obsFresh()) return toast(lockReason(), 'err');
+    if (leaseOther() != null) return toast(lockReason(), 'err');
     if (isStopped()) {
       // Single tap in stopped state: ONLY clears fault / resets to Standby/Idle
       inflight = true;
-      clearFault().finally(() => { setTimeout(() => { inflight = false; }, 300); });
+      clearFault({ directLease: true }).finally(() => { setTimeout(() => { inflight = false; }, 300); });
       return;
     }
-    if (!isLive()) return toast(lockReason(), 'err');
 
     // Both enabling and disabling require holding 600ms to prevent accidental taps dropping the arm
     btn.classList.add('holding');
     timer = setTimeout(() => {
       cancel(); buzz(20);
+      if (leaseModalOrPending() || !obsFresh() || leaseOther() != null) return;
       inflight = true;
       // Re-evaluate current state at timeout to prevent stale transition race
       const targetEnable = !isOperational();
       if (!targetEnable) {
-        releaseAll();
-        toast(t('toast.stowing'), 'info');
-        controlledUnload();
+        if (S.leaseGeneration == null) {
+          requireLeaseOrPrompt().catch((err) => { if (!isCancelledErr(err)) toast(err.message, 'err', err.code); });
+        } else {
+          releaseAll();
+          toast(t('toast.stowing'), 'info');
+          controlledUnload();
+        }
       } else {
         if (S.obs?.positions?.length > GRIP && S.grip == null) S.grip = gripFrac(S.obs.positions[GRIP]);
-        api('/api/v1/torque', { enable: true }, { quiet: true })
+        api('/api/v1/torque', { enable: true }, { quiet: true, directLease: true })
           .then(() => toast(t('toast.enabled'), 'ok'))
-          .catch((e) => toast(t('toast.enable_fail') + (e.message || t('toast.enable_fail_def')), 'err', e.code));
+          .catch((err) => { if (!isCancelledErr(err)) toast(t('toast.enable_fail') + (err.message || t('toast.enable_fail_def')), 'err', err.code); });
       }
       setTimeout(() => { inflight = false; }, 300);
     }, 600);
@@ -9526,12 +10052,24 @@ async function disableTorque({ fallback = true } = {}) {
   const btn = $('btn-park-off');
   let timer = null;
   const cancel = () => { clearTimeout(timer); timer = null; btn.classList.remove('holding'); };
+  holdCancels.push(cancel);
   btn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    if (unloading) return;
-    if (!isLive()) return toast(lockReason(), 'err');
+    if (unloading || leaseModalOrPending()) return;
+    if (!obsFresh()) return toast(lockReason(), 'err');
+    if (leaseOther() != null) return toast(lockReason(), 'err');
     btn.classList.add('holding');
-    timer = setTimeout(() => { cancel(); buzz(20); releaseAll(); toast(t('toast.stowing'), 'info'); controlledUnload(); }, 600);
+    timer = setTimeout(() => {
+      cancel(); buzz(20);
+      if (leaseModalOrPending() || !obsFresh() || leaseOther() != null) return;
+      if (S.leaseGeneration == null) {
+        requireLeaseOrPrompt().catch((err) => { if (!isCancelledErr(err)) toast(err.message, 'err', err.code); });
+        return;
+      }
+      releaseAll();
+      toast(t('toast.stowing'), 'info');
+      controlledUnload();
+    }, 600);
   });
   for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -9545,13 +10083,13 @@ function gcBlockText() {
   if (!isLive()) return t('gc.b.offline');
   if (leaseOther() != null) return t('gc.b.observer');
   const b = S.obs?.gravity_comp?.blocker;
-  // not held but free: the switch acquires the lease first
+  // not held but free: the switch prompts to confirm taking control first
   if (!b || (b.code === 'LEASE_REQUIRED' && S.leaseGeneration == null)) return null;
   const k = 'gc.b.' + b.code;
   return t(k) !== k ? t(k) : (b.message || b.code);
 }
 function gcExit() {
-  api('/api/v1/mode/gravity_comp', { enable: false }, { quiet: true }).catch((e) => toast(e.message, 'err', e.code));
+  api('/api/v1/mode/gravity_comp', { enable: false }, { quiet: true }).catch((e) => { if (!isCancelledErr(e)) toast(e.message, 'err', e.code); });
 }
 let gcHintAt = 0;
 function gcSticksOff() { if (Date.now() - gcHintAt > 2500) { gcHintAt = Date.now(); toast(t('gc.sticks_off'), 'warn'); } }
@@ -9559,11 +10097,13 @@ function gcSticksOff() { if (Date.now() - gcHintAt > 2500) { gcHintAt = Date.now
 let gcGripDir = 0;
 function gcGrip(dir) {
   if (!dir || dir === gcGripDir) return;
+  if (leaseModalOrPending()) return;
+  if (S.leaseGeneration == null) { promptTakeControl(); return; }
   gcGripDir = dir;
   S.grip = dir > 0 ? 0 : 1; S.gripCmdAt = Date.now();
   commandRPC('/api/v1/action/gripper', dir > 0 ? { command: 'close' } : { command: 'open' })
     .then((r) => syncEpoch(r.epoch_id))
-    .catch((e) => { if (e.code !== 'MOTION_BUSY') toast(e.message, 'err', e.code); });
+    .catch((e) => { if (!isCancelledErr(e) && e.code !== 'MOTION_BUSY') toast(e.message, 'err', e.code); });
 }
 function gcInput(v) {
   const g = S.mode === 'cart' ? -cartGripVel() : (v[GRIP] || 0);
@@ -9574,21 +10114,28 @@ function gcInput(v) {
   const btn = $('btn-gc');
   let timer = null, inflight = false;
   const cancel = () => { clearTimeout(timer); timer = null; btn.classList.remove('holding'); };
+  holdCancels.push(cancel);
   btn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    if (inflight) return;
+    if (inflight || leaseModalOrPending()) return;
     if (gcOn()) { gcExit(); return; } // leaving is a single tap
     const why = gcBlockText();
     if (why) { toast(t('gc.enter_fail') + why, 'err', S.obs?.gravity_comp?.blocker?.code || ''); return; }
     btn.classList.add('holding');
     timer = setTimeout(() => {
       cancel(); buzz(20);
+      if (leaseModalOrPending()) return;
+      if (S.leaseGeneration == null) {
+        requireLeaseOrPrompt().catch((err) => { if (!isCancelledErr(err)) toast(err.message, 'err', err.code); });
+        return;
+      }
       inflight = true;
       releaseAll();
       toast(t('gc.entering'), 'info');
       api('/api/v1/mode/gravity_comp', { enable: true }, { quiet: true })
         .then(() => { toast(t('gc.entered'), 'ok'); if (teachOn()) teachStrip(true); })
         .catch((err) => {
+          if (isCancelledErr(err)) return;
           const k = 'gc.b.' + err.code;
           toast(t('gc.enter_fail') + (t(k) !== k ? t(k) : err.message), 'err', err.code);
         })
@@ -9674,6 +10221,8 @@ function syncPoseMode() {
 }
 function togglePoseLock() {
   if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (leaseModalOrPending()) return;
+  if (S.leaseGeneration == null) { promptTakeControl(); return; }
   S.poseLocked = !S.poseLocked;
   buzz(8);
   syncPoseMode();
@@ -9703,6 +10252,8 @@ const gripOpenNow = () => (S.obs && S.obs.positions.length > GRIP ? gripFrac(S.o
 if ($('s-grip')) {
   $('s-grip').addEventListener('click', () => {
     if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+    if (leaseModalOrPending()) return;
+    if (S.leaseGeneration == null) { promptTakeControl(); return; }
     // target follows the last command while it is still travelling, otherwise the measured state
     const ref = S.grip != null ? S.grip : gripOpenNow();
     S.grip = ref > 0.5 ? 0 : 1;
@@ -9733,7 +10284,11 @@ function presetTarget(name) {
 }
 async function runPreset(name) {
   if (!canMove() || !isLive()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (leaseModalOrPending()) return;
+  const snap = requireLeaseSyncOrPrompt((err) => toast(t('toast.preset_fail') + (err.message || err), 'err'));
+  if (!snap) return;
   releaseAll();
+  if (!isControlSnapValid(snap)) return;
   S.presetRunning = true;
   S.preset = { name, until: Date.now() + 15000, startedAt: Date.now() };
   const timer = setTimeout(() => {
@@ -9748,7 +10303,6 @@ async function runPreset(name) {
   };
 
   try {
-    if (S.ws && S.ws.readyState === 1) await ensureLease();
     if (S.ws && S.ws.readyState === 1 && S.leaseGeneration != null) {
       S.lastIntentAt = Date.now();
       S.ws.send(JSON.stringify({
@@ -9759,6 +10313,7 @@ async function runPreset(name) {
         client_id: CLIENT_ID,
         generation: S.leaseGeneration,
       }));
+      motionIntentSeq++;
     } else {
       if (name === 'home') {
         await api('/api/v1/motion/home', { epoch_id: S.epoch });
@@ -9772,7 +10327,7 @@ async function runPreset(name) {
     }
   } catch (err) {
     resetPresetRunning();
-    toast(t('toast.preset_fail') + (err.message || err), 'err');
+    if (!isCancelledErr(err)) toast(t('toast.preset_fail') + (err.message || err), 'err');
   }
 }
 for (const b of document.querySelectorAll('.preset')) b.addEventListener('click', () => runPreset(b.dataset.preset));
@@ -9911,7 +10466,7 @@ async function epPlay(id) {
     EP.actionId = d.action_id; EP.playing = id;
     toast(t('ep.started', { id, x: EP.speed }), 'ok');
     epRender(t('ep.started', { id, x: EP.speed }));
-  } catch (e) { const m = epCodeText(e); toast(m, 'err', e.code || ''); epRender(m, true); }
+  } catch (e) { if (isCancelledErr(e)) return; const m = epCodeText(e); toast(m, 'err', e.code || ''); epRender(m, true); }
 }
 async function epDelete(id) {
   if (EP.delArmed !== id) {
@@ -9956,7 +10511,7 @@ $('ep-speed').addEventListener('click', (e) => {
   for (const x of $('ep-speed').children) { const on = x === b; x.classList.toggle('on', on); x.setAttribute('aria-checked', String(on)); }
 });
 $('ep-refresh').addEventListener('click', () => epLoad(false));
-$('ep-stop').addEventListener('click', () => { api('/api/v1/motion/stop', {}).catch(() => {}); });
+bindStopButton($('ep-stop'));
 $('ep-list').addEventListener('click', (e) => {
   const b = e.target.closest('button'), li = e.target.closest('li');
   if (!b || !li || !li.dataset.id) return;
@@ -10929,7 +11484,7 @@ function graspRunningAction() {
 const graspDetOn = () => (S.dof === 7 || isSoArmProfile()) && DET.avail && DET.enabled;
 function graspRPC(path, body) {
   return commandRPC(path, body).then((d) => { syncEpoch(d.epoch_id); return d; }, (e) => {
-    toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message) : e.message, 'err', e.code || '');
+    if (!isCancelledErr(e)) toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message) : e.message, 'err', e.code || '');
     throw e;
   });
 }
@@ -10978,12 +11533,12 @@ function graspOnObs(o) {
   }
 }
 function graspStop(reason) {
-  if (!graspRunningAction() && !GR.sending) return;
+  if (reason === 'button') { stopMotion({ okKey: 'grasp.stopped', okLevel: 'warn' }); return; }
+  if ((!graspRunningAction() && !GR.sending) || S.leaseGeneration == null) return;
   const now = Date.now();
   if (now - GR.stopAt < 400) return;
   GR.stopAt = now;
   api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
-  if (reason === 'button') toast(t('grasp.stopped'), 'warn');
 }
 // Stick / key / jog input while a grasp runs stops it (checked every frame).
 function graspCheckInput(v) {
@@ -10992,13 +11547,15 @@ function graspCheckInput(v) {
   if (v.some((x) => x !== 0) || cart || C.gripJog) graspStop('input');
 }
 window.addEventListener('keydown', (e) => {
+  if (opIsOpen() || takeModalOpen() || preemptModalOpen() || S.leaseGeneration == null) return;
   if (!graspRunningAction() || e.ctrlKey || e.metaKey || e.altKey) return;
-  if (['Shift', 'Control', 'Meta', 'Alt', 'Tab'].includes(e.key)) return;
-  if (e.target && e.target.closest && e.target.closest('input, textarea, #gset')) return;
+  if (e.key === 'Escape' || e.key === ' ' || e.code === 'Space' || ['Shift', 'Control', 'Meta', 'Alt', 'Tab'].includes(e.key)) return;
+  if (isDeliberateStopTarget(e.target) || (e.target && e.target.closest && e.target.closest('input, textarea, #gset'))) return;
   graspStop('input');
 }, true);
 document.addEventListener('pointerdown', (e) => {
-  if (!graspRunningAction()) return;
+  if (opIsOpen() || takeModalOpen() || preemptModalOpen() || S.leaseGeneration == null) return;
+  if (!graspRunningAction() || isDeliberateStopTarget(e.target)) return;
   const el = e.target && e.target.closest ? e.target : null;
   if (el && el.closest('.cockpit, .ops, .safety') && !el.closest('#grasp-bar')) graspStop('input');
 }, true);
@@ -11079,6 +11636,8 @@ async function graspGo() {
   const s = GR.sel;
   if (!s || GR.sending) return;
   if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (leaseModalOrPending()) return;
+  if (S.leaseGeneration == null) { promptTakeControl(); return; }
   releaseAll();
   GR.sending = true; renderGrasp();
   try {
@@ -11124,7 +11683,7 @@ function renderGrasp() {
 }
 $('grasp-go').addEventListener('click', graspGo);
 $('grasp-cancel').addEventListener('click', () => { GR.sel = null; renderGrasp(); });
-$('grasp-stop').addEventListener('click', () => graspStop('button'));
+bindStopButton($('grasp-stop'), { okKey: 'grasp.stopped', okLevel: 'warn' });
 
 /* ---- size measurement of the selected object (capability measure_multiview, WS /api/v1/action/measure_multiview):
    a confirmation with the range and duration, then the action's progress, then a result card that stays until it is
@@ -11166,7 +11725,7 @@ function msRender() {
   head.appendChild(cwEl('small', '', MS.sel ? MS.sel.label : ''));
   c.appendChild(head);
   const acts = cwEl('div', 'ms-acts');
-  const btn = (label, fn, cls = '', id = '') => { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.addEventListener('click', fn); acts.appendChild(b); return b; };
+  const btn = (label, fn, cls = '', id = '') => { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; if (fn) b.addEventListener('click', fn); acts.appendChild(b); return b; };
   if (MS.state === 'confirm' || MS.state === 'starting') {
     c.appendChild(cwEl('p', '', t('ms.confirm', { cm: (MS_REQ.baseline_m * 50).toFixed(0), n: MS_REQ.views, sp: Math.round(MS_REQ.speed_scale * 100) })));
     c.appendChild(cwEl('p', 'ms-warn', t('ms.stop_note')));
@@ -11179,7 +11738,7 @@ function msRender() {
     const txt = m ? t('ms.ph.' + m[1], { k: m[2] === 'start' ? 1 : Number(m[2]) + 1, n: MS_REQ.views }) : t('ms.ph.' + (ph || 'start'));
     c.appendChild(cwEl('p', '', txt));
     const bar = cwEl('div', 'calib-bar'); const fill = document.createElement('i'); fill.style.width = Math.round(MS.progress * 100) + '%'; bar.appendChild(fill); c.appendChild(bar);
-    btn(t('grasp.stop'), () => api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e)), 'grasp-stop', 'ms-stop');
+    bindStopButton(btn(t('grasp.stop'), null, 'grasp-stop', 'ms-stop'));
   } else if (MS.state === 'done') {
     const o = MS.res && MS.res.objects && MS.res.objects[0];
     if (!o) c.appendChild(cwEl('p', 'ms-err', t('ms.e.none')));
@@ -11234,6 +11793,7 @@ async function msStart() {
     const ack = await commandRPC('/api/v1/action/measure_multiview', { ...MS_REQ, label: MS.sel.label, target: { box_norm: b } }, true, 5000);
     MS.id = ack.action_id ?? null; MS.state = 'running'; MS.phase = ''; MS.progress = 0;
   } catch (e) {
+    if (isCancelledErr(e)) { MS.state = 'confirm'; msRender(); return; }
     // OPERATOR_REQUIRED: commandRPC opened the dialog; a motion is not sent again by itself
     MS.state = 'failed'; MS.err = { code: e.code || '', text: e.code === 'OPERATOR_REQUIRED' ? t('ms.e.OPERATOR_REQUIRED') : msErrText(e.code, e.message) };
   }
@@ -11322,6 +11882,7 @@ async function gsetWrite(patch) {
     graspLoadSetup(true).then(() => { if (!$('gset').hidden) gsetRender(); });
     return true;
   } catch (e) {
+    if (isCancelledErr(e)) return false;
     if (e.code === 'POLICY_REVISION_MISMATCH') graspLoadSetup(true);
     gsetRender(e.message);
     return false;
@@ -11425,6 +11986,7 @@ async function colWrite(patch) {
     colLoad(true);
   } catch (e) {
     COL.busy = false;
+    if (isCancelledErr(e)) { colRenderSet(); return; }
     toast(e.message, 'err', e.code || '');
     colRenderSet(e.message);
     if (e.code === 'POLICY_REVISION_MISMATCH') colLoad(true);
@@ -11520,7 +12082,7 @@ function toolsRender() {
 // release_lease: only with torque off and nothing moving (armd parks a torqued arm on release)
 function toolsReleaseState() {
   const o = S.obs || {};
-  if (S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1) return 'none';
+  if (leaseOp || S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1) return 'none';
   if (o.is_torqued || o.disable_pending || o.enable_state === 'Enabled') return 'torqued';
   if (o.action?.state === 'running' || S.state === 'Moving' || S.presetRunning || S.streamActive || unloading || pendingCommands.size
     || (Array.isArray(o.velocities) && o.velocities.some((v) => !(Math.abs(v) < 0.05)))) return 'moving';
@@ -11533,9 +12095,7 @@ function toolsRenderRelease() {
 }
 function toolsRelease() {
   if (toolsReleaseState() !== 'ok') { toolsRenderRelease(); return; }
-  try { S.ws.send(JSON.stringify({ type: 'release_lease', client_id: CLIENT_ID, generation: S.leaseGeneration })); } catch (_) { return; }
-  resetLease();
-  toast(t('toast.lease_released'), 'info');
+  sendReleaseLease('toast.lease_released');
   toolsRenderRelease();
 }
 // the calibration wizard in a mode (camera / fine); the mode stays when views were captured
@@ -11628,6 +12188,7 @@ async function gbRun() {
     GB.ok = !!b && b.state === 'learned';
     GB.status = t('gb.done', { st: b ? t('gb.st.' + b.state) : '--' });
   } catch (e) {
+    if (isCancelledErr(e)) { GB.status = ''; return; }
     GB.status = e.code === 'OPERATOR_REQUIRED' ? t('gb.op')
       : e.code === 'CALIBRATION_OBSTRUCTED' ? t('gb.obst', { m: e.message })
       : t('gb.err', { m: (e.code ? e.code + ': ' : '') + e.message });
@@ -11653,7 +12214,7 @@ async function gtRun(store) {
     GT.res = { stop_rad: a.stop_rad, offset_rad: a.offset_rad, pass: !!a.pass };
     GT.status = '';
     gtLoad();
-  } catch (e) { GT.status = t('gt.err', { m: (e.code ? e.code + ': ' : '') + e.message }); }
+  } catch (e) { GT.status = isCancelledErr(e) ? '' : t('gt.err', { m: (e.code ? e.code + ': ' : '') + e.message }); }
   finally { GT.busy = false; gtRender(); }
 }
 /* ---------- zero tool: WS /api/v1/calibration/motor_zero (src/motor_zero.rs, src/joint_zero.rs) ----------
@@ -11802,7 +12363,7 @@ async function mzPark() {
       if (id != null) for (const a of [o.action, o.previous_action]) if (a && a.id === id && a.state !== 'running') return true;
       return !o.is_torqued;
     }, 60000);
-  } catch (e) { MZ.status = mzErrText(e); }
+  } catch (e) { MZ.status = isCancelledErr(e) ? '' : mzErrText(e); }
   finally { MZ.busy = false; mzRender(); }
 }
 // first tap: armd's dry run (checks, readings); second tap within 5 s: the zero
@@ -11827,6 +12388,7 @@ async function mzGo() {
     }
   } catch (e) {
     MZ.armedUntil = 0;
+    if (isCancelledErr(e)) { MZ.status = ''; return; }
     const rep = e.reply || {};
     if (e.code === 'MOTOR_ZERO_UNVERIFIED' || (rep.joints && rep.invalidated)) { MZ.res = { ...rep, ok: false }; mzAfter(); }
     MZ.status = mzErrText(e);
@@ -11841,7 +12403,7 @@ async function mzUndo(backup) {
     await commandRPC('/api/v1/calibration/joint_zero/restore', { backup }, true, 10000);
     MZ.res = null; MZ.status = t('mz.undone');
     mzAfter();
-  } catch (e) { MZ.status = mzErrText(e); }
+  } catch (e) { MZ.status = isCancelledErr(e) ? '' : mzErrText(e); }
   finally { MZ.busy = false; mzRender(); }
 }
 $('mzero-close').addEventListener('click', () => { if (!MZ.busy) mzOpen(false); });
@@ -11901,6 +12463,7 @@ function posesRender(status) {
     ol.appendChild(li);
   }
   if (status !== undefined) setText($('pose-status'), status);
+  syncControlInputsUi(pageHasControl());
 }
 function poseNameCheck() {
   const v = $('pose-name').value.trim();
@@ -11923,6 +12486,7 @@ async function poseSave() {
     await posesLoad(true);
     posesRender(t('pose.saved', { name }));
   } catch (e) {
+    if (isCancelledErr(e)) return;
     if (e.code === 'POLICY_REVISION_MISMATCH') posesLoad(true);
     const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m);
   }
@@ -11943,6 +12507,7 @@ async function poseDelete(name) {
     await posesLoad(true);
     posesRender(t('pose.deleted', { name }));
   } catch (e) {
+    if (isCancelledErr(e)) return;
     if (e.code === 'POLICY_REVISION_MISMATCH') posesLoad(true);
     const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m);
   }
@@ -11953,7 +12518,7 @@ async function poseGo(name) {
     await commandRPC('/api/v1/action/move_to_pose', { name, speed_scale: clamp(speedScale(), 0.1, 1), tag: 'cockpit' });
     setText($('pose-status'), t('pose.moving', { name }));
     toast(t('pose.moving', { name }), 'ok');
-  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); setText($('pose-status'), m); }
+  } catch (e) { if (isCancelledErr(e)) return; const m = poseErr(e); toast(m, 'err', e.code || ''); setText($('pose-status'), m); }
 }
 function psetOpen(open) {
   $('pset').hidden = !open;
@@ -12307,7 +12872,7 @@ function teachRenderEditor(body) {
   const r3 = cwEl('div', 'tch-row');
   const go = tchBtn(t('tch.run'), () => teachRun({}), 'btn-primary', running || TCH.busy || !c.steps.length); go.id = 'tch-run';
   const one = tchBtn(t('tch.single.sel'), () => teachRun({ from: Math.max(0, TCH.sel), single: true }), '', running || TCH.busy || !c.steps.length); one.id = 'tch-step';
-  const stop = tchBtn(t('tch.stop'), teachStop, 'tch-stop'); stop.id = 'tch-stop'; stop.hidden = !running;
+  const stop = tchBtn(t('tch.stop'), null, 'tch-stop'); stop.id = 'tch-stop'; stop.hidden = !running; bindStopButton(stop);
   r3.append(go, one, stop);
   rb.appendChild(r3);
   const pg = cwEl('div', 'tch-prog'); pg.id = 'tch-prog'; pg.setAttribute('role', 'status');
@@ -12336,7 +12901,7 @@ function teachRenderPoses(body) {
   if (quick) {
     const r = cwEl('div', 'tch-row');
     const pg = cwEl('span', 'tch-prog grow'); pg.id = 'tch-pick-prog'; pg.setAttribute('role', 'status');
-    const stop = tchBtn(t('tch.stop'), teachStop, 'tch-stop'); stop.id = 'tch-pick-stop';
+    const stop = tchBtn(t('tch.stop'), null, 'tch-stop'); stop.id = 'tch-pick-stop'; bindStopButton(stop);
     r.append(pg, stop);
     pb.appendChild(r);
   }
@@ -12475,8 +13040,9 @@ function teachAddStep(st) {
   if (li && TCH.open) li.scrollIntoView({ block: 'nearest' });
   return true;
 }
-async function teachSave() {
+async function teachSave(controlSnap = null) {
   const c = TCH.cur; if (!c) return false;
+  if (controlSnap && !isControlSnapValid(controlSnap)) return false;
   c.name = (c.name || '').trim();
   if (!TCH_SEQ_NAME.test(c.name)) { teachStatus(t('tch.e.name'), true); return false; }
   if (TCH.seqs.some((s) => s.name === c.name && s.id !== c.id)) { teachStatus(t('tch.e.dup'), true); return false; }
@@ -12484,7 +13050,7 @@ async function teachSave() {
   if (c.id) { body.id = c.id; if (c.rev != null) body.rev = c.rev; }
   TCH.busy = true;
   try {
-    const r = await commandRPC('/api/v1/sequences/save', body);
+    const r = await commandRPC('/api/v1/sequences/save', body, true, 2000, controlSnap ? { controlSnap } : null);
     const s = r && r.sequence ? r.sequence : { ...c };
     TCH.cur = JSON.parse(JSON.stringify(s)); TCH.cur.steps = TCH.cur.steps || []; TCH.dirty = false;
     const k = TCH.seqs.findIndex((x) => x.id === s.id);
@@ -12492,6 +13058,7 @@ async function teachSave() {
     teachStatus(t('tch.seq.saved', { n: s.name }));
     return true;
   } catch (e) {
+    if (isCancelledErr(e)) return false;
     teachStatus(e.code === 'SEQUENCE_CONFLICT' ? t('tch.e.SEQUENCE_CONFLICT') : teachErr(e), true);
     if (e.code === 'SEQUENCE_REF_MISSING' && e.reply && Number.isInteger(e.reply.step)) TCH.sel = e.reply.step;
     return false;
@@ -12504,7 +13071,7 @@ async function teachDelSeq() {
     await commandRPC('/api/v1/sequences/delete', { id: c.id });
     TCH.seqs = TCH.seqs.filter((s) => s.id !== c.id); TCH.cur = null; TCH.dirty = false;
     teachStatus(t('tch.seq.deleted', { n: c.name }));
-  } catch (e) { teachStatus(teachErr(e), true); }
+  } catch (e) { if (!isCancelledErr(e)) teachStatus(teachErr(e), true); }
   teachRender();
 }
 const teachRunning = () => { const a = S.obs && S.obs.action; return !!(a && a.kind === 'sequence' && a.state === 'running'); };
@@ -12517,22 +13084,27 @@ async function teachRun({ from = 0, single = false, allowStale = false }) {
   const c = TCH.cur; if (!c || TCH.busy) return;
   if (!c.steps.length) { teachStatus(t('tch.st.empty'), true); return; }
   if (teachMoveBlock()) return;
-  if ((TCH.dirty || !c.id) && !(await teachSave())) return;
+  const snap = requireLeaseSyncOrPrompt((e) => { teachStatus(teachErr(e), true); toast(teachErr(e), 'err', e.code || ''); });
+  if (!snap) return;
+  if ((TCH.dirty || !c.id) && !(await teachSave(snap))) return;
+  if (!isControlSnapValid(snap)) return;
   const body = { id: TCH.cur.id, from_step: clamp(from, 0, TCH.cur.steps.length - 1), single_step: !!single, repeat: single ? 1 : TCH.repeat, allow_stale: !!allowStale, tag: 'cockpit' };
   if (TCH.runRec && !single) body.record = { dataset: TCH.runDs || TCH.ds, task: TCH.runTask.trim() || TCH.cur.name };
   TCH.busy = true;
   try {
-    const r = await commandRPC('/api/v1/action/run_sequence', body);
+    if (!isControlSnapValid(snap)) throw cancelledError();
+    const r = await commandRPC('/api/v1/action/run_sequence', body, true, 2000, { controlSnap: snap });
     syncEpoch(r.epoch_id);
     TCH.run = { actionId: r.action_id, seqId: TCH.cur.id, n: TCH.cur.steps.length, record: !!body.record };
     TCH.ask = null;
     teachStatus(single ? t('tch.run.single', { n: body.from_step + 1 }) : t('tch.run.started', { n: TCH.cur.name, r: body.repeat }));
   } catch (e) {
+    if (isCancelledErr(e)) return;
     if (e.code === 'DATA_STALE') { TCH.ask = { kind: 'seq', from, single }; teachStatus(teachErr(e), true); }
     else { teachStatus(teachErr(e), true); toast(teachErr(e), 'err', e.code || ''); }
   } finally { TCH.busy = false; teachRender(); }
 }
-function teachStop() { api('/api/v1/motion/stop', {}).catch(() => {}); }
+function teachStop() { stopMotion(); }
 // live step highlight and progress from the parent action (kind "sequence")
 function teachLive() {
   const o = S.obs; if (!o || !TCH.open) return;
@@ -12603,7 +13175,7 @@ async function teachSavePose(name, append = false) {
       teachStatus(t('pose.saved', { name }));
     }
     teachRender(); teachBarRender();
-  } catch (e) { const m = teachErr(e); toast(m, 'err', e.code || ''); teachStatus(m, true); }
+  } catch (e) { if (isCancelledErr(e)) return; const m = teachErr(e); toast(m, 'err', e.code || ''); teachStatus(m, true); }
 }
 async function teachRenamePose(p, name) {
   if (!POSE_NAME_RE.test(name)) { teachStatus(t('pose.bad'), true); return; }
@@ -12612,7 +13184,7 @@ async function teachRenamePose(p, name) {
     await teachPoseCmd('/api/v1/poses/rename', { id: p.id, name });
     TCH.edit = null; teachStatus(t('tch.renamed', { a: p.name, b: name }));
     await teachLoad(true);
-  } catch (e) { teachStatus(e.code === 'UNKNOWN_COMMAND' || e.code === 'NOT_FOUND' || e.code === '404' || e.code === 'UNSUPPORTED' ? t('tch.e.rename_na') : teachErr(e), true); }
+  } catch (e) { if (isCancelledErr(e)) return; teachStatus(e.code === 'UNKNOWN_COMMAND' || e.code === 'NOT_FOUND' || e.code === '404' || e.code === 'UNSUPPORTED' ? t('tch.e.rename_na') : teachErr(e), true); }
 }
 async function teachDelPose(p) {
   if (!teachArm('pose:' + p.name)) return;
@@ -12628,7 +13200,7 @@ async function teachDelPose(p) {
     }
     teachStatus(t('pose.deleted', { name: p.name }));
     await teachLoad(true);
-  } catch (e) { teachStatus(teachErr(e), true); teachRender(); }
+  } catch (e) { if (!isCancelledErr(e)) teachStatus(teachErr(e), true); teachRender(); }
 }
 
 // the ticked poses as steps of a motion (each restores the gripper opening saved with the pose)
@@ -12644,24 +13216,29 @@ async function teachPlayPicked(allowStale) {
   const steps = teachPickSteps();
   if (!steps.length || TCH.busy || teachRunning()) return;
   if (teachMoveBlock()) return;
+  const snap = requireLeaseSyncOrPrompt((e) => { teachStatus(teachErr(e), true); toast(teachErr(e), 'err', e.code || ''); });
+  if (!snap) return;
   TCH.busy = true; teachRender();
   try {
     const sq = await teachGet('/api/v1/sequences').catch(() => null);
+    if (!isControlSnapValid(snap)) throw cancelledError();
     if (sq && Array.isArray(sq.sequences)) TCH.seqs = sq.sequences;
     const slot = TCH.seqs.find(teachQuick);
     const body = { name: TCH_QUICK, description: t('tch.pick.desc'), steps };
     if (slot) body.id = slot.id;
-    const r = await commandRPC('/api/v1/sequences/save', body);
+    const r = await commandRPC('/api/v1/sequences/save', body, true, 2000, { controlSnap: snap });
+    if (!isControlSnapValid(snap)) throw cancelledError();
     const q = r && r.sequence && r.sequence.id ? r.sequence : { ...body, id: slot && slot.id };
     if (!q.id) throw Object.assign(new Error(t('err.rejected')), { code: 'SEQUENCE_NOT_FOUND' });
     const k = TCH.seqs.findIndex((x) => x.id === q.id);
     if (k >= 0) TCH.seqs[k] = q; else TCH.seqs.push(q);
-    const d = await commandRPC('/api/v1/action/run_sequence', { id: q.id, from_step: 0, single_step: false, repeat: 1, allow_stale: !!allowStale, tag: 'cockpit' });
+    const d = await commandRPC('/api/v1/action/run_sequence', { id: q.id, from_step: 0, single_step: false, repeat: 1, allow_stale: !!allowStale, tag: 'cockpit' }, true, 2000, { controlSnap: snap });
     syncEpoch(d.epoch_id);
     TCH.run = { actionId: d.action_id, seqId: q.id, n: steps.length, record: false, quick: true, poses: steps.map((x) => x.pose_id) };
     TCH.ask = null;
     teachStatus(t('tch.pick.started', { n: steps.length }));
   } catch (e) {
+    if (isCancelledErr(e)) return;
     if (e.code === 'DATA_STALE') { TCH.ask = { kind: 'quick' }; teachStatus(teachErr(e), true); }
     else { teachStatus(teachErr(e), true); toast(teachErr(e), 'err', e.code || ''); }
   } finally { TCH.busy = false; teachRender(); }
@@ -12685,6 +13262,7 @@ async function teachReplay(id, allowStale) {
     const e = teachEp(id);
     teachStatus(t('ep.started', { id: e ? teachEpName(e) : id, x: TCH.epSpeed }));
   } catch (e) {
+    if (isCancelledErr(e)) { teachRender(); return; }
     if (e.code === 'DATA_STALE') TCH.ask = { kind: 'ep', id };
     teachStatus(teachErr(e), true);
   }
@@ -13841,9 +14419,10 @@ function frame(ts) {
   const v = commandVector();
   const en = live && isOperational() && leaseOther() == null;
   const op = en && !colHold();
+  const ctrl = pageHasControl();
   const torqued = !!(S.obs && S.obs.is_torqued);
-  const act = v.map((x) => op && x !== 0);
-  if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
+  const act = v.map((x) => ctrl && x !== 0);
+  if (S.mode === 'cart' && ctrl && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
   poseTick(ts);
   drawOverlay();
   graspCheckInput(v);
@@ -13855,6 +14434,7 @@ function frame(ts) {
   body.classList.toggle('offline', !live);
   body.classList.toggle('locked', !op);
   body.classList.toggle('stopped', live && isStopped());
+  syncControlInputsUi(ctrl);
   const cartHeld = Object.values(C.hold).some((h) => h[0] || h[1]);
   if (!op && (S.keys.size || cartHeld || S.hold.some((h) => h[0] || h[1]) || pads.some((p) => p.active()))) releaseAll();
   setText($('lock-txt'), lockReason());
@@ -13872,24 +14452,46 @@ function frame(ts) {
   setCls(badge, 'sc-status-badge ' + (hold ? 'is-warn' : STATE_BADGE[st] ?? ''));
 
   // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
+  const fresh = obsFresh(), holder = leaseOther(), ls = $('lease-status');
+  ls.hidden = !live;
+  if (live) {
+    const [cls, txt] = leaseOp && leaseOp.kind === 'release' ? ['is-checking', t('lease.releasing')]
+      : leaseOp && leaseOp.kind === 'refresh' ? ['is-checking', t('lease.refreshing')]
+      : !fresh ? ['is-checking', t('lease.checking')]
+      : S.leaseGeneration != null ? ['is-own', t('lease.own')]
+      : holder != null ? ['is-other', t('lease.other', { who: leaseHolderDetail(holder) })]
+      : S.leaseReleased != null ? ['is-released', t('lease.released.tag')]
+      : ['is-readonly', t('lease.readonly')];
+    setCls(ls, 'lease-status ' + cls); setText($('lease-status-txt'), txt);
+  }
+  const showReleased = fresh && !leaseOp && S.leaseGeneration == null && S.leaseReleased != null;
+  $('lease-released').hidden = !showReleased;
+  if (showReleased) {
+    setText($('lease-released-txt'), holder != null ? t('lease.released.other', { who: leaseHolderDetail(holder) }) : t(S.leaseReleased.reason === 'expired' ? 'lease.released.expired' : 'lease.released.reconnect'));
+    $('btn-retake').disabled = holder != null || !fresh || !!leaseOp;
+  }
+
   const eb = $('btn-enable');
   const stopped = isStopped();
-  eb.classList.toggle('on', en);
+  const armedReadonly = live && !stopped && isOperational() && S.leaseGeneration == null;
+  eb.classList.toggle('on', en && S.leaseGeneration != null);
   eb.classList.toggle('clear', stopped);
-  eb.setAttribute('aria-checked', String(en));
+  eb.setAttribute('aria-checked', String(en && S.leaseGeneration != null));
   // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
   const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
-  $('btn-park-off').hidden = !holdingIdle || leaseOther() != null;
+  $('btn-park-off').hidden = !holdingIdle || holder != null;
+  $('btn-park-off').disabled = !fresh || !!leaseOp || holder != null;
   const opClear = live && stopped && opLocked() && clearNeedsOperator();
   $('op-inline').hidden = !opClear;
   if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : 'op.inline_fault'));
-  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop_s') : t('en.clear_fault_s')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
-  setText($('enable-sub'), stopped ? t('en.sub_reset') : en ? t('en.sub_off') : t('en.hold'));
-  eb.disabled = !live || leaseOther() != null;
-  $('btn-stop').disabled = !live;
-  const holder = leaseOther();
-  $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || holder == null;
-  setText($('preempt-who'), holder == null ? '' : t('preempt.who', { who: leaseHolderText(holder) }));
+  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop_s') : t('en.clear_fault_s')) : armedReadonly ? t('en.armed_readonly') : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
+  setText($('enable-sub'), stopped ? t('en.sub_reset') : armedReadonly ? (holder != null ? t('lease.other', { who: leaseHolderDetail(holder) }) : t('en.sub_readonly')) : en ? t('en.sub_off') : t('en.hold'));
+  eb.disabled = !fresh || !!leaseOp || holder != null;
+  $('btn-stop').disabled = false;
+  $('btn-preempt').hidden = !fresh || !!leaseOp || holder == null;
+  setText($('preempt-who'), holder == null ? '' : t('preempt.who', { who: leaseHolderDetail(holder) }));
+  if (preemptModalOpen()) renderPreemptModal();
+  if (takeModalOpen()) renderTakeModal();
 
   // jog rows
   rows.forEach((r, i) => {
@@ -13923,8 +14525,8 @@ function frame(ts) {
     }
     r.row.classList.toggle('active', act[i]);
   });
-  for (const d of padDirs) d.classList.toggle('hot', op && Math.sign(v[Number(d.dataset.j)]) === Number(d.dataset.s));
-  if (S.mode === 'cart') renderCart(live, op);
+  for (const d of padDirs) d.classList.toggle('hot', ctrl && Math.sign(v[Number(d.dataset.j)]) === Number(d.dataset.s));
+  if (S.mode === 'cart') renderCart(live, op, ctrl);
 
   // video HUD
   const cam = $('cam-chip');
@@ -13954,8 +14556,15 @@ function frame(ts) {
   setText($('t-torque'), S.obs?.enable_state === 'Enabled' ? t('tq.on') : S.obs?.enable_state === 'Disabled' ? t('tq.off') : t('tq.unknown'));
   $('t-torque').className = torqued ? 'good' : '';
   const hbAge = S.hb.at ? Date.now() - S.hb.at : null;
-  setText($('t-lease'), hbAge == null ? '--' : `${S.hb.hz} Hz · ${hbAge} ms`);
-  $('t-lease').className = hbAge == null ? '' : hbAge < 300 ? 'good' : hbAge < 500 ? 'warn' : 'bad';
+  const tl = $('t-lease');
+  const [tlTxt, tlCls] = !fresh ? [t('lease.t.checking'), '']
+    : leaseOp && leaseOp.kind === 'release' ? [t('lease.releasing'), 'warn']
+    : leaseOp && leaseOp.kind === 'refresh' ? [t('lease.refreshing'), 'warn']
+    : S.leaseGeneration != null ? [hbAge == null ? t('lease.t.own') : `${S.hb.hz} Hz · ${hbAge} ms`, hbAge == null || hbAge < 300 ? 'good' : hbAge < 500 ? 'warn' : 'bad']
+    : holder != null ? [leaseHolderDetail(holder), 'warn']
+    : S.leaseReleased != null ? [t('lease.t.released'), 'warn']
+    : [t('lease.t.readonly'), ''];
+  setText(tl, tlTxt); tl.className = tlCls;
   const ages = S.obs?.feedback_age_ms || [];
   const feedbackFresh = live && ages.length === S.dof && ages.every((age) => Number.isFinite(age) && age <= 250);
   setText($('t-can'), !live ? t('no_telemetry') : feedbackFresh ? t('can.fresh') : t('can.stale'));
@@ -14001,10 +14610,10 @@ function frame(ts) {
     setText($('rec-frames'), '~' + Math.round(el / 1000 * 50));
     setText($('rec-chip'), t('rec.chip') + fmtTime(el));
   }
-  if (simple) renderSimple(live, op);
+  if (simple) renderSimple(live, op, ctrl);
 }
 
-function renderSimple(live, op) {
+function renderSimple(live, op, ctrl) {
   const has = live && S.obs.positions.length > GRIP;
   const f = has ? gripFrac(S.obs.positions[GRIP]) : null;
   const travelling = Date.now() - S.gripCmdAt < 1500 && S.grip != null;
@@ -14028,18 +14637,19 @@ function renderSimple(live, op) {
   if ($('s-grip-jog-bar')) $('s-grip-jog-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
 
   const rd = $('s-ready');
-  setCls(rd, 'ready' + (op ? ' ok' : live && (isStopped() || colHold()) ? ' bad' : ''));
-  setText($('s-ready-txt'), !live ? t('wait_arm') : op ? t('ready') : lockReason());
+  const readonlyOp = live && op && !ctrl;
+  setCls(rd, 'ready' + (op && !readonlyOp ? ' ok' : live && (isStopped() || colHold()) ? ' bad' : ''));
+  setText($('s-ready-txt'), !live ? t('wait_arm') : readonlyOp ? t(S.leaseReleased ? 'ready.released' : 'ready.readonly') : op ? t('ready') : lockReason());
   if (S.preset && Date.now() > S.preset.until) { S.preset = null; S.presetRunning = false; }
   for (const b of document.querySelectorAll('.preset')) b.classList.toggle('busy', !!S.preset && S.preset.name === b.dataset.preset);
   const bad = C.status !== 'ok' && C.status !== 'idle';
   const hint = $('s-hint');
-  setText(hint, !live ? t('wait_arm') : !op ? lockReason() : bad ? ikText(C.msg) : '');
+  setText(hint, !live ? t('wait_arm') : !op ? lockReason() : bad ? ikText(C.msg) : readonlyOp ? t(S.leaseReleased ? 'ready.released' : 'ready.readonly') : '');
   hint.classList.toggle('bad', live && op && bad);
   hint.classList.toggle('lock', !(live && op && bad));
 }
 
-function renderCart(live, op) {
+function renderCart(live, op, ctrl) {
   // readouts from daemon obs.tcp for measured state; local targets apply active_tool.tcp_offset_m once
   const view = viewActive();
   const pos6 = S.obs && S.obs.positions;
@@ -14080,7 +14690,7 @@ function renderCart(live, op) {
   setText(badge, !live ? 'IK --' : bad ? t('ik.blocked') : C.sending ? t('ik.stream', { hz: CFG.cart.hz }) : t('ik.ready'));
   setCls(badge, 'sc-status-badge ' + (!live ? '' : bad ? 'is-warn' : C.sending ? 'is-info' : 'is-ok'));
   const msg = $('ik-msg');
-  setText(msg, !live ? t('wait_telemetry') : bad ? ikText(C.msg) : !op ? t('cart.enable_first') : t('cart.following', { branch: view ? 'DLS' : (C.branch ?? '-'), tx: CFG.cart.tx === 'ws' ? t('cart.tx_ws') : t('cart.tx_rest') }));
+  setText(msg, !live ? t('wait_telemetry') : bad ? ikText(C.msg) : !op ? t('cart.enable_first') : !ctrl ? t(S.leaseReleased ? 'ready.released' : 'ready.readonly') : t('cart.following', { branch: view ? 'DLS' : (C.branch ?? '-'), tx: CFG.cart.tx === 'ws' ? t('cart.tx_ws') : t('cart.tx_rest') }));
   msg.classList.toggle('bad', bad);
   setText($('ik-us'), C.solveUs == null ? '' : 'IK ' + (C.solveUs < 1 ? C.solveUs.toFixed(2) : C.solveUs.toFixed(1)) + t('ik.per_solve'));
   const gr = $('grip-range');
@@ -14091,7 +14701,7 @@ function renderCart(live, op) {
   gr.style.setProperty('--v', gr.value + '%');
   setText($('grip-pct'), live && S.obs.positions.length > GRIP ? Math.round(gripFrac(S.obs.positions[GRIP]) * 100) + '%' : '--%');
   const cv = cartVelocity();
-  for (const d of cartDirs) d.classList.toggle('hot', op && Math.sign(cv[d.dataset.ax]) === Number(d.dataset.s));
+  for (const d of cartDirs) d.classList.toggle('hot', ctrl && Math.sign(cv[d.dataset.ax]) === Number(d.dataset.s));
 }
 
 // Expose core detection & overlay symbols for testing and telemetry inspection
@@ -15055,9 +15665,8 @@ async function initSandbox() {
    Operator Auth Badge & Modal
    ================================================================= */
 function reconnectWS() {
-  const old = S.ws;
+  if (S.ws) retireSocket(S.ws, { reconnect: false, markReleased: true });
   connectWS();
-  if (old) { try { old.close(); } catch (_) {} }
 }
 /* Operator access. The badge in the header opens the dialog; a privileged request refused with OPERATOR_REQUIRED
    opens it with the reason (opRequire). After an unlock the token goes to the open telemetry socket ({type:"auth"}),
@@ -15173,10 +15782,15 @@ document.addEventListener('click', (e) => {
   if (OP.pass === el) return;
   e.preventDefault(); e.stopImmediatePropagation();
   const mode = el.dataset.opMode || 'gate';
+  const snap = { controlEpoch: S.controlEpoch, ws: S.ws, epoch: S.epoch };
   opRequire(el.dataset.op, undefined, { retry: mode === 'gate', skip: mode === 'offer' }).then((ok) => {
     const tgt = document.contains(el) ? el : (el.id && $(el.id)) || null;
     if (!tgt || tgt.disabled) return;
-    if (mode === 'offer' || (ok && mode === 'gate')) { OP.pass = tgt; try { tgt.click(); } finally { OP.pass = null; } }
+    if (mode === 'offer') { OP.pass = tgt; try { tgt.click(); } finally { OP.pass = null; } }
+    else if (ok && mode === 'gate') {
+      if (S.controlEpoch !== snap.controlEpoch || S.ws !== snap.ws || S.epoch !== snap.epoch) return;
+      OP.pass = tgt; try { tgt.click(); } finally { OP.pass = null; }
+    }
     else if (ok) toast(t(el.dataset.opAgain || 'op.again'), 'info');
   });
 }, true);
@@ -15301,6 +15915,7 @@ function closeOperatorModal(ok = false) {
   document.body.classList.remove('op-open');
   $('op-pin').value = '';
   OP.why = null; OP.retry = false; OP.skip = false; OP.renew = false;
+  suppressHeldConfirmKeys();
   const f = OP.lastFocus; OP.lastFocus = null;
   if (f && typeof f.focus === 'function' && document.contains(f)) { try { f.focus({ preventScroll: true }); } catch (_) {} }
   opSettle(ok);
@@ -15364,19 +15979,15 @@ $('op-cancel')?.addEventListener('click', () => closeOperatorModal(false));
 $('op-modal')?.addEventListener('pointerdown', (e) => { if (e.target === e.currentTarget) closeOperatorModal(false); });
 $('op-form')?.addEventListener('submit', submitOperatorPin);
 $('op-lock')?.addEventListener('click', lockOperator);
-$('op-estop')?.addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
-$('op-inline')?.addEventListener('click', () => { opRequire('/api/v1/safety/clear_fault').then((ok) => { if (ok && isStopped()) clearFault(); }); });
-document.addEventListener('keydown', (e) => {
-  if (!opIsOpen()) return;
-  // stopPropagation: the window handler below would take this Escape as Stop once the dialog is closed
-  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeOperatorModal(false); return; }
-  if (e.key === 'Tab') { // keep focus inside the dialog
-    const f = [...$('op-modal').querySelectorAll('button:not([hidden]):not([disabled]), input:not([hidden])')].filter((x) => x.offsetParent !== null);
-    if (!f.length) return;
-    const i = f.indexOf(document.activeElement);
-    if (e.shiftKey && i <= 0) { e.preventDefault(); f[f.length - 1].focus(); }
-    else if (!e.shiftKey && i === f.length - 1) { e.preventDefault(); f[0].focus(); }
-  }
+bindStopButton($('op-stop'));
+bindEstopButton($('op-estop'));
+$('op-inline')?.addEventListener('click', () => {
+  const snap = { controlEpoch: S.controlEpoch, faultKey: mitFaultKey() };
+  opRequire('/api/v1/safety/clear_fault').then((ok) => {
+    if (ok && isStopped() && S.controlEpoch === snap.controlEpoch && mitFaultKey() === snap.faultKey) {
+      clearFault({ directLease: true });
+    }
+  });
 });
 if (window.visualViewport) for (const ev of ['resize', 'scroll']) window.visualViewport.addEventListener(ev, opFit);
 i18nHooks.push(() => { if (opIsOpen()) renderOperatorModal(); });
@@ -15402,11 +16013,12 @@ initDepth();
 initCalib();
 initCwiz();
 videoStart();
+syncControlInputsUi(pageHasControl());
 requestAnimationFrame(frame);
 
 /* i18n: re-render dynamic UI on language change */
 i18nHooks.push(
-  renderJogRows, renderGripCol, renderPoseUi, renderOpBadge,
+  renderJogRows, renderGripCol, renderPoseUi, renderOpBadge, renderPreemptModal, renderTakeModal,
   () => setMode(S.ctl, S.input),
   () => { if (lastHint) videoHint(...lastHint); },
   () => {

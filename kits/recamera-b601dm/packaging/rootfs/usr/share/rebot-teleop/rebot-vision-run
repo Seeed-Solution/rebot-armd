@@ -13,6 +13,7 @@
 BIN=${REBOT_VISION_BIN:-/usr/bin/rebot-vision}
 CONF=${REBOT_VISION_CONF:-/userdata/rebot-teleop/vision.json}
 LOG=${REBOT_VISION_LOG:-/var/log/rebot-vision.log}
+INIT_SCRIPT=${REBOT_TELEOP_INIT:-/etc/init.d/K92rebot-teleop}
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [rebot-vision-run] $*" >> "$LOG"; }
 
@@ -62,7 +63,11 @@ main() {
         $NICE "$BIN" --config "$CONF" >> "$LOG" 2>&1 &
         child=$!
         # a SIGTERM between the fork and the line above found no child to forward to
-        [ "$stopping" -eq 1 ] && kill -TERM "$child" 2>/dev/null
+        if [ "$stopping" -eq 1 ]; then
+            kill -TERM "$child" 2>/dev/null
+        elif [ -x "$INIT_SCRIPT" ]; then
+            "$INIT_SCRIPT" rt-priorities --settle >/dev/null 2>&1 || true
+        fi
         wait_child
         child=""
         [ "$stopping" -eq 1 ] && break
