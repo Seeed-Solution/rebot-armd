@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -284,6 +285,18 @@ pub enum SafetyError {
 
     #[error("OWNER_TRANSFERRED: control ownership transferred to RT executor; shell lease calls are refused")]
     OwnerTransferred,
+
+    #[error("Stopped before motion began")]
+    Stopped,
+
+    #[error("Control lease is no longer current")]
+    LeaseLost,
+
+    #[error("Action terminal queue is full; wait for pending action completions to drain before starting a new action")]
+    TerminalsBusy,
+
+    #[error("Admission stamp has already been consumed or carries an invalid request id")]
+    StampAlreadyConsumed,
 }
 
 impl SafetyError {
@@ -1304,6 +1317,7 @@ pub struct SafetyManager {
     log_dropped: u64,
     log_dropped_forwarded: u64,
     epoch_id: u64,
+    epoch_mirror: Arc<AtomicU64>,
     /// Monotonic counter incremented when `latch` records a new kind or distinct fault code.
     latch_count: u64,
     /// Code recorded by the trigger site of the current shown Fault.
@@ -1363,6 +1377,7 @@ impl Clone for SafetyManager {
             log_dropped: self.log_dropped,
             log_dropped_forwarded: self.log_dropped_forwarded,
             epoch_id: self.epoch_id,
+            epoch_mirror: Arc::new(AtomicU64::new(self.epoch_id)),
             latch_count: self.latch_count,
             fault_code: self.fault_code,
             latched_fault_kinds: self.latched_fault_kinds,
@@ -1422,6 +1437,7 @@ impl Default for SafetyManager {
             log_dropped: 0,
             log_dropped_forwarded: 0,
             epoch_id: 1,
+            epoch_mirror: Arc::new(AtomicU64::new(1)),
             latch_count: 0,
             fault_code: None,
             latched_fault_kinds: 0,
@@ -1951,6 +1967,18 @@ impl SafetyManager {
         self.epoch_id
     }
 
+    /// Lock-free atomic mirror of [`Self::epoch_id`], kept in sync on every epoch bump.
+    pub fn epoch_mirror(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.epoch_mirror)
+    }
+
+    #[inline]
+    fn bump_epoch(&mut self) -> u64 {
+        self.epoch_id = self.epoch_id.wrapping_add(1);
+        self.epoch_mirror.store(self.epoch_id, Ordering::SeqCst);
+        self.epoch_id
+    }
+
     /// Single authoritative fault/E-stop latch used by every detector.
     ///
     /// Always records `kind`, its bounded inline detail, and worst-of recoverability in the
@@ -1983,7 +2011,7 @@ impl SafetyManager {
 
         // 2. EVERY latch (a new kind or a repeat of the same kind, including E-stop) advances epoch.
         self.latch_count = self.latch_count.wrapping_add(1);
-        self.epoch_id = self.epoch_id.wrapping_add(1);
+        self.bump_epoch();
 
         // Repeat detection of an already-recorded kind with the same code needs no Arc/log churn.
         if already_latched && prev_detail.is_some_and(|d| d.code == code) {
@@ -2203,7 +2231,7 @@ impl SafetyManager {
             self.latched_fault_codes = 0;
             self.has_non_recoverable = false;
             self.latched_fault_details.fill(None);
-            self.epoch_id = self.epoch_id.wrapping_add(1);
+            self.bump_epoch();
             Ok(SafetyState::Idle)
         } else {
             Ok((*self.state_arc).clone())
@@ -2312,7 +2340,7 @@ impl SafetyManager {
             let before = self.epoch_id;
             let ep = self.latch(kind, FaultDetail::DetailUnavailable(code));
             if !self.can_accept_fault_transition() && ep == before {
-                self.epoch_id = self.epoch_id.wrapping_add(1);
+                self.bump_epoch();
             }
             return self.epoch_id;
         }

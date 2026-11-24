@@ -195,6 +195,11 @@ impl JointPolynomials {
             Self::Heap(v) => v.as_mut_slice(),
         }
     }
+
+    /// True when stored on the heap (`dof > INLINE_POLYS`).
+    pub fn is_heap(&self) -> bool {
+        matches!(self, Self::Heap(_))
+    }
 }
 
 impl std::ops::Deref for JointPolynomials {

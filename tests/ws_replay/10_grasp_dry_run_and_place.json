@@ -1,0 +1,38 @@
+{
+  "id": "10_grasp_dry_run_and_place",
+  "family": "place_grasp",
+  "description": "grasp dry_run without lease (exempt), grasp dry_run with lease + mock detector, place validation",
+  "setup": {"profile":"rebot_dm","seed_poses":true,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":true},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"body":{"dry_run":true,"position":[0.2,0.0,0.1]},"path":"/api/v1/action/grasp","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"dry_run":true,"position":[0.2,0.0,0.1]},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/grasp","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/place","request_id":4,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"position":[2.0,2.0,2.0]},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/place","request_id":5,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"dry_run":true,"position":[0.2,0.0,0.1]},"path":"/api/v1/action/grasp","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","control_mode":"position","epoch_id":1,"is_torqued":false,"message":"label must be a non-empty string of at most 64 bytes","reachable":false,"request_id":1,"safety_state":"Idle","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":2,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"dry_run":true,"position":[0.2,0.0,0.1]},"epoch_id":1,"generation":1,"path":"/api/v1/action/grasp","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","control_mode":"position","epoch_id":1,"is_torqued":true,"message":"label must be a non-empty string of at most 64 bytes","reachable":false,"request_id":3,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/action/place","request_id":4,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"exactly one of pose or position is required","request_id":4,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"position":[2.0,2.0,2.0]},"epoch_id":1,"generation":1,"path":"/api/v1/action/place","request_id":5,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"WORKSPACE_VIOLATION","constraint_id":"max_reach","epoch_id":1,"error":"WORKSPACE_VIOLATION","geometry_id":"end_origin","message":"Path leaves the safe workspace at s=0.220: check point 0 reach 0.524 m beyond bound 0.520 m","reason":"new intrusion into max_reach by 0.004m (geometry end_origin)","request_id":5,"safety_state":null,"status":422,"type":"command_reject","violation_phase":"plan"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

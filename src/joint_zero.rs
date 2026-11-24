@@ -254,6 +254,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
     fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
     fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }
+    fn gripper_pos_force_info(&self) -> Option<crate::driver::GripperPosForceInfo> { self.inner.gripper_pos_force_info() }
     fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
@@ -322,39 +323,81 @@ impl ArmDriver for ZeroOffsetDriver {
 }
 
 /// Result of the zero check against the reference pose (`zero_convention`).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// Stack-only (`Copy`, zero heap allocation on `armd-control`); the human-readable warning
+/// `message` for `legacy_j6` is formatted off-thread on serialization or log drain.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ZeroConvention {
     /// `unchecked` (no check at the rest pose yet), `ok`, `legacy_j6`.
     pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     /// J6 reading at the check (rad).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub j6_rad: Option<f32>,
+    /// Expected J6 rest reading (rad) for `legacy_j6` off-thread message formatting.
+    expected_j6_rad: Option<f32>,
+}
+
+impl ZeroConvention {
+    /// Formatted diagnostic message for `legacy_j6` (None for `unchecked` / `ok`).
+    pub fn message(&self) -> Option<String> {
+        if self.status != "legacy_j6" {
+            return None;
+        }
+        let j6 = self.j6_rad?;
+        let rest6 = self.expected_j6_rad.unwrap_or(0.0);
+        let d6 = f64::from(j6 - rest6);
+        Some(format!(
+            "J6 reads {:.1} deg in the rest pose (expected {:.1} deg): this arm's J6 was zeroed with the wrist rolled 90 deg. \
+             Fold the arm into the rest pose and set the zero of J6 with the zero tool (Tools > zero; software zero recommended, reversible). \
+             Until then park rolls the wrist 90 deg and the 3D view / camera orientation is off by 90 deg.",
+            d6.to_degrees() + f64::from(rest6).to_degrees(),
+            f64::from(rest6).to_degrees(),
+        ))
+    }
+}
+
+impl Serialize for ZeroConvention {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let msg = self.message();
+        let len = 1 + usize::from(msg.is_some()) + usize::from(self.j6_rad.is_some());
+        let mut st = serializer.serialize_struct("ZeroConvention", len)?;
+        st.serialize_field("status", self.status)?;
+        if let Some(ref m) = msg {
+            st.serialize_field("message", m)?;
+        }
+        if let Some(j6) = self.j6_rad {
+            st.serialize_field("j6_rad", &j6)?;
+        }
+        st.end()
+    }
 }
 
 impl Default for ZeroConvention {
-    fn default() -> Self { Self { status: "unchecked", message: None, j6_rad: None } }
+    fn default() -> Self { Self { status: "unchecked", j6_rad: None, expected_j6_rad: None } }
 }
 
 /// Check readings `q` against the reference `rest` (joint angles) with the resting tolerances
 /// `tol` (arm joints). None: the arm is not in the rest pose apart from J6 (no verdict). The
 /// legacy zero: every arm joint but J6 within its tolerance and |J6 - rest| within
-/// [`LEGACY_J6_TOL_RAD`] of pi/2.
+/// [`LEGACY_J6_TOL_RAD`] of pi/2. Allocation free.
 pub fn check_convention(q: &[f32], rest: &[f32], tol: &[f32]) -> Option<ZeroConvention> {
     if q.len() < 6 || rest.len() < 6 || !q.iter().all(|v| v.is_finite()) { return None; }
     let others = (0..tol.len().min(6)).filter(|&i| i != 5).all(|i| (q[i] - rest[i]).abs() <= tol[i]);
     if !others { return None; }
     let d6 = f64::from(q[5] - rest[5]);
     if (d6.abs() - std::f64::consts::FRAC_PI_2).abs() <= LEGACY_J6_TOL_RAD {
-        return Some(ZeroConvention { status: "legacy_j6", j6_rad: Some(q[5]), message: Some(format!(
-            "J6 reads {:.1} deg in the rest pose (expected {:.1} deg): this arm's J6 was zeroed with the wrist rolled 90 deg. \
-             Fold the arm into the rest pose and set the zero of J6 with the zero tool (Tools > zero; software zero recommended, reversible). \
-             Until then park rolls the wrist 90 deg and the 3D view / camera orientation is off by 90 deg.",
-            d6.to_degrees() + f64::from(rest[5]).to_degrees(), f64::from(rest[5]).to_degrees())) });
+        return Some(ZeroConvention {
+            status: "legacy_j6",
+            j6_rad: Some(q[5]),
+            expected_j6_rad: Some(rest[5]),
+        });
     }
     let tol6 = tol.get(5).copied().unwrap_or(0.08);
-    (d6.abs() <= f64::from(tol6)).then_some(ZeroConvention { status: "ok", message: None, j6_rad: Some(q[5]) })
+    (d6.abs() <= f64::from(tol6)).then_some(ZeroConvention {
+        status: "ok",
+        j6_rad: Some(q[5]),
+        expected_j6_rad: None,
+    })
 }
 
 #[cfg(test)]

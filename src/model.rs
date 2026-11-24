@@ -2534,6 +2534,17 @@ impl HolderLabel {
         Self { len: n as u8, buf }
     }
 
+    /// Exact inline copy when `s` fits within [`Self::CAPACITY`] bytes; `None` if longer
+    /// (fail-closed for identity comparisons where truncation could alias two IDs).
+    pub fn try_new(s: &str) -> Option<Self> {
+        if s.len() > Self::CAPACITY {
+            return None;
+        }
+        let mut buf = [0u8; Self::CAPACITY];
+        buf[..s.len()].copy_from_slice(s.as_bytes());
+        Some(Self { len: s.len() as u8, buf })
+    }
+
     pub fn as_str(&self) -> &str {
         // SAFETY-free: `new` copies a prefix ending at a char boundary of a `str`
         std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
@@ -2740,8 +2751,30 @@ impl ArmObservation {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn blank_rt() -> Self {
         let mut obs = Self::blank();
-        obs.safety_text_spare = SafetyTextSpare(String::with_capacity(crate::safety::SAFETY_LOG_TEXT_CAPACITY));
+        obs.ensure_rt_safety_text_spare();
         obs
+    }
+
+    /// Ensures `safety_text_spare` (or the owned `String` already inside `safety_state`) holds at
+    /// least `SAFETY_LOG_TEXT_CAPACITY` bytes so RT `set_safety_state` transitions never allocate
+    /// or drop a spare buffer (needed after cloning an `ArmObservation`, because
+    /// `SafetyTextSpare::clone` intentionally returns an empty `String`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn ensure_rt_safety_text_spare(&mut self) {
+        let needed = crate::safety::SAFETY_LOG_TEXT_CAPACITY;
+        match &mut self.safety_state {
+            SafetyState::Fault(crate::safety::FaultReason::Other(s))
+            | SafetyState::Fault(crate::safety::FaultReason::JointLimitExceeded { joint_name: s, .. }) => {
+                if s.capacity() < needed {
+                    s.reserve(needed - s.len());
+                }
+            }
+            _ => {
+                if self.safety_text_spare.0.capacity() < needed {
+                    self.safety_text_spare.0.reserve(needed - self.safety_text_spare.0.len());
+                }
+            }
+        }
     }
 
     /// Updates `self.safety_state` to match `next`, recycling any owned `String` buffer between

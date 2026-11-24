@@ -82,7 +82,7 @@ async fn armed(config: ArmConfig, arm: Arm) -> (ArmSupervisor, Arc<Mutex<Arm>>) 
     let supervisor = ArmSupervisor::new(config).with_driver(Box::new(FakeDriver(arm.clone())));
     supervisor.set_lease_enabled(false).await;
     supervisor.tick(DT).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.tick(DT).await;
     (supervisor, arm)
 }
@@ -115,7 +115,7 @@ async fn stream(supervisor: &ArmSupervisor, seconds: f64, target: impl Fn(f64, &
     let mut obs = supervisor.get_observation().await;
     for k in 0..(seconds / DT) as usize {
         let t = k as f64 * DT;
-        let _ = supervisor.servo(target(t, &obs.commanded_positions), obs.epoch_id).await;
+        let _ = supervisor.servo(supervisor.capture_admission_stamp(), target(t, &obs.commanded_positions), obs.epoch_id).await;
         obs = tick(supervisor).await;
         let v = supervisor.inner().read().await.commanded_velocities.clone();
         stats.record(&obs, &v);
@@ -193,7 +193,7 @@ async fn a4_targets_beyond_the_limits_report_joint_limit_without_fault() {
         let obs = supervisor.get_observation().await;
         let mut t = obs.commanded_positions.clone();
         t[1] = 2.5; // J2 limit 2.0944
-        if supervisor.servo(t, obs.epoch_id).await.is_err() { rejected += 1; }
+        if supervisor.servo(supervisor.capture_admission_stamp(), t, obs.epoch_id).await.is_err() { rejected += 1; }
         let obs = tick(&supervisor).await;
         stats.record(&obs, &[]);
         assert_eq!(obs.motion_limit.as_ref().map(|l| (l.reason, l.joint)), Some((MotionLimitReason::JointLimit, Some(1))));
@@ -213,7 +213,7 @@ async fn a4_targets_beyond_the_limits_report_joint_limit_without_fault() {
         let obs = supervisor.get_observation().await;
         let mut t = obs.commanded_positions.clone();
         t[3] = (t[3] + 0.3).min(profile().limits[3].max_position); // J4 limit
-        supervisor.servo(t, obs.epoch_id).await.unwrap();
+        supervisor.servo(supervisor.capture_admission_stamp(), t, obs.epoch_id).await.unwrap();
         let obs = tick(&supervisor).await;
         seen |= obs.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::JointLimit && l.joint == Some(3));
         assert!(obs.safety_state.is_operational());
@@ -238,7 +238,7 @@ async fn a5_workspace_rejection_reports_workspace() {
         }
         found.expect("a pose outside the workspace")
     };
-    let err = supervisor.servo(bad, obs.epoch_id).await.unwrap_err();
+    let err = supervisor.servo(supervisor.capture_admission_stamp(), bad, obs.epoch_id).await.unwrap_err();
     assert!(format!("{err:?}").contains("Workspace"), "{err:?}");
     let obs = tick(&supervisor).await;
     let l = obs.motion_limit.expect("motion_limit");
@@ -256,7 +256,7 @@ async fn b_blocked_joint_holds_without_fault_and_accepts_the_next_command() {
         let obs = supervisor.get_observation().await;
         let mut t = obs.commanded_positions.clone();
         t[1] += 0.3;
-        let _ = supervisor.servo(t, obs.epoch_id).await;
+        let _ = supervisor.servo(supervisor.capture_admission_stamp(), t, obs.epoch_id).await;
         let obs = tick(&supervisor).await;
         max_lead = max_lead.max((obs.commanded_positions[1] - obs.positions[1]).abs());
         assert!(obs.safety_state.is_operational(), "no Fault: {:?}", obs.safety_state);
@@ -283,7 +283,7 @@ async fn b_blocked_joint_holds_without_fault_and_accepts_the_next_command() {
     let obs = supervisor.get_observation().await;
     let mut t = obs.commanded_positions.clone();
     t[1] += 0.1;
-    supervisor.servo(t.clone(), obs.epoch_id).await.expect("next command accepted");
+    supervisor.servo(supervisor.capture_admission_stamp(), t.clone(), obs.epoch_id).await.expect("next command accepted");
     for _ in 0..100 { tick(&supervisor).await; }
     let obs = supervisor.get_observation().await;
     assert!((obs.positions[1] - t[1]).abs() < 0.02, "J2 reached {} (target {})", obs.positions[1], t[1]);
@@ -323,7 +323,7 @@ async fn c_pushed_while_holding_latches_the_fault() {
         let obs = supervisor.get_observation().await;
         let mut t = obs.commanded_positions.clone();
         t[1] += 0.3;
-        let _ = supervisor.servo(t, obs.epoch_id).await;
+        let _ = supervisor.servo(supervisor.capture_admission_stamp(), t, obs.epoch_id).await;
         if tick(&supervisor).await.motion_limit.is_some_and(|l| l.reason == MotionLimitReason::Blocked) { break; }
     }
     assert!(supervisor.inner().read().await.servo_blocked_hold);

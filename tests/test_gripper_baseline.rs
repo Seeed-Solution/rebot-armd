@@ -9,6 +9,10 @@
 //! 0.55-0.7 N·m near open, with tick-to-tick noise and a run-to-run offset.
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[global_allocator]
+static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
+
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
 use armd::gripper_baseline::{ContactSource, Direction, ThresholdSource};
 use armd::model::{ArmConfig, GripperPolicy, JointState};
@@ -116,12 +120,39 @@ impl ArmDriver for RigDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { true }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.resize(7, Some(Duration::ZERO));
+    }
+    fn feedback_all_within(&self, dof: usize, _max_age: Duration) -> bool { dof == 7 }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        out.clear();
+        out.resize(7, Some(0));
+    }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) {
+        out.clear();
+        out.resize(7, Some(std::time::Instant::now()));
+    }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { out.clear(); }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<std::time::Instant>>) { out.clear(); }
+    fn clear_fault_disables_arm_joint(&self, _arm_dof: usize) -> bool { false }
+    fn has_hardware_fault(&self) -> bool { false }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let mut out = Vec::with_capacity(7);
+        self.read_joint_states_into(&mut out)?;
+        Ok(out)
+    }
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         let r = self.0.lock().unwrap();
-        Ok((0..7).map(|i| JointState { position: r.q[i], velocity: r.v[i], torque: r.tau[i], temperature: 30.0 }).collect())
+        out.clear();
+        for i in 0..7 {
+            out.push(JointState { position: r.q[i], velocity: r.v[i], torque: r.tau[i], temperature: 30.0 });
+        }
+        Ok(())
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut r = self.0.lock().unwrap();
@@ -176,7 +207,9 @@ fn rig(finger: Finger) -> (SupervisorInner, Arc<Mutex<Rig>>) {
     // the baseline is bound to the follower kind
     inner.follower = Some("rig".into());
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    armd::SupervisorInner::enable_torque(admitted).unwrap();
     (inner, rig)
 }
 
@@ -188,7 +221,9 @@ fn req(command: GripperCommand, fraction: Option<f64>, speed: f64) -> GripperReq
 /// within a second); (action, seconds).
 fn run_with(inner: &mut SupervisorInner, request: GripperRequest, cmd: GripperBaselineCmd) -> (armd::motion::ActionStatus, f64) {
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_gripper_with_baseline(request, epoch, cmd).unwrap();
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    let (id, _) = armd::SupervisorInner::start_gripper_with_baseline(admitted, request, epoch, cmd).unwrap();
     for i in 0..(30.0 / DT) as usize {
         inner.tick(DT);
         let a = inner.last_action.clone().unwrap();
@@ -301,24 +336,40 @@ fn new_finger_soft_object_is_detected_and_held_under_the_cap() {
     learn(&mut inner, &rig, 2);
     let estimate = |inner: &SupervisorInner| inner.gripper_baseline.as_ref().unwrap().estimate(-1.5, Direction::Close, 1.0).unwrap().baseline_nm;
     let (close_moves, base_before) = (baseline_obs(&inner).close_moves, estimate(&inner));
+    let mut saw_baseline_contact = false;
     for (k1, k2) in [(1.5_f32, 8.0_f32), (0.8, 4.0), (3.0, 20.0)] {
         { let mut r = rig.lock().unwrap(); r.load = Load::Soft(-2.0, k1, k2); r.peak_tau = 0.0; }
+        inner.gripper_last_contact = None;
+        let trips_before = inner.gripper_force_trips;
         let (a, t) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
-        let c = inner.gripper_last_contact.unwrap();
+        let c = inner.gripper_last_contact;
         let peak = rig.lock().unwrap().peak_tau;
         eprintln!("soft k1 {k1}: {} holding {:?} in {t:.1} s at {:.3} rad, contact {c:?}, peak {peak:.2}", a.state, a.holding, inner.measured_positions[6]);
         assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "k1 {k1}: {a:?}");
-        assert!(c.at_rad > -2.05 && c.at_rad < -1.3, "{c:?}");
+        match c {
+            Some(c) => {
+                assert!(c.at_rad > -2.05 && c.at_rad < -1.3, "{c:?}");
+                if c.source == ContactSource::Torque {
+                    assert_eq!(c.threshold_source, ThresholdSource::Baseline);
+                    assert!(c.margin_nm.unwrap() > 0.1, "{c:?}");
+                    saw_baseline_contact = true;
+                }
+            }
+            None => {
+                // With J7's 0.82 N·m moving floor + 3-tick requirement, a stiff piecewise ramp
+                // can cross the 1-tick torque cap before 3 moving ticks elapse; the grasp still
+                // catches and holds the object cleanly under the cap.
+                assert!(inner.gripper_force_trips > trips_before, "k1 {k1}: neither contact nor cap trip");
+                assert!(inner.measured_positions[6] > -2.05 && inner.measured_positions[6] < -1.3,
+                    "k1 {k1}: J7 {}", inner.measured_positions[6]);
+            }
+        }
         // the cap latches after GRIPPER_FORCE_CAP_TICKS ticks (test_gripper_force CAP_MARGIN_NM)
         assert!(peak < cap() + 0.25, "peak {peak:.3}");
         // and the grip settles at or below the cap
         rig.lock().unwrap().peak_tau = 0.0;
         for _ in 0..50 { inner.tick(DT); }
         assert!(rig.lock().unwrap().peak_tau <= cap() + 1e-3);
-        if c.source == ContactSource::Torque {
-            assert_eq!(c.threshold_source, ThresholdSource::Baseline);
-            assert!(c.margin_nm.unwrap() > 0.1, "{c:?}");
-        }
         assert!(t < 8.0, "{t:.1} s");
         // holding: not learned
         assert_eq!(baseline_obs(&inner).close_moves, close_moves);
@@ -327,6 +378,7 @@ fn new_finger_soft_object_is_detected_and_held_under_the_cap() {
         let (a, _) = run(&mut inner, req(GripperCommand::Open, None, 1.0));
         assert_eq!(a.state, "done");
     }
+    assert!(saw_baseline_contact, "expected at least one soft case to trigger Baseline contact before cap");
     assert!((estimate(&inner) - base_before).abs() < 0.02, "{} -> {}", base_before, estimate(&inner));
 }
 
@@ -362,16 +414,20 @@ fn incident_still_stops_at_the_cap_with_a_baseline() {
     }
 }
 
-/// Old finger (0.40 N·m everywhere): calibrated, the soft object is caught where the former
-/// absolute rule caught it; uncalibrated (0.85 N·m threshold) later. Both hold it.
+/// Old finger (0.40 N·m everywhere): while moving, both calibrated and uncalibrated respect J7's
+/// 0.82 N·m moving floor and catch/hold a soft object under the cap; once stopped on a rigid
+/// object, calibrated triggers at baseline + margin (0.55 N·m) and uncalibrated at
+/// contact_torque_nm (0.60 N·m).
 #[test]
 fn old_finger_contact_unchanged_by_the_baseline() {
-    let contact = |learned: bool| {
+    let contact = |learned: bool, load: Load| {
         let (mut inner, rig) = rig(Finger::Old);
         if learned { learn(&mut inner, &rig, 2); }
-        rig.lock().unwrap().load = Load::Soft(-2.0, 1.5, 8.0);
+        rig.lock().unwrap().load = load;
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner.start_gripper(req(GripperCommand::Close, None, 1.0), epoch).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
         let mut first = None;
         loop {
             inner.tick(DT);
@@ -384,22 +440,32 @@ fn old_finger_contact_unchanged_by_the_baseline() {
             }
         }
         let peak = rig.lock().unwrap().peak_tau;
-        (first, peak, inner.gripper_force_trips)
+        (first, peak, inner.gripper_force_trips, inner.measured_positions[6])
     };
-    let (c0, p0, trips0) = contact(false);
-    let (c1, p1, _) = contact(true);
-    eprintln!("old finger: unlearned {c0:?} peak {p0:.2} trips {trips0}; calibrated {c1:?} peak {p1:.2}");
-    let c1 = c1.expect("calibrated: torque contact");
-    // calibrated (0.40 + 0.15 = 0.55 N·m): where the former absolute rule (0.6 N·m) found it,
-    // 0.6 = 0.40 + 1.5 x pen at pen 0.13 rad (-1.87 rad), within 0.1 rad
-    assert_eq!(c1.threshold_source, ThresholdSource::Baseline);
-    assert!((c1.at_rad - (-1.867)).abs() < 0.1, "{c1:?}");
-    // uncalibrated (0.85 N·m): later, or the cap latches first; held either way
-    match c0 {
-        Some(c0) => assert!(c0.threshold_source == ThresholdSource::Uncalibrated && c0.at_rad >= c1.at_rad, "{c0:?} vs {c1:?}"),
-        None => assert!(trips0 >= 1, "uncalibrated: neither a contact nor a cap trip"),
+    // Moving soft object: both enforce J7's 0.82 N·m moving floor (neither falsely triggers at
+    // 0.55-0.80 N·m while moving) and catch/hold cleanly under cap + margin.
+    let (c0, p0, trips0, q0) = contact(false, Load::Soft(-2.0, 1.5, 8.0));
+    let (c1, p1, trips1, q1) = contact(true, Load::Soft(-2.0, 1.5, 8.0));
+    eprintln!("old finger soft: unlearned {c0:?} peak {p0:.2} trips {trips0} q {q0:.3}; calibrated {c1:?} peak {p1:.2} trips {trips1} q {q1:.3}");
+    for (label, c, trips, q) in [("uncalibrated", c0, trips0, q0), ("calibrated", c1, trips1, q1)] {
+        match c {
+            Some(c) => assert!(c.torque_nm >= armd::motion::GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM - 1e-4, "{label}: {c:?}"),
+            None => assert!(trips >= 1 && q > -2.0 && q < -1.5, "{label}: neither moving contact nor cap trip (q={q})"),
+        }
     }
     assert!(p0 <= cap() + 0.25 && p1 <= cap() + 0.25, "{p0} {p1}");
+
+    // Stopped rigid contact at -2.0 rad: calibrated uses baseline + margin (0.55 N·m),
+    // uncalibrated uses contact_torque_nm (0.60 N·m).
+    let (s0, _, _, _) = contact(false, Load::CloseBlock(-2.0, 3.0));
+    let (s1, _, _, _) = contact(true, Load::CloseBlock(-2.0, 3.0));
+    let s0 = s0.expect("uncalibrated stopped contact");
+    let s1 = s1.expect("calibrated stopped contact");
+    assert_eq!(s0.threshold_source, ThresholdSource::Uncalibrated);
+    assert_eq!(s1.threshold_source, ThresholdSource::Baseline);
+    assert!((s1.threshold_nm.unwrap() - 0.55).abs() < 0.03, "{s1:?}");
+    assert!((s0.threshold_nm.unwrap() - 0.60).abs() < 1e-3, "{s0:?}");
+    assert!((s1.at_rad - (-2.0)).abs() < 0.02 && (s0.at_rad - (-2.0)).abs() < 0.02);
 }
 
 /// After lubrication (free torque 0.65 x everywhere) the baseline follows down over a few
@@ -468,7 +534,9 @@ fn reset_happens_only_after_admission() {
     learn(&mut inner, &rig, 1);
     let before = inner.gripper_baseline.clone();
     let epoch = inner.safety.epoch_id();
-    assert!(inner.start_gripper_with_baseline(req(GripperCommand::Open, None, 1.0), epoch + 1, GripperBaselineCmd::Reset).is_err());
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    assert!(armd::SupervisorInner::start_gripper_with_baseline(admitted, req(GripperCommand::Open, None, 1.0), epoch + 1, GripperBaselineCmd::Reset).is_err());
     assert_eq!(inner.gripper_baseline, before);
     let (a, _) = run_with(&mut inner, req(GripperCommand::Open, None, 1.0), GripperBaselineCmd::Reset);
     assert_eq!(a.state, "done");
@@ -497,7 +565,9 @@ fn slipped_object_is_not_held() {
             if learned { learn(&mut inner, &rig, 3); }
             rig.lock().unwrap().load = Load::SlipAfter(-2.0, after);
             let epoch = inner.safety.epoch_id();
-            let (id, _) = inner.start_gripper(req(GripperCommand::Close, None, 1.0), epoch).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
             let mut first = None;
             let a = loop {
                 inner.tick(DT);
@@ -627,7 +697,9 @@ async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>
         inner.lease_enabled = false;
         inner.follower = Some("rig".into());
         inner.tick(DT);
-        inner.set_torque(true).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
     }
     let ticker = sup.clone();
     tokio::spawn(async move {
@@ -652,7 +724,7 @@ async fn calib_wait(sup: &armd::ArmSupervisor, id: u64, mut each: impl FnMut(&ar
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn calibration_action_learns_from_free_strokes() {
     let (sup, _rig) = calib_rig(Finger::New).await;
-    let (id, expected) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+    let (id, expected) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
     assert!(expected > 60.0, "{expected}");
     let mut phases = Vec::new();
     let a = calib_wait(&sup, id, |a| { if let Some(p) = a.phase { if phases.last() != Some(&p) { phases.push(p); } } }).await;
@@ -677,7 +749,7 @@ async fn calibration_action_obstructed_or_stopped_learns_nothing() {
             inner.gripper_baseline.clone()
         };
         if case == "soft" { rig.lock().unwrap().load = Load::Soft(-3.0, 1.0, 4.0); }
-        let (id, _) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+        let (id, _) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
         let mut stopped = false;
         let sup2 = sup.clone();
         let a = calib_wait(&sup, id, |a| {
@@ -726,7 +798,9 @@ fn gripper_zero_change_invalidates_the_baseline() {
     assert!(inner.gripper_baseline_dirty);
     inner.set_joint_zero_offsets(&[0.0; 7]).unwrap();
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    armd::SupervisorInner::enable_torque(admitted).unwrap();
     // a moved stroke (gripper calibration offset): the next motion starts unlearned
     learn(&mut inner, &rig, 1);
     let p = inner.config.gripper_policy.as_mut().unwrap();
@@ -748,7 +822,7 @@ async fn calibration_fails_on_a_thin_obstruction_before_the_closed_stroke_end() 
         let (sup, rig) = calib_rig(Finger::New).await;
         let before = { let mut inner = sup.inner().write().await; inner.gripper_baseline_for_motion(); inner.gripper_baseline.clone() };
         rig.lock().unwrap().load = Load::CloseBlock(target - 0.10, k);
-        let (id, _) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+        let (id, _) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
         let a = calib_wait(&sup, id, |_| {}).await;
         for _ in 0..200 {
             if sup.inner().read().await.gripper_calibration.is_none() { break; }
@@ -782,7 +856,9 @@ fn move_that_stops_short_on_an_object_releases_its_lead() {
         let (mut inner, rig) = rig(Finger::New);
         rig.lock().unwrap().load = Load::CloseBlock(target - 0.10, k);
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner.start_gripper(req(GripperCommand::Move, Some(0.05), 0.3), epoch).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Move, Some(0.05), 0.3), epoch).unwrap();
         let a = loop {
             inner.tick(DT);
             let a = inner.last_action.clone().unwrap();
@@ -852,4 +928,483 @@ fn default_deadline_covers_a_slow_full_stroke() {
     let slowest = armd::motion::GripperMotion::new(GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 0.05, timeout_s: None, tag: None },
         p.clone(), lim, p.open_rad, 6);
     assert_eq!(slowest.timeout_s, armd::motion::GRIPPER_MAX_DEFAULT_TIMEOUT_S);
+}
+
+/// I16 Item 1: A moving jaw with a torque bump below J7's moving torque floor (0.82 N·m, or
+/// 0.9 * ceiling_estimate) — or a brief <3-tick spike above it — must NOT trigger contact or
+/// stall on ANY gripper path (direct action, macro grasp/place/sequence, calibration stroke,
+/// or servo stream, including slow closing speeds |v| < 0.10 rad/s), whether calibrated or
+/// uncalibrated. Once net progress stops over the window, contact triggers cleanly on both
+/// grasp and stream paths.
+#[test]
+fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
+    use armd::motion::{GripperContactDetector, GripperContactInput, GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM};
+
+    // 1. Direct gripper action (grasp: true and grasp: false), both calibrated (baseline 0.40 ->
+    //    stopped threshold 0.55 N·m) and uncalibrated, with sustained 0.75 N·m drag bump while moving.
+    for learned in [false, true] {
+        for grasp in [true, false] {
+            let (mut inner, rig) = rig(Finger::Old);
+            if learned { learn(&mut inner, &rig, 2); }
+            rig.lock().unwrap().load = Load::Drag(-4.5, -1.5, 0.35); // 0.40 + 0.35 = 0.75 N·m while moving
+            let epoch = inner.safety.epoch_id();
+            let req_cmd = GripperRequest { command: GripperCommand::Close, fraction: None, grasp, speed: 0.30, timeout_s: None, tag: None };
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let (id, _) = SupervisorInner::start_gripper(admitted, req_cmd, epoch).unwrap();
+            let a = loop {
+                inner.tick(DT);
+                if inner.measured_positions[6] < -0.35 {
+                    assert!(!inner.gripper_stalled, "action learned={learned} grasp={grasp}: false stall at {}", inner.measured_positions[6]);
+                    assert!(inner.gripper_last_contact.is_none(), "action learned={learned} grasp={grasp}: false contact {:?}", inner.gripper_last_contact);
+                }
+                let a = inner.last_action.clone().unwrap();
+                assert_eq!(a.id, id);
+                if !a.is_running() { break a; }
+            };
+            assert_eq!(a.state, "done", "action learned={learned} grasp={grasp}: {a:?}");
+            if grasp { assert_eq!(a.holding, Some(false), "action learned={learned}: {a:?}"); }
+            assert!(inner.measured_positions[6] > -0.10, "action learned={learned} grasp={grasp}: ended at {}", inner.measured_positions[6]);
+        }
+    }
+
+    // 2. Macro paths (grasp / place / sequence share `start_macro_gripper_within`, calibration
+    //    uses `start_macro_gripper_learning_within`), calibrated and uncalibrated, with 0.75 N·m bump.
+    for learned in [false, true] {
+        for (label, grasp, calib) in [("macro_grasp", true, false), ("macro_place_seq", false, false), ("calibration", false, true)] {
+            let (mut inner, rig) = rig(Finger::Old);
+            if learned { learn(&mut inner, &rig, 2); }
+            rig.lock().unwrap().load = Load::Drag(-4.5, -1.5, 0.35); // 0.75 N·m while moving
+            let epoch = inner.safety.epoch_id();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let macro_id = SupervisorInner::begin_orchestrated_action(admitted, if calib { "gripper_calibrate" } else { "grasp" }, None, epoch).unwrap();
+            let request = GripperRequest {
+                command: if calib { GripperCommand::Move } else { GripperCommand::Close },
+                fraction: calib.then_some(0.05),
+                grasp,
+                speed: 0.30,
+                timeout_s: None,
+                tag: None,
+            };
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            if calib {
+                SupervisorInner::start_macro_gripper_learning_within(admitted, macro_id, request, armd::motion::LearnMode::Calibration, None, false).unwrap();
+            } else {
+                SupervisorInner::start_macro_gripper_within(admitted, macro_id, request, None, false).unwrap();
+            }
+            let target_rad = if calib {
+                let p = GripperPolicy::rebot_dm();
+                p.closed_rad + 0.05 * (p.open_rad - p.closed_rad)
+            } else {
+                0.0
+            };
+            let mut finished = false;
+            for _ in 0..(30.0 / DT) as usize {
+                inner.tick(DT);
+                if inner.measured_positions[6] < target_rad - 0.35 {
+                    assert!(!inner.gripper_stalled, "{label} learned={learned}: false stall at {}", inner.measured_positions[6]);
+                    assert!(inner.gripper_last_contact.is_none(), "{label} learned={learned}: false contact {:?}", inner.gripper_last_contact);
+                }
+                let sub = inner.macro_run.as_ref().unwrap().sub.clone();
+                match sub {
+                    armd::macro_action::SubState::Done(d) => {
+                        if grasp { assert_eq!(d.holding, Some(false), "{label} learned={learned}: {d:?}"); }
+                        finished = true;
+                        break;
+                    }
+                    armd::macro_action::SubState::Failed { code, message } => {
+                        panic!("{label} learned={learned} failed: {code}: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(finished, "{label} learned={learned}: did not finish");
+            assert!((inner.measured_positions[6] - target_rad).abs() < 0.10, "{label} learned={learned}: ended at {}", inner.measured_positions[6]);
+        }
+    }
+
+    // 3. Stream path (servo stream):
+    //    3a. Moving jaw at 0.30 rad/s and slow 0.06 rad/s (|v| < 0.10 rad/s!) with sustained
+    //        0.75 N·m bump (above calibrated 0.55, contact_torque_nm 0.60, and stall_nm 0.444,
+    //        below J7's 0.82 N·m moving floor): regulator must NOT engage and stall must NOT latch.
+    for learned in [false, true] {
+        for speed in [0.30_f32, 0.06_f32] {
+            let (mut inner, rig) = rig(Finger::Old);
+            if learned { learn(&mut inner, &rig, 2); }
+            rig.lock().unwrap().load = Load::Drag(-5.65, -0.5, 0.35); // 0.75 N·m across travel (including slow 0.06 rad/s ramp from -5.7)
+            let epoch = inner.safety.epoch_id();
+            let mut target = INSPECT.to_vec();
+            // Run 2.5 s of closing ramp (~0.75 rad at 0.30 rad/s or ~0.15 rad at 0.06 rad/s),
+            // far longer than the 0.10-0.14 s progress window.
+            let mut g = INSPECT[6];
+            let mut saw_high_tau = false;
+            for _ in 0..125 {
+                g = (g + speed * DT as f32).min(0.0);
+                target[6] = g;
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::servo(admitted, target.clone(), epoch).unwrap();
+                inner.tick(DT);
+                let r = rig.lock().unwrap();
+                if r.tau[6].abs() >= 0.70 { saw_high_tau = true; }
+                assert!(
+                    inner.gripper_stream_contact.is_none(),
+                    "stream learned={learned} speed={speed}: false stream contact {:?} while moving (q={:.3}, v={:.3}, tau={:.3})",
+                    inner.gripper_stream_contact, r.q[6], r.v[6], r.tau[6]
+                );
+                assert!(
+                    !inner.gripper_stalled,
+                    "stream learned={learned} speed={speed}: false stall while moving (q={:.3}, v={:.3}, tau={:.3})",
+                    r.q[6], r.v[6], r.tau[6]
+                );
+            }
+            assert!(saw_high_tau, "stream learned={learned} speed={speed}: test never exercised >= 0.70 N·m drag");
+            assert!(
+                rig.lock().unwrap().q[6] > INSPECT[6] + 0.05,
+                "stream learned={learned} speed={speed}: jaw did not advance"
+            );
+        }
+    }
+
+    //    3b. Moving jaw under stream with a 2-tick 0.90 N·m torque spike (>= 0.82 N·m moving floor,
+    //        < 3 sustained ticks): must NOT trigger single-sample stream contact.
+    for learned in [false, true] {
+        let (mut inner, rig) = rig(Finger::Old);
+        if learned { learn(&mut inner, &rig, 2); }
+        let epoch = inner.safety.epoch_id();
+        let mut target = INSPECT.to_vec();
+        let mut g = INSPECT[6];
+        let mut saw_spike_tau = false;
+        for tick in 0..80 {
+            g = (g + 0.30 * DT as f32).min(0.0);
+            target[6] = g;
+            // Inject a 2-tick 0.90 N·m torque bump mid-travel (ticks 30 and 31).
+            rig.lock().unwrap().load = if tick == 30 || tick == 31 {
+                Load::Drag(-6.0, 0.0, 0.50) // 0.40 + 0.50 = 0.90 N·m
+            } else {
+                Load::Free
+            };
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::servo(admitted, target.clone(), epoch).unwrap();
+            inner.tick(DT);
+            if rig.lock().unwrap().tau[6].abs() >= 0.85 {
+                saw_spike_tau = true;
+            }
+            assert!(
+                inner.gripper_stream_contact.is_none(),
+                "stream 2-tick spike learned={learned} tick={tick}: false contact {:?}",
+                inner.gripper_stream_contact
+            );
+            assert!(!inner.gripper_stalled, "stream 2-tick spike learned={learned} tick={tick}: false stall");
+        }
+        assert!(saw_spike_tau, "stream 2-tick spike learned={learned}: never observed >= 0.85 N·m spike");
+    }
+
+    //    3c. Stopped jaw on a rigid block under a closing stream: once net progress stops over the
+    //        window, the stream regulator DOES engage cleanly and prevents stall latch.
+    for learned in [false, true] {
+        let (mut inner, rig) = rig(Finger::Old);
+        if learned { learn(&mut inner, &rig, 2); }
+        rig.lock().unwrap().load = Load::CloseBlock(-5.3, 3.0);
+        let epoch = inner.safety.epoch_id();
+        let mut target = INSPECT.to_vec();
+        let mut g = INSPECT[6];
+        for _ in 0..150 {
+            g = (g + 0.30 * DT as f32).min(0.0);
+            target[6] = g;
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::servo(admitted, target.clone(), epoch).unwrap();
+            inner.tick(DT);
+        }
+        assert!(inner.gripper_stream_contact.is_some(), "stream stopped learned={learned}: regulator did not engage");
+        assert!(!inner.gripper_stalled, "stream stopped learned={learned}: regulator failed to preempt stall");
+    }
+
+    // 4. Shared detector unit check: moving floor scales with 0.9 * ceiling_torque_estimate_nm
+    //    even with a calibrated baseline (baseline 0.40 -> stopped thresh 0.55 N·m, ceiling 1.0 ->
+    //    moving floor 0.90 N·m). Moving at 0.86 N·m for 10 ticks does NOT trigger; once stopped,
+    //    0.56 N·m triggers after the net-progress window.
+    let (mut inner, rig) = rig(Finger::Old);
+    learn(&mut inner, &rig, 2);
+    let baseline = inner.gripper_baseline.as_ref().unwrap();
+    let mut det = GripperContactDetector::default();
+    let mut q = -4.0_f32;
+    for _ in 0..10 {
+        q += 0.006; // moving at 0.30 rad/s
+        let ev = det.step(&GripperContactInput {
+            baseline: Some(baseline),
+            contact_torque_nm: Some(0.60),
+            max_close_torque_nm: Some(1.0),
+            ceiling_torque_estimate_nm: Some(1.0), // 0.9 * 1.0 = 0.90 > 0.82
+            stopped_stall_nm: None,
+            measured_pos: q,
+            dir: 1.0,
+            baseline_speed: 0.30,
+            window_speed: Some(0.30),
+            tau_abs: 0.86,
+            dt: DT,
+            torque_feedback: true,
+            active: true,
+        });
+        assert!(!ev.triggered && !ev.progress_stopped, "moving 0.86 N·m below 0.9*ceil=0.90 triggered: {ev:?}");
+        assert!(ev.threshold_nm.unwrap() >= 0.90_f32.max(GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM) - 1e-5);
+    }
+    // Now jaw stops at q with 0.56 N·m (>= calibrated 0.55 N·m, < 0.60 contact_torque_nm).
+    let mut stopped_hit = false;
+    for _ in 0..8 {
+        let ev = det.step(&GripperContactInput {
+            baseline: Some(baseline),
+            contact_torque_nm: Some(0.60),
+            max_close_torque_nm: Some(1.0),
+            ceiling_torque_estimate_nm: Some(1.0),
+            stopped_stall_nm: None,
+            measured_pos: q,
+            dir: 1.0,
+            baseline_speed: 0.30,
+            window_speed: Some(0.30),
+            tau_abs: 0.56,
+            dt: DT,
+            torque_feedback: true,
+            active: true,
+        });
+        if ev.triggered {
+            assert!(ev.progress_stopped);
+            assert_eq!(ev.threshold_source, ThresholdSource::Baseline);
+            stopped_hit = true;
+            break;
+        }
+    }
+    assert!(stopped_hit, "stopped jaw at 0.56 N·m (>= calibrated 0.55 N·m) did not trigger");
+}
+
+/// I16 Item 4: Automatic baseline learning must consume queued `MoveRecord`s off the control
+/// thread under BOTH `RtOwner::Executor` and `RtOwner::Legacy`, without allocating on
+/// `armd-control`, enforcing tool/follower isolation, updating the owner's live baseline
+/// observation, and persisting to disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
+    use armd::gripper_baseline::{FreeTorqueBaseline, MoveRecord, MoveSamples};
+    use armd::rt_core::executor::ExecutorConfig;
+    use armd::ArmSupervisor;
+
+    // Positive control proving `TimedAlloc` is active as #[global_allocator] in this test binary
+    // so `lock_alloc_calls == 0` below cannot be vacuously zero.
+    std::thread::spawn(|| {
+        armd::diagnostics::alloc::time_this_thread();
+        let _ = armd::diagnostics::alloc::take();
+        let probe: Vec<u8> = vec![0xAB; 64];
+        std::hint::black_box(&probe);
+        drop(probe);
+        let stats = armd::diagnostics::alloc::take();
+        assert!(stats.calls > 0, "TimedAlloc positive control failed: calls={}", stats.calls);
+    })
+    .join()
+    .unwrap();
+
+    let make_open_record = |tau_nm: f32| -> MoveRecord {
+        let mut samples = MoveSamples::default();
+        for i in 0..=200 {
+            let q = 0.0 + (-5.7) * (i as f32 / 200.0);
+            samples.push(q, tau_nm, 1.0);
+        }
+        MoveRecord {
+            direction: Direction::Open,
+            start_rad: 0.0,
+            end_rad: -5.7,
+            samples,
+            calibration: false,
+        }
+    };
+
+    // 1. Executor owner: a live unloaded full opening move (0.0 -> -5.7) finishes on `armd-control`
+    //    with `RigDriver` (Finger::Old = 0.40 N·m, torque_feedback = true) and queues a real
+    //    `MoveRecord` into `core.gripper_baseline_pending`. A foreign-tool baseline (`"other-tool"`,
+    //    0.99 N·m, 7 open moves) is seeded on the owner right before executor start so
+    //    `TakeBaselinePending` MUST filter it out via `belongs_to` and `StoreBaseline` MUST return
+    //    it off-thread for zero-free reclamation on `armd-control`.
+    let dir = tempfile::tempdir().unwrap();
+    let baseline_path = dir.path().join("gripper_baseline.rig.json");
+
+    let mut q_closed = INSPECT;
+    q_closed[6] = 0.0;
+    let live_rig = Arc::new(Mutex::new(Rig {
+        q: q_closed,
+        v: [0.0; 7],
+        tau: [0.0; 7],
+        enabled: EnableState::Disabled,
+        finger: Finger::Old,
+        load: Load::Free,
+        seed: 7,
+        offset: 0.0,
+        broke: false,
+        peak_tau: 0.0,
+        pressed: 0,
+    }));
+    let sup = Arc::new(
+        ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(RigDriver(live_rig.clone()))),
+    );
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.follower = Some("rig".into());
+        inner.gripper_baseline_path = Some(baseline_path.clone());
+        inner.tick(DT);
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
+        let ep = inner.safety.epoch_id();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::start_gripper(
+            admitted,
+            GripperRequest {
+                command: GripperCommand::Open,
+                fraction: None,
+                grasp: false,
+                speed: 3.0,
+                timeout_s: Some(10.0),
+                tag: None,
+            },
+            ep,
+        )
+        .unwrap();
+        // Seed the foreign-tool baseline AFTER `start_gripper` (which calls
+        // `gripper_baseline_for_motion`) so it is genuinely present in `core.gripper_baseline`
+        // when `TakeBaselinePending` and `StoreBaseline` execute on `armd-control`.
+        let mut foreign = FreeTorqueBaseline::new(
+            0.0,
+            -5.7,
+            Some("other-tool".into()),
+            Some("deadbeef".into()),
+            Some("rig".into()),
+        );
+        foreign.learn(&make_open_record(0.99), 2.0);
+        foreign.open_moves = 7;
+        inner.gripper_baseline = Some(foreign);
+    }
+
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg.alloc_timing = true;
+    let handle = sup.start_executor(cfg).await.unwrap();
+
+    // Let the live full-stroke opening motion finish on `armd-control` first: the control thread
+    // only queues the MoveRecord (never learns synchronously on `armd-control`), so `open_moves`
+    // stays 0 until the off-thread consumer starts.
+    let motion_deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < motion_deadline {
+        let obs = sup.get_observation().await;
+        if obs.action.as_ref().is_some_and(|a| !a.is_running()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pre_obs = sup.get_observation().await;
+    assert!(pre_obs.action.as_ref().is_some_and(|a| a.state.as_str() == "done"), "{:?}", pre_obs.action);
+    assert_eq!(pre_obs.gripper.as_ref().and_then(|g| g.baseline).unwrap().open_moves, 0);
+
+    let consumer = armd::gripper_calib::spawn_baseline_persister_with_interval(
+        sup.clone(),
+        Duration::from_millis(20),
+    );
+
+    // Wait until the consumer drains the live queued record, updates the owner's live baseline,
+    // and persists the JSON file to disk (read published StateHub observations so every
+    // maintenance release in `tick_samples` is a baseline op).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut learned_obs = None;
+    while std::time::Instant::now() < deadline {
+        let obs = sup.get_observation().await;
+        if let Some(b) = obs.gripper.and_then(|g| g.baseline) {
+            if b.open_moves >= 1 && b.state.as_str() == "learning" && baseline_path.exists() {
+                learned_obs = Some(b);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let obs_b = learned_obs.expect("executor baseline consumer did not drain/learn/persist queued records");
+    assert_eq!(obs_b.open_moves, 1, "expected 1 live open move (not foreign tool's 7): {obs_b:?}");
+    assert_eq!(obs_b.state.as_str(), "learning", "{obs_b:?}");
+
+    // Persisted file parses cleanly, belongs to the active tool (not "other-tool"), and learned
+    // the live Finger::Old opening stroke (~0.40 N·m, not the foreign 0.99 N·m table).
+    let raw = std::fs::read_to_string(&baseline_path).unwrap();
+    let persisted: FreeTorqueBaseline = serde_json::from_str(&raw).unwrap();
+    persisted.validate().unwrap();
+    assert_eq!(persisted.open_moves, 1, "{persisted:?}");
+    assert_ne!(persisted.tool_id.as_deref(), Some("other-tool"));
+    let est = persisted.estimate(-3.0, Direction::Open, 1.0).expect("open bin learned from live stroke");
+    assert!((est.baseline_nm - 0.40).abs() < 0.08, "expected ~0.40 N·m live open baseline (not foreign 0.99): {est:?}");
+
+    // Queue must now be empty on the executor owner, and a stale-generation StoreBaseline must
+    // be refused without mutating live state.
+    let taken_after = handle
+        .take_baseline_pending_async(false)
+        .await
+        .unwrap();
+    assert!(taken_after.moves.is_empty(), "queued records were not drained: {}", taken_after.moves.len());
+    assert!(taken_after.generation >= 1, "expected generation bump after store");
+    let stale_stored = handle
+        .store_baseline_async(persisted.clone(), taken_after.generation - 1, false)
+        .await
+        .unwrap();
+    assert!(!stale_stored, "stale generation StoreBaseline must be refused");
+
+    // Verify EVERY tick (including the live opening motion completion tick and EVERY maintenance
+    // release servicing TakeBaselinePending / StoreBaseline) did 0 allocations/frees on
+    // `armd-control` (measured by active `TimedAlloc` global allocator).
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let samples = sup.tick_samples();
+    let maint_allocs: Vec<(u64, u32)> = samples
+        .iter()
+        .filter(|s| s.maint_req_id != 0)
+        .map(|s| (s.maint_req_id, s.usage.lock_alloc_calls))
+        .collect();
+    assert!(maint_allocs.len() >= 2, "expected >= 2 baseline maintenance releases, got {maint_allocs:?}");
+    assert!(
+        maint_allocs.iter().all(|&(_, calls)| calls == 0),
+        "baseline maintenance op allocated on armd-control: {maint_allocs:?}"
+    );
+    // Verify EVERY post-warmup tick (`release_seq > 3`, after the 3 triple-buffer slots obtain
+    // their initial `ArmObservation` buffers — covering the live opening motion, its completion
+    // tick retiring `ActiveTrajectory` off-thread, and every baseline maintenance op) did 0
+    // allocations/frees on `armd-control` (measured by active `TimedAlloc` global allocator).
+    let post_warmup = samples.iter().filter(|s| s.release_seq > 3).count();
+    assert!(post_warmup >= 50, "expected >= 50 post-warmup ticks, got {post_warmup}");
+    let nonzero_ticks: Vec<(u64, u64, u32)> = samples
+        .iter()
+        .filter(|s| s.release_seq > 3 && s.usage.lock_alloc_calls != 0)
+        .map(|s| (s.release_seq, s.maint_req_id, s.usage.lock_alloc_calls))
+        .collect();
+    assert!(
+        nonzero_ticks.is_empty(),
+        "post-warmup control tick allocated/freed on armd-control (release_seq, maint_req_id, calls): {nonzero_ticks:?}"
+    );
+
+    // Stopping the executor causes the spawned consumer task to exit cleanly (no hang/panic).
+    handle.stop_and_join();
+    tokio::time::timeout(Duration::from_secs(2), consumer)
+        .await
+        .expect("baseline consumer did not exit after executor stop")
+        .unwrap();
+
+    // 2. Legacy owner parity: the same consumer helper drains & persists queued records in Legacy mode.
+    let dir_leg = tempfile::tempdir().unwrap();
+    let leg_path = dir_leg.path().join("gripper_baseline.legacy.json");
+    let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup_leg.inner().write().await;
+        inner.follower = Some("legacy".into());
+        inner.gripper_baseline_path = Some(leg_path.clone());
+        inner.gripper_baseline_pending.push(make_open_record(0.32));
+    }
+    assert!(armd::gripper_calib::step_baseline_persister_once(&sup_leg).await);
+    assert!(leg_path.exists(), "legacy baseline file not written");
+    let leg_obs = sup_leg.inner().read().await.gripper_baseline_observation();
+    assert_eq!(leg_obs.open_moves, 1, "{leg_obs:?}");
+    assert!(sup_leg.inner().read().await.gripper_baseline_pending.is_empty());
 }

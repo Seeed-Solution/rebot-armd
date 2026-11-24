@@ -140,6 +140,17 @@ impl Authority {
         if self.parent_generation != 0 && self.parent_generation != current.parent_generation { return Some("PARENT_REPLACED"); }
         None
     }
+
+    /// Authority check for stop-direction operations (such as torque disable) that must
+    /// remain executable across an authorized Stop: exempt from `stop_generation`, while
+    /// preserving epoch, lease, config, and parent checks.
+    pub fn admits_stop_direction(&self, current: &Authority) -> Option<&'static str> {
+        if self.epoch != current.epoch { return Some("EPOCH_MISMATCH"); }
+        if self.lease_generation != current.lease_generation { return Some("LEASE_LOST"); }
+        if self.config_revision != current.config_revision { return Some("PLAN_STALE"); }
+        if self.parent_generation != 0 && self.parent_generation != current.parent_generation { return Some("PARENT_REPLACED"); }
+        None
+    }
 }
 
 /// Who sent a command and under which authority, until when.
@@ -163,6 +174,14 @@ impl Stamp {
         if self.arm != arm || self.boot != boot || self.boot.is_zero() { return Some("WRONG_TARGET"); }
         if now > self.deadline { return Some("DEADLINE_EXPIRED"); }
         self.authority.admits(current)
+    }
+
+    /// Stop-direction stamp check (identity, deadline, and [`Authority::admits_stop_direction`]):
+    /// exempt from `stop_generation` so a Stop never blocks a queued torque disable.
+    pub fn check_stop_direction(&self, arm: ArmId, boot: BootId, now: Instant, current: &Authority) -> Option<&'static str> {
+        if self.arm != arm || self.boot != boot || self.boot.is_zero() { return Some("WRONG_TARGET"); }
+        if now > self.deadline { return Some("DEADLINE_EXPIRED"); }
+        self.authority.admits_stop_direction(current)
     }
 }
 

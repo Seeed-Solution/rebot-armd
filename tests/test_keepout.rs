@@ -50,7 +50,7 @@ fn profile_keepout_rejects_a_move_to_through_the_box() {
 #[test]
 fn keepout_applies_to_joint_moves_and_reports_the_box_name() {
     let mut inner = sim_at(with_boxes(vec![cube("bin_a", tcp(&INSPECT))]), &[0.0; 7]);
-    let err = inner.jog_action(INSPECT.to_vec(), None, None, "joint_move").unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, INSPECT.to_vec(), None, None, "joint_move")) } }.unwrap_err();
     let ArmError::Safety(e) = err else { panic!("{err:?}") };
     let api = armd::api::rest::ApiError::from(ArmError::Safety(e.clone()));
     assert_eq!(api.code.as_deref(), Some("WORKSPACE_VIOLATION"));
@@ -154,7 +154,7 @@ fn park_blocking_box(inner: &SupervisorInner) -> KeepoutBox {
 fn explicit_park_through_a_keepout_box_is_workspace_violation() {
     let probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
     let mut inner = sim_at(with_boxes(vec![park_blocking_box(&probe)]), &INSPECT);
-    let err = inner.unload_action().unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::unload_action(__a)) } }.unwrap_err();
     let api = armd::api::rest::ApiError::from(err);
     assert_eq!(api.code.as_deref(), Some("WORKSPACE_VIOLATION"), "{api:?}");
     assert!(api.message.contains("keepout 'on_park_path'"), "{}", api.message);
@@ -162,7 +162,7 @@ fn explicit_park_through_a_keepout_box_is_workspace_violation() {
     assert!(inner.is_torqued, "torque held");
     // Without the box the same park starts.
     let mut inner = sim_at(ArmConfig::rebot_dm(), &INSPECT);
-    assert!(inner.unload_action().unwrap().is_some());
+    assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::unload_action(__a)) } }.unwrap().is_some());
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn servo_stream_cannot_sweep_through_a_keepout_box() {
     let b = KeepoutBox { name: "between".into(), min_m: c.map(|v| (v - 0.02) as f32), max_m: c.map(|v| (v + 0.02) as f32) };
     let mut inner = sim_at(with_boxes(vec![b]), &INSPECT);
     let epoch = inner.safety.epoch_id();
-    inner.servo(target.to_vec(), epoch).expect("the target itself is outside the box");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, target.to_vec(), epoch)) } }.expect("the target itself is outside the box");
     let ws = inner.config.workspace.clone().unwrap();
     for _ in 0..300 {
         inner.tick(0.02);
@@ -234,7 +234,7 @@ fn keepout_change_is_busy_during_motion_and_makes_plans_stale() {
     let mut inner = sim_at(ArmConfig::rebot_dm(), &INSPECT);
     let mut q = INSPECT.to_vec();
     q[0] += 0.2;
-    inner.jog(q, None, None).unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, None, None)) } }.unwrap();
     let err = inner.set_keepout_boxes(vec![cube("late", [0.3, 0.3, 0.3])]).unwrap_err();
     assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("MOTION_BUSY"));
     assert!(inner.keepout_state().boxes.is_empty());
@@ -245,7 +245,7 @@ fn keepout_change_is_busy_during_motion_and_makes_plans_stale() {
     let path = plan_cartesian(&input, g, Speed::default()).unwrap();
     // the box lands on the planned path after planning
     inner.set_keepout_boxes(vec![cube("late", [p0[0] + 0.04, p0[1], p0[2]])]).unwrap();
-    let err = inner.install_path(&input, path, "move_to", None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::install_path(__a, &input, path, "move_to", None)) } }.unwrap_err();
     assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("PLAN_STALE"));
     assert!(inner.active_trajectory.is_none());
 }
@@ -256,7 +256,7 @@ fn joint_move_keepout_sampling_is_dense_enough_for_small_boxes() {
     let mut target = INSPECT;
     target[0] += 1.2;
     let mut probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
-    probe.jog(target.to_vec(), None, None).unwrap();
+    { let s = probe.current_admission_stamp(); { let __s = s; probe.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, target.to_vec(), None, None)) } }.unwrap();
     let traj = probe.active_trajectory.as_ref().unwrap().as_quintic().unwrap().clone();
     let between = traj.sample(traj.duration * 10.5 / 20.0).positions;
     let c = tcp(&between);
@@ -266,14 +266,14 @@ fn joint_move_keepout_sampling_is_dense_enough_for_small_boxes() {
     let ws = { let mut w = probe.config.workspace.clone().unwrap(); w.keepout_boxes = vec![small.clone()]; w };
     assert!(samples.iter().all(|q| probe.config.arm_model.workspace_violation(q, &ws, &probe.config.camera_mount).total == 0.0), "box must sit between samples");
     let mut inner = sim_at(with_boxes(vec![small]), &INSPECT);
-    let err = inner.jog(target.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, target.to_vec(), None, None)) } }.unwrap_err();
     assert!(err.to_string().contains("keepout 'pin'"), "{err}");
     assert!(inner.active_trajectory.is_none());
 
     // a box far from the path costs no subdivision and is accepted
     let far = KeepoutBox { name: "far".into(), min_m: [0.9, 0.9, 0.9], max_m: [0.9001, 0.9001, 0.9001] };
     let mut inner = sim_at(with_boxes(vec![far]), &INSPECT);
-    inner.jog(target.to_vec(), None, None).expect("a box out of reach does not block the move");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, target.to_vec(), None, None)) } }.expect("a box out of reach does not block the move");
 
     // a path whose check needs more FK evaluations than the plan budget is refused with a clear message
     let near = KeepoutBox { name: "near".into(), min_m: c.map(|v| (v + 0.003) as f32), max_m: c.map(|v| (v + 0.02) as f32) };
@@ -319,7 +319,7 @@ fn joint_move_keepout_check_catches_a_clipped_box_corner() {
     target[0] += 1.2;
     target[1] -= 0.3;
     let mut probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
-    probe.jog(target.to_vec(), None, None).unwrap();
+    { let s = probe.current_admission_stamp(); { let __s = s; probe.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, target.to_vec(), None, None)) } }.unwrap();
     let traj = probe.active_trajectory.as_ref().unwrap().as_quintic().unwrap().clone();
     let (dim, inside) = (0.02f64, 0.0005f64);
     let old = spacing_samples(&probe, &traj, 0.5 * dim);
@@ -342,7 +342,7 @@ fn joint_move_keepout_check_catches_a_clipped_box_corner() {
     }
     let b = found.expect("a box corner between two samples of the former sampling");
     let mut inner = sim_at(with_boxes(vec![b]), &INSPECT);
-    let err = inner.jog(target.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, target.to_vec(), None, None)) } }.unwrap_err();
     assert!(err.to_string().contains("keepout 'corner'"), "{err}");
     assert!(inner.active_trajectory.is_none());
 }
@@ -417,7 +417,7 @@ fn keepout_sweep_bounds_cover_the_motion() {
     target[0] += 1.2;
     target[2] += 0.5;
     let mut probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
-    probe.jog(target.to_vec(), None, None).unwrap();
+    { let s = probe.current_admission_stamp(); { let __s = s; probe.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, target.to_vec(), None, None)) } }.unwrap();
     let traj = probe.active_trajectory.as_ref().unwrap().as_quintic().unwrap().clone();
     for k in 0..10 {
         let (t0, t1) = (traj.duration * k as f64 / 10.0, traj.duration * (k + 1) as f64 / 10.0);

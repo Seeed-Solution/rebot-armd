@@ -94,12 +94,12 @@ async fn nonzero_offsets_shift_park_limits_and_fk_consistently() {
     assert_eq!(fk.p, k::fk(&[0.0; 6]).p, "FK of the calibrated reading = the URDF rest pose");
     // park target = home (joint 0) = motor pi/2 on J6
     assert_eq!(sup.get_config().await.home_positions, vec![0.0; 7]);
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     let epoch = sup.inner().read().await.safety.epoch_id();
     let mut target = vec![0.0f32; 7];
     target[0] = 0.05;
     for _ in 0..60 {
-        let _ = sup.servo(target.clone(), epoch).await;
+        let _ = sup.servo(sup.capture_admission_stamp(), target.clone(), epoch).await;
         sup.tick(0.02).await;
         tokio::time::sleep(Duration::from_millis(2)).await;
     }

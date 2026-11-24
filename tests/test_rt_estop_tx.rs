@@ -7,11 +7,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use armd::driver::DamiaoArmDriver;
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::safety::SafetyState;
-use armd::transport::{CanFrame, CanTransport, TransportError};
+use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
 use armd::{ArmConfig, SupervisorInner};
 
 /// When the bus raises the E-stop request (as `ArmSupervisor::trigger_e_stop` does).
@@ -36,6 +37,7 @@ struct Bus {
     motors: Vec<(u16, DamiaoLimits, f32, bool)>,
     rx: VecDeque<CanFrame>,
     shared: Arc<Mutex<Shared>>,
+    clock: MockClock,
 }
 
 impl Bus {
@@ -59,6 +61,10 @@ impl Bus {
 }
 
 impl CanTransport for Bus {
+    fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+        Some(Arc::new(self.clock.clone()))
+    }
+
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let id = frame.id as u16;
         let find = |m: &[(u16, DamiaoLimits, f32, bool)], id: u16| m.iter().position(|x| x.0 == id);
@@ -97,35 +103,42 @@ impl CanTransport for Bus {
     fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
 }
 
-fn rig() -> (SupervisorInner, Arc<Mutex<Shared>>) {
+fn step(inner: &mut SupervisorInner, clock: &MockClock) {
+    clock.advance(Duration::from_millis(20));
+    inner.tick(0.02);
+}
+
+fn rig() -> (SupervisorInner, Arc<Mutex<Shared>>, MockClock) {
     let cfg = ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() };
     let limits: Vec<DamiaoLimits> = cfg.damiao_ranges.as_ref().unwrap().iter().map(|r| r.limits()).collect();
     let shared = Arc::new(Mutex::new(Shared { trigger: Trigger::Off, targets_sent: 0, requested: None }));
+    let clock = MockClock::new();
     let bus = Bus {
         motors: limits.iter().enumerate().map(|(i, l)| (i as u16 + 1, *l, 0.0, false)).collect(),
         rx: VecDeque::new(),
         shared: shared.clone(),
+        clock: clock.clone(),
     };
     let dof = cfg.dof;
     let driver = DamiaoArmDriver::new(bus, (1..=dof as u16).collect()).with_joint_limits(limits).unwrap();
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     shared.lock().unwrap().requested = Some((inner.requested_estop_count.clone(), inner.e_stop_latched.clone()));
     inner.lease_enabled = false;
-    inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
-    for _ in 0..5 { inner.tick(0.02); }
+    step(&mut inner, &clock);
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
+    for _ in 0..5 { step(&mut inner, &clock); }
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.5;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
-    for _ in 0..10 { inner.tick(0.02); }
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, Some(2.0), Some(epoch))) } }.expect("jog");
+    for _ in 0..10 { step(&mut inner, &clock); }
     assert!(inner.active_trajectory.is_some());
-    (inner, shared)
+    (inner, shared, clock)
 }
 
 #[test]
 fn estop_during_the_batch_stops_its_remaining_frames_and_applies_in_the_same_tick() {
-    let (mut inner, shared) = rig();
+    let (mut inner, shared, clock) = rig();
     let dof = inner.config.dof;
     let action = inner.last_action.as_ref().unwrap().id;
     {
@@ -133,7 +146,7 @@ fn estop_during_the_batch_stops_its_remaining_frames_and_applies_in_the_same_tic
         s.targets_sent = 0;
         s.trigger = Trigger::AfterTargets(3);
     }
-    inner.tick(0.02);
+    step(&mut inner, &clock);
     let sent = shared.lock().unwrap().targets_sent;
     assert_eq!(sent, 3, "frames after the request were sent ({sent} of {dof})");
     assert_eq!(inner.safety.state(), &SafetyState::EStop, "applied in the same tick, not a driver-write fault");
@@ -144,20 +157,20 @@ fn estop_during_the_batch_stops_its_remaining_frames_and_applies_in_the_same_tic
     assert_eq!(a.code.as_deref(), Some("ESTOP_ACTIVE"), "{a:?}");
     // the latched E-stop holds: later ticks still send hold frames (no dynamic command)
     let held = inner.commanded_positions.clone();
-    for _ in 0..5 { inner.tick(0.02); }
+    for _ in 0..5 { step(&mut inner, &clock); }
     assert_eq!(inner.commanded_positions, held);
     assert_eq!(inner.safety.state(), &SafetyState::EStop);
 }
 
 #[test]
 fn estop_during_the_receive_suppresses_the_whole_output_of_the_tick() {
-    let (mut inner, shared) = rig();
+    let (mut inner, shared, clock) = rig();
     {
         let mut s = shared.lock().unwrap();
         s.targets_sent = 0;
         s.trigger = Trigger::OnReceive;
     }
-    inner.tick(0.02);
+    step(&mut inner, &clock);
     assert_eq!(shared.lock().unwrap().targets_sent, 0, "no target frame after the request");
     assert_eq!(inner.safety.state(), &SafetyState::EStop);
     assert!(inner.active_trajectory.is_none());

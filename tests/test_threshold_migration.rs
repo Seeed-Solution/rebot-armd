@@ -161,7 +161,7 @@ impl Rig {
         let drv = Arc::new(Mutex::new(driver));
         let sup = ArmSupervisor::new(config);
         sup.set_driver(Box::new(Shared(drv.clone()))).await;
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         Self { sup, drv }
     }
 
