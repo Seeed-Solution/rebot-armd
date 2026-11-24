@@ -9801,7 +9801,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             || self
                 .motor_ids
                 .iter()
-                .any(|&tx_id| frame.id == (0x100 + tx_id as u32) || frame.id == (0x300 + tx_id as u32))
+                .any(|&tx_id| {
+                    frame.id == (0x100 + tx_id as u32)
+                        || frame.id == (u32::from(damiao::POS_FORCE_BASE_ID) + tx_id as u32)
+                })
             || frame.data == damiao::CMD_ENABLE
             || frame.data == damiao::CMD_DISABLE
             || frame.data == damiao::CMD_CLEAR_FAULTS

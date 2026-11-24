@@ -4024,9 +4024,82 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// True iff `compact_lower` (whitespace-stripped, lowercased production source) contains a hex
+/// literal token equal to `hex_token` (e.g. `"0x307"` or `"0x300"`) not extended by another hex
+/// digit (so unrelated CJK codepoints like `0x3005`/`0x3007` are ignored while `0x300`, `0x300u32`,
+/// `0x300+id`, and `0x307` are all caught).
+fn has_hex_literal_token(compact_lower: &str, hex_token: &str) -> bool {
+    let bytes = compact_lower.as_bytes();
+    for (idx, _) in compact_lower.match_indices(hex_token) {
+        let after = idx + hex_token.len();
+        let next_is_hex = bytes.get(after).is_some_and(|b| b.is_ascii_hexdigit());
+        if !next_is_hex {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip the balanced `{ ... }` bodies (and headers from `fn_prefix`) of every allow-listed
+/// function from `clean` (comment/literal/`#[cfg(test)]`-stripped source), asserting each
+/// allow-listed function exists once, and return `(outside_all_compact, per_fn_body_compact)`.
+fn partition_allowlisted_fns_compact<'a>(
+    clean: &str,
+    allowlist: &[(&'a str, &str)],
+) -> (String, Vec<(&'a str, String)>) {
+    let mut ranges: Vec<(usize, usize, &'a str, String)> = Vec::with_capacity(allowlist.len());
+    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
+    for &(fn_prefix, _why_safe) in allowlist {
+        let matches: Vec<usize> = clean.match_indices(fn_prefix).map(|(idx, _)| idx).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one allow-listed `{fn_prefix}` definition, found {}",
+            matches.len()
+        );
+        let fn_start = matches[0];
+        let body_open = clean[fn_start..]
+            .find('{')
+            .map(|rel| fn_start + rel)
+            .unwrap_or_else(|| panic!("missing opening brace for allow-listed `{fn_prefix}`"));
+        let mut depth = 0usize;
+        let mut body_end = None;
+        for (rel, ch) in clean[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = Some(body_open + rel);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body_end =
+            body_end.unwrap_or_else(|| panic!("missing closing brace for allow-listed `{fn_prefix}`"));
+        ranges.push((fn_start, body_end, fn_prefix, compact(&clean[body_open..=body_end])));
+    }
+    ranges.sort_by_key(|(start, _, _, _)| *start);
+    let mut outside = String::with_capacity(clean.len());
+    let mut cursor = 0usize;
+    let mut bodies = Vec::with_capacity(ranges.len());
+    for (start, end, name, body) in ranges {
+        assert!(start >= cursor, "overlapping allow-listed function `{name}`");
+        outside.push_str(&clean[cursor..start]);
+        cursor = end + 1;
+        bodies.push((name, body));
+    }
+    outside.push_str(&clean[cursor..]);
+    (compact(&outside), bodies)
+}
+
 #[test]
 fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
-    // Self-check: verify multi-line splits are caught and #[cfg(test)] / comments / literals ignored.
+    // Self-check: verify multi-line splits, raw 0x307 / 0x300 / CanFrame literals, and unlisted
+    // `emit_pos_force_frame(` callers inside driver.rs are ALL caught, while comments / literals /
+    // `#[cfg(test)]` items are ignored.
     let synthetic = r#"
         impl Demo {
             // damiao::build_pos_force_frame(0x300, 7, 0.0, 0, 0);
@@ -4035,14 +4108,23 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
                 damiao::
                     build_pos_force_frame(0x300, 7, 0.0, 0, 0);
             }
-            fn sneaky(&mut self) {
+            fn sneaky_build(&mut self) {
                 build_pos_force_frame
                     (0x300, 7, 0.0, 0, 0);
+            }
+            fn ok_ret(&self) -> CanFrame {
+                damiao::build_pos_vel_frame(0x100, 1, 0.0, 1.0)
+            }
+            fn sneaky_raw(&mut self) {
+                let _raw = CanFrame { id: 0x307, dlc: 8 };
+                let _ctor = CanFrame::new(0x307, &[]);
+                let _base = 0x300 + 7;
+                self.emit_pos_force_frame();
             }
         }
         #[cfg(test)]
         mod tests {
-            fn t() { build_pos_force_frame(0x300, 7, 0.0, 0, 0); }
+            fn t() { let _ = (0x307, CanFrame { id: 0x300 }, build_pos_force_frame(0x300, 7, 0.0, 0, 0)); }
         }
     "#;
     let syn_prod = strip_cfg_test_items(&strip_rust_comments_and_literals(synthetic));
@@ -4052,6 +4134,23 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
         syn_out.matches("build_pos_force_frame(").count(),
         1,
         "must catch multi-line build_pos_force_frame( outside emitter: {syn_out}"
+    );
+    let syn_out_lower = syn_out.to_ascii_lowercase();
+    assert!(has_hex_literal_token(&syn_out_lower, "0x307"), "must catch raw 0x307 in driver.rs");
+    assert!(has_hex_literal_token(&syn_out_lower, "0x300"), "must catch raw 0x300 in driver.rs");
+    assert!(!has_hex_literal_token("0x3005|0x3007", "0x300"), "must not trip on 0x3005/0x3007 CJK ranges");
+    let count_raw_can_frame_ctors = |compact_src: &str| -> usize {
+        let struct_lits = compact_src
+            .match_indices("CanFrame{")
+            .filter(|&(idx, _)| !compact_src[..idx].ends_with("->"))
+            .count();
+        struct_lits + compact_src.matches("CanFrame::new").count()
+    };
+    assert_eq!(count_raw_can_frame_ctors(&syn_out), 2, "must catch raw CanFrame literal + CanFrame::new (ignoring `-> CanFrame {{`)");
+    assert_eq!(
+        syn_out.matches("emit_pos_force_frame(").count(),
+        1,
+        "must catch unlisted emit_pos_force_frame( caller in driver.rs"
     );
 
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -4074,8 +4173,16 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
         let compact: String = prod.chars().filter(|c| !c.is_ascii_whitespace()).collect();
         let compact_lower = compact.to_ascii_lowercase();
 
+        // Raw CAN ID `0x307` is forbidden across ALL production source files, INCLUDING driver.rs
+        // and protocol/damiao.rs.
+        assert!(
+            !has_hex_literal_token(&compact_lower, "0x307"),
+            "production file src/{rel} must not hardcode CAN ID 0x307"
+        );
+
         if rel == "protocol/damiao.rs" {
-            // Only the `pub fn build_pos_force_frame(` definition itself may appear here.
+            // Only the `pub fn build_pos_force_frame(` definition itself (and `POS_FORCE_BASE_ID = 0x300`)
+            // may appear here.
             assert_eq!(
                 compact.matches("build_pos_force_frame(").count(),
                 1,
@@ -4088,23 +4195,128 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
             continue;
         }
 
+        // Raw base ID `0x300` is forbidden across ALL production source files outside protocol/damiao.rs,
+        // INCLUDING src/driver.rs!
+        assert!(
+            !has_hex_literal_token(&compact_lower, "0x300"),
+            "production file src/{rel} must not hardcode PosForce base CAN ID 0x300"
+        );
+
         if rel == "driver.rs" {
-            let (outside, inside) = partition_unique_fn_compact(&prod, "fn emit_pos_force_frame(");
+            // 1. No raw `CanFrame { ... }` struct literal or `CanFrame::new*` constructor in
+            //    production driver.rs (prevents bypassing `damiao::build_pos_force_frame` with
+            //    hand-built CAN frames).
             assert_eq!(
-                inside.matches("build_pos_force_frame(").count(),
+                count_raw_can_frame_ctors(&compact),
+                0,
+                "src/driver.rs must not hand-construct raw CanFrame literals/constructors in production code"
+            );
+
+            // 2. `build_pos_force_frame(` exists ONLY inside `DamiaoArmDriver::emit_pos_force_frame`.
+            let (outside_build, inside_build) =
+                partition_unique_fn_compact(&prod, "fn emit_pos_force_frame(");
+            assert_eq!(
+                inside_build.matches("build_pos_force_frame(").count(),
                 1,
                 "DamiaoArmDriver::emit_pos_force_frame must contain EXACTLY ONE build_pos_force_frame( call"
             );
             assert_eq!(
-                outside.matches("build_pos_force_frame(").count(),
+                outside_build.matches("build_pos_force_frame(").count(),
                 0,
                 "src/driver.rs must have ZERO build_pos_force_frame( calls outside emit_pos_force_frame"
             );
-            total_driver_build_sites += inside.matches("build_pos_force_frame(").count();
+            total_driver_build_sites += inside_build.matches("build_pos_force_frame(").count();
+
+            // 3. Explicit allow-list for EVERY `POS_FORCE_BASE_ID` reference in production driver.rs:
+            //    all non-emitter sites are strictly read-only CAN ID predicates or key lookups.
+            const POS_FORCE_BASE_ID_ALLOWLIST: &[(&str, &str)] = &[
+                (
+                    "fn emit_pos_force_frame(",
+                    "Sole production constructor calling damiao::build_pos_force_frame",
+                ),
+                (
+                    "fn frame_pos_force_joint(",
+                    "Read-only CAN ID predicate used by DamiaoArmDriver::send submission guard",
+                ),
+                (
+                    "fn pos_force_freeze_params(",
+                    "Read-only lookup of last_target_frames CAN ID for boot-fallback parameters",
+                ),
+                (
+                    "fn is_pos_force_freeze_frame(",
+                    "Read-only bit-for-bit freeze payload predicate (constructs no frame)",
+                ),
+                (
+                    "fn validate_pos_force_target_static(",
+                    "Pure static validation returning expected CAN ID (constructs no frame)",
+                ),
+                (
+                    "fn process_rx_frame(",
+                    "Read-only SocketCAN local-echo RX filter (drops echoed 0x300+id TX frames)",
+                ),
+                (
+                    "fn receive_feedback(",
+                    "Read-only last_target_frames CAN ID match for standalone recovery speed lookup",
+                ),
+            ];
+            let (outside_base_id, _) =
+                partition_allowlisted_fns_compact(&prod, POS_FORCE_BASE_ID_ALLOWLIST);
+            assert_eq!(
+                outside_base_id.matches("POS_FORCE_BASE_ID").count(),
+                0,
+                "src/driver.rs references POS_FORCE_BASE_ID outside its explicit allow-list"
+            );
+
+            // 4. Explicit allow-list for EVERY caller of `emit_pos_force_frame(` in production driver.rs:
+            //    every site goes through `emit_pos_force_frame` (`send()` chokepoint) and documents
+            //    why it is safe alongside the control-tick emitter.
+            const EMIT_POS_FORCE_FRAME_ALLOWLIST: &[(&str, &str)] = &[
+                (
+                    "fn emit_pos_force_frame(",
+                    "Definition of the sole production 0x307 frame builder/transmitter",
+                ),
+                (
+                    "fn emit_pos_force_j7_impl(",
+                    "Single control-tick J7 emitter invoked once per tick from the tick epilogue (both Legacy & RT Executor) and direct-driver fallback; enforces stop_gen/estop_epoch stamp degradation",
+                ),
+                (
+                    "fn finish_pos_force_readback(",
+                    "Pre-enable stationary hold during torque-on handshake right after CTRL_MODE readback while motor is still disabled (allow_freeze = false; fails closed unless fresh <= 100 ms stationary torque-off feedback)",
+                ),
+                (
+                    "fn write_modes_send(",
+                    "Immediate hold frame directly following a CTRL_MODE register switch (allow_freeze = false; fails closed if stale or stop-inhibited)",
+                ),
+                (
+                    "fn write_modes_confirmed(",
+                    "Immediate hold frame directly following a confirmed CTRL_MODE register switch (allow_freeze = false; fails closed if stale, fenced, or stop-inhibited)",
+                ),
+                (
+                    "fn receive_feedback(",
+                    "Standalone-driver recovery only (early-continues when external_pos_force_emitter == true, so unreachable under SupervisorInner; allow_freeze = false)",
+                ),
+            ];
+            let (outside_emit_callers, emit_bodies) =
+                partition_allowlisted_fns_compact(&prod, EMIT_POS_FORCE_FRAME_ALLOWLIST);
+            assert_eq!(
+                outside_emit_callers.matches("emit_pos_force_frame(").count(),
+                0,
+                "src/driver.rs has unlisted emit_pos_force_frame( caller outside allow-list"
+            );
+            for (fn_name, body) in emit_bodies {
+                if fn_name == "fn emit_pos_force_frame(" {
+                    continue;
+                }
+                assert_eq!(
+                    body.matches("emit_pos_force_frame(").count(),
+                    1,
+                    "allow-listed {fn_name} expected exactly 1 emit_pos_force_frame( call"
+                );
+            }
             continue;
         }
 
-        // Every other production source file in src/: ZERO 0x307 / POS_FORCE_BASE_ID / build_pos_force_frame.
+        // Every other production source file in src/: ZERO POS_FORCE_BASE_ID / build_pos_force_frame.
         assert_eq!(
             compact.matches("build_pos_force_frame(").count(),
             0,
@@ -4114,11 +4326,6 @@ fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
             compact.matches("POS_FORCE_BASE_ID").count(),
             0,
             "production file src/{rel} must not reference POS_FORCE_BASE_ID"
-        );
-        assert_eq!(
-            compact_lower.matches("0x307").count(),
-            0,
-            "production file src/{rel} must not hardcode CAN ID 0x307"
         );
 
         // Outside driver.rs and joint_zero.rs (trait + zero-offset wrapper), `emit_pos_force_j7(`
