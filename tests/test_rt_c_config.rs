@@ -2058,7 +2058,11 @@ async fn codex_review_regression_invariants_executor() {
     );
 
     // 9e. Automatic gravity-comp exit on lease timeout executes with 0 allocations on armd-control.
-    let sup_gc = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    // Clear `resting_pose` so post-exit lease watchdog latches `WatchdogTimeout` instead of
+    // invoking the unmigrated `StopPolicy::NormalUnload` trajectory planner.
+    let mut cfg_gc = ArmConfig::rebot_dm();
+    cfg_gc.resting_pose = None;
+    let sup_gc = Arc::new(ArmSupervisor::new(cfg_gc));
     let lease_conn = "gc-auto-exit";
     let (lease_gen, epoch) = {
         let mut inner = sup_gc.inner().write().await;
