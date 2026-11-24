@@ -3143,3 +3143,163 @@ fn stopped_reconciliation_never_trusts_pre_write_off_feedback_after_deferred_or_
         assert!(!inner.is_torqued);
     }
 }
+
+/// Round 6 (Major 3): `RobStrideArmDriver::clear_fault()` sends type-4 (`TYPE_STOP`) CAN frames
+/// with `data[0] = 1` (documented under motor-stop; hardware behaviour unverified). Fail closed:
+/// supervisor `clear_fault()` refuses away from rest with `TORQUE_OFF_WOULD_DROP` (0 type-4 frames
+/// transmitted) and allows it at fresh rest pose.
+#[test]
+fn robstride_clear_fault_routes_through_rest_pose_gate_and_refuses_raised() {
+    use armd::driver::RobStrideArmDriver;
+    use armd::model::RestingPosePolicy;
+    use armd::protocol::robstride::{self, RobStrideLimits};
+    use armd::transport::{CanFrame, CanTransport, DriverClock, MockCanTransport, TransportError};
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct SharedCan(Arc<Mutex<MockCanTransport>>);
+    impl SharedCan {
+        fn new(clock: MockClock) -> Self {
+            Self(Arc::new(Mutex::new(MockCanTransport::new().with_clock(clock))))
+        }
+        fn push_rx(&self, f: CanFrame) {
+            self.0.lock().unwrap().provide_rx_frame(f);
+        }
+        fn take_tx(&self) -> Vec<CanFrame> {
+            self.0.lock().unwrap().take_tx_frames()
+        }
+    }
+    impl CanTransport for SharedCan {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            self.0.lock().unwrap().clock()
+        }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.0.lock().unwrap().transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.0.lock().unwrap().receive()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    let rs_limits = RobStrideLimits::default();
+    let make_fb_frame = |motor_id: u8, pos_rad: f32, fault_flags: u8| {
+        let id = robstride::build_feedback_extended_id(fault_flags, motor_id, 0xFD);
+        let p_raw = ((pos_rad - rs_limits.p_min) / (rs_limits.p_max - rs_limits.p_min) * 65535.0)
+            .clamp(0.0, 65535.0) as u16;
+        let v_raw = 32768u16;
+        let t_raw = 32768u16;
+        let temp_raw = 300u16; // 30.0 C
+        let data = [
+            (p_raw >> 8) as u8,
+            p_raw as u8,
+            (v_raw >> 8) as u8,
+            v_raw as u8,
+            (t_raw >> 8) as u8,
+            t_raw as u8,
+            (temp_raw >> 8) as u8,
+            temp_raw as u8,
+        ];
+        CanFrame::new_extended(id, &data).unwrap()
+    };
+
+    let mut cfg = ArmConfig::default();
+    cfg.dof = 6;
+    cfg.joint_names = (1..=6).map(|i| format!("joint_{i}")).collect();
+    cfg.limits.truncate(6);
+    cfg.home_positions = vec![0.0; 6];
+    // Wider resting_pose position tolerance (0.10) than rest_pose_tolerance_rad (0.05) so a
+    // 0.08 rad offset specifically exercises the Rule A′ TORQUE_OFF_WOULD_DROP refusal, while
+    // 0.40 rad is refused by resting-support check (both transmit 0 type-4 frames).
+    cfg.resting_pose = Some(RestingPosePolicy {
+        positions: Some(vec![0.0; 6]),
+        position_tolerances: vec![0.10; 6],
+        max_total_deviation: 0.30,
+        max_velocity: 0.1,
+        joint_max_velocities: Vec::new(),
+        feedback_max_age_ms: 100,
+        support_torque_limits: Vec::new(),
+        support_load_limits: Vec::new(),
+    });
+    cfg.rest_pose_tolerance_rad = 0.05;
+    cfg.lease_timeout_ms = 600_000;
+
+    let clock = MockClock::new();
+    let can = SharedCan::new(clock.clone());
+    let mut drv = RobStrideArmDriver::new(can.clone(), vec![1, 2, 3, 4, 5, 6]);
+    // Establish initial empty-queue receive bound.
+    drv.read_joint_states().unwrap();
+
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.is_torqued = true;
+
+    // 1. Non-rest pose (J2 = 0.08 rad > 0.05 rad tolerance) with hardware fault on motor 2 ->
+    //    clear_fault refuses with TORQUE_OFF_WOULD_DROP and transmits ZERO type-4 frames!
+    for id in 1..=6u8 {
+        let q = if id == 2 { 0.08 } else { 0.0 };
+        let flags = if id == 2 { 0x04 } else { 0x00 };
+        can.push_rx(make_fb_frame(id, q, flags));
+    }
+    inner.tick(0.02);
+    assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
+    let epoch_before = inner.safety.epoch_id();
+    let _ = can.take_tx();
+
+    // Provide another fresh feedback batch for `clear_fault()`'s initial `read_joint_states`.
+    for id in 1..=6u8 {
+        let q = if id == 2 { 0.08 } else { 0.0 };
+        let flags = if id == 2 { 0x04 } else { 0x00 };
+        can.push_rx(make_fb_frame(id, q, flags));
+    }
+    let err = inner.clear_fault().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SafetyError::TorqueOffWouldDrop {
+                joint: Some(ref j),
+                ..
+            } if j == "joint_2"
+        ),
+        "RobStride clear_fault away from rest must refuse with TorqueOffWouldDrop, got {err:?}"
+    );
+    let sent_raised = can.take_tx();
+    assert!(
+        sent_raised.is_empty(),
+        "RobStride clear_fault away from rest must transmit 0 type-4 frames, got {sent_raised:?}"
+    );
+    assert_eq!(inner.safety.epoch_id(), epoch_before);
+    assert!(inner.is_torqued);
+
+    // 2. At rest pose (all 6 joints 0.0 rad) with fresh feedback -> clear_fault transmits type-4
+    //    clear-fault frames to all 6 motors!
+    clock.advance(Duration::from_millis(10));
+    for id in 1..=6u8 {
+        let flags = if id == 2 { 0x04 } else { 0x00 };
+        can.push_rx(make_fb_frame(id, 0.0, flags));
+    }
+    inner.tick(0.02);
+    let _ = can.take_tx();
+    for id in 1..=6u8 {
+        let flags = if id == 2 { 0x04 } else { 0x00 };
+        can.push_rx(make_fb_frame(id, 0.0, flags));
+    }
+    let res_at_rest = inner.clear_fault();
+    assert!(
+        matches!(res_at_rest, Err(SafetyError::ClearFaultRejected(_))),
+        "first clear_fault sends hardware reset and awaits post-reset clean feedback, got {res_at_rest:?}"
+    );
+    let sent_at_rest = can.take_tx();
+    assert_eq!(
+        sent_at_rest.len(),
+        6,
+        "RobStride clear_fault at fresh rest pose must transmit 6 type-4 clear-fault frames, got {}",
+        sent_at_rest.len()
+    );
+    for (idx, frame) in sent_at_rest.iter().enumerate() {
+        let expected = robstride::build_clear_fault_frame((idx + 1) as u8, 0xFD);
+        assert_eq!(*frame, expected);
+    }
+}

@@ -9942,15 +9942,21 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         Ok(())
     }
 
-    /// Per-write transmit choke point for RobStride stop/disable CAN frames: re-evaluates stop
-    /// state, freshness, rest pose, and 1 s request lifetime immediately before each `can.transmit`.
-    fn send_stop_frame(&mut self, id: u8, kind: DisableKind) -> Result<(), ArmDriverError> {
-        let frame = robstride::build_stop_frame(id, self.master_id);
+    /// Per-write transmit choke point for RobStride type-4 stop / fault-clear CAN frames:
+    /// re-evaluates stop state, freshness, rest pose, and 1 s request lifetime immediately
+    /// before each `can.transmit`.
+    fn send_type4_frame(&mut self, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
         if let DisableKind::DisableRequested { started_at, rollback } = kind {
             self.check_disable_requested(started_at, rollback)?;
         }
-        self.can.transmit(&frame)?;
+        self.can.transmit(frame)?;
         Ok(())
+    }
+
+    /// Per-write transmit choke point for RobStride stop/disable CAN frames.
+    fn send_stop_frame(&mut self, id: u8, kind: DisableKind) -> Result<(), ArmDriverError> {
+        let frame = robstride::build_stop_frame(id, self.master_id);
+        self.send_type4_frame(&frame, kind)
     }
 
     pub fn with_gains(mut self, kp: f32, kd: f32) -> Self {
@@ -10127,24 +10133,56 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         Ok(())
     }
 
-    fn clear_fault_disables_arm_joint(&self, _arm_dof: usize) -> bool { false }
+    fn clear_fault_disables_joints(&self) -> Vec<usize> {
+        if self.has_hardware_fault() {
+            (0..self.motor_ids.len()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool {
+        self.has_hardware_fault() && !self.motor_ids.is_empty() && arm_dof > 0
+    }
 
     fn has_hardware_fault(&self) -> bool {
         self.fault_flags.iter().any(|&flags| flags != 0)
     }
 
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
-        let mut err = None;
-        for &id in &self.motor_ids {
+        // `build_clear_fault_frame` sends type-4 (`TYPE_STOP`) frames with `data[0] = 1`
+        // (documented under the motor-stop command; hardware behaviour unverified). Fail closed
+        // by routing every write through the same per-write disable choke point as `disable_torque`.
+        let started_at = self.now();
+        let kind = DisableKind::DisableRequested {
+            started_at,
+            rollback: false,
+        };
+        let mut wrote_any = false;
+        let mut refused_err = None;
+        let mut last_err = None;
+        for idx in 0..self.motor_ids.len() {
+            let id = self.motor_ids[idx];
             let frame = robstride::build_clear_fault_frame(id, self.master_id);
-            if let Err(e) = self.can.transmit(&frame) {
-                err = Some(e);
+            match self.send_type4_frame(&frame, kind) {
+                Ok(()) => wrote_any = true,
+                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
+                    refused_err = Some(e);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
             }
         }
-        if let Err(e) = self.can.flush() { err = Some(e); }
+        if wrote_any {
+            if let Err(e) = self.can.flush() {
+                last_err = Some(e.into());
+            }
+        }
         // A sent reset is not proof that the reported fault has cleared.
         // The next telemetry response updates fault_flags.
-        if let Some(e) = err {
+        if let Some(e) = refused_err {
+            Err(e)
+        } else if let Some(e) = last_err {
             Err(ArmDriverError::HardwareFault(e.to_string()))
         } else {
             Ok(())
@@ -11331,6 +11369,94 @@ mod tx_chokepoint_tests {
                 reason: DisableProtectiveReason::Thermal,
             })
             .unwrap();
+            assert_eq!(bus.tx_len(), 3);
+
+            // 5. RobStride `clear_fault()` (type-4 stop/fault-clear frames) routes through the
+            //    exact same per-write disable choke point: refused raised / stale / mid-batch
+            //    E-stop / freshness / 1 s lifetime, allowed at fresh rest pose.
+            stopped.store(true, Ordering::SeqCst);
+            let t_cf = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.50;
+                drv.last_feedback_instant[i] = Some(t_cf);
+                drv.feedback_queue_bound[i] = Some(t_cf);
+            }
+            bus.clear_tx();
+            assert!(matches!(
+                drv.clear_fault(),
+                Err(ArmDriverError::TorqueOffWouldDrop)
+            ));
+            assert_eq!(bus.tx_len(), 0, "RobStride clear_fault while stopped & raised must send 0 frames");
+
+            // At rest with stale (> 100 ms) feedback -> refused with 0 frames.
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.0;
+            }
+            clock.advance(Duration::from_millis(105));
+            bus.clear_tx();
+            assert!(matches!(
+                drv.clear_fault(),
+                Err(ArmDriverError::TorqueOffWouldDrop)
+            ));
+            assert_eq!(bus.tx_len(), 0, "RobStride clear_fault while stopped & stale must send 0 frames");
+
+            // Mid-batch E-stop on raised arm stops clear_fault after frame #1.
+            stopped.store(false, Ordering::SeqCst);
+            let t_cf2 = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.50;
+                drv.last_feedback_instant[i] = Some(t_cf2);
+                drv.feedback_queue_bound[i] = Some(t_cf2);
+            }
+            let stopped_cb_cf = Arc::clone(&stopped);
+            let mut count_cf = 0usize;
+            bus.set_on_tx(move |_| {
+                count_cf += 1;
+                if count_cf == 1 {
+                    stopped_cb_cf.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            bus.clear_tx();
+            assert!(matches!(
+                drv.clear_fault(),
+                Err(ArmDriverError::TorqueOffWouldDrop)
+            ));
+            assert_eq!(bus.tx_len(), 1, "RobStride clear_fault must stop after frame #1 on mid-batch E-stop");
+
+            // Mid-batch freshness cutoff (> 100 ms) while stopped at rest stops after frame #1.
+            let t_cf3 = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.0;
+                drv.last_feedback_instant[i] = Some(t_cf3);
+                drv.feedback_queue_bound[i] = Some(t_cf3);
+            }
+            let clk_cf = clock.clone();
+            let mut count_cf2 = 0usize;
+            bus.set_on_tx(move |_| {
+                count_cf2 += 1;
+                if count_cf2 == 1 {
+                    clk_cf.advance(Duration::from_millis(105));
+                }
+                Ok(())
+            });
+            bus.clear_tx();
+            assert!(matches!(
+                drv.clear_fault(),
+                Err(ArmDriverError::TorqueOffWouldDrop)
+            ));
+            assert_eq!(bus.tx_len(), 1, "RobStride clear_fault must stop after frame #1 on mid-batch staleness");
+
+            // Fresh rest pose while stopped -> transmits all 3 type-4 clear-fault frames.
+            let t_cf4 = clock.now();
+            for i in 0..3 {
+                drv.cached_states[i].position = 0.0;
+                drv.last_feedback_instant[i] = Some(t_cf4);
+                drv.feedback_queue_bound[i] = Some(t_cf4);
+            }
+            bus.set_on_tx(|_| Ok(()));
+            bus.clear_tx();
+            drv.clear_fault().expect("RobStride clear_fault at fresh rest pose must succeed");
             assert_eq!(bus.tx_len(), 3);
         }
     }
