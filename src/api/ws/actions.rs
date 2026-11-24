@@ -246,31 +246,13 @@ pub(super) fn prepare_action(
         }
         #[cfg(feature = "policy-runtime")]
         "/api/v1/action/policy/start" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let request =
-                crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
-            let _ = crate::policy_runtime::compute_policy_deadline(request.max_seconds)
-                .map_err(ArmError::from)?;
-            inner.check_policy_start_preconditions_with(
-                request.mode,
-                request.sim_only,
-                request.i_am_at_the_arm,
-                epoch,
-            )?;
-            return Ok(ActionStart::Policy(Box::new(PendingPolicyStart {
-                request,
-                config: inner.config.clone(),
-                epoch,
-                stamp,
-                policy_live_allowed: inner.policy_live_allowed(),
-            })));
+            return Ok(ActionStart::Policy(Box::new(policy::prepare_policy_start(
+                inner, stamp, body, epoch,
+            )?)));
         }
         #[cfg(feature = "policy-runtime")]
         "/api/v1/action/policy/stop" => {
-            inner.advance_stop_generation();
-            let stopped = inner.stop_policy_run(None, "STOPPED");
-            return Ok(ActionStart::PolicyStopped(stopped));
+            return Ok(ActionStart::PolicyStopped(policy::prepare_policy_stop(inner)));
         }
         _ => return Err(invalid_command("Unknown action")),
     };
@@ -483,12 +465,12 @@ pub(super) fn dispatch_action_command(
             None
         }
         #[cfg(feature = "policy-runtime")]
-        Ok(ActionStart::PolicyStopped(stopped)) => {
-            let had_pending = pending_policy_loads.load(Ordering::SeqCst) > 0;
-            let mut ack = command_ack(inner, &value["request_id"], None);
-            ack["stopped"] = json!(stopped || had_pending);
-            Some(ack)
-        }
+        Ok(ActionStart::PolicyStopped(stopped)) => Some(policy::format_policy_stop_ack(
+            inner,
+            &value["request_id"],
+            stopped,
+            pending_policy_loads,
+        )),
         Err(error) => Some(command_reject(inner, &value["request_id"], error)),
     }
 }
