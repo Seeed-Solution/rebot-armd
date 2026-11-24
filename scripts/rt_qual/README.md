@@ -112,7 +112,7 @@ Section-delimited text:
 - `=== SAMPLE N ... ===` .. `=== SAMPLE_END ===`: periodic `/proc/loadavg`, `/proc/interrupts`, `/proc/softirqs`, `/proc/schedstat`, `ip -s -d link show can0`, per-thread `/proc/<armd_pid>/task/*/{stat,status,sched}` (including `VmLck`, `voluntary_ctxt_switches`, `nonvoluntary_ctxt_switches`), and compact IRQ/SPI thread CPU runtime snapshots.
 
 ### `report.md`
-1. Stage 3 §6 Gate Verdict table and overall `PASS` / `FAIL` / `INCOMPLETE` verdict (forces `INCOMPLETE` when `diag_dropped` increases unless an observed breach already forces `FAIL`).
+1. Stage 3 §6 Gate Verdict table and overall `PASS` / `FAIL` / `INCOMPLETE` verdict (forces `INCOMPLETE` when `diag_dropped` increases, is absent, or resets mid-run, unless an observed breach already forces `FAIL`).
 2. Run and environment summary (`armd` version, `owner_mode`, `wake_lateness_us` percentiles and `>1`/`>5`/`>10 ms` threshold counts, `diag_dropped`, kernel config, `control_thread` scheduling, `VmLck`, context switch deltas).
 3. Release latency per load phase (`tick_us` p50/p99/max, `lock_us`, `wait_us`, `period_us`, `wake_lateness_us` p99/max or legacy wake overrun proxy, `skipped_releases`/`late_count` delta, observed RX age).
 4. Per-phase lock breakdown (`pre`, `rx`, `control`, `tx`, `finish`, `obs`, `publish`) and deduplicated worst-tick Wall-vs-CPU table showing off-CPU preemption time, context switches, page faults, alloc calls, and lock holders.

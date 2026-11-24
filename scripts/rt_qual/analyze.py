@@ -67,26 +67,73 @@ def max_or_none(vals: list[float]) -> float | None:
     return max(vals) if vals else None
 
 
-def cumulative_delta(
-    samples: list[LoadSample], key: str
-) -> tuple[bool, int | None, int | None, int | None]:
-    """Return (present, start, end, delta) for a monotonic cumulative integer field in `tick`."""
-    vals = [
+@dataclass
+class CounterSeries:
+    present_any: bool
+    partial_missing: bool
+    reset_detected: bool
+    start: int | None
+    end: int | None
+    total_delta: int | None
+    per_sample_deltas: list[int | None]
+
+
+def analyze_counter_series(samples: list[LoadSample], key: str) -> CounterSeries:
+    """Chronologically track a cumulative monotonic integer field across all adjacent samples.
+
+    Detects missing samples (`partial_missing`) and counter resets (`cur < prev`, summing both
+    pre-reset and post-reset increments so e.g. `0 -> 7 -> 0` yields `total_delta=7` and
+    `reset_detected=True` rather than hiding events behind an endpoint-only difference).
+    """
+    raw_vals: list[int | None] = [
         int(s.tick[key])
-        for s in samples
         if isinstance(s.tick.get(key), int) and not isinstance(s.tick.get(key), bool)
+        else None
+        for s in samples
     ]
-    if not vals:
-        return (False, None, None, None)
-    start, end = vals[0], vals[-1]
-    if len(vals) == 1:
-        delta = end
-    elif end >= start:
-        delta = end - start
-    else:
-        # Daemon restarted mid-run; fall back to post-restart count.
-        delta = end
-    return (True, start, end, delta)
+    present_vals = [v for v in raw_vals if v is not None]
+    if not present_vals:
+        return CounterSeries(False, False, False, None, None, None, [None] * len(samples))
+
+    partial_missing = any(v is None for v in raw_vals)
+    reset_detected = False
+    per_sample: list[int | None] = [None] * len(samples)
+
+    if len(samples) == 1:
+        v0 = present_vals[0]
+        per_sample[0] = v0
+        return CounterSeries(True, False, False, v0, v0, v0, per_sample)
+
+    total_delta = 0
+    prev_val: int | None = None
+    for idx, val in enumerate(raw_vals):
+        if val is None:
+            per_sample[idx] = None
+            continue
+        if prev_val is None:
+            # First observed value establishes the run baseline (0 delta on that sample).
+            per_sample[idx] = 0
+        elif val >= prev_val:
+            step = val - prev_val
+            per_sample[idx] = step
+            total_delta += step
+        else:
+            # Counter decreased (daemon restart / counter reset): count post-reset increments
+            # AND flag reset_detected so coverage is marked incomplete.
+            reset_detected = True
+            per_sample[idx] = val
+            total_delta += val
+        prev_val = val
+
+    return CounterSeries(
+        present_any=True,
+        partial_missing=partial_missing,
+        reset_detected=reset_detected,
+        start=present_vals[0],
+        end=present_vals[-1],
+        total_delta=total_delta,
+        per_sample_deltas=per_sample,
+    )
 
 
 @dataclass
@@ -632,22 +679,31 @@ def analyze(
         else None
     )
 
-    first_late = samples[0].tick.get("late_count")
-    last_late = samples[-1].tick.get("late_count")
-    late_delta = (
-        int(last_late) - int(first_late)
-        if isinstance(first_late, int) and isinstance(last_late, int)
-        else None
-    )
+    late_series = analyze_counter_series(samples, "late_count")
+    first_late = late_series.start
+    last_late = late_series.end
+    late_delta = late_series.total_delta
     late_any_nonzero = any((s.tick.get("late_count") or 0) > 0 for s in samples)
 
     # Q1 executor/legacy timing fields (absent in older JSON; keep proxy fallbacks).
-    has_skipped_releases, skipped_start, skipped_end, skipped_delta = cumulative_delta(samples, "skipped_releases")
-    has_diag_dropped, diag_dropped_start, diag_dropped_end, diag_dropped_delta = cumulative_delta(samples, "diag_dropped")
+    skipped_series = analyze_counter_series(samples, "skipped_releases")
+    has_skipped_releases = skipped_series.present_any
+    skipped_start = skipped_series.start
+    skipped_end = skipped_series.end
+    skipped_delta = skipped_series.total_delta
+    skipped_coverage_gap = skipped_series.partial_missing or skipped_series.reset_detected
+
+    diag_series = analyze_counter_series(samples, "diag_dropped")
+    has_diag_dropped = diag_series.present_any
+    diag_dropped_start = diag_series.start
+    diag_dropped_end = diag_series.end
+    diag_dropped_delta = diag_series.total_delta
     diag_samples_lost = bool(has_diag_dropped and diag_dropped_delta is not None and diag_dropped_delta > 0)
+    diag_coverage_gap = (not has_diag_dropped) or diag_series.partial_missing or diag_series.reset_detected
 
     wake_dicts = [s.tick["wake_lateness_us"] for s in samples if isinstance(s.tick.get("wake_lateness_us"), dict)]
     has_wake_lateness = bool(wake_dicts)
+    wake_lateness_partial = has_wake_lateness and len(wake_dicts) < len(samples)
     wake_lateness_max_us = (
         max(int(w.get("max", 0)) for w in wake_dicts) if has_wake_lateness else None
     )
@@ -659,9 +715,24 @@ def analyze(
         if has_wake_lateness
         else None
     )
-    has_wake_over_1ms, _, wake_over_1ms_end, wake_over_1ms_delta = cumulative_delta(samples, "wake_lateness_over_1ms")
-    has_wake_over_5ms, _, wake_over_5ms_end, wake_over_5ms_delta = cumulative_delta(samples, "wake_lateness_over_5ms")
-    has_wake_over_10ms, _, wake_over_10ms_end, wake_over_10ms_delta = cumulative_delta(samples, "wake_lateness_over_10ms")
+    wake_over_1ms = analyze_counter_series(samples, "wake_lateness_over_1ms")
+    wake_over_5ms = analyze_counter_series(samples, "wake_lateness_over_5ms")
+    wake_over_10ms = analyze_counter_series(samples, "wake_lateness_over_10ms")
+    has_wake_over_1ms, wake_over_1ms_end, wake_over_1ms_delta = (
+        wake_over_1ms.present_any,
+        wake_over_1ms.end,
+        wake_over_1ms.total_delta,
+    )
+    has_wake_over_5ms, wake_over_5ms_end, wake_over_5ms_delta = (
+        wake_over_5ms.present_any,
+        wake_over_5ms.end,
+        wake_over_5ms.total_delta,
+    )
+    has_wake_over_10ms, wake_over_10ms_end, wake_over_10ms_delta = (
+        wake_over_10ms.present_any,
+        wake_over_10ms.end,
+        wake_over_10ms.total_delta,
+    )
 
     owner_mode: str | None = None
     for s in reversed(samples):
@@ -765,25 +836,47 @@ def analyze(
 
     # ---- Gate Evaluation ----
     release_pass = (tick_max_us / 1000.0) < RELEASE_BUDGET_MS
+    release_gap_reasons: list[str] = []
+    if diag_samples_lost:
+        release_gap_reasons.append(f"`diag_dropped` delta={diag_dropped_delta}")
+    if not has_diag_dropped:
+        release_gap_reasons.append("`diag_dropped` not exposed")
+    elif diag_series.partial_missing:
+        release_gap_reasons.append("`diag_dropped` missing on some samples")
+    if diag_series.reset_detected:
+        release_gap_reasons.append("`diag_dropped` counter reset mid-run")
     if not release_pass:
         release_status = "FAIL"
     elif diag_samples_lost:
         release_status = "INCOMPLETE (diag_dropped > 0)"
+    elif release_gap_reasons:
+        release_status = "INCOMPLETE (diag coverage gap)"
     else:
         release_status = "PASS"
     release_detail = (
         f"`tick_us.max` = **{fmt_ms(us_to_ms(tick_max_us))} ms** "
         f"(p99 max {fmt_ms(us_to_ms(tick_p99_max_us))} ms, p50 med {fmt_ms(us_to_ms(tick_p50_med_us))} ms)"
-        + (f" (incomplete: `diag_dropped` delta={diag_dropped_delta})" if diag_samples_lost else "")
+        + (f" (incomplete: {'; '.join(release_gap_reasons)})" if release_gap_reasons else "")
     )
 
     if has_skipped_releases and skipped_delta is not None:
         skipped_pass = skipped_delta == 0
-        skipped_status = "PASS" if skipped_pass else "FAIL"
+        skipped_gap_notes: list[str] = []
+        if skipped_series.partial_missing:
+            skipped_gap_notes.append("skipped_releases missing on some samples")
+        if skipped_series.reset_detected:
+            skipped_gap_notes.append("skipped_releases counter reset mid-run")
+        if not skipped_pass:
+            skipped_status = "FAIL"
+        elif skipped_gap_notes:
+            skipped_status = "INCOMPLETE (counter coverage gap)"
+        else:
+            skipped_status = "PASS"
         diag_note = f", diag_dropped delta={diag_dropped_delta}" if has_diag_dropped else ""
+        gap_suffix = f" (gap: {'; '.join(skipped_gap_notes)})" if skipped_gap_notes else ""
         skipped_detail = (
             f"skipped_releases delta={skipped_delta} (start={fmt_int(skipped_start)}, end={fmt_int(skipped_end)}), "
-            f"late_count delta={fmt_int(late_delta)}{diag_note}"
+            f"late_count delta={fmt_int(late_delta)}{diag_note}{gap_suffix}"
         )
     else:
         skipped_pass = (late_delta == 0 if late_delta is not None else not late_any_nonzero) and period_max_us <= (2 * nom_period_us)
@@ -842,8 +935,16 @@ def analyze(
     mit_gaps: list[str] = []
     if diag_samples_lost:
         mit_gaps.append(f"diag_dropped delta={diag_dropped_delta} lost tick/wake samples")
+    if not has_diag_dropped:
+        mit_gaps.append("diag_dropped not exposed")
+    elif diag_series.partial_missing:
+        mit_gaps.append("diag_dropped missing on some samples")
+    if diag_series.reset_detected:
+        mit_gaps.append("diag_dropped counter reset mid-run")
     if not has_wake_lateness:
         mit_gaps.append("wake_lateness_us not exposed (using period proxy)")
+    elif wake_lateness_partial:
+        mit_gaps.append("wake_lateness_us missing on some samples")
     if not has_enqueue_to_wire:
         mit_gaps.append("enqueue-to-wire CAN latency not exposed")
     if not mit_observable_pass:
@@ -865,8 +966,11 @@ def analyze(
     hard_fail = (not release_pass) or (not skipped_pass) or (not lock_pass) or (not alloc_pass) or (not mit_observable_pass) or (not fault_pass)
     any_gaps = (
         (not has_skipped_releases)
+        or skipped_coverage_gap
         or (not has_wake_lateness)
+        or wake_lateness_partial
         or diag_samples_lost
+        or diag_coverage_gap
         or (not has_lock_attempts)
         or (not has_enqueue_to_wire)
         or (not alloc_timing_confirmed)
@@ -875,6 +979,8 @@ def analyze(
         overall_verdict = "FAIL"
     elif diag_samples_lost:
         overall_verdict = f"INCOMPLETE (diagnostic samples dropped: diag_dropped delta={diag_dropped_delta})"
+    elif diag_series.reset_detected or skipped_series.reset_detected:
+        overall_verdict = "INCOMPLETE (counter reset detected mid-run; coverage incomplete)"
     elif any_gaps:
         overall_verdict = "INCOMPLETE (all observable criteria PASS; diagnostic gaps remain)"
     else:
@@ -1001,7 +1107,11 @@ def analyze(
     )
     out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 
-    def phase_row(name: str, grp: list[LoadSample], prev_sample: LoadSample | None = None) -> str:
+    def sum_step_deltas(grp: list[LoadSample], step_deltas: list[int | None]) -> int | None:
+        vals = [step_deltas[x.index] for x in grp if step_deltas[x.index] is not None]
+        return sum(vals) if vals else None
+
+    def phase_row(name: str, grp: list[LoadSample]) -> str:
         t_p50 = us_to_ms(median_or_none([float(x.tick["tick_us"]["p50"]) for x in grp if "tick_us" in x.tick]))
         t_p99 = us_to_ms(max_or_none([float(x.tick["tick_us"]["p99"]) for x in grp if "tick_us" in x.tick]))
         t_max = us_to_ms(max_or_none([float(x.tick["tick_us"]["max"]) for x in grp if "tick_us" in x.tick]))
@@ -1034,12 +1144,9 @@ def analyze(
         else:
             wake_p = max(0.0, (p_max_us - nom_period_us) / 1000.0) if p_max_us is not None else None
             wake_str = fmt_ms(wake_p)
-        l0 = prev_sample.tick.get("late_count") if prev_sample is not None else grp[0].tick.get("late_count")
-        l1 = grp[-1].tick.get("late_count")
-        ld = (int(l1) - int(l0)) if isinstance(l0, int) and isinstance(l1, int) and l1 >= l0 else None
+        ld = sum_step_deltas(grp, late_series.per_sample_deltas)
         if has_skipped_releases:
-            delta_grp = [prev_sample, *grp] if prev_sample is not None else grp
-            _, _, _, sd = cumulative_delta(delta_grp, "skipped_releases")
+            sd = sum_step_deltas(grp, skipped_series.per_sample_deltas)
             skip_str = f"{fmt_int(sd)} / {fmt_int(ld)}"
         else:
             skip_str = fmt_int(ld)
@@ -1053,10 +1160,8 @@ def analyze(
             f"{skip_str} | {rx_str} | {enq_str} |"
         )
 
-    prev_phase_last: LoadSample | None = None
     for ph in phases_ordered:
-        out.append(phase_row(ph, by_phase[ph], prev_phase_last))
-        prev_phase_last = by_phase[ph][-1]
+        out.append(phase_row(ph, by_phase[ph]))
     if len(phases_ordered) > 1:
         out.append(phase_row("ALL", samples))
     out.append("")
@@ -1279,10 +1384,24 @@ def analyze(
             "`skipped_releases`: tracked in `ExecutorStats::skipped_releases` (`src/rt_core/executor.rs`), "
             "not serialized in `GET /api/v1/diagnostics/tick` (only `late_count` for `dt > 2 * period` is exposed)."
         )
+    elif skipped_coverage_gap:
+        gaps.append(
+            "`skipped_releases`: partial presence or mid-run counter reset detected; deadline coverage is incomplete."
+        )
     if not has_wake_lateness:
         gaps.append(
             "`wake_lateness_us`: scheduled release time vs actual wakeup offset is not in `TickSample`; "
             "only start-to-start `period_us` is exposed."
+        )
+    elif wake_lateness_partial:
+        gaps.append("`wake_lateness_us`: missing on some samples; wake-lateness coverage is incomplete.")
+    if not has_diag_dropped:
+        gaps.append(
+            "`diag_dropped`: not present in input JSON; diagnostic ring sample loss cannot be ruled out."
+        )
+    elif diag_series.partial_missing or diag_series.reset_detected:
+        gaps.append(
+            "`diag_dropped`: partial presence or mid-run counter reset detected; sample-loss coverage is incomplete."
         )
     if diag_samples_lost:
         gaps.append(
