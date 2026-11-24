@@ -258,7 +258,10 @@ pub(super) async fn complete_pending_motion(
                 return Some(ack);
             }
             Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_START_DRIFT_RETRIES => {
-                snapshot = req::MotionPlanSnapshot::from_supervisor_with_config(&inner, snapshot.config);
+                let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, snapshot.config) else {
+                    return Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
+                };
+                snapshot = next;
                 continue;
             }
             Err(err) => {
@@ -311,8 +314,8 @@ fn spawn_park_continuation(
             }).await;
             let mut inner = supervisor.inner().write().await;
             if inner.detached { return; }
-            if closing.load(Ordering::Acquire) {
-                req::fail_park_continuation(&mut inner, action_id, "UNLOAD_FAILED", "Connection closed before park continuation installed");
+            if closing.load(Ordering::Acquire) || Instant::now() >= deadline {
+                req::fail_park_continuation(&mut inner, action_id, "UNLOAD_FAILED", "Park continuation timed out or disconnected before install");
                 return;
             }
             let plan = match planned {

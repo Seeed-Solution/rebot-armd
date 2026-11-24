@@ -722,6 +722,8 @@ impl crate::supervisor::SupervisorInner {
             ramp.limits.get(g).map(|l| l.max_velocity)
         } else if let Some(lim) = self.tracking.retained_motion_limits.as_ref().and_then(|ls| ls.get(g)) {
             Some(lim.max_velocity)
+        } else if let Some((caps, dof)) = self.tracking.retained_motion_vel_caps {
+            (g < dof).then_some(caps[g])
         } else if self.servo_target.is_some() {
             let mut v = self.config.limits.get(g)?.max_velocity;
             #[cfg(feature = "policy-runtime")]

@@ -1150,6 +1150,8 @@ pub struct SupervisorInner {
     pub(crate) retired_trajectories: std::collections::VecDeque<ActiveTrajectory>,
     /// Preallocated reusable `UnloadSettle` ring returned on stop/finish (0 alloc / 0 free on RT).
     pub(crate) unload_settle_spare: Option<UnloadSettle>,
+    /// Preallocated reusable `Box<GripperMotion>` for park object-release on RT (0 alloc / 0 free).
+    pub(crate) park_release_spare: Option<Box<GripperMotion>>,
     /// Monotonic revision bumped on every change to motion planning inputs (limits, workspace,
     /// keep-out boxes, camera mount, kinematics, commissioning, gripper calibration, power).
     pub motion_config_revision: u64,
@@ -1160,8 +1162,6 @@ pub struct SupervisorInner {
     pub(crate) last_poll_partial_enable: bool,
     pub(crate) last_poll_oldest_age: Option<Duration>,
     pub(crate) last_poll_feedback_valid: bool,
-    /// Park action cancelled by an authorized stop before the first disable write.
-    pub(crate) park_stopped_action: Option<u64>,
     /// Active off-owner deferred park continuation (MIT handback or `holding_after_clear` rearm).
     pub(crate) park_continuation: Option<ParkContinuation>,
     /// Off-RT waiter notification for legacy WS park continuations (never touched on `rt_executor_owned`).
@@ -1798,17 +1798,18 @@ impl SupervisorInner {
             ],
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
+            park_release_spare: None,
             motion_config_revision: 1,
             driver_caps: DriverCapabilities::default(),
             last_poll_enable_state: EnableState::Unknown,
             last_poll_partial_enable: false,
             last_poll_oldest_age: None,
             last_poll_feedback_valid: false,
-            park_stopped_action: None,
             park_continuation: None,
             park_continuation_notify: Arc::new(tokio::sync::Notify::new()),
         };
         inner.prepare_workspace_eval_bufs();
+        inner.prepare_park_release_spare();
         inner
     }
 
@@ -2889,10 +2890,45 @@ impl SupervisorInner {
             || self.retired_trajectories.len() < self.retired_trajectories.capacity()
     }
 
-    /// Replaces `self.active_trajectory`, retiring any heap-backed previous trajectory off-thread on RT.
+    /// Preallocates a reusable `Box<GripperMotion>` off-RT so a 7-DOF park carrying an object
+    /// runs Opening and Closing release moves with strictly zero heap allocations/frees on RT.
+    pub(crate) fn prepare_park_release_spare(&mut self) {
+        let (Some(g_idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.clone()) else {
+            self.park_release_spare = None;
+            return;
+        };
+        let Some(limit) = self.config.limits.get(g_idx).cloned() else {
+            self.park_release_spare = None;
+            return;
+        };
+        let req = GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: PARK_RELEASE_SPEED, timeout_s: None, tag: None };
+        let start = self.commanded_positions.get(g_idx).copied().unwrap_or(policy.closed_rad);
+        self.park_release_spare = Some(Box::new(GripperMotion::new(req, policy, limit, start, g_idx)));
+    }
+
+    /// Recycles a clean park-release `Box<GripperMotion>` into `park_release_spare` (0 free on RT),
+    /// otherwise returns `Some(old)` iff dropping `old` would touch the heap.
+    pub(crate) fn recycle_or_keep_heap_trajectory(&mut self, old: ActiveTrajectory) -> Option<ActiveTrajectory> {
+        if old.action_id.is_none() && old.motion_limits.is_none() && old.then.is_none() && self.park_release_spare.is_none() {
+            if let Reference::Gripper(gm) = &old.reference {
+                if gm.is_park_release_clean() {
+                    if let Reference::Gripper(gm) = old.reference {
+                        self.park_release_spare = Some(gm);
+                        return None;
+                    }
+                }
+            }
+        }
+        old.has_heap_storage().then_some(old)
+    }
+
+    /// Replaces `self.active_trajectory`, recycling reusable park-release storage or retiring
+    /// heap-backed previous trajectories off-thread on RT.
     pub(crate) fn replace_active_trajectory(&mut self, next: Option<ActiveTrajectory>) {
         if let Some(old) = std::mem::replace(&mut self.active_trajectory, next) {
-            if old.has_heap_storage() { self.retire_active_trajectory(old); }
+            if let Some(heap_old) = self.recycle_or_keep_heap_trajectory(old) {
+                self.retire_active_trajectory(heap_old);
+            }
         }
     }
 
@@ -3381,7 +3417,9 @@ impl SupervisorInner {
             // a hold at the jaw's own closed stop is not an object
             let gap = self.config.gripper_policy.as_ref().map_or(f32::INFINITY, |p| (hold - p.closed_rad).abs() - p.holding_gap_rad);
             if gap >= 0.0 && !self.park_gripper_contact {
-                tracing::info!("Park: gripper held at {hold:.3} rad (object in the jaw); releasing it at the resting pose");
+                if !self.rt_executor_owned {
+                    tracing::info!("Park: gripper held at {hold:.3} rad (object in the jaw); releasing it at the resting pose");
+                }
                 self.park_gripper_contact = true;
             }
         }
@@ -3408,7 +3446,7 @@ impl SupervisorInner {
             self.park_gripper_contact = false;
             return false;
         };
-        let Some(policy) = self.config.gripper_policy.clone() else {
+        let Some(policy) = self.config.gripper_policy.as_ref() else {
             self.park_gripper_contact = false;
             return false;
         };
@@ -3422,19 +3460,33 @@ impl SupervisorInner {
             }
             ParkRelease::Closing => (GripperCommand::Close, None),
         };
-        let request = GripperRequest { command, fraction, grasp: false, speed: PARK_RELEASE_SPEED, timeout_s: None, tag: None };
         let close_cap = self.gripper_close_speed_limit();
         let ceiling_est = self.gripper_ceiling_torque_estimate();
-        let motion = match GripperMotion::try_with_close_speed_limit(
-            request, policy, self.config.limits[gripper_idx].clone(),
-            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
-        ) {
-            Ok(m) => m.with_ceiling_torque_estimate(ceiling_est),
-            Err(e) => {
-                tracing::error!("Park release skipped: {e}");
-                return false;
+        let mut boxed = if let Some(spare) = self.park_release_spare.take() {
+            spare
+        } else if !self.rt_executor_owned {
+            let req = GripperRequest { command, fraction, grasp: false, speed: PARK_RELEASE_SPEED, timeout_s: None, tag: None };
+            match GripperMotion::try_with_close_speed_limit(
+                req, policy.clone(), self.config.limits[gripper_idx].clone(),
+                self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+            ) {
+                Ok(m) => Box::new(m.with_ceiling_torque_estimate(ceiling_est)),
+                Err(e) => {
+                    tracing::error!("Park release skipped: {e}");
+                    return false;
+                }
             }
+        } else {
+            return false;
         };
+        if boxed.reinit_park_release_in_place(
+            command, fraction, PARK_RELEASE_SPEED, &self.config.limits[gripper_idx],
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap, ceiling_est,
+        ).is_err() {
+            self.park_release_spare = Some(boxed);
+            if !self.rt_executor_owned { tracing::error!("Park release skipped: invalid pos-force close speed"); }
+            return false;
+        }
         // the stall latch of the carry would block the opening move's first ticks otherwise
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
@@ -3442,13 +3494,18 @@ impl SupervisorInner {
         self.gripper_stall_window.reset();
         self.gripper_motion_hold = None;
         if next == ParkRelease::Opening { self.releasing = true; }
-        let duration = motion.expected_duration();
-        tracing::info!("Park release: {} joint {} {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
-            gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
-        if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
-        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
-        self.target_positions[gripper_idx] = motion.target;
-        self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
+        let duration = boxed.expected_duration();
+        let target_rad = boxed.target;
+        let timeout_s = boxed.timeout_s;
+        let wire_ceil = boxed.wire_velocity_ceiling();
+        if !self.rt_executor_owned {
+            tracing::info!("Park release: {} joint {} {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
+                gripper_idx + 1, self.commanded_positions[gripper_idx], target_rad);
+        }
+        if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += timeout_s.max(duration); }
+        self.gripper_hold_vel_ceiling = Some(wire_ceil);
+        self.target_positions[gripper_idx] = target_rad;
+        self.replace_active_trajectory(Some(ActiveTrajectory::new(None, Reference::Gripper(boxed))));
         self.park_release = Some(next);
         true
     }
@@ -5184,6 +5241,11 @@ impl SupervisorInner {
         } else {
             None
         };
+        let vel_caps_before_step = if tracking_enabled {
+            self.active_trajectory.as_ref().and_then(|a| a.motion_vel_caps)
+        } else {
+            None
+        };
         let gripper_idx_for_ceiling = self.config.gripper_index();
         // a gripper action that ended since the last tick without reporting done (lease loss,
         // fault, cancel), or one still installed while the arm is stopped: hold the measured jaw;
@@ -5338,6 +5400,11 @@ impl SupervisorInner {
         if let Some(caps) = caps_before_step {
             if self.active_trajectory.is_none() {
                 self.tracking.retained_motion_limits = Some(caps);
+            }
+        }
+        if let Some(vcaps) = vel_caps_before_step {
+            if self.active_trajectory.is_none() {
+                self.tracking.retained_motion_vel_caps = Some(vcaps);
             }
         }
 
@@ -6008,6 +6075,7 @@ impl SupervisorInner {
                 && !self.tracking.has_residual_lead(&self.commanded_positions, &self.config.arm_joints());
             if settled {
                 self.tracking.retained_motion_limits = None;
+                self.tracking.retained_motion_vel_caps = None;
             }
         }
 
@@ -7078,6 +7146,7 @@ impl ArmSupervisor {
         Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
         guard.safety.drain_retired_state_arcs_off_thread();
         guard.prepare_workspace_eval_bufs();
+        guard.prepare_park_release_spare();
         guard.core.hub().set_motion_config(Arc::new(
             crate::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&guard),
         ));
@@ -7699,7 +7768,10 @@ impl ArmSupervisor {
             match res {
                 Ok(installed) => return Ok(installed.epoch()),
                 Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_RETRIES => {
-                    snapshot = req::MotionPlanSnapshot::from_supervisor_with_config(&inner, snapshot.config);
+                    let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, snapshot.config) else {
+                        return Err(req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, epoch_id));
+                    };
+                    snapshot = next;
                 }
                 Err(e) => return Err(e.into_arm_error(&inner, request.action_kind, epoch_id)),
             }

@@ -126,6 +126,7 @@ pub struct MotionPlanSnapshot {
     pub torque_hold: Option<TorqueHold>,
     pub power_hold: Option<PowerHold>,
     pub holding_after_clear: bool,
+    pub mit_moving: bool,
     pub epoch: u64,
     pub stop_generation: u64,
     pub lease_generation: u64,
@@ -139,6 +140,8 @@ impl MotionPlanSnapshot {
     }
 
     pub fn from_supervisor_with_config(inner: &SupervisorInner, config: Arc<MotionConfigSnapshot>) -> Self {
+        let workspace_revision = config.workspace_revision;
+        let motion_config_revision = config.motion_config_revision;
         Self {
             config,
             commanded_positions: inner.commanded_positions.clone(),
@@ -147,12 +150,22 @@ impl MotionPlanSnapshot {
             torque_hold: inner.torque_guard.hold,
             power_hold: inner.power.gov.hold,
             holding_after_clear: inner.holding_after_clear(),
+            mit_moving: inner.mit_active() && inner.commanded_velocities.iter().any(|&v| v != 0.0),
             epoch: inner.safety.epoch_id(),
             stop_generation: inner.current_stop_gen(),
             lease_generation: inner.current_active_lease_gen(),
-            workspace_revision: inner.workspace_revision,
-            motion_config_revision: inner.motion_config_revision,
+            workspace_revision,
+            motion_config_revision,
         }
+    }
+
+    /// Reuses `config` for a `StartDrifted` retry ONLY while both owner revisions still match.
+    /// Returns `None` if workspace or motion config changed (caller must fail `PlanStale`).
+    pub fn refresh_for_drift_retry(inner: &SupervisorInner, config: Arc<MotionConfigSnapshot>) -> Option<Self> {
+        if config.workspace_revision != inner.workspace_revision || config.motion_config_revision != inner.motion_config_revision {
+            return None;
+        }
+        Some(Self::from_supervisor_with_config(inner, config))
     }
 
     /// Zero-lock snapshot from published `StateHub` telemetry + cached `MotionConfigSnapshot`.
@@ -174,6 +187,7 @@ impl MotionPlanSnapshot {
             torque_hold: None,
             power_hold: None,
             holding_after_clear: snap.rt.holding_after_clear,
+            mit_moving: false,
             epoch: snap.obs.epoch_id,
             stop_generation: snap.rt.stop_generation,
             lease_generation: snap.rt.lease_generation,
@@ -190,6 +204,7 @@ pub struct PreparedMotionSlot {
     pub dof: u8,
     pub start: [f32; MAX_DOF],
     pub v0: [f32; MAX_DOF],
+    pub requested_target: [f32; MAX_DOF],
     pub target: [f32; MAX_DOF],
     pub vel_caps: [f32; MAX_DOF],
     pub has_speed_scale: bool,
@@ -203,6 +218,7 @@ pub struct PreparedMotionSlot {
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
     pub for_holding_after_clear: bool,
+    pub for_mit_deferral: bool,
     pub continuation_action: Option<u64>,
 }
 
@@ -364,16 +380,18 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
             _ => MotionError::Unsupported("Gripper close during commissioning jog requires torque_feedback when max_close_torque_nm is configured".into()).into(),
         });
     }
-    if req.kind == MotionKind::Park && snap.holding_after_clear {
+    if req.kind == MotionKind::Park && (snap.holding_after_clear || snap.mit_moving) {
         return Ok(PreparedMotionPlan {
             slot: PreparedMotionSlot {
                 kind: MotionKind::Park, dof: dof as u8,
-                start: [0.0; MAX_DOF], v0: [0.0; MAX_DOF], target: [0.0; MAX_DOF], vel_caps: [0.0; MAX_DOF],
+                start: [0.0; MAX_DOF], v0: [0.0; MAX_DOF], requested_target: [0.0; MAX_DOF], target: [0.0; MAX_DOF], vel_caps: [0.0; MAX_DOF],
                 has_speed_scale: false, speed_scale: 1.0, polynomials: [zero_poly(); INLINE_POLYS],
                 duration: PARK_DURATION_S, power_scale: None, power_budget_hash: cfg.power_budget_hash,
                 tcp_offset: arm_cfg.tcp_offset, checked_workspace: cfg.workspace.is_some(),
                 workspace_revision: snap.workspace_revision, motion_config_revision: snap.motion_config_revision,
-                for_holding_after_clear: true, continuation_action: None,
+                for_holding_after_clear: snap.holding_after_clear,
+                for_mit_deferral: !snap.holding_after_clear && snap.mit_moving,
+                continuation_action: None,
             },
             heap_traj: None,
         });
@@ -398,6 +416,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
             (clamped, arm_cfg.resting_positions().to_vec(), Some(PARK_DURATION_S), cfg.planning_limits(None))
         }
     };
+    let requested_unfiltered = target.clone();
     if !is_park {
         if let Some(h) = snap.torque_hold {
             if let Some(t) = target.get_mut(h.joint) { if (*t - h.hold_q) * h.sign > 0.0 { *t = h.hold_q; } }
@@ -447,24 +466,25 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
         check_path_with_tcp_tol(&arm_cfg.arm_model, ws, &arm_cfg.camera_mount, arm_cfg.tcp_offset, eps, &start, samples.iter().map(Vec::as_slice)).map_err(map_ws)?;
     }
 
-    let (mut s_arr, mut v_arr, mut t_arr, mut vc_arr, mut p_arr) =
-        ([0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [zero_poly(); INLINE_POLYS]);
+    let (mut s_arr, mut v_arr, mut r_arr, mut t_arr, mut vc_arr, mut p_arr) =
+        ([0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [0.0f32; MAX_DOF], [zero_poly(); INLINE_POLYS]);
     let inline = dof <= MAX_DOF && traj.polynomials.len() == dof;
     if inline {
         s_arr[..dof].copy_from_slice(&start);
         v_arr[..dof].copy_from_slice(&snap.commanded_velocities);
+        r_arr[..dof].copy_from_slice(&requested_unfiltered);
         t_arr[..dof].copy_from_slice(&target);
         for i in 0..dof { vc_arr[i] = limits[i].max_velocity; p_arr[i] = traj.polynomials[i]; }
     }
     Ok(PreparedMotionPlan {
         slot: PreparedMotionSlot {
-            kind: req.kind, dof: dof as u8, start: s_arr, v0: v_arr, target: t_arr, vel_caps: vc_arr,
+            kind: req.kind, dof: dof as u8, start: s_arr, v0: v_arr, requested_target: r_arr, target: t_arr, vel_caps: vc_arr,
             has_speed_scale: req.speed_scale.is_some(), speed_scale: req.speed_scale.unwrap_or(1.0),
             polynomials: p_arr, duration: traj.duration, power_scale,
             power_budget_hash: cfg.power_budget_hash, tcp_offset: arm_cfg.tcp_offset,
             checked_workspace: cfg.workspace.is_some(), workspace_revision: snap.workspace_revision,
             motion_config_revision: snap.motion_config_revision, for_holding_after_clear: false,
-            continuation_action: None,
+            for_mit_deferral: false, continuation_action: None,
         },
         heap_traj: (!inline).then_some(traj),
     })
@@ -491,7 +511,7 @@ pub fn preflight_motion_request(inner: &SupervisorInner, stamp: AdmissionStamp, 
 }
 
 fn check_common_blockers(inner: &SupervisorInner) -> Result<(), MotionInstallError> {
-    if !inner.can_replace_active_trajectory() || inner.gravity_comp.is_some() { return Err(MotionInstallError::MotionBusy); }
+    if inner.calibration_busy || !inner.can_replace_active_trajectory() || inner.gravity_comp.is_some() { return Err(MotionInstallError::MotionBusy); }
     if inner.core.motion_inhibited_by_config() { return Err(MotionInstallError::ConfigBusy); }
     if inner.collision.hold.is_some() { return Err(MotionInstallError::CollisionHold); }
     if inner.handover_settling_since.is_some() { return Err(MotionInstallError::HandoverSettling); }
@@ -566,7 +586,7 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
                 if inner.config.home_positions.len() != dof { return Err(MotionInstallError::PlanStale); }
                 filtered[..dof].copy_from_slice(&inner.config.home_positions);
             } else {
-                filtered[..dof].copy_from_slice(&slot.target[..dof]);
+                filtered[..dof].copy_from_slice(&slot.requested_target[..dof]);
             }
             let notes = inner.preview_hold_filters(&mut filtered[..dof]);
             if (0..dof).any(|i| (filtered[i] - slot.target[i]).abs() > EXACT_START_TOL) { return Err(MotionInstallError::PlanStale); }
@@ -643,6 +663,13 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
         }
     } else if slot.for_holding_after_clear {
         return Err(MotionInstallError::PlanStale);
+    } else if slot.for_mit_deferral {
+        if slot.workspace_revision != inner.workspace_revision || slot.motion_config_revision != inner.motion_config_revision {
+            return Err(MotionInstallError::PlanStale);
+        }
+        if !inner.mit_active() {
+            return Err(MotionInstallError::StartDrifted);
+        }
     } else if !inner.mit_active() {
         let _ = verify_motion_freshness(inner, slot)?;
     } else if slot.workspace_revision != inner.workspace_revision || slot.motion_config_revision != inner.motion_config_revision {
@@ -655,13 +682,7 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
 
     if holding {
         let tentative_id = this.next_action_id + 1;
-        let rearm = this.begin_park_rearm_transition(&proof, tentative_id).map_err(|e| match e {
-            SafetyError::EStopActive => MotionInstallError::EStopActive,
-            SafetyError::FaultActive(_) => MotionInstallError::FaultActive,
-            SafetyError::HandoverSettling => MotionInstallError::HandoverSettling,
-            SafetyError::FeedbackUnavailable => MotionInstallError::FeedbackStale,
-            _ => MotionInstallError::EnableFailed,
-        })?;
+        let rearm = this.begin_park_rearm_transition(&proof, tentative_id)?;
         let id = this.begin_action_rt("park");
         debug_assert_eq!(id, tentative_id);
         let phase = match rearm { ParkRearmStart::ConfirmedNow => ParkContinuationPhase::ReadyForPlan, ParkRearmStart::Pending => ParkContinuationPhase::WaitingRearm };
@@ -684,7 +705,7 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
             }
             return Err(MotionInstallError::MotionBusy);
         }
-        if verify_motion_freshness(this, slot).is_err() {
+        if slot.for_mit_deferral || verify_motion_freshness(this, slot).is_err() {
             let id = this.begin_action_rt("park");
             this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::ReadyForPlan, epoch, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
             this.notify_park_continuation();
@@ -695,7 +716,7 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
 }
 
 pub fn install_park_continuation(inner: &mut SupervisorInner, action_id: u64, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool) -> Result<MotionInstalled, MotionInstallError> {
-    if slot.kind != MotionKind::Park || slot.for_holding_after_clear { return Err(MotionInstallError::InvalidCommand); }
+    if slot.kind != MotionKind::Park || slot.for_holding_after_clear || slot.for_mit_deferral { return Err(MotionInstallError::InvalidCommand); }
     let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id && c.phase == ParkContinuationPhase::ReadyForPlan) else {
         return Err(MotionInstallError::ContinuationMismatch);
     };
@@ -710,7 +731,15 @@ pub fn install_park_continuation(inner: &mut SupervisorInner, action_id: u64, sl
         _ => {}
     }
     if inner.safety.epoch_id() != cont.epoch || expected_epoch.is_some_and(|e| e != cont.epoch) { return Err(MotionInstallError::EpochMismatch); }
-    if inner.active_lease.as_ref().map(|l| l.generation) != cont.lease_gen { return Err(MotionInstallError::LeaseLost); }
+    let now = Instant::now();
+    let live_lease_gen = if inner.lease_enabled {
+        inner.active_lease.as_ref()
+            .filter(|l| now.saturating_duration_since(l.acquired_at) < inner.lease_timeout)
+            .map(|l| l.generation)
+    } else {
+        inner.active_lease.as_ref().map(|l| l.generation)
+    };
+    if live_lease_gen != cont.lease_gen { return Err(MotionInstallError::LeaseLost); }
     if inner.workspace_revision != cont.workspace_revision || inner.motion_config_revision != cont.motion_config_revision {
         return Err(MotionInstallError::PlanStale);
     }
@@ -753,7 +782,6 @@ fn install_park_trajectory(this: &mut SupervisorInner, existing_action_id: Optio
     this.clear_unload_settle();
     this.park_gripper_contact = false;
     this.park_release = None;
-    this.park_stopped_action = None;
     this.prepared_quintics_used += 1;
     let now = Instant::now();
     this.last_heartbeat = now;

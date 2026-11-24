@@ -331,6 +331,9 @@ pub struct TrackingRuntime {
     /// Motion caps (`ActiveTrajectory::motion_limits`) of a planned motion whose reference
     /// finished, kept in force until it has settled and its residual lead is ramped out.
     pub retained_motion_limits: Option<Vec<crate::model::JointLimit>>,
+    /// Zero-allocation inline velocity caps (`ActiveTrajectory::motion_vel_caps`) retained
+    /// through post-quintic settling until lead is ramped out.
+    pub retained_motion_vel_caps: Option<([f32; 8], usize)>,
     /// Ticks whose issued output was the lead withdrawal after the lead candidate failed
     /// validation (`TrackingOutput::withdrawn`); diagnostics only.
     pub withdrawal_ticks: u64,
@@ -482,6 +485,7 @@ impl TrackingRuntime {
             }
         } else {
             self.history_state = TrackingHistoryState::Unknown;
+        self.retained_motion_vel_caps = None;
             self.last_issued_velocities = None;
             self.last_nominal = None;
         }
@@ -531,6 +535,7 @@ impl TrackingRuntime {
     /// Invalidate output history (partial writes, suspension, holds/faults, mode changes).
     pub fn invalidate(&mut self) {
         self.history_state = TrackingHistoryState::Unknown;
+        self.retained_motion_vel_caps = None;
         if let Some(v) = self.last_issued_positions.take() {
             if self.spare_issued_positions.is_none() {
                 self.spare_issued_positions = Some(v);
@@ -707,7 +712,12 @@ impl crate::supervisor::SupervisorInner {
                     l.max_velocity = l.max_velocity.min(m.max_velocity);
                     l.max_acceleration = l.max_acceleration.min(m.max_acceleration);
                 }
-            } else if let Some((vcaps, dof)) = self.active_trajectory.as_ref().and_then(|a| a.motion_vel_caps) {
+            } else if let Some((vcaps, dof)) = self
+                .active_trajectory
+                .as_ref()
+                .and_then(|a| a.motion_vel_caps)
+                .or(self.tracking.retained_motion_vel_caps)
+            {
                 if dof == base.len() {
                     for (l, &v) in base.iter_mut().zip(&vcaps[..dof]) {
                         l.max_velocity = l.max_velocity.min(v);

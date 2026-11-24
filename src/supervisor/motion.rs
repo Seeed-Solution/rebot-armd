@@ -76,7 +76,10 @@ impl SupervisorInner {
     pub(crate) fn retire_motion_payloads(&mut self) {
         self.release_servo_target();
         let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
-        let trajectory = self.active_trajectory.take().filter(|t| t.has_heap_storage());
+        let trajectory = match self.active_trajectory.take() {
+            Some(old) => self.recycle_or_keep_heap_trajectory(old),
+            None => None,
+        };
         self.clear_unload_settle();
         let unload_settle = self.unload_settle.take();
         if trajectory.is_some() || unload_settle.is_some() || servo_ws_min_depths.is_some() {
@@ -339,7 +342,7 @@ impl SupervisorInner {
                     if self.is_torqued {
                         self.pending_normal_unload = false;
                         self.unload_settle = None;
-                        self.active_trajectory = None;
+                        self.replace_active_trajectory(None);
                         self.servo_target = None;
                     }
                     return;
@@ -351,7 +354,7 @@ impl SupervisorInner {
                 if self.mit_active() && self.mit_hand_back("park").is_err() {
                     if self.mit_active() && !self.safety.state().is_stopped() {
                         tracing::warn!("Park requested while MIT tracking moves the arm: braking to rest and handing back first");
-                        self.active_trajectory = None;
+                        self.replace_active_trajectory(None);
                         self.mit.park_after_hand_back = true;
                     }
                     return;
@@ -423,7 +426,7 @@ impl SupervisorInner {
                                 self.park_rejection = Some(e);
                                 self.pending_normal_unload = false;
                                 self.unload_settle = None;
-                                self.active_trajectory = None;
+                                self.replace_active_trajectory(None);
                                 return;
                             }
                         }
@@ -435,7 +438,7 @@ impl SupervisorInner {
                                 self.park_rejection = Some(e);
                                 self.pending_normal_unload = false;
                                 self.unload_settle = None;
-                                self.active_trajectory = None;
+                                self.replace_active_trajectory(None);
                                 return;
                             }
                         };
@@ -445,7 +448,7 @@ impl SupervisorInner {
                             self.park_rejection = Some(e);
                             self.pending_normal_unload = false;
                             self.unload_settle = None;
-                            self.active_trajectory = None;
+                            self.replace_active_trajectory(None);
                             return;
                         }
                         let _ = self.safety.set_torque(true);
@@ -469,7 +472,7 @@ impl SupervisorInner {
                     tracing::warn!("NormalUnload cannot plan motion or arm not operational; maintaining holding torque to prevent dropping arm");
                     self.pending_normal_unload = false;
                     self.unload_settle = None;
-                    self.active_trajectory = None;
+                    self.replace_active_trajectory(None);
                     self.servo_target = None;
                     return;
                 }
@@ -478,7 +481,7 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.is_torqued = false;
                 self.tracking.invalidate();
-                self.active_trajectory = None;
+                self.replace_active_trajectory(None);
                 self.reset_gripper_stall();
                 self.commanded_velocities = vec![0.0; self.config.dof];
                 if self.driver.is_none() {
@@ -1674,7 +1677,6 @@ impl SupervisorInner {
         self.stop_motion();
         if !disable_in_flight {
             if let Some(id) = cancelled_continuation.map(|c| c.action_id).or(running_park_id) {
-                self.park_stopped_action = None;
                 self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
             }
         }

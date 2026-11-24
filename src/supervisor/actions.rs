@@ -1544,11 +1544,6 @@ impl SupervisorInner {
             {
                 return;
             }
-            if self.park_stopped_action == Some(id) {
-                self.park_stopped_action = None;
-                self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
-                return;
-            }
             if self.pending_normal_unload {
                 let progress = self.active_trajectory.as_ref().and_then(|a| a.as_quintic()).map_or(1.0, |t| (t.elapsed / t.duration).min(1.0) as f32);
                 if let Some(a) = self.last_action.as_mut() { a.progress = progress; }

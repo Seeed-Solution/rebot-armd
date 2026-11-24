@@ -598,6 +598,7 @@ impl SupervisorInner {
         self.gripper_calib_jaw_opening = cand.gripper_calib_jaw_opening;
         self.gripper_calib_invalid = cand.gripper_calib_invalid;
         self.driver_config_error = cand.driver_config_error;
+        self.prepare_park_release_spare();
         self.bump_motion_config_revision();
     }
 

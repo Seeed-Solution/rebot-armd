@@ -1919,6 +1919,82 @@ impl GripperMotion {
         Ok(m)
     }
 
+    /// Zero-allocation in-place reinitialization for park gripper release on RT threads,
+    /// reusing preallocated `self.policy` and `self.limit.name` without heap ops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reinit_park_release_in_place(
+        &mut self,
+        command: GripperCommand,
+        fraction: Option<f64>,
+        speed: f64,
+        limit: &JointLimit,
+        start: f32,
+        gripper_index: usize,
+        close_speed_limit: Option<f32>,
+        ceiling_torque_estimate_nm: Option<f32>,
+    ) -> Result<(), &'static str> {
+        let dir = if self.policy.closed_rad >= self.policy.open_rad { 1.0 } else { -1.0 };
+        let target = match command {
+            GripperCommand::Open => self.policy.open_rad,
+            GripperCommand::Close => self.policy.closed_rad,
+            GripperCommand::Move => self.policy.closed_rad + fraction.unwrap_or(0.0) as f32 * (self.policy.open_rad - self.policy.closed_rad),
+            GripperCommand::Seek => self.policy.closed_rad + dir * 0.6,
+        }.clamp(limit.min_position, limit.max_position);
+        let closing = (target - start) * dir > 1e-6;
+        let (planned_speed, max_velocity, planned_vel_raw) = match close_speed_limit {
+            Some(cap) => {
+                if !(cap.is_finite() && cap > 0.0) { return Err("INVALID_COMMAND"); }
+                let max_v = if limit.max_velocity.is_finite() && limit.max_velocity > 0.0 { f64::from(limit.max_velocity) } else { speed };
+                if closing {
+                    let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(speed.min(max_v).min(f64::from(cap)));
+                    if raw == 0 { return Err("INVALID_COMMAND"); }
+                    (f64::from(raw) / 100.0, crate::model::DamiaoGripperDrive::step_speed_f32(raw), Some(raw))
+                } else {
+                    if crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(speed.min(max_v)) == 0 { return Err("INVALID_COMMAND"); }
+                    (speed, speed as f32, None)
+                }
+            }
+            None => (speed, speed as f32, None),
+        };
+        self.request.command = command;
+        self.request.fraction = fraction;
+        self.request.grasp = false;
+        self.request.speed = speed;
+        self.request.timeout_s = None;
+        self.limit.min_position = limit.min_position;
+        self.limit.max_position = limit.max_position;
+        self.limit.max_velocity = max_velocity;
+        self.limit.max_acceleration = limit.max_acceleration;
+        self.target = target;
+        self.start = start;
+        self.gripper_index = gripper_index;
+        self.planned_speed = planned_speed;
+        self.planned_vel_raw = planned_vel_raw;
+        self.ceiling_torque_estimate_nm = ceiling_torque_estimate_nm.filter(|v| v.is_finite() && *v > 0.0);
+        self.elapsed = 0.0;
+        self.still_for = 0.0;
+        self.still_anchor = None;
+        self.moved = false;
+        self.phase = GripPhase::Moving;
+        self.contact_rad = None;
+        self.contact_detector.reset();
+        self.lag_window.reset();
+        self.learn = LearnMode::Off;
+        self.last_contact = None;
+        self.loaded = false;
+        self.extendable = true;
+        self.timeout_s = self.default_timeout_s();
+        self.hard_timeout_s = (self.timeout_s + GRIPPER_MAX_EXTENSION_S).min(GRIPPER_MAX_DEFAULT_TIMEOUT_S).max(self.timeout_s);
+        self.progress_ref = (0.0, start);
+        self.window_unloaded = true;
+        self.cap_k = None;
+        Ok(())
+    }
+
+    pub fn is_park_release_clean(&self) -> bool {
+        self.request.tag.is_none() && self.samples.is_none() && self.baseline.is_none() && self.learned.is_none()
+    }
+
     /// Switch from an explicit caller timeout to the unified derived default deadline.
     pub fn use_default_timeout(&mut self) {
         self.request.timeout_s = None;
