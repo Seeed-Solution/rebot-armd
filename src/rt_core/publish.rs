@@ -132,9 +132,9 @@ struct RetireRing {
     tail: AtomicU64,
 }
 
-// SAFETY: slot `i % CAP` is written by the producer only while `tail <= i < tail + CAP`
-// (Acquire load of `tail`) and taken by the consumer only while `i < head` (Acquire load of
-// `head`); the consumer side runs under the hub mutex, so it is single.
+// SAFETY: `slots` has fixed length `RETIRE_CAPACITY`; slot `i % CAP` is written by the producer
+// only while `tail <= i < tail + CAP` (Acquire load of `tail`) and taken by the consumer only
+// while `i < head` (Acquire load of `head`); the consumer side runs under the hub mutex, so it is single.
 unsafe impl Sync for RetireRing {}
 
 impl RetireRing {
@@ -220,6 +220,47 @@ impl StatePublisher {
     /// `ArmCore::take_observation_buffer`).
     pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
 
+    /// Pre-populates empty triple-buffer observation slots off the release loop without blocking
+    /// on a contended reader. Leaves `meta` and `published_seq` untouched.
+    ///
+    /// - If `hub.state` is uncontended (`try_lock`), warms all 3 slots directly.
+    /// - If a reader holds `hub.state`, warms the producer's writable slot(s) without waiting
+    ///   (both `back` and `middle` when nothing has been published yet via `swap_unfresh`) and
+    ///   stores a template in `hub.prewarm_template` so `StateHub::refresh` warms `front`
+    ///   off-thread before rotating it back to the producer.
+    pub fn try_prewarm_observations(&mut self, mut make: impl FnMut() -> ArmObservation) {
+        let _ = self.hub.prewarm_template.set(Box::new(make()));
+        match self.hub.state.try_lock() {
+            Ok(mut st) => {
+                self.producer.for_each_slot_mut(&mut st.consumer, |slot| {
+                    if slot.obs.is_none() {
+                        slot.obs = Some(make());
+                    }
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut st = p.into_inner();
+                self.producer.for_each_slot_mut(&mut st.consumer, |slot| {
+                    if slot.obs.is_none() {
+                        slot.obs = Some(make());
+                    }
+                });
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let back = self.producer.back_mut();
+                if back.obs.is_none() {
+                    back.obs = Some(make());
+                }
+                if self.producer.swap_unfresh() {
+                    let other = self.producer.back_mut();
+                    if other.obs.is_none() {
+                        other.obs = Some(make());
+                    }
+                }
+            }
+        }
+    }
+
     /// Moves the preallocated string spares out of the back slot (0 alloc).
     pub fn take_back_spares(&mut self) -> ObservationSpares {
         std::mem::take(&mut self.producer.back_mut().spares)
@@ -273,6 +314,9 @@ pub struct StateHub {
     retire: RetireRing,
     /// Displaced observations the tick had to free itself (retire ring full).
     tick_frees: AtomicU64,
+    /// Pre-sized observation template recorded at executor startup so a contended reader warms
+    /// its own `front` slot off-thread before handing it back to the RT producer.
+    prewarm_template: OnceLock<Box<ArmObservation>>,
 }
 
 /// A publisher for an arm with `dof` joints and its hub.
@@ -292,6 +336,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         record: OnceLock::new(),
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
+        prewarm_template: OnceLock::new(),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
 }
@@ -314,13 +359,30 @@ impl StateHub {
     fn refresh(&self, st: &mut HubState) -> Option<Arc<Snapshot>> {
         self.retire.free_all();
         super::ops::stop_diag().drain_and_log_once();
-        if st.consumer.refresh() {
-            let slot = st.consumer.front_mut();
-            // copied, not moved: the slot keeps its memory for the tick to fill again (the
-            // tick neither allocates nor frees observations)
-            if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
-                let snap = Snapshot { meta, obs: obs.clone(), rt: slot.rt.clone() };
-                st.latest = Some(Arc::new(snap));
+        // Acquire-check `has_fresh()` BEFORE inspecting `prewarm_template`: in executor mode
+        // `try_prewarm_observations` sets `prewarm_template` (Release) before any release
+        // calls `Producer::publish` (AcqRel), so observing `FRESH == 1` guarantees
+        // `prewarm_template` is visible and prevents rotating an empty `front` slot into
+        // `middle` for the RT producer.
+        if st.consumer.has_fresh() {
+            if st.consumer.front().obs.is_none() {
+                if let Some(tmpl) = self.prewarm_template.get() {
+                    let mut obs = (**tmpl).clone();
+                    obs.ensure_rt_safety_text_spare();
+                    let dof = obs.positions.len();
+                    obs.gravity_torques.reserve(dof);
+                    obs.motor_errors.reserve(dof);
+                    st.consumer.front_mut().obs = Some(obs);
+                }
+            }
+            if st.consumer.refresh() {
+                let slot = st.consumer.front_mut();
+                // copied, not moved: the slot keeps its memory for the tick to fill again (the
+                // tick neither allocates nor frees observations)
+                if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
+                    let snap = Snapshot { meta, obs: obs.clone(), rt: slot.rt.clone() };
+                    st.latest = Some(Arc::new(snap));
+                }
             }
         }
         st.latest.clone()
@@ -434,5 +496,52 @@ mod tests {
         });
         let (p, v, i, s) = hub.latest().unwrap().rt.arm_feedback(&[0, 2]);
         assert_eq!((p, v, i, s), (vec![1.0, 2.0, 3.0], vec![0.1, 0.3], vec![Some(now), Some(now)], vec![5, 7]));
+    }
+
+    #[test]
+    fn startup_reader_holding_lock_before_prewarm_never_rotates_empty_front_to_producer() {
+        let (mut publisher, hub) = state_channel(7);
+        let now = Instant::now();
+        let (p, s, i) = ([0.0f32; 7], [1u64; 7], [Some(now); 7]);
+
+        // Reader acquires `hub.state` BEFORE `try_prewarm_observations` runs and pauses.
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let hub_r = Arc::clone(&hub);
+        let reader = std::thread::spawn(move || {
+            let mut st = hub_r.state.lock().unwrap();
+            assert!(st.consumer.front().obs.is_none());
+            assert!(hub_r.prewarm_template.get().is_none());
+            entered_tx.send(()).unwrap();
+            // Pause while producer runs `try_prewarm_observations` (hits WouldBlock) + publishes!
+            resume_rx.recv().unwrap();
+            let snap = hub_r.refresh(&mut st).expect("published snapshot visible after resume");
+            assert_eq!(snap.meta.seq, 2);
+            assert!(st.consumer.front().obs.is_some());
+        });
+
+        entered_rx.recv().unwrap();
+        // Contended startup prewarm warms back & middle without blocking and records template.
+        publisher.try_prewarm_observations(|| obs(0.0));
+        assert!(hub.prewarm_template.get().is_some());
+        // Publish twice while reader still holds `hub.state`.
+        for seq in 1..=2u64 {
+            let mut o = publisher.take_back_observation().expect("back slot prewarmed");
+            o.timestamp = seq as f64;
+            assert!(publisher.publish(seq, now, now + Duration::from_millis(40), o, inputs(&p, &s, &i)).is_none());
+        }
+        // Resume reader: `refresh()` must warm `front` BEFORE rotating it into `middle`.
+        resume_tx.send(()).unwrap();
+        reader.join().unwrap();
+
+        // Subsequent publications rotate that consumer slot back into the producer: NEVER empty!
+        for seq in 3..=6u64 {
+            let mut o = publisher
+                .take_back_observation()
+                .expect("rotated consumer front slot must be prewarmed off-thread");
+            o.timestamp = seq as f64;
+            assert!(publisher.publish(seq, now, now + Duration::from_millis(40), o, inputs(&p, &s, &i)).is_none());
+        }
+        assert_eq!(hub.tick_frees(), 0);
     }
 }

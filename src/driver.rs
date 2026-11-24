@@ -553,6 +553,8 @@ const DAMIAO_ENABLE_RETRY_AT: [Duration; 2] = [Duration::from_millis(25), Durati
 pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
 /// Time bound of one Damiao receive pass (with at most 64 frames).
 pub const DAMIAO_RX_PASS: Duration = Duration::from_millis(5);
+/// Maximum age for Damiao joint feedback to still be considered valid.
+const DAMIAO_FEEDBACK_VALID_WINDOW: Duration = Duration::from_millis(250);
 
 /// Driver-owned causal evidence of one motor's physical torque state.
 ///
@@ -7995,6 +7997,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    /// Whether joint `i` has causally confirmed off evidence AND fresh feedback within
+    /// [`DAMIAO_FEEDBACK_VALID_WINDOW`] (used by `panic_disable_step` / `unconfirmed_disable_joints`
+    /// so stale sticky-disabled motors still get refreshed on panic-disable).
+    fn joint_disable_confirmed_fresh(&self, i: usize) -> bool {
+        self.motor_evidence_at(i) == MotorTorqueEvidence::OffConfirmed
+            && self
+                .last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| self.since(t) <= DAMIAO_FEEDBACK_VALID_WINDOW)
+    }
+
     /// Bounded post-TX RX drain: consumes pre-command frames that arrived between the pre-drain
     /// and `can.transmit` + `flush` while `motor_*_tx` is still `AwaitingPostTxEmpty`, then
     /// promotes every `AwaitingPostTxEmpty` boundary to `PostTxEmpty` upon observing an empty RX
@@ -8960,7 +8975,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.last_feedback_instant.is_empty() {
             return false;
         }
-        let limit = Duration::from_millis(250);
+        let limit = DAMIAO_FEEDBACK_VALID_WINDOW;
         let mut all_valid = true;
         // Use monotonic process uptime to prevent clock-jump discontinuities on RTC synchronization
         static MONOTONIC_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
@@ -9236,15 +9251,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         let unconfirmed_before = self.unconfirmed_disable_joints();
-        if unconfirmed_before.is_empty() && self.enable_state() == EnableState::Disabled {
+        if unconfirmed_before.is_empty()
+            && self.is_feedback_valid()
+            && self.enable_state() == EnableState::Disabled
+        {
             self.disable_confirmed_sticky = true;
             self.mit_fence = None;
             return Some(Ok(Vec::new()));
         }
 
-        // Send disable to every unconfirmed motor; a send error on one motor must NEVER stop
-        // attempts on the remaining motors. Panic-disable keeps its own deadline loop and routes
-        // every frame through `send(TxKind::DisableProtective { reason: ProcessExit }, ..)`.
+        // Send disable to every unconfirmed or stale motor; a send error on one motor must NEVER
+        // stop attempts on the remaining motors unless the step deadline itself has passed.
+        // Panic-disable keeps its own deadline loop and routes every frame through
+        // `send(TxKind::DisableProtective { reason: ProcessExit }, ..)`.
+        let tx_deadline = Deadline { at: deadline };
         let mut sent_any = false;
         for i in unconfirmed_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
@@ -9253,12 +9273,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     reason: DisableProtectiveReason::ProcessExit,
                 },
                 None,
-                None,
+                Some(tx_deadline),
                 false,
                 |_| Some(damiao::build_disable_frame(id)),
             ) {
                 Ok(_) => {
                     sent_any = true;
+                }
+                Err(TxRefusal::DeadlinePassed) => {
+                    tracing::warn!(
+                        "Panic disable step deadline passed before TX for Damiao joint J{} (CAN ID 0x{:X})",
+                        i + 1,
+                        id
+                    );
+                    break;
                 }
                 Err(r) => {
                     tracing::warn!(
@@ -9284,7 +9312,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.rx_frame_limit = None;
 
         let remaining = self.unconfirmed_disable_joints();
-        if remaining.is_empty() && self.enable_state() == EnableState::Disabled {
+        if remaining.is_empty()
+            && self.is_feedback_valid()
+            && self.enable_state() == EnableState::Disabled
+        {
             self.disable_confirmed_sticky = true;
             self.mit_fence = None;
         }
@@ -9293,7 +9324,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn unconfirmed_disable_joints(&self) -> Vec<usize> {
         (0..self.motor_ids.len())
-            .filter(|&i| self.motor_evidence_at(i) != MotorTorqueEvidence::OffConfirmed)
+            .filter(|&i| !self.joint_disable_confirmed_fresh(i))
             .collect()
     }
 

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -33,7 +33,330 @@ pub use streams::targets;
 pub use driver_transitions::{
     run_with_panic_deadline_observer, EnableLifecycle, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT,
 };
+pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until};
 pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
+
+/// Global monotonic allocator for single-use [`AdmissionStamp::request_id`] values.
+static NEXT_ADMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// High bit reserving an isolated single-use namespace for RT broker `RequestId` values so
+/// per-broker monotonic IDs never collide with global [`next_admission_request_id`] IDs.
+const BROKER_REQUEST_ID_BIT: u64 = 1u64 << 63;
+
+/// Allocates a fresh non-zero, single-use admission request ID (lock-free, zero-alloc).
+#[inline]
+pub fn next_admission_request_id() -> u64 {
+    let id = NEXT_ADMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        id != 0 && (id & BROKER_REQUEST_ID_BIT) == 0,
+        "admission request_id overflow"
+    );
+    id
+}
+
+/// Generation snapshot captured ONCE at request admission (lock-free in the WS reader
+/// before queuing, or at REST/caller entry) and required by every supervisor/owner function
+/// that starts motion or output.
+///
+/// Although `AdmissionStamp` is [`Copy`] so callers can carry it across off-lock planning,
+/// each stamp carries a unique non-zero [`request_id`](Self::request_id) consumed once by
+/// [`SupervisorInner::check_admission`] under the owner lock; any second use is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionStamp {
+    pub stop_gen: u64,
+    pub estop_epoch: u64,
+    pub lease_gen: u64,
+    /// Monotonic WS connection ID (`>= 1`) captured at WS admission, or `0` for non-WS callers.
+    /// Checked against the owner-lock closed-connection set so a stale stamp from a closed
+    /// connection is always refused.
+    pub connection_id: u64,
+    /// Globally unique non-zero request ID consumed once by [`SupervisorInner::check_admission`].
+    /// A zero or already-consumed `request_id` is refused fail-closed.
+    pub request_id: u64,
+}
+
+impl AdmissionStamp {
+    /// Derives a fresh single-use child [`AdmissionStamp`] for a macro sub-motion while
+    /// preserving the parent's admission-captured `stop_gen`, `estop_epoch`, `lease_gen`, and
+    /// `connection_id` verbatim (never re-sampling live owner authority).
+    pub fn for_macro_child(self) -> Self {
+        Self {
+            request_id: if self.request_id == 0 {
+                0
+            } else {
+                next_admission_request_id()
+            },
+            ..self
+        }
+    }
+
+    /// Constructs a single-use [`AdmissionStamp`] for an RT broker request using its broker
+    /// `RequestId` in an isolated namespace (zero-alloc; `0` stays `0` and is refused fail-closed).
+    pub(crate) fn from_broker(
+        stop_gen: u64,
+        estop_epoch: u64,
+        lease_gen: u64,
+        broker_request_id: u64,
+    ) -> Self {
+        Self {
+            stop_gen,
+            estop_epoch,
+            lease_gen,
+            connection_id: 0,
+            request_id: if broker_request_id == 0 {
+                0
+            } else {
+                broker_request_id | BROKER_REQUEST_ID_BIT
+            },
+        }
+    }
+
+    /// Constructs a fresh single-use [`AdmissionStamp`] for an RT-internal latest-target or
+    /// stream-handback step (zero-alloc atomic counter).
+    pub(crate) fn for_rt_internal(stop_gen: u64, estop_epoch: u64, lease_gen: u64) -> Self {
+        Self {
+            stop_gen,
+            estop_epoch,
+            lease_gen,
+            connection_id: 0,
+            request_id: next_admission_request_id(),
+        }
+    }
+}
+
+/// Opaque, single-use admission proof token created ONLY by [`SupervisorInner::check_admission`]
+/// under the owner lock and borrowing the owner lock guard for `'g`.
+///
+/// It cannot be constructed externally, cloned, copied, sent across threads/`.await` points,
+/// stored past the guard lifetime `'g`, or held after dropping the owner lock guard, and every
+/// function that starts motion or output consumes it by value:
+///
+/// ```compile_fail
+/// use armd::{AdmissionStamp, Admitted};
+/// let _forged = Admitted(AdmissionStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0, connection_id: 0, request_id: 1 });
+/// ```
+///
+/// ```compile_fail
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<armd::Admitted<'_>>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<armd::Admitted<'_>>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<armd::Admitted<'_>>();
+/// ```
+///
+/// Holding [`Admitted`] after dropping the owner lock guard does not compile:
+///
+/// ```compile_fail,E0505
+/// use armd::{ArmSupervisor, SupervisorInner};
+/// async fn cannot_drop_guard_while_holding_admitted(sup: &ArmSupervisor) {
+///     let stamp = sup.capture_admission_stamp();
+///     let mut guard = sup.inner().write().await;
+///     let admitted = guard.check_admission(stamp).unwrap();
+///     drop(guard);
+///     let _ = SupervisorInner::enable_torque(admitted);
+/// }
+/// ```
+///
+/// ```compile_fail,E0597
+/// use armd::{ArmSupervisor, SupervisorInner};
+/// async fn cannot_return_admitted_past_guard_scope(sup: &ArmSupervisor) {
+///     let stamp = sup.capture_admission_stamp();
+///     let admitted = {
+///         let mut guard = sup.inner().write().await;
+///         guard.check_admission(stamp).unwrap()
+///     };
+///     let _ = SupervisorInner::enable_torque(admitted);
+/// }
+/// ```
+///
+/// Mutating the owner state while holding [`Admitted`] or storing it in `'static` does not compile:
+///
+/// ```compile_fail,E0499
+/// use armd::{ArmConfig, SupervisorInner};
+/// let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+/// let stamp = inner.current_admission_stamp();
+/// let admitted = inner.check_admission(stamp).unwrap();
+/// let _ = inner.authorized_stop();
+/// let _ = SupervisorInner::enable_torque(admitted);
+/// ```
+///
+/// ```compile_fail
+/// fn assert_static<T: 'static>() {}
+/// fn reject_static<'a>() { assert_static::<armd::Admitted<'a>>(); }
+/// ```
+///
+/// Calling a motion or output start without an [`Admitted`] token does not compile:
+///
+/// ```compile_fail,E0061
+/// use armd::SupervisorInner;
+/// let _ = SupervisorInner::jog(vec![0.0; 7], None, None);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use armd::SupervisorInner;
+/// let _ = SupervisorInner::enable_torque();
+/// ```
+///
+/// ```compile_fail,E0061
+/// use armd::motion::{GripperCommand, GripperRequest};
+/// use armd::SupervisorInner;
+/// let req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None };
+/// let _ = SupervisorInner::start_gripper_with_baseline(req, 1, armd::supervisor::GripperBaselineCmd::None);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use armd::motion::{GripperCommand, GripperRequest, LearnMode};
+/// use armd::SupervisorInner;
+/// let req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None };
+/// let _ = SupervisorInner::start_macro_gripper_learning(1, req, LearnMode::Calibration);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use std::sync::Arc;
+/// use armd::{ArmConfig, ArmSupervisor};
+/// let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+/// let _ = armd::gripper_calib::begin_calibration(&sup, 1, None);
+/// ```
+///
+/// ```compile_fail,E0061
+/// use std::sync::Arc;
+/// use armd::{ArmConfig, ArmSupervisor};
+/// let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+/// let _ = armd::gripper_calib::start_calibration(&sup);
+/// ```
+#[must_use = "Admitted token must be consumed by a motion/output start"]
+pub struct Admitted<'g> {
+    inner: &'g mut SupervisorInner,
+    stamp: AdmissionStamp,
+    _not_send_sync: std::marker::PhantomData<*mut ()>,
+}
+
+impl std::fmt::Debug for Admitted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Admitted").field("stamp", &self.stamp).finish()
+    }
+}
+
+/// Crate-private, non-`Copy`, non-`Clone` witness proving a live [`Admitted`] token was
+/// verified and consumed inside `armd`. Only [`Admitted::consume`] can construct it.
+pub(crate) struct AdmittedProof {
+    stamp: AdmissionStamp,
+}
+
+impl AdmittedProof {
+    #[inline]
+    pub(crate) fn stamp(&self) -> AdmissionStamp {
+        self.stamp
+    }
+}
+
+impl<'g> Admitted<'g> {
+    /// The validated stamp captured at request admission.
+    #[inline]
+    pub fn stamp(&self) -> AdmissionStamp {
+        self.stamp
+    }
+
+    /// Re-verifies this token against live owner state (including lock-free atomic E-stop
+    /// and urgent-stop counters) without consuming it.
+    pub(crate) fn verify_live(&self) -> Result<AdmissionStamp, SafetyError> {
+        self.inner.verify_admission_stamp(self.stamp)?;
+        Ok(self.stamp)
+    }
+
+    /// Consumes this single-use token by value, re-verifies its stamp against live owner
+    /// state, and yields `&'g mut SupervisorInner` plus a crate-private [`AdmittedProof`].
+    pub(crate) fn consume(self) -> Result<(&'g mut SupervisorInner, AdmittedProof), SafetyError> {
+        let stamp = self.stamp;
+        let inner = self.inner;
+        inner.verify_admission_stamp(stamp)?;
+        Ok((inner, AdmittedProof { stamp }))
+    }
+}
+
+/// Complete catalog of motion/output start entry points gated by [`AdmissionStamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MotionStartKind {
+    Jog,
+    Home,
+    Park,
+    Preset,
+    MoveTo,
+    MoveRelative,
+    MoveToPose,
+    Place,
+    Grasp,
+    Replay,
+    Sequence,
+    CalibHover,
+    MeasureMultiview,
+    MacroStart,
+    MacroChildPath,
+    MacroChildQuintic,
+    MacroChildGripper,
+    MacroChildReplay,
+    Servo,
+    PolicyShadow,
+    PolicyLive,
+    GravityComp,
+    Gripper,
+    GripperCalibrate,
+    GripperZeroCheck,
+    TorqueEnable,
+}
+
+impl MotionStartKind {
+    pub const ALL: &'static [MotionStartKind] = &[
+        Self::Jog,
+        Self::Home,
+        Self::Park,
+        Self::Preset,
+        Self::MoveTo,
+        Self::MoveRelative,
+        Self::MoveToPose,
+        Self::Place,
+        Self::Grasp,
+        Self::Replay,
+        Self::Sequence,
+        Self::CalibHover,
+        Self::MeasureMultiview,
+        Self::MacroStart,
+        Self::MacroChildPath,
+        Self::MacroChildQuintic,
+        Self::MacroChildGripper,
+        Self::MacroChildReplay,
+        Self::Servo,
+        Self::PolicyShadow,
+        Self::PolicyLive,
+        Self::GravityComp,
+        Self::Gripper,
+        Self::GripperCalibrate,
+        Self::GripperZeroCheck,
+        Self::TorqueEnable,
+    ];
+}
+
+/// Single sealed execution contract for [`SupervisorInner::start_motion`]: an operation can only
+/// run when handed a single-use [`Admitted`] token produced by [`SupervisorInner::check_admission`]
+/// under the owner lock.
+///
+/// ```compile_fail,E0061
+/// use armd::SupervisorInner;
+/// // Calling start_motion without an Admitted token fails to compile:
+/// let _ = SupervisorInner::start_motion(());
+/// ```
+pub trait MotionStartOp {
+    type Output;
+    fn kind(&self) -> MotionStartKind;
+    fn execute(self, admitted: Admitted<'_>) -> Result<Self::Output, ArmError>;
+}
 
 #[derive(Debug, Error)]
 pub enum ArmError {
@@ -598,6 +921,8 @@ pub struct SupervisorInner {
     pub joint_zero_offsets: Vec<f32>,
     /// Zero check against the profile's `zero_reference` (`zero_convention`).
     pub zero_convention: crate::joint_zero::ZeroConvention,
+    /// Pending `legacy_j6` warning deferred from `armd-control` to off-thread log formatting.
+    pub(crate) pending_legacy_j6_log: Option<crate::joint_zero::ZeroConvention>,
     /// Run the zero check on the next tick with fresh feedback and torque off (startup, after
     /// torque went off, after a zero).
     pub zero_check_pending: bool,
@@ -643,6 +968,11 @@ pub struct SupervisorInner {
     pub applied_estop_count: u64,
     /// `applied_estop_count` for the bus driver's E-stop gate (`crate::rt_core::urgent`).
     pub estop_applied: Arc<AtomicU64>,
+    /// Monotonic stop generation incremented under the owner lock whenever a Stop applies.
+    /// Shared lock-free with [`ArmSupervisor`] so WS/REST admission can capture [`AdmissionStamp`].
+    pub stop_gen: Arc<AtomicU64>,
+    /// Lock-free mirror of the active lease generation (`0` when no lease is held).
+    pub lease_gen_mirror: Arc<AtomicU64>,
     pub last_preemption: Option<Instant>,
     /// Connection and generation most recently evicted by a forced acquire.
     pub last_evicted: Option<(String, u64)>,
@@ -765,6 +1095,18 @@ pub struct SupervisorInner {
     pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
     /// Highest E-stop request generation dropped if `pending_estop_acks` ever reached capacity 64.
     pub(crate) estop_ack_overflow_gen: u64,
+    /// Preallocated queue of heap-owning motion payloads retired on `armd-control` for off-thread drop.
+    pub(crate) pending_retired_stops: std::collections::VecDeque<crate::rt_core::urgent::RetiredStopPayloads>,
+    /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`),
+    /// set under the owner lock during teardown and checked on every motion/output install.
+    closed_connections: ClosedConnections,
+    /// Bounded, preallocated single-use tracker for consumed global admission request IDs.
+    consumed_stamps: ConsumedStamps,
+    /// Bounded, preallocated single-use tracker for consumed RT broker `RequestId` values.
+    consumed_broker_stamps: ConsumedStamps,
+    /// Shared per-connection bounded action-terminal FIFO broadcaster (wired by `ArmSupervisor::new`;
+    /// `None` on standalone `SupervisorInner::new`, never locked on `armd-control`).
+    terminals: Option<Arc<TerminalBroadcaster>>,
     /// Monotonic count of deferred safety log events dropped at the RT->off-thread SPSC ring.
     pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
@@ -1021,6 +1363,141 @@ pub struct PendingZeroCheckPersist {
     pub active_tool_is_stock: bool,
 }
 
+/// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`).
+/// Bounded by `open_connections + 1` with zero eviction and O(log K) zero-alloc lookup.
+#[derive(Debug, Default)]
+pub(crate) struct ClosedConnections {
+    intervals: Vec<(u64, u64)>,
+}
+
+impl ClosedConnections {
+    pub(crate) fn mark_closed(&mut self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let idx = self
+            .intervals
+            .partition_point(|&(_, end)| end.saturating_add(1) < id);
+        if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
+            let (lo, hi) = self.intervals[idx];
+            let new_lo = lo.min(id);
+            let mut new_hi = hi.max(id);
+            if idx + 1 < self.intervals.len()
+                && self.intervals[idx + 1].0 <= new_hi.saturating_add(1)
+            {
+                new_hi = new_hi.max(self.intervals[idx + 1].1);
+                self.intervals.remove(idx + 1);
+            }
+            self.intervals[idx] = (new_lo, new_hi);
+        } else {
+            self.intervals.insert(idx, (id, id));
+        }
+    }
+
+    pub(crate) fn is_closed(&self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let idx = self.intervals.partition_point(|&(_, end)| end < id);
+        idx < self.intervals.len() && self.intervals[idx].0 <= id
+    }
+}
+
+/// Preallocated capacity for [`ConsumedStamps`] disjoint intervals above `watermark`.
+const CONSUMED_STAMPS_INTERVAL_CAP: usize = 256;
+
+/// Bounded, zero-allocation-in-steady-state set of consumed single-use admission request IDs
+/// (`>= 1`), stored as a monotonic `watermark` (every `id <= watermark` is treated as consumed,
+/// fail-closed) plus up to [`CONSUMED_STAMPS_INTERVAL_CAP`] sorted coalesced inclusive
+/// intervals `(lo, hi)` above `watermark`.
+#[derive(Debug)]
+pub(crate) struct ConsumedStamps {
+    watermark: u64,
+    intervals: Vec<(u64, u64)>,
+}
+
+impl ConsumedStamps {
+    pub(crate) fn new() -> Self {
+        Self {
+            watermark: 0,
+            intervals: Vec::with_capacity(CONSUMED_STAMPS_INTERVAL_CAP),
+        }
+    }
+
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        if id == 0 || id <= self.watermark {
+            return true;
+        }
+        let idx = self.intervals.partition_point(|&(_, end)| end < id);
+        idx < self.intervals.len() && self.intervals[idx].0 <= id
+    }
+
+    pub(crate) fn record(&mut self, id: u64) {
+        if id == 0 || id <= self.watermark {
+            return;
+        }
+        if id == self.watermark.saturating_add(1) {
+            self.watermark = id;
+            self.fold_contiguous_into_watermark();
+            return;
+        }
+        let mut idx = self
+            .intervals
+            .partition_point(|&(_, end)| end.saturating_add(1) < id);
+        if idx < self.intervals.len() && self.intervals[idx].0 <= id.saturating_add(1) {
+            let (lo, hi) = self.intervals[idx];
+            let new_lo = lo.min(id);
+            let mut new_hi = hi.max(id);
+            if idx + 1 < self.intervals.len()
+                && self.intervals[idx + 1].0 <= new_hi.saturating_add(1)
+            {
+                new_hi = new_hi.max(self.intervals[idx + 1].1);
+                self.intervals.remove(idx + 1);
+            }
+            self.intervals[idx] = (new_lo, new_hi);
+            self.fold_contiguous_into_watermark();
+            return;
+        }
+        // Capacity full: fold oldest range into `watermark` fail-closed (zero allocation,
+        // never forgets any previously consumed ID).
+        if self.intervals.len() >= CONSUMED_STAMPS_INTERVAL_CAP {
+            if idx == 0 {
+                self.watermark = self.watermark.max(id);
+                self.fold_contiguous_into_watermark();
+                return;
+            }
+            let (_, oldest_hi) = self.intervals.remove(0);
+            self.watermark = self.watermark.max(oldest_hi);
+            self.fold_contiguous_into_watermark();
+            // Re-locate insertion point after folding into watermark.
+            if id <= self.watermark {
+                return;
+            }
+            if id == self.watermark.saturating_add(1) {
+                self.watermark = id;
+                self.fold_contiguous_into_watermark();
+                return;
+            }
+            idx = self
+                .intervals
+                .partition_point(|&(_, end)| end.saturating_add(1) < id);
+        }
+        self.intervals.insert(idx, (id, id));
+        self.fold_contiguous_into_watermark();
+    }
+
+    fn fold_contiguous_into_watermark(&mut self) {
+        while let Some(&(lo, hi)) = self.intervals.first() {
+            if lo <= self.watermark.saturating_add(1) {
+                self.watermark = self.watermark.max(hi);
+                self.intervals.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 impl SupervisorInner {
     pub fn new(mut config: ArmConfig) -> Self {
         config.validate().expect("Invalid ArmConfig: invariant violation");
@@ -1098,11 +1575,11 @@ impl SupervisorInner {
             feedback_numeric_valid: true,
             sim_time_s: 0.0,
             last_still_since_s: None,
-            still_anchor_positions: Vec::new(),
+            still_anchor_positions: Vec::with_capacity(dof),
             still_window_ever_moved: false,
-            table_still_first_rx_instants: Vec::new(),
-            table_still_last_rx_instants: Vec::new(),
-            table_still_anchor_positions: Vec::new(),
+            table_still_first_rx_instants: Vec::with_capacity(dof),
+            table_still_last_rx_instants: Vec::with_capacity(dof),
+            table_still_anchor_positions: Vec::with_capacity(dof),
             torques: vec![0.0; dof],
             loads: vec![0.0; dof],
             temperatures: vec![25.0; dof],
@@ -1183,6 +1660,7 @@ impl SupervisorInner {
             calibration_load_error: None,
             joint_zero_offsets: vec![0.0; dof],
             zero_convention: Default::default(),
+            pending_legacy_j6_log: None,
             zero_check_pending: true,
             zero_check_prev_torqued: false,
             profile_camera_mount,
@@ -1202,7 +1680,7 @@ impl SupervisorInner {
             gravity_torques_ramped: vec![0.0; dof],
             last_can_feedback_instant: None,
             core: crate::rt_core::ArmCore::new(dof),
-            joint_feedback_queue_bounds: Vec::new(),
+            joint_feedback_queue_bounds: Vec::with_capacity(dof),
             scratch: crate::rt_core::scratch::TickScratch::with_dof(dof),
             ws_eval_bufs: Default::default(),
             bus_loss_instant: None,
@@ -1210,6 +1688,8 @@ impl SupervisorInner {
             requested_estop_count: Arc::new(AtomicU64::new(0)),
             applied_estop_count: 0,
             estop_applied: Arc::new(AtomicU64::new(0)),
+            stop_gen: Arc::new(AtomicU64::new(0)),
+            lease_gen_mirror: Arc::new(AtomicU64::new(0)),
             last_preemption: None,
             last_evicted: None,
             handover_settling_since: None,
@@ -1270,6 +1750,13 @@ impl SupervisorInner {
                 crate::rt_core::executor::ESTOP_ACK_CAPACITY,
             ),
             estop_ack_overflow_gen: 0,
+            pending_retired_stops: std::collections::VecDeque::with_capacity(
+                crate::rt_core::urgent::URGENT_STOP_CAPACITY,
+            ),
+            closed_connections: ClosedConnections::default(),
+            consumed_stamps: ConsumedStamps::new(),
+            consumed_broker_stamps: ConsumedStamps::new(),
+            terminals: None,
             safety_log_ring_dropped: 0,
             before_publish_hook: None,
             tx_joint_no_progress_ticks: vec![0; dof],
@@ -1308,12 +1795,209 @@ impl SupervisorInner {
         config: &ArmConfig,
         e_stop_latched: Arc<AtomicBool>,
         requested_estop_count: Arc<AtomicU64>,
+        stop_gen: Arc<AtomicU64>,
+        lease_gen_mirror: Arc<AtomicU64>,
     ) -> Self {
         let mut shell = Self::new(config.clone());
         shell.e_stop_latched = e_stop_latched;
         shell.requested_estop_count = requested_estop_count;
+        shell.stop_gen = stop_gen;
+        shell.lease_gen_mirror = lease_gen_mirror;
         shell.detached = true;
         shell
+    }
+
+    /// Current owner-serialized stop generation.
+    pub fn current_stop_gen(&self) -> u64 {
+        let local = self.stop_gen.load(Ordering::SeqCst);
+        match self.stop_requests.as_ref() {
+            Some(stops) => local.max(stops.current()),
+            None => local,
+        }
+    }
+
+    /// Current valid (unexpired) active lease generation, or `0` when no valid lease is held.
+    pub fn current_active_lease_gen(&self) -> u64 {
+        self.active_lease
+            .as_ref()
+            .filter(|a| a.acquired_at.elapsed() < self.lease_timeout)
+            .map_or(0, |a| a.generation)
+    }
+
+    /// Capture an [`AdmissionStamp`] from the current owner state (for tests and in-process
+    /// request entry before mutating/stopping; never called inside motion-start functions).
+    pub fn current_admission_stamp(&self) -> AdmissionStamp {
+        AdmissionStamp {
+            stop_gen: self.current_stop_gen(),
+            estop_epoch: self.safety.epoch_id(),
+            lease_gen: self.current_active_lease_gen(),
+            connection_id: 0,
+            request_id: next_admission_request_id(),
+        }
+    }
+
+    /// Marks WS connection `connection_id` (`>= 1`) closed under the owner lock so no
+    /// resuming async install or stale [`Admitted`] token from that connection can start motion.
+    pub fn mark_connection_closed(&mut self, connection_id: u64) {
+        self.closed_connections.mark_closed(connection_id);
+    }
+
+    /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under the owner lock.
+    pub fn is_connection_closed(&self, connection_id: u64) -> bool {
+        self.closed_connections.is_closed(connection_id)
+    }
+
+    /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
+    /// superseded by this start plus the new action's eventual terminal (never drops a terminal).
+    pub(crate) fn check_terminal_fifo_for_new_action(&self) -> Result<(), SafetyError> {
+        let Some(terminals) = self.terminals.as_ref() else {
+            return Ok(());
+        };
+        let has_running = self.last_action.as_ref().is_some_and(|a| a.is_running());
+        if !terminals.can_start_action(has_running, self.rt_executor_owned) {
+            return Err(SafetyError::TerminalsBusy);
+        }
+        Ok(())
+    }
+
+    /// Records a finished action (`!is_running()`) into every subscribed connection's bounded
+    /// terminal FIFO (deduped by action ID) and wakes `armd-dispatch` immediately. Skipped on
+    /// `armd-control` (`rt_executor_owned == true`) so RT ticks stay lock-free/zero-alloc.
+    pub(crate) fn record_finished_action(&self, action: &ActionStatus) {
+        if self.rt_executor_owned || action.is_running() {
+            return;
+        }
+        if let Some(terminals) = self.terminals.as_ref() {
+            if terminals.record_finished(action) {
+                self.core.hub().wake();
+            }
+        }
+    }
+
+    /// Convenience helper: if `self.last_action` matches `id` and is terminal, record it.
+    pub(crate) fn record_finished_action_by_id(&self, id: u64) {
+        if self.rt_executor_owned {
+            return;
+        }
+        if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
+            self.record_finished_action(a);
+        }
+    }
+
+    /// Patches `failed_step` on a queued terminal action if still awaiting dispatcher drain.
+    pub(crate) fn update_recorded_terminal_failed_step(&self, id: u64, step: Option<usize>) {
+        if self.rt_executor_owned {
+            return;
+        }
+        if let Some(terminals) = self.terminals.as_ref() {
+            terminals.update_failed_step(id, step);
+        }
+    }
+
+    /// Advance the stop generation under the owner lock whenever a Stop applies.
+    pub fn advance_stop_generation(&mut self) -> u64 {
+        self.stop_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Monotonically synchronize `stop_gen` with an RT executor's `CommitCtx::stop_generation`.
+    pub(crate) fn sync_stop_generation(&mut self, gen: u64) {
+        let _ = self.stop_gen.fetch_max(gen, Ordering::SeqCst);
+    }
+
+    /// Keep `lease_gen_mirror` synchronized with `active_lease` under the owner lock.
+    pub(crate) fn sync_lease_gen_mirror(&self) {
+        self.lease_gen_mirror.store(self.current_active_lease_gen(), Ordering::SeqCst);
+    }
+
+    fn verify_admission_stamp(&self, stamp: AdmissionStamp) -> Result<(), SafetyError> {
+        if stamp.connection_id != 0 && self.is_connection_closed(stamp.connection_id) {
+            return Err(SafetyError::LeaseLost);
+        }
+        if stamp.stop_gen != self.current_stop_gen() {
+            return Err(SafetyError::Stopped);
+        }
+        let active_gen = self.current_active_lease_gen();
+        if stamp.lease_gen != active_gen {
+            return Err(SafetyError::LeaseLost);
+        }
+        let current_epoch = self.safety.epoch_id();
+        if stamp.estop_epoch != current_epoch {
+            if self.e_stop_latched.load(Ordering::SeqCst)
+                || matches!(self.safety.state(), SafetyState::EStop)
+            {
+                return Err(SafetyError::EStopActive);
+            }
+            return Err(SafetyError::EpochMismatch {
+                expected: current_epoch,
+                received: stamp.estop_epoch,
+            });
+        }
+        if self.e_stop_latched.load(Ordering::SeqCst)
+            || matches!(self.safety.state(), SafetyState::EStop)
+        {
+            return Err(SafetyError::EStopActive);
+        }
+        Ok(())
+    }
+
+    fn is_stamp_consumed(&self, request_id: u64) -> bool {
+        if request_id == 0 {
+            return true;
+        }
+        if (request_id & BROKER_REQUEST_ID_BIT) != 0 {
+            self.consumed_broker_stamps
+                .contains(request_id & !BROKER_REQUEST_ID_BIT)
+        } else {
+            self.consumed_stamps.contains(request_id)
+        }
+    }
+
+    fn record_consumed_stamp(&mut self, request_id: u64) {
+        if request_id == 0 {
+            return;
+        }
+        if (request_id & BROKER_REQUEST_ID_BIT) != 0 {
+            self.consumed_broker_stamps
+                .record(request_id & !BROKER_REQUEST_ID_BIT);
+        } else {
+            self.consumed_stamps.record(request_id);
+        }
+    }
+
+    /// Read-only preflight admission check used before off-lock planning or non-installing
+    /// validation: verifies authority and confirms `stamp.request_id` is non-zero and not yet
+    /// consumed, WITHOUT consuming it.
+    pub fn preflight_admission(&self, stamp: AdmissionStamp) -> Result<(), SafetyError> {
+        if self.is_stamp_consumed(stamp.request_id) {
+            return Err(SafetyError::StampAlreadyConsumed);
+        }
+        self.verify_admission_stamp(stamp)
+    }
+
+    /// Single owner-lock motion/output admission gate: the SOLE constructor of [`Admitted`].
+    /// Compares the caller's admission-captured [`AdmissionStamp`] against current owner state
+    /// without re-sampling, consumes its single-use [`AdmissionStamp::request_id`] under the
+    /// owner lock, and returns an [`Admitted<'g>`] token borrowing the owner guard.
+    pub fn check_admission<'g>(
+        &'g mut self,
+        stamp: AdmissionStamp,
+    ) -> Result<Admitted<'g>, SafetyError> {
+        if self.is_stamp_consumed(stamp.request_id) {
+            return Err(SafetyError::StampAlreadyConsumed);
+        }
+        self.verify_admission_stamp(stamp)?;
+        self.record_consumed_stamp(stamp.request_id);
+        Ok(Admitted {
+            inner: self,
+            stamp,
+            _not_send_sync: std::marker::PhantomData,
+        })
+    }
+
+    /// Unified motion-start wrapper: requires an [`Admitted`] token by value under the owner lock.
+    pub fn start_motion<Op: MotionStartOp>(admitted: Admitted<'_>, op: Op) -> Result<Op::Output, ArmError> {
+        admitted.verify_live()?;
+        op.execute(admitted)
     }
 
     /// Observation schema: profile capabilities plus the parts that depend on the driver.
@@ -1339,7 +2023,7 @@ impl SupervisorInner {
         schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
         if let Some(t) = schema.capabilities.teach.as_mut() { t.episodes = self.episodes.enabled(); }
         schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
-        schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(&self.zero_convention).ok());
+        schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(self.zero_convention).ok());
         schema
     }
 
@@ -1772,6 +2456,30 @@ impl SupervisorInner {
         obs
     }
 
+    /// Pre-warms RT-owned scratch/history buffers, static fallback policies, and empty
+    /// triple-buffer observation slots for the RT executor before the first release runs
+    /// (nonblocking under reader contention; leaves `published_seq` unchanged).
+    pub(crate) fn prewarm_observation_slots(&mut self) {
+        let _ = Self::default_rebot_dm_resting_pose();
+        let dof = self.config.dof;
+        let arm_dof = self.config.arm_dof();
+        self.still_anchor_positions.reserve(dof);
+        self.table_still_anchor_positions.reserve(dof);
+        self.table_still_first_rx_instants.reserve(dof);
+        self.table_still_last_rx_instants.reserve(dof);
+        self.joint_feedback_queue_bounds.reserve(dof);
+        self.motor_errors.reserve(dof);
+        self.gravity_torques.reserve(arm_dof);
+        let tmpl = self.current_observation();
+        self.core.try_prewarm_observations(|| {
+            let mut obs = tmpl.clone();
+            obs.ensure_rt_safety_text_spare();
+            obs.gravity_torques.reserve(arm_dof);
+            obs.motor_errors.reserve(dof);
+            obs
+        });
+    }
+
     /// [`Self::current_observation`] at `timestamp` written into `out`, reusing its memory: the
     /// control tick fills its published sample this way, without allocating while no value
     /// changes its shape (armd 1.6 RT core). Every field is overwritten.
@@ -1911,10 +2619,15 @@ impl SupervisorInner {
         })
     }
 
-    fn resting_policy(&self) -> Option<RestingPosePolicy> {
+    fn default_rebot_dm_resting_pose() -> &'static RestingPosePolicy {
+        static DEFAULT_REBOT_DM: std::sync::OnceLock<RestingPosePolicy> = std::sync::OnceLock::new();
+        DEFAULT_REBOT_DM.get_or_init(RestingPosePolicy::rebot_dm)
+    }
+
+    fn resting_policy(&self) -> Option<&RestingPosePolicy> {
         match &self.config.resting_pose {
-            Some(policy) => Some(policy.clone()),
-            None if self.driver.is_none() => Some(RestingPosePolicy::rebot_dm()),
+            Some(policy) => Some(policy),
+            None if self.driver.is_none() => Some(Self::default_rebot_dm_resting_pose()),
             None => None,
         }
     }
@@ -2605,6 +3318,9 @@ impl SupervisorInner {
     /// Release step of a park that carried an object, run once the park trajectory ends:
     /// open [`PARK_RELEASE_OPEN_RAD`] past the contact, then close (stall-protected gripper
     /// moves), then the unload settle. Returns true while the release owns the tick.
+    ///
+    /// Exempt from `Admitted` (Invariant 1a): system-initiated stop-direction motion
+    /// completing a `NormalUnload` park so the gripper releases safely before torque-off.
     fn step_park_release(&mut self) -> bool {
         let next = match self.park_release {
             None if self.park_gripper_contact => ParkRelease::Opening,
@@ -2681,7 +3397,7 @@ impl SupervisorInner {
     }
 
     /// Return an `UnloadSettle` buffer to `unload_settle_spare` (resetting its logical state
-    /// without freeing its preallocated sample ring).
+    /// without freeing its preallocated sample ring; any overflow is retired off-thread on RT).
     pub(crate) fn clear_unload_settle(&mut self) {
         if let Some(mut settle) = self.unload_settle.take() {
             settle.pending_s = 0.0;
@@ -2691,6 +3407,11 @@ impl SupervisorInner {
             settle.last_report_s = None;
             if self.unload_settle_spare.is_none() {
                 self.unload_settle_spare = Some(settle);
+            } else {
+                self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                    unload_settle: Some(settle),
+                    ..Default::default()
+                });
             }
         }
     }
@@ -5597,15 +6318,248 @@ enum OwnerSlot {
     Failed,
 }
 
+/// Lock-free ticket returned synchronously by [`ArmSupervisor::begin_e_stop_checked`] after
+/// latching `e_stop_latched` and advancing `requested_estop_count` via atomics (zero mutexes,
+/// zero waiter scans).
+pub(crate) struct CheckedEstopTicket {
+    req: u64,
+    mode: u8,
+}
+
+/// Default bounded capacity of each connection's finished-action terminal FIFO.
+pub const TERMINAL_FIFO_CAPACITY: usize = 64;
+
+type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
+
+struct ConnectionTerminalQueue {
+    sub_id: u64,
+    fifo: std::collections::VecDeque<ActionStatus>,
+    seen: std::collections::VecDeque<u64>,
+    sink: TerminalSinkFn,
+}
+
+struct TerminalBroadcasterInner {
+    next_id: u64,
+    capacity: usize,
+    sinks: Vec<ConnectionTerminalQueue>,
+}
+
+/// Lossless off-RT per-connection bounded FIFO of finished actions: every terminal action
+/// (`!is_running()`) is appended in exact order to each subscribed connection's bounded FIFO,
+/// from which `armd-dispatch` drains every terminal in order onto that connection's lossless
+/// ordinary control queue. Never drops a terminal; if full, new action starts are refused with
+/// [`SafetyError::TerminalsBusy`] until drained. Never locks on `armd-control`.
+pub(crate) struct TerminalBroadcaster {
+    subscriber_count: AtomicUsize,
+    pending_total: AtomicUsize,
+    max_fifo_len: AtomicUsize,
+    capacity_atomic: AtomicUsize,
+    dispatch_paused: AtomicBool,
+    inner: std::sync::Mutex<TerminalBroadcasterInner>,
+}
+
+impl Default for TerminalBroadcaster {
+    fn default() -> Self {
+        Self {
+            subscriber_count: AtomicUsize::new(0),
+            pending_total: AtomicUsize::new(0),
+            max_fifo_len: AtomicUsize::new(0),
+            capacity_atomic: AtomicUsize::new(TERMINAL_FIFO_CAPACITY),
+            dispatch_paused: AtomicBool::new(false),
+            inner: std::sync::Mutex::new(TerminalBroadcasterInner {
+                next_id: 1,
+                capacity: TERMINAL_FIFO_CAPACITY,
+                sinks: Vec::new(),
+            }),
+        }
+    }
+}
+
+impl TerminalBroadcaster {
+    fn recompute_atomics(&self, g: &TerminalBroadcasterInner) {
+        self.subscriber_count.store(g.sinks.len(), Ordering::Release);
+        let mut pending = 0usize;
+        let mut max_len = 0usize;
+        for q in &g.sinks {
+            let l = q.fifo.len();
+            pending += l;
+            if l > max_len {
+                max_len = l;
+            }
+        }
+        self.pending_total.store(pending, Ordering::Release);
+        self.max_fifo_len.store(max_len, Ordering::Release);
+        self.capacity_atomic.store(g.capacity, Ordering::Release);
+    }
+
+    pub(crate) fn subscribe(&self, sink: TerminalSinkFn) -> u64 {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let id = g.next_id;
+        g.next_id += 1;
+        let cap = g.capacity;
+        g.sinks.push(ConnectionTerminalQueue {
+            sub_id: id,
+            fifo: std::collections::VecDeque::with_capacity(cap.min(TERMINAL_FIFO_CAPACITY)),
+            seen: std::collections::VecDeque::with_capacity(cap.max(128)),
+            sink,
+        });
+        self.recompute_atomics(&g);
+        id
+    }
+
+    pub(crate) fn unsubscribe(&self, id: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.sinks.retain(|q| q.sub_id != id);
+        self.recompute_atomics(&g);
+    }
+
+    pub(crate) fn can_start_action(&self, has_running_action: bool, lock_free: bool) -> bool {
+        if self.subscriber_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        // Reserve 1 slot for the new action's eventual terminal, plus 1 immediate slot if a
+        // currently running action will be superseded right now.
+        let needed = if has_running_action { 2 } else { 1 };
+        if lock_free {
+            let cap = self.capacity_atomic.load(Ordering::Acquire);
+            let max_len = self.max_fifo_len.load(Ordering::Acquire);
+            return max_len.saturating_add(needed) <= cap;
+        }
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.sinks.is_empty() {
+            return true;
+        }
+        g.sinks
+            .iter()
+            .all(|q| q.fifo.len().saturating_add(needed) <= g.capacity)
+    }
+
+    pub(crate) fn record_finished(&self, action: &ActionStatus) -> bool {
+        if action.is_running() || self.subscriber_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.sinks.is_empty() {
+            return false;
+        }
+        let cap = g.capacity;
+        let mut enqueued = false;
+        for q in &mut g.sinks {
+            if q.seen.contains(&action.id) {
+                continue;
+            }
+            // Never drop or skip a finished action's terminal even if `q.fifo.len() >= cap`:
+            // `can_start_action` refuses NEW starts with `TERMINALS_BUSY` once `len >= cap`,
+            // while any already-running action's terminal is preserved in strict FIFO order.
+            let seen_cap = cap.max(128).max(q.fifo.len() + 1);
+            if q.seen.len() >= seen_cap {
+                q.seen.pop_front();
+            }
+            q.seen.push_back(action.id);
+            q.fifo.push_back(action.clone());
+            enqueued = true;
+        }
+        if enqueued {
+            self.recompute_atomics(&g);
+        }
+        enqueued
+    }
+
+    pub(crate) fn record_from_observation(&self, obs: &ArmObservation) {
+        if self.subscriber_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        // Check `previous_action` before `action` to preserve chronological FIFO order.
+        for act in [obs.previous_action.as_ref(), obs.action.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if !act.is_running() {
+                self.record_finished(act);
+            }
+        }
+    }
+
+    pub(crate) fn update_failed_step(&self, action_id: u64, step: Option<usize>) {
+        if self.subscriber_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for q in &mut g.sinks {
+            if let Some(a) = q.fifo.iter_mut().find(|a| a.id == action_id) {
+                a.failed_step = step;
+            }
+        }
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.dispatch_paused.load(Ordering::Acquire)
+            && self.pending_total.load(Ordering::Acquire) > 0
+    }
+
+    pub(crate) fn drain_all(&self, base_obs: &ArmObservation) {
+        if self.dispatch_paused.load(Ordering::Acquire)
+            || self.pending_total.load(Ordering::Acquire) == 0
+        {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Pop a terminal ONLY after its sink confirms a successful enqueue. On failure
+        // (e.g., outbound queue full -> fatal close triggered), keep the terminal at the
+        // head of the FIFO and keep the subscriber until connection teardown unsubscribes it.
+        for q in &mut g.sinks {
+            while let Some(finished) = q.fifo.front() {
+                let mut obs = base_obs.clone();
+                obs.action = Some(finished.clone());
+                obs.previous_action = None;
+                if (q.sink)(&obs) {
+                    q.fifo.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.recompute_atomics(&g);
+    }
+
+    pub(crate) fn set_capacity(&self, capacity: usize) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.capacity = capacity.max(1);
+        self.recompute_atomics(&g);
+    }
+
+    pub(crate) fn set_dispatch_paused(&self, paused: bool) {
+        self.dispatch_paused.store(paused, Ordering::Release);
+    }
+
+    pub(crate) fn pending_total(&self) -> usize {
+        self.pending_total.load(Ordering::Acquire)
+    }
+}
+
+/// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
+pub(crate) struct TerminalSubscription {
+    broadcaster: Arc<TerminalBroadcaster>,
+    id: u64,
+}
+
+impl Drop for TerminalSubscription {
+    fn drop(&mut self) {
+        self.broadcaster.unsubscribe(self.id);
+    }
+}
+
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
+    terminals: Arc<TerminalBroadcaster>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
-    tick_stats: Arc<std::sync::Mutex<crate::diagnostics::tick::TickStats>>,
-    /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
-    tick_stats_wait_us: AtomicU64,
+    stop_gen: Arc<AtomicU64>,
+    estop_epoch: Arc<AtomicU64>,
+    lease_gen_mirror: Arc<AtomicU64>,
+    tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     control_sched: Arc<std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     /// Readers' side of the tick's state publication (`crate::rt_core::publish`).
     hub: Arc<crate::rt_core::publish::StateHub>,
@@ -5613,6 +6567,8 @@ pub struct ArmSupervisor {
     dispatcher_start: std::sync::Mutex<()>,
     /// Control period of the last tick (µs): bounds how long a reader waits for a sample.
     control_period_us: Arc<AtomicU64>,
+    /// Configured nominal control loop frequency (Hz, immutable after startup).
+    control_frequency_hz: u32,
     obs_cache_hits: AtomicU64,
     obs_cache_misses: AtomicU64,
     obs_waits: AtomicU64,
@@ -5630,6 +6586,13 @@ pub struct ArmSupervisor {
     estop_reg: Arc<std::sync::Mutex<crate::rt_core::executor::EstopRegistry>>,
     /// Off-thread consumer sinks installed when ownership transfers to the RT executor.
     sinks: Arc<std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>>,
+    /// Template observation used by `armd-dispatch` to carry drained action terminals if no
+    /// control tick has published to `hub` yet.
+    template_obs: ArmObservation,
+    /// Shared periodic-loop timing stats attached in Legacy mode (`run_periodic`).
+    legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
+    /// Unique identifier for this daemon/supervisor instance (changes across restarts).
+    instance_id: String,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -5688,27 +6651,128 @@ impl Drop for ArmSupervisor {
     fn drop(&mut self) { self.hub.close(); }
 }
 
+/// Immutable host/process boot identity exposed on `GET /api/v1/diagnostics/tick` so offline
+/// qualification analysis can detect kernel reboots and `panic = "abort"` daemon restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub boot_id: Option<String>,
+    pub process_start_unix_ns: Option<u64>,
+}
+
+/// Pure parser computing a process's Unix-epoch start timestamp (nanoseconds) from Linux
+/// `/proc/stat` (`btime` seconds) and `/proc/self/stat` (field 22 `starttime` in clock ticks),
+/// given `sysconf(_SC_CLK_TCK)`. Handles arbitrary `comm` names containing spaces or parentheses
+/// by splitting after the final `')'`. Returns `None` on parse failure, `clk_tck <= 0`, or
+/// arithmetic overflow (never emits a placeholder).
+pub fn parse_linux_process_start_unix_ns(
+    proc_stat: &str,
+    proc_self_stat: &str,
+    clk_tck: i64,
+) -> Option<u64> {
+    if clk_tck <= 0 {
+        return None;
+    }
+    let btime_secs: u64 = proc_stat.lines().find_map(|line| {
+        let mut toks = line.split_whitespace();
+        if toks.next()? == "btime" {
+            toks.next()?.parse::<u64>().ok()
+        } else {
+            None
+        }
+    })?;
+    let after_comm = proc_self_stat.rsplit_once(')')?.1;
+    // Fields after `)` begin at field 3 (`state`), so field 22 (`starttime`) is 0-based index 19.
+    let start_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+    let btime_ns = u128::from(btime_secs).checked_mul(1_000_000_000)?;
+    let offset_ns = u128::from(start_ticks)
+        .checked_mul(1_000_000_000)?
+        .checked_div(u128::try_from(clk_tck).ok()?)?;
+    let total_ns = btime_ns.checked_add(offset_ns)?;
+    u64::try_from(total_ns).ok()
+}
+
+fn read_process_identity() -> ProcessIdentity {
+    #[cfg(target_os = "linux")]
+    {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // SAFETY: `sysconf(_SC_CLK_TCK)` is a thread-safe POSIX query with no pointer arguments.
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as i64 };
+        let process_start_unix_ns = (|| {
+            let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+            let proc_self_stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+            parse_linux_process_start_unix_ns(&proc_stat, &proc_self_stat, clk_tck)
+        })();
+        ProcessIdentity {
+            boot_id,
+            process_start_unix_ns,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let process_start_unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
+            .filter(|&ns| ns > 0);
+        ProcessIdentity {
+            boot_id: None,
+            process_start_unix_ns,
+        }
+    }
+}
+
+static PROCESS_IDENTITY: std::sync::OnceLock<ProcessIdentity> = std::sync::OnceLock::new();
+
+/// Eagerly initializes and returns the process-wide immutable boot identity.
+/// Called at the top of `main()` and in `ArmSupervisor::new()`.
+pub fn init_process_identity() -> &'static ProcessIdentity {
+    PROCESS_IDENTITY.get_or_init(read_process_identity)
+}
+
 impl ArmSupervisor {
     pub fn new(config: ArmConfig) -> Self {
+        let _ = init_process_identity();
         let (tx, _) = broadcast::channel(128);
         let e_stop_latched = Arc::new(AtomicBool::new(false));
         let requested_estop_count = Arc::new(AtomicU64::new(0));
+        let stop_gen = Arc::new(AtomicU64::new(0));
+        let lease_gen_mirror = Arc::new(AtomicU64::new(0));
+        let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
+        inner.stop_gen = stop_gen.clone();
+        inner.lease_gen_mirror = lease_gen_mirror.clone();
+        inner.terminals = Some(Arc::clone(&terminals));
+        let template_obs = inner.current_observation();
+        let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
-        let control_period_us = (1e6 / f64::from(inner.config.control_frequency_hz.max(1))) as u64;
+        let control_frequency_hz = inner.config.control_frequency_hz.max(1);
+        let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
+        static NEXT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
+        let boot_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let seq = NEXT_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let instance_id = format!("armd-{}-{boot_ns:x}-{seq}", std::process::id());
         Self {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
+            terminals,
             e_stop_latched,
             requested_estop_count,
-            tick_stats: Arc::new(std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default())),
-            tick_stats_wait_us: AtomicU64::new(0),
+            stop_gen,
+            estop_epoch,
+            lease_gen_mirror,
+            tick_stats: Arc::new(crate::diagnostics::tick::LockFreeTickStats::new()),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
             hub,
             dispatcher_start: std::sync::Mutex::new(()),
             control_period_us: Arc::new(AtomicU64::new(control_period_us)),
+            control_frequency_hz,
             obs_cache_hits: AtomicU64::new(0),
             obs_cache_misses: AtomicU64::new(0),
             obs_waits: AtomicU64::new(0),
@@ -5719,12 +6783,76 @@ impl ArmSupervisor {
             executor_base_gen: AtomicU64::new(0),
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
+            template_obs,
+            legacy_loop_stats: std::sync::Mutex::new(None),
+            instance_id,
         }
     }
 
     /// Current ownership mode (`OWNER_LEGACY`, `OWNER_TRANSFERRING`, `OWNER_EXECUTOR`, `OWNER_FAILED`).
     pub fn owner_mode(&self) -> u8 {
         self.owner_mode.load(Ordering::Acquire)
+    }
+
+    /// Configured control frequency (Hz, immutable after startup, lock-free).
+    pub fn control_frequency_hz(&self) -> u32 {
+        self.control_frequency_hz
+    }
+
+    /// Lock-free current stop generation (bumped under the owner lock on Stop).
+    pub fn stop_generation(&self) -> u64 {
+        self.stop_gen.load(Ordering::SeqCst)
+    }
+
+    /// Lock-free current E-stop / safety epoch id.
+    pub fn estop_epoch(&self) -> u64 {
+        self.estop_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Lock-free mirror of the active lease generation (`0` when no lease is held).
+    pub fn lease_generation(&self) -> u64 {
+        self.lease_gen_mirror.load(Ordering::SeqCst)
+    }
+
+    /// Lock-free admission stamp captured ONCE at request entry (WS reader or REST entry).
+    pub fn capture_admission_stamp(&self) -> AdmissionStamp {
+        AdmissionStamp {
+            stop_gen: self.stop_generation(),
+            estop_epoch: self.estop_epoch(),
+            lease_gen: self.lease_generation(),
+            connection_id: 0,
+            request_id: next_admission_request_id(),
+        }
+    }
+
+    /// Human-readable ownership mode name exposed in `GET /api/v1/diagnostics/tick`.
+    pub fn owner_mode_name(&self) -> &'static str {
+        match self.owner_mode() {
+            OWNER_LEGACY => "legacy",
+            OWNER_TRANSFERRING => "transferring",
+            OWNER_EXECUTOR => "executor",
+            OWNER_FAILED => "failed",
+            _ => "unknown",
+        }
+    }
+
+    /// Attaches the legacy periodic control loop's [`ExecutorStats`] so `GET /api/v1/diagnostics/tick`
+    /// reports `skipped_releases`, monotonic release peaks/thresholds, and single-completion publication
+    /// into [`LockFreeTickStats`] in Legacy mode.
+    pub fn attach_legacy_loop_stats(&self, stats: Arc<crate::rt_core::executor::ExecutorStats>) {
+        stats.attach_legacy_tick_ring(Arc::clone(&self.tick_stats));
+        *self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats);
+    }
+
+    /// Signals stop on the legacy periodic control loop, recording the monotonic shutdown timestamp
+    /// and waking Linux futex sleep when legacy loop stats are attached.
+    pub fn signal_legacy_stop(&self, stop: &AtomicBool) {
+        let stats = self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(stats) = stats {
+            stats.signal_stop(stop);
+        } else {
+            stop.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Handle to the synchronous RT executor when ownership has transferred.
@@ -5801,6 +6929,7 @@ impl ArmSupervisor {
             || guard.motor_zero_busy
             || guard.zero_check_persisting.is_some()
             || guard.gravity_comp.is_some()
+            || guard.macro_run.is_some()
             || guard.mit_active()
             || guard.mit.revoke_pending
         {
@@ -5808,7 +6937,7 @@ impl ArmSupervisor {
             return Err(ArmError::Rejected {
                 status: 409,
                 code: "TRANSFER_BLOCKED".into(),
-                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, or MIT tracking is active".into(),
+                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, macro action, or MIT tracking is active".into(),
             });
         }
         #[cfg(feature = "policy-runtime")]
@@ -5855,6 +6984,8 @@ impl ArmSupervisor {
             &guard.config,
             self.e_stop_latched.clone(),
             self.requested_estop_count.clone(),
+            self.stop_gen.clone(),
+            self.lease_gen_mirror.clone(),
         );
         let real = std::mem::replace(&mut *guard, shell);
 
@@ -5920,6 +7051,19 @@ impl ArmSupervisor {
         Ok(self.telemetry_tx.subscribe())
     }
 
+    /// Subscribes a WS connection's lossless ordinary control queue to unseen action-terminal
+    /// observations so terminals are never lost to telemetry broadcast lag.
+    pub(crate) fn subscribe_action_terminals(
+        &self,
+        sink: impl Fn(&ArmObservation) -> bool + Send + Sync + 'static,
+    ) -> TerminalSubscription {
+        let id = self.terminals.subscribe(Box::new(sink));
+        TerminalSubscription {
+            broadcaster: Arc::clone(&self.terminals),
+            id,
+        }
+    }
+
     /// Starts the dispatcher thread (armd does at startup, before the control loop): it
     /// frees the observations the tick retired, forwards telemetry and drains the
     /// recording ring. Idempotent.
@@ -5932,18 +7076,47 @@ impl ArmSupervisor {
         if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return Ok(()); }
-        let (hub, tx, sinks, tick_stats) = (
+        let (hub, tx, terminals, sinks, tick_stats, template_obs) = (
             Arc::clone(&self.hub),
             self.telemetry_tx.clone(),
+            Arc::clone(&self.terminals),
             Arc::clone(&self.sinks),
             Arc::clone(&self.tick_stats),
+            self.template_obs.clone(),
         );
         let handle = std::thread::Builder::new()
             .name("armd-dispatch".into())
-            .spawn(move || dispatch_loop(&hub, &tx, &sinks, &tick_stats))
+            .spawn(move || dispatch_loop(&hub, &tx, &terminals, &sinks, &tick_stats, &template_obs))
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
         Ok(())
+    }
+
+    /// Test-only hook: configure per-connection bounded terminal FIFO capacity.
+    #[doc(hidden)]
+    pub fn test_set_terminal_fifo_capacity(&self, capacity: usize) {
+        self.terminals.set_capacity(capacity);
+    }
+
+    /// Test-only hook: pause or resume draining of per-connection terminal FIFOs in `armd-dispatch`.
+    #[doc(hidden)]
+    pub fn test_set_terminal_dispatch_paused(&self, paused: bool) {
+        self.terminals.set_dispatch_paused(paused);
+        if !paused {
+            self.hub.wake();
+        }
+    }
+
+    /// Test-only accessor for total pending finished actions across subscribed terminal FIFOs.
+    #[doc(hidden)]
+    pub fn test_pending_terminal_count(&self) -> usize {
+        self.terminals.pending_total()
+    }
+
+    /// Test-only accessor for subscribed WS terminal FIFO count.
+    #[doc(hidden)]
+    pub fn test_terminal_subscriber_count(&self) -> usize {
+        self.terminals.subscriber_count.load(Ordering::Acquire)
     }
 
     #[doc(hidden)]
@@ -6204,19 +7377,33 @@ impl ArmSupervisor {
         self
     }
 
-    pub async fn set_torque(&self, enable: bool) -> Result<SafetyState, ArmError> {
-        if enable && self.e_stop_latched.load(Ordering::SeqCst) {
+    pub async fn enable_torque(&self, stamp: AdmissionStamp) -> Result<SafetyState, ArmError> {
+        if self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.clone().write_owned().await;
         self.check_legacy_under_guard(&inner)?;
         // Post-lock double-check: verify atomic e-stop latch again after acquiring write lock
-        if enable && inner.estop_pending() {
+        if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
-        tokio::task::spawn_blocking(move || inner.set_torque(enable))
+        tokio::task::spawn_blocking(move || {
+            let admitted = inner.check_admission(stamp)?;
+            SupervisorInner::enable_torque(admitted)
+        })
+        .await
+        .map_err(|e| ArmError::Internal(format!("enable_torque blocking task failed: {e}")))?
+        .map_err(ArmError::Safety)
+    }
+
+    /// Exempt from `Admitted` (Invariant 1c): torque disable is a stop-direction action that
+    /// removes actuator output and must never be blocked by a Stop or admission check.
+    pub async fn disable_torque(&self) -> Result<SafetyState, ArmError> {
+        let mut inner = self.inner.clone().write_owned().await;
+        self.check_legacy_under_guard(&inner)?;
+        tokio::task::spawn_blocking(move || inner.disable_torque())
             .await
-            .map_err(|e| ArmError::Internal(format!("set_torque blocking task failed: {e}")))?
+            .map_err(|e| ArmError::Internal(format!("disable_torque blocking task failed: {e}")))?
             .map_err(ArmError::Safety)
     }
 
@@ -6340,7 +7527,7 @@ impl ArmSupervisor {
         inner.gravity_torques_ramped.clone()
     }
 
-    pub async fn servo(&self, targets: Vec<f32>, epoch_id: u64) -> Result<(), ArmError> {
+    pub async fn servo(&self, stamp: AdmissionStamp, targets: Vec<f32>, epoch_id: u64) -> Result<(), ArmError> {
         if self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
@@ -6349,7 +7536,8 @@ impl ArmSupervisor {
         if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
-        inner.servo(targets, epoch_id)?;
+        let admitted = inner.check_admission(stamp)?;
+        SupervisorInner::servo(admitted, targets, epoch_id)?;
         Ok(())
     }
 
@@ -6376,24 +7564,28 @@ impl ArmSupervisor {
 
     pub async fn jog(
         &self,
+        stamp: AdmissionStamp,
         target_positions: Vec<f32>,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
-        inner.jog(target_positions, duration_secs, epoch_id)
+        let admitted = inner.check_admission(stamp)?;
+        SupervisorInner::jog(admitted, target_positions, duration_secs, epoch_id)
     }
 
     pub async fn home(
         &self,
+        stamp: AdmissionStamp,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
         let home_pos = inner.config.home_positions.clone();
-        inner.jog_action(home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
+        let admitted = inner.check_admission(stamp)?;
+        SupervisorInner::jog_action(admitted, home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
     }
 
     pub async fn stop_motion(&self) {
@@ -6428,17 +7620,23 @@ impl ArmSupervisor {
     /// Bounded last-chance hardware disable for the legacy control-thread panic handler.
     /// Latches E-stop immediately and attempts one disable through the legacy driver within
     /// `timeout` without ever blocking indefinitely (even if another task holds `inner` or a
-    /// blocking transport syscall stalls).
+    /// blocking transport syscall stalls). `timeout` is the hard upper bound, with a small
+    /// internal cooperative reserve so clean `Unconfirmed` exhaustion finishes logging, lock
+    /// release, and channel handoff before `rx.recv_timeout` triggers `TimedOut`.
     pub fn attempt_legacy_panic_disable(&self, timeout: Duration) -> PanicDisableOutcome {
         self.e_stop_latched.store(true, Ordering::SeqCst);
         self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
-        let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>, deadline: Instant| -> PanicDisableOutcome {
+        let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>,
+                          coop_deadline: Instant,
+                          hard_deadline: Instant,
+                          coop_budget: Duration|
+         -> PanicDisableOutcome {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut guard = loop {
                     if let Ok(g) = inner.try_write() {
                         break g;
                     }
-                    let rem = deadline.saturating_duration_since(Instant::now());
+                    let rem = hard_deadline.saturating_duration_since(Instant::now());
                     if rem.is_zero() {
                         return PanicDisableOutcome::TimedOut;
                     }
@@ -6447,24 +7645,17 @@ impl ArmSupervisor {
                 if guard.detached {
                     return PanicDisableOutcome::NoDriver;
                 }
-                let rem = deadline.saturating_duration_since(Instant::now());
-                if rem.is_zero() {
+                if Instant::now() >= hard_deadline {
                     return PanicDisableOutcome::TimedOut;
                 }
-                // Reserve a small handoff margin before the outer `rx.recv_timeout(timeout)`
-                // expires so `Unconfirmed` from a bounded driver loop is delivered reliably
-                // under scheduler load instead of racing to `TimedOut`.
-                let inner_budget = if rem > Duration::from_millis(12) {
-                    rem - Duration::from_millis(6)
-                } else {
-                    rem
-                };
-                guard.attempt_panic_disable(inner_budget)
+                guard.attempt_panic_disable_until(coop_deadline, hard_deadline, coop_budget)
             }))
             .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during legacy panic-disable".into()))
         };
 
-        let deadline = Instant::now() + timeout;
+        let origin = Instant::now();
+        let (coop_deadline, hard_deadline) = driver_transitions::panic_disable_deadlines(origin, timeout);
+        let coop_budget = coop_deadline.saturating_duration_since(origin);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let inner = Arc::clone(&self.inner);
@@ -6472,16 +7663,19 @@ impl ArmSupervisor {
             match std::thread::Builder::new()
                 .name("armd-panic-disable".into())
                 .spawn(move || {
-                    let outcome = run_inline(inner, deadline);
-                    let _ = tx.send(outcome);
+                    let outcome = run_inline(inner, coop_deadline, hard_deadline, coop_budget);
+                    let _ = tx.send((outcome, Instant::now()));
                 }) {
-                Ok(_) => match rx.recv_timeout(timeout) {
-                    Ok(outcome) => outcome,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PanicDisableOutcome::TimedOut,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
+                Ok(_) => {
+                    let wait = hard_deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(wait) {
+                        Ok((outcome, completed_at)) if completed_at < hard_deadline => outcome,
+                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PanicDisableOutcome::TimedOut,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     // Never fall back to an unbounded inline driver call when the bounded
                     // helper thread cannot be spawned; only confirm NoDriver via non-blocking try_write.
@@ -6498,7 +7692,7 @@ impl ArmSupervisor {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            run_inline(Arc::clone(&self.inner), deadline)
+            run_inline(Arc::clone(&self.inner), coop_deadline, hard_deadline, coop_budget)
         }
     }
 
@@ -6568,24 +7762,51 @@ impl ArmSupervisor {
         }
     }
 
-    /// Lock-free physical stop latch + exact per-request pinned acknowledgement across both
-    /// Legacy and Executor ownership (including concurrent Legacy -> Executor handoff).
-    pub async fn trigger_e_stop_checked(&self) -> Result<(SafetyState, u64), ArmError> {
-        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop_checked");
-        // Set the physical E-stop latch FIRST before touching any lock.
+    /// Test-only hook: holds the ACK-drain `estop_reg` mutex so tests can prove the WS reader
+    /// E-stop path latches and increments `requested_estop_count` purely via lock-free atomics.
+    #[doc(hidden)]
+    pub fn test_lock_estop_registry(&self) -> impl Drop + '_ {
+        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test-only accessor for the monotonic lock-free E-stop request counter.
+    #[doc(hidden)]
+    pub fn test_requested_estop_count(&self) -> u64 {
+        self.requested_estop_count.load(Ordering::SeqCst)
+    }
+
+    /// Synchronously latches the physical E-stop flag and increments the requested generation
+    /// using ONLY lock-free atomics (never takes `estop_reg` mutex or scans waiters on the
+    /// reader path). Call [`Self::finish_e_stop_checked`] off-reader to register/resolve and
+    /// obtain the applied `(SafetyState, epoch_id)`.
+    pub(crate) fn begin_e_stop_checked(&self) -> CheckedEstopTicket {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::begin_e_stop_checked");
         self.e_stop_latched.store(true, Ordering::SeqCst);
-        let (req, mut rx, mode) = {
-            let mut reg = self.estop_reg.lock().unwrap_or_else(|e| e.into_inner());
-            let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
-            let rx = reg.register(req);
-            let mode = self.owner_mode.load(Ordering::Acquire);
-            if mode == OWNER_EXECUTOR {
-                reg.drain();
-            }
-            (req, rx, mode)
+        let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let mode = self.owner_mode.load(Ordering::Acquire);
+        CheckedEstopTicket { req, mode }
+    }
+
+    pub(crate) async fn finish_e_stop_checked(
+        &self,
+        ticket: CheckedEstopTicket,
+    ) -> Result<(SafetyState, u64), ArmError> {
+        let CheckedEstopTicket { req, mode } = ticket;
+        // Off-reader waiter registration / early-ACK resolution (never runs on WS reader).
+        let wait = self
+            .estop_reg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_or_resolve(req);
+        let mut rx = match wait {
+            crate::rt_core::executor::EstopWait::Resolved(res) => return res,
+            crate::rt_core::executor::EstopWait::Pending(rx) => rx,
         };
         match mode {
-            OWNER_EXECUTOR => self.await_estop_waiter(rx).await,
+            OWNER_EXECUTOR => {
+                self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
+                self.await_estop_waiter(rx).await
+            }
             OWNER_LEGACY | OWNER_TRANSFERRING => {
                 if let Ok(res) = rx.try_recv() {
                     return res;
@@ -6640,11 +7861,121 @@ impl ArmSupervisor {
         }
     }
 
+    /// Lock-free physical stop latch + exact per-request pinned acknowledgement across both
+    /// Legacy and Executor ownership (including concurrent Legacy -> Executor handoff).
+    pub async fn trigger_e_stop_checked(&self) -> Result<(SafetyState, u64), ArmError> {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop_checked");
+        let ticket = self.begin_e_stop_checked();
+        self.finish_e_stop_checked(ticket).await
+    }
+
     pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop");
         self.trigger_e_stop_checked()
             .await
             .unwrap_or((SafetyState::EStop, 0))
+    }
+
+    /// Non-blocking urgent-stop enqueue in `OWNER_EXECUTOR` mode so a WS receive loop can
+    /// await the reply in `tokio::select!` without blocking subsequent `estop` frames on
+    /// the same socket. Returns `Ok(None)` in `OWNER_LEGACY`.
+    pub(crate) fn try_enqueue_executor_urgent_stop(
+        &self,
+        stop: crate::rt_core::urgent::UrgentStop,
+    ) -> Result<
+        Option<(
+            Arc<crate::rt_core::urgent::UrgentStopClient>,
+            tokio::sync::oneshot::Receiver<
+                Result<crate::rt_core::urgent::UrgentStopOutcome, crate::rt_core::urgent::UrgentStopError>,
+            >,
+        )>,
+        ArmError,
+    > {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::try_enqueue_executor_urgent_stop");
+        match self.owner_mode() {
+            OWNER_LEGACY => Ok(None),
+            OWNER_EXECUTOR => {
+                let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                let client = h.urgent_stop_client();
+                let rx = client.enqueue_async(stop).map_err(ArmError::from)?;
+                Ok(Some((client, rx)))
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Authorized-stop handoff routed through whichever single owner holds `ArmCore`
+    /// (including concurrent Legacy -> Executor handoff).
+    /// - In `OWNER_EXECUTOR`: forwards through the bounded urgent `Stop` channel without
+    ///   touching the legacy supervisor lock; only an authorized stop advances `StopRequests`.
+    /// - In `OWNER_LEGACY`: validates under `inner.write()` and preserves exact legacy
+    ///   `/api/v1/motion/stop` semantics (gravity-comp exit, `stop_motion`, `request_macro_stop`).
+    pub async fn urgent_stop(
+        &self,
+        stop: crate::rt_core::urgent::UrgentStop,
+    ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
+        self.urgent_stop_with_legacy_hook(stop, |_, _| {}).await
+    }
+
+    /// Like [`Self::urgent_stop`], running `on_legacy_applied(epoch, stop_gen)` strictly inside
+    /// the legacy `inner.write()` critical section alongside the stop mutation.
+    pub(crate) async fn urgent_stop_with_legacy_hook(
+        &self,
+        stop: crate::rt_core::urgent::UrgentStop,
+        on_legacy_applied: impl FnOnce(u64, u64),
+    ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
+        use crate::rt_core::urgent::UrgentStopOutcome;
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::urgent_stop");
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                h.urgent_stop_async(stop).await.map_err(ArmError::from)
+            }
+            OWNER_LEGACY => {
+                let mut guard = self.inner.write().await;
+                if !guard.detached {
+                    guard.consume_pending_estop();
+                    Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
+                    let epoch = guard.safety.epoch_id();
+                    if stop.lease_generation == 0
+                        || !guard.validate_lease_at(stop.connection.as_str(), stop.lease_generation, Instant::now())
+                    {
+                        return Ok(UrgentStopOutcome::LeaseLost { epoch });
+                    }
+                    if stop.epoch != Some(epoch) {
+                        return Ok(UrgentStopOutcome::EpochMismatch { epoch });
+                    }
+                    if !stop.request_id_valid {
+                        return Ok(UrgentStopOutcome::InvalidRequestId);
+                    }
+                    if let Some(message) = stop.body_error {
+                        return Ok(UrgentStopOutcome::InvalidBody { message, epoch });
+                    }
+                    guard.exit_gravity_comp("STOPPED", "Stop command");
+                    guard.stop_motion();
+                    guard.request_macro_stop();
+                    let stop_gen = guard.advance_stop_generation();
+                    let applied_epoch = guard.safety.epoch_id();
+                    on_legacy_applied(applied_epoch, stop_gen);
+                    return Ok(UrgentStopOutcome::Applied {
+                        stop_generation: stop_gen,
+                        applied_to_motion: true,
+                        epoch: applied_epoch,
+                        safety_state: guard.safety.state_arc(),
+                        is_torqued: guard.is_torqued,
+                        control_mode_gravity_comp: guard.gravity_comp_active(),
+                    });
+                }
+                drop(guard);
+                if self.owner_mode() == OWNER_EXECUTOR {
+                    let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                    h.urgent_stop_async(stop).await.map_err(ArmError::from)
+                } else {
+                    Err(executor_unavailable())
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
     }
 
     pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
@@ -6729,13 +8060,15 @@ impl ArmSupervisor {
         scheduled_deadline: Option<Instant>,
     ) -> Option<ArmObservation> {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick_shared");
+        let wake_lateness_ns = crate::diagnostics::tick::take_current_wake_lateness_ns();
+        let wake_lateness_us = (wake_lateness_ns / 1_000).min(u64::from(u32::MAX)) as u32;
         if self.owner_mode() != OWNER_LEGACY {
             return None;
         }
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
+        let (obs, terminal_obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
@@ -6767,11 +8100,26 @@ impl ArmSupervisor {
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
             Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
-            (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked,
+            // Capture any terminal action observation WITHOUT touching `self.hub.latest()` so a
+            // preempted reader holding `StateHub`'s reader lock can never delay `tick_shared`.
+            let terminal_obs = if inner.last_action.as_ref().is_some_and(|a| !a.is_running())
+                || inner.previous_action.as_ref().is_some_and(|(a, _)| !a.is_running())
+            {
+                kept.clone().or_else(|| Some(inner.current_observation()))
+            } else {
+                None
+            };
+            (kept, terminal_obs, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked,
                 body_start - locked, lock_end - body_end, allocs)
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
+        if let Some(ref tobs) = terminal_obs {
+            self.terminals.record_from_observation(tobs);
+            if self.terminals.has_pending() {
+                self.hub.wake();
+            }
+        }
         self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
@@ -6798,6 +8146,7 @@ impl ArmSupervisor {
                             a.message = Some(format!("Failed to persist gripper calibration: {e}"));
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
                     Err(e) => {
@@ -6813,6 +8162,7 @@ impl ArmSupervisor {
                             a.message = Some(format!("Failed to persist gripper calibration: {e}"));
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
                 };
@@ -6847,6 +8197,7 @@ impl ArmSupervisor {
                                 });
                                 a.finished_at = Some(now);
                             }
+                            inner.record_finished_action_by_id(job.action_id);
                         }
                         return;
                     }
@@ -6863,6 +8214,7 @@ impl ArmSupervisor {
                             a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
 
@@ -6878,6 +8230,7 @@ impl ArmSupervisor {
                             a.message = Some("Gripper calibration revision changed concurrently".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
 
@@ -6896,6 +8249,7 @@ impl ArmSupervisor {
                                 a.message = Some(format!("Gripper calibration rejected: {e}"));
                                 a.finished_at = Some(now);
                             }
+                            inner.record_finished_action_by_id(job.action_id);
                             return;
                         }
                     };
@@ -6921,6 +8275,7 @@ impl ArmSupervisor {
                             a.message = Some("Control lease lost or expired before gripper calibration persisted".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
                     if !auth_still_ok {
@@ -6935,6 +8290,7 @@ impl ArmSupervisor {
                             a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
 
@@ -6952,6 +8308,7 @@ impl ArmSupervisor {
                                 a.message = Some(format!("Failed to persist gripper calibration: {e}"));
                                 a.finished_at = Some(now);
                             }
+                            inner.record_finished_action_by_id(job.action_id);
                             return;
                         }
                     };
@@ -6986,6 +8343,7 @@ impl ArmSupervisor {
                         }
                     }
                 }
+                inner.record_finished_action_by_id(job.action_id);
             });
         }
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
@@ -7002,17 +8360,19 @@ impl ArmSupervisor {
                 released_before_lock_us: signed(locked, r.released),
             }
         };
-        let sample = crate::diagnostics::tick::TickSample {
+        let mut sample = crate::diagnostics::tick::TickSample {
             tick_us: us(done - started),
+            release_us: 0,
             wait_us: us(wait),
             lock_us: us(lock_held),
             post_us: us(done - released),
             period_us: if dt.is_finite() && dt >= 0.0 { us(Duration::from_secs_f64(dt.min(4.0e3))) } else { 0 },
+            wake_lateness_us,
             reader_hold_us: us(log.reader_hold),
             writer_hold_us: us(log.writer_hold),
             reader_acquire_us: us(log.reader_acquire),
             writer_acquire_us: us(log.writer_acquire),
-            stats_wait_us: self.tick_stats_wait_us.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+            stats_wait_us: 0,
             phases: crate::diagnostics::tick::LockPhases {
                 pre_us: us(pre),
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
@@ -7032,25 +8392,154 @@ impl ArmSupervisor {
             maint_req_id: 0,
             release_flags: 0,
         };
-        let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
-        self.tick_stats_wait_us.store(done.elapsed().as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
-        stats.record(&sample);
-        drop(stats);
+        if crate::diagnostics::tick::periodic_defers_sample_publish() {
+            // Single-completion point in `run_periodic_with_clock` will stamp full `release_us`
+            // (covering wake through `block_on` return and stats publication) and record once.
+            crate::diagnostics::tick::stash_periodic_sample(sample);
+        } else {
+            sample.release_us = us(started.elapsed());
+            let _ = self.tick_stats.record(&sample);
+        }
         obs
+    }
+
+    /// Exposes the lock-free tick ring for deterministic paused-reader contention tests.
+    #[doc(hidden)]
+    pub fn tick_stats_ring_for_test(&self) -> &Arc<crate::diagnostics::tick::LockFreeTickStats> {
+        &self.tick_stats
     }
 
     /// The raw samples of the last ticks, oldest first (tests, diagnostics).
     pub fn tick_samples(&self) -> Vec<crate::diagnostics::tick::TickSample> {
         self.drain_diag();
-        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window().samples().to_vec()
+        self.tick_stats.window().samples().to_vec()
     }
 
-    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
-    /// the stats mutex and sorted after it is released, so this route does not delay a tick.
+    /// Requests a coherent control-thread baseline marker (`POST /api/v1/diagnostics/tick/mark`)
+    /// on the currently active periodic owner. Returns 503 if no control loop is actively running.
+    pub fn mark_tick_baseline(&self) -> Result<u64, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let Some(h) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                if h.is_exited() || !h.stats().is_loop_active() {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_STOPPED".into(),
+                        message: "RT executor control loop is not active".into(),
+                    });
+                }
+                Ok(h.stats().request_marker())
+            }
+            OWNER_LEGACY => {
+                let stats = self
+                    .legacy_loop_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let Some(s) = stats else {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "CONTROL_LOOP_INACTIVE".into(),
+                        message: "Legacy periodic control loop is not active".into(),
+                    });
+                };
+                if !s.is_loop_active() {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "CONTROL_LOOP_INACTIVE".into(),
+                        message: "Legacy periodic control loop is not active".into(),
+                    });
+                }
+                Ok(s.request_marker())
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). Reads the lock-free ring
+    /// without ever blocking the control thread.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
-        self.drain_diag();
-        let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
-        let mut snap = window.snapshot();
+        const MAX_ALIGN_ATTEMPTS: usize = 4;
+        let active_stats = if let Some(h) = self.executor_handle() {
+            Some(Arc::clone(h.stats()))
+        } else {
+            self.legacy_loop_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+
+        let mut snap = if let Some(s) = active_stats {
+            // Bounded alignment loop: read monotonic snapshot FIRST (Acquire on `stats_seq`),
+            // drain off-thread diagnostics (guaranteed to include all samples & amendments
+            // published before `mono1`), copy the lock-free window (fast memcpy, no sort),
+            // and re-read monotonic snapshot to confirm no release crossed the capture window.
+            let mut chosen: Option<(
+                crate::diagnostics::tick::TickWindow,
+                crate::rt_core::executor::MonotonicStatsSnapshot,
+            )> = None;
+            let mut last_attempt = None;
+            for _ in 0..MAX_ALIGN_ATTEMPTS {
+                let mono1 = s.snapshot_monotonic();
+                self.drain_diag();
+                let win = self.tick_stats.window();
+                let mono2 = s.snapshot_monotonic();
+                let aligned = mono1.coherent
+                    && mono2.coherent
+                    && !win.is_lapped()
+                    && mono1.releases_started == mono2.releases_started
+                    && mono1.releases_total == mono2.releases_total
+                    && mono1.skipped_releases == mono2.skipped_releases
+                    && mono1.loop_active == mono2.loop_active;
+                if aligned {
+                    chosen = Some((win, mono2));
+                    break;
+                }
+                last_attempt = Some((win, mono2));
+            }
+            let (win, mono, align_lapped) = match chosen {
+                Some((win, mono)) => (win, mono, false),
+                None => {
+                    let (win, mono) = last_attempt.expect("MAX_ALIGN_ATTEMPTS > 0");
+                    (win, mono, true)
+                }
+            };
+            let mut snap = win.snapshot();
+            snap.stats_reader_retries = self.tick_stats.reader_retries();
+            snap.stats_writer_drops = self
+                .tick_stats
+                .writer_contention_drops()
+                .saturating_add(s.amend_missed.load(Ordering::Relaxed));
+            if !mono.coherent || align_lapped {
+                snap.stats_snapshot_lapped = true;
+            }
+            snap.loop_active = mono.loop_active;
+            snap.releases_started = mono.releases_started;
+            snap.releases_total = mono.releases_total;
+            snap.in_flight_release_us = mono.in_flight_release_us;
+            snap.release_us_max_ever = mono.release_us_max_ever;
+            snap.releases_over_10ms = mono.releases_over_10ms;
+            snap.releases_over_15ms = mono.releases_over_15ms;
+            snap.releases_over_20ms = mono.releases_over_20ms;
+            snap.wake_late_max_ever = mono.wake_late_max_ever;
+            snap.skipped_releases = mono.skipped_releases;
+            snap.diag_dropped = mono.diag_dropped;
+            snap.wake_lateness_over_1ms = mono.wake_lateness_over_1ms;
+            snap.wake_lateness_over_5ms = mono.wake_lateness_over_5ms;
+            snap.wake_lateness_over_10ms = mono.wake_lateness_over_10ms;
+            snap.since_marker = mono.since_marker;
+            snap
+        } else {
+            self.drain_diag();
+            self.tick_stats.snapshot()
+        };
+        snap.instance_id = self.instance_id.clone();
+        let ident = init_process_identity();
+        snap.boot_id = ident.boot_id.clone();
+        snap.process_start_unix_ns = ident.process_start_unix_ns;
+        snap.owner_mode = self.owner_mode_name();
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),
@@ -7093,8 +8582,10 @@ impl ArmSupervisor {
 fn dispatch_loop(
     hub: &crate::rt_core::publish::StateHub,
     tx: &broadcast::Sender<ArmObservation>,
+    terminals: &TerminalBroadcaster,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
-    tick_stats: &std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
+    template_obs: &ArmObservation,
 ) {
     #[cfg(target_os = "linux")]
     {
@@ -7117,22 +8608,44 @@ fn dispatch_loop(
     while !hub.is_closed() {
         drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
+        let mut new_obs: Option<ArmObservation> = None;
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
-                if tx.receiver_count() > 0 { let _ = tx.send(s.obs.clone()); }
+                terminals.record_from_observation(&s.obs);
+                new_obs = Some(s.obs.clone());
+            }
+        }
+        // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
+        // BEFORE forwarding telemetry so a newer telemetry snapshot can never overtake earlier
+        // terminals on the wire.
+        if terminals.has_pending() {
+            let base = new_obs
+                .clone()
+                .or_else(|| hub.latest().map(|s| s.obs.clone()));
+            terminals.drain_all(base.as_ref().unwrap_or(template_obs));
+        }
+        if let Some(obs) = new_obs {
+            if terminals.pending_total() == 0 && tx.receiver_count() > 0 {
+                let _ = tx.send(obs);
             }
         }
         std::thread::park_timeout(Duration::from_millis(50));
     }
-    // Final drain on supervisor close so no retired/diagnostic/reply items are stranded,
+    // Final drain on supervisor close so no retired/diagnostic/reply/terminal items are stranded,
     // and emit any final safety overflow summary.
     let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(s) = s {
         s.flush_and_report_shutdown(tick_stats);
     }
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    let _ = hub.latest();
+    let latest_obs = hub.latest().map(|s| s.obs.clone());
+    if let Some(obs) = latest_obs.as_ref() {
+        terminals.record_from_observation(obs);
+    }
+    if terminals.has_pending() {
+        terminals.drain_all(latest_obs.as_ref().unwrap_or(template_obs));
+    }
 }
 
 #[cfg(test)]
@@ -7444,5 +8957,141 @@ mod observation_snapshot_tests {
         // the deadline comes from the sample, not from when it is evaluated
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(inner.observation_valid_until(&obs, cap), (at, until));
+    }
+
+    #[tokio::test]
+    async fn legacy_urgent_stop_advances_policy_gen_inside_write_lock_only_on_apply() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let conn = "connection:policy-race";
+        let (gen, ep) = {
+            let mut inner = sup.inner().write().await;
+            let g = inner.acquire_lease(conn).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::enable_torque(admitted).unwrap();
+            (g, inner.safety.epoch_id())
+        };
+        let policy_stop_gen = Arc::new(AtomicU64::new(0));
+        let mk = |lg, e| crate::rt_core::urgent::UrgentStop {
+            connection: crate::model::HolderLabel::new(conn),
+            lease_generation: lg,
+            epoch: Some(e),
+            request_id: 1,
+            request_id_valid: true,
+            body_error: None,
+        };
+        // Refused stop (wrong epoch / wrong lease) must NOT advance stop_gen or invoke the hook.
+        let r_refused = sup.urgent_stop_with_legacy_hook(mk(gen, ep + 1), |_, _| { policy_stop_gen.fetch_add(1, Ordering::SeqCst); }).await.unwrap();
+        assert!(matches!(r_refused, crate::rt_core::urgent::UrgentStopOutcome::EpochMismatch { .. }));
+        assert_eq!(policy_stop_gen.load(Ordering::SeqCst), 0);
+        assert_eq!(sup.stop_generation(), 0);
+
+        // Authorized stop must advance stop_gen BEFORE releasing `inner.write()`, so a
+        // concurrent motion-start installer queued on `inner.write()` observes the bump immediately.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (s1, p1, e1, r1) = (sup.clone(), policy_stop_gen.clone(), entered.clone(), release.clone());
+        let stop_task = tokio::spawn(async move {
+            s1.urgent_stop_with_legacy_hook(mk(gen, ep), |_, stop_gen| {
+                p1.store(stop_gen, Ordering::SeqCst);
+                e1.notify_one();
+                // Yield briefly while still holding `inner.write()` so the installer task queues on the lock.
+                std::thread::sleep(Duration::from_millis(15));
+                r1.notify_one();
+            }).await.unwrap()
+        });
+        entered.notified().await;
+        // Now acquire `inner.write()` just like policy-load completion does: as soon as the lock
+        // is granted, `stop_gen` MUST already be 1 (zero race window after Stop applies).
+        let guard = sup.inner().write().await;
+        assert_eq!(policy_stop_gen.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.current_stop_gen(), 1);
+        drop(guard);
+        let outcome = stop_task.await.unwrap();
+        assert!(matches!(outcome, crate::rt_core::urgent::UrgentStopOutcome::Applied { stop_generation: 1, .. }));
+    }
+
+    #[test]
+    fn terminal_broadcaster_never_skips_or_pops_on_full_fifo_or_failed_enqueue() {
+        let tb = TerminalBroadcaster::default();
+        tb.set_capacity(2);
+        let accept = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let accept_c = Arc::clone(&accept);
+        let delivered_c = Arc::clone(&delivered);
+        let sub_id = tb.subscribe(Box::new(move |obs| {
+            if !accept_c.load(Ordering::SeqCst) {
+                return false;
+            }
+            if let Some(a) = obs.action.as_ref() {
+                delivered_c.lock().unwrap().push(a.id);
+            }
+            true
+        }));
+        let mut factory = SupervisorInner::new(ArmConfig::rebot_dm());
+        let mut mk_done = || {
+            let id = factory.begin_action("jog", None);
+            factory.finish_action(id, "done", None, None, None, None, None);
+            factory.last_action.clone().unwrap()
+        };
+        let a1 = mk_done();
+        let a2 = mk_done();
+        let a3 = mk_done();
+        assert!(tb.can_start_action(false, false));
+        assert!(tb.record_finished(&a1));
+        assert!(tb.record_finished(&a2));
+        // FIFO is now at capacity (2/2): NEW starts must be refused (`TERMINALS_BUSY`).
+        assert!(!tb.can_start_action(false, false));
+        assert!(!tb.can_start_action(false, true));
+        // An already-running action finishing while FIFO is full MUST NOT be skipped/dropped.
+        assert!(tb.record_finished(&a3));
+        assert_eq!(tb.pending_total(), 3);
+        assert!(!tb.can_start_action(false, false));
+
+        // Sink rejects (outbound queue full): drain_all MUST NOT pop action 1 and MUST NOT remove
+        // the subscriber.
+        let base_obs = factory.current_observation();
+        tb.drain_all(&base_obs);
+        assert_eq!(tb.pending_total(), 3, "failed enqueue must not pop terminal or drop subscriber");
+        assert!(delivered.lock().unwrap().is_empty());
+
+        // Once sink accepts again, all 3 terminals pop and deliver in exact FIFO order.
+        accept.store(true, Ordering::SeqCst);
+        tb.drain_all(&base_obs);
+        assert_eq!(tb.pending_total(), 0);
+        assert_eq!(*delivered.lock().unwrap(), vec![a1.id, a2.id, a3.id]);
+        assert!(tb.can_start_action(false, false));
+        tb.unsubscribe(sub_id);
+    }
+
+    #[test]
+    fn parse_linux_process_start_unix_ns_handles_valid_weird_comm_and_errors() {
+        // 19 fields after `)` before field 22 (`starttime`), e.g. state='S', ppid..=num_threads(18) -> 19 tokens, index 19 is starttime=250.
+        let proc_stat = "cpu 1 2 3\nbtime 1700000000\nprocesses 42\n";
+        let self_stat = "1234 (armd (rt) v1.6) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 250 999 1000";
+        // 1700000000 s + 250 / 100 s = 1700000002.5 s = 1700000002_500_000_000 ns
+        assert_eq!(
+            parse_linux_process_start_unix_ns(proc_stat, self_stat, 100),
+            Some(1_700_000_002_500_000_000)
+        );
+        // Invalid clk_tck <= 0 -> None
+        assert_eq!(parse_linux_process_start_unix_ns(proc_stat, self_stat, 0), None);
+        assert_eq!(parse_linux_process_start_unix_ns(proc_stat, self_stat, -1), None);
+        // Missing btime -> None
+        assert_eq!(parse_linux_process_start_unix_ns("cpu 1 2 3\n", self_stat, 100), None);
+        // Malformed / truncated /proc/self/stat -> None
+        assert_eq!(parse_linux_process_start_unix_ns(proc_stat, "1234 (armd) S 1 2", 100), None);
+        // Overflow -> None
+        let overflow_stat = format!("btime {}\n", u64::MAX);
+        assert_eq!(parse_linux_process_start_unix_ns(&overflow_stat, self_stat, 100), None);
+
+        #[cfg(target_os = "linux")]
+        {
+            let id1 = init_process_identity();
+            let id2 = init_process_identity();
+            assert_eq!(id1, id2);
+            assert!(id1.boot_id.as_deref().is_some_and(|s| !s.is_empty()));
+            assert!(id1.process_start_unix_ns.is_some_and(|ns| ns > 0));
+        }
     }
 }

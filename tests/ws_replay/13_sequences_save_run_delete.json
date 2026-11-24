@@ -1,0 +1,36 @@
+{
+  "id": "13_sequences_save_run_delete",
+  "family": "sequence",
+  "description": "sequences/save with seeded pose + wait step, run_sequence + terminal, sequences/delete",
+  "setup": {"profile":"rebot_dm","seed_poses":true,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"name":"seq_demo","steps":[{"pose_id":"01J00000000000000000000002","speed_scale":1.0,"type":"pose"},{"s":0.05,"type":"wait"}]},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/sequences/save","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"id":"{{sequence_id}}"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/run_sequence","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1,"capture_action":"sq"},
+    {"op":"expect_terminal","client":"c0","action_alias":"sq"},
+    {"op":"send","client":"c0","frame":{"body":{"id":"{{sequence_id}}"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/sequences/delete","request_id":4,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":1,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"name":"seq_demo","steps":[{"pose_id":"01J00000000000000000000002","speed_scale":1.0,"type":"pose"},{"s":0.05,"type":"wait"}]},"epoch_id":1,"generation":1,"path":"/api/v1/sequences/save","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","durability_confirmed":true,"epoch_id":1,"is_torqued":true,"persisted":true,"request_id":2,"revision":1,"safety_state":"Armed","sequence":{"created_at":"2026-11-24T05:46:04.961Z","description":"","id":"01M861E191B181TNC1FN82XDY1","name":"seq_demo","rev":1,"steps":[{"gripper":"keep","pose_id":"01J00000000000000000000002","speed_scale":1.0,"type":"pose"},{"s":0.05,"type":"wait"}],"updated_at":"2026-11-24T05:46:04.961Z"},"status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"id":"01M861E191B181TNC1FN82XDY1"},"epoch_id":1,"generation":1,"path":"/api/v1/action/run_sequence","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"action_id":1,"control_mode":"position","epoch_id":1,"expected_duration_s":9.570833744495015,"is_torqued":true,"request_id":3,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"action_terminal","client":"c0","action":{"code":null,"error_px":null,"finished_at":6.874669464,"gripper_gap_rad":null,"holding":null,"id":1,"iteration":null,"kind":"sequence","message":null,"phase":"done","phase_ms":{"done":0,"pose":6738,"start":0,"wait":51},"power_scale":1.0,"progress":1.0,"repeat_index":0,"repeats":1,"sequence_id":"01M861E191B181TNC1FN82XDY1","settled":null,"started_at":0.085005301,"state":"done","step_index":1,"step_type":"wait","tag":null},"safety_state":"Armed","epoch_id":1,"is_torqued":true,"control_mode":"position"},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"id":"01M861E191B181TNC1FN82XDY1"},"epoch_id":1,"generation":1,"path":"/api/v1/sequences/delete","request_id":4,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","durability_confirmed":true,"epoch_id":1,"is_torqued":true,"persisted":true,"request_id":4,"revision":2,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

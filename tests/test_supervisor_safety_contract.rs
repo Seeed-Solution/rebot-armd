@@ -57,7 +57,7 @@ async fn setup(caps: DriverCapabilities, max_velocity: Option<f32>) -> (ArmSuper
         hardware: hardware.clone(), capabilities: caps, max_velocity,
     }));
     supervisor.set_lease_enabled(false).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     (supervisor, hardware)
 }
 
@@ -70,7 +70,7 @@ async fn thermal_trip_overrides_estop_and_retries_failed_disable_without_epoch_c
     assert!(matches!(first.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })));
     assert!(first.is_torqued && first.disable_pending);
     assert!(!supervisor.shutdown_ready().await);
-    assert!(supervisor.set_torque(true).await.is_err());
+    assert!(supervisor.enable_torque(supervisor.capture_admission_stamp()).await.is_err());
     assert_eq!(h.lock().unwrap().disable_calls, 1);
     let next = supervisor.tick(0.02).await;
     assert_eq!(next.epoch_id, first.epoch_id);
@@ -95,7 +95,7 @@ async fn thermal_trip_overrides_estop_and_retries_failed_disable_without_epoch_c
 async fn successful_disable_write_without_feedback_is_not_reported_as_power_off() {
     let (supervisor, h) = setup(full_caps(), None).await;
     h.lock().unwrap().confirm_disable = false;
-    assert!(supervisor.set_torque(false).await.is_err());
+    assert!(supervisor.disable_torque().await.is_err());
     let obs = supervisor.get_observation().await;
     assert!(obs.is_torqued && obs.disable_pending && obs.safety_state.is_stopped());
     assert!(!supervisor.shutdown_ready().await);
@@ -196,8 +196,8 @@ async fn driver_speed_limit_and_explicit_gravity_model_are_enforced() {
 #[tokio::test]
 async fn control_loop_stall_latches_instead_of_advancing_old_trajectory() {
     let supervisor = ArmSupervisor::new(ArmConfig::default());
-    supervisor.set_torque(true).await.unwrap();
-    supervisor.jog(vec![0.3; 6], Some(1.0), None).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.3; 6], Some(1.0), None).await.unwrap();
     let obs = supervisor.tick(0.300).await;
     assert!(obs.safety_state.is_stopped());
     assert_eq!(obs.positions, vec![0.0; 6]);
@@ -208,8 +208,8 @@ async fn control_loop_stall_latches_instead_of_advancing_old_trajectory() {
 async fn single_late_tick_below_stall_bound_keeps_arm_operational() {
     // One 100 ms scheduling hiccup on a loaded single-core host must not fault the arm.
     let supervisor = ArmSupervisor::new(ArmConfig::default());
-    supervisor.set_torque(true).await.unwrap();
-    supervisor.jog(vec![0.3; 6], Some(1.0), None).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.3; 6], Some(1.0), None).await.unwrap();
     let obs = supervisor.tick(0.100).await;
     assert!(!obs.safety_state.is_stopped(), "state: {:?}", obs.safety_state);
 }
@@ -240,9 +240,9 @@ async fn jerk_enabled_servo_settles_after_small_target() {
     config.max_jerk = Some(50.0);
     let supervisor = ArmSupervisor::new(config);
     supervisor.set_lease_enabled(false).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.inner().write().await.motion_frame_timeout = Duration::from_secs(60);
-    supervisor.servo(vec![0.1; 6], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.1; 6], 1).await.unwrap();
     for _ in 0..300 { supervisor.tick(0.02).await; }
     let obs = supervisor.get_observation().await;
     assert!(!obs.safety_state.is_stopped());
@@ -263,7 +263,7 @@ async fn setup7() -> (ArmSupervisor, Arc<Mutex<Hardware>>) {
         hardware: hardware.clone(), capabilities: full_caps(), max_velocity: None,
     }));
     supervisor.set_lease_enabled(false).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     (supervisor, hardware)
 }
 

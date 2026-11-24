@@ -426,7 +426,8 @@ pub fn spawn_baseline_persister_with_interval(
 /// Every [`BASELINE_PERSIST_INTERVAL`]: learn queued gripper moves and write a changed baseline
 /// for whichever owner (`RtOwner::Legacy` or `RtOwner::Executor`) currently owns `ArmCore`.
 /// Learning and JSON serialization always run off the control thread and without holding the
-/// supervisor lock.
+/// supervisor lock. Passive telemetry/persistence consumer only: never starts motion or actuator
+/// output (no `Admitted` token needed).
 pub fn spawn_baseline_persister(supervisor: std::sync::Arc<ArmSupervisor>) {
     drop(spawn_baseline_persister_with_interval(supervisor, BASELINE_PERSIST_INTERVAL));
 }
@@ -534,7 +535,9 @@ pub fn strokes(close_speed: f64) -> Vec<Stroke> {
 /// CALIBRATION_MAX_TORQUE_FRACTION x cap, and every bin within the profile of the earlier
 /// strokes; otherwise the action fails CALIBRATION_OBSTRUCTED and the baseline stays as it was.
 /// When all strokes pass, the baseline is replaced by the one learned from them.
-pub fn begin_calibration(inner: &mut SupervisorInner, sup: &std::sync::Arc<ArmSupervisor>, epoch: u64, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+pub fn begin_calibration(admitted: crate::supervisor::Admitted<'_>, sup: &std::sync::Arc<ArmSupervisor>, epoch: u64, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+    let (inner, proof) = admitted.consume()?;
+    let stamp = proof.stamp();
     let (Some(_), Some(policy)) = (inner.config.gripper_index(), inner.config.gripper_policy.clone()) else {
         return Err(MotionError::Unsupported("Gripper calibration needs a profile with a gripper joint and policy".into()).into());
     };
@@ -542,14 +545,14 @@ pub fn begin_calibration(inner: &mut SupervisorInner, sup: &std::sync::Arc<ArmSu
     if !torque_feedback {
         return Err(MotionError::Unsupported("Gripper calibration needs torque feedback".into()).into());
     }
-    let id = inner.begin_orchestrated_action("gripper_calibrate", tag, epoch)?;
+    let id = inner.begin_orchestrated_action_inner(&proof, "gripper_calibrate", tag, epoch)?;
     let list = strokes(inner.effective_planned_close_speed());
     inner.gripper_calibration = Some(crate::supervisor::GripperCalibrationRun { id, records: Vec::with_capacity(list.len() + 2) });
     let span = f64::from((policy.open_rad - policy.closed_rad).abs());
     let expected: f64 = list.iter().map(|s| span * 0.95 / s.speed + 1.5).sum();
     let sup2 = sup.clone();
     tokio::spawn(async move {
-        let worker = { let sup = sup2.clone(); tokio::spawn(async move { run_calibration(sup, id).await }) };
+        let worker = { let sup = sup2.clone(); tokio::spawn(async move { run_calibration(sup, id, stamp).await }) };
         if let Err(e) = worker.await {
             let mut inner = sup2.inner().write().await;
             inner.gripper_calibration = None;
@@ -560,16 +563,24 @@ pub fn begin_calibration(inner: &mut SupervisorInner, sup: &std::sync::Arc<ArmSu
 }
 
 /// Start `gripper_calibrate` without a WS lease check (tests, in-process agents).
-pub async fn start_calibration(sup: &std::sync::Arc<ArmSupervisor>) -> Result<(u64, f64), ArmError> {
+pub async fn start_calibration(
+    sup: &std::sync::Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+) -> Result<(u64, f64), ArmError> {
     let mut inner = sup.inner().write().await;
     let epoch = inner.safety.epoch_id();
-    begin_calibration(&mut inner, sup, epoch, None)
+    let admitted = inner.check_admission(stamp)?;
+    begin_calibration(admitted, sup, epoch, None)
 }
 
-async fn run_calibration(sup: std::sync::Arc<ArmSupervisor>, id: u64) {
+async fn run_calibration(
+    sup: std::sync::Arc<ArmSupervisor>,
+    id: u64,
+    stamp: crate::supervisor::AdmissionStamp,
+) {
     use crate::macro_action::{MacroCtx, Stop};
     let ctx = MacroCtx {
-        sup: sup.clone(), id,
+        sup: sup.clone(), id, stamp,
         deadline: std::time::Instant::now() + std::time::Duration::from_secs(400),
         phase_timeout_s: 40.0,
         timeout_code: "CALIBRATION_TIMEOUT",
@@ -606,7 +617,7 @@ fn torque_quantile(rec: &crate::gripper_baseline::MoveRecord, q: f32) -> f32 {
 }
 
 async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crate::gripper_baseline::FreeTorqueBaseline, crate::macro_action::Stop> {
-    use crate::macro_action::{arm_fail, fail};
+    use crate::macro_action::fail;
     let obstructed = |m: String| fail("CALIBRATION_OBSTRUCTED", m);
     let (policy, g, mut scratch, limit_nm, close_speed) = {
         let inner = ctx.sup.inner().read().await;
@@ -631,9 +642,15 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
             let mut inner = ctx.sup.inner().write().await;
             if !inner.macro_alive(ctx.id) { return Err(crate::macro_action::Stop::Cancelled); }
             let before = inner.gripper_calibration.as_ref().map_or(0, |c| c.records.len());
-            let (duration, timeout_s, is_pos_force_close) = inner
-                .start_macro_gripper_learning_within(ctx.id, request, crate::motion::LearnMode::Calibration, None, false)
-                .map_err(arm_fail)?;
+            // Every calibration stroke must pass AdmissionStamp under the owner lock and consume Admitted.
+            let admitted = match inner.check_admission(ctx.next_child_stamp()) {
+                Ok(a) => a,
+                Err(e) => return Err(ctx.map_install_err(&mut inner, e.into())),
+            };
+            let (duration, timeout_s, is_pos_force_close) = SupervisorInner::start_macro_gripper_learning_within(
+                admitted, ctx.id, request, crate::motion::LearnMode::Calibration, None, false,
+            )
+            .map_err(|e| ctx.map_install_err(&mut inner, e))?;
             let stroke_speed = match inner.active_trajectory.as_ref().map(|a| &a.reference) {
                 Some(crate::motion::Reference::Gripper(gm)) => gm.planned_speed,
                 _ => st.speed,

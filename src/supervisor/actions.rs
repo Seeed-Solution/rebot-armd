@@ -118,6 +118,7 @@ impl SupervisorInner {
                 }
                 old.finished_at = Some(now);
             }
+            self.record_finished_action(&old);
             if let Some((mut prev, _)) = self.previous_action.replace((old, now + 2.0)) {
                 if let Some(msg) = prev.message.take() {
                     self.recycle_action_msg_spare(msg);
@@ -265,14 +266,16 @@ impl SupervisorInner {
                     }
                 }
             }
-            tracing::info!(
-                "Action {} ({}) {}{}{}",
-                id,
-                a.kind,
-                state,
-                if code.is_some() { " " } else { "" },
-                code.unwrap_or(""),
-            );
+            if !self.rt_executor_owned {
+                tracing::info!(
+                    "Action {} ({}) {}{}{}",
+                    id,
+                    a.kind,
+                    state,
+                    if code.is_some() { " " } else { "" },
+                    code.unwrap_or(""),
+                );
+            }
         }
         if let Some(unused_msg) = displaced_message.or(incoming_message) {
             self.recycle_action_msg_spare(unused_msg);
@@ -391,6 +394,7 @@ impl SupervisorInner {
             }
             self.macro_run = None;
         }
+        self.record_finished_action_by_id(id);
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
@@ -404,24 +408,26 @@ impl SupervisorInner {
             && !self.e_stop_latched.load(Ordering::SeqCst)
     }
 
-    pub fn unload_action(&mut self) -> Result<Option<u64>, ArmError> {
-        self.park_rejection = None;
+    pub fn unload_action(admitted: Admitted<'_>) -> Result<Option<u64>, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.check_terminal_fifo_for_new_action()?;
+        this.park_rejection = None;
         // A park from the hold after a clear re-arms through the verified enable path first (fresh
         // feedback, commanded = measured); without it NormalUnload keeps holding and parks nothing.
-        if self.holding_after_clear() {
-            self.set_torque(true)?;
+        if this.holding_after_clear() {
+            this.enable_torque_inner(&proof)?;
         }
-        self.execute_stop(StopPolicy::NormalUnload);
-        if let Some(e) = self.park_rejection.take() { return Err(e.into()); }
-        if self.mit.park_after_hand_back && !self.pending_normal_unload {
+        this.execute_stop(StopPolicy::NormalUnload);
+        if let Some(e) = this.park_rejection.take() { return Err(e.into()); }
+        if this.mit.park_after_hand_back && !this.pending_normal_unload {
             // deferred behind the MIT brake and hand back: the action runs from now on
-            let id = self.begin_action("park", None);
-            self.mit.deferred_park_action = Some(id);
+            let id = this.begin_action("park", None);
+            this.mit.deferred_park_action = Some(id);
             return Ok(Some(id));
         }
-        if !self.pending_normal_unload { return Ok(None); }
-        let id = self.begin_action("park", None);
-        if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+        if !this.pending_normal_unload { return Ok(None); }
+        let id = this.begin_action("park", None);
+        if let Some(active) = this.active_trajectory.as_mut() { active.action_id = Some(id); }
         Ok(Some(id))
     }
 
@@ -447,29 +453,41 @@ impl SupervisorInner {
 
     /// Begin a macro action (`grasp`, `place`) after its first motion was planned from
     /// `input`. Its orchestrator drives it from now on. Returns its id.
-    pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+    pub fn begin_macro(admitted: Admitted<'_>, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.begin_macro_inner(&proof, kind, input, tag)
+    }
+
+    pub(crate) fn begin_macro_inner(&mut self, proof: &crate::supervisor::AdmittedProof, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         self.check_plan_fresh(input)?;
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun::new(id, input.epoch));
+        self.macro_run = Some(MacroRun::new(id, input.epoch, proof.stamp()));
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
 
     /// Begin a sequence run (parent macro action of kind `sequence`, no Cartesian plan needed).
-    pub fn begin_sequence_action(&mut self, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
-        self.begin_orchestrated_action("sequence", tag, epoch)
+    pub fn begin_sequence_action(admitted: Admitted<'_>, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+        Self::begin_orchestrated_action(admitted, "sequence", tag, epoch)
     }
 
     /// Begin a parent action of `kind` whose orchestrator runs outside the lock (sequence,
-    /// calib_hover): epoch, preconditions, macro run record.
-    pub fn begin_orchestrated_action(&mut self, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+    /// calib_hover): stamp, epoch, preconditions, macro run record.
+    pub fn begin_orchestrated_action(admitted: Admitted<'_>, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.begin_orchestrated_action_inner(&proof, kind, tag, epoch)
+    }
+
+    pub(crate) fn begin_orchestrated_action_inner(&mut self, proof: &crate::supervisor::AdmittedProof, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun::new(id, epoch));
+        self.macro_run = Some(MacroRun::new(id, epoch, proof.stamp()));
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
@@ -741,7 +759,10 @@ impl SupervisorInner {
     /// `CartesianPath` takes one waypoint (`n == 1`, an end-link goal; more: `UNSUPPORTED`).
     /// `JointQuinticLimited` plans from the commanded state with `max_velocity` (0: the
     /// profile's); `duration_s` is the prepared estimate and is not enforced.
-    pub fn commit_macro_child(&mut self, primitive: &crate::rt_core::ops::Primitive, now: Instant) -> Result<crate::rt_core::broker::ActionId, &'static str> {
+    pub fn commit_macro_child(admitted: Admitted<'_>, primitive: &crate::rt_core::ops::Primitive, now: Instant) -> Result<crate::rt_core::broker::ActionId, &'static str> {
+        let (this, proof) = admitted
+            .consume()
+            .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
         use crate::rt_core::ops::Primitive;
         let Some(spec) = primitive.child().copied() else { return Err("INVALID_COMMAND"); };
         let start = match primitive {
@@ -750,23 +771,23 @@ impl SupervisorInner {
             _ => return Err("INVALID_COMMAND"),
         };
         if matches!(primitive, Primitive::CartesianPath { n, .. } if *n != 1) {
-            self.commit_child_checks(&spec, start)?;
+            this.commit_child_checks(&spec, start)?;
             return Err("UNSUPPORTED");
         }
         let primitive = *primitive;
-        self.commit_child_install(spec, start, now, move |this, id| match primitive {
+        this.commit_child_install(spec, start, now, move |this, id| match primitive {
             Primitive::JointQuinticLimited { dof, q, max_velocity, .. } => {
                 let mut limits = this.planning_limits();
                 for (i, l) in limits.iter_mut().enumerate().take(usize::from(dof)) {
                     if max_velocity[i] > 0.0 { l.max_velocity = l.max_velocity.min(max_velocity[i]); }
                 }
-                this.install_macro_quintic(id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
+                this.install_macro_quintic_inner(&proof, id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
             }
             Primitive::Gripper { fraction, speed, grasp, .. } => {
                 let command = if grasp && fraction <= 0.0 { GripperCommand::Close } else if !grasp && fraction >= 1.0 { GripperCommand::Open } else { GripperCommand::Move };
                 let request = GripperRequest { command, fraction: (command == GripperCommand::Move).then_some(f64::from(fraction)), grasp,
                     speed: f64::from(speed), timeout_s: Some(spec.timeout_s), tag: None };
-                this.start_macro_gripper(id, request).map(drop)
+                this.start_macro_gripper_learning_within_inner(&proof, id, request, crate::motion::LearnMode::Opening, None, false).map(drop)
             }
             Primitive::CartesianPath { waypoints, speed_mps, .. } => {
                 let w = waypoints[0];
@@ -775,7 +796,7 @@ impl SupervisorInner {
                 this.plan_input().and_then(|input| {
                     let speed = crate::motion::Speed { linear: f64::from(speed_mps), angular: crate::motion::DEFAULT_ANGULAR_RPS };
                     let path = crate::motion::plan_cartesian(&input, goal, speed).map_err(ArmError::from)?;
-                    this.install_macro_path(id, &input, path).map(drop)
+                    this.install_macro_path_inner(&proof, id, &input, path).map(drop)
                 })
             }
             Primitive::Replay { episode, speed, gripper, .. } => {
@@ -783,7 +804,7 @@ impl SupervisorInner {
                 let epoch = this.safety.epoch_id();
                 this.replay_input(request, epoch)
                     .and_then(crate::replay::plan)
-                    .and_then(|planned| this.install_macro_replay(id, planned).map(drop))
+                    .and_then(|planned| this.install_macro_replay_inner(&proof, id, planned).map(drop))
             }
             _ => Err(MotionError::InvalidCommand("not a child primitive".into()).into()),
         })
@@ -832,41 +853,37 @@ impl SupervisorInner {
 
     /// Installs a prepared Cartesian path as a sub-motion of macro action `id` (the RT
     /// commit of a `Primitive::Prepared` child: no IK). Returns its planned duration.
-    pub(crate) fn install_macro_prepared_path(&mut self, id: u64, path: JointPath, power_noted: bool) -> Result<f64, ArmError> {
-        let epoch = self.macro_sub_ready(id)?;
-        self.check_prepared_fresh(epoch)?;
-        let duration = self.start_path_motion_at(epoch, &path)?;
-        if power_noted { self.note_action_power_scale(id, path.power_scale); }
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
-        self.set_macro_sub_running(id);
+    pub(crate) fn install_macro_prepared_path(admitted: Admitted<'_>, id: u64, path: JointPath, power_noted: bool) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        let epoch = this.macro_sub_ready(id)?;
+        this.check_prepared_fresh(epoch)?;
+        let duration = this.start_path_motion_at_inner(&proof, epoch, &path)?;
+        if power_noted { this.note_action_power_scale(id, path.power_scale); }
+        this.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+        this.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }
 
     /// Installs a prepared Cartesian path borrowing directly from an immutable pinned
     /// [`crate::rt_core::broker::PlanSlotRef`] as a sub-motion of macro action `id` (zero
     /// sample/param vector copies). Returns its planned duration.
-    pub(crate) fn install_macro_prepared_path_slot(
-        &mut self,
-        id: u64,
-        dof: usize,
-        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
-        duration_s: f64,
-        power_scale: Option<f64>,
-    ) -> Result<f64, ArmError> {
-        let epoch = self.macro_sub_ready(id)?;
-        self.validate_prepared_joint_path(dof, &slot.path, duration_s)
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_macro_prepared_path_slot(admitted: Admitted<'_>, id: u64, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>, duration_s: f64, power_scale: Option<f64>) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        let epoch = this.macro_sub_ready(id)?;
+        this.validate_prepared_joint_path(dof, &slot.path, duration_s)
             .map_err(|_| ArmError::Motion(MotionError::InvalidCommand("invalid prepared Cartesian path".into())))?;
-        self.check_prepared_fresh(epoch)?;
+        this.check_prepared_fresh(epoch)?;
         let last = &slot.path.samples()[slot.path.len() - 1][..dof];
-        let duration = self.start_path_motion_slice(epoch, last, duration_s)?;
+        let duration = this.start_path_motion_slice_inner(&proof, epoch, last, duration_s)?;
         let scale = power_scale.unwrap_or(1.0);
-        if power_scale.is_some() { self.note_action_power_scale(id, scale); }
-        let arm_dof = self.config.arm_dof();
-        self.active_trajectory = Some(ActiveTrajectory::new(
+        if power_scale.is_some() { this.note_action_power_scale(id, scale); }
+        let arm_dof = this.config.arm_dof();
+        this.active_trajectory = Some(ActiveTrajectory::new(
             Some(id),
             Reference::Path(PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s)),
         ));
-        self.set_macro_sub_running(id);
+        this.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }
 
@@ -888,11 +905,16 @@ impl SupervisorInner {
     }
 
     /// Install a planned sub-motion of macro action `id`. Returns its planned duration.
-    pub fn install_macro_path(&mut self, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+    pub fn install_macro_path(admitted: Admitted<'_>, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_macro_path_inner(&proof, id, input, path)
+    }
+
+    pub(crate) fn install_macro_path_inner(&mut self, proof: &crate::supervisor::AdmittedProof, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.check_plan_fresh(input)?;
-        let duration = self.start_path_motion(input, &path)?;
+        let duration = self.start_path_motion_at_inner(proof, input.epoch, &path)?;
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
         self.set_macro_sub_running(id);
@@ -1045,15 +1067,15 @@ impl SupervisorInner {
     }
 
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
-    pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
-        self.start_macro_gripper_learning_within(id, request, crate::motion::LearnMode::Opening, None, false)
+    pub fn start_macro_gripper(admitted: Admitted<'_>, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        Self::start_macro_gripper_learning_within(admitted, id, request, crate::motion::LearnMode::Opening, None, false)
             .map(|(dur, _, _)| dur)
     }
 
     /// [`Self::start_macro_gripper`] recording the move for the baseline as `learn` allows
     /// (`gripper_calibrate` strokes: `LearnMode::Calibration`).
-    pub fn start_macro_gripper_learning(&mut self, id: u64, request: GripperRequest, learn: crate::motion::LearnMode) -> Result<f64, ArmError> {
-        self.start_macro_gripper_learning_within(id, request, learn, None, false)
+    pub fn start_macro_gripper_learning(admitted: Admitted<'_>, id: u64, request: GripperRequest, learn: crate::motion::LearnMode) -> Result<f64, ArmError> {
+        Self::start_macro_gripper_learning_within(admitted, id, request, learn, None, false)
             .map(|(dur, _, _)| dur)
     }
 
@@ -1061,14 +1083,9 @@ impl SupervisorInner {
     /// `max_budget_s` is positive/finite and (for pos-force closes) covers the planned duration.
     /// Returns `(expected_duration, timeout_s, is_pos_force_close)`.
     #[doc(hidden)]
-    pub fn start_macro_gripper_within(
-        &mut self,
-        id: u64,
-        request: GripperRequest,
-        max_budget_s: Option<f64>,
-        extend_pos_force_close_timeout: bool,
-    ) -> Result<(f64, f64, bool), ArmError> {
-        self.start_macro_gripper_learning_within(
+    pub fn start_macro_gripper_within(admitted: Admitted<'_>, id: u64, request: GripperRequest, max_budget_s: Option<f64>, extend_pos_force_close_timeout: bool) -> Result<(f64, f64, bool), ArmError> {
+        Self::start_macro_gripper_learning_within(
+            admitted,
             id,
             request,
             crate::motion::LearnMode::Opening,
@@ -1079,14 +1096,12 @@ impl SupervisorInner {
 
     /// [`Self::start_macro_gripper_within`] with an explicit baseline [`crate::motion::LearnMode`].
     #[doc(hidden)]
-    pub fn start_macro_gripper_learning_within(
-        &mut self,
-        id: u64,
-        request: GripperRequest,
-        learn: crate::motion::LearnMode,
-        max_budget_s: Option<f64>,
-        extend_pos_force_close_timeout: bool,
-    ) -> Result<(f64, f64, bool), ArmError> {
+    pub fn start_macro_gripper_learning_within(admitted: Admitted<'_>, id: u64, request: GripperRequest, learn: crate::motion::LearnMode, max_budget_s: Option<f64>, extend_pos_force_close_timeout: bool) -> Result<(f64, f64, bool), ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.start_macro_gripper_learning_within_inner(&proof, id, request, learn, max_budget_s, extend_pos_force_close_timeout)
+    }
+
+    pub(crate) fn start_macro_gripper_learning_within_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, id: u64, request: GripperRequest, learn: crate::motion::LearnMode, max_budget_s: Option<f64>, extend_pos_force_close_timeout: bool) -> Result<(f64, f64, bool), ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
@@ -1141,7 +1156,12 @@ impl SupervisorInner {
     /// Start a joint-space quintic sub-motion of macro action `id` (sequence pose step) to
     /// `target`, planned with `limits` from the commanded state; it counts as done once settled.
     /// Returns its planned duration.
-    pub fn install_macro_quintic(&mut self, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
+    pub fn install_macro_quintic(admitted: Admitted<'_>, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
+        let (this, proof) = admitted.consume()?;
+        this.install_macro_quintic_inner(&proof, id, target, limits)
+    }
+
+    pub(crate) fn install_macro_quintic_inner(&mut self, _proof: &crate::supervisor::AdmittedProof, id: u64, target: Vec<f32>, limits: &[crate::model::JointLimit]) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         if epoch != self.safety.epoch_id() { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.action_preconditions()?;
@@ -1205,13 +1225,19 @@ impl SupervisorInner {
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
-    pub fn start_gripper(&mut self, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
-        self.start_gripper_with_baseline(request, epoch, GripperBaselineCmd::None)
+    pub fn start_gripper(admitted: Admitted<'_>, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
+        Self::start_gripper_with_baseline(admitted, request, epoch, GripperBaselineCmd::None)
     }
 
     /// [`Self::start_gripper`] with a baseline command; a reset happens only once the action is
     /// admitted (a refused action leaves the learned baseline as it was).
-    pub fn start_gripper_with_baseline(&mut self, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
+    pub fn start_gripper_with_baseline(admitted: Admitted<'_>, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
+        let (this, _proof) = admitted.consume()?;
+        this.start_gripper_with_baseline_inner(request, epoch, baseline_cmd)
+    }
+
+    fn start_gripper_with_baseline_inner(&mut self, request: GripperRequest, epoch: u64, baseline_cmd: GripperBaselineCmd) -> Result<(u64, f64), ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
         })?;
@@ -1256,16 +1282,17 @@ impl SupervisorInner {
     }
 
     /// Start a gripper zero check action. Returns (action id, expected duration).
-    pub fn start_gripper_zero_check(&mut self, body: &serde_json::Value, epoch: u64) -> Result<(u64, f64), ArmError> {
-        self.start_gripper_zero_check_with_auth(body, epoch, None)
+    pub fn start_gripper_zero_check(admitted: Admitted<'_>, body: &serde_json::Value, epoch: u64) -> Result<(u64, f64), ArmError> {
+        Self::start_gripper_zero_check_with_auth(admitted, body, epoch, None)
     }
 
-    pub fn start_gripper_zero_check_with_auth(
-        &mut self,
-        body: &serde_json::Value,
-        epoch: u64,
-        operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
-    ) -> Result<(u64, f64), ArmError> {
+    pub fn start_gripper_zero_check_with_auth(admitted: Admitted<'_>, body: &serde_json::Value, epoch: u64, operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>) -> Result<(u64, f64), ArmError> {
+        let (this, _proof) = admitted.consume()?;
+        this.start_gripper_zero_check_with_auth_inner(body, epoch, operator_auth)
+    }
+
+    fn start_gripper_zero_check_with_auth_inner(&mut self, body: &serde_json::Value, epoch: u64, operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>) -> Result<(u64, f64), ArmError> {
+        self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper zero check needs a profile with a gripper joint".into())
         })?;

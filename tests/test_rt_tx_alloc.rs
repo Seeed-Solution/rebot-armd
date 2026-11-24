@@ -622,11 +622,11 @@ fn supervisor_tick_publish_with_damiao_tx_instrumentation_does_not_allocate() {
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, Some(2.0), Some(epoch))) } }.expect("jog");
     for _ in 0..5 {
         let _ = inner.tick_publish(0.02, 1, false);
         let _ = inner.core.hub().latest();
@@ -995,7 +995,9 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
         inner.lease_enabled = false;
         inner.tick(0.02);
-        inner.set_torque(true).expect("arm");
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).expect("arm");
         inner.rt_executor_owned = true;
         inner.safety.set_off_thread_reclaim(true);
         for _ in 0..5 {
@@ -1137,7 +1139,9 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
 
     // (e) Active gravity-comp tick on a fresh warmed-up SupervisorInner with DamiaoArmDriver<SharedNoAllocBus>.
     let (mut gc_inner, _gc_bus) = mk_rt_supervisor();
-    gc_inner.enter_gravity_comp(Default::default()).expect("enter gravity comp");
+    let stamp = gc_inner.current_admission_stamp();
+    let admitted = gc_inner.check_admission(stamp).unwrap();
+    SupervisorInner::enter_gravity_comp(admitted, Default::default()).expect("enter gravity comp");
     // Advance past ramp_in_s (1.0 s) and warm up one Active tick across all triple-buffer slots.
     for _ in 0..60 {
         let _ = gc_inner.tick_publish(0.02, 1, false);
@@ -1159,9 +1163,16 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     //     — whole release must do 0 allocs, 0 frees!
     let (mut jog_inner, jog_bus) = mk_rt_supervisor();
     let epoch = jog_inner.safety.epoch_id();
-    let (_, jog_id, _) = jog_inner
-        .jog_action(vec![0.15, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(epoch), "joint_move")
-        .expect("start jog");
+    let stamp = jog_inner.current_admission_stamp();
+    let admitted = jog_inner.check_admission(stamp).unwrap();
+    let (_, jog_id, _) = SupervisorInner::jog_action(
+        admitted,
+        vec![0.15, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+        Some(1.0),
+        Some(epoch),
+        "joint_move",
+    )
+    .expect("start jog");
     // Warm up running action across all 3 triple-buffer slots before counting.
     for _ in 0..4 {
         let _ = jog_inner.tick_publish(0.02, 1, false);

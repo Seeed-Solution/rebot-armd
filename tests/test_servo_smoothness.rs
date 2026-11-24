@@ -11,7 +11,7 @@ async fn arm(dof: usize, velocity: f32, acceleration: f32) -> ArmSupervisor {
         .collect();
     let supervisor = ArmSupervisor::new(cfg);
     supervisor.set_lease_enabled(false).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.inner().write().await.motion_frame_timeout = Duration::from_secs(60);
     supervisor
 }
@@ -38,7 +38,7 @@ fn check_step(before: &ArmObservation, after: &ArmObservation, h: f64, a: f32, v
 #[tokio::test]
 async fn short_target_brakes_without_overshoot_and_reaches_exact_zero_velocity() {
     let supervisor = arm(1, 2.0, 5.0).await;
-    supervisor.servo(vec![0.10], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.10], 1).await.unwrap();
     let mut previous = supervisor.get_observation().await;
     let mut saw_motion = false;
     for _ in 0..100 {
@@ -61,7 +61,7 @@ async fn streaming_small_multi_axis_targets_preserve_derivatives() {
     for k in 1..=50 {
         // Each network sample is smaller than the old 0.04-rad arrival threshold.
         let target = k as f32 * 0.001;
-        supervisor.servo(vec![target, -target * 0.5], 1).await.unwrap();
+        supervisor.servo(supervisor.capture_admission_stamp(), vec![target, -target * 0.5], 1).await.unwrap();
         let current = supervisor.tick(0.02).await;
         check_step(&previous, &current, 0.02, 5.0, 2.0);
         assert!(current.velocities[0] > 0.0);
@@ -75,7 +75,7 @@ async fn streaming_small_multi_axis_targets_preserve_derivatives() {
 #[tokio::test]
 async fn reversal_moves_in_both_directions_and_settles() {
     let supervisor = arm(1, 2.0, 5.0).await;
-    supervisor.servo(vec![0.20], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.20], 1).await.unwrap();
     let mut previous = supervisor.get_observation().await;
     for _ in 0..8 {
         let current = supervisor.tick(0.02).await;
@@ -84,7 +84,7 @@ async fn reversal_moves_in_both_directions_and_settles() {
     }
     assert!(previous.velocities[0] > 0.3);
     // This reverse goal is within the dirty-frame window, so it is exercised.
-    supervisor.servo(vec![-0.05], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![-0.05], 1).await.unwrap();
     let mut saw_negative = false;
     for _ in 0..150 {
         let current = supervisor.tick(0.02).await;
@@ -108,7 +108,7 @@ async fn expired_servo_brakes_at_both_limits_with_alternating_dt() {
             inner.commanded_velocities[0] = sign;
             inner.measured_velocities[0] = sign;
         }
-        supervisor.servo(vec![sign * 0.99], 1).await.unwrap();
+        supervisor.servo(supervisor.capture_admission_stamp(), vec![sign * 0.99], 1).await.unwrap();
         {
             let mut inner = supervisor.inner().write().await;
             inner.motion_frame_timeout = Duration::from_millis(200);
@@ -131,7 +131,7 @@ async fn expired_servo_brakes_at_both_limits_with_alternating_dt() {
 #[tokio::test]
 async fn variable_dt_respects_small_acceleration_and_velocity_limits() {
     let supervisor = arm(1, 0.0005, 0.0002).await;
-    supervisor.servo(vec![0.001], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.001], 1).await.unwrap();
     let mut previous = supervisor.get_observation().await;
     let mut peak_v = 0.0_f32;
     for h in [0.001, 0.01, 0.06, 0.003, 0.02, 0.05].into_iter().cycle().take(600) {
@@ -174,7 +174,7 @@ async fn infeasible_axis_faults_without_partial_multi_axis_update() {
             inner.measured_positions = vec![0.0, 0.9];
             inner.commanded_velocities = vec![0.1, 2.0];
         }
-        if active_servo { supervisor.servo(vec![0.1, 0.95], 1).await.unwrap(); }
+        if active_servo { supervisor.servo(supervisor.capture_admission_stamp(), vec![0.1, 0.95], 1).await.unwrap(); }
         let obs = supervisor.tick(0.02).await;
         assert!(matches!(obs.safety_state, SafetyState::Fault(_)));
         assert_eq!(obs.positions, vec![0.0, 0.9], "no axis may commit a partial step");
@@ -191,7 +191,7 @@ async fn infeasible_axis_faults_without_partial_multi_axis_update() {
 async fn invalid_acceleration_faults_instead_of_silently_increasing_it() {
     for acceleration in [0.0, -1.0, f32::NAN, f32::INFINITY] {
         let supervisor = arm(1, 2.0, 5.0).await;
-        supervisor.servo(vec![0.1], 1).await.unwrap();
+        supervisor.servo(supervisor.capture_admission_stamp(), vec![0.1], 1).await.unwrap();
         supervisor.inner().write().await.config.limits[0].max_acceleration = acceleration;
         let obs = supervisor.tick(0.02).await;
         assert!(matches!(obs.safety_state, SafetyState::Fault(_)));
@@ -259,7 +259,7 @@ async fn test_limit_infeasible_braking_triggers_fault() {
         inner.commanded_velocities[0] = v_prev;
         inner.measured_velocities[0] = v_prev;
     }
-    supervisor.servo(vec![target], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![target], 1).await.unwrap();
     let obs = supervisor.tick(h).await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "must trigger fault");
 }
@@ -282,7 +282,7 @@ async fn test_limit_exceeding_eps_triggers_fault() {
         inner.commanded_positions[0] = q_raw;
         inner.measured_positions[0] = q_raw;
     }
-    supervisor.servo(vec![target], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![target], 1).await.unwrap();
     let obs = supervisor.tick(h).await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "must trigger fault");
 }
@@ -293,7 +293,7 @@ async fn test_two_tick_settle_hysteresis_and_exact_resets() {
     assert_eq!(supervisor.inner().read().await.servo_settled_ticks[0], 0);
 
     // Initial state at target 0.0
-    supervisor.servo(vec![0.0], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.0], 1).await.unwrap();
     assert_eq!(supervisor.inner().read().await.servo_settled_ticks[0], 0);
 
     // Tick 1: reaches target deadband (|e| <= 1.0e-4 && |v| <= 1.5e-2) -> counter = 1
@@ -347,7 +347,7 @@ async fn test_two_tick_settle_hysteresis_and_exact_resets() {
         inner.clear_fault().unwrap();
         assert_eq!(inner.servo_settled_ticks[0], 0, "counter must reset on clear_fault");
     }
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 4. Inject timeout case -> counter resets to 0
     {
@@ -370,7 +370,7 @@ async fn test_two_tick_settle_hysteresis_and_exact_resets() {
     // 5. When conditions are satisfied again: must strictly accumulate 2 frames again to mark motion finished
     supervisor.inner().write().await.motion_frame_timeout = Duration::from_secs(60);
     let epoch = supervisor.inner().read().await.safety.epoch_id();
-    supervisor.servo(vec![0.0], epoch).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.0], epoch).await.unwrap();
     assert_eq!(supervisor.inner().read().await.servo_settled_ticks[0], 0);
 
     let re_obs1 = supervisor.tick(0.02).await;

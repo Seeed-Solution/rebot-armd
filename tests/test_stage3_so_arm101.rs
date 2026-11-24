@@ -469,7 +469,7 @@ async fn test_5dof_place_execution_lateral_target() {
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     }
 
     let ticker = sup.clone();
@@ -488,7 +488,7 @@ async fn test_5dof_place_execution_lateral_target() {
         "release": true,
         "retreat": true,
     });
-    let (id, _) = place::start(&sup, &body).await.expect("place::start should succeed");
+    let (id, _) = place::start(&sup, sup.capture_admission_stamp(), &body).await.expect("place::start should succeed");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut seen_phases = Vec::new();
@@ -564,7 +564,7 @@ fn test_so_arm_default_grasp_no_workspace_violation() {
         // 3. Test grasp::plan at nominal target
         let mut inner = SupervisorInner::new(config.clone());
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         let target_nom = [0.22, 0.0, setup.table_z_m + setup.grasp_height_m];
         let r_down = grasp::look_down(&kinematics::IDENTITY);
         let goal = Pose::new(r_down, [target_nom[0], target_nom[1], setup.table_z_m + setup.approach_height_m]);
@@ -615,7 +615,7 @@ fn test_5dof_grasp_off_axis_yaw_free_orchestrator_and_plan() {
     // 2. Test grasp::plan feasibility check on off-axis target
     let mut inner = SupervisorInner::new(config.clone());
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let q32: Vec<f32> = sol.q.iter().map(|&x| x as f32).collect();
     inner.commanded_positions = q32.clone();
     inner.measured_positions = q32;
@@ -745,7 +745,7 @@ async fn test_so101_park_uses_folded_resting_pose_and_load_limits() {
 
     // 1. Verify NormalUnload (park) targets resting_positions()
     let mut inner = armd::supervisor::SupervisorInner::new(config.clone());
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     inner.commanded_positions = config.home_positions.clone();
     inner.measured_positions = config.home_positions.clone();
     inner.apply_stop_policy(armd::safety::StopPolicy::NormalUnload);
@@ -779,7 +779,7 @@ async fn test_so101_park_uses_folded_resting_pose_and_load_limits() {
     };
 
     let supervisor = ArmSupervisor::new(config.clone()).with_driver(Box::new(driver));
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // Loads within limits -> safe resting pose accepted even with J6 open at 1.2 rad
     *shared_loads.lock().unwrap() = vec![0.0, 0.15, 0.20, 0.0, 0.0, 0.0];
@@ -862,7 +862,7 @@ fn test_5dof_grasp_plan_from_tilted_scan_to_off_axis_target_no_branch_flip() {
 
     let mut inner = SupervisorInner::new(config.clone());
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let q32: Vec<f32> = q_scan.iter().map(|&x| x as f32).collect();
     inner.commanded_positions = q32.clone();
     inner.measured_positions = q32;
@@ -904,7 +904,7 @@ async fn test_5dof_orchestrator_probe_lateral_returns_fallback() {
     };
 
     let supervisor = std::sync::Arc::new(ArmSupervisor::new(config.clone()).with_driver(Box::new(driver)));
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     struct DummyDetectionSource;
     impl grasp::DetectionSource for DummyDetectionSource {
@@ -917,6 +917,7 @@ async fn test_5dof_orchestrator_probe_lateral_returns_fallback() {
     let ctx = armd::macro_action::MacroCtx {
         sup: supervisor.clone(),
         id: 1,
+        stamp: supervisor.capture_admission_stamp(),
         deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
         phase_timeout_s: setup.phase_timeout_s,
         timeout_code: "GRASP_TIMEOUT",
@@ -1409,7 +1410,7 @@ async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze
     {
         let mut inner = supervisor.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
         inner.target_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
@@ -1434,7 +1435,7 @@ async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze
 
     // Reverse servo command (opening jaw towards open_rad=1.5)
     let rev_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.8];
-    let servo_res = supervisor.servo(rev_targets, 1).await;
+    let servo_res = supervisor.servo(supervisor.capture_admission_stamp(), rev_targets, 1).await;
     assert!(servo_res.is_ok(), "Reverse servo command must be accepted");
     assert!(!supervisor.is_gripper_stalled().await, "Reverse servo command un-stalls gripper");
 
@@ -1450,7 +1451,7 @@ async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze
 
     // Squeeze command towards closed_rad=0.0
     let squeeze_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.2];
-    let sq_res = supervisor.servo(squeeze_targets, 1).await;
+    let sq_res = supervisor.servo(supervisor.capture_admission_stamp(), squeeze_targets, 1).await;
     assert!(sq_res.is_ok(), "Squeeze command accepted");
 
     // Tick: since 0x20 still asserted and pushing into stall, it must re-latch!
@@ -1538,7 +1539,7 @@ async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop
         }
     }
 
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
 
     supervisor.tick(0.02).await;

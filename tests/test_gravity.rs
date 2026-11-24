@@ -131,7 +131,7 @@ async fn test_gravity_feedforward_torque_ramping_and_injection() {
     let mut config = ArmConfig::default();
     config.gravity_model = Some(armd::model::GravityModel::RebotDevArm);
     let supervisor = ArmSupervisor::new(config).with_driver(driver);
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // Advance 5 ticks (0.1s total) to ramp up torque
     for _ in 0..5 {

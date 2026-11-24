@@ -162,6 +162,7 @@ pub fn create_router_full_with_sandbox(
     auth: crate::auth::OperatorAuth,
     sandbox: Arc<sandbox::SandboxState>,
 ) -> Router {
+    ws::prewarm_dispatch_tables();
     let router = Router::new()
         .route("/api/v1/auth/status", get(rest::auth_status))
         .route("/api/v1/auth/unlock", post(rest::auth_unlock))
@@ -288,6 +289,10 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
         .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
         .route("/api/v1/diagnostics/tick", get(diagnostics::get_tick))
+        .route(
+            "/api/v1/diagnostics/tick/mark",
+            post(diagnostics::post_tick_mark).layer(middleware::from_fn(require_operator)),
+        )
         .route("/api/v1/diagnostics/power", get(diagnostics::get_power))
         .route("/api/v1/ws", get(ws::ws_handler))
         // Single-Origin Reverse Proxy Routes
@@ -366,9 +371,13 @@ async fn gate_executor_owner(
                                 | "/api/v1/diagnostics/tick"
                                 | "/api/v1/diagnostics/boots"
                                 | "/api/v1/diagnostics/blackbox"
+                                | "/api/v1/ws"
                         )
                 }
-                axum::http::Method::POST => path == "/api/v1/safety/e_stop",
+                axum::http::Method::POST => matches!(
+                    path,
+                    "/api/v1/safety/e_stop" | "/api/v1/diagnostics/tick/mark"
+                ),
                 _ => false,
             };
             if allowed {

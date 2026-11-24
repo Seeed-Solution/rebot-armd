@@ -404,7 +404,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
             arm.0.lock().unwrap().q = q;
             inner.driver = Some(std::sync::Mutex::new(Box::new(arm.clone())));
         }
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.commanded_positions = q.to_vec();
         inner.measured_positions = q.to_vec();
         inner.target_positions = q.to_vec();
@@ -501,7 +501,7 @@ struct Outcome { status: armd::motion::ActionStatus, centred_err_m: f64, final_p
 
 async fn run_grasp(rig: &Rig) -> Outcome {
     let body = tap(rig).await;
-    let (id, duration) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
+    let (id, duration) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &body).await.expect("grasp accepted");
     assert!(duration > 5.0);
     let mut centred_err_m = f64::NAN;
     let sup = rig.sup.clone();
@@ -559,7 +559,7 @@ async fn grasp_align_closes_the_jaws_across_the_short_side() {
         s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start.r);
         rig.sup.inner().write().await.set_grasp_setup(s.clone());
         let body = tap(&rig).await;
-        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
+        let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &body).await.expect("grasp accepted");
         let mut saw_align = false;
         let status = wait_done(&rig.sup, id, 40.0, |a| { saw_align |= a.phase.as_deref() == Some("align") && a.is_running(); }).await;
         let final_pose = start_pose(&rig).await;
@@ -615,7 +615,7 @@ async fn grasp_converges_with_wrong_intrinsics_and_mount() {
 async fn grasp_fails_target_lost_and_restores_inference() {
     let setup = GraspSetup::default();
     let rig = rig(setup, Truth::same(), 0.0, [0.01, 0.01], false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "centring", None).await;
     rig.sim.visible.store(false, Ordering::SeqCst);
     let t = Instant::now();
@@ -636,7 +636,7 @@ async fn grasp_fails_centring_when_iterations_run_out() {
     s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
     s.grip_pixel_norm[0] = (s.grip_pixel_norm[0] + 0.15).min(1.0);
     rig.sup.inner().write().await.set_grasp_setup(s);
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     let a = wait_done(&rig.sup, id, 20.0, |_| {}).await;
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("CENTRING_FAILED")), "{a:?}");
     assert_eq!(a.iteration, Some(1));
@@ -679,7 +679,7 @@ async fn assert_idle_after(sup: &ArmSupervisor, id: u64) {
 
 async fn cancel_case(phase: &str, moving: Option<bool>, cancel: impl AsyncFnOnce(&Rig)) -> armd::motion::ActionStatus {
     let rig = rig(GraspSetup::default(), Truth::same(), 0.0, [0.02, 0.0], false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, phase, moving).await;
     let t = Instant::now();
     cancel(&rig).await;
@@ -719,7 +719,7 @@ async fn grasp_superseded_by_jog() {
         let mut inner = rig.sup.inner().write().await;
         let mut q = inner.commanded_positions.clone();
         q[0] += 0.02;
-        inner.jog(q, None, None).unwrap();
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog(__a, q, None, None)) } }.unwrap();
     }).await;
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("cancelled", Some("SUPERSEDED")), "{a:?}");
 }
@@ -727,12 +727,12 @@ async fn grasp_superseded_by_jog() {
 #[tokio::test]
 async fn grasp_rejects_servo_frames_while_running() {
     let rig = rig(GraspSetup::default(), Truth::same(), 0.0, [0.0, 0.0], false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "centring", Some(false)).await;
     let mut inner = rig.sup.inner().write().await;
     let q = inner.commanded_positions.clone();
     let epoch = inner.safety.epoch_id();
-    assert_eq!(inner.servo(q, epoch), Err(armd::SafetyError::MotionBusy));
+    assert_eq!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, q, epoch)) } }, Err(armd::SafetyError::MotionBusy));
 }
 
 // ---- WS: ack, lease loss, workspace rejection, setup ----
@@ -942,7 +942,7 @@ async fn grasp_leaves_a_running_yolo_mode_alone_and_restores_after_failure() {
     // already yolo with inference on: no mode request at all
     let rig1 = rig(setup.clone(), Truth::same(), 0.0, [0.01, 0.01], false).await;
     *rig1.sim.vision.lock().unwrap() = Some(vm("both", true));
-    let (id, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.unwrap();
+    let (id, _) = grasp::start(&rig1.sup, rig1.sup.capture_admission_stamp(), rig1.sim.clone(), &tap(&rig1).await).await.unwrap();
     wait_phase(&rig1.sup, id, "centring", None).await;
     rig1.sim.visible.store(false, Ordering::SeqCst);
     let a = wait_done(&rig1.sup, id, 10.0, |_| {}).await;
@@ -952,7 +952,7 @@ async fn grasp_leaves_a_running_yolo_mode_alone_and_restores_after_failure() {
     // aruco base mode: restored after a failure as well
     let rig2 = rig(setup.clone(), Truth::same(), 0.0, [0.01, 0.01], false).await;
     *rig2.sim.vision.lock().unwrap() = Some(vm("aruco", true));
-    let (id, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.unwrap();
+    let (id, _) = grasp::start(&rig2.sup, rig2.sup.capture_admission_stamp(), rig2.sim.clone(), &tap(&rig2).await).await.unwrap();
     wait_phase(&rig2.sup, id, "centring", None).await;
     assert_eq!(rig2.sim.vision.lock().unwrap().clone(), Some(vm("both", true)));
     rig2.sim.visible.store(false, Ordering::SeqCst);
@@ -967,7 +967,7 @@ async fn grasp_without_yolo_model_fails_detection_unavailable() {
     let rig = rig(GraspSetup::default(), Truth::same(), 0.0, [0.0, 0.0], false).await;
     *rig.sim.vision.lock().unwrap() = Some(vm("aruco", false));
     rig.sim.no_yolo.store(true, Ordering::SeqCst);
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     let a = wait_done(&rig.sup, id, 10.0, |_| {}).await;
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{a:?}");
     assert_eq!(rig.sim.vision.lock().unwrap().clone(), Some(vm("aruco", false)), "mode untouched");
@@ -1004,7 +1004,7 @@ async fn grasp_triggers_fail_target_lost_and_without_model() {
     let rig1 = rig(GraspSetup::default(), Truth::same(), 0.0, [0.01, 0.01], false).await;
     rig1.sim.per_request.store(true, Ordering::SeqCst);
     *rig1.sim.vision.lock().unwrap() = Some(vm("aruco", true));
-    let (id, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.unwrap();
+    let (id, _) = grasp::start(&rig1.sup, rig1.sup.capture_admission_stamp(), rig1.sim.clone(), &tap(&rig1).await).await.unwrap();
     wait_phase(&rig1.sup, id, "centring", None).await;
     rig1.sim.visible.store(false, Ordering::SeqCst);
     let a = wait_done(&rig1.sup, id, 10.0, |_| {}).await;
@@ -1017,7 +1017,7 @@ async fn grasp_triggers_fail_target_lost_and_without_model() {
     rig2.sim.per_request.store(true, Ordering::SeqCst);
     rig2.sim.no_yolo.store(true, Ordering::SeqCst);
     *rig2.sim.vision.lock().unwrap() = Some(vm("aruco", false));
-    let (id, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.unwrap();
+    let (id, _) = grasp::start(&rig2.sup, rig2.sup.capture_admission_stamp(), rig2.sim.clone(), &tap(&rig2).await).await.unwrap();
     let a = wait_done(&rig2.sup, id, 10.0, |_| {}).await;
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{a:?}");
     assert!(rig2.sim.mode_calls.lock().unwrap().is_empty());
@@ -1031,7 +1031,7 @@ fn camera_tilt_change_is_busy_while_a_macro_runs() {
     let mut inner = common::sim_at(ArmConfig::rebot_dm(), &common::INSPECT);
     inner.set_grasp_setup(GraspSetup::default());
     let input = inner.plan_input().unwrap();
-    inner.begin_macro("grasp", &input, None).unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_macro(__a, "grasp", &input, None)) } }.unwrap();
     let err = grasp::update_setup(&mut inner, &json!({"camera_tilt_deg": 25.0})).unwrap_err();
     assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("MOTION_BUSY"));
     assert_eq!(inner.config.camera_mount.tilt_deg, 0.0);
@@ -1069,7 +1069,7 @@ async fn camera_down_grasp_with_the_v8_mount() {
         // the operator has the tool pitched half way, so the table below is in view
         let rig = rig_mounted(setup.clone(), truth, 0.0, v8_setup().2, offset, false).await;
         let body = tap(&rig).await;
-        let (id, duration) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
+        let (id, duration) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &body).await.expect("grasp accepted");
         let mut phases: Vec<String> = Vec::new();
         let mut down_err = f64::NAN;
         let sup = rig.sup.clone();
@@ -1128,11 +1128,11 @@ async fn camera_down_on_without_lens_centre_is_rejected() {
     let rig = rig(setup, truth, 0.0, [0.0, 0.0], false).await;
     let mut body = tap(&rig).await;
     body["overrides"] = json!({"acquire_camera_down": "on"});
-    let err = grasp::start(&rig.sup, rig.sim.clone(), &body).await.unwrap_err();
+    let err = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &body).await.unwrap_err();
     assert_eq!(err.code.as_deref(), Some("INVALID_COMMAND"), "{err:?}");
     assert!(rig.sup.get_observation().await.action.is_none(), "no action started");
     body["overrides"] = json!({"acquire_camera_down": "sideways"});
-    assert_eq!(grasp::start(&rig.sup, rig.sim.clone(), &body).await.unwrap_err().code.as_deref(), Some("INVALID_COMMAND"));
+    assert_eq!(grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &body).await.unwrap_err().code.as_deref(), Some("INVALID_COMMAND"));
 }
 
 /// Lowest base-frame z of the TCP, the workspace check points and the lens centre at `q`.
@@ -1161,7 +1161,7 @@ async fn camera_down_keeps_the_pitched_envelope_above_a_raised_table() {
     let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.0, 0.0], false).await;
     let config = rig.sup.inner().read().await.config.clone();
     let body = tap(&rig).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &body).await.expect("grasp accepted");
     let sup = rig.sup.clone();
     let mut lowest = f64::INFINITY;
     let mut at = String::new();
@@ -1204,7 +1204,7 @@ async fn v8_recheck_rig() -> (Rig, GraspSetup) {
 async fn camera_down_recheck_failures_end_the_grasp_before_descent() {
     for (case, expect) in [("lost", "TARGET_LOST"), ("displaced", "TARGET_DISPLACED"), ("detector", "DETECTION_UNAVAILABLE")] {
         let (rig, s) = v8_recheck_rig().await;
-        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
         wait_phase(&rig.sup, id, "transition", Some(true)).await;
         match case {
             "lost" => rig.sim.visible.store(false, Ordering::SeqCst),
@@ -1233,7 +1233,7 @@ async fn stale_frames_end_the_observation_as_target_lost() {
     let rig1 = rig(GraspSetup::default(), Truth::same(), 0.0, [0.01, 0.01], false).await;
     let (rig2, _) = v8_recheck_rig().await;
     for (case, rig, phase) in [("centring", &rig1, "centring"), ("re-check", &rig2, "transition")] {
-        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(rig).await).await.unwrap();
+        let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(rig).await).await.unwrap();
         wait_phase(&rig.sup, id, phase, Some(case == "re-check")).await;
         rig.sim.stale.store(true, Ordering::SeqCst);
         let t = Instant::now();
@@ -1251,7 +1251,7 @@ async fn stale_frames_end_the_observation_as_target_lost() {
 async fn camera_down_stop_during_the_transition() {
     let (setup, truth, start) = v8_setup();
     let rig = rig_mounted(setup, truth, 0.0, start, [0.0, 0.0], false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "transition", Some(true)).await;
     {
         let mut inner = rig.sup.inner().write().await;
@@ -1296,7 +1296,7 @@ async fn camera_down_collision_during_the_transition_holds() {
     let (setup, truth, start) = v8_setup();
     let arm = common::TestArm::new();
     let rig = rig_driven(setup, truth, 0.0, start, [0.0, 0.0], false, Some(arm.clone())).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "transition", Some(true)).await;
     arm.set_residual(1, -20.0);
     let a = wait_done(&rig.sup, id, 10.0, |_| {}).await;
@@ -1319,7 +1319,7 @@ async fn camera_down_rejects_a_camera_body_that_would_reach_the_table() {
         let start = pitched_start(&kinematics::cam_mount(false, 0.0, -38.0), 0.5, 0.30);
         let rig = rig_mounted(setup.clone(), truth, 0.0, start, [0.0, 0.0], false).await;
         rig.sup.inner().write().await.config.camera_mount.body_size_m = Some(body);
-        let r = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await;
+        let r = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await;
         println!("camera body {body:?}: {:?}", r.as_ref().map(|_| ()).map_err(|e| (e.code.clone(), e.message.clone())));
         if accepted {
             let (id, _) = r.expect("accepted with a 1 mm body");
@@ -1357,7 +1357,7 @@ async fn look_down_descent_that_would_bring_the_camera_to_the_table_fails() {
         s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
         rig.sup.inner().write().await.set_grasp_setup(s.clone());
         let config = rig.sup.inner().read().await.config.clone();
-        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("acked: approach and centring are clear");
+        let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("acked: approach and centring are clear");
         let sup = rig.sup.clone();
         let mut lowest = f64::INFINITY;
         let a = wait_done(&rig.sup, id, 60.0, |_| {
@@ -1390,7 +1390,7 @@ async fn delayed_detector_recovers_from_stale_frames() {
             let (rig, s) = v8_recheck_rig().await;
             rig.sim.delayed.store(true, Ordering::SeqCst);
             rig.sim.per_request.store(triggered, Ordering::SeqCst);
-            let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+            let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
             wait_phase(&rig.sup, id, phase, Some(phase == "transition")).await;
             if phase == "transition" {
                 // stale from the end of the move: the re-check sees stale frames first
@@ -1516,7 +1516,7 @@ async fn height_rig_with(top: f64, overrides: Value, truth: Truth) -> (Rig, Gras
 
 /// TCP z (lowest seen) while the jaws close.
 async fn run_grasp_close_z(rig: &Rig) -> (armd::motion::ActionStatus, f64) {
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(rig).await).await.expect("grasp accepted");
     let sup = rig.sup.clone();
     let mut close_z = f64::NAN;
     let a = wait_done(&rig.sup, id, 60.0, |a| {
@@ -1579,7 +1579,7 @@ async fn height_probe_too_tall_object_fails() {
 #[tokio::test]
 async fn height_probe_moves_up_over_a_tall_object() {
     let (rig, s) = height_rig(0.12, json!({})).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let sup = rig.sup.clone();
     let (mut start_z, mut min_z, mut max_z) = (f64::NAN, f64::INFINITY, f64::NEG_INFINITY);
     let a = wait_done(&rig.sup, id, 60.0, |a| {
@@ -1653,7 +1653,7 @@ async fn height_probe_falls_back_to_a_shorter_raise() {
 #[tokio::test]
 async fn lateral_probe_estimates_the_top_from_parallax() {
     let (rig, s) = height_rig(0.08, json!({"height_probe_mode": "lateral", "lateral_probe_m": 0.02})).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let sup = rig.sup.clone();
     let (mut start, mut min_z, mut max_xy) = (None::<Vec3>, f64::INFINITY, 0.0f64);
     let mut after_probe = None::<Vec3>;
@@ -1750,7 +1750,7 @@ async fn lateral_probe_falls_back_to_up_when_a_pose_is_unreachable() {
 async fn recentre_at_mid_height_and_skip_when_lost() {
     for lose in [false, true] {
         let (rig, s) = height_rig(0.05, json!({"recentre_height_m": 0.07})).await;
-        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
         if lose {
             wait_phase(&rig.sup, id, "recentre", None).await;
             rig.sim.visible.store(false, Ordering::SeqCst);
@@ -1791,7 +1791,7 @@ async fn descend_logs_residual_peaks_and_stops_on_contact() {
         let mut s = setup.clone();
         s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
         rig.sup.inner().write().await.set_grasp_setup(s.clone());
-        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
         wait_phase(&rig.sup, id, "descend", Some(true)).await;
         // contact below 0.08 m
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1844,7 +1844,7 @@ async fn post_lift_recheck_reports_a_dropped_object() {
         let mut s = setup.clone();
         s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
         rig.sup.inner().write().await.set_grasp_setup(s.clone());
-        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
         if drop_it {
             wait_phase(&rig.sup, id, "lift", Some(true)).await;
             rig.hold.store(false, Ordering::SeqCst);
@@ -1879,7 +1879,7 @@ async fn post_lift_regrip_keeps_a_loose_object() {
     let mut s = setup.clone();
     s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
     rig.sup.inner().write().await.set_grasp_setup(s.clone());
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "lift", Some(true)).await;
     // loose: the jaw reaches its hold target, no grip torque
     rig.hold.store(false, Ordering::SeqCst);
@@ -1920,7 +1920,7 @@ async fn too_wide_case(conf: f64) {
     *rig.sim.angle.lock().unwrap() = Some((0.0, conf));
     *rig.sim.width_px.lock().unwrap() = Some(350.0);
 
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let sup = rig.sup.clone();
     let mut min_z = f64::MAX;
     let a = wait_done(&rig.sup, id, 30.0, |_| {
@@ -1956,7 +1956,7 @@ async fn width_within_limit_grasps() {
     *rig.sim.angle.lock().unwrap() = Some((0.0, 0.9));
     *rig.sim.width_px.lock().unwrap() = Some(160.0);
 
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
 
     println!("within limit: {} {:?}, holding {:?}, width {:?}", a.state, a.code, a.holding, a.grasp_width_m);
@@ -1983,7 +1983,7 @@ async fn noisy_angles_skips_align_and_too_wide_fires_along_jaw_axis() {
     *rig.sim.angle_noise.lock().unwrap() = Some(40.0);
     *rig.sim.width_px.lock().unwrap() = Some(350.0);
 
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
 
     assert_eq!(a.state, "failed");
@@ -2053,7 +2053,7 @@ async fn grasp_diagnostics_phase_ms_and_motions_with_tracking_error() {
         }
     });
 
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 40.0, |_| {}).await;
     offset_active.store(false, Ordering::SeqCst);
     assert_eq!(a.state, "done");
@@ -2099,7 +2099,7 @@ async fn orchestrator_test_pre_open_j7_before_descend() {
     let sup = rig.sup.clone();
     let mut pre_descend_j7 = None;
 
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 40.0, |_| {
         if let Ok(inner) = sup.inner().try_read() {
             if let Some(act) = &inner.last_action {
@@ -2139,7 +2139,7 @@ async fn pre_open_skip_conditions() {
         r.sup.inner().write().await.set_grasp_setup(s.clone());
         *r.sim.width_px.lock().unwrap() = Some(160.0);
 
-        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("skipped:uncalibrated"));
     }
@@ -2157,7 +2157,7 @@ async fn pre_open_skip_conditions() {
         r.sup.inner().write().await.set_grasp_setup(s.clone());
         *r.sim.width_px.lock().unwrap() = Some(160.0);
 
-        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("off"));
     }
@@ -2178,7 +2178,7 @@ async fn pre_open_skip_conditions() {
         r.sup.inner().write().await.set_grasp_setup(s.clone());
         *r.sim.width_px.lock().unwrap() = Some(310.0);
 
-        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("skipped:open_rad"));
     }
@@ -2196,7 +2196,7 @@ async fn pre_open_skip_conditions() {
         r.sup.inner().write().await.set_grasp_setup(s.clone());
         *r.sim.width_px.lock().unwrap() = None;
 
-        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
         let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
         assert_eq!(a.pre_open.as_deref(), Some("skipped:no_width"));
     }
@@ -2231,7 +2231,7 @@ async fn calibrated_too_wide_limit() {
     *r.sim.angle.lock().unwrap() = Some((0.0, 0.9));
     *r.sim.width_px.lock().unwrap() = Some(275.0);
 
-    let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
     let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
 
     assert_eq!(a.state, "failed");
@@ -2258,7 +2258,7 @@ async fn grasp_records_focus_calls_and_clears_at_end() {
         b[3].as_f64().unwrap(),
     ];
 
-    let (id, _) = grasp::start(&r.sup, r.sim.clone(), &body).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &body).await.expect("grasp accepted");
     let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
     assert_eq!(a.state, "done");
 
@@ -2284,7 +2284,7 @@ async fn grasp_completes_when_mask_focus_fails() {
     // Simulate focus failure (e.g. older detector returning error)
     r.sim.focus_error.store(true, Ordering::SeqCst);
 
-    let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&r.sup, r.sup.capture_admission_stamp(), r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
     let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
     assert_eq!(a.state, "done");
     assert_eq!(a.holding, Some(true));
@@ -2314,7 +2314,7 @@ async fn depth_oblique_ransac_skips_probe_and_grasps() {
         drift_per_frame: false,
     });
 
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
     assert_eq!(a.state, "done");
     assert_eq!(a.holding, Some(true));
@@ -2355,7 +2355,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         drift_per_frame: false,
     });
 
-    let (id, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig1.sup, rig1.sup.capture_admission_stamp(), rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
     let a = wait_done(&rig1.sup, id, 30.0, |_| {}).await;
     assert_eq!(a.state, "done");
     assert_eq!(a.holding, Some(true));
@@ -2386,7 +2386,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         drift_per_frame: false,
     });
 
-    let (id2, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
+    let (id2, _) = grasp::start(&rig2.sup, rig2.sup.capture_admission_stamp(), rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
     let a2 = wait_done(&rig2.sup, id2, 30.0, |_| {}).await;
     assert_eq!(a2.state, "done");
     assert_eq!(a2.holding, Some(true));
@@ -2417,7 +2417,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         drift_per_frame: false,
     });
 
-    let (id3, _) = grasp::start(&rig3.sup, rig3.sim.clone(), &tap(&rig3).await).await.expect("grasp accepted");
+    let (id3, _) = grasp::start(&rig3.sup, rig3.sup.capture_admission_stamp(), rig3.sim.clone(), &tap(&rig3).await).await.expect("grasp accepted");
     let a3 = wait_done(&rig3.sup, id3, 30.0, |_| {}).await;
     assert_eq!(a3.state, "failed");
     assert_eq!(a3.code.as_deref(), Some("TOO_WIDE"));
@@ -2448,7 +2448,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
         drift_per_frame: false,
     });
 
-    let (id1, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
+    let (id1, _) = grasp::start(&rig1.sup, rig1.sup.capture_admission_stamp(), rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
     let a1 = wait_done(&rig1.sup, id1, 30.0, |_| {}).await;
     assert_eq!(a1.state, "done");
     assert_eq!(a1.holding, Some(true));
@@ -2476,7 +2476,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
         drift_per_frame: false,
     });
 
-    let (id2, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
+    let (id2, _) = grasp::start(&rig2.sup, rig2.sup.capture_admission_stamp(), rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
     let a2 = wait_done(&rig2.sup, id2, 30.0, |_| {}).await;
     assert_eq!(a2.state, "done");
     assert_eq!(a2.holding, Some(true));
@@ -2508,7 +2508,7 @@ async fn depth_tall_object_fails_when_the_probe_cannot_measure() {
         drift_per_frame: false,
     });
 
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
     assert_eq!(a.state, "failed");
     assert_eq!(a.code.as_deref(), Some("OBJECT_TOO_TALL"));
@@ -2543,7 +2543,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         drift_per_frame: false,
     });
 
-    let (id1, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
+    let (id1, _) = grasp::start(&rig1.sup, rig1.sup.capture_admission_stamp(), rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
     let a1 = wait_done(&rig1.sup, id1, 30.0, |_| {}).await;
     assert_eq!(a1.state, "done");
     assert_eq!(a1.holding, Some(true));
@@ -2571,7 +2571,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         drift_per_frame: false,
     });
 
-    let (id2, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
+    let (id2, _) = grasp::start(&rig2.sup, rig2.sup.capture_admission_stamp(), rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
     let a2 = wait_done(&rig2.sup, id2, 30.0, |_| {}).await;
     assert_eq!(a2.state, "done");
     assert_eq!(a2.holding, Some(true));
@@ -2602,7 +2602,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         drift_per_frame: false,
     });
 
-    let (id3, _) = grasp::start(&rig3.sup, rig3.sim.clone(), &tap(&rig3).await).await.expect("grasp accepted");
+    let (id3, _) = grasp::start(&rig3.sup, rig3.sup.capture_admission_stamp(), rig3.sim.clone(), &tap(&rig3).await).await.expect("grasp accepted");
     let a3 = wait_done(&rig3.sup, id3, 30.0, |_| {}).await;
     assert_eq!(a3.state, "done");
     assert_eq!(a3.holding, Some(true));
@@ -2635,7 +2635,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         drift_per_frame: true,
     });
 
-    let (id4, _) = grasp::start(&rig4.sup, rig4.sim.clone(), &tap(&rig4).await).await.expect("grasp accepted");
+    let (id4, _) = grasp::start(&rig4.sup, rig4.sup.capture_admission_stamp(), rig4.sim.clone(), &tap(&rig4).await).await.expect("grasp accepted");
     let a4 = wait_done(&rig4.sup, id4, 30.0, |_| {}).await;
     assert_eq!(a4.state, "done");
     assert_eq!(a4.holding, Some(true));
@@ -2667,7 +2667,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         drift_per_frame: false,
     });
 
-    let (id5, _) = grasp::start(&rig5.sup, rig5.sim.clone(), &tap(&rig5).await).await.expect("grasp accepted");
+    let (id5, _) = grasp::start(&rig5.sup, rig5.sup.capture_admission_stamp(), rig5.sim.clone(), &tap(&rig5).await).await.expect("grasp accepted");
     let a5 = wait_done(&rig5.sup, id5, 30.0, |_| {}).await;
     assert_eq!(a5.state, "done");
     assert_eq!(a5.holding, Some(true));
@@ -2699,7 +2699,7 @@ async fn depth_rig(setup: GraspSetup, depth: DepthSim, width_px: Option<f64>, to
 }
 
 async fn run_to_end(rig: &Rig) -> ActionStatus {
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(rig).await).await.expect("grasp accepted");
     wait_done(&rig.sup, id, 30.0, |_| {}).await
 }
 
@@ -2795,7 +2795,7 @@ async fn record_only_too_tall_depth_falls_back_to_the_setup_height() {
 #[tokio::test]
 async fn stop_during_the_probe_ends_the_grasp_with_the_estimates_so_far() {
     let (rig, _) = height_rig(0.08, json!({})).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     wait_phase(&rig.sup, id, "probe", Some(true)).await;
     {
         let mut inner = rig.sup.inner().write().await;
@@ -2842,7 +2842,7 @@ async fn yaw_and_width_estimates_follow_the_source_order() {
     // default: the mask width decides; the depth yaw is recorded (the mock reports no depth angle)
     let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), ..GraspSetup::default() };
     let rig = depth_estimates_rig(setup.clone(), false, false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
     println!("default: {} align {:?} yaw {:?} width {:?} grasp_width_m {:?}", a.state, a.align, a.yaw_estimates, a.width_estimates, a.grasp_width_m);
     assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
@@ -2855,7 +2855,7 @@ async fn yaw_and_width_estimates_follow_the_source_order() {
     // at the measured depth); the mask width is recorded
     let setup = GraspSetup { width_sources: vec![grasp::WidthSource::Depth], width_record: vec![grasp::WidthSource::Mask], ..setup };
     let rig = depth_estimates_rig(setup, false, false).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
     println!("depth first: {} width {:?} grasp_width_m {:?}", a.state, a.width_estimates, a.grasp_width_m);
     assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
@@ -2869,7 +2869,7 @@ async fn depth_entry_reports_why_there_is_no_measurement() {
     // a metric model with the table occluded: fewer than 3 table samples
     let setup = GraspSetup { camera_tilt_deg: 0.0, ..GraspSetup::default() };
     let rig = depth_estimates_rig(setup, true, true).await;
-    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let (id, _) = grasp::start(&rig.sup, rig.sup.capture_admission_stamp(), rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
     println!("occluded: {} height {:?}", a.state, a.height_estimates);
     assert_eq!(a.state, "done", "{a:?}");
@@ -2925,7 +2925,7 @@ async fn task_requirement_mismatch_rejects_the_command_without_motion() {
     assert_eq!(reply["code"], "TASK_UNSUPPORTED", "{reply}");
     assert!(reply["message"].as_str().unwrap().contains("not metric"), "{reply}");
     // the in-process start rejects the same way
-    let err = grasp::start(&w.rig.sup, w.rig.sim.clone(), &body).await.unwrap_err();
+    let err = grasp::start(&w.rig.sup, w.rig.sup.capture_admission_stamp(), w.rig.sim.clone(), &body).await.unwrap_err();
     assert_eq!(err.code.as_deref(), Some("TASK_UNSUPPORTED"), "{err:?}");
     // one mode reading per command, no action, nothing moved
     assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 4);

@@ -26,6 +26,12 @@ use serde_json::json;
 const BOOT: BootId = BootId(42);
 const RELEASE: Duration = Duration::from_millis(20);
 
+fn enable_torque_admitted(inner: &mut SupervisorInner) -> Result<SafetyState, SafetyError> {
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp)?;
+    SupervisorInner::enable_torque(admitted)
+}
+
 fn limits() -> Vec<DamiaoLimits> {
     ArmConfig::rebot_dm()
         .damiao_ranges
@@ -176,12 +182,12 @@ fn rest_pose_tolerance_rad_profile_field_defaults_customizes_and_validates() {
     rest_pos[1] = -0.50;
     cfg.resting_pose.as_mut().unwrap().positions = Some(rest_pos);
     let mut inner = SupervisorInner::new(cfg);
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("test".into()));
 
     // At 0.0 (home, 0.50 rad away from custom rest -0.50) -> refused naming joint_2 with rest -0.50.
     assert!(matches!(
-        inner.set_torque(false),
+        inner.disable_torque(),
         Err(SafetyError::TorqueOffWouldDrop {
             ref joint,
             position: Some(p),
@@ -192,14 +198,14 @@ fn rest_pose_tolerance_rad_profile_field_defaults_customizes_and_validates() {
 
     // At -0.42 (0.08 rad from -0.50, within custom 0.10 rad tolerance) -> allowed, latch kept.
     inner.measured_positions[1] = -0.42;
-    assert!(matches!(inner.set_torque(false), Ok(SafetyState::Fault(_))));
+    assert!(matches!(inner.disable_torque(), Ok(SafetyState::Fault(_))));
     assert!(!inner.is_torqued);
 }
 
 #[test]
 fn legacy_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
     let (mut inner, bus, clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
 
     // Gripper wide open (-3.0 rad), all arm joints within 0.05 rad of rest (0.0).
     bus.with(|s| {
@@ -226,7 +232,7 @@ fn legacy_fault_at_rest_allows_disable_keeps_latch_and_ignores_gripper() {
     let kinds_before = inner.safety.latched_fault_kinds();
     let fault_before = inner.safety.fault();
 
-    let state = inner.set_torque(false).expect("disable at rest in Fault must succeed");
+    let state = inner.disable_torque().expect("disable at rest in Fault must succeed");
     assert!(matches!(state, SafetyState::Fault(_)), "Fault latch must stay active");
     assert!(matches!(inner.safety.state(), SafetyState::Fault(_)));
     assert_eq!(inner.safety.epoch_id(), epoch_before, "torque-off must not advance epoch");
@@ -371,7 +377,7 @@ async fn legacy_raised_in_fault_refuses_with_torque_off_would_drop_and_no_force_
     assert!(sup.get_observation().await.is_torqued);
 
     // 5. SDK-facing ArmSupervisor::set_torque(false) returns SafetyError::TorqueOffWouldDrop.
-    let sdk_err = sup.set_torque(false).await.unwrap_err();
+    let sdk_err = sup.disable_torque().await.unwrap_err();
     match sdk_err {
         ArmError::Safety(SafetyError::TorqueOffWouldDrop {
             joint,
@@ -447,7 +453,7 @@ fn executor_raised_in_fault_refuses_with_torque_off_would_drop_both_transition_a
     // 2. Driverless executor: ImmediateOp::TorqueOff
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     inner.measured_positions[1] = 0.25;
     inner.safety.trigger_fault_coded(
         FaultCode::WatchdogTimeout,
@@ -496,7 +502,7 @@ fn executor_raised_in_fault_refuses_with_torque_off_would_drop_both_transition_a
 fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
     // 1. Legacy owner with real DamiaoArmDriver + MockClock
     let (mut inner, bus, clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     // Arm is physically at rest (0.0), enter Fault.
     inner.safety.trigger_fault_coded(
         FaultCode::BusLoss,
@@ -508,7 +514,7 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
         inner.may_disable_torque_while_stopped(),
         Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
     );
-    let err = inner.set_torque(false).unwrap_err();
+    let err = inner.disable_torque().unwrap_err();
     assert!(matches!(err, SafetyError::TorqueOffWouldDrop { joint: None, .. }), "{err:?}");
     assert!(inner.is_torqued);
 
@@ -517,7 +523,7 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
     inner.tick(0.02); // observe empty RX queue at current time
     bus.with(|s| s.push_all_feedback());
     inner.tick(0.02);
-    assert!(matches!(inner.set_torque(false), Ok(SafetyState::Fault(_))));
+    assert!(matches!(inner.disable_torque(), Ok(SafetyState::Fault(_))));
     assert!(!inner.is_torqued);
 
     // 2. Executor owner with stale feedback (> 100 ms)
@@ -549,7 +555,7 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
 fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     // 1. Legacy owner in E-Stop
     let (mut inner, bus, clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
 
     // Raised -> trigger E-stop -> refused with TORQUE_OFF_WOULD_DROP
     bus.with(|s| {
@@ -568,7 +574,7 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     let kinds_before = inner.safety.latched_fault_kinds();
     let fault_before = inner.safety.fault();
     assert!(matches!(
-        inner.set_torque(false),
+        inner.disable_torque(),
         Err(SafetyError::TorqueOffWouldDrop { ref joint, .. }) if joint.as_deref() == Some("joint_1")
     ));
     assert!(inner.is_torqued);
@@ -589,7 +595,7 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert_eq!(inner.safety.epoch_id(), epoch_before);
     bus.with(|s| s.tx_error = true);
-    assert!(inner.set_torque(false).is_err());
+    assert!(inner.disable_torque().is_err());
     assert_eq!(*inner.safety.state(), SafetyState::EStop, "failed disable must not overwrite E-Stop latch");
     assert_eq!(inner.safety.epoch_id(), epoch_before, "failed disable must not advance epoch");
     assert_eq!(inner.safety.latched_fault_kinds(), kinds_before, "failed disable must not mutate fault record");
@@ -600,7 +606,7 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     bus.with(|s| s.tx_error = false);
     clock.advance(Duration::from_millis(150));
     assert!(matches!(
-        inner.set_torque(false),
+        inner.disable_torque(),
         Err(SafetyError::TorqueOffWouldDrop { joint: None, .. })
     ));
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
@@ -618,7 +624,7 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
     inner.tick(0.02);
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert_eq!(inner.safety.epoch_id(), epoch_before);
-    let st = inner.set_torque(false).expect("disable at rest in E-Stop must succeed");
+    let st = inner.disable_torque().expect("disable at rest in E-Stop must succeed");
     assert_eq!(st, SafetyState::EStop);
     assert_eq!(*inner.safety.state(), SafetyState::EStop);
     assert_eq!(inner.safety.epoch_id(), epoch_before, "confirmed disable must not advance epoch");
@@ -696,7 +702,7 @@ fn relatching_deferral_fault_loop_allows_disable_at_rest_on_both_owners() {
 
     // 1. Legacy owner
     let (mut inner, bus, _clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     bus.with(|s| s.tx_step = Duration::from_millis(2));
 
     // Run ticks at rest: write_joint_targets defers -> latches DriverWriteFailed; subsequent
@@ -715,7 +721,7 @@ fn relatching_deferral_fault_loop_allows_disable_at_rest_on_both_owners() {
 
     // Disable at rest succeeds despite the deferral cost (TxKind::Disable exempt from TX budget).
     bus.with(|s| s.push_all_feedback());
-    let state = inner.set_torque(false).expect("disable at rest must beat deferral fault loop");
+    let state = inner.disable_torque().expect("disable at rest must beat deferral fault loop");
     assert!(matches!(state, SafetyState::Fault(_)));
     assert!(!inner.is_torqued);
     assert!(!inner.disable_pending);
@@ -821,14 +827,14 @@ fn hardware_without_calibrated_resting_pose_refuses_stopped_torque_off_on_both_o
 
     // 1. Legacy owner
     let (mut inner, _bus, _clock) = make_uncalibrated();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
     assert_eq!(
         inner.may_disable_torque_while_stopped(),
         Err(StoppedTorqueOffRefusal::NoRestingPoseConfigured)
     );
     assert!(matches!(
-        inner.set_torque(false),
+        inner.disable_torque(),
         Err(SafetyError::TorqueOffWouldDrop {
             joint: None,
             ref reason,
@@ -873,7 +879,7 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
     // 1. Silent gripper (J7 stale > 150 ms) while J1..J6 are fresh (<= 100 ms) at rest:
     // rest-pose admission must PASS because gripper is excluded from rule 1.
     let (mut inner, bus, clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
     bus.with(|s| {
         s.follow_commands = false;
@@ -911,7 +917,7 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
 
     // 2. Driverless invalid / missing / stale synthetic feedback refuses; invalid gripper ignored.
     let mut mock = SupervisorInner::new(ArmConfig::rebot_dm());
-    mock.set_torque(true).unwrap();
+    enable_torque_admitted(&mut mock).unwrap();
     mock.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
 
     mock.measured_positions[6] = f32::NAN;
@@ -1040,7 +1046,7 @@ fn queued_old_can_frames_exceeding_queue_bound_are_rejected_as_stale() {
     // Even if old at-rest frames are dequeued at `now` (decode age = 0 ms), the conservative
     // receive-queue bound (`rx_empty_instant` > 100 ms ago) must reject them as stale.
     let (mut inner, bus, clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
     bus.with(|s| {
         s.follow_commands = false;
@@ -1070,7 +1076,7 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     // at rest (0.0), while the driver's fresh J1..J6 feedback (read during clear_fault) shows J2
     // raised to 0.45 rad. The rest check MUST use the fresh driver positions and refuse.
     let (mut inner, bus, clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
     assert!((inner.measured_positions[1] - 0.0).abs() < 1e-3);
 
@@ -1104,7 +1110,7 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     );
 
     // Rest check MUST refuse naming joint_2 with the fresh ~0.45 rad driver position.
-    let err = inner.set_torque(false).unwrap_err();
+    let err = inner.disable_torque().unwrap_err();
     match err {
         SafetyError::TorqueOffWouldDrop {
             joint: Some(ref j),
@@ -1141,7 +1147,7 @@ fn fresh_driver_timestamps_never_vouch_for_stale_measured_positions_and_zero_off
     let mut offsets = vec![0.0; 7];
     offsets[1] = 0.40;
     inner_z.set_joint_zero_offsets(&offsets).unwrap();
-    inner_z.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner_z).unwrap();
     inner_z.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
     // Motor raw q = 0.0 with offset 0.40 => logical q = -0.40 (outside rest).
     bus_z.with(|s| {
@@ -1172,7 +1178,7 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
     // stays None).
     let (mut inner_t, bus_t, _clock_t) = make_driver_rig();
     inner_t.config.resting_pose = None;
-    inner_t.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner_t).unwrap();
     bus_t.with(|s| {
         s.follow_commands = false;
         s.motors[1].q = 0.45;
@@ -1202,7 +1208,7 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
     //    does NOT consult `eval_stopped_torque_off`.
     let (mut inner_s, bus_s, clock_s) = make_driver_rig();
     inner_s.config.resting_pose = None;
-    inner_s.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner_s).unwrap();
     bus_s.with(|s| {
         s.follow_commands = false;
         s.motors[1].q = 0.45;
@@ -1244,7 +1250,7 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
     //    disables motors unconditionally without consulting `eval_stopped_torque_off`.
     let (mut inner_p, bus_p, _clock_p) = make_driver_rig();
     inner_p.config.resting_pose = None;
-    inner_p.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner_p).unwrap();
     bus_p.with(|s| {
         s.follow_commands = false;
         s.motors[1].q = 0.45;
@@ -1269,7 +1275,7 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
 #[test]
 fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_check() {
     let (mut inner, bus, clock) = make_driver_rig();
-    inner.set_torque(true).unwrap();
+    enable_torque_admitted(&mut inner).unwrap();
     inner.apply_stop_policy(StopPolicy::EStopLatch);
     let epoch_before = inner.safety.epoch_id();
 
@@ -1279,7 +1285,7 @@ fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_c
         s.tx_error = true;
         s.push_all_feedback();
     });
-    assert!(inner.set_torque(false).is_err());
+    assert!(inner.disable_torque().is_err());
     assert!(inner.disable_pending);
     assert!(matches!(
         inner.active_disable_kind(),
@@ -1333,7 +1339,7 @@ fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_c
     });
     inner.tick(0.02);
     assert!(matches!(
-        inner.set_torque(false),
+        inner.disable_torque(),
         Err(SafetyError::TorqueOffWouldDrop { joint: Some(ref j), .. }) if j == "joint_2"
     ));
 }
@@ -1852,7 +1858,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     // -------------------------------------------------------------------------
     for pose in ALL_POSES {
         let (mut inner, bus, clock) = make_driver_rig();
-        inner.set_torque(true).unwrap();
+        enable_torque_admitted(&mut inner).unwrap();
         inner.apply_stop_policy(StopPolicy::EStopLatch);
 
         // Start a DisableRequested handshake at rest while motor 2 stays silent (never replies
@@ -1936,7 +1942,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     // Also verify legacy handshake resend past 1 s total request lifetime sends 0 frames even at rest.
     {
         let (mut inner, bus, clock) = make_driver_rig();
-        inner.set_torque(true).unwrap();
+        enable_torque_admitted(&mut inner).unwrap();
         inner.apply_stop_policy(StopPolicy::EStopLatch);
         bus.with(|s| {
             s.follow_commands = false;
@@ -2058,7 +2064,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     for started_before_stop in [false, true] {
         for pose in ALL_POSES {
             let (mut inner, bus, clock) = make_driver_rig();
-            inner.set_torque(true).unwrap();
+            enable_torque_admitted(&mut inner).unwrap();
             bus.with(|s| {
                 s.follow_commands = false;
                 s.rx.clear();
@@ -2076,7 +2082,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 s.pending.clear();
                 s.push_all_feedback();
             });
-            assert!(inner.set_torque(false).is_err());
+            assert!(inner.disable_torque().is_err());
             assert!(inner.disable_pending);
 
             if started_before_stop {
@@ -2197,7 +2203,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 });
             }
             bus.clear_log();
-            let err = inner.set_torque(true).unwrap_err();
+            let err = enable_torque_admitted(&mut inner).unwrap_err();
             assert!(
                 matches!(err, SafetyError::ClearFaultRejected(_)),
                 "expected enable failure, got {err:?}"
@@ -2501,7 +2507,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
     ] {
         for pose in ALL_POSES {
             let (mut inner, bus, clock) = make_driver_rig();
-            inner.set_torque(true).unwrap();
+            enable_torque_admitted(&mut inner).unwrap();
             inner.apply_stop_policy(StopPolicy::EStopLatch);
             bus.with(|s| {
                 s.follow_commands = false;
@@ -2703,7 +2709,7 @@ fn partial_enable_at_raised_pose_then_validation_failure_enters_failed_hold_and_
         assert_eq!(*inner.safety.state(), SafetyState::Idle);
 
         bus.clear_log();
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(
             matches!(err, SafetyError::FeedbackUnavailable),
             "fail_read_err={fail_read_err}: expected FeedbackUnavailable, got {err:?}"
@@ -3597,7 +3603,7 @@ fn spec_b1_queued_0x0_after_deferred_or_retried_damiao_enable_never_confirms_off
         inner.lease_enabled = false;
 
         bus.clear_log();
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
         // m-02: prove retries actually fired (at least initial + 1 retry for motor 1).
@@ -3721,7 +3727,7 @@ fn spec_b2_feetech_failed_enable_holds_at_measured_positions_never_old_cached_co
         }
     }
 
-    let err = inner.set_torque(true).unwrap_err();
+    let err = enable_torque_admitted(&mut inner).unwrap_err();
     assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
     let enable_tx = serial_inner.lock().unwrap().take_tx();
     assert_eq!(
@@ -4013,7 +4019,7 @@ fn spec_m1_m2_delayed_rt_failure_and_feetech_internal_failure_both_enter_failed_
 
         let mut inner = SupervisorInner::new(feetech_6dof_config()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
         assert!(inner.is_torqued && !inner.disable_pending);
@@ -4108,7 +4114,7 @@ fn spec_5_joint_without_fresh_feedback_gets_no_hold_frame_drops_queued_and_recap
     inner.lease_enabled = false;
 
     // Enter FailedHold with all 7 joints fresh at `initial_pose`.
-    assert!(inner.set_torque(true).is_err());
+    assert!(enable_torque_admitted(&mut inner).is_err());
     assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
 
     // Tick 1: J1 & J2 transmit, J3..J7 holds are queued in the hold TX queue.
@@ -4336,7 +4342,7 @@ fn spec_7_failed_enable_at_rest_pose_does_not_roll_back_automatically() {
         inner.tick(0.02);
         bus.clear_log();
 
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
         assert_eq!(
             spec_count_damiao_disables(&bus),
@@ -4357,7 +4363,7 @@ fn spec_7_failed_enable_at_rest_pose_does_not_roll_back_automatically() {
         clock.advance(Duration::from_millis(5));
         inner.tick(0.02);
         bus.clear_log();
-        let state = inner.set_torque(false).expect("explicit disable at rest must succeed");
+        let state = inner.disable_torque().expect("explicit disable at rest must succeed");
         assert!(matches!(state, SafetyState::Fault(_)), "explicit disable preserves ENABLE_FAILED latch");
         assert!(spec_count_damiao_disables(&bus) >= 7, "explicit disable sends disable frames");
         assert!(!inner.is_torqued);
@@ -4431,7 +4437,7 @@ fn spec_7_failed_enable_at_rest_pose_does_not_roll_back_automatically() {
         let mut inner = SupervisorInner::new(feetech_6dof_config()).with_driver(Box::new(drv));
         inner.lease_enabled = false;
 
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
         let fail_tx = serial.lock().unwrap().take_tx();
         assert_eq!(
@@ -4726,7 +4732,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
         inner = inner.with_driver(Box::new(drv));
         enable_writes.lock().unwrap().clear();
 
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::EStopActive), "expected EStopActive, got {err:?}");
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
         assert!(inner.e_stop_latched.load(Ordering::SeqCst), "E-stop latch flag must be preserved");
@@ -4787,7 +4793,7 @@ fn review_b04_fashionstar_and_robstride_mid_batch_estop_aborts_with_zero_later_e
         inner = inner.with_driver(Box::new(drv));
         tx.lock().unwrap().clear();
 
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::EStopActive), "expected EStopActive, got {err:?}");
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
         assert!(inner.e_stop_latched.load(Ordering::SeqCst), "E-stop latch flag must be preserved");
@@ -4892,7 +4898,7 @@ fn review_m01_m06_m07_m08_m09_unverified_mode_thermal_late_reply_and_gap_recaptu
         }
 
         // Trigger FailedHold via blocking set_torque(true).
-        let err = inner.set_torque(true).unwrap_err();
+        let err = enable_torque_admitted(&mut inner).unwrap_err();
         assert!(matches!(err, SafetyError::ClearFaultRejected(_)));
         assert_eq!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
         // Enable timed out after 150 ms (> 100 ms hold freshness) so initial status is unheld(no_fresh_fb).

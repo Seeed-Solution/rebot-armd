@@ -229,7 +229,7 @@ fn supervisor(with_driver: bool) -> SupervisorInner {
     }
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     warm(&mut inner, 5);
     inner
 }
@@ -264,7 +264,7 @@ fn scenarios(with_driver: bool) {
     q[0] += 0.4;
     q[2] -= 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, q, Some(2.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     assert!(inner.active_trajectory.is_some());
     assert_zero(&format!("{tag} quintic"), &count_ticks(&mut inner, 50, |_, _| {}));
@@ -277,14 +277,14 @@ fn scenarios(with_driver: bool) {
     for i in 0..10 {
         let mut t = base.clone();
         t[0] += 0.002 * i as f32;
-        inner.servo(t, epoch).unwrap();
+        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::servo(a, t, epoch) }.unwrap();
         warm(&mut inner, 1);
     }
     let targets: Vec<Vec<f32>> = (10..60).map(|i| { let mut t = base.clone(); t[0] += 0.002 * i as f32; t }).collect();
     let mut targets = targets.into_iter();
     let mut servo_counts = Vec::new();
     for _ in 0..50 {
-        inner.servo(targets.next().unwrap(), epoch).unwrap();
+        { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::servo(a, targets.next().unwrap(), epoch) }.unwrap();
         servo_counts.push(tick_counted(&mut inner));
     }
     assert_zero(&format!("{tag} servo stream"), &servo_counts);
@@ -292,11 +292,11 @@ fn scenarios(with_driver: bool) {
     // gripper close (from fully open, slowly)
     let mut inner = supervisor(with_driver);
     let epoch = inner.safety.epoch_id();
-    inner.start_gripper(GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 2.0, timeout_s: None, tag: None }, epoch)
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::start_gripper(a, GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 2.0, timeout_s: None, tag: None }, epoch) }
         .expect("gripper open");
     for _ in 0..200 { if inner.active_trajectory.is_none() { break; } warm(&mut inner, 1); }
     assert!(inner.active_trajectory.is_none(), "gripper open finished");
-    inner.start_gripper(GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 0.3, timeout_s: None, tag: None }, epoch)
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::start_gripper(a, GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 0.3, timeout_s: None, tag: None }, epoch) }
         .expect("gripper close");
     warm(&mut inner, 5);
     assert!(inner.active_trajectory.is_some());
@@ -318,7 +318,7 @@ fn scenarios(with_driver: bool) {
     let mut q = inner.commanded_positions.clone();
     q[1] += 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, q, Some(2.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     let counts = count_ticks(&mut inner, 50, |inner, i| {
         // the dispatcher drains the ring off the control thread
@@ -370,7 +370,7 @@ fn ticks_do_not_touch_the_allocator_with_stalled_readers_and_dispatcher() {
     let mut q = inner.commanded_positions.clone();
     q[1] += 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(8.0), Some(epoch)).expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, q, Some(8.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     let hub = inner.core.hub().clone();
     let ring = inner.core.record_ring().unwrap().clone();
@@ -455,11 +455,11 @@ fn observation_stop_reason_and_phase_transitions_do_not_touch_the_allocator() {
     let mut inner = supervisor(false);
     let gen = inner.acquire_lease("alloc").expect("lease");
     let epoch = inner.safety.epoch_id();
-    inner.begin_policy_run(PolicyRunStart {
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::begin_policy_run(a, PolicyRunStart {
         epoch_id: epoch, connection_id: "alloc".into(), lease_generation: gen, policy_id: "p".into(), artifact_digest: "d".into(),
         backend: "mlp".into(), mode: PolicyMode::Shadow, sim_only: false, max_first_step_rad: None, max_step_rad: None, tag: None,
         i_am_at_the_arm: false, verified_release_gate: None,
-    }).expect("run");
+    }) }.expect("run");
     let mut run = inner.policy_run.take().expect("run");
     let mut out = PolicyObservation::default();
     run.to_observation_into(true, &mut out);
@@ -542,7 +542,6 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
     assert_eq!(ALL_PLAN_SLOTS_PAYLOAD_BYTES, 655_360);
 
     let sample = [0.25f32; MAX_DOF];
-    let mut handles = [None; PLAN_SLOTS];
 
     // Warm up the exact monomorphized staging/pin/retire/reclaim code pages and stack frame on a
     // 1-slot scratch pool so no demand-paged `.text` or stack minor fault can fire during the
@@ -559,6 +558,7 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
 
     let (mut writer, mut reader) = plan_slots(PLAN_SLOTS, PlanSlot::default);
     assert_eq!((writer.capacity(), reader.capacity()), (PLAN_SLOTS, PLAN_SLOTS));
+    let mut handles = [None; PLAN_SLOTS];
 
     #[cfg(target_os = "linux")]
     let thread_faults = || -> (i64, i64) {
@@ -619,10 +619,10 @@ fn watchdog_park_supervisor() -> SupervisorInner {
     });
     let mut inner = SupervisorInner::new(cfg);
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.expect("arm");
     let _gen = inner.acquire_lease("client").expect("lease");
     let epoch = inner.safety.epoch_id();
-    inner.jog(vec![0.5, 0.2], Some(0.2), Some(epoch)).expect("jog");
+    { let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); armd::SupervisorInner::jog(a, vec![0.5, 0.2], Some(0.2), Some(epoch)) }.expect("jog");
     for _ in 0..40 {
         inner.active_lease.as_mut().unwrap().acquired_at = Instant::now();
         inner.last_heartbeat = Instant::now();
@@ -663,7 +663,7 @@ fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
     let mut idle = supervisor(false);
     let q = idle.commanded_positions.clone();
     let ep = idle.safety.epoch_id();
-    idle.servo(q, ep).expect("servo");
+    { let a = idle.check_admission(idle.current_admission_stamp()).unwrap(); armd::SupervisorInner::servo(a, q, ep) }.expect("servo");
     let (stopped_idle, a2, f2) = counted(|| idle.authorized_stop());
     assert!(stopped_idle);
     assert_eq!((a2, f2), (0, 0), "idle/servo authorized_stop touched allocator");
@@ -896,9 +896,13 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
 
     // 3. In-place path and replay target activation perform (0, 0) allocs/frees.
     let epoch = fx.core.safety.epoch_id();
+    let stamp1 = fx.core.current_admission_stamp();
+    let stamp2 = fx.core.current_admission_stamp();
     let (res, a_act, f_act) = counted(|| {
-        let d1 = fx.core.start_path_motion_slice(epoch, &goal[..dof], 0.5).unwrap();
-        fx.core.start_replay_motion(&start[..dof]).unwrap();
+        let admitted1 = fx.core.check_admission(stamp1).unwrap();
+        let d1 = armd::SupervisorInner::start_path_motion_slice(admitted1, epoch, &goal[..dof], 0.5).unwrap();
+        let admitted2 = fx.core.check_admission(stamp2).unwrap();
+        armd::SupervisorInner::start_replay_motion(admitted2, &start[..dof]).unwrap();
         d1
     });
     assert_eq!(res, 0.5);
@@ -1410,19 +1414,21 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
         inner.measured_positions[g_idx] = -2.0;
         inner.target_positions[g_idx] = -2.0;
         let ep = inner.safety.epoch_id();
-        let (grasp_id, _) = inner
-            .start_gripper(
-                GripperRequest {
-                    command: GripperCommand::Close,
-                    fraction: None,
-                    grasp: true,
-                    speed: 0.30,
-                    timeout_s: Some(10.0),
-                    tag: None,
-                },
-                ep,
-            )
-            .unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (grasp_id, _) = SupervisorInner::start_gripper(
+            admitted,
+            GripperRequest {
+                command: GripperCommand::Close,
+                fraction: None,
+                grasp: true,
+                speed: 0.30,
+                timeout_s: Some(10.0),
+                tag: None,
+            },
+            ep,
+        )
+        .unwrap();
         warm(&mut inner, 3);
         // Latch stall so the next tick enters `GripPhase::Squeeze`, then step through all settle ticks.
         inner.gripper_stalled = true;
@@ -1456,23 +1462,27 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
         inner.measured_positions[g_idx] = -2.0;
         inner.target_positions[g_idx] = -2.0;
         let ep = inner.safety.epoch_id();
-        let cal_id = inner.begin_orchestrated_action("gripper_calibrate", None, ep).unwrap();
-        inner
-            .start_macro_gripper_learning_within(
-                cal_id,
-                GripperRequest {
-                    command: GripperCommand::Move,
-                    fraction: Some(0.05),
-                    grasp: false,
-                    speed: 0.30,
-                    timeout_s: None,
-                    tag: None,
-                },
-                LearnMode::Calibration,
-                None,
-                false,
-            )
-            .unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let cal_id = SupervisorInner::begin_orchestrated_action(admitted, "gripper_calibrate", None, ep).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::start_macro_gripper_learning_within(
+            admitted,
+            cal_id,
+            GripperRequest {
+                command: GripperCommand::Move,
+                fraction: Some(0.05),
+                grasp: false,
+                speed: 0.30,
+                timeout_s: None,
+                tag: None,
+            },
+            LearnMode::Calibration,
+            None,
+            false,
+        )
+        .unwrap();
         warm(&mut inner, 3);
         inner.gripper_stalled = true;
         inner.gripper_stall_sign = 1.0;
@@ -1497,19 +1507,21 @@ fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
         inner.measured_positions[g_idx] = -2.0;
         inner.target_positions[g_idx] = -2.0;
         let ep = inner.safety.epoch_id();
-        let (act_id, _) = inner
-            .start_gripper(
-                GripperRequest {
-                    command: GripperCommand::Move,
-                    fraction: Some(0.0),
-                    grasp: false,
-                    speed: 0.30,
-                    timeout_s: None,
-                    tag: None,
-                },
-                ep,
-            )
-            .unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (act_id, _) = SupervisorInner::start_gripper(
+            admitted,
+            GripperRequest {
+                command: GripperCommand::Move,
+                fraction: Some(0.0),
+                grasp: false,
+                speed: 0.30,
+                timeout_s: None,
+                tag: None,
+            },
+            ep,
+        )
+        .unwrap();
         warm(&mut inner, 3);
         inner.gripper_stalled = true;
         inner.gripper_stall_sign = 1.0;

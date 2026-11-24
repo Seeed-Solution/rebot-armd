@@ -376,7 +376,7 @@ where
             supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
             // Stop the legacy periodic loop first so it stops competing for the supervisor lock
             // and actuator bus while bounded emergency disable runs.
-            control_stop.store(true, Ordering::SeqCst);
+            supervisor.signal_legacy_stop(&control_stop);
             let sup = Arc::clone(supervisor);
             let outcome = tokio::task::spawn_blocking(move || {
                 sup.attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT)
@@ -391,7 +391,7 @@ where
         after_legacy_commit_before_abort().await;
         // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
         server_handle.abort();
-        control_stop.store(true, Ordering::SeqCst);
+        supervisor.signal_legacy_stop(&control_stop);
         info!("armd stopped after shutdown readiness confirmation");
         return Ok(());
     }
@@ -404,6 +404,7 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
+    let _ = armd::supervisor::init_process_identity();
     let system = armd::diagnostics::boot::SystemInfo::read();
     let cli = parse_cli_args()?;
 
@@ -478,7 +479,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let bind_ip: std::net::IpAddr = match std::env::var("ARMD_BIND_HOST") {
+        Ok(s) if !s.trim().is_empty() => s
+            .trim()
+            .parse()
+            .map_err(|_| format!("Invalid ARMD_BIND_HOST: {s}"))?,
+        _ => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    };
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, port)).await?;
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_limits: Option<Vec<_>> = config.damiao_ranges.as_ref().map(|r| r.iter().map(|r| r.limits()).collect());
     let config_dof = config.dof;
@@ -601,6 +609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let control_stop_flag = control_stop.clone();
             let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
+            supervisor.attach_legacy_loop_stats(executor_stats.clone());
             let loop_stats = executor_stats.clone();
             let runtime = tokio::runtime::Handle::current();
             std::thread::Builder::new().name("armd-control".into()).spawn(move || {
@@ -632,6 +641,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             runtime.block_on(control_supervisor.control_tick_with_deadline(dt, release_deadline));
                         }));
                     if let Err(e) = tick_res {
+                        armd::rt_core::executor::account_periodic_overrun_on_panic_exit(&loop_stats);
                         control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
                         error!("Control thread panicked during tick: {:?}", e);
                         let outcome = control_supervisor
@@ -783,19 +793,29 @@ mod shutdown_tests {
     fn refused_shutdown_latches_stop_until_explicit_recovery_and_rearm() {
         let mut inner = physical(EnableState::Enabled);
         let old_epoch = inner.safety.epoch_id();
-        inner.servo(vec![0.1; 6], old_epoch).unwrap();
+        let st = inner.current_admission_stamp();
+        inner.check_admission(st).and_then(|a| SupervisorInner::servo(a, vec![0.1; 6], old_epoch)).unwrap();
         assert!(!request_shutdown(&mut inner));
         assert_eq!(inner.safety.state(), &SafetyState::EStop);
         let new_epoch = inner.safety.epoch_id();
         assert_ne!(new_epoch, old_epoch);
-        assert!(inner.servo(vec![0.1; 6], old_epoch).is_err());
-        assert!(inner.servo(vec![0.1; 6], new_epoch).is_err());
-        assert!(inner.set_torque(true).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.check_admission(st).and_then(|a| SupervisorInner::servo(a, vec![0.1; 6], old_epoch)).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.check_admission(st).and_then(|a| SupervisorInner::servo(a, vec![0.1; 6], new_epoch)).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.check_admission(st).and_then(SupervisorInner::enable_torque).is_err());
         inner.clear_fault().unwrap();
         assert_eq!(inner.safety.state(), &SafetyState::Idle);
-        assert!(inner.servo(vec![0.1; 6], inner.safety.epoch_id()).is_err());
-        inner.set_torque(true).unwrap();
-        assert!(inner.servo(vec![0.1; 6], inner.safety.epoch_id()).is_ok());
+        let st = inner.current_admission_stamp();
+        let ep_now = inner.safety.epoch_id();
+        assert!(inner.check_admission(st).and_then(|a| SupervisorInner::servo(a, vec![0.1; 6], ep_now)).is_err());
+        let st = inner.current_admission_stamp();
+        let adm = inner.check_admission(st).unwrap();
+        SupervisorInner::enable_torque(adm).unwrap();
+        let st = inner.current_admission_stamp();
+        let ep_now = inner.safety.epoch_id();
+        assert!(inner.check_admission(st).and_then(|a| SupervisorInner::servo(a, vec![0.1; 6], ep_now)).is_ok());
     }
 
     #[test]
@@ -817,7 +837,8 @@ mod shutdown_tests {
     fn confirmed_disabled_hardware_can_exit_and_cannot_reenable_during_exit() {
         let mut inner = physical(EnableState::Disabled);
         assert!(request_shutdown(&mut inner));
-        assert!(inner.set_torque(true).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.check_admission(st).and_then(SupervisorInner::enable_torque).is_err());
         let mut unknown = physical(EnableState::Unknown);
         assert!(!request_shutdown(&mut unknown));
     }
@@ -897,7 +918,7 @@ mod shutdown_tests {
         };
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -1001,7 +1022,7 @@ mod shutdown_tests {
         };
         let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
         sup_leg.set_lease_enabled(false).await;
-        sup_leg.set_torque(true).await.unwrap();
+        sup_leg.enable_torque(sup_leg.capture_admission_stamp()).await.unwrap();
         let legacy_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut server_leg = tokio::spawn(async {
             std::future::pending::<std::io::Result<()>>().await
@@ -1063,9 +1084,9 @@ mod shutdown_tests {
             .expect_err("clear_fault must be refused once legacy shutdown is committed");
         assert!(cf_err.to_string().contains("shutdown"), "unexpected clear_fault err: {cf_err}");
         let en_err = sup
-            .set_torque(true)
+            .enable_torque(sup.capture_admission_stamp())
             .await
-            .expect_err("set_torque(true) must be refused once legacy shutdown is committed");
+            .expect_err("enable_torque must be refused once legacy shutdown is committed");
         assert!(
             matches!(en_err, armd::supervisor::ArmError::Safety(armd::safety::SafetyError::EStopActive)),
             "unexpected set_torque(true) err: {en_err:?}"

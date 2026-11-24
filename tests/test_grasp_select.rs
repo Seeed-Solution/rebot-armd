@@ -109,7 +109,9 @@ async fn scene_q(config: ArmConfig, setup: GraspSetup, q: [f64; 6]) -> Scene {
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
         inner.commanded_positions = q7.clone();
         inner.measured_positions = q7.clone();
         inner.target_positions = q7;

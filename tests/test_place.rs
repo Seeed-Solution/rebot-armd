@@ -228,13 +228,13 @@ async fn stop_between_phases_refuses_the_next_sub_motion() {
     let r = rig(vec![]).await;
     let mut inner = r.sup.inner().write().await;
     let input = inner.plan_input().unwrap();
-    let id = inner.begin_macro("place", &input, None).unwrap();
+    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::begin_macro(__a, "place", &input, None)) } }.unwrap();
     // the stop handler of `/api/v1/motion/stop`
     inner.stop_motion();
     inner.request_macro_stop();
     let j7 = inner.commanded_positions[6];
     let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(8.0), tag: None };
-    assert!(inner.start_macro_gripper(id, open).is_err(), "gripper sub-motion installed after stop");
+    assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_macro_gripper(__a, id, open)) } }.is_err(), "gripper sub-motion installed after stop");
     assert!(inner.active_trajectory.is_none() && inner.macro_run.is_none());
     assert_eq!(inner.commanded_positions[6], j7);
     assert!(inner.target_positions[6] == j7, "gripper target changed");

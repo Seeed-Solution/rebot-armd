@@ -207,7 +207,9 @@ fn rig(finger: Finger) -> (SupervisorInner, Arc<Mutex<Rig>>) {
     // the baseline is bound to the follower kind
     inner.follower = Some("rig".into());
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    armd::SupervisorInner::enable_torque(admitted).unwrap();
     (inner, rig)
 }
 
@@ -219,7 +221,9 @@ fn req(command: GripperCommand, fraction: Option<f64>, speed: f64) -> GripperReq
 /// within a second); (action, seconds).
 fn run_with(inner: &mut SupervisorInner, request: GripperRequest, cmd: GripperBaselineCmd) -> (armd::motion::ActionStatus, f64) {
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_gripper_with_baseline(request, epoch, cmd).unwrap();
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    let (id, _) = armd::SupervisorInner::start_gripper_with_baseline(admitted, request, epoch, cmd).unwrap();
     for i in 0..(30.0 / DT) as usize {
         inner.tick(DT);
         let a = inner.last_action.clone().unwrap();
@@ -421,7 +425,9 @@ fn old_finger_contact_unchanged_by_the_baseline() {
         if learned { learn(&mut inner, &rig, 2); }
         rig.lock().unwrap().load = load;
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner.start_gripper(req(GripperCommand::Close, None, 1.0), epoch).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
         let mut first = None;
         loop {
             inner.tick(DT);
@@ -528,7 +534,9 @@ fn reset_happens_only_after_admission() {
     learn(&mut inner, &rig, 1);
     let before = inner.gripper_baseline.clone();
     let epoch = inner.safety.epoch_id();
-    assert!(inner.start_gripper_with_baseline(req(GripperCommand::Open, None, 1.0), epoch + 1, GripperBaselineCmd::Reset).is_err());
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    assert!(armd::SupervisorInner::start_gripper_with_baseline(admitted, req(GripperCommand::Open, None, 1.0), epoch + 1, GripperBaselineCmd::Reset).is_err());
     assert_eq!(inner.gripper_baseline, before);
     let (a, _) = run_with(&mut inner, req(GripperCommand::Open, None, 1.0), GripperBaselineCmd::Reset);
     assert_eq!(a.state, "done");
@@ -557,7 +565,9 @@ fn slipped_object_is_not_held() {
             if learned { learn(&mut inner, &rig, 3); }
             rig.lock().unwrap().load = Load::SlipAfter(-2.0, after);
             let epoch = inner.safety.epoch_id();
-            let (id, _) = inner.start_gripper(req(GripperCommand::Close, None, 1.0), epoch).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Close, None, 1.0), epoch).unwrap();
             let mut first = None;
             let a = loop {
                 inner.tick(DT);
@@ -687,7 +697,9 @@ async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>
         inner.lease_enabled = false;
         inner.follower = Some("rig".into());
         inner.tick(DT);
-        inner.set_torque(true).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
     }
     let ticker = sup.clone();
     tokio::spawn(async move {
@@ -712,7 +724,7 @@ async fn calib_wait(sup: &armd::ArmSupervisor, id: u64, mut each: impl FnMut(&ar
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn calibration_action_learns_from_free_strokes() {
     let (sup, _rig) = calib_rig(Finger::New).await;
-    let (id, expected) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+    let (id, expected) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
     assert!(expected > 60.0, "{expected}");
     let mut phases = Vec::new();
     let a = calib_wait(&sup, id, |a| { if let Some(p) = a.phase { if phases.last() != Some(&p) { phases.push(p); } } }).await;
@@ -737,7 +749,7 @@ async fn calibration_action_obstructed_or_stopped_learns_nothing() {
             inner.gripper_baseline.clone()
         };
         if case == "soft" { rig.lock().unwrap().load = Load::Soft(-3.0, 1.0, 4.0); }
-        let (id, _) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+        let (id, _) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
         let mut stopped = false;
         let sup2 = sup.clone();
         let a = calib_wait(&sup, id, |a| {
@@ -786,7 +798,9 @@ fn gripper_zero_change_invalidates_the_baseline() {
     assert!(inner.gripper_baseline_dirty);
     inner.set_joint_zero_offsets(&[0.0; 7]).unwrap();
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    let stamp = inner.current_admission_stamp();
+    let admitted = inner.check_admission(stamp).unwrap();
+    armd::SupervisorInner::enable_torque(admitted).unwrap();
     // a moved stroke (gripper calibration offset): the next motion starts unlearned
     learn(&mut inner, &rig, 1);
     let p = inner.config.gripper_policy.as_mut().unwrap();
@@ -808,7 +822,7 @@ async fn calibration_fails_on_a_thin_obstruction_before_the_closed_stroke_end() 
         let (sup, rig) = calib_rig(Finger::New).await;
         let before = { let mut inner = sup.inner().write().await; inner.gripper_baseline_for_motion(); inner.gripper_baseline.clone() };
         rig.lock().unwrap().load = Load::CloseBlock(target - 0.10, k);
-        let (id, _) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+        let (id, _) = armd::gripper_calib::start_calibration(&sup, sup.capture_admission_stamp()).await.unwrap();
         let a = calib_wait(&sup, id, |_| {}).await;
         for _ in 0..200 {
             if sup.inner().read().await.gripper_calibration.is_none() { break; }
@@ -842,7 +856,9 @@ fn move_that_stops_short_on_an_object_releases_its_lead() {
         let (mut inner, rig) = rig(Finger::New);
         rig.lock().unwrap().load = Load::CloseBlock(target - 0.10, k);
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner.start_gripper(req(GripperCommand::Move, Some(0.05), 0.3), epoch).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (id, _) = armd::SupervisorInner::start_gripper(admitted, req(GripperCommand::Move, Some(0.05), 0.3), epoch).unwrap();
         let a = loop {
             inner.tick(DT);
             let a = inner.last_action.clone().unwrap();
@@ -933,7 +949,9 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
             rig.lock().unwrap().load = Load::Drag(-4.5, -1.5, 0.35); // 0.40 + 0.35 = 0.75 N·m while moving
             let epoch = inner.safety.epoch_id();
             let req_cmd = GripperRequest { command: GripperCommand::Close, fraction: None, grasp, speed: 0.30, timeout_s: None, tag: None };
-            let (id, _) = inner.start_gripper(req_cmd, epoch).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let (id, _) = SupervisorInner::start_gripper(admitted, req_cmd, epoch).unwrap();
             let a = loop {
                 inner.tick(DT);
                 if inner.measured_positions[6] < -0.35 {
@@ -958,7 +976,9 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
             if learned { learn(&mut inner, &rig, 2); }
             rig.lock().unwrap().load = Load::Drag(-4.5, -1.5, 0.35); // 0.75 N·m while moving
             let epoch = inner.safety.epoch_id();
-            let macro_id = inner.begin_orchestrated_action(if calib { "gripper_calibrate" } else { "grasp" }, None, epoch).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let macro_id = SupervisorInner::begin_orchestrated_action(admitted, if calib { "gripper_calibrate" } else { "grasp" }, None, epoch).unwrap();
             let request = GripperRequest {
                 command: if calib { GripperCommand::Move } else { GripperCommand::Close },
                 fraction: calib.then_some(0.05),
@@ -967,10 +987,12 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
                 timeout_s: None,
                 tag: None,
             };
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
             if calib {
-                inner.start_macro_gripper_learning_within(macro_id, request, armd::motion::LearnMode::Calibration, None, false).unwrap();
+                SupervisorInner::start_macro_gripper_learning_within(admitted, macro_id, request, armd::motion::LearnMode::Calibration, None, false).unwrap();
             } else {
-                inner.start_macro_gripper_within(macro_id, request, None, false).unwrap();
+                SupervisorInner::start_macro_gripper_within(admitted, macro_id, request, None, false).unwrap();
             }
             let target_rad = if calib {
                 let p = GripperPolicy::rebot_dm();
@@ -1021,7 +1043,9 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
             for _ in 0..125 {
                 g = (g + speed * DT as f32).min(0.0);
                 target[6] = g;
-                inner.servo(target.clone(), epoch).unwrap();
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).unwrap();
+                SupervisorInner::servo(admitted, target.clone(), epoch).unwrap();
                 inner.tick(DT);
                 let r = rig.lock().unwrap();
                 if r.tau[6].abs() >= 0.70 { saw_high_tau = true; }
@@ -1062,7 +1086,9 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
             } else {
                 Load::Free
             };
-            inner.servo(target.clone(), epoch).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::servo(admitted, target.clone(), epoch).unwrap();
             inner.tick(DT);
             if rig.lock().unwrap().tau[6].abs() >= 0.85 {
                 saw_spike_tau = true;
@@ -1089,7 +1115,9 @@ fn moving_jaw_torque_bump_does_not_trigger_contact_on_any_path() {
         for _ in 0..150 {
             g = (g + 0.30 * DT as f32).min(0.0);
             target[6] = g;
-            inner.servo(target.clone(), epoch).unwrap();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            SupervisorInner::servo(admitted, target.clone(), epoch).unwrap();
             inner.tick(DT);
         }
         assert!(inner.gripper_stream_contact.is_some(), "stream stopped learned={learned}: regulator did not engage");
@@ -1225,21 +1253,25 @@ async fn executor_owner_consumes_queued_baseline_records_off_control_thread() {
         inner.follower = Some("rig".into());
         inner.gripper_baseline_path = Some(baseline_path.clone());
         inner.tick(DT);
-        inner.set_torque(true).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
         let ep = inner.safety.epoch_id();
-        inner
-            .start_gripper(
-                GripperRequest {
-                    command: GripperCommand::Open,
-                    fraction: None,
-                    grasp: false,
-                    speed: 3.0,
-                    timeout_s: Some(10.0),
-                    tag: None,
-                },
-                ep,
-            )
-            .unwrap();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::start_gripper(
+            admitted,
+            GripperRequest {
+                command: GripperCommand::Open,
+                fraction: None,
+                grasp: false,
+                speed: 3.0,
+                timeout_s: Some(10.0),
+                tag: None,
+            },
+            ep,
+        )
+        .unwrap();
         // Seed the foreign-tool baseline AFTER `start_gripper` (which calls
         // `gripper_baseline_for_motion`) so it is genuinely present in `core.gripper_baseline`
         // when `TakeBaselinePending` and `StoreBaseline` execute on `armd-control`.

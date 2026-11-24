@@ -141,7 +141,11 @@ impl SupervisorInner {
         let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, &self.config.home_positions, tol) else { return; };
         if self.zero_convention.status == "legacy_j6" && v.status != "legacy_j6" { return; }
         if v.status == "legacy_j6" && self.zero_convention.status != "legacy_j6" {
-            tracing::warn!("Joint zero check: {}", v.message.as_deref().unwrap_or(""));
+            if self.rt_executor_owned {
+                self.pending_legacy_j6_log = Some(v);
+            } else if let Some(msg) = v.message() {
+                tracing::warn!("Joint zero check: {msg}");
+            }
         }
         self.zero_convention = v;
     }
@@ -517,6 +521,7 @@ impl SupervisorInner {
                 }
             };
             a.finished_at = Some(now);
+            self.record_finished_action_by_id(action_id);
             return (code_buf, old_msg);
         }
         (code_buf, msg_buf)
@@ -537,6 +542,7 @@ impl SupervisorInner {
             a.code = Some(crate::model::HolderLabel::new(&code));
             let old_msg = a.message.replace(message);
             a.finished_at = Some(now);
+            self.record_finished_action_by_id(action_id);
             return (Some(code), old_msg);
         }
         (Some(code), Some(message))
@@ -549,7 +555,7 @@ impl SupervisorInner {
         warning: Option<String>,
     ) -> Option<String> {
         let now = self.now_s();
-        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+        let ret = if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
                 a.state = crate::model::HolderLabel::new("done");
                 a.progress = 1.0;
@@ -559,22 +565,25 @@ impl SupervisorInner {
                 crate::rt_core::config_iface::Durability::Durable => {
                     a.durability_confirmed = Some(true);
                     let prev = a.durability_warning.take();
-                    return warning.or(prev);
+                    warning.or(prev)
                 }
                 crate::rt_core::config_iface::Durability::DurableUnconfirmed => {
                     a.durability_confirmed = Some(false);
-                    return match warning {
+                    match warning {
                         Some(w) => a.durability_warning.replace(w),
                         None => a.durability_warning.take(),
-                    };
+                    }
                 }
                 crate::rt_core::config_iface::Durability::Volatile => {
                     a.durability_confirmed = Some(false);
-                    return warning;
+                    warning
                 }
             }
-        }
-        warning
+        } else {
+            return warning;
+        };
+        self.record_finished_action_by_id(action_id);
+        ret
     }
 
     /// Infallibly commit a pre-validated [`GripperCalibrationCandidate`] after disk rename.

@@ -895,7 +895,7 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     let sup_panic = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_panic)));
     sup_panic.set_lease_enabled(false).await;
     // Enable torque before transfer so the arm is physically energized when the executor panics.
-    sup_panic.set_torque(true).await.unwrap();
+    sup_panic.enable_torque(sup_panic.capture_admission_stamp()).await.unwrap();
     assert!(bus_panic.with(|s| s.motors.iter().all(|m| m.enabled)));
     bus_panic.with(|s| s.tx_log.clear());
 
@@ -936,7 +936,7 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     drv_silent.check_mapping_ranges();
     let sup_silent = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_silent)));
     sup_silent.set_lease_enabled(false).await;
-    sup_silent.set_torque(true).await.unwrap();
+    sup_silent.enable_torque(sup_silent.capture_admission_stamp()).await.unwrap();
     bus_silent.with(|s| {
         for m in &mut s.motors {
             m.silent = true;
@@ -971,7 +971,7 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     drv_leg.check_mapping_ranges();
     let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
     sup_leg.set_lease_enabled(false).await;
-    sup_leg.set_torque(true).await.unwrap();
+    sup_leg.enable_torque(sup_leg.capture_admission_stamp()).await.unwrap();
     bus_leg.with(|s| s.tx_log.clear());
 
     let sup_leg_ref = sup_leg.clone();
@@ -1360,14 +1360,13 @@ async fn emergency_disable_reaches_driver_while_persistence_stalled_in_dir_sync(
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
         inner.gripper_calib_path = Some(calib_path.clone());
         let epoch = inner.safety.epoch_id();
-        let _ = inner
-            .start_gripper_zero_check(
+        let _ = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::start_gripper_zero_check(__a,
                 &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}),
                 epoch,
-            )
+            )) } }
             .unwrap();
     }
     assert!(bus.with(|s| s.motors.iter().all(|m| m.enabled)));
@@ -1527,7 +1526,7 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     };
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     driver_tids.lock().unwrap().clear();
 
     let (obs_tx, obs_rx) = std::sync::mpsc::sync_channel::<std::thread::ThreadId>(1);
@@ -1598,7 +1597,7 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     };
     let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
     sup2.set_lease_enabled(false).await;
-    sup2.set_torque(true).await.unwrap();
+    sup2.enable_torque(sup2.capture_admission_stamp()).await.unwrap();
     driver_tids2.lock().unwrap().clear();
     let hooks2 = PersistTestHooks {
         panic_disable_timeout: Some(Duration::from_millis(60)),
@@ -1639,7 +1638,7 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     };
     let sup3 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv3)));
     sup3.set_lease_enabled(false).await;
-    sup3.set_torque(true).await.unwrap();
+    sup3.enable_torque(sup3.capture_admission_stamp()).await.unwrap();
     let sup3_c = sup3.clone();
     let t_leg = Instant::now();
     let outcome3 = tokio::task::spawn_blocking(move || {
@@ -1899,7 +1898,7 @@ async fn estop_ack_waits_for_step6_publication_barrier() {
 
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
 
     // Arm the publication barrier once `trigger_e_stop_checked()` has bumped `requested_estop_count`
     // and Step 1 has applied E-stop: pause right BEFORE Step 6 `core.publish(...)`!
@@ -2056,7 +2055,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     drv.check_mapping_ranges();
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     assert!(inner_bus.with(|s| s.motors.iter().all(|m| m.enabled)));
     inner_bus.with(|s| s.tx_log.clear());
 
@@ -2108,7 +2107,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     drv_leg.check_mapping_ranges();
     let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
     sup_leg.set_lease_enabled(false).await;
-    sup_leg.set_torque(true).await.unwrap();
+    sup_leg.enable_torque(sup_leg.capture_admission_stamp()).await.unwrap();
     inner_leg.with(|s| s.tx_log.clear());
 
     let sup_leg_c = sup_leg.clone();
@@ -2143,7 +2142,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     drv_perm.check_mapping_ranges();
     let sup_perm = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_perm)));
     sup_perm.set_lease_enabled(false).await;
-    sup_perm.set_torque(true).await.unwrap();
+    sup_perm.enable_torque(sup_perm.capture_admission_stamp()).await.unwrap();
     inner_perm.with(|s| s.tx_log.clear());
 
     let sup_perm_c = sup_perm.clone();
@@ -2409,7 +2408,7 @@ async fn emergency_timeout_detaches_stalled_control_thread_so_drop_is_bounded() 
     };
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     let hooks = PersistTestHooks {
         panic_disable_timeout: Some(Duration::from_millis(60)),
         ..Default::default()
@@ -2464,7 +2463,7 @@ async fn emergency_timeout_detaches_stalled_control_thread_so_drop_is_bounded() 
     };
     let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
     sup2.set_lease_enabled(false).await;
-    sup2.set_torque(true).await.unwrap();
+    sup2.enable_torque(sup2.capture_admission_stamp()).await.unwrap();
     let mut cfg2 = ExecutorConfig::for_tests(Duration::from_millis(5));
     cfg2.panic_policy = PanicPolicy::StopExecutor;
     let hooks2 = PersistTestHooks {
@@ -2797,4 +2796,284 @@ fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames
     assert_eq!(seen_budget.load(Ordering::SeqCst), 13, "RX pass budget must be reduced by 7 (20 - 7 = 13)");
     assert_eq!(poll_c.rx_frames, 11, "reported rx_frames must sum transition (7) + read pass (4) = 11: {poll_c:?}");
     assert!(!poll_c.budget_exhausted);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_disable_rt_persistent_j3_unconfirmed_and_damiao_stale_refresh_and_rx_fence() {
+    #[derive(Clone)]
+    struct FailJ3DisableBus {
+        inner: FakeBus,
+        fail_j3_remaining: Arc<AtomicUsize>,
+        j3_failures: Arc<AtomicUsize>,
+        j3_successes: Arc<AtomicUsize>,
+    }
+
+    impl CanTransport for FailJ3DisableBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            if frame.id == 3 && frame.data == armd::protocol::damiao::CMD_DISABLE {
+                let prev = self.fail_j3_remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    v.checked_sub(1)
+                });
+                if prev.is_ok() {
+                    self.j3_failures.fetch_add(1, Ordering::SeqCst);
+                    return Err(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "persistent CAN TX failure on J3",
+                    )));
+                }
+                self.j3_successes.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<Instant>), TransportError> {
+            self.inner.receive_timestamped()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            self.inner.clock()
+        }
+    }
+
+    // (a) RT executor panic path with persistent J3 TX failure: cooperative exhaustion must
+    // finish cleanly before the hard deadline observer triggers `on_panic_disable_timeout`.
+    let inner_rt = FakeBus::new(&dm_limits());
+    inner_rt.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let bus_rt = FailJ3DisableBus {
+        inner: inner_rt.clone(),
+        fail_j3_remaining: Arc::new(AtomicUsize::new(usize::MAX)),
+        j3_failures: Arc::new(AtomicUsize::new(0)),
+        j3_successes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut drv_rt = DamiaoArmDriver::new(bus_rt.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_rt.read_joint_states().unwrap();
+    drv_rt.check_mapping_ranges();
+    let sup_rt = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_rt)));
+    sup_rt.set_lease_enabled(false).await;
+    sup_rt.enable_torque(sup_rt.capture_admission_stamp()).await.unwrap();
+    inner_rt.with(|s| s.tx_log.clear());
+
+    let timeout_fired = Arc::new(AtomicBool::new(false));
+    let timeout_fired_cb = Arc::clone(&timeout_fired);
+    let mut cfg_rt = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg_rt.panic_policy = PanicPolicy::StopExecutor;
+    let handle = sup_rt
+        .start_executor_with_hooks(
+            cfg_rt,
+            PersistTestHooks {
+                panic_on_release: Some(2),
+                panic_disable_timeout: Some(Duration::from_millis(80)),
+                on_panic_disable_timeout: Some(Arc::new(move || {
+                    timeout_fired_cb.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(2), || handle.is_exited()).await;
+
+    assert!(
+        !timeout_fired.load(Ordering::SeqCst),
+        "on_panic_disable_timeout must NOT fire when cooperative exhaustion completes cleanly"
+    );
+    assert_eq!(
+        handle.last_teardown_disable_outcome(),
+        Some(PanicDisableOutcome::Unconfirmed),
+        "RT teardown disable outcome must be published as Unconfirmed"
+    );
+    assert!(
+        bus_rt.j3_failures.load(Ordering::SeqCst) >= 2,
+        "J3 must be retried multiple times within cooperative budget"
+    );
+    inner_rt.with(|s| {
+        for (i, m) in s.motors.iter().enumerate() {
+            if i != 2 {
+                assert!(!m.enabled, "motor J{} must be disabled despite persistent J3 TX failures", i + 1);
+            }
+        }
+    });
+    handle.stop_and_join();
+
+    // (b) DamiaoArmDriver::panic_disable_step with MockClock:
+    // - Partial-J3 stall > 250ms refreshes stale J1,J2,J4..J7 alongside J3.
+    // - Post-confirmed sticky expiry > 250ms refreshes all 7 motors instead of early-returning.
+    let clock = MockClock::new();
+    let inner_clk = FakeBus::with_clock(&dm_limits(), clock.clone());
+    inner_clk.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let bus_clk = FailJ3DisableBus {
+        inner: inner_clk.clone(),
+        fail_j3_remaining: Arc::new(AtomicUsize::new(1)),
+        j3_failures: Arc::new(AtomicUsize::new(0)),
+        j3_successes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut drv_clk = DamiaoArmDriver::new(bus_clk.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_clk.read_joint_states().unwrap();
+    drv_clk.check_mapping_ranges();
+    drv_clk.set_torque(true).unwrap();
+
+    let rem_pass1 = drv_clk
+        .panic_disable_step(true, clock.now() + Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(rem_pass1, vec![2]);
+    assert_eq!(bus_clk.j3_failures.load(Ordering::SeqCst), 1);
+
+    // Advance past the 250 ms feedback validity window so J1,J2,J4..J7 become stale.
+    clock.advance(Duration::from_millis(300));
+    assert!(!drv_clk.is_feedback_valid());
+    inner_clk.clear_log();
+
+    let rem_pass2 = drv_clk
+        .panic_disable_step(false, clock.now() + Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    assert!(rem_pass2.is_empty(), "pass 2 must confirm all 7 motors: {rem_pass2:?}");
+    assert!(drv_clk.is_feedback_valid());
+    assert_eq!(drv_clk.enable_state(), EnableState::Disabled);
+    let pass2_disable_ids: Vec<u32> = inner_clk
+        .tx_log()
+        .iter()
+        .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
+        .map(|f| f.id)
+        .collect();
+    for id in 1u32..=7 {
+        assert!(
+            pass2_disable_ids.contains(&id),
+            "pass 2 must refresh stale motor J{id} alongside J3: {pass2_disable_ids:?}"
+        );
+    }
+
+    // Post-confirmed sticky expiry > 250ms: disable_confirmed_sticky is true, feedback is stale.
+    clock.advance(Duration::from_millis(300));
+    assert_eq!(drv_clk.enable_state(), EnableState::Disabled);
+    assert!(!drv_clk.is_feedback_valid());
+    inner_clk.with(|s| s.immediate_replies = false);
+    assert_eq!(
+        drv_clk.unconfirmed_disable_joints(),
+        vec![0, 1, 2, 3, 4, 5, 6],
+        "stale motors with no CAN replies must all appear in unconfirmed_disable_joints()"
+    );
+    inner_clk.clear_log();
+
+    // Already-expired step deadline transmits 0 CMD_DISABLE frames (Damiao TX deadline gate).
+    let rem_expired = drv_clk
+        .panic_disable_step(false, clock.now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(rem_expired, vec![0, 1, 2, 3, 4, 5, 6]);
+    assert!(
+        inner_clk
+            .tx_log()
+            .iter()
+            .all(|f| f.data != armd::protocol::damiao::CMD_DISABLE),
+        "expired step deadline must transmit 0 CMD_DISABLE frames"
+    );
+
+    inner_clk.with(|s| s.immediate_replies = true);
+    inner_clk.clear_log();
+    let rem_sticky = drv_clk
+        .panic_disable_step(false, clock.now() + Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    assert!(rem_sticky.is_empty());
+    assert!(drv_clk.is_feedback_valid(), "stale sticky disable step must refresh feedback validity");
+    assert_eq!(drv_clk.enable_state(), EnableState::Disabled);
+    let sticky_disable_ids: Vec<u32> = inner_clk
+        .tx_log()
+        .iter()
+        .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
+        .map(|f| f.id)
+        .collect();
+    for id in 1u32..=7 {
+        assert!(
+            sticky_disable_ids.contains(&id),
+            "stale sticky disable step must refresh all 7 motors (missing J{id}): {sticky_disable_ids:?}"
+        );
+    }
+
+    // (c) Undrained RX boundary on single `panic_disable_step(true, ...)`:
+    // Queue stale state-0 feedback without draining (`last_read_drained == false`), then run one
+    // `panic_disable_step(true, ...)` with J3 failing once.
+    let clock_rx = MockClock::new();
+    let inner_rx = FakeBus::with_clock(&dm_limits(), clock_rx.clone());
+    inner_rx.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let bus_rx = FailJ3DisableBus {
+        inner: inner_rx.clone(),
+        fail_j3_remaining: Arc::new(AtomicUsize::new(1)),
+        j3_failures: Arc::new(AtomicUsize::new(0)),
+        j3_successes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut drv_rx = DamiaoArmDriver::new(bus_rx.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_rx.read_joint_states().unwrap();
+    drv_rx.check_mapping_ranges();
+    drv_rx.set_torque(true).unwrap();
+
+    // Switch to non-immediate replies and push 8 stale state-0 feedback frames; read only 1 so
+    // `last_read_drained == false` and 7 stale state-0 frames remain undrained in `rx`.
+    inner_rx.with(|s| {
+        s.immediate_replies = false;
+        for m in &s.motors {
+            let stale = CanFrame::new_standard(m.reply_id, &[m.id as u8 & 0x0f, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            s.rx.push_back(stale);
+        }
+        let extra = CanFrame::new_standard(s.motors[0].reply_id, &[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        s.rx.push_back(extra);
+    });
+    let mut scratch = Vec::new();
+    let (read_n, exhausted) = drv_rx
+        .read_joint_states_budgeted(&mut scratch, clock_rx.now() + Duration::from_millis(10), 1)
+        .unwrap();
+    assert_eq!(read_n, 1);
+    assert!(exhausted);
+    inner_rx.clear_log();
+
+    let rem_rx = drv_rx
+        .panic_disable_step(true, clock_rx.now() + Duration::from_millis(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(bus_rx.j3_failures.load(Ordering::SeqCst), 1, "J3 disable must fail once");
+    let rx_disable_ids: Vec<u32> = inner_rx
+        .tx_log()
+        .iter()
+        .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
+        .map(|f| f.id)
+        .collect();
+    for id in [1u32, 2, 4, 5, 6, 7] {
+        assert!(
+            rx_disable_ids.contains(&id),
+            "J1,J2,J4..J7 must receive CMD_DISABLE (missing J{id}): {rx_disable_ids:?}"
+        );
+    }
+    assert!(!rem_rx.is_empty(), "pre-boundary stale state-0 feedback must not confirm disable");
+    assert_ne!(
+        drv_rx.enable_state(),
+        EnableState::Disabled,
+        "pre-boundary stale state-0 feedback must not mark driver Disabled"
+    );
 }

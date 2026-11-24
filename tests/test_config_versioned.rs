@@ -122,7 +122,7 @@ fn activation_moves_the_revision_by_one_and_a_failed_apply_changes_nothing() {
     assert_eq!(inner.keepout.revision, 2);
     assert_eq!(runtime_boxes(&inner), ["a"]);
     assert!(inner.core.config_hold().is_none() && !inner.core.motion_inhibited_by_config());
-    inner.jog_action({ let mut q = INSPECT.to_vec(); q[0] += 0.05; q }, Some(0.3), None, "joint_move").expect("motion admitted");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, { let mut q = INSPECT.to_vec(); q[0] += 0.05; q }, Some(0.3), None, "joint_move")) } }.expect("motion admitted");
 }
 
 /// The candidate was renamed into place, then failed to apply: active (revision 1, no
@@ -155,7 +155,7 @@ fn a_held_reservation_refuses_rt_installs_and_leaves_motion_untouched() {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(inner, BootId(7), Capacities { commands: 4, plans: 2, replies: 6 });
     let ctx = fx.ctx(fx.now());
     let p = fx.core.config_proposal(ConfigDomain::Keepout, 1, 0, &ctx);

@@ -155,7 +155,7 @@ async fn rig_with(model_error: f32, edit: impl FnOnce(&mut ArmConfig)) -> Rig {
     let sim = Arc::new(Mutex::new(Sim::new(model_error)));
     let sup = ArmSupervisor::new(config).with_driver(Box::new(SimArm(sim.clone())));
     sup.inner().write().await.acquire_lease(CLIENT).unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     let rig = Rig { sup, sim };
     rig.ticks(10).await;
     rig
@@ -179,7 +179,9 @@ impl Rig {
         obs.unwrap()
     }
     async fn enter(&self) -> Result<(), ArmError> {
-        self.sup.inner().write().await.enter_gravity_comp(Default::default())
+        let mut inner = self.sup.inner().write().await;
+        let admitted = inner.check_admission(self.sup.capture_admission_stamp()).map_err(ArmError::from)?;
+        armd::SupervisorInner::enter_gravity_comp(admitted, Default::default())
     }
     fn q(&self) -> [f32; 7] { self.sim.lock().unwrap().q }
     fn modes(&self) -> [JointMode; 7] { self.sim.lock().unwrap().modes }
@@ -187,7 +189,12 @@ impl Rig {
 }
 
 fn code(err: ArmError) -> String {
-    match err { ArmError::Rejected { code, .. } => code, other => panic!("expected a rejection, got {other:?}") }
+    match err {
+        ArmError::Rejected { code, .. } => code,
+        other => armd::api::rest::ApiError::from(other)
+            .code
+            .unwrap_or_else(|| panic!("expected a rejection with code")),
+    }
 }
 
 /// Run until the mode is back in position control (or `max` ticks); returns ticks used.
@@ -209,7 +216,7 @@ async fn enter_preconditions_reject_with_codes() {
     let sup = ArmSupervisor::new(ArmConfig::default());
     let obs = sup.get_observation().await;
     assert!(!obs.gravity_comp.supported);
-    assert_eq!(code(sup.inner().write().await.enter_gravity_comp(Default::default()).unwrap_err()), "UNSUPPORTED");
+    assert_eq!(code({ let mut inner = sup.inner().write().await; let a = inner.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::enter_gravity_comp(a, Default::default()) }.unwrap_err()), "UNSUPPORTED");
 
     // a driver without MIT switching
     struct NoSwitch(SimArm);
@@ -221,7 +228,7 @@ async fn enter_preconditions_reject_with_codes() {
     }
     let sim = Arc::new(Mutex::new(Sim::new(0.0)));
     let sup = ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(NoSwitch(SimArm(sim))));
-    assert_eq!(code(sup.inner().write().await.enter_gravity_comp(Default::default()).unwrap_err()), "UNSUPPORTED");
+    assert_eq!(code({ let mut inner = sup.inner().write().await; let a = inner.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::enter_gravity_comp(a, Default::default()) }.unwrap_err()), "UNSUPPORTED");
 
     // not armed
     let sim = Arc::new(Mutex::new(Sim::new(0.0)));
@@ -231,7 +238,7 @@ async fn enter_preconditions_reject_with_codes() {
     let obs = sup.get_observation().await;
     assert!(obs.gravity_comp.supported);
     assert_eq!(obs.gravity_comp.blocker.as_ref().unwrap().code, "NOT_ARMED");
-    assert_eq!(code(sup.inner().write().await.enter_gravity_comp(Default::default()).unwrap_err()), "NOT_ARMED");
+    assert_eq!(code({ let mut inner = sup.inner().write().await; let a = inner.check_admission(sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::enter_gravity_comp(a, Default::default()) }.unwrap_err()), "NOT_ARMED");
 
     // armed and still: allowed
     let r = rig(0.0).await;
@@ -247,7 +254,7 @@ async fn enter_preconditions_reject_with_codes() {
     let epoch = r.sup.get_observation().await.epoch_id;
     let mut target = r.sup.get_observation().await.positions;
     target[0] += 0.2;
-    r.sup.servo(target, epoch).await.unwrap();
+    r.sup.servo(r.sup.capture_admission_stamp(), target, epoch).await.unwrap();
     r.ticks(2).await;
     assert_eq!(code(r.enter().await.unwrap_err()), "MOTION_BUSY");
 
@@ -277,9 +284,9 @@ async fn enter_preconditions_reject_with_codes() {
 
     // override outside the configured range
     let r = rig(0.0).await;
-    let err = r.sup.inner().write().await.enter_gravity_comp(armd::gravity_comp::GravityCompRequest { scale: Some(1.5), damping_kd: None }).unwrap_err();
+    let err = { let mut inner = r.sup.inner().write().await; let a = inner.check_admission(r.sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::enter_gravity_comp(a, armd::gravity_comp::GravityCompRequest { scale: Some(1.5), damping_kd: None }) }.unwrap_err();
     assert_eq!(code(err), "INVALID_COMMAND");
-    let err = r.sup.inner().write().await.enter_gravity_comp(armd::gravity_comp::GravityCompRequest { scale: None, damping_kd: Some(vec![3.0; 6]) }).unwrap_err();
+    let err = { let mut inner = r.sup.inner().write().await; let a = inner.check_admission(r.sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::enter_gravity_comp(a, armd::gravity_comp::GravityCompRequest { scale: None, damping_kd: Some(vec![3.0; 6]) }) }.unwrap_err();
     assert_eq!(code(err), "INVALID_COMMAND");
     assert_eq!(r.modes(), [JointMode::Position; 7], "a rejected entry switches nothing");
 }
@@ -595,7 +602,7 @@ async fn hand_motion_does_not_trip_tracking_and_is_recorded() {
     // gripper is commanded while floating
     let epoch = r.sup.get_observation().await.epoch_id;
     let req = armd::motion::parse_gripper(&serde_json::json!({"command":"open"})).unwrap();
-    r.sup.inner().write().await.start_gripper(req, epoch).unwrap();
+    { let mut inner = r.sup.inner().write().await; let a = inner.check_admission(r.sup.capture_admission_stamp()).unwrap(); armd::SupervisorInner::start_gripper(a, req, epoch) }.unwrap();
     r.ticks(60).await;
     assert!(r.q()[6] < -1.0, "gripper opened in POS_VEL: {}", r.q()[6]);
     assert_eq!(r.phase().await.as_deref(), Some("active"));
@@ -620,11 +627,11 @@ async fn motion_commands_are_busy_while_floating() {
     let obs = r.sup.get_observation().await;
     let epoch = obs.epoch_id;
     let mut i = r.sup.inner().write().await;
-    assert_eq!(i.servo(obs.positions.clone(), epoch).unwrap_err(), armd::SafetyError::MotionBusy);
-    let jog = i.jog_action(obs.positions.clone(), None, Some(epoch), "joint_move").unwrap_err();
+    assert_eq!({ let s = i.current_admission_stamp(); { let __s = s; i.check_admission(__s).and_then(|__a| armd::SupervisorInner::servo(__a, obs.positions.clone(), epoch)) } }.unwrap_err(), armd::SafetyError::MotionBusy);
+    let jog = { let s = i.current_admission_stamp(); { let __s = s; i.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| armd::SupervisorInner::jog_action(__a, obs.positions.clone(), None, Some(epoch), "joint_move")) } }.unwrap_err();
     assert!(matches!(jog, ArmError::Motion(armd::motion::MotionError::MotionBusy(_))), "{jog:?}");
     assert!(matches!(i.plan_input().unwrap_err(), ArmError::Motion(armd::motion::MotionError::MotionBusy(_))));
-    assert_eq!(i.set_torque(false).unwrap_err(), armd::SafetyError::MotionBusy);
+    assert_eq!(i.disable_torque().unwrap_err(), armd::SafetyError::MotionBusy);
     assert_eq!(i.gravity_comp_run().unwrap().phase.name(), "active", "rejections do not end the mode");
 }
 
