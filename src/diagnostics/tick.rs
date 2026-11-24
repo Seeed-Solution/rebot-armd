@@ -200,6 +200,28 @@ thread_local! {
     static TX_TICK: Cell<TxTickMetrics> = const { Cell::new(TxTickMetrics::ZERO) };
 }
 
+/// Monotonic counter of stopped-hold TX ticks skipped because `driver.try_lock()` was contended
+/// (L3: stopped-hold TX never blocks on the driver mutex).
+static STOPPED_HOLD_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one stopped-hold TX tick skipped due to driver mutex contention (zero allocation).
+#[inline]
+pub fn record_stopped_hold_lock_contended() {
+    STOPPED_HOLD_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total stopped-hold TX ticks skipped due to driver mutex contention since boot.
+#[inline]
+pub fn stopped_hold_lock_contended_count() -> u64 {
+    STOPPED_HOLD_LOCK_CONTENDED.load(Ordering::Relaxed)
+}
+
+/// Reset the stopped-hold driver lock contention counter (tests).
+#[inline]
+pub fn reset_stopped_hold_lock_contended() {
+    STOPPED_HOLD_LOCK_CONTENDED.store(0, Ordering::Relaxed);
+}
+
 /// Calling thread's CPU time in nanoseconds from `CLOCK_THREAD_CPUTIME_ID` (Linux; 0 elsewhere).
 #[inline]
 pub fn thread_cpu_ns() -> u64 {
@@ -574,6 +596,9 @@ pub struct TxDiagnostics {
     pub since_boot_deferred: u64,
     pub since_boot_dropped_stale: u64,
     pub since_boot_dropped_stopped: u64,
+    /// Stopped-hold TX ticks skipped because `driver.try_lock()` was contended (L3).
+    #[serde(default)]
+    pub stopped_hold_lock_contended: u64,
 }
 
 /// Coherent per-run baseline deltas and peaks since the latest operator
@@ -1618,6 +1643,7 @@ impl TickWindow {
                 since_boot_deferred: self.tx_totals.deferred,
                 since_boot_dropped_stale: self.tx_totals.dropped_stale,
                 since_boot_dropped_stopped: self.tx_totals.dropped_stopped,
+                stopped_hold_lock_contended: stopped_hold_lock_contended_count(),
             },
             control_thread: None,
             observation_cache: ObservationCacheStats::default(),

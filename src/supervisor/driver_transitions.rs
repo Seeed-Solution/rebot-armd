@@ -551,6 +551,12 @@ pub struct MeasuredHoldTracker {
     pub unverified_mode_since: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
     /// Bitmask of joints that have already latched the 200 ms unverified-mode fault.
     pub unverified_mode_faulted_mask: u64,
+    /// Owner-held bitmask of joints with pending/queued stopped-hold TX frames on the driver (L3).
+    pub owner_pending_hold_mask: u64,
+    /// Owner-held active stopped-hold mask for the current pass (L3).
+    pub owner_hold_mask: u64,
+    /// Owner-held inline stopped-hold target queue for the current pass (L3; zero alloc).
+    pub owner_hold_targets: [f32; crate::rt_core::mailbox::MAX_DOF],
     /// Most recent per-motor torque evidence observed from the driver.
     pub motor_evidence: [crate::driver::MotorTorqueEvidence; crate::rt_core::mailbox::MAX_DOF],
     /// Most recent per-joint hold status observed during hold evaluation/servicing.
@@ -569,6 +575,9 @@ impl MeasuredHoldTracker {
             last_seen_fresh_at: [None; crate::rt_core::mailbox::MAX_DOF],
             unverified_mode_since: [None; crate::rt_core::mailbox::MAX_DOF],
             unverified_mode_faulted_mask: 0,
+            owner_pending_hold_mask: 0,
+            owner_hold_mask: 0,
+            owner_hold_targets: [0.0; crate::rt_core::mailbox::MAX_DOF],
             motor_evidence: [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF],
             joint_status: [crate::driver::JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
             enable_failed_cause: crate::safety::BoundedText::empty(),
@@ -582,6 +591,9 @@ impl MeasuredHoldTracker {
         self.last_seen_fresh_at.fill(None);
         self.unverified_mode_since.fill(None);
         self.unverified_mode_faulted_mask = 0;
+        self.owner_pending_hold_mask = 0;
+        self.owner_hold_mask = 0;
+        self.owner_hold_targets.fill(0.0);
         self.joint_status.fill(crate::driver::JointHoldStatus::SkippedOff);
         self.enable_failed_cause = crate::safety::BoundedText::empty();
     }
@@ -1777,6 +1789,52 @@ impl SupervisorInner {
         )
     }
 
+    #[doc(hidden)]
+    pub fn owner_hold_mask(&self) -> u64 {
+        self.measured_hold.owner_hold_mask
+    }
+
+    #[doc(hidden)]
+    pub fn owner_pending_hold_mask(&self) -> u64 {
+        self.measured_hold.owner_pending_hold_mask
+    }
+
+    #[doc(hidden)]
+    pub fn invalidate_owner_driver_snapshot_for_test(&mut self) {
+        self.owner_driver_snapshot.invalidate();
+    }
+
+    /// Test-only helper (L3): holds `self.driver`'s mutex on a separate OS thread while running
+    /// `f(self)` (which must not replace or drop `self.driver`), then releases and joins the
+    /// holder thread before returning.
+    #[doc(hidden)]
+    pub fn with_contended_driver_for_test<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(driver_ref) = self.driver.as_ref() else {
+            return f(self);
+        };
+        let addr = (driver_ref as *const std::sync::Mutex<Box<dyn crate::driver::ArmDriver>>) as usize;
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let holder = std::thread::spawn(move || {
+            // SAFETY: `self.driver` stays in place for the duration of `f(self)` and this thread
+            // is strictly joined before `with_contended_driver_for_test` returns (even on panic).
+            let mutex = unsafe { &*(addr as *const std::sync::Mutex<Box<dyn crate::driver::ArmDriver>>) };
+            let _guard = mutex.lock().unwrap();
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        locked_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("holder acquired driver mutex");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        let _ = release_tx.send(());
+        let _ = holder.join();
+        match res {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     /// Services one masked measured-position hold pass while stopped or in `FailedHold`
     /// (zero heap allocation on RT; hold capture and MIT preparation read owner-held data without
     /// locking the driver mutex; never falls back to cached `commanded_positions`).
@@ -1844,41 +1902,75 @@ impl SupervisorInner {
             false
         };
 
-        // Prune queued holds for ineligible, continuity-broken, or MIT-rejected joints and
-        // transmit the masked hold batch in one single driver lock.
+        // L3: The stopped-hold queue and mask are owner state. Record them inline before TX.
+        self.measured_hold.owner_hold_mask = hold_mask;
+        for (slot, target) in self.measured_hold.owner_hold_targets[..dof]
+            .iter_mut()
+            .zip(targets.iter())
+        {
+            *slot = target.position;
+        }
+
+        // L3: An empty mask with no owner-tracked queued holds takes NO driver lock at all.
         let keep_queued_mask = hold_mask & !invalidated_mask;
-        let write_result = self.driver.as_ref().and_then(|d| d.lock().ok()).map(|mut drv| {
-            drv.drop_pending_holds_outside_mask(keep_queued_mask);
-            if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
-                if cap.joint < targets.len() && (hold_mask & (1u64 << cap.joint)) != 0 {
-                    targets[cap.joint].velocity = Some(cap.close_speed_rad_s);
+        let needs_prune = (self.measured_hold.owner_pending_hold_mask & !keep_queued_mask) != 0;
+        if hold_mask == 0 && !needs_prune {
+            self.scratch.targets = targets;
+            return TickOutput::None;
+        }
+
+        // L3: Non-blocking `try_lock` for stopped-hold TX: on contention, skip this tick's send
+        // and increment the diagnostics counter (never blocks the control thread).
+        let write_result = match self.driver.as_ref() {
+            Some(d) => match d.try_lock() {
+                Ok(mut drv) => {
+                    drv.drop_pending_holds_outside_mask(keep_queued_mask);
+                    if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
+                        if cap.joint < targets.len() && (hold_mask & (1u64 << cap.joint)) != 0 {
+                            targets[cap.joint].velocity = Some(cap.close_speed_rad_s);
+                        }
+                    }
+                    let r = drv.write_measured_hold_masked(hold_mask, &targets);
+                    let now = drv.clock_now();
+                    let max_age = drv.tx_frame_max_age();
+                    let oldest_pending = drv.oldest_pending_tx_age();
+                    let last_expired = drv.last_tx_expired_age();
+                    let sent_any_fallback = drv.last_hold_tx_sent_any();
+                    let has_pending_holds = drv.pending_tx_len_total() > 0;
+                    Some((r, now, max_age, oldest_pending, last_expired, sent_any_fallback, has_pending_holds))
                 }
-            }
-            let r = drv.write_measured_hold_masked(hold_mask, &targets);
-            let now = drv.clock_now();
-            let max_age = drv.tx_frame_max_age();
-            let oldest_pending = drv.oldest_pending_tx_age();
-            let last_expired = drv.last_tx_expired_age();
-            let sent_any_fallback = drv.last_hold_tx_sent_any();
-            (r, now, max_age, oldest_pending, last_expired, sent_any_fallback)
-        });
+                Err(_) => {
+                    crate::diagnostics::tick::record_stopped_hold_lock_contended();
+                    None
+                }
+            },
+            None => None,
+        };
         self.scratch.targets = targets;
 
-        let Some((write_res, now, max_age, oldest_pending, last_expired, sent_any_fallback)) = write_result else {
+        let Some((write_res, now, max_age, oldest_pending, last_expired, sent_any_fallback, has_pending_holds)) = write_result else {
             return TickOutput::None;
         };
 
         let out = match write_res {
             Ok(report) => {
                 let n = report.dof.min(dof);
+                let mut next_pending_mask = 0u64;
                 for j in 0..n {
                     self.measured_hold.joint_status[j] = report.joint_status[j];
+                    if report.joint_status[j] == JointHoldStatus::Queued {
+                        next_pending_mask |= 1u64 << j;
+                    }
                     if !matches!(report.joint_status[j], JointHoldStatus::Held | JointHoldStatus::Queued) {
                         self.measured_hold.captured_positions[j] = None;
                         self.measured_hold.captured_continuity_epoch[j] = None;
                         self.measured_hold.last_seen_fresh_at[j] = None;
                     }
                 }
+                if has_pending_holds && next_pending_mask == 0 {
+                    next_pending_mask = hold_mask;
+                }
+                self.measured_hold.owner_pending_hold_mask = next_pending_mask;
                 if hold_mask == 0 && !report.sent_any && matches!(report.outcome, TxBatchOutcome::Complete) {
                     TickOutput::None
                 } else {

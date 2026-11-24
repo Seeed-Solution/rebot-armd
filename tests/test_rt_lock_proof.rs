@@ -1380,3 +1380,85 @@ fn production_executor_mock_positive_control_counts_and_catches_try_read_on_armd
         });
     });
 }
+
+/// L3 lock-proof: under `ControlThreadGuard` + `ReleaseGuard`, stopped-hold TX uses non-blocking
+/// `try_lock` (skips the tick and increments `TxDiagnostics::stopped_hold_lock_contended` when the
+/// driver mutex is held on another OS thread), and an empty hold mask takes NO lock at all.
+#[test]
+fn l3_stopped_hold_never_blocks_on_driver_mutex_and_empty_mask_takes_no_lock() {
+    use armd::diagnostics::tick::{
+        reset_stopped_hold_lock_contended, stopped_hold_lock_contended_count, TickStats,
+    };
+    use armd::rt_core::ops::{CoreOps, ServiceBudget};
+    use armd::safety::StopPolicy;
+    use armd::transport::MockClock;
+    use armd::SupervisorInner;
+
+    run_bounded_fixture(Duration::from_secs(5), "l3_stopped_hold_lock_proof", |_deadline| {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = if i < 6 { 0.25 } else { 0.0 };
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(dm_limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).unwrap();
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+
+        // Populate owner-held snapshot on an uncontended Step 2 poll.
+        bus.with(|s| s.push_all_feedback());
+        let now = Instant::now();
+        let budget = ServiceBudget::for_release(now, now + Duration::from_millis(20));
+        let _ = inner.poll_hardware(&budget);
+        assert!(inner.service_stopped_measured_hold_complete(0.02, false));
+        assert_ne!(inner.owner_hold_mask(), 0);
+        assert_eq!(inner.owner_pending_hold_mask(), 0);
+
+        reset_stopped_hold_lock_contended();
+        inner.with_contended_driver_for_test(|core| {
+            let _rt_thread = ControlThreadGuard::enter();
+            let _release = ReleaseGuard::enter();
+
+            // 1. Contended non-empty mask: try_lock returns immediately, skips send, counts contention.
+            let t0 = Instant::now();
+            let sent = core.service_stopped_measured_hold_complete(0.02, false);
+            assert!(!sent, "L3: contended stopped-hold must skip send");
+            assert!(
+                t0.elapsed() < Duration::from_millis(20),
+                "L3: contended stopped-hold must never block"
+            );
+            assert_eq!(stopped_hold_lock_contended_count(), 1);
+            let snap = TickStats::default().snapshot();
+            assert_eq!(snap.tx.stopped_hold_lock_contended, 1);
+
+            // 2. Empty mask while driver mutex is STILL held: takes NO lock at all (counter stays 1).
+            core.invalidate_owner_driver_snapshot_for_test();
+            let t1 = Instant::now();
+            let sent_empty = core.service_stopped_measured_hold_complete(0.02, false);
+            assert!(!sent_empty);
+            assert_eq!(core.owner_hold_mask(), 0);
+            assert!(t1.elapsed() < Duration::from_millis(20));
+            assert_eq!(
+                stopped_hold_lock_contended_count(),
+                1,
+                "L3: empty mask must NOT attempt try_lock"
+            );
+        });
+    });
+}

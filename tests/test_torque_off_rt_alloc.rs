@@ -1059,3 +1059,83 @@ fn r1_mit_stopped_hold_zero_alloc() {
         "R1: 5 MIT stopped hold releases must transmit >= 30 MIT hold frames"
     );
 }
+
+/// L3: The stopped-hold queue and mask are owner state; TX uses non-blocking `try_lock` (skips
+/// the tick and increments the diagnostics counter on contention, never blocks, 0 alloc), and an
+/// empty mask takes NO lock at all (0 contention, 0 alloc).
+#[test]
+fn l3_stopped_hold_try_lock_contention_and_empty_mask_zero_alloc() {
+    use armd::diagnostics::tick::{
+        reset_stopped_hold_lock_contended, stopped_hold_lock_contended_count,
+    };
+    use std::time::Instant;
+
+    let (mut fx, _b, bus, clock) = build_armed_estopped_fixture(0.30);
+    // Step 2 poll populates owner_driver_snapshot with all 7 joints fresh & verified -> non-empty mask.
+    bus.with(|s| s.push_all_feedback());
+    let step2_budget = armd::rt_core::ops::ServiceBudget::for_release(fx.now(), fx.now() + RELEASE);
+    let _ = fx.core.poll_hardware(&step2_budget);
+    assert!(fx.core.service_stopped_measured_hold_complete(0.02, false));
+    assert_ne!(fx.core.owner_hold_mask(), 0);
+    assert_eq!(fx.core.owner_pending_hold_mask(), 0);
+
+    // Hold the driver mutex on another OS thread throughout the contention + empty-mask checks.
+    reset_stopped_hold_lock_contended();
+    fx.core.with_contended_driver_for_test(|core| {
+        // 1. Non-empty hold mask while driver mutex is contended:
+        //    `service_stopped_measured_hold_complete` MUST NOT block, skips send (`false`),
+        //    increments `stopped_hold_lock_contended_count`, and allocates (0, 0).
+        let t0 = Instant::now();
+        let (sent, a1, f1) = counted(|| core.service_stopped_measured_hold_complete(0.02, false));
+        let elapsed1 = t0.elapsed();
+        assert!(!sent, "L3: contended driver mutex must skip stopped-hold TX");
+        assert!(
+            elapsed1 < Duration::from_millis(20),
+            "L3: contended try_lock must not block, took {elapsed1:?}"
+        );
+        assert_eq!(
+            stopped_hold_lock_contended_count(),
+            1,
+            "L3: contended try_lock must increment diagnostics counter"
+        );
+        assert_eq!(
+            (a1, f1),
+            (0, 0),
+            "L3: contended stopped-hold skip must allocate 0 and free 0"
+        );
+
+        // 2. Empty hold mask (no eligible joints, no pending holds) while driver mutex is STILL
+        //    held: MUST take NO lock at all -> counter stays unchanged at 1 and allocates (0, 0).
+        core.invalidate_owner_driver_snapshot_for_test();
+        let t1 = Instant::now();
+        let (sent_empty, a2, f2) =
+            counted(|| core.service_stopped_measured_hold_complete(0.02, false));
+        let elapsed2 = t1.elapsed();
+        assert!(!sent_empty);
+        assert_eq!(core.owner_hold_mask(), 0);
+        assert!(
+            elapsed2 < Duration::from_millis(20),
+            "L3: empty mask must return immediately without touching lock, took {elapsed2:?}"
+        );
+        assert_eq!(
+            stopped_hold_lock_contended_count(),
+            1,
+            "L3: empty mask MUST NOT call try_lock or touch driver mutex"
+        );
+        assert_eq!(
+            (a2, f2),
+            (0, 0),
+            "L3: empty-mask stopped-hold pass must allocate 0 and free 0"
+        );
+    });
+
+    // 3. Once uncontended again, refreshing Step 2 resumes normal zero-alloc stopped-hold TX.
+    clock.advance(RELEASE);
+    bus.with(|s| s.push_all_feedback());
+    let step2_budget2 = armd::rt_core::ops::ServiceBudget::for_release(fx.now(), fx.now() + RELEASE);
+    let _ = fx.core.poll_hardware(&step2_budget2);
+    let (sent_ok, a3, f3) = counted(|| fx.core.service_stopped_measured_hold_complete(0.02, false));
+    assert!(sent_ok, "L3: uncontended stopped-hold TX must succeed");
+    assert_eq!((a3, f3), (0, 0));
+    assert_eq!(stopped_hold_lock_contended_count(), 1);
+}
