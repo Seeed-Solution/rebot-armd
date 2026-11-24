@@ -517,9 +517,24 @@ impl SupervisorInner {
     /// Arms the RT deadline of the current child of macro `id` (the tick fails it with `code` /
     /// `message` when it still runs after `deadline`). Returns its ticket.
     pub fn arm_macro_child(&mut self, id: u64, deadline: Instant, code: &str, message: String) -> Option<ChildTicket> {
+        self.arm_macro_child_bounded(
+            id,
+            deadline,
+            crate::safety::BoundedText::new(code),
+            crate::motion::StepErrorText::new(&message),
+        )
+    }
+
+    pub(crate) fn arm_macro_child_bounded(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        code: crate::safety::BoundedText<48>,
+        message: crate::motion::StepErrorText,
+    ) -> Option<ChildTicket> {
         let m = self.macro_run.as_mut().filter(|m| m.id == id && m.children > 0)?;
         m.child.deadline = Some(deadline);
-        m.child.timeout = Some((code.to_string(), message));
+        m.child.timeout = Some((code, message));
         m.ticket()
     }
 
@@ -546,7 +561,10 @@ impl SupervisorInner {
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
-        let (code, message) = m.child.timeout.take().unwrap_or_else(|| ("TIMEOUT".into(), "Sub-motion did not finish in time".into()));
+        let (code, message) = m.child.timeout.take().unwrap_or_else(|| (
+            crate::safety::BoundedText::new("TIMEOUT"),
+            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+        ));
         m.child.deadline = None;
         m.sub = SubState::Failed { code, message };
         true
@@ -580,7 +598,10 @@ impl SupervisorInner {
             m.child.watch.contact_joint = Some(joint);
             m.child.watch.contact_tcp_z_m = z;
             if let Some(code) = guard.stop_code {
-                m.sub = SubState::Failed { code: code.into(), message: format!("contact on J{}", joint + 1) };
+                m.sub = SubState::Failed {
+                    code: crate::safety::BoundedText::new(code),
+                    message: crate::motion::format_step_error(format_args!("contact on J{}", joint + 1)),
+                };
             }
         }
     }
@@ -677,7 +698,12 @@ impl SupervisorInner {
             return Err(code(e));
         }
         let deadline = now + Duration::from_secs_f64(if spec.timeout_s.is_finite() { spec.timeout_s.clamp(0.0, 1e6) } else { 1e6 });
-        self.arm_macro_child(id, deadline, spec.timeout_code, "Sub-motion did not finish in time".into());
+        self.arm_macro_child_bounded(
+            id,
+            deadline,
+            crate::safety::BoundedText::new(spec.timeout_code),
+            crate::motion::StepErrorText::new("Sub-motion did not finish in time"),
+        );
         Ok(crate::rt_core::broker::ActionId(id))
     }
 
@@ -1379,7 +1405,7 @@ impl SupervisorInner {
                     && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
                 self.active_trajectory = None;
                 self.commanded_velocities.fill(0.0);
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 Some(DeferredActionDone {
                     action_id,
                     macro_sub,
@@ -1394,7 +1420,7 @@ impl SupervisorInner {
                     self.stop_motion();
                     self.tracking.invalidate();
                     if self.measured_positions.iter().all(|q| q.is_finite()) {
-                        self.commanded_positions = self.measured_positions.clone();
+                        crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
                     }
                     self.commanded_accelerations.fill(0.0);
                 } else {
@@ -1407,11 +1433,18 @@ impl SupervisorInner {
                     self.releasing = false;
                 }
                 self.commanded_velocities.fill(0.0);
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
                 if macro_sub {
-                    if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
-                } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
+                    if let Some(m) = self.macro_run.as_mut() {
+                        m.sub = SubState::Failed {
+                            code: crate::safety::BoundedText::new(code),
+                            message,
+                        };
+                    }
+                } else if let Some(id) = action_id {
+                    self.finish_action(id, "failed", Some(code), Some(message.as_str().to_owned()), None, None, None);
+                }
                 None
             }
         }

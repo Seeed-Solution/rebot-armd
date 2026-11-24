@@ -1200,3 +1200,217 @@ fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_all
     assert!(rep.command.unwrap().1.is_ok(), "device profile jog committed");
     assert_eq!((a, f), (0, 0), "device profile jog commit touched allocator");
 }
+
+/// I16 Item 3: Zero heap allocations and zero frees on `armd-control` for:
+/// 1. Short-stall error formatting in `GripperMotion::step_into` on an obstructed calibration
+///    stroke (and `SubState::Failed` handoff in `apply_action_step` on `macro_sub`).
+/// 2. `GripPhase::Squeeze` entering squeeze, collecting samples across both normal settle windows
+///    and >256-sample decimation windows, and computing medians in-place at settle completion.
+#[test]
+fn gripper_short_stall_error_and_grasp_squeeze_settle_are_zero_alloc() {
+    use armd::motion::{
+        GripperCommand, GripperMotion, GripperRequest, LearnMode, StepCtx, StepOut, StepStatus,
+        GRIPPER_SQUEEZE_SAMPLE_CAP,
+    };
+    use armd::model::ArmConfig;
+
+    let cfg = ArmConfig::rebot_dm();
+    let dof = cfg.dof;
+    let g_idx = cfg.gripper_index().unwrap();
+    let policy = cfg.gripper_policy.clone().unwrap();
+    let limit = cfg.limits[g_idx].clone();
+
+    // 1. Obstructed calibration stroke short-stall in `step_into`:
+    //    Closing from -5.4 toward 5% (-0.285), stalled at -3.0 (>= 0.25 rad short of target).
+    let mut cal_gm = GripperMotion::try_with_close_speed_limit(
+        GripperRequest {
+            command: GripperCommand::Move,
+            fraction: Some(0.05),
+            grasp: false,
+            speed: 0.30,
+            timeout_s: None,
+            tag: None,
+        },
+        policy.clone(),
+        limit.clone(),
+        -5.4,
+        g_idx,
+        Some(0.30),
+    )
+    .unwrap()
+    .with_baseline(None, LearnMode::Calibration);
+
+    let mut out = StepOut {
+        positions: Vec::with_capacity(dof),
+        velocities: Vec::with_capacity(dof),
+        ..Default::default()
+    };
+    let mut commanded = vec![0.0f32; dof];
+    let mut measured = vec![0.0f32; dof];
+    let cmd_vel = vec![0.0f32; dof];
+    let meas_vel = vec![0.0f32; dof];
+    let mut torques = vec![0.0f32; dof];
+    let loads = vec![0.0f32; dof];
+    commanded[g_idx] = -2.8;
+    measured[g_idx] = -3.0;
+    torques[g_idx] = 0.70;
+
+    let stalled_ctx = StepCtx {
+        dt: 0.02,
+        time_scale: 1.0,
+        measured: &measured,
+        measured_velocities: &meas_vel,
+        commanded: &commanded,
+        commanded_velocities: &cmd_vel,
+        torques: &torques,
+        loads: &loads,
+        feedback_fresh: true,
+        torque_feedback: true,
+        load_feedback: false,
+        gripper_stalled: true,
+        gripper_stall_sign: 1.0,
+        gripper_force_capped: false,
+    };
+
+    let ((), allocs, frees) = counted(|| cal_gm.step_into(&stalled_ctx, &mut out));
+    assert_eq!((allocs, frees), (0, 0), "obstructed calibration short-stall step_into touched allocator");
+    match &out.status {
+        StepStatus::Failed { code, message } => {
+            assert_eq!(*code, "GRIPPER_TIMEOUT");
+            assert!(
+                message.as_str().contains("Gripper stalled short of target")
+                    && message.as_str().contains("-3.000"),
+                "unexpected short-stall message: {message}"
+            );
+        }
+        other => panic!("expected GRIPPER_TIMEOUT short-stall failure, got {other:?}"),
+    }
+
+    // 2. Grasp squeeze: enter squeeze, accumulate >256 samples (exercising both normal and
+    //    bounded 2x decimation paths) and finish settle with in-place median sorting, all (0, 0).
+    let mut long_policy = policy.clone();
+    long_policy.settle_ms = 5_000; // 5 s; with dt=0.01 s -> 500 samples (> GRIPPER_SQUEEZE_SAMPLE_CAP = 256)
+    let mut grasp_gm = GripperMotion::try_with_close_speed_limit(
+        GripperRequest {
+            command: GripperCommand::Close,
+            fraction: None,
+            grasp: true,
+            speed: 0.30,
+            timeout_s: Some(30.0),
+            tag: None,
+        },
+        long_policy,
+        limit,
+        -5.4,
+        g_idx,
+        Some(0.30),
+    )
+    .unwrap();
+
+    commanded[g_idx] = -2.0;
+    measured[g_idx] = -2.0;
+    torques[g_idx] = 0.72;
+    let enter_ctx = StepCtx {
+        dt: 0.01,
+        time_scale: 1.0,
+        measured: &measured,
+        measured_velocities: &meas_vel,
+        commanded: &commanded,
+        commanded_velocities: &cmd_vel,
+        torques: &torques,
+        loads: &loads,
+        feedback_fresh: true,
+        torque_feedback: true,
+        load_feedback: false,
+        gripper_stalled: true,
+        gripper_stall_sign: 1.0,
+        gripper_force_capped: false,
+    };
+    let ((), a_enter, f_enter) = counted(|| grasp_gm.step_into(&enter_ctx, &mut out));
+    assert_eq!((a_enter, f_enter), (0, 0), "entering GripPhase::Squeeze touched allocator");
+    assert_eq!(out.status, StepStatus::Running);
+
+    let mut settle_ticks = 0usize;
+    let mut settled_done = None;
+    let mut total_a = 0u64;
+    let mut total_f = 0u64;
+    for tick in 0..800 {
+        commanded[g_idx] = out.positions[g_idx];
+        torques[g_idx] = 0.65 + ((tick % 7) as f32) * 0.02;
+        let sq_ctx = StepCtx {
+            dt: 0.01,
+            time_scale: 1.0,
+            measured: &measured,
+            measured_velocities: &meas_vel,
+            commanded: &commanded,
+            commanded_velocities: &cmd_vel,
+            torques: &torques,
+            loads: &loads,
+            feedback_fresh: true,
+            torque_feedback: true,
+            load_feedback: false,
+            gripper_stalled: true,
+            gripper_stall_sign: 1.0,
+            gripper_force_capped: false,
+        };
+        let ((), a, f) = counted(|| grasp_gm.step_into(&sq_ctx, &mut out));
+        total_a += a;
+        total_f += f;
+        settle_ticks += 1;
+        if let StepStatus::Done { holding, gripper_gap_rad, .. } = out.status {
+            settled_done = Some((holding, gripper_gap_rad));
+            break;
+        }
+    }
+    assert!(
+        settle_ticks > GRIPPER_SQUEEZE_SAMPLE_CAP,
+        "expected > {GRIPPER_SQUEEZE_SAMPLE_CAP} squeeze ticks to cover decimation, got {settle_ticks}"
+    );
+    assert_eq!(
+        (total_a, total_f),
+        (0, 0),
+        "grasp squeeze sample collection / settle median touched allocator"
+    );
+    let (holding, gap) = settled_done.expect("grasp squeeze did not finish settle");
+    assert_eq!(holding, Some(true));
+    assert!((gap.unwrap() - 2.0).abs() < 1e-3);
+
+    // 3. Full SupervisorInner::tick_publish during grasp squeeze (including entry and all squeeze
+    //    ticks prior to final Box<GripperMotion> retirement) performs (0, 0) allocs/frees, and
+    //    an obstructed calibration macro stroke short-stall tick performs 0 allocations.
+    let mut inner = supervisor(false);
+    inner.commanded_positions[g_idx] = -2.0;
+    inner.measured_positions[g_idx] = -2.0;
+    inner.target_positions[g_idx] = -2.0;
+    let ep = inner.safety.epoch_id();
+    let cal_id = inner.begin_orchestrated_action("gripper_calibrate", None, ep).unwrap();
+    inner
+        .start_macro_gripper_learning_within(
+            cal_id,
+            GripperRequest {
+                command: GripperCommand::Move,
+                fraction: Some(0.05),
+                grasp: false,
+                speed: 0.30,
+                timeout_s: None,
+                tag: None,
+            },
+            LearnMode::Calibration,
+            None,
+            false,
+        )
+        .unwrap();
+    warm(&mut inner, 3);
+    // Simulate a travel-direction stall far short of the 5% (-0.285) target.
+    inner.gripper_stalled = true;
+    inner.gripper_stall_sign = 1.0;
+    let (a_fail, _f_fail) = tick_counted(&mut inner);
+    assert_eq!(a_fail, 0, "obstructed calibration short-stall tick allocated on control thread");
+    match inner.macro_run.as_ref().map(|m| &m.sub) {
+        Some(armd::macro_action::SubState::Failed { code, message }) => {
+            assert_eq!(code.as_str(), "GRIPPER_TIMEOUT");
+            assert!(message.as_str().contains("Gripper stalled short of target"), "{message}");
+        }
+        other => panic!("expected macro SubState::Failed(GRIPPER_TIMEOUT), got {other:?}"),
+    }
+}

@@ -1108,11 +1108,22 @@ pub struct StepCtx<'a> {
     pub gripper_force_capped: bool,
 }
 
+/// Bounded inline error text carried by [`StepStatus::Failed`] so `step_into` never allocates
+/// on `armd-control`.
+pub type StepErrorText = crate::safety::BoundedText<160>;
+
+pub(crate) fn format_step_error(args: core::fmt::Arguments<'_>) -> StepErrorText {
+    use core::fmt::Write as _;
+    let mut buf = StepErrorText::empty();
+    let _ = buf.write_fmt(args);
+    buf
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepStatus {
     Running,
     Done { settled: Option<bool>, holding: Option<bool>, gripper_gap_rad: Option<f32> },
-    Failed { code: &'static str, message: String },
+    Failed { code: &'static str, message: StepErrorText },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1583,8 +1594,12 @@ impl PathTrajectory {
                 zeros(&mut velocities, dof);
                 return StepOut {
                     positions, velocities,
-                    status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
-                        "Arm did not follow the path for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
+                    status: StepStatus::Failed {
+                        code: "TRACKING_STALL",
+                        message: format_step_error(format_args!(
+                            "Arm did not follow the path for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped"
+                        )),
+                    },
                     progress: (self.elapsed / duration) as f32, clear_gripper_stall: false,
                 };
             }
@@ -1674,12 +1689,60 @@ impl CapRamp {
     }
 }
 
+/// Bounded inline capacity for [`GripPhase::Squeeze`] torque and load samples (covers the full
+/// validated `settle_ms <= 5000` window at 50 Hz without decimation, and decimates by 2x above it).
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, PartialEq)]
+pub const GRIPPER_SQUEEZE_SAMPLE_CAP: usize = 256;
+
+/// Bounded, inline, zero-allocation sample ring for `GripPhase::Squeeze`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SqueezeSamples {
+    buf: [f32; GRIPPER_SQUEEZE_SAMPLE_CAP],
+    len: usize,
+    stride: usize,
+    offered: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SqueezeSamples {
+    fn new() -> Self {
+        Self { buf: [0.0; GRIPPER_SQUEEZE_SAMPLE_CAP], len: 0, stride: 1, offered: 0 }
+    }
+
+    fn push(&mut self, value: f32) {
+        self.offered += 1;
+        if !(self.offered - 1).is_multiple_of(self.stride) {
+            return;
+        }
+        if self.len == GRIPPER_SQUEEZE_SAMPLE_CAP {
+            for i in 0..GRIPPER_SQUEEZE_SAMPLE_CAP / 2 {
+                self.buf[i] = self.buf[2 * i];
+            }
+            self.len = GRIPPER_SQUEEZE_SAMPLE_CAP / 2;
+            self.stride = self.stride.saturating_mul(2).max(1);
+        }
+        self.buf[self.len] = value;
+        self.len += 1;
+    }
+
+    fn median_in_place(&mut self) -> f32 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        // `sort_unstable_by` sorts in place with O(1) stack space and zero heap allocation.
+        self.buf[..self.len].sort_unstable_by(|a, b| a.total_cmp(b));
+        self.buf[self.len / 2]
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // GripperMotion is already boxed; inline SqueezeSamples keeps squeeze zero-alloc
 enum GripPhase {
     Moving,
     /// Squeezing an object: hold target, advance timer while wire-stepping to `hold`,
-    /// settle timer once `hold` (or `advance_budget_s`) is reached, and samples of
+    /// settle timer once `hold` (or `advance_budget_s`) is reached, and bounded inline samples of
     /// |τ_gripper| and |load_gripper|.
     /// `ramp`: the squeeze started at the measured position after a torque cap trip and
     /// presses in (squeeze_rad over half the window) until the torque reaches SQUEEZE_RAMP_FRACTION of the cap.
@@ -1688,8 +1751,8 @@ enum GripPhase {
         advance_elapsed: f64,
         advance_budget_s: f64,
         elapsed: f64,
-        taus: Vec<f32>,
-        loads: Vec<f32>,
+        taus: SqueezeSamples,
+        loads: SqueezeSamples,
         ramp: bool,
         cap_ramp: CapRamp,
     },
@@ -2034,7 +2097,9 @@ impl GripperMotion {
                 clear_gripper_stall: false,
                 status: StepStatus::Failed {
                     code: "FEEDBACK_UNAVAILABLE",
-                    message: "Gripper close stopped: torque feedback unavailable or stale while max_close_torque_nm is configured".into(),
+                    message: StepErrorText::new(
+                        "Gripper close stopped: torque feedback unavailable or stale while max_close_torque_nm is configured",
+                    ),
                 },
             };
         }
@@ -2056,9 +2121,16 @@ impl GripperMotion {
                     None => *hold,
                 };
                 if idx < positions.len() { positions[idx] = next_q; }
-                return StepOut { positions, velocities, progress: 1.0, clear_gripper_stall: false,
-                    status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
-                        "Gripper did not finish within {:.1} s (squeezing at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
+                return StepOut {
+                    positions, velocities, progress: 1.0, clear_gripper_stall: false,
+                    status: StepStatus::Failed {
+                        code: "GRIPPER_TIMEOUT",
+                        message: format_step_error(format_args!(
+                            "Gripper did not finish within {:.1} s (squeezing at {m_g:.3} rad, target {:.3} rad)",
+                            self.timeout_s, self.target
+                        )),
+                    },
+                };
             }
         }
         if let GripPhase::Squeeze { hold, advance_elapsed, advance_budget_s, elapsed, taus, loads, ramp, cap_ramp } = &mut self.phase {
@@ -2120,12 +2192,8 @@ impl GripperMotion {
         }
         if let GripPhase::Squeeze { elapsed, taus, loads, .. } = &mut self.phase {
             let status = if *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6 {
-                let mut sorted = taus.clone();
-                sorted.sort_by(|a, b| a.total_cmp(b));
-                let tau = sorted[sorted.len() / 2];
-                let mut sorted_loads = loads.clone();
-                sorted_loads.sort_by(|a, b| a.total_cmp(b));
-                let median_abs_load = if sorted_loads.is_empty() { 0.0 } else { sorted_loads[sorted_loads.len() / 2] };
+                let tau = taus.median_in_place();
+                let median_abs_load = loads.median_in_place();
                 let gap = (self.policy.closed_rad - m_g) * self.close_dir();
                 let holding = match self.policy.holding_mode {
                     HoldingMode::TorqueAndGap => ctx.torque_feedback && gap >= self.policy.holding_gap_rad && tau >= self.policy.holding_torque_nm,
@@ -2177,9 +2245,16 @@ impl GripperMotion {
         }
         if self.elapsed > self.timeout_s {
             if idx < positions.len() { positions[idx] = m_g; }
-            return StepOut { positions, velocities, progress: progress_of(m_g), clear_gripper_stall: clear,
-                status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
-                    "Gripper did not finish within {:.1} s (at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
+            return StepOut {
+                positions, velocities, progress: progress_of(m_g), clear_gripper_stall: clear,
+                status: StepStatus::Failed {
+                    code: "GRIPPER_TIMEOUT",
+                    message: format_step_error(format_args!(
+                        "Gripper did not finish within {:.1} s (at {m_g:.3} rad, target {:.3} rad)",
+                        self.timeout_s, self.target
+                    )),
+                },
+            };
         }
         if stalled { self.note_load(m_g); }
         if ctx.gripper_force_capped { self.loaded = true; }
@@ -2331,8 +2406,8 @@ impl GripperMotion {
                     advance_elapsed: 0.0,
                     advance_budget_s,
                     elapsed: 0.0,
-                    taus: Vec::new(),
-                    loads: Vec::new(),
+                    taus: SqueezeSamples::new(),
+                    loads: SqueezeSamples::new(),
                     ramp,
                     cap_ramp,
                 };
@@ -2350,10 +2425,10 @@ impl GripperMotion {
             } else {
                 StepStatus::Failed {
                     code: "GRIPPER_TIMEOUT",
-                    message: format!(
+                    message: format_step_error(format_args!(
                         "Gripper stalled short of target (at {m_g:.3} rad, target {:.3} rad)",
                         self.target
-                    ),
+                    )),
                 }
             }
         } else if self.request.command != GripperCommand::Seek && still && ((m_g - self.target).abs() < SETTLE_POS_RAD as f32

@@ -599,8 +599,12 @@ impl ReplayMotion {
                         velocities.resize(n, 0.0);
                         return StepOut {
                             positions, velocities, progress, clear_gripper_stall: false,
-                            status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
-                                "Arm did not follow the replay for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
+                            status: StepStatus::Failed {
+                                code: "TRACKING_STALL",
+                                message: crate::motion::format_step_error(format_args!(
+                                    "Arm did not follow the replay for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped"
+                                )),
+                            },
                         };
                     }
                 } else {
