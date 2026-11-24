@@ -1436,6 +1436,8 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
         let grip = inner.config.gripper_index().map(|g| g + 1);
         let has_grip_calib = inner.gripper_calib_offset.is_some() || inner.gripper_calib_jaw_opening.is_some();
         let gripper_stale = grip.is_some_and(|g| moved.contains(&g)) && has_grip_calib;
+        // the free-motion baseline is indexed by jaw position (crate::gripper_baseline)
+        if grip.is_some_and(|g| moved.contains(&g)) && inner.gripper_baseline.is_some() { inner.reset_gripper_baseline(); }
         let gripper_write = gripper_stale.then(|| {
             inner.gripper_calib_stale = Some(CalibrationStale { reason: reason.clone(), at: at.clone() });
             inner.gripper_calib_revision += 1;

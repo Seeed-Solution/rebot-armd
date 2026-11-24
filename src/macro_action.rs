@@ -380,7 +380,13 @@ impl MacroCtx {
     /// arm its RT child deadline under the same write lock, and wait on its `ChildTicket`:
     /// pos-force closes arm up to `(timeout_s + 10 s).min(self.deadline)` (not clamped to
     /// `phase_timeout_s`), while pos-vel and opening moves use `arm_child` (`phase_timeout_s`).
-    async fn run_gripper(&self, phase: &str, request: GripperRequest) -> Result<SubDone, Stop> {
+    async fn run_gripper_planned(
+        &self,
+        phase: &str,
+        command: GripperCommand,
+        fraction: Option<f64>,
+        grasp: bool,
+    ) -> Result<SubDone, Stop> {
         let ticket = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
@@ -388,6 +394,22 @@ impl MacroCtx {
             if now >= self.deadline {
                 return Err(fail(self.timeout_code, self.timeout_message.clone()));
             }
+            let closes = match command {
+                GripperCommand::Close | GripperCommand::Seek => true,
+                GripperCommand::Open => false,
+                GripperCommand::Move => match (inner.config.gripper_policy.as_ref(), inner.config.gripper_index()) {
+                    (Some(p), Some(g)) => {
+                        let target = p.closed_rad + fraction.unwrap_or(0.0) as f32 * (p.open_rad - p.closed_rad);
+                        let dir = if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 };
+                        (target - inner.commanded_positions.get(g).copied().unwrap_or(target)) * dir > 1e-3
+                    }
+                    _ => true,
+                },
+            };
+            let close_speed = inner.config.gripper_policy.as_ref()
+                .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
+            let (speed, timeout_s) = if closes { (close_speed, None) } else { (1.0, Some(8.0)) };
+            let request = GripperRequest { command, fraction, grasp, speed, timeout_s, tag: None };
             let remaining_s = self.deadline.duration_since(now).as_secs_f64();
             let (duration, timeout_s, is_pos_force_close) = inner
                 .start_macro_gripper_within(self.id, request, Some(remaining_s), true)
@@ -410,23 +432,17 @@ impl MacroCtx {
         self.wait_child(ticket.ok_or(Stop::Cancelled)?).await
     }
 
-    /// Run a gripper open / close sub-motion and wait for it.
+    /// Run a gripper open / close sub-motion and wait for it. Opens at 1 rad/s within 8 s; a
+    /// close runs at `min(gripper_policy.close_speed_rad_s, damiao_gripper.close_speed_rad_s when
+    /// pos_force)` (wire-quantized in `pos_force`) with the derived deadline.
     pub async fn gripper(&self, phase: &str, command: GripperCommand) -> Result<SubDone, Stop> {
-        let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed: 1.0, timeout_s: Some(8.0), tag: None };
-        self.run_gripper(phase, request).await
+        self.run_gripper_planned(phase, command, None, command == GripperCommand::Close).await
     }
 
-    /// Run a gripper move sub-motion with a fraction in [0, 1] and wait for it.
+    /// Run a gripper move sub-motion with a fraction in [0, 1] and wait for it: at the unified
+    /// closing speed with the derived deadline when closing, else 1 rad/s within 8 s.
     pub async fn gripper_move(&self, phase: &str, fraction: f64) -> Result<SubDone, Stop> {
-        let request = GripperRequest {
-            command: GripperCommand::Move,
-            fraction: Some(fraction),
-            grasp: false,
-            speed: 1.0,
-            timeout_s: Some(8.0),
-            tag: None,
-        };
-        self.run_gripper(phase, request).await
+        self.run_gripper_planned(phase, GripperCommand::Move, Some(fraction), false).await
     }
 
     /// [`phase`](Self::phase) followed by [`gripper`](Self::gripper).
