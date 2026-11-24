@@ -325,8 +325,7 @@ impl PlannedMacro {
     ) -> Result<(u64, f64), ArmError> {
         match self {
             Self::Grasp(planned) => {
-                let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-                crate::grasp::begin(admitted, supervisor, deps.source.clone(), planned)
+                crate::grasp::begin_with_stamp(inner, stamp, supervisor, deps.source.clone(), planned)
             }
             Self::Place(planned) => crate::place::begin_with_stamp(inner, stamp, supervisor, planned),
         }

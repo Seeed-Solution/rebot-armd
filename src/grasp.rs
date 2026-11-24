@@ -3275,23 +3275,121 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPl
     }
 }
 
+/// Build the A7 [`BeginMacroSpec`] for a planned `grasp` macro (shared by Legacy and RT Executor).
+pub fn begin_macro_spec(
+    planned: &PlannedGrasp,
+    prepared_boot: crate::rt_core::broker::BootId,
+    dof: usize,
+    gripper_idx: Option<usize>,
+    deadline: Instant,
+) -> crate::rt_core::requests::actions::BeginMacroSpec {
+    use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+    let mut start = vec![0.0f32; dof];
+    let arm_dof = planned.input.arm.arm_dof().min(dof).min(6);
+    for (i, dst) in start.iter_mut().take(arm_dof).enumerate() {
+        *dst = planned.input.q0[i] as f32;
+    }
+    if let Some(g) = gripper_idx.filter(|&g| g < dof) {
+        start[g] = planned.input.j7;
+    }
+    let mut spec = BeginMacroSpec::new(MacroKind::Grasp, prepared_boot);
+    if let Ok(s) = spec.with_start(&start) {
+        spec = s;
+    }
+    spec.check_workspace_revision = true;
+    spec.macro_deadline = Some(deadline);
+    spec.timeout_code = crate::safety::BoundedText::new("GRASP_TIMEOUT");
+    if let Some(tag) = planned.request.tag.as_deref() {
+        spec.tag = crate::model::HolderLabel::new(tag);
+    }
+    if let Some(task) = planned.request.task.as_deref() {
+        spec.task = crate::model::HolderLabel::new(task);
+    }
+    spec
+}
+
+/// Begin a planned grasp under a short write lock through the single owner-side
+/// [`crate::rt_core::requests::actions::install_begin_macro`] function and spawn its orchestrator.
+/// Returns (action id, expected duration).
+pub fn begin_with_stamp(
+    inner: &mut SupervisorInner,
+    stamp: crate::supervisor::AdmissionStamp,
+    supervisor: &Arc<ArmSupervisor>,
+    source: Arc<dyn DetectionSource>,
+    planned: PlannedGrasp,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{
+        install_begin_macro, ActionStamp, OwnerCheckCtx, DEFAULT_ACTION_DEADLINE,
+    };
+    let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
+    let spec = begin_macro_spec(
+        &planned,
+        inner.boot_id,
+        inner.config.dof,
+        inner.config.gripper_index(),
+        deadline,
+    );
+    let action_stamp = ActionStamp {
+        arm: inner.core.id(),
+        boot: inner.boot_id,
+        admission: stamp,
+        config_revision: planned.input.workspace_revision,
+        calibration_revision: None,
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
+    };
+    let owner_ctx = OwnerCheckCtx::for_legacy(inner);
+    let id = install_begin_macro(
+        inner,
+        &action_stamp,
+        &owner_ctx,
+        &spec,
+        planned.request.tag.clone(),
+        planned.request.task.clone(),
+    )
+    .map_err(|r| r.into_arm_error(inner))?;
+    let duration = expected_duration(&planned)
+        + inner.approach_estimate_s("grasp_final", planned.request.approach);
+    spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
+    Ok((id, duration))
+}
+
 /// Begin a planned grasp under the write lock: the action record (with its `task`) and the
 /// orchestrator. Returns (action id, expected duration).
 pub fn begin(admitted: crate::supervisor::Admitted<'_>, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
+    let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
     let (inner, proof) = admitted.consume()?;
     let stamp = proof.stamp();
-    let id = inner.begin_macro_inner(&proof, "grasp", &planned.input, planned.request.tag.clone())?;
-    if let Some(task) = &planned.request.task {
-        inner.update_action(id, |a| a.task = Some(task.clone()));
-    }
+    let spec = begin_macro_spec(
+        &planned,
+        inner.boot_id,
+        inner.config.dof,
+        inner.config.gripper_index(),
+        deadline,
+    );
     let duration = expected_duration(&planned) + inner.approach_estimate_s("grasp_final", planned.request.approach);
-    spawn(supervisor.clone(), source, id, planned, stamp);
+    let ws_rev = planned.input.workspace_revision;
+    let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
+        inner,
+        &proof,
+        &spec,
+        Some(ws_rev),
+        planned.request.tag.clone(),
+        planned.request.task.clone(),
+    )?;
+    spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
     Ok((id, duration))
 }
 
 /// Start a grasp (tests, in-process agents): caller passes the `AdmissionStamp` captured at
 /// admission (never re-sampled internally). Prepares, plans, runs task preflight, validates
-/// `stamp` under the owner lock, and spawns the orchestrator. Returns (action id, expected duration).
+/// `stamp` under the owner lock through [`begin_with_stamp`], and spawns the orchestrator.
+/// Returns (action id, expected duration).
 pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::AdmissionStamp, source: Arc<dyn DetectionSource>, body: &Value) -> Result<(u64, f64), ApiError> {
     let pending = {
         let inner = supervisor.inner().read().await;
@@ -3301,13 +3399,24 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
     preflight(source.as_ref(), &mut planned).await?;
     let mut inner = supervisor.inner().write().await;
-    let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-    Ok(begin(admitted, supervisor, source, planned)?)
+    Ok(begin_with_stamp(&mut inner, stamp, supervisor, source, planned)?)
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "grasp", ..)`.
 pub fn spawn(supervisor: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp, stamp: crate::supervisor::AdmissionStamp) {
-    tokio::spawn(run(supervisor, source, id, planned, stamp));
+    let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
+    spawn_with_deadline(supervisor, source, id, planned, stamp, deadline);
+}
+
+fn spawn_with_deadline(
+    supervisor: Arc<ArmSupervisor>,
+    source: Arc<dyn DetectionSource>,
+    id: u64,
+    planned: PlannedGrasp,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+) {
+    tokio::spawn(run(supervisor, source, id, planned, stamp, deadline));
 }
 
 // ---- orchestrator ----
@@ -3362,11 +3471,27 @@ impl Orchestrator {
 
     /// [`move_arm_in`](Self::move_arm_in) with an optional same-side final approach.
     async fn move_arm_final_in(&self, frame: GoalFrame, phase: &str, spec: GoalSpec, linear: f64, approach: Option<crate::macro_action::FinalApproach>) -> Result<SubDone, Stop> {
-        let input = {
-            let inner = self.sup.inner().read().await;
-            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.plan_input_in(frame).map_err(crate::macro_action::arm_fail)?
-        };
+        self.move_arm_final_in_guarded(frame, phase, spec, linear, approach, None)
+            .await
+            .map(|(done, _)| done)
+    }
+
+    /// [`move_arm_final_in`](Self::move_arm_final_in) folding an optional [`ContactGuard`]
+    /// atomically into `ChildSpec.contact` at `InstallChild` time (0 lock pre-check on Executor).
+    async fn move_arm_final_in_guarded(
+        &self,
+        frame: GoalFrame,
+        phase: &str,
+        spec: GoalSpec,
+        linear: f64,
+        approach: Option<crate::macro_action::FinalApproach>,
+        contact: Option<ContactGuard>,
+    ) -> Result<(SubDone, crate::macro_action::ContactWatch), Stop> {
+        if !self.alive().await {
+            return Err(Stop::Cancelled);
+        }
+        let snap = self.ctx.snapshot(self.deadline).await?;
+        let input = snap.plan_input_in(frame).map_err(crate::macro_action::arm_fail)?;
         let spec = if input.arm.arm_dof() == 5 {
             match spec {
                 GoalSpec::Absolute { p, r } => GoalSpec::AbsoluteEx { p, r, auto_yaw: true },
@@ -3378,18 +3503,21 @@ impl Orchestrator {
         let (goal, _yaw_free) = motion::resolve_goal_ex(&input, &spec);
         let goal_end = motion::goal_to_end(&goal, &input);
         if let Some(e) = table_violation(&input.arm.fk(&input.q0), &goal_end, &self.envelope, self.setup.table_z_m) {
-            if let MotionError::WorkspaceViolation { ref detail, .. } = e {
-                self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
+            if !self.is_executor() {
+                if let MotionError::WorkspaceViolation { ref detail, .. } = e {
+                    self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
+                }
             }
             return Err(crate::macro_action::arm_fail(e.into()));
         }
-        self.ctx.move_arm_staged_in_with_table(
+        self.ctx.move_arm_staged_in_with_table_guarded(
             frame,
             phase,
             spec,
             Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS },
             approach,
             Some((self.envelope.clone(), self.setup.table_z_m + TABLE_CLEARANCE_M)),
+            contact,
         ).await.map_err(|(stop, _)| stop)
     }
 
@@ -4409,14 +4537,28 @@ impl Orchestrator {
         max_residual_nm[1] = lim;
         max_residual_nm[2] = lim;
         let guard = ContactGuard { max_residual_nm, stop_code: None };
-        self.sup.inner().write().await.guard_next_macro_child(self.id, Some(guard));
-        let result = self.move_arm_final_in(GoalFrame::Tcp, "descend", GoalSpec::Absolute { p: ins.goal_tcp, r: None }, ins.speed_mps, Some(final_approach)).await;
-        {
+        let result = self
+            .move_arm_final_in_guarded(
+                GoalFrame::Tcp,
+                "descend",
+                GoalSpec::Absolute { p: ins.goal_tcp, r: None },
+                ins.speed_mps,
+                Some(final_approach),
+                Some(guard),
+            )
+            .await;
+        if !self.is_executor() {
             let mut inner = self.sup.inner().write().await;
-            // a guard not taken by a child (planning or install refused) does not stay armed
-            inner.guard_next_macro_child(self.id, None);
-            let watch = inner.macro_run.as_ref().filter(|m| m.id == self.id && m.child.guard == Some(guard)).and_then(|m| m.ticket())
-                .and_then(|t| inner.macro_child_watch(t)).unwrap_or_default();
+            let watch = match &result {
+                Ok((_, w)) => *w,
+                Err(_) => inner
+                    .macro_run
+                    .as_ref()
+                    .filter(|m| m.id == self.id && m.child.guard == Some(guard))
+                    .and_then(|m| m.ticket())
+                    .and_then(|t| inner.macro_child_watch(t))
+                    .unwrap_or_default(),
+            };
             let contact_h = watch.contact_joint.map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m);
             inner.update_action(self.id, |a| {
                 a.descend_peak_residual_nm = watch.peak_residual_nm;
@@ -4427,6 +4569,10 @@ impl Orchestrator {
                 tracing::info!("Grasp {}: contact during the descent at {h:.3} m above the table", self.id);
                 // a contact stop ends the descent before the short segment
                 inner.approach_interrupted(self.id, "contact");
+            }
+        } else if let Ok((_, watch)) = &result {
+            if let Some(h) = watch.contact_joint.map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m) {
+                tracing::info!("Grasp {}: contact during the descent at {h:.3} m above the table", self.id);
             }
         }
         result.map(|_| ())
@@ -4815,10 +4961,17 @@ pub fn roll_across_long_side(jaw: Vec3, long: Vec3) -> f64 {
     (t + pi / 2.0).rem_euclid(pi) - pi / 2.0
 }
 
-async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, mut planned: PlannedGrasp, stamp: crate::supervisor::AdmissionStamp) {
+async fn run(
+    sup: Arc<ArmSupervisor>,
+    source: Arc<dyn DetectionSource>,
+    id: u64,
+    mut planned: PlannedGrasp,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+) {
+    use crate::rt_core::requests::actions::{FinishState, HeldUpdate};
     let setup = planned.request.setup.clone();
     let cam = CamModel::assumed(&planned.input.arm, &setup, &planned.input.cam);
-    let deadline = Instant::now() + Duration::from_secs_f64(setup.timeout_s);
     // one mode reading per grasp: the preflight's, else read here
     let mode = match planned.mode.take() {
         Some(m) => m,
@@ -4833,7 +4986,13 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         sup: sup.clone(), id, stamp, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
         timeout_message: format!("Grasp did not finish within {:.0} s", setup.timeout_s),
     };
-    let contact_end_m = sup.inner().read().await.config.effective_physical_contact_end_m();
+    let contact_end_m = if ctx.is_executor() {
+        sup.hub()
+            .prep_env()
+            .and_then(|e| e.config.effective_physical_contact_end_m())
+    } else {
+        sup.inner().read().await.config.effective_physical_contact_end_m()
+    };
     let envelope = envelope_with_contact(planned.input.ws.as_ref(), &planned.input.cam, &cam.rec, contact_end_m);
     let lens_known = planned.input.cam.offset_m.is_some();
     let orch = Orchestrator { ctx, source: source.clone(), setup, cam, envelope, tcp_offset: planned.input.tcp_offset, triggered, lens_known, depth_available, generation };
@@ -4881,29 +5040,68 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the vision mode: {e}"))),
     } };
     let _ = source.set_mask_focus(None, [0.0; 4], 0).await;
-    let mut inner = sup.inner().write().await;
     match result {
         Ok((holding, gap)) => {
-            // a grasp stopped meanwhile must not overwrite newer held state
-            if holding && inner.macro_alive(id) {
-                let spill_safe = planned.request.setup.spill_safe_labels.iter().any(|s| s.eq_ignore_ascii_case(&planned.request.label));
-                inner.held = Some(crate::supervisor::HeldObject {
-                    label: planned.request.label.clone(),
+            let held = if holding {
+                let spill_safe = planned
+                    .request
+                    .setup
+                    .spill_safe_labels
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&planned.request.label));
+                HeldUpdate::Set {
+                    label: crate::model::HolderLabel::new(&planned.request.label),
                     spill_safe,
-                });
-            }
-            inner.finish_macro(id, "done", None, None, Some(holding), gap);
+                }
+            } else {
+                HeldUpdate::Unchanged
+            };
+            orch.ctx
+                .finish(FinishState::Done, None, None, Some(holding), gap, held)
+                .await;
         }
         Err(Stop::Fail(code, message)) => {
-            let holding = if code == "NOT_HOLDING" || code == "DROPPED" { Some(false) } else { None };
-            inner.finish_macro(id, "failed", Some(&code), Some(message), holding, None);
+            let holding = if code == "NOT_HOLDING" || code == "DROPPED" {
+                Some(false)
+            } else {
+                None
+            };
+            let held = if holding == Some(false) {
+                HeldUpdate::Clear
+            } else {
+                HeldUpdate::Unchanged
+            };
+            orch.ctx
+                .finish(
+                    FinishState::Failed,
+                    Some(&code),
+                    Some(message),
+                    holding,
+                    None,
+                    held,
+                )
+                .await;
         }
-        Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),
+        Err(Stop::Cancelled) => {
+            orch.ctx
+                .finish(
+                    FinishState::Cancelled,
+                    None,
+                    None,
+                    None,
+                    None,
+                    HeldUpdate::Unchanged,
+                )
+                .await;
+        }
     }
-    if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
-        let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
-        let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
-        tracing::info!("Grasp {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
+    if !orch.ctx.is_executor() {
+        let inner = sup.inner().read().await;
+        if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
+            let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
+            let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
+            tracing::info!("Grasp {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
+        }
     }
 }
 
