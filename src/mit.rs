@@ -780,15 +780,15 @@ impl crate::supervisor::SupervisorInner {
                 // - When the authorized ceiling itself encodes to 0 (unrepresentable), never fall
                 //   back to vlim()/close_speed_rad_s or bump up to raw 1: forward the
                 //   unrepresentable ceiling/velocity so DamiaoArmDriver fails closed with 0 frames.
-                if let Some(cap) = drv.motor_current_cap().filter(|c| c.mode == "pos_force" && c.active) {
+                if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
                     if let Some(t) = targets.get_mut(cap.joint) {
                         if !t.velocity.is_some_and(|v| !v.is_finite()) {
                             let ceiling_raw = active_pf_ceiling
                                 .filter(|c| c.is_finite() && *c > 0.0)
                                 .map(crate::model::DamiaoGripperDrive::quantize_vel_raw)
                                 .unwrap_or(0);
-                            let close_ok = cap.close_speed_rad_s
-                                .is_some_and(|cs| cs.is_finite() && crate::model::DamiaoGripperDrive::quantize_vel_raw(cs) >= 1);
+                            let close_ok = cap.close_speed_rad_s.is_finite()
+                                && crate::model::DamiaoGripperDrive::quantize_vel_raw(cap.close_speed_rad_s) >= 1;
                             if ceiling_raw >= 1 && close_ok {
                                 let ceiling_wire = crate::model::DamiaoGripperDrive::wire_speed_f32(ceiling_raw);
                                 if t.velocity.is_none_or(|v| v == 0.0) {

@@ -2098,6 +2098,9 @@ impl SupervisorInner {
         self.pending_rearm = true;
         self.output_suspended = false;
         self.gripper_stalled = false;
+        self.gripper_high_torque_ticks = 0;
+        self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_window.reset();
         self.gripper_stall_sign = 0.0;
         self.gripper_prev_hw_overload = false;
         self.gripper_hold_vel_ceiling = None;

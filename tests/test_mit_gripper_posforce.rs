@@ -3972,3 +3972,147 @@ fn enable_refresh_waits_for_empty_queue_and_reports_queued_fault_or_motion_beyon
         assert!(!d.is_enabled());
     }
 }
+
+/// I16 Item 2: Calibration close at raw 29 must be quantized ONCE and sent on CAN 0x307 as
+/// raw 29 (never double-floored raw 29 -> 0.29_f64 -> raw 28).
+#[tokio::test]
+async fn calibration_close_at_raw_29_is_sent_as_raw_29() {
+    use std::sync::Arc;
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    const DT: f64 = 0.02;
+
+    #[derive(Clone)]
+    struct RateLimitedBus {
+        inner: FakeBus,
+        dt: f32,
+    }
+
+    impl CanTransport for RateLimitedBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let prev_q = self.inner.with(|s| s.motors[J7].q);
+            self.inner.transmit(frame)?;
+            if frame.id == 0x307 || frame.id == 0x107 {
+                self.inner.with(|s| {
+                    let m = &mut s.motors[J7];
+                    if !m.enabled { return; }
+                    let target_p = f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+                    let wire_v = if frame.id == 0x307 {
+                        f32::from(u16::from_le_bytes([frame.data[4], frame.data[5]])) * 0.01
+                    } else {
+                        f32::from_le_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]).abs()
+                    };
+                    let max_step = wire_v * self.dt;
+                    let delta = (target_p - prev_q).clamp(-max_step, max_step);
+                    let next_q = prev_q + delta;
+                    m.q = next_q;
+                    m.v = (next_q - prev_q) / self.dt;
+                    let updated = m.feedback_frame();
+                    if let Some(last) = s.pending.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    } else if let Some(last) = s.rx.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    }
+                });
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+    }
+
+    // Check both speed-limiting sources that quantize to raw 29:
+    // (a) damiao_gripper.close_speed_rad_s = 0.299 (policy 0.30)
+    // (b) gripper_policy.close_speed_rad_s = 0.295 (damiao 0.30)
+    // (c) wire_speed_f32(29) exact boundary
+    for (label, damiao_speed, policy_speed) in [
+        ("damiao_0.299", 0.299_f32, 0.30_f32),
+        ("policy_0.295", 0.30_f32, 0.295_f32),
+        ("wire_29", DamiaoGripperDrive::wire_speed_f32(29), 0.30_f32),
+    ] {
+        assert_eq!(DamiaoGripperDrive::quantize_vel_raw(damiao_speed.min(policy_speed)), 29, "{label}");
+        // Demonstrate the raw 29 -> 0.29_f64 -> 28 IEEE-754 floor trap that used to occur.
+        assert_eq!(DamiaoGripperDrive::quantize_vel_raw_f64(29.0 / 100.0), 28);
+
+        let clock = MockClock::new();
+        let inner_bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        inner_bus.with(|s| {
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = if i == J7 { -5.4 } else { 0.0 };
+            }
+        });
+        let bus = RateLimitedBus { inner: inner_bus.clone(), dt: DT as f32 };
+        let d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(GripperPosForce { close_speed_rad_s: damiao_speed, ..pf() }).unwrap();
+
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.gripper_policy.as_mut().unwrap().close_speed_rad_s = Some(policy_speed);
+        cfg.damiao_gripper = Some(DamiaoGripperDrive {
+            close_speed_rad_s: damiao_speed,
+            ..DamiaoGripperDrive::rebot_dm()
+        });
+        let sup = Arc::new(armd::ArmSupervisor::new(cfg));
+        sup.set_driver(Box::new(d)).await;
+        {
+            let mut inner = sup.inner().write().await;
+            inner.lease_enabled = false;
+            inner.follower = Some("damiao".into());
+            inner.tick(DT);
+            inner.set_torque(true).unwrap();
+            clock.advance(Duration::from_millis(20));
+            inner.tick(DT);
+            assert!((inner.effective_planned_close_speed() - 0.29).abs() < 1e-12, "{label}");
+        }
+
+        let (cal_id, _) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+        // Wait for the calibration orchestrator to install stroke 1 (closing to 5 % open).
+        let mut installed_raw = None;
+        for _ in 0..100 {
+            {
+                let inner = sup.inner().read().await;
+                if let Some(armd::motion::Reference::Gripper(gm)) = inner.active_trajectory.as_ref().map(|a| &a.reference) {
+                    installed_raw = gm.planned_vel_raw;
+                    assert_eq!(gm.planned_speed, 0.29, "{label}: planned_speed");
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(installed_raw, Some(29), "{label}: calibration close stroke double-quantized");
+
+        inner_bus.clear_log();
+        let mut max_vel_raw = 0u16;
+        let mut saw_29 = false;
+        let mut frames_checked = 0usize;
+        // Step through acceleration + cruise of stroke 1 (~1.5 s = 75 ticks).
+        for _ in 0..80 {
+            inner_bus.clear_log();
+            clock.advance(Duration::from_millis(20));
+            {
+                let mut inner = sup.inner().write().await;
+                inner.tick(DT);
+            }
+            for f in j7_commands(&inner_bus.tx_log()) {
+                assert_eq!(f.id, 0x307, "{label}");
+                let vel_raw = u16::from_le_bytes([f.data[4], f.data[5]]);
+                assert!((1..=29).contains(&vel_raw), "{label}: vel_raw={vel_raw} out of 1..=29");
+                max_vel_raw = max_vel_raw.max(vel_raw);
+                if vel_raw == 29 { saw_29 = true; }
+                frames_checked += 1;
+            }
+        }
+        assert!(frames_checked > 0, "{label}: no 0x307 frames emitted");
+        assert!(saw_29 && max_vel_raw == 29, "{label}: expected cruise vel_raw 29, got max {max_vel_raw}");
+
+        // Cleanly cancel the calibration orchestrator before next case.
+        {
+            let mut inner = sup.inner().write().await;
+            assert_eq!(inner.macro_run.as_ref().map(|m| m.id), Some(cal_id));
+            inner.request_macro_stop();
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}

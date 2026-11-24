@@ -284,6 +284,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
     fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
     fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }
+    fn gripper_pos_force_info(&self) -> Option<crate::driver::GripperPosForceInfo> { self.inner.gripper_pos_force_info() }
     fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
