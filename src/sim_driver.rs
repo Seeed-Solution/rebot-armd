@@ -605,24 +605,70 @@ impl ArmDriver for SimArmDriver {
         max_age: Duration,
         out: &mut [f32],
     ) -> bool {
-        if joints.is_empty() || out.len() < joints.len() {
-            return false;
-        }
-        if !self.feedback_joints_within(joints, max_age) {
+        if joints.is_empty() || out.len() < joints.len() || joints.iter().any(|&i| i >= self.dof) {
             return false;
         }
         let caps = self.capabilities();
+        if self.rt_mode.load(Ordering::Relaxed) {
+            if !self.cached_has_state
+                || !self.cached_received_at.is_some_and(|t| t.elapsed() <= max_age)
+            {
+                return false;
+            }
+            for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+                let Some(s) = self.cached.get(i) else {
+                    return false;
+                };
+                if !crate::driver::joint_state_valid(s, caps) {
+                    return false;
+                }
+                if caps.load_feedback && !self.cached_loads.get(i).is_some_and(|l| l.is_finite()) {
+                    return false;
+                }
+                *slot = s.position;
+            }
+            return true;
+        }
+        // Legacy mode: take BOTH timestamp and joint states from the same locked receiver packet
+        // so the newest received timestamp can never vouch for older owner-cached positions.
+        let Ok(s) = self.shared.lock() else {
+            return false;
+        };
+        if !s.received_at.is_some_and(|t| t.elapsed() <= max_age) {
+            return false;
+        }
+        let Some(ref state) = s.latest else {
+            return false;
+        };
+        let off = self.zero_offsets.as_deref();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
-            let Some(s) = self.cached.get(i) else {
+            let (Some(&raw_q), Some(&dq), Some(&tau), Some(&temp)) = (
+                state.q.get(i),
+                state.dq.get(i),
+                state.tau.get(i),
+                state.temp.get(i),
+            ) else {
                 return false;
             };
-            if !crate::driver::joint_state_valid(s, caps) {
+            let js = JointState {
+                position: off.map_or(raw_q, |o| raw_q - o[i]),
+                velocity: dq,
+                torque: if self.load_only_feedback { 0.0 } else { tau },
+                temperature: temp,
+            };
+            if !crate::driver::joint_state_valid(&js, caps) {
                 return false;
             }
-            if caps.load_feedback && !self.cached_loads.get(i).is_some_and(|l| l.is_finite()) {
-                return false;
+            if caps.load_feedback {
+                let load_ok = match state.loads.as_ref() {
+                    Some(loads) if loads.len() == self.dof => loads.get(i).is_some_and(|l| l.is_finite()),
+                    _ => tau.is_finite(),
+                };
+                if !load_ok {
+                    return false;
+                }
             }
-            *slot = s.position;
+            *slot = js.position;
         }
         true
     }
@@ -1080,5 +1126,34 @@ mod tests {
         let mut peer = Peer::new();
         let _drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
         assert_eq!(peer.recv().kind, "poll");
+    }
+
+    #[test]
+    fn fresh_joint_positions_reads_timestamp_and_positions_from_same_packet() {
+        let mut peer = Peer::new();
+        let mut drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
+        // Packet 1: rest pose (q0 = 0.0), synced into owner-local `self.cached`.
+        peer.send_state(1, 1, 0, true, 0.0);
+        settle();
+        assert_eq!(drv.read_joint_states().unwrap()[0].position, 0.0);
+
+        // Packet 2: raised pose (q0 = 0.45), received on the background thread WITHOUT calling
+        // `read_joint_states()` again so `self.cached` still holds 0.0.
+        peer.send_state(1, 2, 0, true, 0.45);
+        settle();
+        assert_eq!(drv.cached[0].position, 0.0, "owner cache must still hold packet 1");
+
+        // Legacy mode MUST read BOTH timestamp and position from packet 2 (0.45), never 0.0.
+        let mut out = [0.0f32; 2];
+        assert!(drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(200), &mut out));
+        assert!((out[0] - 0.45).abs() < 1e-5, "expected packet 2 position 0.45, got {}", out[0]);
+
+        // RT mode reads BOTH timestamp and position from the owner-local coherent snapshot.
+        drv.set_rt_mode(true);
+        drv.cached_received_at = Some(Instant::now() - Duration::from_millis(500));
+        assert!(
+            !drv.fresh_joint_positions_into(&[0, 1], Duration::from_millis(100), &mut out),
+            "stale owner-local timestamp in RT mode must be refused even when receiver has newer packet"
+        );
     }
 }
