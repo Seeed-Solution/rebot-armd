@@ -29,14 +29,22 @@ impl Default for MockClock {
 
 impl MockClock {
     pub fn new() -> Self {
+        Self::starting_at(Instant::now())
+    }
+
+    pub fn starting_at(base: Instant) -> Self {
         Self {
             inner: Arc::new(MockClockInner {
                 id: NEXT_MOCK_CLOCK_ID.fetch_add(1, Ordering::Relaxed),
-                base: Instant::now(),
+                base,
                 elapsed_ns: AtomicU64::new(0),
                 idle_read_step_ns: AtomicU64::new(1_000_000),
             }),
         }
+    }
+
+    pub fn base(&self) -> Instant {
+        self.inner.base
     }
 
     pub fn elapsed(&self) -> Duration {

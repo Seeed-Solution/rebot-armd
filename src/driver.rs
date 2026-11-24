@@ -327,6 +327,13 @@ pub const DAMIAO_TX_MAX_FRAMES: usize = 16;
 /// frames to the next tick (bounded by `DAMIAO_TX_FRAME_MAX_AGE` = 45 ms). Overridable per
 /// profile via `ArmConfig::tx_budget_ms`.
 pub const DAMIAO_TX_MAX_DURATION: Duration = Duration::from_millis(10);
+/// Publication margin reserved at the end of a control release when bounding the per-tick CAN TX
+/// start-cutoff (`tx_deadline = min(first_tx + tx_budget, release_deadline - margin)`).
+///
+/// Measured on SG2002 B601-DM (`qual-smoke-20261124T000133Z`, `1.6.0-dev11`, `SCHED_FIFO` 45,
+/// 1000-tick window): `finish_us` p50 7 µs / p99 298 µs, `obs_us` p50 751 µs / p99 1,257 µs,
+/// `publish_us` p50 59 µs / p99 116 µs (combined p50 0.817 ms, p99 1.671 ms → 2 ms margin).
+pub const DAMIAO_TX_RELEASE_PUBLISH_MARGIN: Duration = Duration::from_millis(2);
 /// Default inclusive maximum age of a queued target frame before it is dropped as stale
 /// (`age >= frame_max_age` drops).
 pub const DAMIAO_TX_FRAME_MAX_AGE: Duration = Duration::from_millis(45);
@@ -540,6 +547,11 @@ pub trait ArmDriver: Send {
 
     /// Discard any carried-over pending TX frames (no-op for drivers without a TX queue).
     fn discard_pending_tx(&mut self) {}
+
+    /// Sets an absolute driver-clock ceiling on the active release's TX start-cutoff
+    /// (`tx_deadline = min(first_tx + tx_budget, ceiling)`). Pass `None` when leaving a
+    /// control release so off-tick calls are never clipped by a prior release deadline.
+    fn set_tx_release_deadline(&mut self, _deadline: Option<Instant>) {}
 
     /// Configured inclusive maximum age for carried-over TX frames (default 45 ms).
     fn tx_frame_max_age(&self) -> Duration { DAMIAO_TX_FRAME_MAX_AGE }
@@ -2959,6 +2971,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// `last_feedback_instant` (cleared by `send_enable` to enforce post-enable state-1 replies),
     /// this preserves live J7 telemetry age across carried and retried `CMD_ENABLE` frames.
     pf_last_fresh_feedback: Option<(Instant, Instant)>,
+    /// Optional absolute driver-clock ceiling on the active control release's TX start-cutoff
+    /// (`release_deadline - publish_margin`), set during a release and cleared afterwards.
+    tx_release_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3416,6 +3431,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             refresh_unfinished: 0,
             enable_stop_stamp: None,
             pf_last_fresh_feedback: None,
+            tx_release_deadline: None,
         }
     }
 
@@ -3432,6 +3448,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn set_tx_budget(&mut self, budget: TxBudget) {
         self.tx_budget = budget;
         self.tick_tx = None;
+        self.tx_release_deadline = None;
     }
 
     /// Open a fresh per-tick TX budget window. Called automatically at the start of
@@ -3490,11 +3507,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     #[inline]
     fn ensure_tx_pass(&mut self) -> TickTxPass {
-        if let Some(pass) = self.tick_tx {
+        if let Some(mut pass) = self.tick_tx {
+            if let Some(cap) = self.tx_release_deadline {
+                pass.deadline = pass.deadline.min(cap);
+                self.tick_tx = Some(pass);
+            }
             pass
         } else {
+            let mut deadline = self.now() + self.tx_budget.max_duration;
+            if let Some(cap) = self.tx_release_deadline {
+                deadline = deadline.min(cap);
+            }
             let pass = TickTxPass {
-                deadline: self.now() + self.tx_budget.max_duration,
+                deadline,
                 attempts: 0,
                 backpressured: false,
             };
@@ -3513,7 +3538,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     #[inline]
     fn flush_cutoff_exceeded(&self) -> bool {
         !self.can.flush_is_noop()
-            && self.tick_tx.is_some_and(|pass| self.now() >= pass.deadline)
+            && (self.tick_tx.is_some_and(|pass| self.now() >= pass.deadline)
+                || self.tx_release_deadline.is_some_and(|cap| self.now() >= cap))
     }
 
     /// Shared mode-switch implementation used by both off-tick [`ArmDriver::set_joint_modes`]
@@ -3577,10 +3603,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     #[inline]
     fn can_start_tick_tx_n(&self, needed: usize) -> bool {
-        let Some(pass) = self.tick_tx else { return needed <= self.tx_budget.max_frames; };
+        let Some(pass) = self.tick_tx else {
+            return needed <= self.tx_budget.max_frames
+                && self.tx_release_deadline.is_none_or(|cap| self.now() < cap);
+        };
+        let effective_deadline = self
+            .tx_release_deadline
+            .map_or(pass.deadline, |cap| pass.deadline.min(cap));
         !pass.backpressured
             && pass.attempts.saturating_add(needed) <= self.tx_budget.max_frames
-            && self.now() < pass.deadline
+            && self.now() < effective_deadline
     }
 
     #[inline]
@@ -8098,6 +8130,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn discard_pending_tx(&mut self) {
         self.discard_all_pending_tx();
+    }
+
+    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+        self.tx_release_deadline = deadline;
+        if let (Some(cap), Some(pass)) = (deadline, self.tick_tx.as_mut()) {
+            pass.deadline = pass.deadline.min(cap);
+        }
     }
 
     fn tx_frame_max_age(&self) -> Duration {

@@ -11,12 +11,12 @@ use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
 use armd::driver::{
     is_estop_inhibited, ArmDriver, DamiaoArmDriver, JointTarget,
     TxBatchOutcome, TxBudget, DAMIAO_TX_FRAME_MAX_AGE, DAMIAO_TX_MAX_DURATION,
-    DAMIAO_TX_MAX_FRAMES,
+    DAMIAO_TX_MAX_FRAMES, DAMIAO_TX_RELEASE_PUBLISH_MARGIN,
 };
 use armd::motion::{GripperCommand, GripperRequest};
 use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::broker::{BootId, Broker, Capacities, ClientId, Submit, TransitionOp};
-use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture};
+use armd::rt_core::ops::{Checkpoint, CoreOps, PlanSlot, ReleaseFixture, VirtualClock};
 use armd::rt_core::urgent::{EstopGate, StopRequests};
 use armd::safety::{FaultCode, FaultReason, SafetyState};
 use armd::supervisor::HeldObject;
@@ -96,10 +96,12 @@ impl DualRig {
             Owner::Legacy => RigOwner::Legacy(Box::new(inner)),
             Owner::Executor => {
                 inner.rt_executor_owned = true;
-                let (fx, broker, _tw, _stop) = ReleaseFixture::new(
+                // Drive BOTH FakeBus/DamiaoArmDriver and ReleaseFixture from ONE shared clock.
+                let (fx, broker, _tw, _stop) = ReleaseFixture::new_with_clock(
                     inner,
                     BootId(77),
                     Capacities { commands: 8, plans: 4, replies: 16 },
+                    VirtualClock::from_mock_clock(clock.clone()),
                 );
                 RigOwner::Executor { fx: Box::new(fx), broker: Box::new(broker), next_req: 1 }
             }
@@ -124,13 +126,15 @@ impl DualRig {
     }
 
     fn step_dt(&mut self, dt: f64, push_feedback: bool) {
-        self.clock.advance(Duration::from_secs_f64(dt));
+        let started = self.clock.now();
+        let release_deadline = started + Duration::from_secs_f64(dt);
         if push_feedback {
             self.bus.with(|s| s.push_all_feedback());
         }
         match &mut self.owner {
             RigOwner::Legacy(inner) => {
-                inner.tick(dt);
+                inner.tick_with_release_deadline(dt, self.clock.now(), release_deadline);
+                self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
             }
             RigOwner::Executor { fx, .. } => {
                 fx.dt = dt;
@@ -159,13 +163,11 @@ impl DualRig {
             }
             RigOwner::Executor { fx, broker, next_req } => {
                 // ClearFault via the RT executor's budgeted maintenance op, then TorqueOn via broker.
-                self.clock.advance(ms(20));
                 self.bus.with(|s| s.push_all_feedback());
                 let dl = armd::transport::DriverClock::now(&self.clock) + ms(200);
                 fx.core.clear_fault_executor(dl).expect("executor clear_fault_executor");
                 assert_eq!(*fx.core.safety.state(), SafetyState::Idle);
 
-                self.clock.advance(ms(20));
                 self.bus.with(|s| s.push_all_feedback());
                 let auth = fx.core.authority(&fx.ctx(fx.now()));
                 let id = *next_req;
@@ -182,7 +184,6 @@ impl DualRig {
                 let rep = fx.step();
                 assert!(rep.command.as_ref().is_some_and(|(_, r)| r.is_ok()), "TorqueOn: {rep:?}");
                 for _ in 0..5 {
-                    self.clock.advance(ms(20));
                     self.bus.with(|s| s.push_all_feedback());
                     fx.step();
                 }
@@ -640,13 +641,11 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
                 assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
             }
             RigOwner::Executor { fx, broker, next_req } => {
-                rig.clock.advance(ms(20));
                 rig.bus.with(|s| s.push_all_feedback());
                 let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
                 fx.core.clear_fault_executor(dl).expect("executor clear_fault_executor");
                 assert_eq!(*fx.core.safety.state(), SafetyState::Idle);
 
-                rig.clock.advance(ms(20));
                 rig.bus.with(|s| s.push_all_feedback());
                 let auth = fx.core.authority(&fx.ctx(fx.now()));
                 let id = *next_req;
@@ -668,7 +667,6 @@ fn dual_owner_stopped_hold_deferral_escalation_precedence_and_recovery() {
                     if fx.core.safety.state().is_operational() {
                         break;
                     }
-                    rig.clock.advance(ms(20));
                     rig.bus.with(|s| s.push_all_feedback());
                     fx.step();
                 }
@@ -1196,17 +1194,24 @@ fn profile_tx_budget_and_stall_ticks_validation() {
     let mut cfg = ArmConfig::rebot_dm();
     cfg.tx_budget_ms = Some(0);
     assert!(cfg.validate().is_err(), "tx_budget_ms = 0 must be rejected");
-    cfg.tx_budget_ms = Some(21); // > 20 ms control period at 50 Hz
-    assert!(cfg.validate().is_err(), "tx_budget_ms > period must be rejected");
-    cfg.control_frequency_hz = 200; // 5 ms period
-    cfg.tx_budget_ms = None; // omitted default (10 ms) exceeds 5 ms period -> must be rejected!
-    assert!(cfg.validate().is_err(), "200 Hz profile omitting tx_budget_ms (effective 10 ms > 5 ms) must be rejected");
+    cfg.tx_budget_ms = Some(11); // > period/2 (10 ms) at 50 Hz
+    assert!(cfg.validate().is_err(), "tx_budget_ms > period/2 (11 ms at 50 Hz) must be rejected");
+    cfg.tx_budget_ms = Some(10); // == period/2 (10 ms) at 50 Hz
+    assert!(cfg.validate().is_ok(), "tx_budget_ms = period/2 (10 ms at 50 Hz) must pass");
+    cfg.control_frequency_hz = 200; // 5 ms period -> period/2 = 2 ms
+    cfg.tx_budget_ms = None; // omitted default (10 ms) exceeds period/2 -> must be rejected!
+    assert!(cfg.validate().is_err(), "200 Hz profile omitting tx_budget_ms (effective 10 ms > 2 ms) must be rejected");
     cfg.tx_budget_ms = Some(10);
     assert!(cfg.validate().is_err(), "200 Hz profile with explicit tx_budget_ms = 10 must be rejected");
-    cfg.tx_budget_ms = Some(5);
-    assert!(cfg.validate().is_ok(), "200 Hz profile with tx_budget_ms = 5 must pass");
-    assert_eq!(cfg.damiao_tx_budget().max_duration, ms(5));
-    cfg.control_frequency_hz = 10; // 100 ms period, still capped by 45 ms frame max age
+    cfg.tx_budget_ms = Some(3);
+    assert!(cfg.validate().is_err(), "200 Hz profile with tx_budget_ms = 3 (> period/2 = 2 ms) must be rejected");
+    cfg.tx_budget_ms = Some(2);
+    assert!(cfg.validate().is_ok(), "200 Hz profile with tx_budget_ms = 2 (== period/2) must pass");
+    assert_eq!(cfg.damiao_tx_budget().max_duration, ms(2));
+    cfg.control_frequency_hz = 1000; // 1 ms period -> period/2 = 0 ms -> rejected
+    cfg.tx_budget_ms = Some(1);
+    assert!(cfg.validate().is_err(), "1000 Hz profile (period/2 < 1 ms) must be rejected");
+    cfg.control_frequency_hz = 10; // 100 ms period, period/2 = 50 ms, still capped by 45 ms frame max age
     cfg.tx_budget_ms = Some(46);
     assert!(cfg.validate().is_err(), "tx_budget_ms > 45 ms must be rejected");
     cfg.tx_budget_ms = Some(45);
@@ -1307,5 +1312,148 @@ fn dual_owner_can_tx_stalled_clear_check_requires_drained_tx_queue_and_fresh_fee
         rig.step();
         rig.clear_fault_and_enable();
         assert_eq!(rig.inner().safety.latched_fault_kinds(), 0);
+    }
+}
+
+/// Round-2 Item 1:
+/// The TX start-cutoff is bounded by `min(first_tx + tx_budget, release_deadline - margin)` on
+/// BOTH owners (Legacy and RT Executor), driven from ONE shared clock:
+/// 1. Executor `ReleaseFixture` and `FakeBus`/`DamiaoArmDriver` share the exact same clock instance.
+/// 2. When output starts late in a 20 ms release (+15 ms, with 10 ms `tx_budget_ms` and 2 ms
+///    publish margin), TX stops at `release_deadline - 2 ms` (+18 ms, sending only 3 of 7 frames at
+///    1 ms/frame) instead of running past the release, carries over the remaining 4 frames, and
+///    completes them cleanly on the next release with 0 faults.
+/// 3. When output starts at/past `release_deadline - 2 ms` (+19 ms), 0 frames start in that
+///    release and all 7 frames carry over cleanly to the next release.
+#[test]
+fn dual_owner_late_output_start_stops_tx_at_release_deadline_and_carries_over() {
+    assert_eq!(DAMIAO_TX_RELEASE_PUBLISH_MARGIN, ms(2));
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new(owner, base_cfg(), None);
+        if let RigOwner::Executor { fx, .. } = &rig.owner {
+            assert_eq!(fx.now(), rig.clock.now(), "executor and driver must share one clock");
+            rig.clock.advance(ms(5));
+            assert_eq!(fx.now(), rig.clock.now(), "advancing shared clock must advance executor clock identically");
+        }
+
+        // Part A: Output starts 15 ms into a 20 ms release (tx_budget = 10 ms, publish margin = 2 ms).
+        // Effective cutoff is min(15 + 10, 20 - 2) = 18 ms -> at 1 ms/frame, exactly 3 frames start
+        // (at 15, 16, 17 ms -> ending at 18 ms), and the remaining 4 frames carry over.
+        rig.bus.clear_log();
+        rig.bus.with(|s| {
+            s.tx_step = ms(1);
+            s.tx_spike_every = 0;
+            s.tx_spike_step = Duration::ZERO;
+            s.push_all_feedback();
+        });
+        let release_start = rig.clock.now();
+        let release_deadline = release_start + ms(20);
+        let cutoff = release_deadline - DAMIAO_TX_RELEASE_PUBLISH_MARGIN;
+        let tx_end_observed: std::time::Instant;
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                rig.clock.advance(ms(15));
+                inner.tick_with_release_deadline(DT, rig.clock.now(), release_deadline);
+                tx_end_observed = rig.clock.now();
+                rig.clock.advance(release_deadline.saturating_duration_since(rig.clock.now()));
+            }
+            RigOwner::Executor { fx, .. } => {
+                let late_clock = rig.clock.clone();
+                let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let armed_cb = Arc::clone(&armed);
+                fx.on_checkpoint(move |cp| {
+                    if cp == Checkpoint::BeforeOutput && armed_cb.swap(false, Ordering::SeqCst) {
+                        late_clock.advance(ms(15));
+                    }
+                });
+                fx.dt = DT;
+                // Record the exact clock after `advance_output` via bus tx timestamping:
+                // 3 frames × 1 ms starting at +15 ms finishes at +18 ms (never past cutoff).
+                fx.step();
+                // Re-clear hook for subsequent releases.
+                fx.on_checkpoint(|_| {});
+                tx_end_observed = release_start + ms(15) + ms(rig.bus.tx_log().len() as u64);
+                assert_eq!(fx.now(), release_deadline, "Executor release must end cleanly on release_deadline");
+            }
+        }
+        let sent_late = rig.bus.tx_log();
+        assert_eq!(
+            sent_late.len(),
+            3,
+            "{owner:?}: late output start (+15 ms in 20 ms release, 2 ms margin) must stop after 3 frames, sent {:?}",
+            sent_late.iter().map(|f| f.id).collect::<Vec<_>>()
+        );
+        assert!(
+            tx_end_observed <= cutoff,
+            "{owner:?}: TX must stop at release_deadline - margin ({cutoff:?}), observed {tx_end_observed:?}"
+        );
+        assert_eq!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_motion_tx_len(),
+            4,
+            "{owner:?}: remaining 4 frames must carry over in pending_tx"
+        );
+        assert!(rig.inner().safety.state().is_operational(), "{owner:?}: single late release must not fault");
+
+        // Next on-time release drains all 4 carried-over frames + fresh batch cleanly!
+        rig.bus.clear_log();
+        rig.bus.with(|s| s.tx_step = Duration::ZERO);
+        rig.step();
+        assert_eq!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_motion_tx_len(),
+            0,
+            "{owner:?}: next on-time release must drain carried-over frames"
+        );
+        assert!(rig.inner().safety.state().is_operational(), "{owner:?}: recovery release must stay operational");
+
+        // Part B: Output starts at +19 ms (past release_deadline - 2 ms = +18 ms) ->
+        // 0 frames start in that release, all 7 frames carry over, next release drains all 7 cleanly.
+        rig.bus.clear_log();
+        rig.bus.with(|s| {
+            s.tx_step = ms(1);
+            s.push_all_feedback();
+        });
+        let release2_start = rig.clock.now();
+        let release2_deadline = release2_start + ms(20);
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                rig.clock.advance(ms(19));
+                inner.tick_with_release_deadline(DT, rig.clock.now(), release2_deadline);
+                rig.clock.advance(release2_deadline.saturating_duration_since(rig.clock.now()));
+            }
+            RigOwner::Executor { fx, .. } => {
+                let late_clock = rig.clock.clone();
+                let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let armed_cb = Arc::clone(&armed);
+                fx.on_checkpoint(move |cp| {
+                    if cp == Checkpoint::BeforeOutput && armed_cb.swap(false, Ordering::SeqCst) {
+                        late_clock.advance(ms(19));
+                    }
+                });
+                fx.dt = DT;
+                fx.step();
+                fx.on_checkpoint(|_| {});
+            }
+        }
+        assert_eq!(
+            rig.bus.tx_log().len(),
+            0,
+            "{owner:?}: output starting past release_deadline - margin must transmit 0 frames"
+        );
+        assert_eq!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_motion_tx_len(),
+            7,
+            "{owner:?}: all 7 frames must carry over when output starts past TX cutoff"
+        );
+        assert!(rig.inner().safety.state().is_operational());
+
+        rig.bus.clear_log();
+        rig.bus.with(|s| s.tx_step = Duration::ZERO);
+        rig.step();
+        assert_eq!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_motion_tx_len(),
+            0
+        );
+        assert_eq!(rig.bus.tx_log().len(), 7);
+        assert!(rig.inner().safety.state().is_operational());
     }
 }

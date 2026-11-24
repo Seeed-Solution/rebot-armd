@@ -1637,7 +1637,17 @@ impl SupervisorInner {
     /// other write can come in between). No allocation in a steady-state tick; `keep` copies
     /// the observation for the caller (tests).
     pub fn tick_publish(&mut self, dt: f64, generation: u64, keep: bool) -> TickPublished {
-        let timestamp = self.tick_control(dt);
+        self.tick_publish_with_deadline(dt, generation, keep, None)
+    }
+
+    pub(crate) fn tick_publish_with_deadline(
+        &mut self,
+        dt: f64,
+        generation: u64,
+        keep: bool,
+        release_bound: Option<(Instant, Instant)>,
+    ) -> TickPublished {
+        let timestamp = self.tick_control_inner(dt, release_bound);
         self.publish_at(timestamp, generation, keep)
     }
 
@@ -2963,6 +2973,28 @@ impl SupervisorInner {
         }
     }
 
+    /// Publication margin reserved at the end of a control release when bounding per-tick CAN TX
+    /// (`DAMIAO_TX_RELEASE_PUBLISH_MARGIN`, capped to `period / 2` for sub-4 ms control periods).
+    pub(crate) fn tx_release_publish_margin(&self) -> Duration {
+        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+        crate::driver::DAMIAO_TX_RELEASE_PUBLISH_MARGIN.min(period / 2)
+    }
+
+    /// Translates an executor/caller `(now, release_deadline)` pair into the absolute driver-clock
+    /// TX start-cutoff `drv_now + (release_deadline - now - margin)`.
+    pub(crate) fn driver_tx_release_cap(
+        &self,
+        drv_now: Instant,
+        now: Instant,
+        release_deadline: Instant,
+    ) -> Instant {
+        let margin = self.tx_release_publish_margin();
+        let remaining = release_deadline
+            .saturating_duration_since(now)
+            .saturating_sub(margin);
+        drv_now + remaining
+    }
+
     /// One control tick and its observation ([`Self::tick_control`], then
     /// [`Self::current_observation`] at the tick's timestamp).
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
@@ -2970,6 +3002,69 @@ impl SupervisorInner {
         let mut obs = ArmObservation::blank();
         self.fill_observation(timestamp, &mut obs);
         obs
+    }
+
+    /// [`Self::tick`] bounded by an explicit control release deadline (`now`, `release_deadline`)
+    /// so TX start-cutoffs never run past `release_deadline - publish_margin`.
+    pub fn tick_with_release_deadline(
+        &mut self,
+        dt: f64,
+        now: Instant,
+        release_deadline: Instant,
+    ) -> ArmObservation {
+        let timestamp = self.tick_control_with_deadline(dt, now, release_deadline);
+        let mut obs = ArmObservation::blank();
+        self.fill_observation(timestamp, &mut obs);
+        obs
+    }
+
+    /// Shared Step-2 hardware poll implementation for [`crate::rt_core::ops::CoreOps::poll_hardware`]
+    /// and [`crate::rt_core::ops::CoreOps::poll_hardware_for_release`].
+    pub(crate) fn poll_hardware_with_release_deadline(
+        &mut self,
+        budget: &crate::rt_core::ops::ServiceBudget,
+        release_deadline: Option<Instant>,
+    ) -> crate::rt_core::ops::HardwarePoll {
+        let was_torqued_or_disabling = self.is_torqued || self.disable_pending;
+        let trans = self.service_torque_transition(budget);
+        let transition_rx = if let Some(tp) = trans {
+            self.core.begin_transition(tp.progress);
+            tp.rx
+        } else {
+            self.service_background_disable(budget)
+        };
+        let rx = self.poll_hardware_rx(Some(budget), transition_rx, release_deadline);
+        let rx_frames = rx.rx_frames;
+        let rx_exhausted = rx.budget_exhausted;
+        self.pending_rx_poll = rx;
+        // Run thermal protection BEFORE consuming background disable confirmation and before
+        // Step 2b maintenance (`ClearFault`/`RequestShutdown`) or Step 3 command admission so an
+        // over-temperature sample arriving on the same poll as confirmed disable cannot suppress
+        // `ThermalTrip`.
+        self.check_thermal_protection(was_torqued_or_disabling);
+        let _ = self.confirm_background_disable_if_ready();
+        let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
+        let Some(driver) = self.driver.as_ref() else {
+            return crate::rt_core::ops::HardwarePoll {
+                driverless: true,
+                rx_frames,
+                budget_exhausted,
+                torque: self.core.poll_transition(),
+                ..crate::rt_core::ops::HardwarePoll::default()
+            };
+        };
+        let d = driver.lock().unwrap_or_else(|e| e.into_inner());
+        d.feedback_ages_into(&mut self.scratch.ages);
+        let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+        crate::rt_core::ops::HardwarePoll {
+            driverless: false,
+            feedback_valid: d.is_feedback_valid(),
+            enable_state: Some(d.enable_state()),
+            oldest_feedback_age: oldest,
+            rx_frames,
+            budget_exhausted,
+            torque: self.core.poll_transition(),
+        }
     }
 
     /// Single-pass hardware receive + feedback intake.
@@ -2982,6 +3077,7 @@ impl SupervisorInner {
         &mut self,
         budget: Option<&crate::rt_core::ops::ServiceBudget>,
         transition_rx: Option<(u16, bool)>,
+        release_deadline: Option<Instant>,
     ) -> PendingRxPoll {
         let mut out = PendingRxPoll { active: true, ..PendingRxPoll::default() };
         let mut new_motor_errors = None;
@@ -2991,6 +3087,14 @@ impl SupervisorInner {
             self.feedback_numeric_valid = false;
             match d.lock() {
                 Ok(mut driver) => {
+                    let applied_step2_tx_cap = if let (Some(b), Some(rd)) = (budget, release_deadline) {
+                        let drv_now = driver.clock_now();
+                        let cap = self.driver_tx_release_cap(drv_now, b.now, rd);
+                        driver.set_tx_release_deadline(Some(cap));
+                        true
+                    } else {
+                        false
+                    };
                     let read_res = match (budget, transition_rx) {
                         (Some(b), Some((frames, exhausted))) => {
                             if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
@@ -3015,6 +3119,9 @@ impl SupervisorInner {
                         }
                         (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
                     };
+                    if applied_step2_tx_cap {
+                        driver.set_tx_release_deadline(None);
+                    }
                     match read_res {
                         Ok((frames, exhausted)) => {
                             out.rx_frames = frames;
@@ -3149,6 +3256,34 @@ impl SupervisorInner {
     /// timestamp (the recording sample's). The control loop fills its published sample with
     /// [`Self::fill_observation`] at this timestamp.
     pub fn tick_control(&mut self, dt: f64) -> f64 {
+        self.tick_control_inner(dt, None)
+    }
+
+    /// [`Self::tick_control`] bounded by an explicit control release deadline (`now`,
+    /// `release_deadline`) so TX start-cutoffs never run past `release_deadline - publish_margin`.
+    pub fn tick_control_with_deadline(&mut self, dt: f64, now: Instant, release_deadline: Instant) -> f64 {
+        self.tick_control_inner(dt, Some((now, release_deadline)))
+    }
+
+    fn tick_control_inner(&mut self, dt: f64, release_bound: Option<(Instant, Instant)>) -> f64 {
+        let applied_tx_cap = if let Some(ref d) = self.driver {
+            if let Ok(mut drv) = d.lock() {
+                let drv_now = drv.clock_now();
+                let cap = match release_bound {
+                    Some((now, release_deadline)) => self.driver_tx_release_cap(drv_now, now, release_deadline),
+                    None => {
+                        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+                        drv_now + period.saturating_sub(self.tx_release_publish_margin())
+                    }
+                };
+                drv.set_tx_release_deadline(Some(cap));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         self.consume_pending_estop();
         // Immediate atomic e-stop latch check before any processing (only latches once when not yet recorded;
         // every new E-stop request arrives via `consume_pending_estop` above and advances the epoch).
@@ -3163,7 +3298,7 @@ impl SupervisorInner {
         let rx = if self.pending_rx_poll.active {
             std::mem::take(&mut self.pending_rx_poll)
         } else {
-            self.poll_hardware_rx(None, None)
+            self.poll_hardware_rx(None, None, None)
         };
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
@@ -5028,6 +5163,14 @@ impl SupervisorInner {
             }
         }
 
+        if applied_tx_cap {
+            if let Some(ref d) = self.driver {
+                if let Ok(mut drv) = d.lock() {
+                    drv.set_tx_release_deadline(None);
+                }
+            }
+        }
+
         timestamp
     }
 }
@@ -6307,7 +6450,14 @@ impl ArmSupervisor {
             inner.tick_phases_us = [0; 5];
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
-            let TickPublished { kept, body_end } = inner.tick_publish(dt, generation, keep);
+            let period = Duration::from_secs_f64(1.0 / f64::from(inner.config.control_frequency_hz.max(1)));
+            let release_deadline = started + period;
+            let TickPublished { kept, body_end } = inner.tick_publish_with_deadline(
+                dt,
+                generation,
+                keep,
+                Some((body_start, release_deadline)),
+            );
             let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
             inner.defer_zero_check_persist = false;

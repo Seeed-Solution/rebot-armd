@@ -1993,11 +1993,19 @@ impl ArmConfig {
         }
         {
             let period_ms = (1000 / u64::from(self.control_frequency_hz.max(1))).max(1);
-            let max_ms = period_ms.min(45);
+            let half_period_ms = period_ms / 2;
+            let max_ms = half_period_ms.min(45);
+            if max_ms == 0 {
+                return Err(format!(
+                    "control_frequency_hz ({}) has period {period_ms} ms; half control period is < 1 ms for tx_budget_ms",
+                    self.control_frequency_hz
+                ));
+            }
             let ms = self.resolved_tx_budget_ms();
             if ms == 0 || ms > max_ms {
                 return Err(format!(
-                    "effective tx_budget_ms ({ms} ms) must be in 1..={max_ms} (control period {period_ms} ms, frame max age 45 ms)"
+                    "effective tx_budget_ms ({ms} ms) must be in 1..={max_ms} (tx_budget_ms <= period/2 = {half_period_ms} ms at {} Hz, frame max age 45 ms)",
+                    self.control_frequency_hz
                 ));
             }
         }
