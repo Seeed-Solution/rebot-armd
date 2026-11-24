@@ -8,7 +8,7 @@ use super::config_iface::{ConfigDomain, ConfigHold, HeldConfig};
 use super::mailbox::TargetAuthority;
 use super::ops::TorqueProgress;
 use super::ids::{ArmId, BusId};
-use super::publish::{state_channel, ObservationSpares, RtInputs, StateHub, StatePublisher};
+use super::publish::{state_channel, ObservationSpares, RtInputs, RtMotionMeta, StateHub, StatePublisher};
 use super::record_ring::{Fence, Finished, RecordProducer, RecordRing};
 use crate::driver::ArmDriver;
 use crate::model::ArmObservation;
@@ -190,9 +190,31 @@ impl ArmCore {
     /// nothing is displaced, so the tick never frees an observation (whatever the readers
     /// and the retire ring do).
     pub fn publish(&mut self, buffer: ObservationBuffer, generation: u64, sampled_at: Instant, valid_until: Instant, positions: &[f32], velocities: &[f32]) {
+        self.publish_with_motion(buffer, generation, sampled_at, valid_until, positions, velocities, &[], RtMotionMeta::default());
+    }
+
+    /// Publishes one tick's observation alongside `commanded_velocities` and motion metadata (0 alloc).
+    pub fn publish_with_motion(
+        &mut self,
+        buffer: ObservationBuffer,
+        generation: u64,
+        sampled_at: Instant,
+        valid_until: Instant,
+        positions: &[f32],
+        velocities: &[f32],
+        commanded_velocities: &[f32],
+        meta: RtMotionMeta,
+    ) {
         self.buffer_out = false;
         self.publisher.restore_back_spares(buffer.1);
-        let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
+        let rt = RtInputs {
+            positions,
+            velocities,
+            commanded_velocities,
+            feedback_instants: &self.feedback.instants,
+            feedback_seqs: &self.feedback.seqs,
+            meta,
+        };
         let displaced = self.publisher.publish(generation, sampled_at, valid_until, buffer.0, rt);
         // the slot was emptied by take_observation_buffer and nothing wrote it since
         debug_assert!(displaced.is_none(), "an in-place publication displaced an observation");
@@ -207,7 +229,14 @@ impl ArmCore {
     #[allow(clippy::result_large_err)]
     pub fn publish_displacing(&mut self, generation: u64, sampled_at: Instant, valid_until: Instant, obs: ArmObservation, positions: &[f32], velocities: &[f32]) -> Result<Option<ArmObservation>, ArmObservation> {
         if self.buffer_out { return Err(obs); }
-        let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
+        let rt = RtInputs {
+            positions,
+            velocities,
+            commanded_velocities: &[],
+            feedback_instants: &self.feedback.instants,
+            feedback_seqs: &self.feedback.seqs,
+            meta: RtMotionMeta::default(),
+        };
         Ok(self.publisher.publish(generation, sampled_at, valid_until, obs, rt))
     }
 

@@ -45,15 +45,35 @@ pub struct SampleMeta {
     pub valid_until: Instant,
 }
 
-/// Per-joint feedback of a sample; every vector has the profile's dof.
+/// Scalar motion/authority metadata published alongside [`RtSample`] (Copy, 0 alloc on RT).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RtMotionMeta {
+    pub workspace_revision: u64,
+    pub motion_config_revision: u64,
+    pub stop_generation: u64,
+    pub lease_generation: u64,
+    pub config_inhibited: bool,
+    pub calibration_busy: bool,
+    pub holding_after_clear: bool,
+}
+
+/// Per-joint feedback and motion-planning state of a sample; every vector has the profile's dof.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RtSample {
     pub positions: Vec<f32>,
     pub velocities: Vec<f32>,
+    pub commanded_velocities: Vec<f32>,
     /// Hardware receive instant of each joint's latest feedback.
     pub feedback_instants: Vec<Option<Instant>>,
     /// Per-joint count of distinct feedback samples.
     pub feedback_seqs: Vec<u64>,
+    pub workspace_revision: u64,
+    pub motion_config_revision: u64,
+    pub stop_generation: u64,
+    pub lease_generation: u64,
+    pub config_inhibited: bool,
+    pub calibration_busy: bool,
+    pub holding_after_clear: bool,
 }
 
 impl RtSample {
@@ -61,8 +81,16 @@ impl RtSample {
         Self {
             positions: Vec::with_capacity(dof),
             velocities: Vec::with_capacity(dof),
+            commanded_velocities: Vec::with_capacity(dof),
             feedback_instants: Vec::with_capacity(dof),
             feedback_seqs: Vec::with_capacity(dof),
+            workspace_revision: 0,
+            motion_config_revision: 0,
+            stop_generation: 0,
+            lease_generation: 0,
+            config_inhibited: false,
+            calibration_busy: false,
+            holding_after_clear: false,
         }
     }
 
@@ -182,8 +210,10 @@ pub struct StatePublisher {
 pub struct RtInputs<'a> {
     pub positions: &'a [f32],
     pub velocities: &'a [f32],
+    pub commanded_velocities: &'a [f32],
     pub feedback_instants: &'a [Option<Instant>],
     pub feedback_seqs: &'a [u64],
+    pub meta: RtMotionMeta,
 }
 
 impl StatePublisher {
@@ -206,8 +236,16 @@ impl StatePublisher {
         if displaced.is_some() { self.hub.tick_frees.fetch_add(1, Ordering::Relaxed); }
         copy_into(&mut slot.rt.positions, rt.positions);
         copy_into(&mut slot.rt.velocities, rt.velocities);
+        copy_into(&mut slot.rt.commanded_velocities, rt.commanded_velocities);
         copy_into(&mut slot.rt.feedback_instants, rt.feedback_instants);
         copy_into(&mut slot.rt.feedback_seqs, rt.feedback_seqs);
+        slot.rt.workspace_revision = rt.meta.workspace_revision;
+        slot.rt.motion_config_revision = rt.meta.motion_config_revision;
+        slot.rt.stop_generation = rt.meta.stop_generation;
+        slot.rt.lease_generation = rt.meta.lease_generation;
+        slot.rt.config_inhibited = rt.meta.config_inhibited;
+        slot.rt.calibration_busy = rt.meta.calibration_busy;
+        slot.rt.holding_after_clear = rt.meta.holding_after_clear;
         let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();
@@ -317,6 +355,8 @@ pub struct StateHub {
     /// Pre-sized observation template recorded at executor startup so a contended reader warms
     /// its own `front` slot off-thread before handing it back to the RT producer.
     prewarm_template: OnceLock<Box<ArmObservation>>,
+    /// Immutable motion planning config snapshot updated off-tick for zero-lock workers.
+    motion_config: std::sync::RwLock<Option<Arc<super::requests::motion::MotionConfigSnapshot>>>,
 }
 
 /// A publisher for an arm with `dof` joints and its hub.
@@ -337,6 +377,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         retire: RetireRing::new(),
         tick_frees: AtomicU64::new(0),
         prewarm_template: OnceLock::new(),
+        motion_config: std::sync::RwLock::new(None),
     });
     (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
 }
@@ -426,6 +467,16 @@ impl StateHub {
     }
 
     pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+
+    /// Publishes an immutable motion planning config snapshot off the RT tick.
+    pub fn set_motion_config(&self, cfg: Arc<super::requests::motion::MotionConfigSnapshot>) {
+        *self.motion_config.write().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
+    }
+
+    /// Reads the latest immutable motion planning config snapshot without touching the owner lock.
+    pub fn motion_config(&self) -> Option<Arc<super::requests::motion::MotionConfigSnapshot>> {
+        self.motion_config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 #[cfg(test)]
@@ -440,7 +491,7 @@ mod tests {
     }
 
     fn inputs<'a>(p: &'a [f32], s: &'a [u64], i: &'a [Option<Instant>]) -> RtInputs<'a> {
-        RtInputs { positions: p, velocities: p, feedback_instants: i, feedback_seqs: s }
+        RtInputs { positions: p, velocities: p, commanded_velocities: p, feedback_instants: i, feedback_seqs: s, meta: RtMotionMeta::default() }
     }
 
     #[test]
@@ -491,8 +542,9 @@ mod tests {
         let (mut publisher, hub) = state_channel(3);
         let now = Instant::now();
         publisher.publish(1, now, now, obs(0.0), RtInputs {
-            positions: &[1.0, 2.0, 3.0], velocities: &[0.1, 0.2, 0.3],
+            positions: &[1.0, 2.0, 3.0], velocities: &[0.1, 0.2, 0.3], commanded_velocities: &[0.0, 0.0, 0.0],
             feedback_instants: &[Some(now), None, Some(now)], feedback_seqs: &[5, 6, 7],
+            meta: RtMotionMeta::default(),
         });
         let (p, v, i, s) = hub.latest().unwrap().rt.arm_feedback(&[0, 2]);
         assert_eq!((p, v, i, s), (vec![1.0, 2.0, 3.0], vec![0.1, 0.3], vec![Some(now), Some(now)], vec![5, 7]));

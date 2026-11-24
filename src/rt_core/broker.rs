@@ -224,6 +224,12 @@ pub enum TransitionOp {
 pub enum CommandKind {
     /// Install the primitive of a plan slot; starts an action (a terminal reply follows the ACK).
     Install { plan: PlanHandle },
+    /// Install a prepared home motion from a plan slot; starts a `home` action.
+    InstallHome { plan: PlanHandle },
+    /// Install a prepared park motion (or `holding_after_clear` park rearm); starts a `park` action.
+    InstallPark { plan: PlanHandle },
+    /// Attach a prepared park continuation trajectory to an existing `park` action (ACK/Refused only).
+    ContinuePark { plan: PlanHandle },
     /// A command without a plan; ACK or refusal only.
     Immediate(ImmediateOp),
     /// Start a driver transition; a terminal reply follows the ACK.
@@ -231,9 +237,21 @@ pub enum CommandKind {
 }
 
 impl CommandKind {
-    /// A terminal reply follows the ACK (an install or a transition).
-    pub fn starts_action(&self) -> bool { matches!(self, Self::Install { .. } | Self::Transition(_)) }
-    pub fn plan(&self) -> Option<PlanHandle> { match self { Self::Install { plan } => Some(*plan), _ => None } }
+    /// True for action-installing commands that supersede and own `ReleaseEngine::active`.
+    pub fn is_install(&self) -> bool {
+        matches!(self, Self::Install { .. } | Self::InstallHome { .. } | Self::InstallPark { .. })
+    }
+    /// A terminal reply follows the ACK (an action install or a transition).
+    pub fn starts_action(&self) -> bool { self.is_install() || matches!(self, Self::Transition(_)) }
+    pub fn plan(&self) -> Option<PlanHandle> {
+        match self {
+            Self::Install { plan }
+            | Self::InstallHome { plan }
+            | Self::InstallPark { plan }
+            | Self::ContinuePark { plan } => Some(*plan),
+            _ => None,
+        }
+    }
 }
 
 /// One entry of the command ring.
@@ -598,6 +616,9 @@ struct Pending {
 /// What a command asks for, with the plan to stage for an install.
 pub enum Submit<'a, P> {
     Install(&'a dyn Fn(&mut P)),
+    InstallHome(&'a dyn Fn(&mut P)),
+    InstallPark(&'a dyn Fn(&mut P)),
+    ContinuePark(&'a dyn Fn(&mut P)),
     Immediate(ImmediateOp),
     Transition(TransitionOp),
 }
@@ -722,7 +743,10 @@ impl<P> Broker<P> {
             self.stats.refused_admission += 1;
             return Err(AdmitError::Disconnected);
         }
-        let terminal = matches!(what, Submit::Install(_) | Submit::Transition(_));
+        let terminal = matches!(
+            what,
+            Submit::Install(_) | Submit::InstallHome(_) | Submit::InstallPark(_) | Submit::Transition(_)
+        );
         let need = 1 + usize::from(terminal);
         let refused = if self.commands.slots() == 0 { Some(AdmitError::CommandsFull) }
             else if self.reserved + need > self.reply_capacity { Some(AdmitError::RepliesFull) }
@@ -739,6 +763,27 @@ impl<P> Broker<P> {
                     return Err(AdmitError::PlansFull);
                 }
             },
+            Submit::InstallHome(write) => match self.plans.stage(write) {
+                Some(plan) => CommandKind::InstallHome { plan },
+                None => {
+                    self.stats.refused_admission += 1;
+                    return Err(AdmitError::PlansFull);
+                }
+            },
+            Submit::InstallPark(write) => match self.plans.stage(write) {
+                Some(plan) => CommandKind::InstallPark { plan },
+                None => {
+                    self.stats.refused_admission += 1;
+                    return Err(AdmitError::PlansFull);
+                }
+            },
+            Submit::ContinuePark(write) => match self.plans.stage(write) {
+                Some(plan) => CommandKind::ContinuePark { plan },
+                None => {
+                    self.stats.refused_admission += 1;
+                    return Err(AdmitError::PlansFull);
+                }
+            },
             Submit::Immediate(op) => CommandKind::Immediate(op),
             Submit::Transition(op) => CommandKind::Transition(op),
         };
@@ -747,7 +792,7 @@ impl<P> Broker<P> {
         let d = Descriptor { stamp: Stamp { arm: self.arm, boot: self.boot, request, client, client_seq, authority, deadline }, kind };
         if self.commands.push(d).is_err() {
             // single producer and slots() > 0 above: unreachable; keep it side-effect free
-            if let CommandKind::Install { plan } = kind { self.plans.unpublish(plan); }
+            if let Some(plan) = kind.plan() { self.plans.unpublish(plan); }
             self.stats.refused_admission += 1;
             return Err(AdmitError::CommandsFull);
         }
@@ -900,7 +945,10 @@ impl<P> Taken<'_, P> {
         intake.reply(Reply::Ack { request, commit_seq, action: committed.action() });
         let installed = match (terminal, committed.action()) {
             (true, Some(action)) => { intake.installed += 1; Some(Installed { request, plan: self.d.kind.plan(), action }) }
-            _ => None,
+            _ => {
+                if let Some(plan) = self.d.kind.plan() { intake.plans.retire(plan); }
+                None
+            }
         };
         Ok(Acked { commit_seq, installed })
     }
@@ -921,7 +969,10 @@ impl<P> Taken<'_, P> {
         let reply = Reply::Ack { request, commit_seq, action: committed.action() };
         let installed = match (terminal, committed.action()) {
             (true, Some(action)) => { intake.installed += 1; Some(Installed { request, plan: self.d.kind.plan(), action }) }
-            _ => None,
+            _ => {
+                if let Some(plan) = self.d.kind.plan() { intake.plans.retire(plan); }
+                None
+            }
         };
         Ok((Acked { commit_seq, installed }, reply))
     }
@@ -931,7 +982,7 @@ impl<P> Taken<'_, P> {
 
     fn refuse_now(&mut self, code: &'static str) {
         self.answered = true;
-        if let CommandKind::Install { plan } = self.d.kind { self.intake.plans.retire(plan); }
+        if let Some(plan) = self.d.kind.plan() { self.intake.plans.retire(plan); }
         let request = self.d.stamp.request;
         self.intake.reply(Reply::Refused { request, code });
     }

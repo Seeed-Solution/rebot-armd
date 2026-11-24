@@ -2419,8 +2419,26 @@ impl SupervisorInner {
         if let Some(ref hook) = self.before_publish_hook {
             hook();
         }
-        let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
-        core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
+        let meta = crate::rt_core::publish::RtMotionMeta {
+            workspace_revision: self.workspace_revision,
+            motion_config_revision: self.motion_config_revision,
+            stop_generation: self.current_stop_gen(),
+            lease_generation: self.current_active_lease_gen(),
+            config_inhibited: self.core.motion_inhibited_by_config(),
+            calibration_busy: self.calibration_busy,
+            holding_after_clear: self.holding_after_clear(),
+        };
+        let SupervisorInner { core, measured_positions, measured_velocities, commanded_velocities, .. } = self;
+        core.publish_with_motion(
+            obs,
+            generation,
+            sampled_at,
+            valid_until,
+            measured_positions,
+            measured_velocities,
+            commanded_velocities,
+            meta,
+        );
         TickPublished { kept, body_end }
     }
 
@@ -4010,9 +4028,16 @@ impl SupervisorInner {
         let applied_step2_tx_cap = release_deadline
             .is_some_and(|rd| self.install_driver_tx_release_cap(budget.now, rd));
         let trans = self.service_torque_transition(budget);
+        let mut park_wake = None;
+        let mut park_state_changed = false;
         let transition_rx = if let Some(tp) = trans {
             if tp.broker_owned {
                 self.core.begin_transition(tp.progress);
+            } else {
+                match tp.progress {
+                    Ok(crate::rt_core::ops::TorqueProgress::Pending { wake }) => park_wake = Some(wake),
+                    Ok(crate::rt_core::ops::TorqueProgress::Done) | Err(_) => park_state_changed = true,
+                }
             }
             tp.rx
         } else {
@@ -4038,6 +4063,8 @@ impl SupervisorInner {
                 rx_frames,
                 budget_exhausted,
                 torque: self.core.poll_transition(),
+                park_wake,
+                park_state_changed,
                 ..crate::rt_core::ops::HardwarePoll::default()
             };
         };
@@ -4052,6 +4079,8 @@ impl SupervisorInner {
             rx_frames,
             budget_exhausted,
             torque: self.core.poll_transition(),
+            park_wake,
+            park_state_changed,
         }
     }
 
@@ -7046,6 +7075,9 @@ impl ArmSupervisor {
         Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
         guard.safety.drain_retired_state_arcs_off_thread();
         guard.prepare_workspace_eval_bufs();
+        guard.core.hub().set_motion_config(Arc::new(
+            crate::rt_core::requests::motion::MotionConfigSnapshot::from_supervisor(&guard),
+        ));
 
         let initial_gen = self.inner.generation();
         let shell = SupervisorInner::detached_shell(

@@ -54,7 +54,7 @@ pub struct Committed {
 }
 
 impl Committed {
-    fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
+    pub(super) fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
 
     /// The request whose command was committed.
     pub fn request(&self) -> RequestId { self.request }
@@ -189,11 +189,12 @@ impl PreparedPath {
     }
 }
 
-/// One plan slot: the primitive and the prepared path a [`Primitive::Prepared`] reads.
+/// One plan slot: the primitive, optional prepared path, and optional `Copy` prepared motion plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanSlot {
     pub primitive: Primitive,
     pub path: PreparedPath,
+    pub motion: Option<super::requests::motion::PreparedMotionSlot>,
 }
 
 impl Default for PlanSlot {
@@ -202,22 +203,25 @@ impl Default for PlanSlot {
 }
 
 impl PlanSlot {
-    pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+    pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n), motion: None } }
 
     /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
     pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
-    /// Stages a primitive that reads no path (the path is cleared).
+    /// Stages a primitive that reads no path (the path and prepared motion slot are cleared).
     pub fn set(&mut self, p: Primitive) {
         self.primitive = p;
         self.path.clear();
+        self.motion = None;
     }
 
     /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
     pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
         self.primitive = Primitive::None;
+        self.motion = None;
         self.path.copy_from(&other.path)?;
         self.primitive = other.primitive;
+        self.motion = other.motion;
         Ok(())
     }
 }
@@ -428,12 +432,22 @@ pub struct HardwarePoll {
     /// The driver transition in flight (None: none): progress, or its failure code (the
     /// transition's terminal is `Failed(code)`).
     pub torque: Option<Result<TorqueProgress, &'static str>>,
+    /// Sub-release wake for an internal park transition (`ParkRearm` or `Park` disable);
+    /// separate from `torque` so broker `ReleaseEngine::transition` stays isolated.
+    pub park_wake: Option<Instant>,
+    /// True when a park `ParkRearm` or `Park` disable transition finished on this poll,
+    /// requiring a Step-6 / sub-release publication.
+    pub park_state_changed: bool,
 }
 
 impl HardwarePoll {
-    /// When the bus owner wants to be serviced before the next release (a pending transition).
+    /// When the bus owner wants to be serviced before the next release (a pending broker or park transition).
     pub fn wake(&self) -> Option<Instant> {
-        match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None }
+        let torque_wake = match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None };
+        match (torque_wake, self.park_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The executor's extra service within the release ending at `release`: the pending
@@ -457,6 +471,22 @@ pub trait CoreOps {
     fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot;
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Installs an off-lock prepared jog (`PreparedMotionSlot`) for `d` with zero RT planning.
+    fn commit_install_slot(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared `home` motion (`PreparedMotionSlot`) for `d`.
+    fn commit_home(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared `park` motion (or `holding_after_clear` rearm) for `d`.
+    fn commit_park(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
+    /// Installs an off-lock prepared continuation trajectory onto an existing deferred `park` action.
+    fn commit_park_continuation(&mut self, _d: &Descriptor, _slot: &super::requests::motion::PreparedMotionSlot, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     /// Installs a [`Primitive::Prepared`] with its slot's `path` after rechecking its stamp
     /// (as `commit_primitive`); no IK and no file I/O. Default: `UNSUPPORTED`.
@@ -723,6 +753,10 @@ impl SupervisorInner {
         Ok(())
     }
 
+    pub(crate) fn check_commit_for_motion(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_commit(d, ctx)
+    }
+
     /// Stop-direction variant of [`Self::check_commit`]: exempt from `stop_generation` checks
     /// so an authorized Stop never blocks a queued torque disable.
     fn check_commit_stop_direction(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
@@ -813,6 +847,22 @@ impl CoreOps for SupervisorInner {
                     .map_err(static_code)
             }
         }
+    }
+
+    fn commit_install_slot(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_install_slot(self, d, slot, ctx)
+    }
+
+    fn commit_home(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_home(self, d, slot, ctx)
+    }
+
+    fn commit_park(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_park(self, d, slot, ctx)
+    }
+
+    fn commit_park_continuation(&mut self, d: &Descriptor, slot: &super::requests::motion::PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        super::requests::motion::commit_park_continuation(self, d, slot, ctx)
     }
 
     fn commit_prepared(&mut self, d: &Descriptor, primitive: &Primitive, path: &PreparedPath, ctx: &CommitCtx) -> Result<Committed, &'static str> {
@@ -1099,16 +1149,33 @@ impl CoreOps for SupervisorInner {
 
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
         let trans = self.service_torque_transition(budget);
+        let mut park_wake = None;
+        let mut park_state_changed = false;
         let (rx_frames, trans_exhausted) = match trans {
             Some(tp) => {
-                self.core.begin_transition(tp.progress);
+                if tp.broker_owned {
+                    self.core.begin_transition(tp.progress);
+                } else {
+                    match tp.progress {
+                        Ok(TorqueProgress::Pending { wake }) => park_wake = Some(wake),
+                        Ok(TorqueProgress::Done) | Err(_) => park_state_changed = true,
+                    }
+                }
                 tp.rx.unwrap_or((0, false))
             }
             None => (0, false),
         };
         let budget_exhausted = budget.now > budget.deadline || trans_exhausted;
         let Some(driver) = self.driver.as_ref() else {
-            return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };
+            return HardwarePoll {
+                driverless: true,
+                rx_frames,
+                budget_exhausted,
+                torque: self.core.poll_transition(),
+                park_wake,
+                park_state_changed,
+                ..HardwarePoll::default()
+            };
         };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
         d.feedback_ages_into(&mut self.scratch.ages);
@@ -1121,6 +1188,8 @@ impl CoreOps for SupervisorInner {
             rx_frames,
             budget_exhausted,
             torque: self.core.poll_transition(),
+            park_wake,
+            park_state_changed,
         }
     }
 
@@ -1532,18 +1601,34 @@ impl ReleaseEngine {
             let result = match d.kind {
                 CommandKind::Install { .. } => match t.plan() {
                     None => Err("PLAN_RETIRED"),
+                    Some(slot) if slot.motion.is_some() => {
+                        let m = slot.motion.expect("checked is_some");
+                        core.commit_install_slot(&d, &m, &ctx)
+                    }
                     Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
                         Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
                         None => Err("PLAN_RETIRED"),
                     },
                     Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
+                CommandKind::InstallHome { .. } => match t.plan().and_then(|s| s.motion) {
+                    Some(m) => core.commit_home(&d, &m, &ctx),
+                    None => Err("PLAN_RETIRED"),
+                },
+                CommandKind::InstallPark { .. } => match t.plan().and_then(|s| s.motion) {
+                    Some(m) => core.commit_park(&d, &m, &ctx),
+                    None => Err("PLAN_RETIRED"),
+                },
+                CommandKind::ContinuePark { .. } => match t.plan().and_then(|s| s.motion) {
+                    Some(m) => core.commit_park_continuation(&d, &m, &ctx),
+                    None => Err("PLAN_RETIRED"),
+                },
                 CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
                 CommandKind::Transition(op) => core.commit_transition_for_release(&d, op, &ctx, release_deadline),
             };
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
-                    let install = matches!(d.kind, CommandKind::Install { .. });
+                    let install = d.kind.is_install();
                     let supersedes = install && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
                     if supersedes {
                         t.ack_deferred(c).map(|(acked, ack_reply)| {
@@ -1623,7 +1708,8 @@ impl ReleaseEngine {
         let budget = ServiceBudget::for_release(now, release_deadline);
         report.poll = core.poll_transition_wake_for_release(&budget, release_deadline);
         let finished = self.take_finished_transition(report);
-        if urgent_applied || finished.is_some() {
+        let active_ended = self.active().and_then(|a| core.action_outcome(a).map(|o| (a, o)));
+        if urgent_applied || finished.is_some() || active_ended.is_some() || report.poll.park_state_changed {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
             if self.flush_urgent_stop_replies() {
@@ -1631,6 +1717,12 @@ impl ReleaseEngine {
             }
             if let Some((t, outcome)) = finished {
                 self.intake.terminal(t, outcome);
+            }
+            if let Some((action, outcome)) = active_ended {
+                let installed = self.active.take().expect("active above");
+                let children = core.action_children(action);
+                self.intake.terminal_with_children(installed, outcome, children);
+                report.ended = Some((action, outcome));
             }
             return true;
         }
