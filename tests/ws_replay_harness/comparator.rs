@@ -474,9 +474,12 @@ impl Normalizer {
                 is_torqued,
                 control_mode,
             } => {
-                // On completion tick, `Moving` -> `Armed` can straddle the terminal vs next tick;
-                // normalize only those two operational states on `done` while keeping Fault/EStop/Idle strict.
-                let norm_safety = if state == "done"
+                // On completion or STOPPED cancellation tick, `Moving` -> `Armed` can straddle
+                // the terminal vs next 50 Hz tick; normalize only those two operational states
+                // while keeping Fault/EStop/Idle and non-STOPPED cancellations strict.
+                let operational_tick_boundary = state == "done"
+                    || (state == "cancelled" && code.as_deref() == Some("STOPPED"));
+                let norm_safety = if operational_tick_boundary
                     && matches!(safety_state.as_str(), Some("Moving" | "Armed"))
                 {
                     Value::String("$operational".into())

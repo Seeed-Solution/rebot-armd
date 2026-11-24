@@ -183,6 +183,69 @@ fn comparator_accepts_bijective_nondeterministic_renumbering_and_rejects_every_s
         close.reason = Some("ESTOP_LATCHED:WRITE_TIMEOUT".into());
     }
     assert!(!compare_transcripts(&base, &bad_close).is_empty());
+
+    // STOPPED cancellation normalizes Moving/Armed tick boundary but rejects Fault/EStop/Idle
+    // and non-STOPPED cancellations.
+    let stopped_moving = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action_id: 1,
+        kind: "joint_move".into(),
+        state: "cancelled".into(),
+        code: Some("STOPPED".into()),
+        safety_state: json!("Moving"),
+        epoch_id: 1,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    let stopped_armed = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action_id: 2,
+        kind: "joint_move".into(),
+        state: "cancelled".into(),
+        code: Some("STOPPED".into()),
+        safety_state: json!("Armed"),
+        epoch_id: 1,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    assert!(compare_transcripts(&stopped_moving, &stopped_armed).is_empty());
+
+    let stopped_fault = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action_id: 2,
+        kind: "joint_move".into(),
+        state: "cancelled".into(),
+        code: Some("STOPPED".into()),
+        safety_state: json!("Fault"),
+        epoch_id: 1,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    assert!(!compare_transcripts(&stopped_moving, &stopped_fault).is_empty());
+
+    let estop_moving = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action_id: 1,
+        kind: "joint_move".into(),
+        state: "cancelled".into(),
+        code: Some("ESTOP".into()),
+        safety_state: json!("Moving"),
+        epoch_id: 2,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    let estop_armed = sample_transcript(vec![RecordedEvent::ActionTerminal {
+        client: "c0".into(),
+        action_id: 1,
+        kind: "joint_move".into(),
+        state: "cancelled".into(),
+        code: Some("ESTOP".into()),
+        safety_state: json!("Armed"),
+        epoch_id: 2,
+        is_torqued: true,
+        control_mode: "position".into(),
+    }]);
+    assert!(!compare_transcripts(&estop_moving, &estop_armed).is_empty());
 }
 
 /// Controlled-clock in-process replay: drives `ArmSupervisor::tick(0.02)` manually (no wall-clock
