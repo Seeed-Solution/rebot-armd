@@ -751,13 +751,23 @@ fn stale_j7_recovery_caps_speed_and_fails_closed_without_fresh_feedback() {
     assert!(j7_commands(&log).is_empty(), "emitted J7 motion frame without fresh feedback: {:?}", j7_commands(&log));
     assert!(log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC), "expected 0xCC refresh: {log:?}");
 
-    // 3. While J7 feedback is stale (> 100 ms), unfenced write_joint_targets skips J7 (0x307)
-    //    so J1-J6 continue normally, emits a J7 0xCC refresh, and reports Stale via take_last_pos_force_tx_status.
+    // 3. While J7 feedback is stale (> 100 ms), unfenced write_joint_targets NEVER skips J7 and
+    //    NEVER sends the new target (-2.0): it sends the 0x307 FREEZE frame (pos = last fresh
+    //    measured J7 position -1.0, vel_raw = 0, same current cap), lets J1-J6 continue, emits
+    //    a J7 0xCC refresh, and reports Stale via take_last_pos_force_tx_status.
     bus.clear_log();
     d.begin_tx_tick();
     d.write_joint_targets(&targets(-2.0)).unwrap();
     let stale_log = bus.tx_log();
-    assert!(j7_commands(&stale_log).is_empty(), "emitted 0x307 during J7 stale outage: {:?}", j7_commands(&stale_log));
+    let stale_j7 = j7_commands(&stale_log);
+    assert_eq!(stale_j7.len(), 1, "expected 1 0x307 freeze frame while stale: {stale_j7:?}");
+    assert_eq!(stale_j7[0].id, 0x307);
+    let freeze_pos = f32::from_le_bytes(stale_j7[0].data[0..4].try_into().unwrap());
+    let freeze_vel = u16::from_le_bytes([stale_j7[0].data[4], stale_j7[0].data[5]]);
+    let freeze_cur = u16::from_le_bytes([stale_j7[0].data[6], stale_j7[0].data[7]]);
+    assert!((freeze_pos - (-1.0)).abs() < 1e-3, "freeze must hold last fresh pos -1.0, got {freeze_pos}");
+    assert_eq!(freeze_vel, 0, "freeze frame must carry vel_raw == 0");
+    assert_eq!(freeze_cur, RAW, "freeze frame must preserve current cap");
     assert!(
         (1..=6u32).all(|id| stale_log.iter().any(|f| f.id == 0x100 + id)),
         "expected J1-J6 commands to continue while J7 is stale: {stale_log:?}"
@@ -768,7 +778,7 @@ fn stale_j7_recovery_caps_speed_and_fails_closed_without_fresh_feedback() {
     );
     assert!(
         matches!(d.take_last_pos_force_tx_status(), armd::driver::PosForceTxStatus::Stale { joint: J7, .. }),
-        "expected Stale status after skipping J7"
+        "expected Stale status after emitting J7 freeze frame"
     );
 
     // 4. Fresh feedback returns with jaw physically opened to -2.5: ramping back toward -1.0 closes at <= close_speed;
@@ -836,18 +846,28 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
 
     // 1. Mid-batch expiry: feedback is 99 ms old at batch entry, J1-J6 take 1 ms each ->
     //    J7 is 105 ms old when its frame is built -> unfenced write_joint_targets sends J1-J6,
-    //    emits NO 0x307 frame, requests a J7 0xCC refresh, and reports Stale.
+    //    emits a 0x307 FREEZE frame (pos = last fresh measured J7, vel_raw = 0, NOT -2.0!),
+    //    requests a J7 0xCC refresh, and reports Stale.
     let (mut d, bus, clock) = rig(true);
     d.set_torque(true).unwrap();
     d.read_joint_states().unwrap();
     d.read_joint_states().unwrap();
+    let last_fresh_j7 = bus.with(|s| s.motors[J7].q);
     clock.advance(Duration::from_millis(99));
     bus.with(|s| s.tx_step = Duration::from_millis(1));
     bus.clear_log();
     d.begin_tx_tick();
     d.write_joint_targets(&targets(-2.0)).unwrap();
     let mid_log = bus.tx_log();
-    assert!(j7_commands(&mid_log).is_empty(), "emitted 0x307 after mid-batch expiry: {:?}", j7_commands(&mid_log));
+    let mid_j7 = j7_commands(&mid_log);
+    assert_eq!(mid_j7.len(), 1, "expected 1 0x307 freeze frame after mid-batch expiry: {mid_j7:?}");
+    assert_eq!(mid_j7[0].id, 0x307);
+    let mid_pos = f32::from_le_bytes(mid_j7[0].data[0..4].try_into().unwrap());
+    let mid_vel = u16::from_le_bytes([mid_j7[0].data[4], mid_j7[0].data[5]]);
+    let mid_cur = u16::from_le_bytes([mid_j7[0].data[6], mid_j7[0].data[7]]);
+    assert!((mid_pos - last_fresh_j7).abs() < 1e-3, "mid-batch freeze pos={mid_pos} != {last_fresh_j7}");
+    assert_eq!(mid_vel, 0, "mid-batch freeze must carry vel_raw == 0");
+    assert_eq!(mid_cur, RAW);
     assert!(
         (1..=6u32).all(|id| mid_log.iter().any(|f| f.id == 0x100 + id)),
         "expected J1-J6 to be sent before J7 expired: {mid_log:?}"
@@ -862,9 +882,9 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     );
 
     // 2. WouldBlock stall crossing 100 ms: single-joint pos-force driver at 99 ms tries once,
-    //    stall advances clock to 101 ms -> retry re-checks freshness, drops the stale pos-force
-    //    frame without a 2nd 0x301 attempt, defers 0xCC while the pass is backpressured, reports
-    //    Stale, and transmits the priority 0xCC refresh on the next tick once the bus clears.
+    //    stall advances clock to 101 ms -> backpressured pass stops without retrying the moving
+    //    target, reports Stale, and on the next tick sends priority 0xCC refresh AND a 0x301
+    //    FREEZE frame (pos = -1.0, vel_raw = 0, NEVER the new target -2.0!).
     let clock = MockClock::new();
     let one_limit = vec![b601_limits()[J7]];
     let bus = FakeBus::with_clock(&one_limit, clock.clone());
@@ -885,7 +905,7 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     bus.with(|s| { s.tx_stall = true; s.stall_step = Duration::from_millis(2); });
     bus.clear_log();
     d.begin_tx_tick();
-    d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap();
+    let _ = d.write_joint_targets_bounded(&[JointTarget::position(-2.0)]).unwrap();
     let stall_log = bus.tx_log();
     let pf_attempts = stall_log.iter().filter(|f| f.id == 0x301).count();
     assert_eq!(pf_attempts, 1, "retried pos-force transmit past freshness bound: {stall_log:?}");
@@ -898,7 +918,14 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
     d.begin_tx_tick();
     d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap();
     let next_log = bus.tx_log();
-    assert!(next_log.iter().all(|f| f.id != 0x301), "emitted 0x301 while still stale: {next_log:?}");
+    let next_pf: Vec<_> = next_log.iter().copied().filter(|f| f.id == 0x301).collect();
+    assert_eq!(next_pf.len(), 1, "expected 1 0x301 freeze frame on next tick: {next_log:?}");
+    let fpos = f32::from_le_bytes(next_pf[0].data[0..4].try_into().unwrap());
+    let fvel = u16::from_le_bytes([next_pf[0].data[4], next_pf[0].data[5]]);
+    let fcur = u16::from_le_bytes([next_pf[0].data[6], next_pf[0].data[7]]);
+    assert!((fpos - (-1.0)).abs() < 1e-3, "expected freeze at last fresh -1.0 (not -2.0), got {fpos}");
+    assert_eq!(fvel, 0, "expected freeze vel_raw == 0");
+    assert_eq!(fcur, RAW);
     assert!(
         next_log.iter().any(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == 0xCC),
         "expected priority 0xCC refresh on next tick after backpressured stall: {next_log:?}"
@@ -4173,10 +4200,22 @@ fn pos_force_crossing_100ms_between_entry_and_staging_skips_j7_in_motion_and_hol
                 "is_hold={is_hold} jump={jump_on_call}: expected PosForceTxStatus::Stale for J7"
             );
             let log = raw_bus.tx_log();
-            assert!(
-                j7_commands(&log).is_empty(),
-                "is_hold={is_hold} jump={jump_on_call}: must emit zero 0x307 frames: {log:?}"
+            let j7_cmds = j7_commands(&log);
+            assert_eq!(
+                j7_cmds.len(),
+                1,
+                "is_hold={is_hold} jump={jump_on_call}: expected 1 0x307 freeze frame: {log:?}"
             );
+            assert_eq!(j7_cmds[0].id, 0x307);
+            let fpos = f32::from_le_bytes(j7_cmds[0].data[0..4].try_into().unwrap());
+            let fvel = u16::from_le_bytes([j7_cmds[0].data[4], j7_cmds[0].data[5]]);
+            let fcur = u16::from_le_bytes([j7_cmds[0].data[6], j7_cmds[0].data[7]]);
+            assert!(
+                (fpos - (-1.0)).abs() < 1e-3,
+                "is_hold={is_hold} jump={jump_on_call}: freeze pos={fpos} must hold last fresh -1.0 (not -1.2)"
+            );
+            assert_eq!(fvel, 0, "is_hold={is_hold} jump={jump_on_call}: freeze vel_raw must be 0");
+            assert_eq!(fcur, RAW);
             assert!(
                 log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
                 "is_hold={is_hold} jump={jump_on_call}: expected J7 0xCC refresh: {log:?}"
@@ -4414,12 +4453,122 @@ fn pos_force_carryover_j7_at_100ms_boundary_never_counted_as_fifo_expired() {
             "jump={jump_on_call}: J7-only carry-over crossing 100 ms must NEVER return Expired, got {outcome:?}"
         );
         assert!(
-            j7_commands(&raw_bus.tx_log()).is_empty(),
-            "jump={jump_on_call}: must not emit stale 0x307"
-        );
-        assert!(
             matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
             "jump={jump_on_call}: expected Stale status for J7"
+        );
+        // Under `max_frames = 6`, if `read_joint_states()` at t = 100 ms ran a recovery write
+        // that emptied `pending_tx`, J1–J6 consume the 6-frame budget and defer J7's freeze frame
+        // (`Deferred { pending: 1 }`) to the very next tick; either way, ZERO non-freeze 0x307
+        // frames may appear and the emitted 0x307 frame must be the exact freeze frame.
+        if matches!(outcome, TxBatchOutcome::Deferred { pending: 1 }) {
+            assert!(
+                j7_commands(&raw_bus.tx_log()).is_empty(),
+                "jump={jump_on_call}: deferred J7 must not emit a moving 0x307 on the first pass"
+            );
+            d.begin_tx_tick();
+            let drain = d.drain_pending_tx().unwrap();
+            assert_eq!(drain, TxBatchOutcome::Complete, "jump={jump_on_call}: freeze frame must drain cleanly");
+        }
+        let j7_cmds = j7_commands(&raw_bus.tx_log());
+        assert_eq!(
+            j7_cmds.len(),
+            1,
+            "jump={jump_on_call}: expected 1 0x307 freeze frame instead of stale target: {j7_cmds:?}"
+        );
+        let fpos = f32::from_le_bytes(j7_cmds[0].data[0..4].try_into().unwrap());
+        let fvel = u16::from_le_bytes([j7_cmds[0].data[4], j7_cmds[0].data[5]]);
+        let fcur = u16::from_le_bytes([j7_cmds[0].data[6], j7_cmds[0].data[7]]);
+        assert!((fpos - (-1.0)).abs() < 1e-3, "jump={jump_on_call}: freeze pos={fpos} != -1.0");
+        assert_eq!(fvel, 0, "jump={jump_on_call}: freeze vel_raw must be 0");
+        assert_eq!(fcur, RAW);
+    }
+
+    // 1b. True J7 carry-over at index 0 (no intermediate recovery write wiping `pending_tx`),
+    //     parked at exact 100 ms feedback age and 44 ms queue age, jumping +2 ms on EVERY `now()`
+    //     call (1..=8): converts in-place to `PosForceFreeze` (NEVER `Expired`) and emits the
+    //     exact 0x307 freeze frame on that very tick!
+    for jump_on_call in 1..=8usize {
+        let base_clock = MockClock::new();
+        let raw_bus = FakeBus::with_clock(&b601_limits(), base_clock.clone());
+        raw_bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+            }
+            s.motors[J7].q = -1.0;
+            s.immediate_replies = true;
+        });
+        let leap_clock = Arc::new(LeapOnNthNowClock {
+            inner: base_clock.clone(),
+            armed: AtomicBool::new(false),
+            target_call: AtomicUsize::new(jump_on_call),
+            calls: AtomicUsize::new(0),
+            jump: Duration::from_millis(2),
+        });
+        let bus = LeapBus { inner: raw_bus.clone(), clock: leap_clock.clone() };
+        let b6 = TxBudget {
+            max_frames: 6,
+            max_duration: Duration::from_millis(10),
+            frame_max_age: Duration::from_millis(45),
+        };
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits())
+            .unwrap()
+            .with_gripper_pos_force(pf())
+            .unwrap()
+            .with_tx_budget(b6);
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).expect("enable");
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| {
+            s.immediate_replies = false;
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        raw_bus.with(|s| s.motors[J7].mute_feedback = true);
+
+        base_clock.advance(Duration::from_millis(56));
+        raw_bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+        d.read_joint_states().unwrap();
+        d.begin_tx_tick();
+        assert_eq!(
+            d.write_joint_targets_bounded(&targets(-1.1)).unwrap(),
+            TxBatchOutcome::Deferred { pending: 1 }
+        );
+        // Advance 44 ms WITHOUT `read_joint_states()` so carried-over J7 stays at index 0
+        // (`queued_age = 44 ms`, `j7_age = 100 ms`).
+        base_clock.advance(Duration::from_millis(44));
+        assert!(d.pos_force_feedback_fresh(), "carryover jump={jump_on_call}: J7 starts at exact 100 ms");
+
+        raw_bus.clear_log();
+        d.begin_tx_tick();
+        leap_clock.calls.store(0, Ordering::SeqCst);
+        leap_clock.armed.store(true, Ordering::SeqCst);
+        let outcome = d
+            .write_joint_targets_bounded(&targets(-1.2))
+            .unwrap_or_else(|e| panic!("carryover jump={jump_on_call}: unexpected error {e:?}"));
+        leap_clock.armed.store(false, Ordering::SeqCst);
+        assert!(
+            !matches!(outcome, TxBatchOutcome::Expired { .. }),
+            "carryover jump={jump_on_call}: J7 carry-over crossing 100 ms + 45 ms must NEVER return Expired, got {outcome:?}"
+        );
+        let j7_cmds = j7_commands(&raw_bus.tx_log());
+        assert_eq!(
+            j7_cmds.len(),
+            1,
+            "carryover jump={jump_on_call}: expected immediate 0x307 freeze frame at index 0: {j7_cmds:?}"
+        );
+        let fpos = f32::from_le_bytes(j7_cmds[0].data[0..4].try_into().unwrap());
+        let fvel = u16::from_le_bytes([j7_cmds[0].data[4], j7_cmds[0].data[5]]);
+        let fcur = u16::from_le_bytes([j7_cmds[0].data[6], j7_cmds[0].data[7]]);
+        assert!((fpos - (-1.0)).abs() < 1e-3, "carryover jump={jump_on_call}: freeze pos={fpos} != -1.0");
+        assert_eq!(fvel, 0, "carryover jump={jump_on_call}: freeze vel_raw must be 0");
+        assert_eq!(fcur, RAW);
+        assert!(
+            matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
+            "carryover jump={jump_on_call}: expected Stale status for J7"
         );
     }
 

@@ -1425,7 +1425,11 @@ fn rt_j7_pos_force_staleness_macro_retire_and_throttled_hold_error_zero_alloc() 
         "expected exactly 2 deferred StoppedHoldOutputFailed events across 1.1 s with exact suppressed counts"
     );
     assert_eq!(inner.hold_tx_error_suppressed(), 4);
-    assert_eq!(inner.safety.fault_code(), Some(FaultCode::J7FeedbackStale));
+    assert_eq!(
+        inner.safety.fault_code(),
+        Some(FaultCode::CanTxStalled),
+        "sustained hard-error stopped-hold streak with live RX must escalate to CAN_TX_STALLED zero-alloc"
+    );
 }
 
 /// Major 4 RT zero-alloc/zero-free regression:
@@ -1835,6 +1839,13 @@ fn rt_j7_exhausted_pool_latch_bounded_clear_and_production_log_forwarding_zero_a
     assert!(published.kept.is_none());
     drop(published);
     assert_eq!((a, f), (0, 0), "post-retry throttled tick touched allocator");
-    assert!(log_rx.pop().is_err(), "error 20 ms after delayed retry acceptance must stay throttled");
+    // Hard-error streak past 45 ms may emit a one-shot CAN_TX_STALLED escalation event,
+    // while `StoppedHoldOutputFailed` itself MUST remain throttled for 1 s after retry acceptance!
+    while let Ok(ev) = log_rx.pop() {
+        assert!(
+            !matches!(ev, SafetyLogEvent::StoppedHoldOutputFailed { .. }),
+            "StoppedHoldOutputFailed 20 ms after delayed retry acceptance must stay throttled, got {ev:?}"
+        );
+    }
     assert_eq!(inner2.hold_tx_error_suppressed(), 1);
 }
