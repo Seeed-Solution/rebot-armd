@@ -274,6 +274,29 @@ impl From<ArmError> for ApiError {
                     current_revision: None,
                     retry_after_s: None,
                 },
+                crate::safety::SafetyError::TorqueOffWouldDrop {
+                    ref joint,
+                    position,
+                    rest,
+                    ref message,
+                } => ApiError {
+                    status: StatusCode::CONFLICT,
+                    error: "TORQUE_OFF_WOULD_DROP".to_string(),
+                    message: message.clone(),
+                    code: Some("TORQUE_OFF_WOULD_DROP".to_string()),
+                    safety_state: None,
+                    details: match (joint, position, rest) {
+                        (Some(j), Some(pos), Some(r)) => Some(Box::new(serde_json::json!({
+                            "joint": j,
+                            "position": pos,
+                            "rest": r,
+                        }))),
+                        _ => None,
+                    },
+                    workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
+                },
                 crate::safety::SafetyError::ClearFaultRejected(msg) => ApiError {
                     status: StatusCode::CONFLICT,
                     error: "ClearFaultRejected".to_string(),

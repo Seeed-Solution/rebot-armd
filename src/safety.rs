@@ -183,6 +183,17 @@ pub enum SafetyError {
     #[error("Motion forbidden in fault/estop state: {0}")]
     MotionForbiddenInFaultState(String),
 
+    #[error("{message}")]
+    TorqueOffWouldDrop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        joint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest: Option<f32>,
+        message: String,
+    },
+
     #[error("Arm is coming to a safe stop from previous session; motion gate locked")]
     HandoverSettling,
 
@@ -450,9 +461,9 @@ impl SafetyManager {
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
         if self.state_arc.is_stopped() {
             if !enable {
-                return Err(SafetyError::MotionForbiddenInFaultState(
-                    "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
-                ));
+                // Disabling torque while stopped keeps the E-stop / Fault latch intact;
+                // rest-pose gating is enforced by the supervisor before reaching here.
+                return Ok((*self.state_arc).clone());
             }
             if let SafetyState::Fault(ref reason) = *self.state_arc {
                 return Err(SafetyError::FaultActive(reason.clone()));

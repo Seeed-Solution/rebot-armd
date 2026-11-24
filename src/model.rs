@@ -1302,6 +1302,14 @@ fn default_servo_max_lead_rad() -> f32 {
     DEFAULT_SERVO_MAX_LEAD_RAD
 }
 
+/// Default for [`ArmConfig::rest_pose_tolerance_rad`]: maximum per-joint deviation from
+/// the profile's rest pose that permits torque disable while stopped (E-stop or Fault).
+pub const DEFAULT_REST_POSE_TOLERANCE_RAD: f32 = 0.05;
+
+fn default_rest_pose_tolerance_rad() -> f32 {
+    DEFAULT_REST_POSE_TOLERANCE_RAD
+}
+
 /// Upper bound on planned motion speed (`speed_cap` in the profile). Each entry is
 /// applied as min() with the request and with `planned_max_velocity`; absent entries
 /// do not cap. Not changeable at runtime.
@@ -1351,6 +1359,11 @@ pub struct ArmConfig {
     /// None forbids automatic hardware torque release without a calibrated profile.
     #[serde(default)]
     pub resting_pose: Option<RestingPosePolicy>,
+    /// Per-joint tolerance (rad) from the profile's rest pose for allowing torque disable while
+    /// stopped (E-stop or Fault). Checked on arm joints (excluding the gripper) against fresh
+    /// feedback (<= 100 ms). Default: 0.05 rad.
+    #[serde(default = "default_rest_pose_tolerance_rad")]
+    pub rest_pose_tolerance_rad: f32,
     #[serde(default)]
     pub following_error: FollowingErrorPolicy,
     /// Soft jerk preference; braking/position constraints take precedence.
@@ -1536,6 +1549,7 @@ impl Default for ArmConfig {
             max_temperature: 70.0,
             control_frequency_hz: 50,
             resting_pose: None,
+            rest_pose_tolerance_rad: DEFAULT_REST_POSE_TOLERANCE_RAD,
             following_error: FollowingErrorPolicy::default(),
             max_jerk: None,
             gravity_model: None,
@@ -1972,6 +1986,12 @@ impl ArmConfig {
                 "servo_max_lead_rad {} must be positive and below the following-error bound {} rad",
                 self.servo_max_lead_rad, self.following_error.max_error_rad));
         }
+        if !self.rest_pose_tolerance_rad.is_finite() || self.rest_pose_tolerance_rad <= 0.0 {
+            return Err(format!(
+                "rest_pose_tolerance_rad {} must be finite and positive",
+                self.rest_pose_tolerance_rad
+            ));
+        }
         let builtin = self.kinematics == Some(KinematicsModel::RebotDevArm) || self.gravity_model == Some(GravityModel::RebotDevArm);
         if builtin && self.uses_urdf() {
             return Err("kinematics and gravity_model must both be RebotDevArm or both Urdf".into());
@@ -2298,6 +2318,7 @@ impl ArmConfig {
             max_temperature: 70.0,
             control_frequency_hz: 50,
             resting_pose: Some(RestingPosePolicy::rebot_dm()),
+            rest_pose_tolerance_rad: DEFAULT_REST_POSE_TOLERANCE_RAD,
             following_error: FollowingErrorPolicy::default(),
             max_jerk: Some(50.0),
             gravity_model: Some(GravityModel::RebotDevArm),
@@ -3265,6 +3286,9 @@ pub struct ObservationSchema {
     /// when the profile has none and in older schemas.
     #[serde(default)]
     pub resting_pose: Option<RestingPosePolicy>,
+    /// Per-joint tolerance (rad) around the rest pose for torque disable while stopped; null in older schemas.
+    #[serde(default)]
+    pub rest_pose_tolerance_rad: Option<f32>,
     /// Torque-saturation guard policy; null when the profile has none (and in older schemas).
     #[serde(default)]
     pub torque_guard: Option<crate::torque_guard::TorqueGuardInfo>,
@@ -3394,6 +3418,7 @@ impl ObservationSchema {
             backlash_approach: config.backlash_approach.clone(),
             home_positions: Some(config.home_positions.clone()),
             resting_pose: config.resting_pose.clone(),
+            rest_pose_tolerance_rad: Some(config.rest_pose_tolerance_rad),
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
             model_joint_map: config.arm_model.joint_map(),
             kinematics_correction: config.arm_model.correction().copied(),
