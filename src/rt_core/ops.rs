@@ -644,7 +644,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
-        "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY",
     ];
     match &e {
         ArmError::Motion(m) => m.code(),
@@ -661,6 +661,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
             S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
             S::Stopped => "STOPPED",
             S::LeaseLost => "LEASE_LOST",
+            S::TerminalsBusy => "TERMINALS_BUSY",
             _ => "REJECTED",
         },
         ArmError::Unsupported(_) => "UNSUPPORTED",

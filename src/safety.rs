@@ -214,6 +214,9 @@ pub enum SafetyError {
 
     #[error("Control lease is no longer current")]
     LeaseLost,
+
+    #[error("Action terminal queue is full; wait for pending action completions to drain before starting a new action")]
+    TerminalsBusy,
 }
 
 impl SafetyError {

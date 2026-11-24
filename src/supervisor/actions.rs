@@ -117,6 +117,7 @@ impl SupervisorInner {
                 }
                 old.finished_at = Some(now);
             }
+            self.record_finished_action(&old);
             self.previous_action = Some((old, now + 2.0));
         }
         self.next_action_id += 1;
@@ -308,6 +309,7 @@ impl SupervisorInner {
             }
             self.macro_run = None;
         }
+        self.record_finished_action_by_id(id);
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
@@ -323,6 +325,7 @@ impl SupervisorInner {
 
     pub fn unload_action(&mut self, admitted: Admitted) -> Result<Option<u64>, ArmError> {
         self.verify_admitted(&admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         self.park_rejection = None;
         // A park from the hold after a clear re-arms through the verified enable path first (fresh
         // feedback, commanded = measured); without it NormalUnload keeps holding and parks nothing.
@@ -369,6 +372,7 @@ impl SupervisorInner {
     /// `input`. Its orchestrator drives it from now on. Returns its id.
     pub fn begin_macro(&mut self, admitted: Admitted, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         let stamp = self.consume_admitted(admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         self.check_plan_fresh(input)?;
         let id = self.begin_action(kind, tag);
         self.macro_run = Some(MacroRun::new(id, input.epoch, stamp));
@@ -385,6 +389,7 @@ impl SupervisorInner {
     /// calib_hover): stamp, epoch, preconditions, macro run record.
     pub fn begin_orchestrated_action(&mut self, admitted: Admitted, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
         let stamp = self.consume_admitted(admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
@@ -944,6 +949,7 @@ impl SupervisorInner {
     /// Start a gripper action. Returns (action id, expected duration).
     pub fn start_gripper(&mut self, admitted: Admitted, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
         let _stamp = self.consume_admitted(admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
         })?;
@@ -991,6 +997,7 @@ impl SupervisorInner {
 
     pub fn start_gripper_zero_check_with_auth(&mut self, admitted: Admitted, body: &serde_json::Value, epoch: u64, operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>) -> Result<(u64, f64), ArmError> {
         let _stamp = self.consume_admitted(admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper zero check needs a profile with a gripper joint".into())
         })?;

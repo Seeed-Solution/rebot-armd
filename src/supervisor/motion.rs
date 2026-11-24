@@ -911,6 +911,7 @@ impl SupervisorInner {
             return self.jog_action(admitted, target_positions.to_vec(), duration_secs, epoch_id, kind);
         };
         let _stamp = self.consume_admitted(admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         let limits = &limits_buf[..lim_n];
         let mut target = [0.0f32; MAX_DOF];
         target[..n].copy_from_slice(target_positions);
@@ -1052,6 +1053,7 @@ impl SupervisorInner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_quintic_prepared(&mut self, admitted: Admitted, target_positions: Vec<f32>, duration_secs: Option<f64>, epoch_id: Option<u64>, kind: &str, tag: Option<String>, limits: &[crate::model::JointLimit], prepared: Option<PreparedQuintic>) -> Result<(u64, u64, f64), ArmError> {
         let _stamp = self.consume_admitted(admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         let mut target_positions = target_positions;
         self.config_motion_check()?;
         self.gravity_comp_motion_busy()?;
@@ -1219,6 +1221,7 @@ impl SupervisorInner {
     /// Returns (action id, expected duration).
     pub fn install_path(&mut self, admitted: Admitted, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
         self.verify_admitted(&admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion(admitted, input, &path)?;
         let id = self.begin_action(kind, tag);
@@ -1290,6 +1293,8 @@ impl SupervisorInner {
     pub(crate) fn install_prepared_path_slot(&mut self, admitted: Admitted, epoch: u64, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>, duration_s: f64, power_scale: Option<f64>) -> Result<(u64, f64), &'static str> {
         self.verify_admitted(&admitted)
             .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
+        self.check_terminal_fifo_for_new_action()
+            .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
         self.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
         self.check_prepared_fresh_static(epoch)?;
         let last = &slot.path.samples()[slot.path.len() - 1][..dof];
@@ -1323,6 +1328,7 @@ impl SupervisorInner {
     /// Returns (action id, expected duration).
     pub(crate) fn install_prepared_path(&mut self, admitted: Admitted, epoch: u64, path: JointPath, power_noted: bool) -> Result<(u64, f64), ArmError> {
         self.verify_admitted(&admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         self.check_prepared_fresh(epoch)?;
         let duration = self.start_path_motion_at(admitted, epoch, &path)?;
         let id = self.begin_action("move_to", None);

@@ -3361,3 +3361,164 @@ async fn teardown_closes_connection_under_owner_lock_and_acquire_release_stops_m
         assert!(direct.active_trajectory.is_none(), "release_lease_and_stop must stop motion");
     }
 }
+
+// 23. Round-5 Item 6 (Per-connection bounded FIFO of finished actions):
+//     (a) Repeated rapid starts overwriting `previous_action` 19 times while dispatcher is paused
+//         lose ZERO terminals: once dispatcher drains, BOTH controller and passive observer receive
+//         ALL 20 finished actions in strict FIFO order.
+//     (b) When the bounded FIFO is full, new starts are refused with `TERMINALS_BUSY` (503) without
+//         dropping or overwriting any queued or running action; once drained, starts succeed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_connection_bounded_terminal_fifo_delivers_all_in_order_and_refuses_when_full() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    async fn collect_terminals(
+        ws: &mut common::TestSocket,
+        expected: usize,
+        timeout: Duration,
+    ) -> Vec<(u64, String, Option<String>)> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + timeout;
+        while out.len() < expected && Instant::now() < deadline {
+            if let Ok(Some(Ok(Message::Text(txt)))) =
+                tokio::time::timeout(Duration::from_millis(200), ws.next()).await
+            {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if v.get("type").is_none() {
+                        if let Some(a) = v.get("action").filter(|a| a["state"].as_str() != Some("running")) {
+                            if let (Some(id), Some(st)) = (a["id"].as_u64(), a["state"].as_str()) {
+                                let code = a.get("code").and_then(|c| c.as_str()).map(str::to_owned);
+                                out.push((id, st.to_owned(), code));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // (a) 20 rapid starts (overwriting `previous_action` 19 times) + second passive observer:
+    //     ZERO terminals disappear; BOTH connections receive all 20 terminals in exact FIFO order.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws_ctrl, gen) = controller(addr).await;
+        let (mut ws_obs, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        // Wait until the observer socket has registered its terminal FIFO subscription.
+        wait_until(Duration::from_secs(1), || sup.test_terminal_subscriber_count() >= 2).await;
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws_ctrl, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let ep = sup.get_observation().await.epoch_id;
+
+        // Pause dispatcher draining so all 19 superseding starts + final stop pile up in the per-connection FIFOs
+        // and repeatedly overwrite `SupervisorInner::previous_action`.
+        sup.test_set_terminal_dispatch_paused(true);
+
+        let mut expected_ids = Vec::new();
+        for k in 0..20u64 {
+            let mut target = vec![0.0f32; 7];
+            target[0] = 0.02 * ((k % 10) + 1) as f32;
+            let ack = rpc(&mut ws_ctrl, gen, ep, "/api/v1/motion/jog", json!({
+                "target_positions": target,
+                "duration_secs": 2.0
+            })).await;
+            assert_eq!(ack["type"], "command_ack", "start {k}: {ack}");
+            expected_ids.push(ack["action_id"].as_u64().expect("action_id"));
+        }
+        // Finish the 20th running action cleanly via urgent Stop + one control tick to reconcile its terminal.
+        let stop_ack = rpc(&mut ws_ctrl, gen, ep, "/api/v1/motion/stop", json!({})).await;
+        assert_eq!(stop_ack["type"], "command_ack", "{stop_ack}");
+        sup.tick(0.02).await;
+        // Each of the 2 subscribed connections has 20 queued terminals (40 total).
+        assert_eq!(sup.test_pending_terminal_count(), 40);
+
+        // Resume dispatcher: BOTH connections must receive ALL 20 terminals in exact FIFO order!
+        sup.test_set_terminal_dispatch_paused(false);
+        let (ctrl_terms, obs_terms) = tokio::join!(
+            collect_terminals(&mut ws_ctrl, 20, Duration::from_secs(3)),
+            collect_terminals(&mut ws_obs, 20, Duration::from_secs(3)),
+        );
+        let ctrl_ids: Vec<u64> = ctrl_terms.iter().map(|(id, _, _)| *id).collect();
+        let obs_ids: Vec<u64> = obs_terms.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ctrl_ids, expected_ids, "controller must receive every terminal in strict FIFO order: {ctrl_terms:?}");
+        assert_eq!(obs_ids, expected_ids, "observer must receive every terminal in strict FIFO order: {obs_terms:?}");
+        for (_, st, code) in &ctrl_terms[..19] {
+            assert_eq!((st.as_str(), code.as_deref()), ("cancelled", Some("SUPERSEDED")));
+        }
+        assert_eq!((ctrl_terms[19].1.as_str(), ctrl_terms[19].2.as_deref()), ("cancelled", Some("STOPPED")));
+        assert_eq!(sup.test_pending_terminal_count(), 0);
+    }
+
+    // (b) Bounded FIFO full -> refuse new starts with `TERMINALS_BUSY` (503) without dropping any
+    //     queued or running action; once drained, new starts succeed again.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        sup.test_set_terminal_fifo_capacity(4);
+        let (mut ws, gen) = controller(addr).await;
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let ep = sup.get_observation().await.epoch_id;
+
+        sup.test_set_terminal_dispatch_paused(true);
+
+        // Start 4 actions: actions 1..3 are superseded into FIFO (len=3), action 4 is running
+        // (1 slot reserved for action 4's eventual terminal so capacity=4 is never exceeded).
+        let mut ids = Vec::new();
+        for k in 0..4u64 {
+            let ack = rpc(&mut ws, gen, ep, "/api/v1/motion/jog", json!({
+                "target_positions": [0.05 * (k + 1) as f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "duration_secs": 2.0
+            })).await;
+            assert_eq!(ack["type"], "command_ack", "action {k}: {ack}");
+            ids.push(ack["action_id"].as_u64().unwrap());
+        }
+        assert_eq!(sup.test_pending_terminal_count(), 3);
+
+        // 5th start while FIFO has 3 + 1 running == 4 (full): MUST refuse with TERMINALS_BUSY (503)!
+        let busy1 = rpc(&mut ws, gen, ep, "/api/v1/motion/jog", json!({
+            "target_positions": [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "duration_secs": 2.0
+        })).await;
+        assert_eq!((busy1["type"].as_str(), busy1["status"].as_u64(), busy1["code"].as_str()),
+            (Some("command_reject"), Some(503), Some("TERMINALS_BUSY")), "{busy1}");
+        // Action 4 must still be running undisturbed and FIFO still holds 3 entries.
+        assert_eq!(sup.inner().read().await.last_action.as_ref().map(|a| (a.id, a.is_running())), Some((ids[3], true)));
+        assert_eq!(sup.test_pending_terminal_count(), 3);
+
+        // Stop action 4 + tick -> action 4 enters the reserved 4th FIFO slot (len=4 == cap, zero dropped!).
+        let stop_ack = rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await;
+        assert_eq!(stop_ack["type"], "command_ack", "{stop_ack}");
+        sup.tick(0.02).await;
+        assert_eq!(sup.test_pending_terminal_count(), 4);
+
+        // Even while idle, starting a new action with FIFO len == 4/4 MUST refuse with TERMINALS_BUSY!
+        let busy2 = rpc(&mut ws, gen, ep, "/api/v1/motion/jog", json!({
+            "target_positions": [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "duration_secs": 2.0
+        })).await;
+        assert_eq!((busy2["type"].as_str(), busy2["status"].as_u64(), busy2["code"].as_str()),
+            (Some("command_reject"), Some(503), Some("TERMINALS_BUSY")), "{busy2}");
+
+        // Unpause dispatcher -> all 4 terminals drain in exact FIFO order!
+        sup.test_set_terminal_dispatch_paused(false);
+        let drained = collect_terminals(&mut ws, 4, Duration::from_secs(3)).await;
+        let drained_ids: Vec<u64> = drained.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(drained_ids, ids, "all 4 terminals must drain in order without loss: {drained:?}");
+        assert_eq!(sup.test_pending_terminal_count(), 0);
+
+        // Now that the FIFO drained, a new action start succeeds cleanly!
+        let ack5 = rpc(&mut ws, gen, ep, "/api/v1/motion/jog", json!({
+            "target_positions": [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "duration_secs": 2.0
+        })).await;
+        assert_eq!(ack5["type"], "command_ack", "start after drain must succeed: {ack5}");
+        let id5 = ack5["action_id"].as_u64().unwrap();
+        let stop5 = rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await;
+        assert_eq!(stop5["type"], "command_ack", "{stop5}");
+        sup.tick(0.02).await;
+        let term5 = collect_terminals(&mut ws, 1, Duration::from_secs(3)).await;
+        assert_eq!(term5.len(), 1);
+        assert_eq!(term5[0].0, id5);
+    }
+}

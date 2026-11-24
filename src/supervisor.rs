@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -735,6 +735,9 @@ pub struct SupervisorInner {
     /// Coalesced sorted inclusive intervals `(lo, hi)` of closed WS connection IDs (`>= 1`),
     /// set under the owner lock during teardown and checked on every motion/output install.
     closed_connections: ClosedConnections,
+    /// Shared per-connection bounded action-terminal FIFO broadcaster (wired by `ArmSupervisor::new`;
+    /// `None` on standalone `SupervisorInner::new`, never locked on `armd-control`).
+    terminals: Option<Arc<TerminalBroadcaster>>,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
     pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -1062,6 +1065,7 @@ impl SupervisorInner {
                 crate::rt_core::urgent::URGENT_STOP_CAPACITY,
             ),
             closed_connections: ClosedConnections::default(),
+            terminals: None,
             before_publish_hook: None,
         }
     }
@@ -1121,6 +1125,53 @@ impl SupervisorInner {
     /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under the owner lock.
     pub fn is_connection_closed(&self, connection_id: u64) -> bool {
         self.closed_connections.is_closed(connection_id)
+    }
+
+    /// Ensures every subscribed connection's bounded terminal FIFO has room for any action
+    /// superseded by this start plus the new action's eventual terminal (never drops a terminal).
+    pub(crate) fn check_terminal_fifo_for_new_action(&self) -> Result<(), SafetyError> {
+        let Some(terminals) = self.terminals.as_ref() else {
+            return Ok(());
+        };
+        let has_running = self.last_action.as_ref().is_some_and(|a| a.is_running());
+        if !terminals.can_start_action(has_running, self.rt_executor_owned) {
+            return Err(SafetyError::TerminalsBusy);
+        }
+        Ok(())
+    }
+
+    /// Records a finished action (`!is_running()`) into every subscribed connection's bounded
+    /// terminal FIFO (deduped by action ID) and wakes `armd-dispatch` immediately. Skipped on
+    /// `armd-control` (`rt_executor_owned == true`) so RT ticks stay lock-free/zero-alloc.
+    pub(crate) fn record_finished_action(&self, action: &ActionStatus) {
+        if self.rt_executor_owned || action.is_running() {
+            return;
+        }
+        if let Some(terminals) = self.terminals.as_ref() {
+            if terminals.record_finished(action) {
+                self.core.hub().wake();
+            }
+        }
+    }
+
+    /// Convenience helper: if `self.last_action` matches `id` and is terminal, record it.
+    pub(crate) fn record_finished_action_by_id(&self, id: u64) {
+        if self.rt_executor_owned {
+            return;
+        }
+        if let Some(a) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()) {
+            self.record_finished_action(a);
+        }
+    }
+
+    /// Patches `failed_step` on a queued terminal action if still awaiting dispatcher drain.
+    pub(crate) fn update_recorded_terminal_failed_step(&self, id: u64, step: Option<usize>) {
+        if self.rt_executor_owned {
+            return;
+        }
+        if let Some(terminals) = self.terminals.as_ref() {
+            terminals.update_failed_step(id, step);
+        }
     }
 
     /// Advance the stop generation under the owner lock whenever a Stop applies.
@@ -4207,27 +4258,49 @@ pub(crate) struct CheckedEstopTicket {
     mode: u8,
 }
 
+/// Default bounded capacity of each connection's finished-action terminal FIFO.
+pub const TERMINAL_FIFO_CAPACITY: usize = 64;
+
 type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
 
-struct TerminalBroadcasterInner {
+struct ConnectionTerminalQueue {
+    sub_id: u64,
+    fifo: std::collections::VecDeque<ActionStatus>,
     seen: std::collections::VecDeque<u64>,
-    next_id: u64,
-    sinks: Vec<(u64, TerminalSinkFn)>,
+    sink: TerminalSinkFn,
 }
 
-/// Lossless off-RT action-terminal fan-out: routes observations carrying an unseen terminal
-/// action (`!is_running()`) directly into each WS connection's ordinary control queue rather
-/// than the lossy telemetry broadcast channel. Never touched by `armd-control`.
+struct TerminalBroadcasterInner {
+    next_id: u64,
+    capacity: usize,
+    sinks: Vec<ConnectionTerminalQueue>,
+}
+
+/// Lossless off-RT per-connection bounded FIFO of finished actions: every terminal action
+/// (`!is_running()`) is appended in exact order to each subscribed connection's bounded FIFO,
+/// from which `armd-dispatch` drains every terminal in order onto that connection's lossless
+/// ordinary control queue. Never drops a terminal; if full, new action starts are refused with
+/// [`SafetyError::TerminalsBusy`] until drained. Never locks on `armd-control`.
 pub(crate) struct TerminalBroadcaster {
+    subscriber_count: AtomicUsize,
+    pending_total: AtomicUsize,
+    max_fifo_len: AtomicUsize,
+    capacity_atomic: AtomicUsize,
+    dispatch_paused: AtomicBool,
     inner: std::sync::Mutex<TerminalBroadcasterInner>,
 }
 
 impl Default for TerminalBroadcaster {
     fn default() -> Self {
         Self {
+            subscriber_count: AtomicUsize::new(0),
+            pending_total: AtomicUsize::new(0),
+            max_fifo_len: AtomicUsize::new(0),
+            capacity_atomic: AtomicUsize::new(TERMINAL_FIFO_CAPACITY),
+            dispatch_paused: AtomicBool::new(false),
             inner: std::sync::Mutex::new(TerminalBroadcasterInner {
-                seen: std::collections::VecDeque::with_capacity(128),
                 next_id: 1,
+                capacity: TERMINAL_FIFO_CAPACITY,
                 sinks: Vec::new(),
             }),
         }
@@ -4235,43 +4308,160 @@ impl Default for TerminalBroadcaster {
 }
 
 impl TerminalBroadcaster {
-    fn has_terminal(obs: &ArmObservation) -> bool {
-        obs.previous_action.as_ref().is_some_and(|a| !a.is_running())
-            || obs.action.as_ref().is_some_and(|a| !a.is_running())
+    fn recompute_atomics(&self, g: &TerminalBroadcasterInner) {
+        self.subscriber_count.store(g.sinks.len(), Ordering::Release);
+        let mut pending = 0usize;
+        let mut max_len = 0usize;
+        for q in &g.sinks {
+            let l = q.fifo.len();
+            pending += l;
+            if l > max_len {
+                max_len = l;
+            }
+        }
+        self.pending_total.store(pending, Ordering::Release);
+        self.max_fifo_len.store(max_len, Ordering::Release);
+        self.capacity_atomic.store(g.capacity, Ordering::Release);
     }
 
     pub(crate) fn subscribe(&self, sink: TerminalSinkFn) -> u64 {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = g.next_id;
         g.next_id += 1;
-        g.sinks.push((id, sink));
+        let cap = g.capacity;
+        g.sinks.push(ConnectionTerminalQueue {
+            sub_id: id,
+            fifo: std::collections::VecDeque::with_capacity(cap.min(TERMINAL_FIFO_CAPACITY)),
+            seen: std::collections::VecDeque::with_capacity(cap.max(128)),
+            sink,
+        });
+        self.recompute_atomics(&g);
         id
     }
 
     pub(crate) fn unsubscribe(&self, id: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.sinks.retain(|(sid, _)| *sid != id);
+        g.sinks.retain(|q| q.sub_id != id);
+        self.recompute_atomics(&g);
     }
 
-    pub(crate) fn publish_if_terminal(&self, obs: &ArmObservation) {
-        if !Self::has_terminal(obs) {
+    pub(crate) fn can_start_action(&self, has_running_action: bool, lock_free: bool) -> bool {
+        if self.subscriber_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        // Reserve 1 slot for the new action's eventual terminal, plus 1 immediate slot if a
+        // currently running action will be superseded right now.
+        let needed = if has_running_action { 2 } else { 1 };
+        if lock_free {
+            let cap = self.capacity_atomic.load(Ordering::Acquire);
+            let max_len = self.max_fifo_len.load(Ordering::Acquire);
+            return max_len.saturating_add(needed) <= cap;
+        }
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.sinks.is_empty() {
+            return true;
+        }
+        g.sinks
+            .iter()
+            .all(|q| q.fifo.len().saturating_add(needed) <= g.capacity)
+    }
+
+    pub(crate) fn record_finished(&self, action: &ActionStatus) -> bool {
+        if action.is_running() || self.subscriber_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.sinks.is_empty() {
+            return false;
+        }
+        let cap = g.capacity;
+        let seen_cap = cap.max(128);
+        let mut enqueued = false;
+        for q in &mut g.sinks {
+            if q.seen.contains(&action.id) {
+                continue;
+            }
+            if q.fifo.len() >= cap {
+                continue;
+            }
+            if q.seen.len() >= seen_cap {
+                q.seen.pop_front();
+            }
+            q.seen.push_back(action.id);
+            q.fifo.push_back(action.clone());
+            enqueued = true;
+        }
+        if enqueued {
+            self.recompute_atomics(&g);
+        }
+        enqueued
+    }
+
+    pub(crate) fn record_from_observation(&self, obs: &ArmObservation) {
+        if self.subscriber_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        // Check `previous_action` before `action` to preserve chronological FIFO order.
+        for act in [obs.previous_action.as_ref(), obs.action.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if !act.is_running() {
+                self.record_finished(act);
+            }
+        }
+    }
+
+    pub(crate) fn update_failed_step(&self, action_id: u64, step: Option<usize>) {
+        if self.subscriber_count.load(Ordering::Acquire) == 0 {
             return;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut found_new = false;
-        for act in [obs.previous_action.as_ref(), obs.action.as_ref()].into_iter().flatten() {
-            if !act.is_running() && !g.seen.contains(&act.id) {
-                if g.seen.len() >= 128 {
-                    g.seen.pop_front();
-                }
-                g.seen.push_back(act.id);
-                found_new = true;
+        for q in &mut g.sinks {
+            if let Some(a) = q.fifo.iter_mut().find(|a| a.id == action_id) {
+                a.failed_step = step;
             }
         }
-        if !found_new || g.sinks.is_empty() {
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.dispatch_paused.load(Ordering::Acquire)
+            && self.pending_total.load(Ordering::Acquire) > 0
+    }
+
+    pub(crate) fn drain_all(&self, base_obs: &ArmObservation) {
+        if self.dispatch_paused.load(Ordering::Acquire)
+            || self.pending_total.load(Ordering::Acquire) == 0
+        {
             return;
         }
-        g.sinks.retain(|(_, sink)| sink(obs));
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.sinks.retain_mut(|q| {
+            while let Some(finished) = q.fifo.pop_front() {
+                let mut obs = base_obs.clone();
+                obs.action = Some(finished);
+                obs.previous_action = None;
+                if !(q.sink)(&obs) {
+                    return false;
+                }
+            }
+            true
+        });
+        self.recompute_atomics(&g);
+    }
+
+    pub(crate) fn set_capacity(&self, capacity: usize) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.capacity = capacity.max(1);
+        self.recompute_atomics(&g);
+    }
+
+    pub(crate) fn set_dispatch_paused(&self, paused: bool) {
+        self.dispatch_paused.store(paused, Ordering::Release);
+    }
+
+    pub(crate) fn pending_total(&self) -> usize {
+        self.pending_total.load(Ordering::Acquire)
     }
 }
 
@@ -4326,6 +4516,9 @@ pub struct ArmSupervisor {
     estop_reg: Arc<std::sync::Mutex<crate::rt_core::executor::EstopRegistry>>,
     /// Off-thread consumer sinks installed when ownership transfers to the RT executor.
     sinks: Arc<std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>>,
+    /// Template observation used by `armd-dispatch` to carry drained action terminals if no
+    /// control tick has published to `hub` yet.
+    template_obs: ArmObservation,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -4391,11 +4584,14 @@ impl ArmSupervisor {
         let requested_estop_count = Arc::new(AtomicU64::new(0));
         let stop_gen = Arc::new(AtomicU64::new(0));
         let lease_gen_mirror = Arc::new(AtomicU64::new(0));
+        let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
         inner.stop_gen = stop_gen.clone();
         inner.lease_gen_mirror = lease_gen_mirror.clone();
+        inner.terminals = Some(Arc::clone(&terminals));
+        let template_obs = inner.current_observation();
         let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
@@ -4403,7 +4599,7 @@ impl ArmSupervisor {
         Self {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
-            terminals: Arc::new(TerminalBroadcaster::default()),
+            terminals,
             e_stop_latched,
             requested_estop_count,
             stop_gen,
@@ -4426,6 +4622,7 @@ impl ArmSupervisor {
             executor_base_gen: AtomicU64::new(0),
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
+            template_obs,
         }
     }
 
@@ -4684,19 +4881,47 @@ impl ArmSupervisor {
         if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return Ok(()); }
-        let (hub, tx, terminals, sinks, tick_stats) = (
+        let (hub, tx, terminals, sinks, tick_stats, template_obs) = (
             Arc::clone(&self.hub),
             self.telemetry_tx.clone(),
             Arc::clone(&self.terminals),
             Arc::clone(&self.sinks),
             Arc::clone(&self.tick_stats),
+            self.template_obs.clone(),
         );
         let handle = std::thread::Builder::new()
             .name("armd-dispatch".into())
-            .spawn(move || dispatch_loop(&hub, &tx, &terminals, &sinks, &tick_stats))
+            .spawn(move || dispatch_loop(&hub, &tx, &terminals, &sinks, &tick_stats, &template_obs))
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
         Ok(())
+    }
+
+    /// Test-only hook: configure per-connection bounded terminal FIFO capacity.
+    #[doc(hidden)]
+    pub fn test_set_terminal_fifo_capacity(&self, capacity: usize) {
+        self.terminals.set_capacity(capacity);
+    }
+
+    /// Test-only hook: pause or resume draining of per-connection terminal FIFOs in `armd-dispatch`.
+    #[doc(hidden)]
+    pub fn test_set_terminal_dispatch_paused(&self, paused: bool) {
+        self.terminals.set_dispatch_paused(paused);
+        if !paused {
+            self.hub.wake();
+        }
+    }
+
+    /// Test-only accessor for total pending finished actions across subscribed terminal FIFOs.
+    #[doc(hidden)]
+    pub fn test_pending_terminal_count(&self) -> usize {
+        self.terminals.pending_total()
+    }
+
+    /// Test-only accessor for subscribed WS terminal FIFO count.
+    #[doc(hidden)]
+    pub fn test_terminal_subscriber_count(&self) -> usize {
+        self.terminals.subscriber_count.load(Ordering::Acquire)
     }
 
     #[doc(hidden)]
@@ -5654,7 +5879,10 @@ impl ArmSupervisor {
         let released = Instant::now();
         let usage_released = UsageMark::now();
         if let Some(ref tobs) = terminal_obs {
-            self.terminals.publish_if_terminal(tobs);
+            self.terminals.record_from_observation(tobs);
+            if self.terminals.has_pending() {
+                self.hub.wake();
+            }
         }
         self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
         if let Some(job) = pending_zc {
@@ -5682,6 +5910,7 @@ impl ArmSupervisor {
                             a.message = Some(format!("Failed to persist gripper calibration: {e}"));
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
                     Err(e) => {
@@ -5697,6 +5926,7 @@ impl ArmSupervisor {
                             a.message = Some(format!("Failed to persist gripper calibration: {e}"));
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
                 };
@@ -5731,6 +5961,7 @@ impl ArmSupervisor {
                                 });
                                 a.finished_at = Some(now);
                             }
+                            inner.record_finished_action_by_id(job.action_id);
                         }
                         return;
                     }
@@ -5747,6 +5978,7 @@ impl ArmSupervisor {
                             a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
 
@@ -5762,6 +5994,7 @@ impl ArmSupervisor {
                             a.message = Some("Gripper calibration revision changed concurrently".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
 
@@ -5780,6 +6013,7 @@ impl ArmSupervisor {
                                 a.message = Some(format!("Gripper calibration rejected: {e}"));
                                 a.finished_at = Some(now);
                             }
+                            inner.record_finished_action_by_id(job.action_id);
                             return;
                         }
                     };
@@ -5805,6 +6039,7 @@ impl ArmSupervisor {
                             a.message = Some("Control lease lost or expired before gripper calibration persisted".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
                     if !auth_still_ok {
@@ -5819,6 +6054,7 @@ impl ArmSupervisor {
                             a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
                             a.finished_at = Some(now);
                         }
+                        inner.record_finished_action_by_id(job.action_id);
                         return;
                     }
 
@@ -5836,6 +6072,7 @@ impl ArmSupervisor {
                                 a.message = Some(format!("Failed to persist gripper calibration: {e}"));
                                 a.finished_at = Some(now);
                             }
+                            inner.record_finished_action_by_id(job.action_id);
                             return;
                         }
                     };
@@ -5870,6 +6107,7 @@ impl ArmSupervisor {
                         }
                     }
                 }
+                inner.record_finished_action_by_id(job.action_id);
             });
         }
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
@@ -5966,6 +6204,7 @@ fn dispatch_loop(
     terminals: &TerminalBroadcaster,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
     tick_stats: &std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    template_obs: &ArmObservation,
 ) {
     #[cfg(target_os = "linux")]
     {
@@ -5988,20 +6227,39 @@ fn dispatch_loop(
     while !hub.is_closed() {
         drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
+        let mut new_obs: Option<ArmObservation> = None;
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
-                terminals.publish_if_terminal(&s.obs);
-                if tx.receiver_count() > 0 { let _ = tx.send(s.obs.clone()); }
+                terminals.record_from_observation(&s.obs);
+                new_obs = Some(s.obs.clone());
+            }
+        }
+        // Drain every connection's bounded terminal FIFO into its higher-priority `ordinary_out_tx`
+        // BEFORE forwarding telemetry so a newer telemetry snapshot can never overtake earlier
+        // terminals on the wire.
+        if terminals.has_pending() {
+            let base = new_obs
+                .clone()
+                .or_else(|| hub.latest().map(|s| s.obs.clone()));
+            terminals.drain_all(base.as_ref().unwrap_or(template_obs));
+        }
+        if let Some(obs) = new_obs {
+            if terminals.pending_total() == 0 && tx.receiver_count() > 0 {
+                let _ = tx.send(obs);
             }
         }
         std::thread::park_timeout(Duration::from_millis(50));
     }
-    // Final drain on supervisor close so no retired/diagnostic/reply items are stranded.
+    // Final drain on supervisor close so no retired/diagnostic/reply/terminal items are stranded.
     drain_sinks();
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    if let Some(s) = hub.latest() {
-        terminals.publish_if_terminal(&s.obs);
+    let latest_obs = hub.latest().map(|s| s.obs.clone());
+    if let Some(obs) = latest_obs.as_ref() {
+        terminals.record_from_observation(obs);
+    }
+    if terminals.has_pending() {
+        terminals.drain_all(latest_obs.as_ref().unwrap_or(template_obs));
     }
 }
 

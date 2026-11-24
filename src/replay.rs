@@ -694,6 +694,8 @@ impl SupervisorInner {
     }
 
     fn install_replay_motion(&mut self, admitted: crate::supervisor::Admitted, motion: ReplayMotion, first: &[f32], scales: [Option<f64>; 2], log_start: bool) -> Result<(u64, f64), ArmError> {
+        self.verify_admitted(&admitted)?;
+        self.check_terminal_fifo_for_new_action()?;
         let expected = motion.expected_duration();
         let tag = motion.tag.clone();
         self.start_replay_motion(admitted, first)?;

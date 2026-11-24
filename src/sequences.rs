@@ -757,10 +757,18 @@ async fn end(ctx: &MacroCtx, result: Result<(), Stop>, step: Option<usize>) {
     let mut inner = ctx.sup.inner().write().await;
     match result {
         Ok(()) => return inner.finish_macro(ctx.id, "done", None, None, None, None),
-        Err(Stop::Fail(code, message)) => inner.finish_macro(ctx.id, "failed", Some(&code), Some(message), None, None),
+        Err(Stop::Fail(code, message)) => {
+            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && a.is_running()) {
+                a.failed_step = step;
+            }
+            inner.finish_macro(ctx.id, "failed", Some(&code), Some(message), None, None);
+        }
         Err(Stop::Cancelled) => {}
     }
-    if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && !a.is_running()) { a.failed_step = step; }
+    if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && !a.is_running()) {
+        a.failed_step = step;
+    }
+    inner.update_recorded_terminal_failed_step(ctx.id, step);
 }
 
 /// Before a motion step: the run is alive and nothing it was checked against changed.

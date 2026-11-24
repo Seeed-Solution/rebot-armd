@@ -862,6 +862,7 @@ impl SupervisorInner {
                 v.min(DEFAULT_MAX_FIRST_STEP_RAD)
             });
 
+        self.check_terminal_fifo_for_new_action()?;
         let action_id = self.begin_action("policy", req.tag);
         let run = PolicyRun {
             action_id,
@@ -1467,6 +1468,7 @@ pub mod targets {
             SafetyError::OwnerTransferred => "OWNER_TRANSFERRED",
             SafetyError::Stopped => "STOPPED",
             SafetyError::LeaseLost => "LEASE_LOST",
+            SafetyError::TerminalsBusy => "TERMINALS_BUSY",
             _ => "SAFETY_ERROR",
         }
     }

@@ -1404,10 +1404,12 @@ fn prepare_action(
     let (kind, parsed) = match path {
         "/api/v1/action/move_to" => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             ("move_to", motion::parse_move_to(body))
         }
         "/api/v1/action/move_relative" => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             ("move_relative", motion::parse_move_relative(body))
         }
         "/api/v1/action/gripper" => {
@@ -1448,14 +1450,17 @@ fn prepare_action(
                 return Ok(ActionStart::DryRunGrasp(body.clone()));
             }
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?)));
         }
         "/api/v1/action/place" => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?)));
         }
         "/api/v1/action/replay" => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             let request = crate::replay::parse_replay(body).map_err(ArmError::from)?;
             return Ok(ActionStart::Replay(inner.replay_input(request, epoch)?));
         }
@@ -1466,19 +1471,23 @@ fn prepare_action(
         }
         "/api/v1/action/run_sequence" => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?)));
         }
         crate::calib_hover::PATH => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?)));
         }
         crate::measure_multiview::PATH => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             return Ok(ActionStart::MeasureMultiview(Box::new(crate::measure_multiview::prepare(inner, body, epoch)?)));
         }
         #[cfg(feature = "policy-runtime")]
         "/api/v1/action/policy/start" => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             let request = crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
             let _ = crate::policy_runtime::compute_policy_deadline(request.max_seconds).map_err(ArmError::from)?;
             inner.check_policy_start_preconditions_with(
