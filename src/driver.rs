@@ -9740,8 +9740,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.motor_ids.is_empty() || self.awaiting_rx_boundary || !self.is_feedback_valid() {
             return false;
         }
-        let has_on = self.motor_status.iter().any(|&s| s == 1);
-        let has_off = self.motor_status.iter().any(|&s| s == 0);
+        let has_on = self.motor_status.contains(&1);
+        let has_off = self.motor_status.contains(&0);
         has_on && has_off
     }
 
