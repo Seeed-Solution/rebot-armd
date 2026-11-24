@@ -7591,14 +7591,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
         match ev {
             MotorTorqueEvidence::OffConfirmed => {
-                if self.motor_disable_confirmed.get(i).copied().unwrap_or(false) {
-                    MotorTorqueEvidence::OffConfirmed
-                } else if self
-                    .last_feedback_instant
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|t| self.since(t) <= FRESHNESS_LIMIT)
+                if self.motor_disable_confirmed.get(i).copied().unwrap_or(false)
+                    || self
+                        .last_feedback_instant
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|t| self.since(t) <= FRESHNESS_LIMIT)
                 {
                     MotorTorqueEvidence::OffConfirmed
                 } else {

@@ -498,6 +498,7 @@ pub struct EnableReducer {
 }
 
 /// Result of one step of the unified enable reducer (stack-only, 0 heap allocs on RT).
+#[allow(clippy::large_enum_variant)] // inline bounded text avoids RT heap allocation
 enum EnableStepOutcome {
     Pending {
         wake: Instant,
@@ -2380,7 +2381,7 @@ impl SupervisorInner {
                     EnableStepOutcome::Pending { wake } => Ok(Rt::Pending { wake }),
                     EnableStepOutcome::Failed { rt_code, .. } => Err(rt_code),
                 };
-                return Some(TransitionPoll { progress, rx });
+                Some(TransitionPoll { progress, rx })
             }
             TorqueTransition::Disable { confirm } => {
                 let Some(d) = self.driver.as_ref() else {
