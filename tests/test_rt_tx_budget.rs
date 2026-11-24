@@ -999,7 +999,7 @@ async fn per_frame_timing_unequal_durations_exposed_in_diagnostics_tick_http_jso
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
         inner.tick(0.02);
-        inner.set_torque(true).expect("arm");
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     }
     bus.clear();
     // Warm up one tick.
@@ -1089,7 +1089,7 @@ fn legacy_supervisor_fails_closed_on_backpressured_final_release_batch() {
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     for _ in 0..3 {
         bus.with(|s| s.push_all_feedback());
         inner.tick(0.02);

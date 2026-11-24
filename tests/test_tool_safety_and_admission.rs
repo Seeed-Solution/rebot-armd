@@ -302,7 +302,7 @@ fn b3_close_torque_cap_refuses_missing_torque_feedback_and_stops_on_stale_feedba
     let mut inner = SupervisorInner::new(cfg);
     inner.driver = Some(Mutex::new(Box::new(drv)));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = vec![0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -3.0];
     inner.measured_positions = inner.commanded_positions.clone();
     inner.target_positions = inner.commanded_positions.clone();
@@ -348,7 +348,7 @@ fn b3_close_torque_cap_refuses_missing_torque_feedback_and_stops_on_stale_feedba
     let mut inner2 = SupervisorInner::new(cfg2);
     inner2.driver = Some(Mutex::new(Box::new(drv2.clone())));
     inner2.lease_enabled = false;
-    inner2.set_torque(true).unwrap();
+    { let __s = inner2.current_admission_stamp(); inner2.enable_torque(__s) }.unwrap();
     inner2.commanded_positions = q0.to_vec();
     inner2.measured_positions = q0.to_vec();
     inner2.target_positions = q0.to_vec();
@@ -578,7 +578,7 @@ async fn b5_b6_replay_checks_tool_provenance_and_tcp_reach_envelope() {
     let (action_id, epoch) = {
         let mut inner = seq_sup_arc.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         inner.commanded_positions = INSPECT.to_vec();
         inner.measured_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
@@ -711,7 +711,7 @@ fn b9_table_z_from_tcp_rejects_stale_or_moving_arm_without_changing_revision_or_
     let mut inner = SupervisorInner::new(cfg);
     inner.driver = Some(Mutex::new(Box::new(drv.clone())));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = q_vert.to_vec();
     inner.measured_positions = q_vert.to_vec();
     inner.target_positions = q_vert.to_vec();
@@ -782,7 +782,7 @@ fn b11_park_retains_torque_when_measured_endpoint_violates_workspace_within_join
 
     let mut inner = SupervisorInner::new(cfg);
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = inner.config.home_positions.clone();
     inner.target_positions = inner.config.home_positions.clone();
     inner.measured_positions = inner.config.home_positions.clone();
@@ -792,7 +792,7 @@ fn b11_park_retains_torque_when_measured_endpoint_violates_workspace_within_join
     inner.measured_positions = q_meas;
     let v = inner.resting_pose_static_violation().expect("must fail on measured workspace violation");
     assert!(v.contains("max_reach"), "expected violation naming max_reach, got: {v}");
-    assert!(inner.set_torque(false).is_err(), "set_torque(false) must refuse to drop torque while measured pose violates workspace");
+    assert!(inner.disable_torque().is_err(), "set_torque(false) must refuse to drop torque while measured pose violates workspace");
     assert!(inner.is_torqued, "holding torque must remain enabled");
 }
 
@@ -959,10 +959,10 @@ fn r2_b04_m01_clear_fault_and_torque_off_enforce_measured_workspace_envelope() {
     let mut inner = SupervisorInner::new(cfg);
     inner.driver = Some(Mutex::new(Box::new(drv.clone())));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
 
     // m01: set_torque(false) returns ArmNotAtRestingPose carrying workspace constraint + geometry point
-    let off_err = inner.set_torque(false).unwrap_err();
+    let off_err = inner.disable_torque().unwrap_err();
     let off_msg = off_err.to_string();
     assert!(off_msg.contains("max_reach") && off_msg.contains("point 0"), "got: {off_msg}");
 
@@ -994,7 +994,7 @@ fn r2_b06_table_z_from_tcp_rejects_cached_or_gapped_hw_timestamps() {
     let mut inner = SupervisorInner::new(cfg);
     inner.driver = Some(Mutex::new(Box::new(drv.clone())));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = q_vert.to_vec();
     inner.measured_positions = q_vert.to_vec();
     inner.target_positions = q_vert.to_vec();
@@ -1066,7 +1066,7 @@ fn r2_b07_commissioning_jog_scales_j7_velocity_and_requires_torque_feedback_on_c
     let mut inner = SupervisorInner::new(cfg.clone());
     inner.driver = Some(Mutex::new(Box::new(drv_no_tq)));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = q_open.to_vec();
     inner.measured_positions = q_open.to_vec();
     inner.target_positions = q_open.to_vec();
@@ -1212,7 +1212,7 @@ fn r2_b11_read_joint_states_error_clears_freshness_and_freezes_streaming_close()
     let mut inner = SupervisorInner::new(cfg);
     inner.driver = Some(Mutex::new(Box::new(drv.clone())));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = q0.to_vec();
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();

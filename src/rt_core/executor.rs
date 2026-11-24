@@ -2994,7 +2994,8 @@ mod tests {
     fn exit_drain_returns_persist_payloads_without_mutating_live_state() {
         let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
         core.lease_enabled = false;
-        core.set_torque(true).unwrap();
+        let stamp = core.current_admission_stamp();
+        core.enable_torque(stamp).unwrap();
         let epoch = core.safety.epoch_id();
         let stamp = core.current_admission_stamp();
         let (action_id, _) = core

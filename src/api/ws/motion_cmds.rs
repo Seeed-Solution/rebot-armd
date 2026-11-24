@@ -13,7 +13,11 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
         "/api/v1/torque" | "/api/v1/arm" => {
             let enabled = body.get("enable").and_then(Value::as_bool)
                 .ok_or_else(|| invalid_command("enable must be boolean"))?;
-            inner.set_torque(enabled).map_err(ArmError::from)?;
+            if enabled {
+                inner.enable_torque(stamp).map_err(ArmError::from)?;
+            } else {
+                inner.disable_torque().map_err(ArmError::from)?;
+            }
         }
         "/api/v1/safety/clear_fault" => {
             // {"mit_recovery": "torque_off_all"}: the operator accepts the MIT expiry recovery

@@ -781,11 +781,12 @@ mod shutdown_tests {
         assert_ne!(new_epoch, old_epoch);
         assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], old_epoch).is_err());
         assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], new_epoch).is_err());
-        assert!(inner.set_torque(true).is_err());
+        assert!(inner.enable_torque(inner.current_admission_stamp()).is_err());
         inner.clear_fault().unwrap();
         assert_eq!(inner.safety.state(), &SafetyState::Idle);
         assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], inner.safety.epoch_id()).is_err());
-        inner.set_torque(true).unwrap();
+        let st = inner.current_admission_stamp();
+        inner.enable_torque(st).unwrap();
         assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], inner.safety.epoch_id()).is_ok());
     }
 
@@ -808,7 +809,8 @@ mod shutdown_tests {
     fn confirmed_disabled_hardware_can_exit_and_cannot_reenable_during_exit() {
         let mut inner = physical(EnableState::Disabled);
         assert!(request_shutdown(&mut inner));
-        assert!(inner.set_torque(true).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.enable_torque(st).is_err());
         let mut unknown = physical(EnableState::Unknown);
         assert!(!request_shutdown(&mut unknown));
     }
@@ -888,7 +890,7 @@ mod shutdown_tests {
         };
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
         sup.set_lease_enabled(false).await;
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -992,7 +994,7 @@ mod shutdown_tests {
         };
         let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
         sup_leg.set_lease_enabled(false).await;
-        sup_leg.set_torque(true).await.unwrap();
+        sup_leg.enable_torque(sup_leg.capture_admission_stamp()).await.unwrap();
         let legacy_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut server_leg = tokio::spawn(async {
             std::future::pending::<std::io::Result<()>>().await
@@ -1054,9 +1056,9 @@ mod shutdown_tests {
             .expect_err("clear_fault must be refused once legacy shutdown is committed");
         assert!(cf_err.to_string().contains("shutdown"), "unexpected clear_fault err: {cf_err}");
         let en_err = sup
-            .set_torque(true)
+            .enable_torque(sup.capture_admission_stamp())
             .await
-            .expect_err("set_torque(true) must be refused once legacy shutdown is committed");
+            .expect_err("enable_torque must be refused once legacy shutdown is committed");
         assert!(
             matches!(en_err, armd::supervisor::ArmError::Safety(armd::safety::SafetyError::EStopActive)),
             "unexpected set_torque(true) err: {en_err:?}"

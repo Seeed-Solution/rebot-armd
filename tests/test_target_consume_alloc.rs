@@ -53,7 +53,7 @@ const CONN: &str = "conn-alloc";
 fn supervisor() -> (SupervisorInner, u64) {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     let gen = inner.acquire_lease(CONN).expect("lease");
     (inner, gen)
 }

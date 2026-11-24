@@ -226,7 +226,7 @@ fn supervisor(with_driver: bool) -> SupervisorInner {
     }
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     warm(&mut inner, 5);
     inner
 }
@@ -614,7 +614,7 @@ fn watchdog_park_supervisor() -> SupervisorInner {
     });
     let mut inner = SupervisorInner::new(cfg);
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     let _gen = inner.acquire_lease("client").expect("lease");
     let epoch = inner.safety.epoch_id();
     { let s = inner.current_admission_stamp(); inner.jog(s, vec![0.5, 0.2], Some(0.2), Some(epoch)) }.expect("jog");

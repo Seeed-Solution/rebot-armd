@@ -21,7 +21,7 @@ fn rebot_dm_inspect_jog_is_capped_at_planned_speed() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         supervisor.set_lease_enabled(false).await;
-        supervisor.set_torque(true).await.unwrap();
+        supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
         supervisor.jog(supervisor.capture_admission_stamp(), INSPECT.to_vec(), None, None).await.unwrap();
         let duration = supervisor.inner().read().await.active_trajectory.as_ref().unwrap().duration();
         assert!((duration - 1.875 * 1.565 / 0.45).abs() < 0.01, "duration {duration}");
@@ -125,7 +125,7 @@ async fn lag_arm(cap: Option<f32>) -> (ArmSupervisor, Arc<Mutex<LagArm>>) {
     let supervisor = ArmSupervisor::new(config).with_driver(Box::new(LagDriver(arm.clone())));
     supervisor.set_lease_enabled(false).await;
     supervisor.tick(DT).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     (supervisor, arm)
 }
 
@@ -180,7 +180,7 @@ async fn watchdog_park_from_far_j6_gets_an_extended_deadline_and_completes() {
     config.lease_timeout_ms = 50;
     let supervisor = ArmSupervisor::new(config);
     supervisor.set_lease_enabled(false).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     let mut far = ArmConfig::rebot_dm().home_positions;
     far[5] -= 4.7;
     supervisor.jog(supervisor.capture_admission_stamp(), far.clone(), None, None).await.unwrap();

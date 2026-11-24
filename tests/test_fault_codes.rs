@@ -25,7 +25,7 @@ async fn fault_is_null_while_healthy_and_serialized_as_null() {
 async fn control_deadline_is_recoverable_and_clear_resets_it() {
     let supervisor = sim();
     supervisor.set_lease_enabled(false).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.tick(0.02).await;
     let obs = supervisor.tick(0.3).await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::Other(_))), "{:?}", obs.safety_state);

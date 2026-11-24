@@ -237,7 +237,7 @@ async fn test_preempt_lease_four_categories() {
     // Cat 3: Fully Settled Armed Hold
     {
         let mut inner = SupervisorInner::new(config.clone());
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         assert_eq!(*inner.safety.state(), SafetyState::Armed);
         assert_eq!(inner.commanded_velocities, vec![0.0, 0.0]);
         assert_eq!(inner.measured_velocities, vec![0.0, 0.0]);
@@ -250,7 +250,7 @@ async fn test_preempt_lease_four_categories() {
     // Cat 4: Moving / Braking / Uncertain -> Must enter gate!
     {
         let mut inner = SupervisorInner::new(config.clone());
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         inner.commanded_velocities = vec![0.5, -0.5];
         inner.measured_velocities = vec![0.5, -0.5];
 
@@ -263,14 +263,14 @@ async fn test_preempt_lease_four_categories() {
 #[tokio::test]
 async fn test_handover_settling_motion_gate_locks_actuation() {
     let mut inner = SupervisorInner::new(test_config());
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     let epoch = inner.safety.epoch_id();
 
     // Lock handover gate
     inner.handover_settling_since = Some(Instant::now());
 
     // 1. set_torque(true) must be rejected
-    let torque_err = inner.set_torque(true).unwrap_err();
+    let torque_err = { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap_err();
     assert_eq!(torque_err, SafetyError::HandoverSettling);
 
     // 2. jog must be rejected
@@ -289,7 +289,7 @@ async fn test_handover_settling_motion_gate_locks_actuation() {
 #[tokio::test]
 async fn test_handover_settling_tick_convergence_to_cat3() {
     let mut inner = SupervisorInner::new(test_config());
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
 
     // In Cat 4: arm has commanded velocity and gate is active
     inner.commanded_velocities = vec![0.05, 0.05];
@@ -317,7 +317,7 @@ async fn test_handover_settling_tick_convergence_to_cat3() {
 #[tokio::test]
 async fn test_handover_settling_timeout_latches_fault() {
     let mut inner = SupervisorInner::new(test_config());
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
 
     // Moving arm unable to settle within 1500ms
     inner.commanded_velocities = vec![0.5, 0.5];
@@ -615,7 +615,7 @@ async fn test_websocket_lease_lost_includes_generation() {
 fn test_handover_settling_preserves_thermal_trip_fault() {
     let mut inner = SupervisorInner::new(test_config());
     let _ = inner.acquire_lease("c1").unwrap();
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
 
     // Trigger Cat 4 preemption (simulate moving)
     inner.commanded_velocities = vec![0.5; inner.config.dof];

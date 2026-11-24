@@ -2420,7 +2420,7 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         let mut sup = SupervisorInner::new(cfg).with_driver(Box::new(d));
         sup.lease_enabled = false;
         sup.tick(DT);
-        sup.set_torque(true).unwrap();
+        { let __s = sup.current_admission_stamp(); sup.enable_torque(__s) }.unwrap();
         sup.tick(DT);
         (sup, inner_bus, clock)
     };
@@ -3209,7 +3209,7 @@ fn stalled_empty_jaw_close_c300_pattern_fails_instead_of_done() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(state.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     let epoch = inner.safety.epoch_id();
     let req = GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None };
     let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper(s, req, epoch) }.unwrap();
@@ -3239,7 +3239,7 @@ fn stalled_empty_jaw_close_c300_pattern_fails_instead_of_done() {
     let mut grasp_sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(grasp_state)));
     grasp_sup.lease_enabled = false;
     grasp_sup.tick(DT);
-    grasp_sup.set_torque(true).unwrap();
+    { let __s = grasp_sup.current_admission_stamp(); grasp_sup.enable_torque(__s) }.unwrap();
     let ep = grasp_sup.safety.epoch_id();
     let (gid, _) = { let s = grasp_sup.current_admission_stamp(); grasp_sup.start_gripper(s,
         GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None }, ep
@@ -3305,7 +3305,7 @@ fn stalled_empty_jaw_close_c300_pattern_fails_instead_of_done() {
     let mut park_sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(park_state)));
     park_sup.lease_enabled = false;
     park_sup.tick(DT);
-    park_sup.set_torque(true).unwrap();
+    { let __s = park_sup.current_admission_stamp(); park_sup.enable_torque(__s) }.unwrap();
     park_sup.pending_normal_unload = true;
     park_sup.park_gripper_contact = true;
     park_sup.held = Some(HeldObject { label: "box".into(), spill_safe: false });
@@ -3437,7 +3437,7 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         let mut sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(SlowTravelDriver(st.clone())));
         sup.lease_enabled = false;
         sup.tick(0.02);
-        sup.set_torque(true).unwrap();
+        { let __s = sup.current_admission_stamp(); sup.enable_torque(__s) }.unwrap();
         sup.tick(0.02);
         (sup, st)
     };

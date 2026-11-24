@@ -1067,7 +1067,8 @@ mod tests {
         q1[6] = -0.2;
         let mut recv = SupervisorInner::new(non_stock_cfg);
         recv.lease_enabled = false;
-        recv.set_torque(true).unwrap();
+        let stamp = recv.current_admission_stamp();
+        recv.enable_torque(stamp).unwrap();
         recv.commanded_positions = q0.clone();
         recv.measured_positions = q0.clone();
         recv.target_positions = q0.clone();
@@ -1126,7 +1127,8 @@ mod tests {
         q1[0] = 0.2;
         let mut recv = SupervisorInner::new(longer_cfg);
         recv.lease_enabled = false;
-        recv.set_torque(true).unwrap();
+        let stamp = recv.current_admission_stamp();
+        recv.enable_torque(stamp).unwrap();
         recv.commanded_positions = q0.clone();
         recv.measured_positions = q0.clone();
         recv.target_positions = q0.clone();

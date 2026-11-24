@@ -242,7 +242,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
     let prepared_ok = prepare_policy(dir_ok.path(), &cfg).unwrap();
     let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
     let gen = sup.acquire_lease("conn-live").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -307,7 +307,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
     let prepared_jump = prepare_policy(dir_jump.path(), &cfg).unwrap();
     let sup2 = Arc::new(ArmSupervisor::new(cfg.clone()));
     let gen2 = sup2.acquire_lease("conn-jump").await.unwrap();
-    sup2.set_torque(true).await.unwrap();
+    sup2.enable_torque(sup2.capture_admission_stamp()).await.unwrap();
     sup2.tick(0.02).await;
     let epoch2 = sup2.get_observation().await.epoch_id;
 
@@ -388,7 +388,7 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
     let cfg = make_6dof_config();
     let sup = Arc::new(ArmSupervisor::new(cfg));
     let gen1 = sup.acquire_lease("conn-1").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch1 = sup.get_observation().await.epoch_id;
 
@@ -555,7 +555,7 @@ async fn policy_frames_do_not_renew_external_lease_watchdog() {
     cfg.lease_timeout_ms = 120; // short watchdog timeout
     let sup = Arc::new(ArmSupervisor::new(cfg));
     let gen = sup.acquire_lease("conn-wd").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -644,7 +644,7 @@ async fn real_driver_rejects_live_mode_but_allows_shadow() {
     );
 
     let gen = sup.acquire_lease("conn-real").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -697,7 +697,7 @@ async fn mutual_exclusion_between_policy_and_other_motions() {
     let cfg = make_6dof_config();
     let sup = Arc::new(ArmSupervisor::new(cfg));
     let gen = sup.acquire_lease("conn-mx").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -1001,7 +1001,7 @@ async fn blocked_hold_during_tick_terminates_live_policy_and_is_not_cleared() {
     let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(PinnedDriver { q: vec![0.0; 6], torqued: false })));
     sup.set_follower("sim").await;
     let gen = sup.acquire_lease("conn-bh").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -1466,7 +1466,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
     let prepared_a = prepare_policy(dir.path(), &cfg).unwrap();
     let sup_a = Arc::new(ArmSupervisor::new(cfg.clone()));
     let gen_a = sup_a.acquire_lease("conn-dl-a").await.unwrap();
-    sup_a.set_torque(true).await.unwrap();
+    sup_a.enable_torque(sup_a.capture_admission_stamp()).await.unwrap();
     sup_a.tick(0.02).await;
     let epoch_a = sup_a.get_observation().await.epoch_id;
     let id_a = {
@@ -1529,7 +1529,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
     .unwrap();
     let sup_b = Arc::new(ArmSupervisor::new(cfg));
     let gen_b = sup_b.acquire_lease("conn-dl-b").await.unwrap();
-    sup_b.set_torque(true).await.unwrap();
+    sup_b.enable_torque(sup_b.capture_admission_stamp()).await.unwrap();
     sup_b.tick(0.02).await;
     let epoch_b = sup_b.get_observation().await.epoch_id;
     let id_b = {
@@ -1651,7 +1651,7 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
     let prepared_b = PreparedPolicy::from_backend(snap, contract, Box::new(VerySlowBackend), &cfg).unwrap();
     let sup_b = Arc::new(ArmSupervisor::new(cfg));
     let gen_b = sup_b.acquire_lease("conn-race-infer").await.unwrap();
-    sup_b.set_torque(true).await.unwrap();
+    sup_b.enable_torque(sup_b.capture_admission_stamp()).await.unwrap();
     sup_b.tick(0.02).await;
     let epoch_b = sup_b.get_observation().await.epoch_id;
     let id_b = {
@@ -1705,7 +1705,7 @@ async fn live_policy_start_rejected_while_arm_braking_and_succeeds_when_settled(
     let cfg = make_6dof_config();
     let sup = Arc::new(ArmSupervisor::new(cfg));
     let gen = sup.acquire_lease("conn-brake").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -2018,7 +2018,7 @@ async fn overlapping_policy_load_is_rejected_with_motion_busy() {
     let cfg = make_6dof_config();
     let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
     let gen = sup.acquire_lease("conn-load").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -2251,7 +2251,7 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
     })));
     sup.set_follower("sim").await;
     let gen = sup.acquire_lease("conn-gc").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     for _ in 0..5 {
         let ep = sup.get_observation().await.epoch_id;
         let _ = sup.heartbeat("conn-gc", ep).await;
@@ -2948,7 +2948,7 @@ async fn live_policy_rejects_stale_joint_measurement_from_slow_inference() {
 
     let sup = Arc::new(ArmSupervisor::new(cfg));
     let gen = sup.acquire_lease("conn-slow-infer").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -3486,7 +3486,7 @@ mod phase2_vision {
             let prepared = prepare_policy(dir.path(), &cfg).unwrap();
             let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
             let gen = sup.acquire_lease("conn-stale").await.unwrap();
-            sup.set_torque(true).await.unwrap();
+            sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
             sup.tick(0.02).await;
             let epoch = sup.get_observation().await.epoch_id;
             let action_id = {
@@ -3535,7 +3535,7 @@ mod phase2_vision {
             let prepared = prepare_policy(dir.path(), &cfg).unwrap();
             let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
             let gen = sup.acquire_lease("conn-missing-ts").await.unwrap();
-            sup.set_torque(true).await.unwrap();
+            sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
             sup.tick(0.02).await;
             let epoch = sup.get_observation().await.epoch_id;
             let action_id = {
@@ -3859,7 +3859,7 @@ mod phase2_vision {
             let prepared = prepare_policy(dir.path(), &cfg).unwrap();
             let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
             let gen = sup.acquire_lease("conn-hold").await.unwrap();
-            sup.set_torque(true).await.unwrap();
+            sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
             sup.tick(0.02).await;
             let epoch = sup.get_observation().await.epoch_id;
             let id = {
@@ -4119,7 +4119,7 @@ mod phase2_vision {
             let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
             let conn_id = format!("conn-{case_name}");
             let gen = sup.acquire_lease(&conn_id).await.unwrap();
-            sup.set_torque(true).await.unwrap();
+            sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
             sup.tick(0.02).await;
             let epoch = sup.get_observation().await.epoch_id;
             let action_id = {
@@ -4224,7 +4224,7 @@ mod phase2_vision {
 
         let sup = Arc::new(ArmSupervisor::new(cfg));
         let gen = sup.acquire_lease("conn-lock-stale").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
@@ -4595,7 +4595,7 @@ mod phase2_vision {
         let prepared = prepare_policy(dir.path(), &cfg).unwrap();
         let sup = Arc::new(ArmSupervisor::new(cfg));
         let gen = sup.acquire_lease("conn-http-delay").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
@@ -4688,7 +4688,7 @@ mod phase2_vision {
 
         let sup = Arc::new(ArmSupervisor::new(cfg));
         let gen = sup.acquire_lease("conn-slow-gen").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
         let action_id = {
@@ -4849,7 +4849,7 @@ mod phase2_vision {
 
         let sup = Arc::new(ArmSupervisor::new(cfg));
         let gen = sup.acquire_lease("conn-vis-hold-clear").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
 
@@ -5355,7 +5355,7 @@ mod phase3_release_gate_tests {
         sup.set_follower("so-arm101").await;
 
         let gen = sup.acquire_lease("conn-triple").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
 
@@ -5929,7 +5929,7 @@ mod phase3_release_gate_tests {
         sup.set_follower("so-arm101").await;
 
         let gen = sup.acquire_lease("conn-speed-cap").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
 
@@ -6580,7 +6580,7 @@ mod device_qualification_tests {
         let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(DummyRealDriver::new(6))));
         sup.set_follower("so-arm101").await;
         let gen = sup.acquire_lease("conn-q").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
         let ledger_dir = tempdir().unwrap();
@@ -6758,7 +6758,7 @@ mod review_fix_tests {
 
     pub(super) async fn begin_live(sup: &Arc<ArmSupervisor>, conn: &str, prepared: &PreparedPolicy) -> (u64, u64) {
         let gen = sup.acquire_lease(conn).await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
         let mut inner = sup.inner().write().await;

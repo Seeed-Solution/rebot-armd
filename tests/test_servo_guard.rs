@@ -82,7 +82,7 @@ async fn armed(config: ArmConfig, arm: Arm) -> (ArmSupervisor, Arc<Mutex<Arm>>) 
     let supervisor = ArmSupervisor::new(config).with_driver(Box::new(FakeDriver(arm.clone())));
     supervisor.set_lease_enabled(false).await;
     supervisor.tick(DT).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.tick(DT).await;
     (supervisor, arm)
 }

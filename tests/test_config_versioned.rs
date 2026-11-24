@@ -155,7 +155,7 @@ fn a_held_reservation_refuses_rt_installs_and_leaves_motion_untouched() {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(inner, BootId(7), Capacities { commands: 4, plans: 2, replies: 6 });
     let ctx = fx.ctx(fx.now());
     let p = fx.core.config_proposal(ConfigDomain::Keepout, 1, 0, &ctx);

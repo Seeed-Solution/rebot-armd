@@ -110,7 +110,7 @@ fn rig(config: ArmConfig, dir: &std::path::Path) -> (SupervisorInner, LagArm) {
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
     inner.episodes = armd::recording::EpisodeStore::new(Some(dir.to_path_buf()));
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, arm)
@@ -526,7 +526,7 @@ async fn record_jog_save_and_replay_matches_the_recording() {
         i.commanded_positions = INSPECT.to_vec();
         i.target_positions = INSPECT.to_vec();
     }
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     realtime(&sup, 10, |_| {}).await;
 
     // record two joint moves (peak commanded speed 1.875 * 0.4 / 2.5 = 0.30 rad/s)

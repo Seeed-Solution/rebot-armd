@@ -58,7 +58,7 @@ fn rig(j7: f32, block: Option<f32>, frozen_j7: bool) -> (SupervisorInner, Arc<Mu
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(RigDriver(rig.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     (inner, rig)
 }
 
@@ -152,7 +152,7 @@ fn gripper_action_needs_a_policy_and_an_idle_arm() {
     config.gripper_policy = None;
     let mut inner = SupervisorInner::new(config);
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     let epoch = inner.safety.epoch_id();
     let err = { let s = inner.current_admission_stamp(); inner.start_gripper(s, request(GripperCommand::Open, None, false, 6.0), epoch) }.unwrap_err();
     assert!(matches!(err, armd::ArmError::Motion(armd::motion::MotionError::Unsupported(_))), "{err:?}");

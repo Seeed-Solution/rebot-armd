@@ -281,7 +281,7 @@ fn rig_at(config: ArmConfig, q0: &[f32], tau_s: Vec<f32>) -> (SupervisorInner, T
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.tick(DT);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, drv)
@@ -1695,7 +1695,7 @@ fn tracking_damiao_recovery_suspends_compensated_writes() {
         .unwrap();
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.tick(DT);
 
     // Start smooth J1 quintic so active lead is being transmitted on 0x101.
@@ -2235,7 +2235,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         inner.measured_positions = q0.to_vec();
         inner.target_positions = q0.to_vec();
         inner.tick(DT);
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         inner.tick(DT);
         assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
         let epoch = inner.safety.epoch_id();
@@ -2342,7 +2342,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         // Unpin, clear fault, and confirm first frame after is clean stationary baseline.
         drv.with(|s| s.pinned[0] = None);
         inner.clear_fault().unwrap();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2375,7 +2375,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         }
 
         inner.clear_fault().unwrap();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2547,7 +2547,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         if matches!(inner.safety.state(), SafetyState::Fault(_)) {
             inner.clear_fault().unwrap();
         }
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_B);
         let obs_after = inner.tick(DT);
@@ -2591,7 +2591,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
             prev_pos = frame[0].position;
         }
         // Re-arm -> first frame after is clean stationary hold at parked pose.
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2626,7 +2626,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         // Let plant settle before re-enabling, then verify first frame after holds actual post-partial-write pose.
         drv.with(|s| s.v.fill(0.0));
         inner.clear_fault().unwrap();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -2660,7 +2660,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         if matches!(inner.safety.state(), SafetyState::Fault(_)) {
             inner.clear_fault().unwrap();
         }
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let idx_after = drv.with(|s| s.written.len());
         hb(&mut inner, CLIENT_A);
         let obs_after = inner.tick(DT);
@@ -3046,7 +3046,7 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
     inner.commanded_positions = q0.to_vec();
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.tick(DT);
     assert!(inner.safety.state().is_operational());
 
@@ -3294,7 +3294,7 @@ fn tracking_reenable_already_torqued_checks_stationarity_and_preserves_history()
         assert!(issued_before - meas_before >= 0.020, "must have active lead before re-enable");
 
         // Call set_torque(true) while already torqued and moving!
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         assert_eq!(
             inner.tracking.last_issued_positions.as_ref().map(|v| v[0]),
             Some(issued_before),
@@ -3330,7 +3330,7 @@ fn tracking_reenable_already_torqued_checks_stationarity_and_preserves_history()
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         inner.tracking.invalidate();
         drv.with(|s| s.v[0] = 0.25);
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         assert_eq!(
             inner.tracking.history_state,
             TrackingHistoryState::Unknown,
@@ -3975,7 +3975,7 @@ fn tracking_seeds_only_on_positive_stationarity_evidence() {
         inner.measured_positions = q0.to_vec();
         inner.target_positions = q0.to_vec();
         inner.tick(DT);
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         assert_eq!(
             inner.tracking.history_state,
             TrackingHistoryState::Unknown,
@@ -4163,7 +4163,7 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     // Receive instants 5 ms apart per tick: every pair of samples so far lies less than one
     // control period (20 ms) apart.
     for k in 0..4u32 {
@@ -4259,7 +4259,7 @@ fn tracking_rest_reference_survives_staggered_joint_replies() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
     let mut seeded_at = None;
     for k in 0..4u64 {
@@ -4381,7 +4381,7 @@ fn tracking_rest_reference_expires_across_control_loop_pause() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.tick(DT);
     assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
     // The control loop pauses; the next sample arrives 300 ms after the reference.
@@ -4472,7 +4472,7 @@ fn tracking_rest_reference_age_spans_oldest_reference_reply() {
     inner.measured_positions = q0.to_vec();
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.tick(DT);
     // Current sample: all joints at base + 110 ms (90 ms after the reference's newest reply).
     drv.with(|s| s.feedback_instants = Some(vec![base + ms(110); 7]));

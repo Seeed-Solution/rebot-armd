@@ -37,7 +37,7 @@ fn rig(policy: Option<CollisionPolicy>) -> (SupervisorInner, TestArm) {
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, arm)
@@ -374,7 +374,7 @@ async fn trip_during_place_ends_it_and_no_phase_follows() {
         inner.commanded_positions = INSPECT.to_vec();
         inner.measured_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     }
     let ticker = sup.clone();
     tokio::spawn(async move {

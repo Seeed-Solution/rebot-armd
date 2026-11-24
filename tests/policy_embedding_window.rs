@@ -635,7 +635,7 @@ async fn positive_m1_t4_http_ingestion_concat_norm_and_live_commit() {
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-m1").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -757,7 +757,7 @@ async fn positive_t1_video_model_commits_cleanly() {
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-t1").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -1278,7 +1278,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-neg").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -1941,7 +1941,7 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-b1").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -2181,7 +2181,7 @@ async fn b2_mid_inference_temporal_clip_oldest_endpoint_expires_blocks_commit() 
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-b2").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -2320,7 +2320,7 @@ async fn m3_unbroken_renewal_mid_inference_discards_target_holds_and_resumes() {
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-m3").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -2554,7 +2554,7 @@ async fn run_m3_fail_closed_case(case: &str) -> (String, usize, usize, u64) {
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-m3-fc").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -2727,7 +2727,7 @@ async fn run_m4_counter_case(
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-m4").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
 
@@ -2927,7 +2927,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
         .unwrap();
 
         let lease_gen = sup.acquire_lease("conn-m1-hold").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
 
@@ -3069,7 +3069,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
         .unwrap();
 
         let lease_gen = sup.acquire_lease("conn-m1-lease").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         sup.tick(0.02).await;
         let epoch = sup.get_observation().await.epoch_id;
 
@@ -3214,7 +3214,7 @@ async fn b02_missing_oldest_captured_at_ms_rejected_400_without_mutation_or_targ
     )
     .unwrap();
     let lease_gen = sup.acquire_lease("conn-b02").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
     let action_id = {
@@ -3397,7 +3397,7 @@ async fn m02_unbroken_renewal_commit_past_old_ticket_expiry_holds_and_resumes() 
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-m02").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
     let action_id = {
@@ -3565,7 +3565,7 @@ async fn r2_late_handshake_renewal_between_ticks_stops_with_handshake_expired() 
     .unwrap();
 
     let lease_gen = sup.acquire_lease("conn-r2-8").await.unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     sup.tick(0.02).await;
     let epoch = sup.get_observation().await.epoch_id;
     let action_id = {

@@ -16,7 +16,7 @@ const DT: f64 = 0.02;
 fn sim_at(q: &[f32; 7]) -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();
@@ -155,7 +155,7 @@ async fn test_zero_check_store_and_reload_shifts_policy() {
     {
         let mut inner = supervisor.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         inner.measured_positions = INSPECT.to_vec();
         inner.commanded_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();

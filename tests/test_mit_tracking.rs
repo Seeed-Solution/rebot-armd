@@ -152,7 +152,7 @@ fn mit_timeout_command_through_the_supervisor_is_torque_off_only() {
     assert_eq!(done["commissioning"][0]["readback"]["timeout_raw"], json!(2400), "{done}");
     assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 2400);
     with_record(&mut inner, record_j4(2400));
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     let e = inner.mit_timeout_command(&json!({"joints": [4]})).unwrap_err();
     assert_eq!(e.code, "MIT_TIMEOUT_ARMED");
     assert_no_flash_write(&bus.tx_log());
@@ -201,7 +201,7 @@ fn mit_gate_refuses_to_arm_unqualified_hardware() {
         let (mut inner, bus) = mit_rig(timeout, rec);
         mutate(&mut inner, &bus);
         bus.with(|s| s.tx_log.clear());
-        let err = inner.set_torque(true).expect_err(label);
+        let err = { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect_err(label);
         assert!(err.to_string().contains("MIT_UNQUALIFIED"), "{label}: {err}");
         assert!(!inner.is_torqued, "{label}: armed");
         assert_eq!(enable_frames(&bus), 0, "{label}: an enable frame was sent");
@@ -214,11 +214,11 @@ fn mit_gate_refuses_to_arm_unqualified_hardware() {
 #[test]
 fn mit_gate_passes_qualified_hardware_and_rechecks_on_every_arm() {
     let (mut inner, bus) = mit_rig(2000, Some(record_j4(2000)));
-    inner.set_torque(true).expect("qualified J4 arms");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("qualified J4 arms");
     assert!(inner.is_torqued && inner.mit_gate_error.is_none());
     // the motor lost its RAM TIMEOUT (power dip): the rearm refuses
     bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 0));
-    let err = inner.set_torque(true).unwrap_err();
+    let err = { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap_err();
     assert!(err.to_string().contains("TIMEOUT readback is 0"), "{err}");
     assert_no_flash_write(&bus.tx_log());
 }
@@ -234,7 +234,7 @@ fn mit_not_requested_sends_no_register_reads_at_arm() {
         inner.lease_enabled = false;
         inner.tick(0.02);
         bus.with(|s| s.tx_log.clear());
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let reads = bus.tx_log().iter().filter(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ).count();
         assert_eq!(reads, 0);
     }
@@ -346,7 +346,7 @@ fn active_rig_clocked(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4_zero(2000, zero_j4));
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.tick(DT);
     inner.tick(DT);
     assert!(inner.mit_active(), "handover: {:?}", inner.mit.handover_error);
@@ -472,7 +472,7 @@ fn mit_owner_handover() {
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4(2000));
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     bus.with(|s| { s.follow_commands = false; s.motors[1].v = 0.3; });
     for _ in 0..5 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
     assert!(!inner.mit_active(), "handover while J2 moves");
@@ -636,7 +636,7 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     assert!(cleared, "clearance");
     assert!(!inner.is_torqued, "the expiry recovery leaves torque off");
     bus.clear_log();
-    inner.set_torque(true).expect("rearm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x33, 9]), "TIMEOUT readback on the rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data), "J4 base mode restored");
     for _ in 0..3 { inner.tick(DT); }
@@ -679,12 +679,12 @@ fn mit_failed_readback_on_rearm_revokes_authorization() {
         bus.clear_log();
         let res = if label == "timeout zero" {
             bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 0));
-            inner.set_torque(true)
+            { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }
         } else {
             // J4 answers the hand back, then nothing (readback unanswered)
             inner.mit_hand_back("test").unwrap();
             bus.with(|s| s.motors[3].silent = true);
-            inner.set_torque(true)
+            { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }
         };
         assert!(res.is_err(), "{label}: rearm passed");
         assert!(!inner.mit_active(), "{label}: MIT still owns J4");
@@ -885,7 +885,7 @@ fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4(2000));
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     assert!(!inner.mit_active(), "no tick yet: handover pending");
     let epoch = inner.safety.epoch_id();
     let mut target = inner.commanded_positions.clone();
@@ -1019,7 +1019,7 @@ fn mit_handover_is_fenced_from_the_first_switch_frame() {
     inner.tick(DT);
     inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
     with_record(&mut inner, record_j4(2000));
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     bus.with(|s| s.motors[3].no_write_ack = true); // the switch happens, its ACK is lost
     bus.clear_log();
     inner.tick(DT);
@@ -1064,7 +1064,7 @@ fn mit_handover_hold_frame_obeys_the_decoded_effort_bound() {
         inner.tick(DT);
         inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
         with_record(&mut inner, record_j4(2000));
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         bus.clear_log();
         for _ in 0..3 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
         assert!(inner.mit_active(), "{:?}", inner.mit.handover_error);
@@ -1124,7 +1124,7 @@ fn mit_rearm_while_moving_brakes_refuses_motion_and_hands_back() {
     { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.5, "joint_move", None, None) }.unwrap();
     for _ in 0..15 { inner.tick(DT); }
     assert!(inner.commanded_velocities[3].abs() > 0.01);
-    assert!(inner.set_torque(true).is_err(), "rearm accepted while MIT moves the arm");
+    assert!({ let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.is_err(), "rearm accepted while MIT moves the arm");
     assert!(inner.active_trajectory.is_none(), "the motion goes on after the refused rearm");
     assert!(inner.plan_input().is_err(), "motion accepted after the refused rearm");
     bus.clear_log();

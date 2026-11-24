@@ -6101,7 +6101,8 @@ mod tests {
         let (id, stamp) = {
             let mut inner = sup.inner().write().await;
             inner.lease_enabled = false;
-            inner.set_torque(true).unwrap();
+            let stamp = inner.current_admission_stamp();
+            inner.enable_torque(stamp).unwrap();
             inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.loads = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.35];

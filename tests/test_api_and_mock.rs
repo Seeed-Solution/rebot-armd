@@ -250,7 +250,7 @@ async fn test_rest_api_heartbeat_and_servo() {
     let (mut ws,generation) = controller(addr).await;
     let servo = serde_json::json!({"targets":[0.1,-0.2]});
     assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/servo",servo.clone()).await["type"],"command_reject");
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/servo",servo).await["type"],"command_ack");
     assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/servo",serde_json::json!({"targets":[50.0,0.0]})).await["type"],"command_reject");
     let before = supervisor.inner().read().await.last_heartbeat;
@@ -266,7 +266,7 @@ async fn test_websocket_lease_handshake_generation_and_http_conflict() {
     use futures_util::{SinkExt, StreamExt};
 
     let (addr, supervisor) = spawn_test_server().await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let ws_url = format!("ws://{}/api/v1/ws", addr);
 
@@ -417,7 +417,7 @@ async fn test_websocket_servo_rejects_missing_generation() {
     use futures_util::{SinkExt, StreamExt};
 
     let (addr, supervisor) = spawn_test_server().await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let ws_url = format!("ws://{}/api/v1/ws", addr);
     let (mut ws, _) = connect_async(&ws_url).await.expect("Failed to connect ws");
@@ -460,7 +460,7 @@ async fn test_ws_rejects_missing_or_invalid_sequence_id() {
     use futures_util::{SinkExt, StreamExt};
 
     let (addr, supervisor) = spawn_test_server().await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let ws_url = format!("ws://{}/api/v1/ws", addr);
     let (mut ws, _) = connect_async(&ws_url).await.expect("Failed to connect ws");
@@ -613,7 +613,7 @@ async fn test_ws_connection_drop_ensures_lease_release() {
     use futures_util::{SinkExt, StreamExt};
 
     let (addr, supervisor) = spawn_test_server().await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let ws_url = format!("ws://{}/api/v1/ws", addr);
 
@@ -701,7 +701,7 @@ async fn test_websocket_preset_ack_and_reject() {
     use futures_util::{SinkExt, StreamExt};
 
     let (addr, supervisor) = spawn_test_server().await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let ws_url = format!("ws://{}/api/v1/ws", addr);
     let (mut ws, _) = connect_async(&ws_url).await.expect("Failed to connect ws");
@@ -923,7 +923,7 @@ async fn test_websocket_empty_client_id_rejected_as_lease_lost() {
     use futures_util::{SinkExt, StreamExt};
 
     let (addr, supervisor) = spawn_test_server().await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let ws_url = format!("ws://{}/api/v1/ws", addr);
 
@@ -1005,7 +1005,7 @@ async fn test_websocket_servo_rejected_during_preset_trajectory() {
     use futures_util::{SinkExt, StreamExt};
 
     let (addr, supervisor) = spawn_test_server().await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     let ws_url = format!("ws://{}/api/v1/ws", addr);
     let (mut ws, _) = connect_async(&ws_url).await.expect("Failed to connect ws");

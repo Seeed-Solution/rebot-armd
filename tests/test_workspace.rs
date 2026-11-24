@@ -40,7 +40,7 @@ fn floor_edge() -> (Vec<f32>, Vec<f32>) {
 fn armed(config: ArmConfig, at: &[f32]) -> SupervisorInner {
     let mut inner = SupervisorInner::new(config);
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = at.to_vec();
     inner.measured_positions = at.to_vec();
     inner.target_positions = at.to_vec();

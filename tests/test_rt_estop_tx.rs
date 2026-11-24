@@ -112,7 +112,7 @@ fn rig() -> (SupervisorInner, Arc<Mutex<Shared>>) {
     shared.lock().unwrap().requested = Some((inner.requested_estop_count.clone(), inner.e_stop_latched.clone()));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     for _ in 0..5 { inner.tick(0.02); }
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.5;

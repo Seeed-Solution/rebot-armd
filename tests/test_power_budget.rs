@@ -92,7 +92,7 @@ fn rig_at(config: ArmConfig, q: [f32; 7]) -> (SupervisorInner, SimArm) {
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, arm)

@@ -11,7 +11,7 @@ async fn arm(dof: usize, velocity: f32, acceleration: f32) -> ArmSupervisor {
         .collect();
     let supervisor = ArmSupervisor::new(cfg);
     supervisor.set_lease_enabled(false).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.inner().write().await.motion_frame_timeout = Duration::from_secs(60);
     supervisor
 }
@@ -347,7 +347,7 @@ async fn test_two_tick_settle_hysteresis_and_exact_resets() {
         inner.clear_fault().unwrap();
         assert_eq!(inner.servo_settled_ticks[0], 0, "counter must reset on clear_fault");
     }
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
 
     // 4. Inject timeout case -> counter resets to 0
     {

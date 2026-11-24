@@ -20,7 +20,7 @@ fn supervisor() -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     inner
 }
 
@@ -248,7 +248,7 @@ fn leased_with(lease_timeout_ms: u64, caps: Capacities) -> (Fx, u64) {
     inner.lease_enabled = true;
     inner.tick(0.02);
     let generation = inner.acquire_lease("client").expect("lease");
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     (ReleaseFixture::new(inner, BOOT, caps), generation)
 }
 
@@ -565,7 +565,7 @@ fn parking_arm() -> (Fx, u64) {
         max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100 });
     let mut inner = SupervisorInner::new(config);
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     let generation = inner.acquire_lease("client-a").expect("lease");
     (ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 2, replies: 8 }), generation)
 }

@@ -155,7 +155,7 @@ async fn rig_with(model_error: f32, edit: impl FnOnce(&mut ArmConfig)) -> Rig {
     let sim = Arc::new(Mutex::new(Sim::new(model_error)));
     let sup = ArmSupervisor::new(config).with_driver(Box::new(SimArm(sim.clone())));
     sup.inner().write().await.acquire_lease(CLIENT).unwrap();
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     let rig = Rig { sup, sim };
     rig.ticks(10).await;
     rig
@@ -623,7 +623,7 @@ async fn motion_commands_are_busy_while_floating() {
     let jog = { let s = i.current_admission_stamp(); i.jog_action(s, obs.positions.clone(), None, Some(epoch), "joint_move") }.unwrap_err();
     assert!(matches!(jog, ArmError::Motion(armd::motion::MotionError::MotionBusy(_))), "{jog:?}");
     assert!(matches!(i.plan_input().unwrap_err(), ArmError::Motion(armd::motion::MotionError::MotionBusy(_))));
-    assert_eq!(i.set_torque(false).unwrap_err(), armd::SafetyError::MotionBusy);
+    assert_eq!(i.disable_torque().unwrap_err(), armd::SafetyError::MotionBusy);
     assert_eq!(i.gravity_comp_run().unwrap().phase.name(), "active", "rejections do not end the mode");
 }
 

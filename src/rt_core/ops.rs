@@ -863,13 +863,19 @@ impl CoreOps for SupervisorInner {
                 if self.driver.is_some() {
                     return Err("UNSUPPORTED");
                 }
-                self.set_torque(true).map(drop).map_err(ArmError::Safety)
+                self.sync_stop_generation(ctx.stop_generation);
+                let stamp = crate::supervisor::AdmissionStamp {
+                    stop_gen: d.stamp.authority.stop_generation,
+                    estop_epoch: d.stamp.authority.epoch,
+                    lease_gen: d.stamp.authority.lease_generation,
+                };
+                self.enable_torque(stamp).map(drop).map_err(ArmError::Safety)
             }
             ImmediateOp::TorqueOff => {
                 if self.driver.is_some() {
                     return Err("UNSUPPORTED");
                 }
-                self.set_torque(false).map(drop).map_err(ArmError::Safety)
+                self.disable_torque().map(drop).map_err(ArmError::Safety)
             }
         };
         r.map(|_| Committed::authorized(d, None)).map_err(static_code)
@@ -880,7 +886,19 @@ impl CoreOps for SupervisorInner {
         if self.core.transition_pending() || self.torque_transition_pending() { return Err("TRANSITION_BUSY"); }
         // starts the bus owner's handshake (ArmDriver::begin_torque); a refusal before any
         // frame refuses the commit, a later failure is the transition's terminal
-        let progress = self.begin_torque_transition(matches!(op, TransitionOp::TorqueOn)).map_err(|e| static_code(ArmError::Safety(e)))?;
+        let progress = match op {
+            TransitionOp::TorqueOn => {
+                self.sync_stop_generation(ctx.stop_generation);
+                let stamp = crate::supervisor::AdmissionStamp {
+                    stop_gen: d.stamp.authority.stop_generation,
+                    estop_epoch: d.stamp.authority.epoch,
+                    lease_gen: d.stamp.authority.lease_generation,
+                };
+                self.begin_enable_torque_transition(stamp)
+            }
+            TransitionOp::TorqueOff => self.begin_disable_torque_transition(),
+        }
+        .map_err(|e| static_code(ArmError::Safety(e)))?;
         // the next service is the next poll (the begin's wake is on the driver's clock)
         self.core.begin_transition(progress.map(|p| match p { TorqueProgress::Pending { .. } => TorqueProgress::Pending { wake: ctx.now }, done => done }));
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))

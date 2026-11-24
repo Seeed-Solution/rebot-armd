@@ -465,7 +465,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         c.rt_executor_owned = true;
         c.prewarm_rt_buffers();
         let lg = c.acquire_lease(conn).unwrap();
-        c.set_torque(true).unwrap();
+        { let __s = c.current_admission_stamp(); c.enable_torque(__s) }.unwrap();
         let e = c.safety.epoch_id();
         { let s = c.current_admission_stamp(); c.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
         for k in 1..=4 { let _ = c.tick_publish(0.005, k, false); let _ = c.core.hub().latest(); }
@@ -487,7 +487,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     let gen = {
         let mut inner = sup.inner().write().await;
         let g = inner.acquire_lease(conn).unwrap();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let ep = inner.safety.epoch_id();
         { let s = inner.current_admission_stamp(); inner.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
         assert!(inner.active_trajectory.as_ref().unwrap().has_heap_storage(), "test requires heap trajectory");
@@ -525,7 +525,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         ce.rt_executor_owned = true;
         ce.prewarm_rt_buffers();
         let _lg = ce.acquire_lease(conn).unwrap();
-        ce.set_torque(true).unwrap();
+        { let __s = ce.current_admission_stamp(); ce.enable_torque(__s) }.unwrap();
         let e = ce.safety.epoch_id();
         { let s = ce.current_admission_stamp(); ce.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
         assert!(ce.active_trajectory.as_ref().unwrap().has_heap_storage());
@@ -543,7 +543,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     {
         let mut inner = sup_e.inner().write().await;
         let _g = inner.acquire_lease(conn).unwrap();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         let ep = inner.safety.epoch_id();
         { let s = inner.current_admission_stamp(); inner.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
     }
@@ -585,7 +585,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     // (c) Watchdog park preserved by `authorized_stop`.
     let mut park_core = SupervisorInner::new(ArmConfig { lease_timeout_ms: 30, ..ArmConfig::rebot_dm() });
     let _g = park_core.acquire_lease("connection:park").unwrap();
-    park_core.set_torque(true).unwrap();
+    { let __s = park_core.current_admission_stamp(); park_core.enable_torque(__s) }.unwrap();
     park_core.commanded_positions = INSPECT.to_vec();
     park_core.measured_positions = INSPECT.to_vec();
     park_core.target_positions = INSPECT.to_vec();
@@ -600,7 +600,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     let gen_p = {
         let mut inner = sup_p.inner().write().await;
         let g = inner.acquire_lease(conn).unwrap();
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         g
     };
     let stop_watch: Arc<Mutex<Option<armd::rt_core::urgent::StopRequests>>> = Arc::new(Mutex::new(None));
@@ -987,7 +987,7 @@ async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
     // (b) Executor path (`ReleaseEngine` + `UrgentStopIntake`): queued Stop from Owner 1 rejected after preemption.
     let mut core = SupervisorInner::new(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() });
     let g1 = core.acquire_lease("connection:owner1").unwrap();
-    core.set_torque(true).unwrap();
+    { let __s = core.current_admission_stamp(); core.enable_torque(__s) }.unwrap();
     let ep_e = core.safety.epoch_id();
     { let s = core.current_admission_stamp(); core.jog_action(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner1_jog") }.unwrap();
     let (mut engine, _broker, _tw, stops) = ReleaseEngine::new(BootId::fresh(), Capacities::default());
@@ -1571,7 +1571,7 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
         let arm = TestArm::new();
         let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(arm)));
         let gen = sup.acquire_lease("conn:gate").await.unwrap();
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         {
             let mut inner = sup.inner().write().await;
             inner.commanded_positions = INSPECT.to_vec();
@@ -2008,6 +2008,104 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
                 );
                 assert_no_motion(&inner, None, "GripperZeroCheck");
             }
+            MotionStartKind::TorqueEnable => {
+                // Direct owner-lock & async facade check: stale stamp refuses enable_torque without
+                // arming, while unstamped disable_torque remains allowed after a Stop.
+                let mut cfg = ArmConfig::rebot_dm();
+                cfg.lease_timeout_ms = 30_000;
+                let sup = Arc::new(ArmSupervisor::new(cfg));
+                let _gen = sup.acquire_lease("conn:torque-gate").await.unwrap();
+                let stale_stamp = sup.capture_admission_stamp();
+                {
+                    let mut inner = sup.inner().write().await;
+                    assert!(inner.authorized_stop());
+                    assert_stopped(ArmError::from(inner.enable_torque(stale_stamp).unwrap_err()), "enable_torque(inner)");
+                    assert!(!inner.is_torqued, "stale enable_torque must not enable torque");
+                }
+                assert_stopped(sup.enable_torque(stale_stamp).await.unwrap_err(), "enable_torque(sup)");
+                assert!(!sup.get_observation().await.is_torqued);
+
+                // Enable cleanly with fresh stamp, then verify disable_torque stays unstamped after Stop.
+                let fresh_stamp = sup.capture_admission_stamp();
+                sup.enable_torque(fresh_stamp).await.unwrap();
+                assert!(sup.get_observation().await.is_torqued);
+                {
+                    let mut inner = sup.inner().write().await;
+                    assert!(inner.authorized_stop());
+                    inner.disable_torque().expect("disable_torque stays unstamped after Stop");
+                    assert!(!inner.is_torqued);
+                }
+
+                // End-to-end WS /api/v1/torque and /api/v1/arm (same path as calibration wizard):
+                // enable admitted before Stop is refused under owner lock; disable admitted before
+                // Stop still succeeds as a stop-direction action.
+                let sup_ws = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }));
+                let addr = serve(sup_ws.clone()).await;
+                let (mut ws, gen) = controller(addr).await;
+                let conn_id = sup_ws.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+                let mut next_rid = 3000u64;
+                for path in ["/api/v1/torque", "/api/v1/arm"] {
+                    let ep = sup_ws.get_observation().await.epoch_id;
+                    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+                    let en_rid = next_rid;
+                    next_rid += 1;
+                    send(&mut ws, json!({
+                        "type": "command", "request_id": en_rid, "generation": gen, "epoch_id": ep,
+                        "path": path, "body": {"enable": true}
+                    })).await;
+                    wait_until(Duration::from_secs(2), || {
+                        armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1
+                    }).await;
+                    let stop_rid = next_rid;
+                    next_rid += 1;
+                    send(&mut ws, json!({
+                        "type": "command", "request_id": stop_rid, "generation": gen, "epoch_id": ep,
+                        "path": "/api/v1/motion/stop", "body": {}
+                    })).await;
+                    let stop_ack = next_of(&mut ws, &["command_ack"]).await;
+                    assert_eq!(stop_ack["request_id"], stop_rid, "{stop_ack}");
+                    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+                    let en_rej = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+                    assert_eq!(en_rej["request_id"], en_rid, "{path}: {en_rej}");
+                    assert_eq!(en_rej["type"], "command_reject", "{path}: {en_rej}");
+                    assert_eq!(en_rej["code"], "STOPPED", "{path}: {en_rej}");
+                    assert!(!sup_ws.get_observation().await.is_torqued, "{path} must not arm after Stop");
+                }
+                // Arm cleanly, then verify WS torque disable admitted before Stop still succeeds.
+                let ep = sup_ws.get_observation().await.epoch_id;
+                let arm_rid = next_rid;
+                next_rid += 1;
+                send(&mut ws, json!({
+                    "type": "command", "request_id": arm_rid, "generation": gen, "epoch_id": ep,
+                    "path": "/api/v1/torque", "body": {"enable": true}
+                })).await;
+                let arm_ack = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+                assert_eq!((arm_ack["request_id"].as_u64(), arm_ack["type"].as_str()), (Some(arm_rid), Some("command_ack")), "{arm_ack}");
+                assert!(sup_ws.get_observation().await.is_torqued);
+
+                let ep2 = sup_ws.get_observation().await.epoch_id;
+                armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+                let dis_rid = next_rid;
+                next_rid += 1;
+                send(&mut ws, json!({
+                    "type": "command", "request_id": dis_rid, "generation": gen, "epoch_id": ep2,
+                    "path": "/api/v1/torque", "body": {"enable": false}
+                })).await;
+                wait_until(Duration::from_secs(2), || {
+                    armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1
+                }).await;
+                let stop_rid = next_rid;
+                send(&mut ws, json!({
+                    "type": "command", "request_id": stop_rid, "generation": gen, "epoch_id": ep2,
+                    "path": "/api/v1/motion/stop", "body": {}
+                })).await;
+                let stop_ack = next_of(&mut ws, &["command_ack"]).await;
+                assert_eq!(stop_ack["request_id"], stop_rid, "{stop_ack}");
+                armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+                let dis_ack = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+                assert_eq!((dis_ack["request_id"].as_u64(), dis_ack["type"].as_str()), (Some(dis_rid), Some("command_ack")), "disable must remain unstamped after Stop: {dis_ack}");
+                assert!(!sup_ws.get_observation().await.is_torqued);
+            }
         }
     }
     assert_eq!(covered.len(), MotionStartKind::ALL.len(), "every MotionStartKind must be tested");
@@ -2161,6 +2259,7 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
         "src/supervisor/motion.rs",
         "src/supervisor/actions.rs",
         "src/supervisor/streams.rs",
+        "src/supervisor/driver_transitions.rs",
         "src/gravity_comp.rs",
         "src/poses.rs",
         "src/backlash.rs",
@@ -2173,6 +2272,8 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
         );
     }
     let required_signatures = [
+        ("src/supervisor/driver_transitions.rs", "pub fn enable_torque("),
+        ("src/supervisor/driver_transitions.rs", "pub(crate) fn begin_enable_torque_transition("),
         ("src/supervisor/motion.rs", "pub fn jog("),
         ("src/supervisor/motion.rs", "pub fn jog_action("),
         ("src/supervisor/motion.rs", "pub fn jog_action_with_speed_scale("),

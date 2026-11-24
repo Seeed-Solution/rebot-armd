@@ -31,7 +31,8 @@ struct Rig {
 fn rig() -> Rig {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    let stamp = inner.current_admission_stamp();
+    inner.enable_torque(stamp).expect("arm");
     let gen = inner.acquire_lease(CONN).expect("lease");
     // the connection got the lease: its servo stream is the one consumed
     inner.authorize_servo_stream(gen);

@@ -15,7 +15,7 @@ const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 fn sim_at(q: &[f32; 7]) -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();
@@ -201,13 +201,13 @@ fn busy_and_stale_preconditions() {
     let input = inner.plan_input().unwrap();
     inner.apply_stop_policy(StopPolicy::EStopLatch);
     inner.clear_fault().unwrap();
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     assert!(matches!({ let s = inner.current_admission_stamp(); inner.install_path(s, &input, path, "move_to", None) }, Err(ArmError::Motion(MotionError::PlanStale(_)))));
     // no kinematics
     let mut config = ArmConfig::rebot_dm();
     config.kinematics = None;
     let mut inner = SupervisorInner::new(config);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     assert!(matches!(inner.plan_input(), Err(ArmError::Motion(MotionError::Unsupported(_)))));
 }
 
@@ -282,7 +282,7 @@ fn blocked_arm_fails_tracking_stall_without_a_fault() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(BlockedDriver(hw)));
     inner.lease_enabled = false;
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     let p0 = tcp(&INSPECT).p;
     let spec = GoalSpec::Absolute { p: [p0[0], p0[1] + 0.2, p0[2]], r: None }; // J1 turns ~0.7 rad
     let (id, duration, _) = start_move(&mut inner, &spec, Speed { linear: 0.15, angular: 1.0 }).unwrap();

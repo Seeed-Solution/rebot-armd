@@ -327,7 +327,7 @@ impl SupervisorInner {
         // A park from the hold after a clear re-arms through the verified enable path first (fresh
         // feedback, commanded = measured); without it NormalUnload keeps holding and parks nothing.
         if self.holding_after_clear() {
-            self.set_torque(true)?;
+            self.enable_torque(stamp)?;
         }
         self.execute_stop(StopPolicy::NormalUnload);
         if let Some(e) = self.park_rejection.take() { return Err(e.into()); }

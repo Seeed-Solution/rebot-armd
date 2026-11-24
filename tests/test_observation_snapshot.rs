@@ -81,7 +81,7 @@ async fn published_sample_matches_the_locked_observation_field_by_field() {
     let (l, p, c) = check("idle").await;
     compare(l, p, c);
     sup.inner().write().await.lease_enabled = false;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     let (l, p, c) = check("torqued").await;
     compare(l, p, c);
     let mut target = sup.get_config().await.home_positions.clone();

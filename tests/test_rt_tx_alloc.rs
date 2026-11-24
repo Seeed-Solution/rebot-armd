@@ -586,7 +586,7 @@ fn supervisor_tick_publish_with_damiao_tx_instrumentation_does_not_allocate() {
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    inner.set_torque(true).expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.3;
     let epoch = inner.safety.epoch_id();

@@ -404,7 +404,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
             arm.0.lock().unwrap().q = q;
             inner.driver = Some(std::sync::Mutex::new(Box::new(arm.clone())));
         }
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         inner.commanded_positions = q.to_vec();
         inner.measured_positions = q.to_vec();
         inner.target_positions = q.to_vec();

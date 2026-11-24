@@ -134,7 +134,8 @@ fn armed(config: ArmConfig, rig: Rig) -> (SupervisorInner, Arc<Mutex<Rig>>) {
     let mut inner = SupervisorInner::new(config).with_driver(Box::new(RigDriver(rig.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
-    inner.set_torque(true).unwrap();
+    let stamp = inner.current_admission_stamp();
+    inner.enable_torque(stamp).unwrap();
     inner.tick(DT);
     (inner, rig)
 }

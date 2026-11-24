@@ -703,22 +703,28 @@ impl SupervisorInner {
         self.gripper_hold_vel_ceiling = None;
     }
 
-    pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
+    pub fn enable_torque(&mut self, stamp: AdmissionStamp) -> Result<SafetyState, SafetyError> {
+        let _admitted = self.check_admission_stamp(stamp)?;
         if self.torque_transition.is_some() {
             return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into()));
         }
         // Torque changes and re-arming are refused in gravity compensation: exit first.
         self.gravity_comp_servo_busy()?;
-        if enable {
-            let (was_torqued, prev_gripper_cmd) = self.enable_prepare()?;
-            if let Some(ref d) = self.driver {
-                let r = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?.set_torque(true);
-                if let Err(e) = r { return Err(self.enable_failed(was_torqued, &e)); }
-            }
-            self.enable_finish(was_torqued, prev_gripper_cmd)
-        } else {
-            self.torque_off(false)
+        let (was_torqued, prev_gripper_cmd) = self.enable_prepare()?;
+        if let Some(ref d) = self.driver {
+            let r = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?.set_torque(true);
+            if let Err(e) = r { return Err(self.enable_failed(was_torqued, &e)); }
         }
+        self.enable_finish(was_torqued, prev_gripper_cmd)
+    }
+
+    pub fn disable_torque(&mut self) -> Result<SafetyState, SafetyError> {
+        if self.torque_transition.is_some() {
+            return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into()));
+        }
+        // Torque changes and re-arming are refused in gravity compensation: exit first.
+        self.gravity_comp_servo_busy()?;
+        self.torque_off(false)
     }
 
     /// Enable, before the driver's handshake: every refusal (gravity compensation, driver
@@ -1149,77 +1155,80 @@ impl SupervisorInner {
     /// changes wait for it.
     pub fn torque_transition_pending(&self) -> bool { self.torque_transition.is_some() }
 
-    /// Starts a torque transition without waiting for its confirmation (the RT's
-    /// `commit_transition`). Err: refused before anything was sent (the same refusals as
-    /// `set_torque(enable)`), the commit is refused with the code. Ok: started; its progress,
-    /// or its failure code once a step failed (the failure is applied as `set_torque` applies
-    /// it: fault `ENABLE_FAILED` / `DRIVER_WRITE_FAILED`). Without a driver it completes now.
-    pub(crate) fn begin_torque_transition(&mut self, enable: bool) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
+    /// Starts a torque-enable transition without waiting for its confirmation (the RT's
+    /// `commit_transition`). Requires a valid [`AdmissionStamp`] checked first under the owner lock.
+    pub(crate) fn begin_enable_torque_transition(&mut self, stamp: AdmissionStamp) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
+        use crate::rt_core::ops::TorqueProgress as Rt;
+        let _admitted = self.check_admission_stamp(stamp)?;
+        if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
+        self.gravity_comp_servo_busy()?;
+        let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false)?;
+        let started = match self.driver.as_ref() {
+            None => None,
+            Some(d) => {
+                let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                let drv_now = drv.clock_now();
+                Some((drv.begin_torque_budgeted(true, 0), drv_now))
+            }
+        };
+        Ok(match started {
+            None | Some((Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)), _)) =>
+                self.enable_finish_inner(was_torqued, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
+                self.torque_transition = Some(TorqueTransition::Enable { was_torqued, prev_gripper_cmd });
+                Ok(Rt::Pending { wake: now })
+            }
+            Some((Err(ref e), _)) if crate::driver::is_estop_inhibited(e) =>
+            {
+                let still_enabled = self.driver.as_ref().is_some_and(|d| {
+                    d.lock().is_ok_and(|drv| {
+                        drv.enable_state() != EnableState::Disabled
+                            || drv.has_any_joint_enabled()
+                            || drv.has_known_partial_enable()
+                    })
+                });
+                self.is_torqued = was_torqued || still_enabled;
+                self.pending_rearm = true;
+                return Err(SafetyError::EStopActive);
+            }
+            Some((r, _)) => self.enable_step_failed(was_torqued, r),
+        })
+    }
+
+    /// Starts a torque-disable transition without waiting for its confirmation (unstamped:
+    /// torque disable is a stop-direction action governed by normal disable rules).
+    pub(crate) fn begin_disable_torque_transition(&mut self) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
         use crate::rt_core::ops::TorqueProgress as Rt;
         if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
         self.gravity_comp_servo_busy()?;
-        if enable {
-            let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false)?;
-            let started = match self.driver.as_ref() {
-                None => None,
-                Some(d) => {
-                    let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-                    let drv_now = drv.clock_now();
-                    Some((drv.begin_torque_budgeted(true, 0), drv_now))
-                }
-            };
-            Ok(match started {
-                None | Some((Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)), _)) =>
-                    self.enable_finish_inner(was_torqued, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
-                Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
-                    self.torque_transition = Some(TorqueTransition::Enable { was_torqued, prev_gripper_cmd });
-                    Ok(Rt::Pending { wake: now })
-                }
-                Some((Err(ref e), _)) if crate::driver::is_estop_inhibited(e) =>
-                {
-                    let still_enabled = self.driver.as_ref().is_some_and(|d| {
-                        d.lock().is_ok_and(|drv| {
-                            drv.enable_state() != EnableState::Disabled
-                                || drv.has_any_joint_enabled()
-                                || drv.has_known_partial_enable()
-                        })
-                    });
-                    self.is_torqued = was_torqued || still_enabled;
-                    self.pending_rearm = true;
-                    return Err(SafetyError::EStopActive);
-                }
-                Some((r, _)) => self.enable_step_failed(was_torqued, r),
-            })
-        } else {
-            self.torque_off_check(false)?;
-            self.stop_motion();
-            self.commanded_velocities.fill(0.0);
-            self.disable_requested();
-            let started = match self.driver.as_ref() {
-                None => None,
-                Some(d) => {
-                    let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-                    let drv_now = drv.clock_now();
-                    Some((drv.begin_torque_budgeted(false, 0), drv_now))
-                }
-            };
-            Ok(match started {
-                None => {
-                    self.disable_confirmed();
-                    self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e))
-                }
-                Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
-                    self.torque_transition = Some(TorqueTransition::Disable { confirm: None });
-                    Ok(Rt::Pending { wake: now })
-                }
-                // the frames went out: the supervisor's confirmation follows (as in request_disable)
-                Some((Ok(crate::driver::TorqueProgress::Done(_)), now)) => {
-                    self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(DisableConfirm::start(now)) });
-                    Ok(Rt::Pending { wake: now })
-                }
-                Some((Err(e), _)) => Err(self.disable_step_failed(e)),
-            })
-        }
+        self.torque_off_check(false)?;
+        self.stop_motion();
+        self.commanded_velocities.fill(0.0);
+        self.disable_requested();
+        let started = match self.driver.as_ref() {
+            None => None,
+            Some(d) => {
+                let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                let drv_now = drv.clock_now();
+                Some((drv.begin_torque_budgeted(false, 0), drv_now))
+            }
+        };
+        Ok(match started {
+            None => {
+                self.disable_confirmed();
+                self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e))
+            }
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
+                self.torque_transition = Some(TorqueTransition::Disable { confirm: None });
+                Ok(Rt::Pending { wake: now })
+            }
+            // the frames went out: the supervisor's confirmation follows (as in request_disable)
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), now)) => {
+                self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(DisableConfirm::start(now)) });
+                Ok(Rt::Pending { wake: now })
+            }
+            Some((Err(e), _)) => Err(self.disable_step_failed(e)),
+        })
     }
 
     /// An enable step that is not a confirmation: the code of the RT contract

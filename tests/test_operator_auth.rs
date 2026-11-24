@@ -1799,7 +1799,7 @@ async fn delayed_zero_check_and_calibration_recheck_operator_session_and_lease_e
     armd::gripper_calib::load_into(&sup_exp, &calib_path).await;
     let aid_exp = {
         let mut inner = sup_exp.inner().write().await;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         inner.commanded_positions = INSPECT.to_vec();
         inner.measured_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();

@@ -890,7 +890,7 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     let sup_panic = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_panic)));
     sup_panic.set_lease_enabled(false).await;
     // Enable torque before transfer so the arm is physically energized when the executor panics.
-    sup_panic.set_torque(true).await.unwrap();
+    sup_panic.enable_torque(sup_panic.capture_admission_stamp()).await.unwrap();
     assert!(bus_panic.with(|s| s.motors.iter().all(|m| m.enabled)));
     bus_panic.with(|s| s.tx_log.clear());
 
@@ -931,7 +931,7 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     drv_silent.check_mapping_ranges();
     let sup_silent = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_silent)));
     sup_silent.set_lease_enabled(false).await;
-    sup_silent.set_torque(true).await.unwrap();
+    sup_silent.enable_torque(sup_silent.capture_admission_stamp()).await.unwrap();
     bus_silent.with(|s| {
         for m in &mut s.motors {
             m.silent = true;
@@ -966,7 +966,7 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     drv_leg.check_mapping_ranges();
     let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
     sup_leg.set_lease_enabled(false).await;
-    sup_leg.set_torque(true).await.unwrap();
+    sup_leg.enable_torque(sup_leg.capture_admission_stamp()).await.unwrap();
     bus_leg.with(|s| s.tx_log.clear());
 
     let sup_leg_ref = sup_leg.clone();
@@ -1337,7 +1337,7 @@ async fn emergency_disable_reaches_driver_while_persistence_stalled_in_dir_sync(
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        inner.set_torque(true).unwrap();
+        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
         inner.gripper_calib_path = Some(calib_path.clone());
         let epoch = inner.safety.epoch_id();
         let _ = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s,
@@ -1503,7 +1503,7 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     };
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     driver_tids.lock().unwrap().clear();
 
     let (obs_tx, obs_rx) = std::sync::mpsc::sync_channel::<std::thread::ThreadId>(1);
@@ -1574,7 +1574,7 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     };
     let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
     sup2.set_lease_enabled(false).await;
-    sup2.set_torque(true).await.unwrap();
+    sup2.enable_torque(sup2.capture_admission_stamp()).await.unwrap();
     driver_tids2.lock().unwrap().clear();
     let hooks2 = PersistTestHooks {
         panic_disable_timeout: Some(Duration::from_millis(60)),
@@ -1615,7 +1615,7 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     };
     let sup3 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv3)));
     sup3.set_lease_enabled(false).await;
-    sup3.set_torque(true).await.unwrap();
+    sup3.enable_torque(sup3.capture_admission_stamp()).await.unwrap();
     let sup3_c = sup3.clone();
     let t_leg = Instant::now();
     let outcome3 = tokio::task::spawn_blocking(move || {
@@ -1874,7 +1874,7 @@ async fn estop_ack_waits_for_step6_publication_barrier() {
 
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
 
     // Arm the publication barrier once `trigger_e_stop_checked()` has bumped `requested_estop_count`
     // and Step 1 has applied E-stop: pause right BEFORE Step 6 `core.publish(...)`!
@@ -2028,7 +2028,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     drv.check_mapping_ranges();
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     assert!(inner_bus.with(|s| s.motors.iter().all(|m| m.enabled)));
     inner_bus.with(|s| s.tx_log.clear());
 
@@ -2080,7 +2080,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     drv_leg.check_mapping_ranges();
     let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
     sup_leg.set_lease_enabled(false).await;
-    sup_leg.set_torque(true).await.unwrap();
+    sup_leg.enable_torque(sup_leg.capture_admission_stamp()).await.unwrap();
     inner_leg.with(|s| s.tx_log.clear());
 
     let sup_leg_c = sup_leg.clone();
@@ -2115,7 +2115,7 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
     drv_perm.check_mapping_ranges();
     let sup_perm = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_perm)));
     sup_perm.set_lease_enabled(false).await;
-    sup_perm.set_torque(true).await.unwrap();
+    sup_perm.enable_torque(sup_perm.capture_admission_stamp()).await.unwrap();
     inner_perm.with(|s| s.tx_log.clear());
 
     let sup_perm_c = sup_perm.clone();
@@ -2381,7 +2381,7 @@ async fn emergency_timeout_detaches_stalled_control_thread_so_drop_is_bounded() 
     };
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.unwrap();
+    sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
     let hooks = PersistTestHooks {
         panic_disable_timeout: Some(Duration::from_millis(60)),
         ..Default::default()
@@ -2436,7 +2436,7 @@ async fn emergency_timeout_detaches_stalled_control_thread_so_drop_is_bounded() 
     };
     let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
     sup2.set_lease_enabled(false).await;
-    sup2.set_torque(true).await.unwrap();
+    sup2.enable_torque(sup2.capture_admission_stamp()).await.unwrap();
     let mut cfg2 = ExecutorConfig::for_tests(Duration::from_millis(5));
     cfg2.panic_policy = PanicPolicy::StopExecutor;
     let hooks2 = PersistTestHooks {

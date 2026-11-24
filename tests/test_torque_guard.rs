@@ -112,7 +112,7 @@ fn rig_at(config: ArmConfig, q: [f32; 7]) -> (SupervisorInner, StopArm) {
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, arm)
@@ -451,7 +451,7 @@ fn bus_loss_then_motors_back_disabled_sets_torque_off_and_keeps_the_fault() {
     inner.clear_fault().unwrap();
     let obs = ticks(&mut inner, 2);
     assert!(!obs.is_torqued && obs.fault.is_none(), "{:?}", obs.safety_state);
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     assert!(ticks(&mut inner, 2).is_torqued);
 }
 

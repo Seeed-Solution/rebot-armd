@@ -86,6 +86,7 @@ pub enum MotionStartKind {
     GravityComp,
     Gripper,
     GripperZeroCheck,
+    TorqueEnable,
 }
 
 impl MotionStartKind {
@@ -114,6 +115,7 @@ impl MotionStartKind {
         Self::GravityComp,
         Self::Gripper,
         Self::GripperZeroCheck,
+        Self::TorqueEnable,
     ];
 }
 
@@ -4829,19 +4831,29 @@ impl ArmSupervisor {
         self
     }
 
-    pub async fn set_torque(&self, enable: bool) -> Result<SafetyState, ArmError> {
-        if enable && self.e_stop_latched.load(Ordering::SeqCst) {
+    pub async fn enable_torque(&self, stamp: AdmissionStamp) -> Result<SafetyState, ArmError> {
+        if self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.clone().write_owned().await;
         self.check_legacy_under_guard(&inner)?;
+        inner.check_admission_stamp(stamp).map_err(ArmError::Safety)?;
         // Post-lock double-check: verify atomic e-stop latch again after acquiring write lock
-        if enable && inner.estop_pending() {
+        if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
-        tokio::task::spawn_blocking(move || inner.set_torque(enable))
+        tokio::task::spawn_blocking(move || inner.enable_torque(stamp))
             .await
-            .map_err(|e| ArmError::Internal(format!("set_torque blocking task failed: {e}")))?
+            .map_err(|e| ArmError::Internal(format!("enable_torque blocking task failed: {e}")))?
+            .map_err(ArmError::Safety)
+    }
+
+    pub async fn disable_torque(&self) -> Result<SafetyState, ArmError> {
+        let mut inner = self.inner.clone().write_owned().await;
+        self.check_legacy_under_guard(&inner)?;
+        tokio::task::spawn_blocking(move || inner.disable_torque())
+            .await
+            .map_err(|e| ArmError::Internal(format!("disable_torque blocking task failed: {e}")))?
             .map_err(ArmError::Safety)
     }
 
@@ -6164,7 +6176,8 @@ mod observation_snapshot_tests {
         let (gen, ep) = {
             let mut inner = sup.inner().write().await;
             let g = inner.acquire_lease(conn).unwrap();
-            inner.set_torque(true).unwrap();
+            let stamp = inner.current_admission_stamp();
+            inner.enable_torque(stamp).unwrap();
             (g, inner.safety.epoch_id())
         };
         let policy_stop_gen = Arc::new(AtomicU64::new(0));

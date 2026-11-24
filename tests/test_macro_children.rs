@@ -33,7 +33,7 @@ fn driven() -> (SupervisorInner, TestArm) {
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
-    inner.set_torque(true).unwrap();
+    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
     for _ in 0..5 { inner.tick(DT); }
     (inner, arm)
 }

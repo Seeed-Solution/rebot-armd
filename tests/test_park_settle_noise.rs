@@ -105,7 +105,7 @@ impl Rig {
             let mut inner = sup.inner().write().await;
             inner.measured_positions = start.to_vec();
         }
-        sup.set_torque(true).await.unwrap();
+        sup.enable_torque(sup.capture_admission_stamp()).await.unwrap();
         Self { sup, drv, lim, q: start.iter().map(|&p| p as f64).collect(), tau: 0.15, blocked: None,
             load: vec![0.0; 7], drift: vec![0.0; 7], noise, rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1) }
     }

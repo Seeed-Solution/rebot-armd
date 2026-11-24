@@ -27,7 +27,7 @@ fn sim_config(resting_pose: bool) -> ArmConfig {
 /// Simulated arm, torqued and parked away from home with the lease watchdog armed.
 async fn sim_torqued_away_from_home(resting_pose: bool) -> ArmSupervisor {
     let supervisor = ArmSupervisor::new(sim_config(resting_pose));
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0, 0.5], Some(0.3), None).await.unwrap();
     for _ in 0..80 { supervisor.tick(0.05).await; }
     let obs = supervisor.get_observation().await;
@@ -172,7 +172,7 @@ async fn hw_torqued(position: f32) -> (ArmSupervisor, Arc<Mutex<Hardware>>) {
     let hw = Arc::new(Mutex::new(Hardware { position, age: Some(Duration::ZERO), enabled: EnableState::Disabled }));
     let supervisor = ArmSupervisor::new(config).with_driver(Box::new(Driver(hw.clone())));
     supervisor.tick(0.02).await;
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     (supervisor, hw)
 }
 
@@ -264,7 +264,7 @@ async fn closing_socket_after_lease_expired_does_not_cancel_watchdog_park() {
 #[tokio::test]
 async fn closing_socket_with_valid_lease_still_stops_motion() {
     let supervisor = Arc::new(ArmSupervisor::new({ let mut c = sim_config(true); c.lease_timeout_ms = 5_000; c }));
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     let addr = serve(supervisor.clone()).await;
     let ws = ws_lease(addr).await;
     supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0, 0.5], Some(2.0), None).await.unwrap();
@@ -283,7 +283,7 @@ async fn closing_socket_with_valid_lease_still_stops_motion() {
 #[tokio::test]
 async fn lease_expiry_mid_action_then_close_still_parks_to_idle() {
     let supervisor = Arc::new(ArmSupervisor::new(sim_config(true)));
-    supervisor.set_torque(true).await.unwrap();
+    supervisor.enable_torque(supervisor.capture_admission_stamp()).await.unwrap();
     let addr = serve(supervisor.clone()).await;
     let ws = ws_lease(addr).await;
     {

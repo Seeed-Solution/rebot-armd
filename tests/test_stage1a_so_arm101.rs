@@ -195,7 +195,7 @@ fn test_gripper_zero_check_rejected_when_not_supported() {
     assert!(!c.gripper_policy.as_ref().unwrap().zero_check_supported);
     let mut sup = SupervisorInner::new(c.clone());
     sup.lease_enabled = false;
-    sup.set_torque(true).unwrap();
+    { let __s = sup.current_admission_stamp(); sup.enable_torque(__s) }.unwrap();
     let res = { let s = sup.current_admission_stamp(); sup.start_gripper_zero_check(s, &json!({}), sup.safety.epoch_id()) };
     match res {
         Err(ArmError::Motion(MotionError::Unsupported(msg))) => {
@@ -208,7 +208,7 @@ fn test_gripper_zero_check_rejected_when_not_supported() {
     c.gripper_policy.as_mut().unwrap().zero_check_supported = true;
     let mut sup_ok = SupervisorInner::new(c);
     sup_ok.lease_enabled = false;
-    sup_ok.set_torque(true).unwrap();
+    { let __s = sup_ok.current_admission_stamp(); sup_ok.enable_torque(__s) }.unwrap();
     let res_ok = { let s = sup_ok.current_admission_stamp(); sup_ok.start_gripper_zero_check(s, &json!({}), sup_ok.safety.epoch_id()) };
     assert!(res_ok.is_ok(), "expected Ok when zero_check_supported is true, got: {res_ok:?}");
 }
