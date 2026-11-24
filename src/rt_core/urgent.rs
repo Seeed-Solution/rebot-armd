@@ -45,6 +45,17 @@ impl EstopGate {
         self.requested.load(Ordering::SeqCst) != self.applied.load(Ordering::SeqCst)
             || self.stops.as_ref().is_some_and(StopRequests::pending)
     }
+
+    /// Monotonic `(estop_requested, stop_requested)` generations observed through this gate
+    /// (lock and allocation free). Both counters remain advanced after a stop is applied
+    /// (`requested == applied`), so deferred frames stamped at admission are invalidated.
+    #[inline]
+    pub fn generations(&self) -> (u64, u64) {
+        (
+            self.requested.load(Ordering::SeqCst),
+            self.stops.as_ref().map_or(0, StopRequests::current),
+        )
+    }
 }
 
 /// Authorized-stop requests (design section 4): a stop increments the generation directly,

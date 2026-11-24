@@ -22,6 +22,34 @@ Control tick on the device (rc6, joint moves with 20 Hz observation polling and 
 worst tick was 42 ms. The arm gate needs control period + `worst_latency_ms` + 5 ms < 45 ms, that is
 a worst latency below 20 ms at the 20 ms control period, so MIT is not enabled on the real arm.
 
+### CAN TX timing and RT priority A/B (2026-11-23)
+
+Measured on the SG2002 B601-DM (`can0` `mcp251xfd` at 1 Mbit/s, `pfifo_fast`, `tx_queue_len=1000`;
+`spi0` and `irq/51-spi0.0` at `SCHED_FIFO` 50) under the same batch-1 load (joint moves, measure
+loop, 20 Hz `GET /observation`):
+
+| Build | Tick priority | `tx_us` p50 | `tx_us` p99 | `tx_us` max | Worst tick (lock wait) |
+|---|---|---:|---:|---:|---|
+| `dev6` (`feat/rt-integration 433200c`) | `SCHED_FIFO` 45 (default) | 3.75 ms | 14.7 ms | 19.2 ms | 44.6 ms (`ws.rs:716`) |
+| `dev6`, `ARMD_RT_PRIORITY=50` | `SCHED_FIFO` 50 | 0.29 ms | 4.3 ms | 12.1 ms | 53.8 ms (`ws.rs:716` held 57.7 ms) |
+| `dev7` (legacy tick, integ lineage) | `SCHED_FIFO` 50 | 0.33 ms | 0.66 ms | 0.97 ms | 37.2 ms (`ws.rs:1165` held 47.6 ms) |
+
+- At `SCHED_FIFO` 45 (below `spi0` and `irq/51-spi0.0` at FIFO 50), each SocketCAN frame write wakes
+  `spi0` and preempts the control thread (~26 involuntary context switches per tick, `lock_cpu_us`
+  1.5–2.1 ms), charging SPI transfer wall time inside `tx_us`.
+- Raising the control thread to `ARMD_RT_PRIORITY=50` (same FIFO priority as the SPI/CAN threads;
+  FIFO does not preempt equal priority) reduced `tx_us` p50 from 3.75 ms to 0.29 ms and p99 from
+  14.7 ms to 4.3 ms.
+- `DEFAULT_PRIORITY` in `src/rt_core/sched.rs` stays `45` until stage-3 step-1 lands and
+  bus-service starvation under combined CAN, SD/eMMC, and USB gadget load is verified on device;
+  use `ARMD_RT_PRIORITY=50` for on-device qualification A/B runs.
+- Bounded per-tick CAN TX (`src/driver.rs`, `TxBudget`: default 16 attempts, 5 ms start-cutoff,
+  45 ms inclusive queued-frame expiry) removes the 3 × 100 µs `WouldBlock` retry sleeps, maps
+  SocketCAN `ENOBUFS` to `TransportError::NoBufferSpace`, keeps MIT partial-batch / preflight /
+  flush failures fail-closed (tripping the fence and clearing cached frames), and exposes per-frame
+  wall and `CLOCK_THREAD_CPUTIME_ID` timing plus queue-pressure counters in
+  `GET /api/v1/diagnostics/tick` (`tx.*`, `max_tx`, and `tx_*` fields on `max_tick` / `max_lock`).
+
 ## What armd enforces
 
 | Check | Where | Result when it fails |

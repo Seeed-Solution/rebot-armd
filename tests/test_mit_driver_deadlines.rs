@@ -230,7 +230,7 @@ fn mit_targets(d: &mut DamiaoArmDriver<FakeBus>) -> Vec<JointTarget> {
 
 fn is_command(f: &CanFrame) -> bool { (1..=7).contains(&f.id) || (0x101..=0x107).contains(&f.id) }
 
-/// The fence is checked before every transmit attempt: a WouldBlock retry that would start at
+/// The fence is checked before every transmit attempt: a frame that would start at
 /// exactly 45 ms after the last complete batch is not sent, and the group keeps no cached output.
 #[test]
 fn fence_expires_between_attempts_at_exactly_45_ms() {
@@ -240,19 +240,23 @@ fn fence_expires_between_attempts_at_exactly_45_ms() {
         clock.advance(ms(20));
         bus.with(|s| s.push_all_feedback());
         let t = mit_targets(&mut d);
-        // first attempt at 44.8 ms (minus `before`); each WouldBlock takes 0.1 ms, the retry pause 0.1 ms
+        // first frame at 44.9 ms (minus `before`); each transmit advances the clock by 0.1 ms,
+        // so the second frame would start at 45.0 ms (minus `before`) with no retry sleep.
         let now = clock.now().saturating_duration_since(armed);
-        clock.advance(ms(45) - Duration::from_micros(200) - before - now);
-        bus.with(|s| { s.tx_stall = true; s.stall_step = Duration::from_micros(100); });
+        clock.advance(ms(45) - Duration::from_micros(100) - before - now);
+        bus.with(|s| { s.tx_step = Duration::from_micros(100); });
         bus.clear_log();
         let e = d.write_joint_targets(&t).unwrap_err();
         assert!(!is_estop_inhibited(&e));
         let log = bus.tx_log();
         assert_eq!(log.len(), expect_attempts, "attempts with {before:?} margin: {log:?}");
-        assert!(log.iter().all(|f| f.id == 0x101), "only J1: {log:?}");
+        assert_eq!(log[0].id, 0x101, "first frame is J1: {log:?}");
+        if expect_attempts == 2 {
+            assert_eq!(log[1].id, 0x102, "second frame is J2: {log:?}");
+        }
         assert!(d.mit_fence_trip().is_some_and(|r| r.contains("gap")), "{:?}", d.mit_fence_trip());
         // after the trip: no cached frame is replayed, no write is accepted
-        bus.with(|s| { s.tx_stall = false; s.push_all_feedback(); });
+        bus.with(|s| { s.tx_step = Duration::ZERO; s.push_all_feedback(); });
         bus.clear_log();
         for _ in 0..5 {
             clock.advance(ms(50));

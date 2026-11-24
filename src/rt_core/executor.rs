@@ -639,6 +639,18 @@ impl EstopRegistry {
     }
 }
 
+/// Deterministic clock hook for [`RtExecutor`] tests (`PersistTestHooks::clock`).
+/// Production runs leave `hooks.clock == None` and use real `Instant::now()`, `CLOCK_MONOTONIC`,
+/// and `clock_nanosleep` with zero overhead.
+#[doc(hidden)]
+pub trait ExecutorClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn now_ns(&self) -> u64;
+    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool);
+    fn sleep(&self, dur: Duration, stop: &AtomicBool);
+    fn wake(&self) {}
+}
+
 /// Deterministic test hooks for persistence barriers, failure injection, and overrun tests.
 #[doc(hidden)]
 #[derive(Clone, Default)]
@@ -661,6 +673,8 @@ pub struct PersistTestHooks {
     pub fail_init: Option<bool>,
     /// Injects a one-shot sleep inside the next release body (tests overrun + `skipped_releases`).
     pub release_delay_once: Option<Arc<Mutex<Option<Duration>>>>,
+    /// Optional deterministic clock for testing release cadence, skipped releases, and sub-release wakes.
+    pub clock: Option<Arc<dyn ExecutorClock>>,
     /// Pauses `armd-persist` while `true` (tests persistence queue saturation).
     pub pause_persist_worker: Option<Arc<AtomicBool>>,
     /// Forces `armd-persist` to leave the final `PersistReply` unpopped when exiting (tests surviving off-thread drain).
@@ -857,6 +871,7 @@ struct RtExecutorShared {
     control_thread: Mutex<Option<JoinHandle<()>>>,
     monitor_thread: Mutex<Option<JoinHandle<()>>>,
     persist_park_thread: Thread,
+    clock: Option<Arc<dyn ExecutorClock>>,
 }
 
 impl RtExecutorShared {
@@ -887,6 +902,9 @@ impl RtExecutorShared {
         self.maint_client.close();
         self.urgent_stop_client.close();
         self.control_stop.store(true, Ordering::Release);
+        if let Some(clock) = self.clock.as_ref() {
+            clock.wake();
+        }
 
         if let Some(bound) = emergency_bound {
             // Wait up to `bound` for `armd-control` to finish its bounded disable and exit;
@@ -1328,6 +1346,7 @@ pub(crate) fn spawn_executor(
         control_thread: Mutex::new(Some(control_thread)),
         monitor_thread: Mutex::new(monitor_thread),
         persist_park_thread,
+        clock: hooks.clock.clone(),
     });
     Ok((RtExecutorHandle { shared }, sinks))
 }
@@ -2379,19 +2398,41 @@ fn control_thread_main(
         return;
     }
 
-    let mut releases = Releases::start(cfg.period);
-    let mut last_release_start = Instant::now();
+    let clock_hook = state.hooks.clock.clone();
+    let now_inst = || -> Instant {
+        clock_hook.as_ref().map_or_else(Instant::now, |c| c.now())
+    };
+    let now_ns_fn = || -> u64 {
+        clock_hook.as_ref().map_or_else(mono_now_ns, |c| c.now_ns())
+    };
+    let sleep_until = |target_ns: u64| {
+        if let Some(c) = clock_hook.as_ref() {
+            c.sleep_until_ns(target_ns, &control_stop);
+        } else {
+            sleep_until_ns(target_ns);
+        }
+    };
+    let sleep_dur = |d: Duration| {
+        if let Some(c) = clock_hook.as_ref() {
+            c.sleep(d, &control_stop);
+        } else {
+            thread::sleep(d);
+        }
+    };
+
+    let mut releases = Releases::start_at(now_ns_fn(), cfg.period);
+    let mut last_release_start = now_inst();
     let mut publish_gen = initial_generation;
     let mut panicked = false;
 
     while !control_stop.load(Ordering::Acquire) {
-        sleep_until_ns(releases.next_ns());
+        sleep_until(releases.next_ns());
         if control_stop.load(Ordering::Acquire) {
             break;
         }
-        let release_start = Instant::now();
+        let release_start = now_inst();
         let usage_start = UsageMark::now();
-        let now_ns = mono_now_ns();
+        let now_ns = now_ns_fn();
         let skipped = releases.advance(now_ns);
         if skipped > 0 {
             stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
@@ -2405,8 +2446,8 @@ fn control_thread_main(
         let step_num = stats.steps.fetch_add(1, Ordering::Relaxed) + 1;
         let dt = elapsed.as_secs_f64();
         let next_release_ns = releases.next_ns();
-        let remaining_ns = next_release_ns.saturating_sub(mono_now_ns());
-        let release_deadline = Instant::now() + Duration::from_nanos(remaining_ns);
+        let remaining_ns = next_release_ns.saturating_sub(now_ns_fn());
+        let release_deadline = now_inst() + Duration::from_nanos(remaining_ns);
         publish_gen += 1;
 
         let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2424,10 +2465,10 @@ fn control_thread_main(
                 .as_ref()
                 .and_then(|d| d.lock().ok().and_then(|mut g| g.take()))
             {
-                thread::sleep(delay);
+                sleep_dur(delay);
             }
             let _ = crate::diagnostics::alloc::take();
-            let body_start = Instant::now();
+            let body_start = now_inst();
             core.defer_zero_check_persist = true;
             core.persist_capacity_available =
                 !state.persist_job_tx.is_abandoned() && state.persist_job_tx.slots() > 0;
@@ -2435,7 +2476,7 @@ fn control_thread_main(
 
             let mut report = engine.step_with_pre_commit(
                 &mut core,
-                Instant::now,
+                now_inst,
                 dt,
                 release_deadline,
                 publish_gen,
@@ -2460,7 +2501,7 @@ fn control_thread_main(
                 return;
             }
             let (phases, body_end) = core.take_tick_phases();
-            let body_end = body_end.unwrap_or_else(Instant::now);
+            let body_end = body_end.unwrap_or_else(now_inst);
             core.defer_zero_check_persist = false;
             if let Some(job) = core.pending_zero_check_persist.take() {
                 if state.persist_job_tx.push(job).is_err() {
@@ -2494,7 +2535,7 @@ fn control_thread_main(
             state.emit_estop_ack_if_advanced(&mut core);
             state.drain_retired_states(&mut core);
             let control_hz = core.config.control_frequency_hz;
-            let done = Instant::now();
+            let done = now_inst();
             let allocs = crate::diagnostics::alloc::take();
             let usage_done = UsageMark::now();
             control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
@@ -2547,11 +2588,11 @@ fn control_thread_main(
                 if wakes >= MAX_SERVICE_WAKES || control_stop.load(Ordering::Acquire) {
                     break;
                 }
-                let now = Instant::now();
+                let now = now_inst();
                 if wake > now {
-                    let wake_ns = mono_now_ns()
+                    let wake_ns = now_ns_fn()
                         .saturating_add(wake.saturating_duration_since(now).as_nanos().min(u128::from(u64::MAX)) as u64);
-                    sleep_until_ns(wake_ns.min(next_release_ns));
+                    sleep_until(wake_ns.min(next_release_ns));
                 }
                 if control_stop.load(Ordering::Acquire) {
                     break;
@@ -2565,7 +2606,7 @@ fn control_thread_main(
                     "RT executor thread must never enter a Tokio runtime during a sub-release wake"
                 );
                 let published = engine
-                    .service_wake(&mut core, Instant::now(), release_deadline, publish_gen + 1, &mut report);
+                    .service_wake(&mut core, now_inst(), release_deadline, publish_gen + 1, &mut report);
                 let urgent_flushed = engine.take_urgent_replies_flushed();
                 if published {
                     publish_gen += 1;
@@ -2762,8 +2803,13 @@ pub struct Releases {
 impl Releases {
     /// First release one period from now.
     pub fn start(period: Duration) -> Self {
+        Self::start_at(mono_now_ns(), period)
+    }
+
+    /// First release one period from an explicit starting monotonic timestamp (nanoseconds).
+    pub fn start_at(now_ns: u64, period: Duration) -> Self {
         let period_ns = (period.as_nanos() as u64).max(1);
-        Self { period_ns, next_ns: mono_now_ns() + period_ns }
+        Self { period_ns, next_ns: now_ns + period_ns }
     }
 
     /// Advances past a release at `now_ns`, preserving the original absolute release grid phase:

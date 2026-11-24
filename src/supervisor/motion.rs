@@ -207,7 +207,7 @@ impl SupervisorInner {
         if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
             if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), driver) {
                 if let Ok(mut drv) = d.try_lock() {
-                    if let Err(e) = drv.write_joint_targets(&targets) {
+                    if let Err(e) = drv.write_estop_hold(&targets) {
                         tracing::error!("Gravity comp hold write failed: {e}");
                     }
                 }
