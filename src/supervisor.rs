@@ -7660,6 +7660,46 @@ impl ArmSupervisor {
         }
     }
 
+    async fn run_prepared_motion(
+        &self,
+        stamp: AdmissionStamp,
+        request: crate::rt_core::requests::motion::MotionRequest,
+        epoch_id: Option<u64>,
+    ) -> Result<u64, ArmError> {
+        use crate::rt_core::requests::motion as req;
+        const MAX_RETRIES: usize = 5;
+        let mut snapshot = {
+            let inner = self.inner.read().await;
+            self.check_legacy_under_guard(&inner)?;
+            req::preflight_motion_request(&inner, stamp, &request, epoch_id)?
+        };
+        for attempt in 0..MAX_RETRIES {
+            let (snap_plan, req_plan) = (snapshot.clone(), request.clone());
+            let prepared = tokio::task::spawn_blocking(move || req::prepare_motion(&snap_plan, &req_plan))
+                .await
+                .map_err(|e| ArmError::Internal(format!("motion planner failed: {e}")))?;
+            let mut inner = self.inner.write().await;
+            self.check_legacy_under_guard(&inner)?;
+            if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
+            inner.preflight_admission(stamp)?;
+            let plan = prepared?;
+            let res = match request.kind {
+                req::MotionKind::Jog => req::install_jog(&mut inner, stamp, &plan.slot, plan.heap_traj, epoch_id, false),
+                req::MotionKind::Home => req::install_home(&mut inner, stamp, &plan.slot, plan.heap_traj, epoch_id, false),
+                req::MotionKind::Park => req::install_park(&mut inner, stamp, &plan.slot, plan.heap_traj, epoch_id, false),
+            };
+            match res {
+                Ok(installed) => return Ok(installed.epoch()),
+                Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_RETRIES => {
+                    snapshot = req::MotionPlanSnapshot::from_supervisor_with_config(&inner, snapshot.config);
+                }
+                Err(e) => return Err(e.into_arm_error(&inner, request.action_kind, epoch_id)),
+            }
+        }
+        let inner = self.inner.read().await;
+        Err(req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, epoch_id))
+    }
+
     pub async fn jog(
         &self,
         stamp: AdmissionStamp,
@@ -7667,10 +7707,8 @@ impl ArmSupervisor {
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
-        let mut inner = self.inner.write().await;
-        self.check_legacy_under_guard(&inner)?;
-        let admitted = inner.check_admission(stamp)?;
-        SupervisorInner::jog(admitted, target_positions, duration_secs, epoch_id)
+        let req = crate::rt_core::requests::motion::MotionRequest::jog(target_positions, duration_secs, None);
+        self.run_prepared_motion(stamp, req, epoch_id).await
     }
 
     pub async fn home(
@@ -7679,11 +7717,8 @@ impl ArmSupervisor {
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
-        let mut inner = self.inner.write().await;
-        self.check_legacy_under_guard(&inner)?;
-        let home_pos = inner.config.home_positions.clone();
-        let admitted = inner.check_admission(stamp)?;
-        SupervisorInner::jog_action(admitted, home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
+        let req = crate::rt_core::requests::motion::MotionRequest::home(duration_secs);
+        self.run_prepared_motion(stamp, req, epoch_id).await
     }
 
     pub async fn stop_motion(&self) {

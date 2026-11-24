@@ -2480,6 +2480,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 policy: None,
                 dry_run_grasp: None,
             };
+            let mut pending_motion: Option<motion::PendingMotion> = None;
             let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
@@ -2515,6 +2516,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             last_sequence: &mut last_sequence,
                             evicted_notify: &mut evicted_notify,
                             action_pending: &mut action_pending,
+                            pending_motion: &mut pending_motion,
                             pending_config_write: &mut pending_config_write,
                             pending_calibration: &mut pending_calibration,
                         };
@@ -2595,6 +2597,22 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             response = None;
                         }
                     }
+                }
+            }
+
+            let allows_motion_deferred = entry.is_some_and(|e| matches!(e.reply, ReplyPolicy::CommandDeferred | ReplyPolicy::PresetReply));
+            if allows_motion_deferred {
+                if let Some(pending) = pending_motion.take() {
+                    let Some(next) = motion::complete_pending_motion(
+                        pending,
+                        stamp,
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_closing,
+                        &worker_tasks,
+                    ).await else { break; };
+                    response = Some(next);
                 }
             }
 
@@ -2705,6 +2723,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     || action_pending.replay.is_some()
                     || has_policy
                     || action_pending.dry_run_grasp.is_some()
+                    || pending_motion.is_some()
                     || pending_calibration.is_some()
                     || pending_config_write.is_some();
                 debug_assert!(
