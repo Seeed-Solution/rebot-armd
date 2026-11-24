@@ -871,6 +871,8 @@ pub struct SupervisorInner {
     pub unload_settle: Option<UnloadSettle>,
     /// Set while a park started by the lease watchdog is running.
     pub watchdog_park: Option<WatchdogPark>,
+    /// Inline reason the lease watchdog held position instead of starting a park (0 heap ops).
+    pub watchdog_park_blocked_reason: Option<crate::model::HolderLabel>,
     /// Set when the last park was refused because its path enters a keep-out box.
     pub park_rejection: Option<SafetyError>,
     /// Bumped on every change of the workspace rule inputs (keep-out boxes, camera mount);
@@ -1705,6 +1707,7 @@ impl SupervisorInner {
             pending_normal_unload: false,
             unload_settle: None,
             watchdog_park: None,
+            watchdog_park_blocked_reason: None,
             park_rejection: None,
             workspace_revision: 0,
             calibration: None,
@@ -2617,6 +2620,7 @@ impl SupervisorInner {
         self.policy_observation_into(&mut out.policy);
         #[cfg(not(feature = "policy-runtime"))]
         { out.policy = None; }
+        out.watchdog_park_blocked_reason = self.watchdog_park_blocked_reason;
         out.safety_log_dropped = self.safety.log_dropped().saturating_add(self.safety_log_ring_dropped);
     }
 
@@ -4926,6 +4930,7 @@ impl SupervisorInner {
             // rigid lock at the current position and latch the fault, keeping torque on.
             match self.watchdog_park_blocker_bounded() {
                 None => {
+                    self.watchdog_park_blocked_reason = None;
                     tracing::warn!("Watchdog: lease expired while torqued, parking");
                     self.apply_stop_policy(StopPolicy::NormalUnload);
                     if self.pending_normal_unload {
@@ -4933,11 +4938,14 @@ impl SupervisorInner {
                         tracing::info!("Watchdog park budget {:.2} s (planned {:.2} s)", budget.as_secs_f64(), self.unload_planned_duration.unwrap_or(0.0));
                         self.watchdog_park = Some(WatchdogPark { elapsed_s: 0.0, budget_s: budget.as_secs_f64(), grace_granted: false });
                     } else {
-                        self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("watchdog park could not be planned"));
+                        let reason = crate::safety::BoundedText::new("watchdog park could not be planned");
+                        self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(reason.as_str()));
+                        self.safety.log_watchdog_park_blocked(reason);
                         self.latch_watchdog_fault();
                     }
                 }
                 Some(reason) => {
+                    self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(reason.as_str()));
                     if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::WatchdogTimeout) {
                         self.safety.log_watchdog_park_blocked(reason);
                     }

@@ -2939,3 +2939,274 @@ async fn sequence_save_reservation_pins_replay_episodes_against_concurrent_delet
 async fn sequence_save_reservation_pins_replay_episodes_against_concurrent_delete_executor() {
     run_sequence_replay_episode_pin_test(RtOwner::Executor).await;
 }
+
+// ============================================================================
+// 13. Item 4: Watchdog does NOT start a park during config hold or reconciliation
+// ============================================================================
+
+async fn setup_torqued_watchdog_rig(owner: RtOwner, lease_timeout: Duration) -> Rig {
+    let dir = tempfile::tempdir().unwrap();
+    let keepout_path = dir.path().join("keepout.json");
+    let collision_path = dir.path().join("collision.json");
+    let gripper_calib_path = dir.path().join("gripper_calib.json");
+    let poses_path = dir.path().join("poses.json");
+    let sequences_path = dir.path().join("sequences.json");
+    let setup_path = dir.path().join("grasp_setup.json");
+    let commissioning_path = dir.path().join("tool_commissioning.json");
+    let calib_path = dir.path().join("calibration.json");
+
+    let cfg = ArmConfig::rebot_dm();
+    assert!(
+        cfg.resting_pose.is_some(),
+        "test requires default resting_pose so an unblocked watchdog would park"
+    );
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    armd::keepout::load_into(&sup, &keepout_path).await.unwrap();
+    armd::collision::load_into(&sup, &collision_path).await;
+    armd::gripper_calib::load_into(&sup, &gripper_calib_path).await;
+    armd::poses::load_into(&sup, &poses_path).await;
+    armd::sequences::load_into(&sup, &sequences_path).await;
+    armd::grasp::load_into(&sup, &setup_path).await;
+    armd::tool::load_commissioning_into(&sup, &commissioning_path).await;
+
+    let lease_conn = "rt-c-wd-conn".to_string();
+    let closed_conn_id = 7777;
+    let (lease_gen, epoch) = {
+        let mut inner = sup.inner().write().await;
+        inner.lease_timeout = lease_timeout;
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.mark_connection_closed(closed_conn_id);
+        let lgen = inner.acquire_lease(&lease_conn).expect("acquire initial lease");
+        let adm = inner.current_admission_stamp();
+        let admitted = inner.check_admission(adm).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+        (lgen, inner.safety.epoch_id())
+    };
+
+    if owner == RtOwner::Executor {
+        let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
+        ecfg.alloc_timing = true;
+        let handle = sup.start_executor(ecfg).await.expect("start RT executor");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while sup.hub().latest().is_none() {
+            assert!(Instant::now() < deadline, "timed out waiting for StateHub snapshot");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+    }
+
+    Rig {
+        sup,
+        _dir: dir,
+        keepout_path,
+        collision_path,
+        gripper_calib_path,
+        poses_path,
+        sequences_path,
+        setup_path,
+        commissioning_path,
+        calib_path,
+        lease_conn,
+        lease_gen,
+        closed_conn_id,
+        epoch,
+    }
+}
+
+async fn run_watchdog_no_park_during_config_reconciliation_test(owner: RtOwner) {
+    // 13a. Keep-out rename + parent-dir fsync failure -> Reconciling + lease expiry on torqued arm
+    //      with default `resting_pose` intact -> NO park motion, holds INSPECT, torque stays ON,
+    //      observation.watchdog_park_blocked_reason explains why.
+    let rig = setup_torqued_watchdog_rig(owner, Duration::from_millis(60)).await;
+
+    let _detached = if owner == RtOwner::Executor {
+        Some(rig.sup.inner().write().await)
+    } else {
+        None
+    };
+
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        fail_dir_sync_once: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    });
+    let pub0 = rig.sup.published_config().await.unwrap();
+    let boxes = vec![KeepoutBox {
+        name: "reconcile-wd-box".into(),
+        min_m: [0.40, 0.40, 0.40],
+        max_m: [0.55, 0.55, 0.55],
+    }];
+    let (plan, _, _, _) = keepout_plan(&rig, &pub0, boxes, pub0.keepout.revision, 701, rig.lease_gen, false);
+    let err = run_config_commit(&rig.sup, plan, || Ok(()), |_, _| {})
+        .await
+        .unwrap_err();
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    assert!(matches!(&err, ArmError::Rejected { status: 500, code, .. } if code == "PERSIST_FAILED"));
+    assert!(rig.keepout_path.exists(), "keep-out file must have been renamed before dir-sync failed");
+    assert_eq!(rig.hold_state(ConfigDomain::Keepout).await, Some(HoldState::Reconciling));
+    assert!(rig.is_config_inhibited().await);
+
+    // Wait past lease_timeout (60 ms) and drive ticks (Legacy) / read hub (Executor).
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let obs = if owner == RtOwner::Legacy {
+        let mut last = rig.sup.inner().write().await.tick(0.02);
+        for _ in 0..10 {
+            last = rig.sup.inner().write().await.tick(0.02);
+        }
+        last
+    } else {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(s) = rig.sup.hub().latest() {
+                if matches!(
+                    s.obs.safety_state,
+                    armd::safety::SafetyState::Fault(armd::safety::FaultReason::WatchdogTimeout)
+                ) {
+                    break s.obs.clone();
+                }
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for WatchdogTimeout during reconciliation");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    assert!(
+        matches!(
+            obs.safety_state,
+            armd::safety::SafetyState::Fault(armd::safety::FaultReason::WatchdogTimeout)
+        ),
+        "watchdog must latch WatchdogTimeout without parking, got {:?}",
+        obs.safety_state
+    );
+    assert!(obs.is_torqued, "torque must remain enabled while holding during reconciliation");
+    assert_eq!(
+        obs.watchdog_park_blocked_reason.as_deref(),
+        Some("configuration reconciliation active"),
+        "observation must report why watchdog park was blocked"
+    );
+    assert!(
+        obs.action.as_ref().is_none_or(|a| a.kind != "park"),
+        "watchdog must NOT start a park action during reconciliation: {:?}",
+        obs.action
+    );
+    for (i, (&p, &exp)) in obs.positions.iter().zip(INSPECT.iter()).enumerate() {
+        assert!(
+            (p - exp).abs() < 1e-4,
+            "joint {i} moved away from INSPECT ({p} vs {exp}) during reconciliation"
+        );
+    }
+    for (i, (&c, &exp)) in obs.commanded_positions.iter().zip(INSPECT.iter()).enumerate() {
+        assert!(
+            (c - exp).abs() < 1e-4,
+            "commanded joint {i} moved away from INSPECT ({c} vs {exp}) during reconciliation"
+        );
+    }
+
+    // Wait another 80 ms to confirm the arm continues holding position with torque ON.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let obs2 = if owner == RtOwner::Legacy {
+        let mut inner = rig.sup.inner().write().await;
+        assert!(!inner.pending_normal_unload);
+        assert!(inner.watchdog_park.is_none());
+        inner.tick(0.02)
+    } else {
+        rig.sup.hub().latest().unwrap().obs.clone()
+    };
+    assert!(obs2.is_torqued);
+    assert_eq!(
+        obs2.watchdog_park_blocked_reason.as_deref(),
+        Some("configuration reconciliation active")
+    );
+    for (i, (&p, &exp)) in obs2.positions.iter().zip(INSPECT.iter()).enumerate() {
+        assert!((p - exp).abs() < 1e-4, "joint {i} drifted after hold ({p} vs {exp})");
+    }
+
+    rig.assert_executor_zero_alloc("watchdog hold during config reconciliation");
+    drop(_detached);
+    rig.shutdown().await;
+
+    // 13b. Active pre-rename configuration hold + lease expiry on torqued arm -> NO park motion,
+    //      observation reports "configuration hold active".
+    let rig_hold = setup_torqued_watchdog_rig(owner, Duration::from_millis(60)).await;
+    let _detached_hold = if owner == RtOwner::Executor {
+        Some(rig_hold.sup.inner().write().await)
+    } else {
+        None
+    };
+
+    let (at_hook_tx, at_hook_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (go_tx, go_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let go_rx = Arc::new(std::sync::Mutex::new(go_rx));
+    rig_hold.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        after_reserve_before_rename: Some(Arc::new(move || {
+            let _ = at_hook_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    });
+    let pub_h = rig_hold.sup.published_config().await.unwrap();
+    let boxes_h = vec![KeepoutBox {
+        name: "hold-wd-box".into(),
+        min_m: [0.40, 0.40, 0.40],
+        max_m: [0.55, 0.55, 0.55],
+    }];
+    let (plan_h, _, _, _) =
+        keepout_plan(&rig_hold, &pub_h, boxes_h, pub_h.keepout.revision, 702, rig_hold.lease_gen, false);
+    let sup_h = Arc::clone(&rig_hold.sup);
+    let commit_task = tokio::spawn(async move {
+        run_config_commit(&sup_h, plan_h, || Ok(()), |_, _| {}).await
+    });
+    tokio::task::spawn_blocking(move || at_hook_rx.recv_timeout(Duration::from_secs(3)).unwrap())
+        .await
+        .unwrap();
+
+    // Expire lease while the Keepout hold is active (before rename).
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let obs_h = if owner == RtOwner::Legacy {
+        let mut inner = rig_hold.sup.inner().write().await;
+        let o = inner.tick(0.02);
+        assert!(!inner.pending_normal_unload && inner.watchdog_park.is_none());
+        o
+    } else {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(s) = rig_hold.sup.hub().latest() {
+                if matches!(
+                    s.obs.safety_state,
+                    armd::safety::SafetyState::Fault(armd::safety::FaultReason::WatchdogTimeout)
+                ) {
+                    break s.obs.clone();
+                }
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for WatchdogTimeout during config hold");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    assert!(obs_h.is_torqued);
+    assert_eq!(
+        obs_h.watchdog_park_blocked_reason.as_deref(),
+        Some("configuration hold active")
+    );
+    for (i, (&p, &exp)) in obs_h.positions.iter().zip(INSPECT.iter()).enumerate() {
+        assert!((p - exp).abs() < 1e-4, "joint {i} moved during config hold ({p} vs {exp})");
+    }
+
+    // Release commit hook; commit aborts cleanly before rename (epoch/lease changed on watchdog).
+    let _ = go_tx.send(());
+    let _ = commit_task.await.unwrap();
+    rig_hold.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    rig_hold.assert_executor_zero_alloc("watchdog hold during active config hold");
+    drop(_detached_hold);
+    rig_hold.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchdog_holds_without_parking_during_config_reconciliation_legacy() {
+    run_watchdog_no_park_during_config_reconciliation_test(RtOwner::Legacy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchdog_holds_without_parking_during_config_reconciliation_executor() {
+    run_watchdog_no_park_during_config_reconciliation_test(RtOwner::Executor).await;
+}

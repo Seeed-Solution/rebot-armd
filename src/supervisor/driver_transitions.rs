@@ -2544,6 +2544,7 @@ impl SupervisorInner {
         self.last_commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
+        self.watchdog_park_blocked_reason = None;
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
         if self.consume_pending_estop() {

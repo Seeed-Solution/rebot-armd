@@ -644,6 +644,21 @@ impl SupervisorInner {
     /// [`WATCHDOG_PARK_SETTLE_GRACE`]; otherwise torque is held and WatchdogTimeout latched.
     pub(super) fn supervise_watchdog_park(&mut self, dt: f64) {
         let Some(mut park) = self.watchdog_park.take() else { return; };
+        if let Some(held) = self.core.config().held() {
+            let msg = if held.state == crate::rt_core::config_iface::HoldState::Reconciling {
+                "configuration reconciliation active"
+            } else {
+                "configuration hold active"
+            };
+            let reason = crate::safety::BoundedText::new(msg);
+            self.watchdog_park_blocked_reason = Some(crate::model::HolderLabel::new(msg));
+            self.safety.log_watchdog_park_blocked(reason);
+            self.stop_motion();
+            if self.is_torqued {
+                self.latch_watchdog_fault();
+            }
+            return;
+        }
         if !self.pending_normal_unload {
             tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
             if self.is_torqued {
@@ -675,6 +690,14 @@ impl SupervisorInner {
     /// watchdog expires. Returns the reason the park is not allowed, or `None` when it is.
     pub(super) fn watchdog_park_blocker_bounded(&self) -> Option<crate::safety::BoundedText<160>> {
         use crate::safety::BoundedText;
+        if let Some(held) = self.core.config().held() {
+            let msg = if held.state == crate::rt_core::config_iface::HoldState::Reconciling {
+                "configuration reconciliation active"
+            } else {
+                "configuration hold active"
+            };
+            return Some(BoundedText::new(msg));
+        }
         let Some(policy) = &self.config.resting_pose else {
             return Some(BoundedText::new("no resting pose configured"));
         };
