@@ -2066,6 +2066,141 @@ pub struct ConfigCommitTestHooks {
     pub fail_persisted_once: Option<Arc<AtomicBool>>,
 }
 
+/// RAII config reservation guard for legacy zero and calibration transactions
+/// (`motor_zero::run`, `motor_zero::restore`, `calibration::apply`, `calibration::restore`).
+///
+/// Acquires the same single-slot [`ConfigHold`] reservation (`ConfigDomain::Calibration`)
+/// shared with all PR C configuration commits (`Poses`, `GripperCalibration`, `Keepout`,
+/// `Collision`, `Sequences`, `GraspSetup`, `ToolCommissioning`) after verifying no staged
+/// config commit currently holds `config_write_lock`. Holding this reservation across the
+/// entire legacy zero + invalidation prevents any staged pose/gripper/calibration write from
+/// interleaving or overwriting stale marks, and fails closed with `409 CONFIG_BUSY` if any
+/// reservation or reconciliation is already active.
+pub(crate) struct LegacyZeroReservationGuard {
+    sup: Option<Arc<ArmSupervisor>>,
+    reservation: Option<Reservation>,
+}
+
+impl LegacyZeroReservationGuard {
+    pub(crate) async fn try_acquire(
+        sup: &Arc<ArmSupervisor>,
+    ) -> Result<Self, crate::calibration::CalibError> {
+        if sup.owner_mode() != OWNER_LEGACY {
+            return Err(crate::calibration::CalibError::new(
+                409,
+                "EXECUTOR_UNSUPPORTED",
+                "operation is not available while the RT executor owns the arm; use the legacy owner",
+            ));
+        }
+        // Fail closed immediately if any staged config commit currently holds `config_write_lock`
+        // (including between lock acquisition and `ConfigRequest::Reserve`). Drop the mutex guard
+        // right after installing the single-slot `ConfigHold` reservation so concurrent callers
+        // reaching `Reserve` fail immediately with `409 CONFIG_BUSY` instead of blocking, and
+        // legacy `Txn::write_grasp` can acquire `config_write_lock` without self-deadlocking.
+        let cw_lock = sup.config_write_lock();
+        let _cw_probe = cw_lock.try_lock().map_err(|_| {
+            crate::calibration::CalibError::new(
+                409,
+                "CONFIG_BUSY",
+                "a configuration change or reconciliation is in progress",
+            )
+        })?;
+        let mut inner = sup.inner().write().await;
+        if inner.detached {
+            return Err(crate::calibration::CalibError::new(
+                409,
+                "EXECUTOR_UNSUPPORTED",
+                "operation is not available while the RT executor owns the arm; use the legacy owner",
+            ));
+        }
+        if inner.core.config().held().is_some() {
+            return Err(crate::calibration::CalibError::new(
+                409,
+                "CONFIG_BUSY",
+                "a configuration change or reconciliation is in progress",
+            ));
+        }
+        let ctx = CommitCtx {
+            arm: inner.core.id(),
+            boot: BootId::process(),
+            now: Instant::now(),
+            stop_generation: inner.current_stop_gen(),
+        };
+        let seq = NEXT_CONFIG_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+        let proposal = ConfigProposal {
+            domain: ConfigDomain::Calibration,
+            expected_revision: ConfigAuthority::revision(&*inner, ConfigDomain::Calibration),
+            candidate: CandidateId(seq),
+            stamp: Stamp {
+                arm: ctx.arm,
+                boot: ctx.boot,
+                request: RequestId(seq),
+                client: ClientId(0),
+                client_seq: seq,
+                authority: inner.authority(&ctx),
+                deadline: ctx.now + std::time::Duration::from_secs(600),
+            },
+        };
+        match ConfigAuthority::reserve(&mut *inner, &proposal, &ctx) {
+            Reserved::Granted(reservation) => Ok(Self {
+                sup: Some(Arc::clone(sup)),
+                reservation: Some(reservation),
+            }),
+            Reserved::Refused { .. } => Err(crate::calibration::CalibError::new(
+                409,
+                "CONFIG_BUSY",
+                "a configuration change or reconciliation is in progress",
+            )),
+        }
+    }
+
+    pub(crate) fn grant(&self) -> GrantId {
+        self.reservation
+            .as_ref()
+            .expect("LegacyZeroReservationGuard holds a reservation until release")
+            .grant()
+    }
+
+    pub(crate) async fn release(mut self) {
+        if let (Some(sup), Some(reservation)) = (self.sup.take(), self.reservation.take()) {
+            let mut inner = sup.inner().write().await;
+            if !inner.detached {
+                let _ = ConfigAuthority::release(&mut *inner, reservation);
+            }
+        }
+    }
+}
+
+impl Drop for LegacyZeroReservationGuard {
+    fn drop(&mut self) {
+        let (Some(sup), Some(reservation)) = (self.sup.take(), self.reservation.take()) else {
+            return;
+        };
+        if let Ok(mut inner) = sup.inner().try_write() {
+            if !inner.detached {
+                let _ = ConfigAuthority::release(&mut *inner, reservation);
+            }
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    let mut inner = sup.inner().write().await;
+                    if !inner.detached {
+                        let _ = ConfigAuthority::release(&mut *inner, reservation);
+                    }
+                });
+            }
+            Err(_) => {
+                let mut inner = sup.inner().blocking_write();
+                if !inner.detached {
+                    let _ = ConfigAuthority::release(&mut *inner, reservation);
+                }
+            }
+        }
+    }
+}
+
 /// RAII guard for a granted [`Reservation`] held off-thread across disk rename/activation.
 ///
 /// If dropped early (cancelled future, panic, or early return):

@@ -1324,7 +1324,13 @@ pub fn kinematics_armed(inner: &SupervisorInner) -> Result<(), CalibError> {
 
 /// Under the lock, before a transaction: no other transaction, the arm idle.
 pub fn begin_checks(inner: &SupervisorInner) -> Result<(), CalibError> {
-    if inner.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply or restore is running")); }
+    if inner.calibration_busy || inner.core.config().held().is_some() {
+        return Err(CalibError::new(
+            409,
+            "CONFIG_BUSY",
+            "a calibration apply, restore, or configuration change is running",
+        ));
+    }
     if let Some(reason) = inner.workspace_change_blocker() {
         return Err(CalibError::new(409, "MOTION_BUSY", format!("the camera calibration cannot change while {reason}")));
     }
@@ -1792,8 +1798,11 @@ pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyR
         let inner = sup.inner().read().await;
         return Ok(json!({"dry_run": true, "before": diff_view(&vision_before, &before, &inner), "after": diff_view(&Value::Object(va), &after, &inner)}));
     }
+    let zero_guard = crate::rt_core::requests::config::LegacyZeroReservationGuard::try_acquire(sup).await?;
     let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None, durability_warnings: Vec::new() };
-    let mut out = txn.run("apply", &req.intrinsics, &after).await?;
+    let res = txn.run("apply", &req.intrinsics, &after).await;
+    zero_guard.release().await;
+    let mut out = res?;
     out["grip_pixel_model"] = json!(after.grip_pixel_model);
     tracing::info!("Camera calibration applied (backup {})", out["backup"].as_str().unwrap_or(""));
     Ok(out)
@@ -1809,6 +1818,13 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
             "/api/v1/calibration/restore is not available while the RT executor owns the arm; use the legacy owner",
         ));
     }
+    let zero_guard = crate::rt_core::requests::config::LegacyZeroReservationGuard::try_acquire(sup).await?;
+    let res = restore_reserved(sup, deps, body, check).await;
+    zero_guard.release().await;
+    res
+}
+
+async fn restore_reserved(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Value, check: &LeaseCheck) -> Result<Value, CalibError> {
     let name = body.get("backup").and_then(Value::as_str)
         .filter(|n| !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .ok_or_else(|| CalibError::invalid("backup must be the name of a backup (GET /api/v1/calibration)"))?.to_string();

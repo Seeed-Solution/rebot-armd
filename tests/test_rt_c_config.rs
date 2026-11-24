@@ -3203,3 +3203,268 @@ async fn executor_public_handle_refuses_joint_zero_and_motor_zero_with_executor_
     ));
     let _ = rig;
 }
+
+// ============================================================================
+// 15. Round 4 M2 — Legacy zero shares config reservation with staged pose writes
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_zero_and_staged_pose_write_are_mutually_exclusive_and_stale_marks_survive_restart() {
+    let rig = Rig::new(RtOwner::Legacy, |_| {}).await;
+    let det_up = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let mut deps = CalibrationDeps::new(rig.calib_path.clone(), Some(rig.setup_path.clone()), det_up);
+    deps.backup_dir = rig._dir.path().join("backups");
+
+    // Move J2 away from reference (0.0) by 0.12 rad (> STALE_THRESHOLD_RAD = 0.5 deg), torque off.
+    {
+        let mut inner = rig.sup.inner().write().await;
+        inner.is_torqued = false;
+        let mut q = inner.config.home_positions.clone();
+        q[1] += 0.12;
+        inner.measured_positions = q.clone();
+        inner.commanded_positions = q.clone();
+        inner.target_positions = q;
+    }
+
+    let make_pose = |pub_cfg: &armd::rt_core::requests::config::PublishedConfig, name: &str| NamedPose {
+        id: armd::recording::new_ulid(),
+        name: name.into(),
+        positions: INSPECT.to_vec(),
+        tcp: pub_cfg.pose_tcp(&INSPECT),
+        saved_at_ms: 1000,
+        profile_id: pub_cfg.config.profile_id.clone(),
+        arm_dof: Some(pub_cfg.config.arm_dof()),
+        gripper_joint: pub_cfg.config.gripper_index(),
+        joint_names: Some(pub_cfg.joint_names()),
+        tool_id: Some(pub_cfg.config.active_tool.id.clone()),
+        tool_config_digest: Some(pub_cfg.config.active_tool.config_digest.clone()),
+        stale: None,
+    };
+
+    let build_pose_plan =
+        |rig: &Rig, pub_cfg: &armd::rt_core::requests::config::PublishedConfig, poses: Vec<NamedPose>| {
+            let next_list = PoseList {
+                profile_id: pub_cfg.config.profile_id.clone(),
+                arm_dof: Some(pub_cfg.config.arm_dof()),
+                gripper_joint: pub_cfg.config.gripper_index(),
+                joint_names: Some(pub_cfg.joint_names()),
+                poses,
+            };
+            let adm = capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch));
+            let prop = build_config_proposal(
+                &rig.sup,
+                ConfigDomain::Poses,
+                pub_cfg.poses.revision,
+                adm,
+                rig.lease_gen,
+                pub_cfg.workspace_revision,
+            );
+            let nl_pub = next_list.clone();
+            let plan = ConfigCommitPlan {
+                proposal: prop,
+                auth: ConfigAuthContext {
+                    admission: adm,
+                    lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
+                },
+                precheck: ReservePrecheck::PosesSave,
+                candidate: ConfigCandidate::Poses {
+                    next_list: next_list.clone(),
+                },
+                write: ConfigWriteOp::from(Some(PendingWrite::new(
+                    rig.poses_path.clone(),
+                    serde_json::to_string_pretty(&next_list).unwrap(),
+                ))),
+                expected_workspace_revision: None,
+                expected_poses_revision: None,
+            };
+            (plan, nl_pub)
+        };
+
+    // Seed initial pose "p_initial" through the common commit path.
+    let pub0 = rig.sup.published_config().await.unwrap();
+    let p_initial = make_pose(&pub0, "p_initial");
+    let (plan0, nl0) = build_pose_plan(&rig, &pub0, vec![p_initial.clone()]);
+    run_config_commit(&rig.sup, plan0, || Ok(()), move |cfg, act| {
+        cfg.poses.list = nl0;
+        cfg.poses.revision = act.revision;
+    })
+    .await
+    .expect("initial pose save");
+
+    // Part A (review interleaving): staged pose write holds reservation, paused after Reserve
+    // and staging, strictly before VerifyAuthority + rename_only().
+    let (at_hook_tx, at_hook_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (go_tx, go_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let go_rx = Arc::new(std::sync::Mutex::new(go_rx));
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        after_reserve_before_rename: Some(Arc::new(move || {
+            let _ = at_hook_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        })),
+        ..Default::default()
+    });
+
+    let pub1 = rig.sup.published_config().await.unwrap();
+    let p_staged = make_pose(&pub1, "p_staged");
+    let (plan1, nl1) = build_pose_plan(&rig, &pub1, vec![p_initial.clone(), p_staged.clone()]);
+    let sup1 = Arc::clone(&rig.sup);
+    let pose_save_task = tokio::spawn(async move {
+        run_config_commit(&sup1, plan1, || Ok(()), move |cfg, act| {
+            cfg.poses.list = nl1;
+            cfg.poses.revision = act.revision;
+        })
+        .await
+    });
+
+    // Wait until poses/save holds the reservation and has staged poses.json.
+    tokio::task::spawn_blocking(move || at_hook_rx.recv_timeout(Duration::from_secs(3)).unwrap())
+        .await
+        .unwrap();
+
+    // While poses/save holds the reservation, legacy zero check/run/restore MUST refuse CONFIG_BUSY
+    // without touching offsets, positions, or files.
+    let offsets_before = rig.sup.inner().read().await.joint_zero_offsets.clone();
+    {
+        let inner = rig.sup.inner().read().await;
+        let check_err = armd::motor_zero::check(&inner, &json!({"joints": [2], "method": "software"}))
+            .expect_err("motor_zero::check must refuse while Poses reservation is held");
+        assert_eq!(check_err.status, 409);
+        assert_eq!(check_err.code, "CONFIG_BUSY");
+
+        let restore_check_err = armd::motor_zero::check_restore(&inner, &json!({"backup": "b1"}))
+            .expect_err("motor_zero::check_restore must refuse while Poses reservation is held");
+        assert_eq!(restore_check_err.status, 409);
+        assert_eq!(restore_check_err.code, "CONFIG_BUSY");
+
+        let calib_err = armd::calibration::begin_checks(&inner)
+            .expect_err("calibration::begin_checks must refuse while Poses reservation is held");
+        assert_eq!(calib_err.status, 409);
+        assert_eq!(calib_err.code, "CONFIG_BUSY");
+    }
+
+    let ok_lease: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+    let sw_req = armd::motor_zero::MotorZeroRequest {
+        joints: vec![1],
+        dry_run: false,
+        force: true,
+        method: Some("software".into()),
+    };
+    let sw_err = armd::motor_zero::run(&rig.sup, &deps, sw_req.clone(), &ok_lease)
+        .await
+        .expect_err("software motor_zero::run must refuse CONFIG_BUSY while Poses reservation is held");
+    assert_eq!(sw_err.status, 409);
+    assert_eq!(sw_err.code, "CONFIG_BUSY");
+
+    let hw_req = armd::motor_zero::MotorZeroRequest {
+        joints: vec![1],
+        dry_run: false,
+        force: true,
+        method: Some("motor".into()),
+    };
+    let hw_err = armd::motor_zero::run(&rig.sup, &deps, hw_req, &ok_lease)
+        .await
+        .expect_err("hard motor_zero::run must refuse CONFIG_BUSY while Poses reservation is held");
+    assert_eq!(hw_err.status, 409);
+    assert_eq!(hw_err.code, "CONFIG_BUSY");
+    assert_eq!(rig.sup.inner().read().await.joint_zero_offsets, offsets_before);
+    assert!(!rig.calib_path.exists(), "refused zero must not write calibration.json");
+
+    // Unpause staged pose write -> succeeds cleanly with both poses saved.
+    let _ = go_tx.send(());
+    pose_save_task
+        .await
+        .unwrap()
+        .expect("staged pose save completes after refused zero");
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+
+    // Part B (reverse interleaving): legacy software zero starts FIRST (holding the shared
+    // ConfigHold across capture + apply + invalidate_after_zero) while a pre-zero staged pose
+    // write races it concurrently -> pose write MUST be refused and NEVER overwrite stale marks!
+    let pub_pre_zero = rig.sup.published_config().await.unwrap();
+    let p_raced = make_pose(&pub_pre_zero, "p_raced");
+    let (plan_raced, nl_raced) = build_pose_plan(
+        &rig,
+        &pub_pre_zero,
+        vec![p_initial.clone(), p_staged.clone(), p_raced.clone()],
+    );
+    let (plan_post_zero, nl_post_zero) = build_pose_plan(
+        &rig,
+        &pub_pre_zero,
+        vec![p_initial.clone(), p_staged.clone(), p_raced],
+    );
+
+    let sup_z = Arc::clone(&rig.sup);
+    let deps_z = deps.clone();
+    let zero_task = tokio::spawn(async move {
+        let lease_ok: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+        armd::motor_zero::run(&sup_z, &deps_z, sw_req, &lease_ok).await
+    });
+
+    // Wait until legacy zero has acquired the shared ConfigHold reservation.
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if rig.sup.inner().read().await.core.config().held().is_some() {
+            break;
+        }
+        assert!(Instant::now() < wait_deadline, "legacy zero did not acquire ConfigHold");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Attempt concurrent staged pose write while legacy zero holds the reservation -> REFUSED.
+    let raced_err = run_config_commit(&rig.sup, plan_raced, || Ok(()), move |cfg, act| {
+        cfg.poses.list = nl_raced;
+        cfg.poses.revision = act.revision;
+    })
+    .await
+    .expect_err("staged pose write must be refused while legacy zero holds ConfigHold");
+    assert!(
+        matches!(
+            &raced_err,
+            ArmError::Rejected { status: 409, code, .. }
+                if code == "CONFIG_BUSY" || code == "POLICY_REVISION_MISMATCH"
+        ) || matches!(&raced_err, ArmError::PolicyRevisionMismatch { .. }),
+        "expected 409 CONFIG_BUSY or POLICY_REVISION_MISMATCH, got {raced_err:?}"
+    );
+
+    // Legacy zero completes cleanly and releases the reservation.
+    let zero_out = zero_task.await.unwrap().expect("legacy software zero succeeds");
+    assert_eq!(zero_out["zero_method"], json!("software"));
+    assert!(
+        rig.sup.inner().read().await.core.config().held().is_none(),
+        "ConfigHold must be released once legacy zero finishes"
+    );
+
+    // A stale pre-zero pose write dispatched after zero finishes MUST also fail revision check.
+    let post_err = run_config_commit(&rig.sup, plan_post_zero, || Ok(()), move |cfg, act| {
+        cfg.poses.list = nl_post_zero;
+        cfg.poses.revision = act.revision;
+    })
+    .await
+    .expect_err("stale pre-zero pose write must not overwrite stale marks after zero");
+    assert!(
+        matches!(&post_err, ArmError::PolicyRevisionMismatch { .. })
+            || matches!(&post_err, ArmError::Rejected { status: 409, code, .. } if code == "POLICY_REVISION_MISMATCH"),
+        "expected POLICY_REVISION_MISMATCH after zero, got {post_err:?}"
+    );
+
+    // Simulate a daemon restart (`poses::load_into`, poses.rs:633): stale marks MUST survive!
+    let restarted = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    armd::poses::load_into(&restarted, &rig.poses_path).await;
+    let reloaded = restarted.inner().read().await.poses.list.poses.clone();
+    assert_eq!(
+        reloaded.len(),
+        2,
+        "only pre-zero poses should exist after refused raced save: {reloaded:?}"
+    );
+    for name in ["p_initial", "p_staged"] {
+        let p = reloaded
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("missing pose '{name}' after restart"));
+        assert!(
+            p.stale.is_some(),
+            "stale mark for pose '{name}' must survive restart (poses.json overwritten?): {p:?}"
+        );
+    }
+    rig.shutdown().await;
+}

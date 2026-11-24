@@ -187,7 +187,13 @@ pub fn check(inner: &SupervisorInner, body: &Value) -> Result<(MotorZeroRequest,
     if let Some(j) = req.joints.iter().find(|j| !tool.joints.contains(&(*j + 1))) {
         return Err(CalibError::new(400, "JOINT_UNSUPPORTED", format!("joint {} is not in calibration_tools.motor_zero.joints {:?}", j + 1, tool.joints)));
     }
-    if inner.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply, restore or motor zero is running")); }
+    if inner.calibration_busy || inner.core.config().held().is_some() {
+        return Err(CalibError::new(
+            409,
+            "CONFIG_BUSY",
+            "a calibration apply, restore, motor zero, or configuration change is running",
+        ));
+    }
     state_checks(inner)?;
     let q = readings(inner)?;
     let r = reference(inner);
@@ -228,10 +234,13 @@ fn fresh_since(fb: &Option<Feedback>, j: usize, since: Instant) -> bool {
     }
 }
 
-async fn locked_step<T>(sup: &ArmSupervisor, check: &LeaseCheck, step: &'static str,
+async fn locked_step<T>(sup: &ArmSupervisor, check: &LeaseCheck, grant: crate::rt_core::config_iface::GrantId, step: &'static str,
     f: impl FnOnce(&mut SupervisorInner) -> Result<T, CalibError>) -> Result<T, CalibError> {
     let mut inner = sup.inner().write().await;
     let at = |mut e: CalibError| { e.extra.insert("step".into(), json!(step)); e };
+    if !inner.core.config().held().is_some_and(|h| h.grant == Some(grant)) {
+        return Err(at(CalibError::new(409, "CONFIG_BUSY", "configuration reservation was lost during zero")));
+    }
     check(&mut inner).map_err(at)?;
     state_checks(&inner).map_err(at)?;
     f(&mut inner).map_err(at)
@@ -257,10 +266,21 @@ pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZer
             format!("{PATH} is not available while the RT executor owns the arm; use the legacy owner"),
         ));
     }
-    if req.method.as_deref() == Some("software") { return run_software(sup, deps, req, check).await; }
+    let zero_guard = crate::rt_core::requests::config::LegacyZeroReservationGuard::try_acquire(sup).await?;
+    let grant = zero_guard.grant();
+    let res = if req.method.as_deref() == Some("software") {
+        run_software(sup, deps, req, check, grant).await
+    } else {
+        run_motor(sup, deps, req, check, grant).await
+    };
+    zero_guard.release().await;
+    res
+}
+
+async fn run_motor(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck, grant: crate::rt_core::config_iface::GrantId) -> Result<Value, CalibError> {
     let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // 1. readings, then disable every motor (official sequence), torque stays off
-    let (before, r, t_disable) = locked_step(sup, check, "disable", |inner| {
+    let (before, r, t_disable) = locked_step(sup, check, grant, "disable", |inner| {
         let q = readings(inner)?;
         if let Some(d) = inner.driver.as_ref() {
             let mut drv = d.lock().map_err(|_| CalibError::new(500, "INTERNAL", "driver unavailable"))?;
@@ -297,7 +317,7 @@ pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZer
     for (k, &j) in req.joints.iter().enumerate() {
         if k > 0 { tokio::time::sleep(COMMAND_SPACING).await; }
         let rj = r[j];
-        let res = locked_step(sup, check, "set_zero", |inner| {
+        let res = locked_step(sup, check, grant, "set_zero", |inner| {
             inner.set_motor_zero(j).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", format!("J{}: {e}", j + 1)))?;
             let mut off = inner.joint_zero_offsets.clone();
             off[j] = -rj;
@@ -342,14 +362,14 @@ pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZer
 }
 
 /// Software zero: average the readings, back up calibration.json, install the offsets, verify.
-async fn run_software(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
+async fn run_software(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck, grant: crate::rt_core::config_iface::GrantId) -> Result<Value, CalibError> {
     let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // 1. capture: mean of fresh readings over SOFTWARE_CAPTURE; the arm must stay still
-    let (r, n) = locked_step(sup, check, "capture", |inner| { readings(inner)?; Ok((reference(inner), inner.config.dof)) }).await?;
+    let (r, n) = locked_step(sup, check, grant, "capture", |inner| { readings(inner)?; Ok((reference(inner), inner.config.dof)) }).await?;
     let t0 = Instant::now();
     let (mut sum, mut lo, mut hi, mut count) = (vec![0.0f64; n], vec![f32::INFINITY; n], vec![f32::NEG_INFINITY; n], 0u32);
     while t0.elapsed() < crate::joint_zero::SOFTWARE_CAPTURE || count == 0 {
-        let q = locked_step(sup, check, "capture", |inner| readings(inner)).await?;
+        let q = locked_step(sup, check, grant, "capture", |inner| readings(inner)).await?;
         for j in 0..n { sum[j] += f64::from(q[j]); lo[j] = lo[j].min(q[j]); hi[j] = hi[j].max(q[j]); }
         count += 1;
         tokio::time::sleep(POLL).await;
@@ -377,7 +397,7 @@ async fn run_software(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: Mot
     // validated and backed up: invalidate a qualification of the zeroed joints on disk before the install
     let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
     crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, "software").await?;
-    let t_apply = locked_step(sup, check, "apply", |inner| {
+    let t_apply = locked_step(sup, check, grant, "apply", |inner| {
         inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))?;
         Ok(Instant::now())
     }).await?;
@@ -427,7 +447,13 @@ pub fn check_restore(inner: &SupervisorInner, body: &Value) -> Result<String, Ca
         .ok_or_else(|| invalid("backup must be the name of a software zero backup (GET /api/v1/calibration backups)"))?.to_string();
     if body.as_object().is_some_and(|o| o.keys().any(|k| k != "backup")) { return Err(invalid("only the field backup is allowed")); }
     if inner.config.zero_reference.is_none() { return Err(CalibError::new(400, "UNSUPPORTED", "the joint zero needs a profile zero_reference")); }
-    if inner.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply, restore or zero is running")); }
+    if inner.calibration_busy || inner.core.config().held().is_some() {
+        return Err(CalibError::new(
+            409,
+            "CONFIG_BUSY",
+            "a calibration apply, restore, zero, or configuration change is running",
+        ));
+    }
     state_checks(inner)?;
     Ok(name)
 }
@@ -443,6 +469,14 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: Str
             format!("{RESTORE_PATH} is not available while the RT executor owns the arm; use the legacy owner"),
         ));
     }
+    let zero_guard = crate::rt_core::requests::config::LegacyZeroReservationGuard::try_acquire(sup).await?;
+    let grant = zero_guard.grant();
+    let res = restore_with_grant(sup, deps, name, check, grant).await;
+    zero_guard.release().await;
+    res
+}
+
+async fn restore_with_grant(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: String, check: &LeaseCheck, grant: crate::rt_core::config_iface::GrantId) -> Result<Value, CalibError> {
     let dir = deps.backup_dir.join(&name);
     let manifest: Value = std::fs::read_to_string(dir.join("manifest.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
         .ok_or_else(|| CalibError::new(404, "BACKUP_NOT_FOUND", format!("backup {name}: no manifest.json")))?;
@@ -454,7 +488,7 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: Str
         Ok(Some(t)) => serde_json::from_str::<crate::calibration::CalibrationFile>(&t).map_err(|e| invalid(format!("backup {name}: calibration.json: {e}")))?.joint_zero,
         Err(e) => return Err(CalibError::new(500, "PERSIST_FAILED", format!("backup {name}: {e}"))),
     };
-    let (old, new, r) = locked_step(sup, check, "restore", |inner| {
+    let (old, new, r) = locked_step(sup, check, grant, "restore", |inner| {
         let n = inner.config.dof;
         let new = target.as_ref().map_or_else(|| vec![0.0; n], |z| z.offsets());
         if let Some(z) = &target { z.validate(Some(n)).map_err(|e| invalid(format!("backup {name}: {e}")))?; }
@@ -463,7 +497,7 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: Str
     let changed: Vec<usize> = (0..old.len()).filter(|&j| old.get(j) != new.get(j)).map(|j| j + 1).collect();
     let backup = write_zero_backup(deps, "joint_zero_restore", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}; nothing was changed")))?;
     crate::calibration::invalidate_mit_before_zero(sup, deps, &changed, "restored").await?;
-    locked_step(sup, check, "apply", |inner| inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))).await?;
+    locked_step(sup, check, grant, "apply", |inner| inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))).await?;
     let joints: Vec<usize> = (0..new.len()).filter(|&j| old[j] != new[j]).collect();
     let changes: Vec<f32> = joints.iter().map(|&j| old[j] - new[j]).collect();
     let entry = Some(target.filter(|z| !z.is_zero()));
