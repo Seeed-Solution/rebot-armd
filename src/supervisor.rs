@@ -710,7 +710,7 @@ impl ThermalCooldown {
     }
 
     pub(crate) fn record_fresh_cool_samples(&mut self, samples: &[Instant]) {
-        let Some(oldest) = samples.iter().copied().min() else {
+        let (Some(oldest), Some(newest)) = (samples.iter().copied().min(), samples.iter().copied().max()) else {
             self.reset();
             return;
         };
@@ -728,7 +728,9 @@ impl ThermalCooldown {
                     });
                 let gapped = oldest_gapped || joint_gapped;
                 if gapped {
-                    self.first_sample_at = Some(oldest);
+                    // Continuity across all joints is only proven from the newest sample on: a joint
+                    // that resumed late must not credit dwell from an older joint's timestamp.
+                    self.first_sample_at = Some(newest);
                     self.last_oldest_sample_at = Some(oldest);
                 } else {
                     self.first_sample_at = Some(first);
@@ -769,6 +771,29 @@ impl ThermalCooldown {
 
     pub(crate) fn record_fresh_cool_at(&mut self, sample_at: Instant) {
         self.record_fresh_cool_samples(std::slice::from_ref(&sample_at));
+    }
+}
+
+#[cfg(test)]
+mod thermal_cooldown_tests {
+    use super::{ThermalCooldown, THERMAL_FEEDBACK_FRESHNESS_LIMIT};
+    use std::time::{Duration, Instant};
+
+    /// A joint that resumes after a stale gap restarts the dwell from the newest sample: dwell is
+    /// never credited from an older joint's timestamp (2026-11-24 review: J1 resumes at 300 ms,
+    /// J2's last sample was at 240 ms, both sample at 330 ms -> dwell 30 ms, not 90 ms).
+    #[test]
+    fn staggered_gap_restarts_dwell_from_newest_sample() {
+        let t0 = Instant::now();
+        let ms = |v: u64| t0 + Duration::from_millis(v);
+        let mut c = ThermalCooldown::default();
+        c.record_fresh_cool_samples(&[ms(0), ms(0)]);
+        c.record_fresh_cool_samples(&[ms(40), ms(240)]);
+        assert!(Duration::from_millis(300 - 40) > THERMAL_FEEDBACK_FRESHNESS_LIMIT);
+        c.record_fresh_cool_samples(&[ms(300), ms(240)]); // J1 gap 260 ms > 250 ms
+        assert_eq!(c.elapsed_ms(), 0);
+        c.record_fresh_cool_samples(&[ms(330), ms(330)]);
+        assert_eq!(c.elapsed_ms(), 30);
     }
 }
 
