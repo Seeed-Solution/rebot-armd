@@ -411,10 +411,47 @@ pub enum PosForceTxStatus {
     /// Active `PosForce` joint had provably fresh (`<= 100 ms`) feedback throughout the pass.
     Fresh,
     /// Active `PosForce` joint feedback was stale (`> 100 ms` or missing receive-queue bound);
-    /// no `0x307` frame was transmitted for `joint`, and a `0xCC` refresh was scheduled.
+    /// a `0x307` freeze frame (or documented boot fallback when no fresh sample has been decoded
+    /// since boot) was selected instead of any new target, and a `0xCC` refresh was scheduled.
     /// `fresh_gen` identifies the most recent provably fresh J7 feedback episode so a fresh RX
     /// sample arriving between two stale output passes always starts a new staleness episode.
     Stale { joint: usize, age: Option<Duration>, fresh_gen: u64 },
+}
+
+/// Boot fallback policy when an active `PosForce` J7 gripper has NEVER decoded a provably fresh
+/// (`<= 100 ms`, bounded, finite) feedback sample since boot (`pf_last_fresh_position == None`).
+///
+/// - [`Self::ZeroCurrent`] (default): emit `vel_raw = 0, i_des = 0` at the last commanded `0x307`
+///   position (or `0.0`).
+/// - [`Self::HoldLastCommandedCurrent`]: emit `vel_raw = 0` at the last commanded `0x307` position
+///   (or `0.0`) with the last commanded `0x307` current (capped to the configured current ceiling).
+///
+/// Switching policies is a single-line change to [`POS_FORCE_BOOT_FALLBACK`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PosForceBootFallback {
+    ZeroCurrent,
+    HoldLastCommandedCurrent,
+}
+
+/// Active boot fallback when no provably fresh J7 sample has been decoded since boot.
+/// Change this single constant to [`PosForceBootFallback::HoldLastCommandedCurrent`] to retain
+/// the last commanded current instead of `i_des = 0`.
+pub const POS_FORCE_BOOT_FALLBACK: PosForceBootFallback = PosForceBootFallback::ZeroCurrent;
+
+/// Resolves the `i_des` current-raw field for the J7 `0x307` boot fallback when no provably fresh
+/// J7 sample has been decoded since boot.
+#[inline]
+pub const fn pos_force_boot_fallback_current(
+    last_commanded_current_raw: Option<u16>,
+    configured_current_raw: u16,
+) -> u16 {
+    match POS_FORCE_BOOT_FALLBACK {
+        PosForceBootFallback::ZeroCurrent => 0,
+        PosForceBootFallback::HoldLastCommandedCurrent => match last_commanded_current_raw {
+            Some(c) if c < configured_current_raw => c,
+            _ => configured_current_raw,
+        },
+    }
 }
 
 pub trait ArmDriver: Send {
@@ -4424,20 +4461,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             )),
             None => {
                 let expected_id = u32::from(damiao::POS_FORCE_BASE_ID) + u32::from(motor_id);
-                let last_cmd_pos = self
+                let last_cmd = self
                     .last_target_frames
                     .get(i)
                     .and_then(|f| f.as_ref())
-                    .filter(|f| f.id == expected_id && f.dlc == 8)
+                    .filter(|f| f.id == expected_id && f.dlc == 8);
+                let last_cmd_pos = last_cmd
                     .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
                     .filter(|p| p.is_finite())
                     .unwrap_or(0.0);
+                let last_cmd_cur = last_cmd
+                    .map(|f| u16::from_le_bytes([f.data[6], f.data[7]]))
+                    .filter(|&c| c > 0);
+                let boot_cur = pos_force_boot_fallback_current(last_cmd_cur, pf.current_raw);
                 Some(damiao::build_pos_force_frame(
                     damiao::POS_FORCE_BASE_ID,
                     motor_id,
                     last_cmd_pos,
                     0,
-                    0,
+                    boot_cur,
                 ))
             }
         }
@@ -10848,6 +10890,10 @@ mod tx_chokepoint_tests {
         drv.joint_modes[0] = Some(DamiaoControlMode::PosForce);
         drv.pf_last_fresh_position = None;
         drv.is_enabled = true;
+
+        assert_eq!(POS_FORCE_BOOT_FALLBACK, PosForceBootFallback::ZeroCurrent);
+        assert_eq!(pos_force_boot_fallback_current(Some(320), 460), 0);
+        assert_eq!(pos_force_boot_fallback_current(None, 460), 0);
 
         // 1. No prior target ever commanded -> emits 0x307 with pos=0.0, vel_raw=0, i_des=0.
         let frame0 = drv
