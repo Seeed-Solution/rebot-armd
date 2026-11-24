@@ -109,7 +109,7 @@ body.ui-simple .only-expert, body.ui-expert .only-simple { display: none !import
 .seg.off button, .seg button:disabled { cursor: not-allowed; }
 .seg.off { opacity: .45; filter: saturate(0); }
 .seg.off button.on { background: transparent; box-shadow: none; }
-body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
+body.locked .pose-go { cursor: not-allowed; }
 
 /* ---------- buttons ---------- */
 .btn {
@@ -1053,7 +1053,6 @@ body.stopped .lock-note { color: var(--sc-status-danger-fg); background: var(--s
 .grip-key:active { transform: scale(.95); }
 .grip-key.pulse::after { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 2px solid var(--sc-color-primary); animation: ripple .8s ease-out; pointer-events: none; }
 @keyframes ripple { from { transform: scale(1); opacity: .9; } to { transform: scale(1.5); opacity: 0; } }
-body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .preset { opacity: .55; filter: saturate(.6); }
 .move-hint { font-size: 12px; color: var(--sc-color-text-tertiary); text-align: center; min-height: 18px; margin-top: -4px; }
 .move-hint.bad { color: var(--sc-status-warning-fg); }
 .move-hint:empty { display: none; }
@@ -1137,7 +1136,6 @@ body.mode-stick .jog-list, body.mode-cart .jog-list { display: none; }
 .jbtn.pressed { background: var(--sc-color-primary-dark); color: #fff; }
 .jbtn.pressed svg, .jbtn.pressed kbd { color: #fff; }
 .jbtn.at-limit { opacity: .4; }
-body.locked .jbtn { opacity: .5; }
 
 /* joysticks */
 .stick-zone { display: none; grid-template-columns: 1fr auto 1fr; align-items: center; justify-items: center; gap: 12px; }
@@ -1161,7 +1159,6 @@ body.mode-stick .stick-zone { display: grid; }
 .pad .dir.b { bottom: 5px; left: 50%; transform: translateX(-50%); }
 .pad .dir.l { left: 6px; top: 50%; transform: translateY(-50%); }
 .pad .dir.r { right: 6px; top: 50%; transform: translateY(-50%); }
-body.locked .pad { opacity: .5; }
 .stick-cap { font-size: 11px; color: var(--sc-color-text-secondary); text-align: center; line-height: 1.5; }
 .stick-cap .ttl { display: block; font-weight: 600; color: var(--sc-color-text); font-size: 12px; }
 .stick-cap b { color: var(--sc-color-primary-dark); }
@@ -1211,7 +1208,6 @@ input[type=range] { -webkit-appearance: none; appearance: none; height: 6px; bor
   background: linear-gradient(to right, var(--sc-color-primary) var(--v, 0%), #e5ecd9 var(--v, 0%)); }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 2px solid var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
 input[type=range]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: #fff; border: 2px solid var(--sc-color-primary-dark); }
-body.locked .cart-zone .jbtn, body.locked .grip-slider { opacity: .5; }
 
 /* ---------- expert side cards ---------- */
 .kv { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 0 16px 12px; }
@@ -1528,7 +1524,6 @@ body::before {
 .grip-key:active { transform: scale(.94); }
 .grip-key.pulse::after { border: 0; background: radial-gradient(closest-side, rgba(140, 192, 32, 0.45), transparent); animation: bloom .7s ease-out; }
 @keyframes bloom { from { transform: scale(.9); opacity: 1; } to { transform: scale(1.7); opacity: 0; } }
-body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .preset { opacity: .5; filter: saturate(.4); }
 
 /* expert surfaces follow the same glass */
 .jrow, .cart-read > div, .kv > div { background: rgba(255, 255, 255, 0.45); border: 1px solid rgba(255, 255, 255, 0.7); border-radius: 12px; }
@@ -1833,6 +1828,34 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   body.ui-simple .toast { padding: 7px 10px; font-size: 12px; line-height: 1.35; }
 }
 
+/* Single visual-state rule for all control inputs driven by pageHasControl() -> body.controls-unavailable */
+body.controls-unavailable .disc,
+body.controls-unavailable .pad,
+body.controls-unavailable .pose-btn,
+body.controls-unavailable .grip-key,
+body.controls-unavailable .preset,
+body.controls-unavailable .jbtn,
+body.controls-unavailable .cart-zone .jbtn,
+body.controls-unavailable .grip-slider,
+body.controls-unavailable #btn-home,
+body.controls-unavailable .gc-sw {
+  opacity: .5;
+  filter: saturate(.25);
+}
+body.controls-unavailable .pose-go { opacity: .45; filter: saturate(0); }
+body.controls-unavailable .disc .knob,
+body.controls-unavailable .pad .knob,
+body.ui-simple.controls-unavailable .disc .knob {
+  background: rgba(148, 163, 184, 0.55);
+  border-color: rgba(255, 255, 255, 0.4);
+  box-shadow: inset 0 2px 4px rgba(255, 255, 255, 0.3), 0 4px 12px rgba(0, 0, 0, 0.16);
+}
+body.controls-unavailable .grip-slider input[type=range] {
+  background: linear-gradient(to right, rgba(148, 163, 184, 0.7) var(--v, 0%), #e2e8f0 var(--v, 0%));
+}
+body.controls-unavailable .grip-slider input[type=range]::-webkit-slider-thumb { border-color: #94a3b8; }
+body.controls-unavailable .grip-slider input[type=range]::-moz-range-thumb { border-color: #94a3b8; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
@@ -1855,7 +1878,7 @@ body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(s
 }
 </style>
 </head>
-<body class="ui-simple offline locked">
+<body class="ui-simple offline locked controls-unavailable">
 <!-- shared SVG defs (arrowheads for the part icons) -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
@@ -2769,7 +2792,7 @@ const I18N = {
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障',
     'mit.recovery.confirm': '电机指令超时已到期。清除故障会关闭所有关节的力矩，机械臂会像收纳断电一样下落。请先托住机械臂或让它处于支撑位，再在提示消失前点一次确认。',
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
-    'en.armed_readonly': '已使能（只读）', 'en.sub_readonly': '按住 0.6 秒：先确认控制权，再停靠卸力',
+    'en.armed_readonly': '力矩已开 · 未控制', 'en.sub_readonly': '按住 0.6 秒：先确认控制权，再停靠卸力',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
     'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
     'estop': '急停', 'estop.aria': '紧急停止',
@@ -3033,7 +3056,7 @@ const I18N = {
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault',
     'mit.recovery.confirm': 'A motor command timeout expired. Clearing turns torque off on every joint and the arm drops like a park torque-off. Support the arm or bring it to rest, then tap again while this warning is shown to confirm.',
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
-    'en.armed_readonly': 'Enabled (read-only)', 'en.sub_readonly': 'Hold 0.6 s: confirm control, then park & torque off',
+    'en.armed_readonly': 'Torque on · not in control', 'en.sub_readonly': 'Hold 0.6 s: confirm control, then park & torque off',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
     'en.park_off': 'Park and turn torque off', 'en.park_off.sub': 'Hold 0.6 s: move to the rest pose, then torque off', 'toast.reset_holding': 'Reset done; the motors still hold the arm. Hold Enable to resume, or hold "Park and turn torque off"',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
@@ -3983,8 +4006,16 @@ let motionIntentSeq = 0;
 const MOTION_START_PATHS = new Set(['/api/v1/motion/home', '/api/v1/motion/jog', '/api/v1/motion/servo', '/api/v1/motion/unload', '/api/v1/action/move_to', '/api/v1/action/move_to_pose', '/api/v1/action/move_relative', '/api/v1/action/run_sequence', '/api/v1/action/replay', '/api/v1/action/gripper', '/api/v1/action/gripper_zero_check', '/api/v1/action/gripper_calibrate', '/api/v1/action/measure_multiview', '/api/v1/action/calib_hover']);
 const isMotionStartingCommand = (path, body) => MOTION_START_PATHS.has(path) || (path === '/api/v1/action/grasp' && !(body && body.dry_run === true)) || (path === '/api/v1/torque' && !!(body && body.enable === true)) || (path === '/api/v1/mode/gravity_comp' && !(body && body.enable === false));
 function commandRPC(path, body, acquire = true, timeoutMs = 2000, opts = null) {
-  const snap = { ws: S.ws, epoch: S.epoch, controlEpoch: S.controlEpoch, leaseGen: S.leaseGeneration };
-  return commandRPCOnce(path, body, acquire, timeoutMs, opts).catch((e) => {
+  const snap = { ws: S.ws, epoch: S.epoch, controlEpoch: S.controlEpoch, leaseGen: S.leaseGeneration, faultKey: path === '/api/v1/safety/clear_fault' ? mitFaultKey() : null };
+  return commandRPCOnce(path, body, acquire, timeoutMs, opts).catch(async (e) => {
+    if (path === '/api/v1/safety/clear_fault' && e?.code === 'CLEAR_FAULT_REJECTED' && /heartbeat/i.test(e.message || '')) {
+      const retryGen = S.leaseGeneration;
+      if (S.ws !== snap.ws || retryGen == null || (snap.leaseGen != null && retryGen !== snap.leaseGen)) throw cancelledError();
+      sendHeartbeat(S.ws);
+      await new Promise((r) => setTimeout(r, 60));
+      if (S.ws !== snap.ws || S.epoch !== snap.epoch || S.controlEpoch !== snap.controlEpoch || S.leaseGeneration !== retryGen || (snap.faultKey != null && mitFaultKey() !== snap.faultKey)) throw cancelledError();
+      return commandRPCOnce(path, body, false, timeoutMs, opts);
+    }
     if (e.code !== 'OPERATOR_REQUIRED') throw e;
     const expectedGen = snap.leaseGen != null ? snap.leaseGen : S.leaseGeneration;
     const unlocked = opRequire(path, body);
@@ -4018,7 +4049,10 @@ function commandRPCOnce(path, body, acquire = true, timeoutMs = 2000, opts = nul
   } else if (acquire && S.leaseGeneration == null) {
     if (opts && opts.directLease) {
       const snap = { ws: S.ws, epoch: S.epoch, controlEpoch: S.controlEpoch, faultKey: path === '/api/v1/safety/clear_fault' ? mitFaultKey() : null };
-      return acquireLeaseDirect().then(() => {
+      return acquireLeaseDirect().then(async () => {
+        if (path === '/api/v1/safety/clear_fault' && S.faultCode === 'WATCHDOG_TIMEOUT') {
+          await new Promise((r) => setTimeout(r, 40));
+        }
         if (S.ws !== snap.ws || S.epoch !== snap.epoch || S.controlEpoch !== snap.controlEpoch || (snap.faultKey != null && mitFaultKey() !== snap.faultKey)) throw cancelledError();
         return commandRPCOnce(path, body, false, timeoutMs, opts);
       });
@@ -4101,6 +4135,15 @@ const isOperational = () => S.state === 'Armed' || S.state === 'Moving';
 // collision guard protective stop (observation.collision.active): enabled, but motion commands are held
 const colHold = () => !!(S.obs && S.obs.collision && S.obs.collision.active);
 const canMove = () => isOperational() && !colHold();
+const CONTROL_INPUT_SEL = '.disc, .pad, .preset, #btn-home, #btn-pose, #s-grip, #grip-range, .jbtn, .pose-go, #btn-gc';
+const pageHasControl = () => !!(isLive() && isOperational() && !colHold() && S.leaseGeneration != null);
+function syncControlInputsUi(active) {
+  document.body.classList.toggle('controls-unavailable', !active);
+  const state = active ? 'active' : 'unavailable';
+  for (const el of document.querySelectorAll(CONTROL_INPUT_SEL)) {
+    if (el.dataset.controlState !== state) el.dataset.controlState = state;
+  }
+}
 const isStopped = () => S.state === 'EStop' || S.state === 'Fault';
 const gripFrac = (rad) => clamp((rad - CFG.gripClosed) / (CFG.gripOpen - CFG.gripClosed), 0, 1);
 const gripRad = () => CFG.gripClosed + (S.grip ?? 0) * (CFG.gripOpen - CFG.gripClosed);
@@ -8510,6 +8553,7 @@ function renderJogRows() {
       zero: mid.querySelector('.zero'), mark: mid.querySelector('.mark'),
     };
   });
+  syncControlInputsUi(pageHasControl());
 }
 renderJogRows();
 
@@ -8523,6 +8567,7 @@ function renderGripCol() {
   const val = document.createElement('div');
   val.className = 'gval'; val.id = 'grip-val'; val.textContent = '--%';
   col.append(open, val, close);
+  syncControlInputsUi(pageHasControl());
 }
 renderGripCol();
 
@@ -10174,6 +10219,8 @@ function syncPoseMode() {
 }
 function togglePoseLock() {
   if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (leaseModalOrPending()) return;
+  if (S.leaseGeneration == null) { promptTakeControl(); return; }
   S.poseLocked = !S.poseLocked;
   buzz(8);
   syncPoseMode();
@@ -12414,6 +12461,7 @@ function posesRender(status) {
     ol.appendChild(li);
   }
   if (status !== undefined) setText($('pose-status'), status);
+  syncControlInputsUi(pageHasControl());
 }
 function poseNameCheck() {
   const v = $('pose-name').value.trim();
@@ -14369,9 +14417,10 @@ function frame(ts) {
   const v = commandVector();
   const en = live && isOperational() && leaseOther() == null;
   const op = en && !colHold();
+  const ctrl = pageHasControl();
   const torqued = !!(S.obs && S.obs.is_torqued);
-  const act = v.map((x) => op && x !== 0);
-  if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
+  const act = v.map((x) => ctrl && x !== 0);
+  if (S.mode === 'cart' && ctrl && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
   poseTick(ts);
   drawOverlay();
   graspCheckInput(v);
@@ -14383,6 +14432,7 @@ function frame(ts) {
   body.classList.toggle('offline', !live);
   body.classList.toggle('locked', !op);
   body.classList.toggle('stopped', live && isStopped());
+  syncControlInputsUi(ctrl);
   const cartHeld = Object.values(C.hold).some((h) => h[0] || h[1]);
   if (!op && (S.keys.size || cartHeld || S.hold.some((h) => h[0] || h[1]) || pads.some((p) => p.active()))) releaseAll();
   setText($('lock-txt'), lockReason());
@@ -14421,7 +14471,7 @@ function frame(ts) {
 
   const eb = $('btn-enable');
   const stopped = isStopped();
-  const armedReadonly = live && !stopped && en && S.leaseGeneration == null;
+  const armedReadonly = live && !stopped && isOperational() && S.leaseGeneration == null;
   eb.classList.toggle('on', en && S.leaseGeneration != null);
   eb.classList.toggle('clear', stopped);
   eb.setAttribute('aria-checked', String(en && S.leaseGeneration != null));
@@ -14433,7 +14483,7 @@ function frame(ts) {
   $('op-inline').hidden = !opClear;
   if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : 'op.inline_fault'));
   setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop_s') : t('en.clear_fault_s')) : armedReadonly ? t('en.armed_readonly') : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
-  setText($('enable-sub'), stopped ? t('en.sub_reset') : armedReadonly ? t('en.sub_readonly') : en ? t('en.sub_off') : t('en.hold'));
+  setText($('enable-sub'), stopped ? t('en.sub_reset') : armedReadonly ? (holder != null ? t('lease.other', { who: leaseHolderDetail(holder) }) : t('en.sub_readonly')) : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !fresh || !!leaseOp || holder != null;
   $('btn-stop').disabled = false;
   $('btn-preempt').hidden = !fresh || !!leaseOp || holder == null;
@@ -14473,8 +14523,8 @@ function frame(ts) {
     }
     r.row.classList.toggle('active', act[i]);
   });
-  for (const d of padDirs) d.classList.toggle('hot', op && Math.sign(v[Number(d.dataset.j)]) === Number(d.dataset.s));
-  if (S.mode === 'cart') renderCart(live, op);
+  for (const d of padDirs) d.classList.toggle('hot', ctrl && Math.sign(v[Number(d.dataset.j)]) === Number(d.dataset.s));
+  if (S.mode === 'cart') renderCart(live, op, ctrl);
 
   // video HUD
   const cam = $('cam-chip');
@@ -14558,10 +14608,10 @@ function frame(ts) {
     setText($('rec-frames'), '~' + Math.round(el / 1000 * 50));
     setText($('rec-chip'), t('rec.chip') + fmtTime(el));
   }
-  if (simple) renderSimple(live, op);
+  if (simple) renderSimple(live, op, ctrl);
 }
 
-function renderSimple(live, op) {
+function renderSimple(live, op, ctrl) {
   const has = live && S.obs.positions.length > GRIP;
   const f = has ? gripFrac(S.obs.positions[GRIP]) : null;
   const travelling = Date.now() - S.gripCmdAt < 1500 && S.grip != null;
@@ -14585,7 +14635,7 @@ function renderSimple(live, op) {
   if ($('s-grip-jog-bar')) $('s-grip-jog-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
 
   const rd = $('s-ready');
-  const readonlyOp = live && op && S.leaseGeneration == null;
+  const readonlyOp = live && op && !ctrl;
   setCls(rd, 'ready' + (op && !readonlyOp ? ' ok' : live && (isStopped() || colHold()) ? ' bad' : ''));
   setText($('s-ready-txt'), !live ? t('wait_arm') : readonlyOp ? t(S.leaseReleased ? 'ready.released' : 'ready.readonly') : op ? t('ready') : lockReason());
   if (S.preset && Date.now() > S.preset.until) { S.preset = null; S.presetRunning = false; }
@@ -14597,7 +14647,7 @@ function renderSimple(live, op) {
   hint.classList.toggle('lock', !(live && op && bad));
 }
 
-function renderCart(live, op) {
+function renderCart(live, op, ctrl) {
   // readouts from daemon obs.tcp for measured state; local targets apply active_tool.tcp_offset_m once
   const view = viewActive();
   const pos6 = S.obs && S.obs.positions;
@@ -14638,7 +14688,7 @@ function renderCart(live, op) {
   setText(badge, !live ? 'IK --' : bad ? t('ik.blocked') : C.sending ? t('ik.stream', { hz: CFG.cart.hz }) : t('ik.ready'));
   setCls(badge, 'sc-status-badge ' + (!live ? '' : bad ? 'is-warn' : C.sending ? 'is-info' : 'is-ok'));
   const msg = $('ik-msg');
-  setText(msg, !live ? t('wait_telemetry') : bad ? ikText(C.msg) : !op ? t('cart.enable_first') : t('cart.following', { branch: view ? 'DLS' : (C.branch ?? '-'), tx: CFG.cart.tx === 'ws' ? t('cart.tx_ws') : t('cart.tx_rest') }));
+  setText(msg, !live ? t('wait_telemetry') : bad ? ikText(C.msg) : !op ? t('cart.enable_first') : !ctrl ? t(S.leaseReleased ? 'ready.released' : 'ready.readonly') : t('cart.following', { branch: view ? 'DLS' : (C.branch ?? '-'), tx: CFG.cart.tx === 'ws' ? t('cart.tx_ws') : t('cart.tx_rest') }));
   msg.classList.toggle('bad', bad);
   setText($('ik-us'), C.solveUs == null ? '' : 'IK ' + (C.solveUs < 1 ? C.solveUs.toFixed(2) : C.solveUs.toFixed(1)) + t('ik.per_solve'));
   const gr = $('grip-range');
@@ -14649,7 +14699,7 @@ function renderCart(live, op) {
   gr.style.setProperty('--v', gr.value + '%');
   setText($('grip-pct'), live && S.obs.positions.length > GRIP ? Math.round(gripFrac(S.obs.positions[GRIP]) * 100) + '%' : '--%');
   const cv = cartVelocity();
-  for (const d of cartDirs) d.classList.toggle('hot', op && Math.sign(cv[d.dataset.ax]) === Number(d.dataset.s));
+  for (const d of cartDirs) d.classList.toggle('hot', ctrl && Math.sign(cv[d.dataset.ax]) === Number(d.dataset.s));
 }
 
 // Expose core detection & overlay symbols for testing and telemetry inspection
@@ -15961,6 +16011,7 @@ initDepth();
 initCalib();
 initCwiz();
 videoStart();
+syncControlInputsUi(pageHasControl());
 requestAnimationFrame(frame);
 
 /* i18n: re-render dynamic UI on language change */
