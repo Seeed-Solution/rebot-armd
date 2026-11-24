@@ -138,6 +138,14 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         pos.is_finite().then_some(pos)
     }
+    fn fresh_measured_sample_for(&self, joint: usize, max_age: Duration) -> Option<(f32, u64)> {
+        let (mut pos, epoch) = self.inner.fresh_measured_sample_for(joint, max_age)?;
+        let o = self.off(joint);
+        if o != 0.0 {
+            pos -= o;
+        }
+        pos.is_finite().then_some((pos, epoch))
+    }
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
         self.inner.joint_hold_mode_verified(joint)
     }
