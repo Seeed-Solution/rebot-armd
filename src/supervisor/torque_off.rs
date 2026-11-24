@@ -128,6 +128,12 @@ impl SupervisorInner {
             return Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback);
         }
 
+        // Hardware (`Some(d)`): freshness and numeric validity are judged strictly on J1..J6
+        // via `fresh_joint_positions_into`; any missing timestamp (`None`) or invalid arm-joint
+        // sample means "not at rest", while gripper freshness/validity and whole-arm
+        // `feedback_numeric_valid` are ignored.
+        // Driverless mock (`None`): keeps working for tests without hardware timestamps
+        // (`last_can_feedback_instant.is_none()` allowed), judging position finiteness on J1..J6.
         let positions_fresh = match self.driver.as_ref() {
             Some(d) => d.lock().is_ok_and(|drv| {
                 drv.fresh_joint_positions_into(

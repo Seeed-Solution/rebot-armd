@@ -611,11 +611,15 @@ impl ArmDriver for SimArmDriver {
         if !self.feedback_joints_within(joints, max_age) {
             return false;
         }
+        let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let Some(s) = self.cached.get(i) else {
                 return false;
             };
-            if !s.position.is_finite() {
+            if !crate::driver::joint_state_valid(s, caps) {
+                return false;
+            }
+            if caps.load_feedback && !self.cached_loads.get(i).is_some_and(|l| l.is_finite()) {
                 return false;
             }
             *slot = s.position;

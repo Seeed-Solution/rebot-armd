@@ -876,14 +876,25 @@ impl SupervisorInner {
         loads: Option<&[f32]>,
     ) -> bool {
         states.len() == dof
-            && states.iter().all(|s| {
-                s.position.is_finite()
-                    && (!caps.velocity_feedback || s.velocity.is_finite())
-                    && (!caps.torque_feedback || s.torque.is_finite())
-                    && (!caps.temperature_feedback || s.temperature.is_finite())
-            })
+            && states.iter().all(|s| crate::driver::joint_state_valid(s, caps))
             && (!caps.load_feedback
                 || loads.is_some_and(|l| l.len() == dof && l.iter().all(|x| x.is_finite())))
+    }
+
+    /// Per-joint subset numeric validity (e.g., J1..J6 arm joints excluding the gripper).
+    #[allow(dead_code)]
+    pub(crate) fn states_valid_joints(
+        states: &[crate::model::JointState],
+        caps: DriverCapabilities,
+        joints: &[usize],
+        loads: Option<&[f32]>,
+    ) -> bool {
+        !joints.is_empty()
+            && joints.iter().all(|&i| {
+                states.get(i).is_some_and(|s| crate::driver::joint_state_valid(s, caps))
+                    && (!caps.load_feedback
+                        || loads.and_then(|l| l.get(i)).is_some_and(|x| x.is_finite()))
+            })
     }
 
     pub fn hardware_feedback_fresh(&self, max_age: Duration) -> bool {

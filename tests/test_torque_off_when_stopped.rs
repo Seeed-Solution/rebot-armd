@@ -907,10 +907,18 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
         Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
     );
 
-    // 2. Driverless invalid / missing / stale synthetic feedback refuses.
+    // 2. Driverless invalid / missing / stale synthetic feedback refuses; invalid gripper ignored.
     let mut mock = SupervisorInner::new(ArmConfig::rebot_dm());
     mock.set_torque(true).unwrap();
     mock.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
+
+    mock.measured_positions[6] = f32::NAN;
+    assert_eq!(
+        mock.may_disable_torque_while_stopped(),
+        Ok(()),
+        "invalid gripper position must not block J1..J6 rest-pose admission in driverless mode"
+    );
+    mock.measured_positions[6] = 0.0;
 
     mock.feedback_numeric_valid = false;
     assert_eq!(mock.may_disable_torque_while_stopped(), Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback));
@@ -922,6 +930,107 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
 
     mock.last_can_feedback_instant = Some(Instant::now() - Duration::from_millis(200));
     assert_eq!(mock.may_disable_torque_while_stopped(), Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback));
+
+    // 3. Real driver with missing timestamps (before any feedback arrives) MUST refuse as not at rest,
+    // even though SupervisorInner::new initializes feedback_numeric_valid=true and measured_positions=rest.
+    let limits: Vec<DamiaoLimits> = ArmConfig::rebot_dm()
+        .damiao_ranges
+        .unwrap()
+        .iter()
+        .map(|r| r.limits())
+        .collect();
+    let bus_empty = FakeBus::new(&limits);
+    let drv_empty = DamiaoArmDriver::new(bus_empty, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    let mut inner_empty = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_empty));
+    inner_empty.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    assert!(inner_empty.feedback_numeric_valid);
+    assert_eq!(
+        inner_empty.may_disable_torque_while_stopped(),
+        Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+        "missing timestamps on a real driver must count as not at rest"
+    );
+
+    // 4. Real driver where gripper reports NaN (making whole-arm feedback_numeric_valid false)
+    // while J1..J6 are fresh and valid at rest MUST still pass; NaN on J2 MUST refuse.
+    struct GripperInvalidDriver {
+        states: Vec<armd::model::JointState>,
+        instants: Vec<Option<Instant>>,
+    }
+    impl ArmDriver for GripperInvalidDriver {
+        fn capabilities(&self) -> armd::driver::DriverCapabilities {
+            armd::driver::DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+            Ok(self.states.clone())
+        }
+        fn write_joint_targets(&mut self, _: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, _: bool) -> Result<(), armd::driver::ArmDriverError> {
+            Ok(())
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            self.instants.iter().map(|t| t.map(|i| i.elapsed())).collect()
+        }
+        fn fresh_joint_positions_into(&self, joints: &[usize], max_age: Duration, out: &mut [f32]) -> bool {
+            let caps = self.capabilities();
+            for (slot, &i) in out.iter_mut().zip(joints.iter()) {
+                let fresh = self.instants.get(i).copied().flatten().is_some_and(|t| t.elapsed() <= max_age);
+                let Some(s) = self.states.get(i) else { return false; };
+                if !fresh
+                    || !s.position.is_finite()
+                    || (caps.velocity_feedback && !s.velocity.is_finite())
+                    || (caps.torque_feedback && !s.torque.is_finite())
+                    || (caps.temperature_feedback && !s.temperature.is_finite())
+                {
+                    return false;
+                }
+                *slot = s.position;
+            }
+            true
+        }
+    }
+
+    let now = Instant::now();
+    let mut bad_grip_states = vec![armd::model::JointState::default(); 7];
+    bad_grip_states[6].position = f32::NAN;
+    bad_grip_states[6].velocity = f32::NAN;
+    let drv_bg = GripperInvalidDriver {
+        states: bad_grip_states,
+        instants: vec![Some(now); 7],
+    };
+    let mut inner_bg = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_bg));
+    inner_bg.tick(0.02);
+    assert!(!inner_bg.feedback_numeric_valid, "whole-arm validity is false when gripper has NaN");
+    inner_bg.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
+    assert_eq!(
+        inner_bg.may_disable_torque_while_stopped(),
+        Ok(()),
+        "invalid gripper feedback must not block J1..J6 rest-pose admission"
+    );
+
+    let mut bad_j2_states = vec![armd::model::JointState::default(); 7];
+    bad_j2_states[1].velocity = f32::NAN;
+    let drv_bj2 = GripperInvalidDriver {
+        states: bad_j2_states,
+        instants: vec![Some(now); 7],
+    };
+    let mut inner_bj2 = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_bj2));
+    inner_bj2.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
+    assert_eq!(
+        inner_bj2.may_disable_torque_while_stopped(),
+        Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+        "NaN velocity on arm joint J2 must refuse rest-pose admission"
+    );
 }
 
 #[test]

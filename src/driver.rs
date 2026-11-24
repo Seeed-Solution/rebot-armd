@@ -375,6 +375,15 @@ pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
 /// Time bound of one Damiao receive pass (with at most 64 frames).
 pub const DAMIAO_RX_PASS: Duration = Duration::from_millis(5);
 
+/// Per-joint numeric validity check for the driver's advertised feedback capabilities.
+#[inline]
+pub(crate) fn joint_state_valid(s: &JointState, caps: DriverCapabilities) -> bool {
+    s.position.is_finite()
+        && (!caps.velocity_feedback || s.velocity.is_finite())
+        && (!caps.torque_feedback || s.torque.is_finite())
+        && (!caps.temperature_feedback || s.temperature.is_finite())
+}
+
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
@@ -1784,6 +1793,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         if joints.is_empty() || out.len() < joints.len() {
             return false;
         }
+        let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
                 .last_feedback_instant
@@ -1797,7 +1807,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             let Some(s) = self.cached_states.get(i) else {
                 return false;
             };
-            if !s.position.is_finite() {
+            if !joint_state_valid(s, caps) {
+                return false;
+            }
+            if caps.load_feedback && !self.cached_loads.get(i).is_some_and(|l| l.is_finite()) {
                 return false;
             }
             *slot = s.position;
@@ -2582,6 +2595,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         if joints.is_empty() || out.len() < joints.len() {
             return false;
         }
+        let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
                 .last_feedback_instant
@@ -2595,7 +2609,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             let Some(s) = self.cached_states.get(i) else {
                 return false;
             };
-            if !s.position.is_finite() {
+            if !joint_state_valid(s, caps) {
                 return false;
             }
             *slot = s.position;
@@ -7768,6 +7782,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if joints.is_empty() || out.len() < joints.len() {
             return false;
         }
+        let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
                 .last_feedback_instant
@@ -7787,7 +7802,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let Some(s) = self.cached_states.get(i) else {
                 return false;
             };
-            if !s.position.is_finite() {
+            if !joint_state_valid(s, caps) {
                 return false;
             }
             *slot = s.position;
@@ -8332,6 +8347,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         if joints.is_empty() || out.len() < joints.len() {
             return false;
         }
+        let caps = self.capabilities();
         for (slot, &i) in out.iter_mut().zip(joints.iter()) {
             let fresh = self
                 .last_feedback_instant
@@ -8351,7 +8367,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             let Some(s) = self.cached_states.get(i) else {
                 return false;
             };
-            if !s.position.is_finite() {
+            if !joint_state_valid(s, caps) {
                 return false;
             }
             *slot = s.position;
