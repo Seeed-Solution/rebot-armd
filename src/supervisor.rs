@@ -1168,6 +1168,32 @@ impl SupervisorInner {
         }
     }
 
+    /// Driver-side Rule A′ gate injected into every attached hardware/sim driver so the
+    /// transmit choke point enforces the stopped rest-pose rule at send time.
+    pub fn stopped_disable_gate(&self) -> crate::driver::StoppedDisableGate {
+        let mut arm_joints = [0usize; crate::rt_core::mailbox::MAX_DOF];
+        let mut arm_joints_len = 0usize;
+        for &j in self.config.arm_joints().iter() {
+            if arm_joints_len < arm_joints.len() {
+                arm_joints[arm_joints_len] = j;
+                arm_joints_len += 1;
+            }
+        }
+        let mut rest_positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let rest = self.config.resting_positions();
+        for (i, &v) in rest.iter().enumerate().take(rest_positions.len()) {
+            rest_positions[i] = v;
+        }
+        crate::driver::StoppedDisableGate {
+            safety_stopped: self.safety.stopped_flag(),
+            has_resting_pose: self.config.resting_pose.is_some(),
+            arm_joints,
+            arm_joints_len,
+            rest_positions,
+            rest_pose_tolerance_rad: self.config.rest_pose_tolerance_rad,
+        }
+    }
+
     /// Attaches the executor's authorized-stop generation tracker and updates the bus
     /// driver's `EstopGate` so mid-batch writes also stop on authorized stop requests.
     pub fn attach_stop_requests(&mut self, stops: crate::rt_core::urgent::StopRequests) {
@@ -5102,6 +5128,7 @@ impl ArmSupervisor {
         driver.set_estop_gate(inner.estop_gate());
         driver.set_gripper_index(inner.config.gripper_index());
         let mut drv: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
+        drv.set_stopped_disable_gate(inner.stopped_disable_gate());
         let caps = drv.capabilities();
         if caps.load_feedback {
             inner.loads = vec![f32::NAN; inner.config.dof];
@@ -5137,7 +5164,8 @@ impl ArmSupervisor {
                 if driver.capabilities().load_feedback {
                     inner.loads = vec![f32::NAN; inner.config.dof];
                 }
-                let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
+                let mut driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
+                driver.set_stopped_disable_gate(inner.stopped_disable_gate());
                 inner.apply_driver_limits(driver.as_ref());
                 inner.driver = Some(std::sync::Mutex::new(driver));
             }

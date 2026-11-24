@@ -158,8 +158,10 @@ enum SendGate {
     Target,
     /// Enable command: inhibited whenever E-stop is latched or pending.
     Enable,
-    /// Disable command: never inhibited by E-stop.
-    Disable,
+    /// Requested disable command: subject to the stopped rest-pose rule and 1 s request lifetime.
+    DisableRequested { started_at: Instant },
+    /// Protective disable command (`Thermal`, `ProcessExit`, `EnableRollbackProven`): never refused.
+    DisableProtective { reason: crate::driver::DisableProtectiveReason },
 }
 
 pub struct SimArmDriver {
@@ -202,6 +204,8 @@ pub struct SimArmDriver {
     abort_flag: Option<Arc<AtomicBool>>,
     /// Pending-E-stop gate checked immediately before target and enable sends.
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    /// Supervisor-injected stopped-disable gate enforced at send time for `DisableRequested`.
+    stopped_disable_gate: Option<crate::driver::StoppedDisableGate>,
     /// Deterministic test hook invoked inside `send_ref` strictly after JSON serialization and
     /// immediately before the final E-stop send gate and socket transmit.
     before_send_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -279,6 +283,7 @@ impl SimArmDriver {
             torque_hs: None,
             abort_flag: None,
             estop_gate: None,
+            stopped_disable_gate: None,
             before_send_hook: None,
         })
     }
@@ -383,7 +388,7 @@ impl SimArmDriver {
         match gate {
             SendGate::Target => self.estop_check()?,
             SendGate::Enable => self.enable_estop_inhibited()?,
-            SendGate::Disable => {}
+            SendGate::DisableRequested { .. } | SendGate::DisableProtective { .. } => {}
         }
         self.seq = next_seq;
         if serialized {
@@ -812,14 +817,34 @@ impl ArmDriver for SimArmDriver {
     /// Blocking: [`ArmDriver::begin_torque`], then served every 1 ms until it finishes. An
     /// unacknowledged disable returns Ok (the caller checks the enable state).
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
-        let mut progress = self.begin_torque(enabled)?;
+        if enabled {
+            let mut progress = self.begin_torque(true)?;
+            loop {
+                match progress {
+                    TorqueProgress::Done(_) => return Ok(()),
+                    TorqueProgress::Pending { .. } => {}
+                }
+                progress = self.poll_torque(Instant::now())?;
+                if matches!(progress, TorqueProgress::Pending { .. }) { std::thread::sleep(Duration::from_millis(1)); }
+            }
+        } else {
+            self.disable_torque(crate::driver::DisableKind::DisableRequested {
+                started_at: Instant::now(),
+            })
+        }
+    }
+
+    fn disable_torque(&mut self, kind: crate::driver::DisableKind) -> Result<(), ArmDriverError> {
+        let mut progress = self.begin_disable_torque(kind)?;
         loop {
             match progress {
                 TorqueProgress::Done(_) => return Ok(()),
                 TorqueProgress::Pending { .. } => {}
             }
             progress = self.poll_torque(Instant::now())?;
-            if matches!(progress, TorqueProgress::Pending { .. }) { std::thread::sleep(Duration::from_millis(1)); }
+            if matches!(progress, TorqueProgress::Pending { .. }) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
@@ -827,19 +852,38 @@ impl ArmDriver for SimArmDriver {
     /// with `ack >= seq` and the requested `enabled`) is awaited until the deadline. A disable
     /// replaces a pending enable.
     fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
-        if enabled && self.torque_hs.is_some() {
-            return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
-        }
         if enabled {
+            if self.torque_hs.is_some() {
+                return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
+            }
             self.enable_estop_inhibited()?;
+            let seq = self.send_ref(false, Some(true), SendGate::Enable)?;
+            self.enable_requested = true;
+            self.enable_seq = seq;
+            let now = Instant::now();
+            self.torque_hs = Some((true, Deadline::after(now, ENABLE_CONFIRM_TIMEOUT)));
+            Ok(TorqueProgress::Pending { wake: now })
+        } else {
+            self.begin_disable_torque(crate::driver::DisableKind::DisableRequested {
+                started_at: Instant::now(),
+            })
         }
-        let gate = if enabled { SendGate::Enable } else { SendGate::Disable };
-        let seq = self.send_ref(false, Some(enabled), gate)?;
-        self.enable_requested = enabled;
+    }
+
+    fn begin_disable_torque(&mut self, kind: crate::driver::DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        let gate = match kind {
+            crate::driver::DisableKind::DisableRequested { started_at } => {
+                SendGate::DisableRequested { started_at }
+            }
+            crate::driver::DisableKind::DisableProtective { reason } => {
+                SendGate::DisableProtective { reason }
+            }
+        };
+        let seq = self.send_ref(false, Some(false), gate)?;
+        self.enable_requested = false;
         self.enable_seq = seq;
-        let timeout = if enabled { ENABLE_CONFIRM_TIMEOUT } else { DISABLE_CONFIRM_TIMEOUT };
         let now = Instant::now();
-        self.torque_hs = Some((enabled, Deadline::after(now, timeout)));
+        self.torque_hs = Some((false, Deadline::after(now, DISABLE_CONFIRM_TIMEOUT)));
         Ok(TorqueProgress::Pending { wake: now })
     }
 
@@ -923,6 +967,10 @@ impl ArmDriver for SimArmDriver {
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.abort_flag = Some(flag); }
 
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
+
+    fn set_stopped_disable_gate(&mut self, gate: crate::driver::StoppedDisableGate) {
+        self.stopped_disable_gate = Some(gate);
+    }
 
     fn supports_mit_mode_switch(&self) -> bool { true }
 

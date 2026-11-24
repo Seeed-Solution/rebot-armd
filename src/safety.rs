@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1264,6 +1265,9 @@ pub struct SafetyManager {
     /// Fixed-size preallocated record of the representative detail per latched [`FaultKind`]
     /// (`FaultKind::COUNT` slots, allocated once at startup; zero RT heap ops).
     latched_fault_details: Box<[Option<LatchedFaultDetail>]>,
+    /// Atomic stopped-state signal (`state.is_stopped() || has_latched_fault()`) shared with
+    /// hardware drivers so their transmit choke point enforces Rule A′ without locks.
+    stopped_flag: Arc<AtomicBool>,
 }
 
 impl Clone for SafetyManager {
@@ -1314,6 +1318,9 @@ impl Clone for SafetyManager {
             latched_fault_codes: self.latched_fault_codes,
             has_non_recoverable: self.has_non_recoverable,
             latched_fault_details: self.latched_fault_details.clone(),
+            stopped_flag: Arc::new(AtomicBool::new(
+                self.state_arc.is_stopped() || self.latched_fault_kinds != 0,
+            )),
         }
     }
 }
@@ -1372,6 +1379,7 @@ impl Default for SafetyManager {
             latched_fault_codes: 0,
             has_non_recoverable: false,
             latched_fault_details: vec![None; FaultKind::COUNT].into_boxed_slice(),
+            stopped_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1379,6 +1387,20 @@ impl Default for SafetyManager {
 impl SafetyManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Shared atomic flag that is `true` whenever safety state is stopped (`EStop` or `Fault`)
+    /// or any fault kind bit is latched. Updated lock-free on every latch and clear.
+    pub fn stopped_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stopped_flag)
+    }
+
+    #[inline]
+    fn sync_stopped_flag(&self) {
+        self.stopped_flag.store(
+            self.state_arc.is_stopped() || self.latched_fault_kinds != 0,
+            Ordering::SeqCst,
+        );
     }
 
     pub fn state(&self) -> &SafetyState {
@@ -1616,6 +1638,7 @@ impl SafetyManager {
     #[doc(hidden)]
     pub fn record_unknown_kind_bit_for_test(&mut self, bit: u8) {
         self.latched_fault_kinds |= bit;
+        self.sync_stopped_flag();
     }
 
     /// Empties every preallocated fault-slot pool for deterministic exhaustion tests.
@@ -1911,6 +1934,7 @@ impl SafetyManager {
         // 1. Always record kind, code, worst-of recoverability, and inline detail (0 heap ops).
         self.latched_fault_kinds |= kind.bit();
         self.latched_fault_codes |= code.bit();
+        self.sync_stopped_flag();
         if kind.always_non_recoverable() || !code.recoverable() {
             self.has_non_recoverable = true;
         }
@@ -2130,6 +2154,7 @@ impl SafetyManager {
             self.latched_fault_codes = 0;
             self.has_non_recoverable = false;
             self.latched_fault_details.fill(None);
+            self.sync_stopped_flag();
             self.epoch_id = self.epoch_id.wrapping_add(1);
             Ok(SafetyState::Idle)
         } else {

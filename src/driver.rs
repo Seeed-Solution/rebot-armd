@@ -227,6 +227,122 @@ pub enum ArmDriverError {
 
     #[error("TX pending queue capacity ({capacity}) exceeded (queued {queued}, new {new})")]
     TxQueueFull { queued: usize, new: usize, capacity: usize },
+
+    #[error("Torque stays on: arm is not proven at resting pose (TORQUE_OFF_WOULD_DROP)")]
+    TorqueOffWouldDrop,
+
+    #[error("Torque disable request expired after 1 s while stopped (TORQUE_OFF_WOULD_DROP)")]
+    DisableRequestExpired,
+}
+
+/// Maximum feedback age accepted at the transmit choke point for proving the arm is at
+/// the rest pose before transmitting `DisableRequested` while stopped.
+pub const STOPPED_DISABLE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
+
+/// Single bounded total lifetime of a `DisableRequested` request while stopped, checked
+/// at send time in the transmit choke point from the request's `started_at`.
+pub const STOPPED_DISABLE_REQUEST_LIFETIME: Duration = Duration::from_secs(1);
+
+/// Exhaustive reasons that authorize a protective torque disable bypassing the stopped
+/// rest-pose rule and 1 s request lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisableProtectiveReason {
+    /// Over-temperature protection (`StopPolicy::ThermalTrip`).
+    Thermal,
+    /// Actual process exit / panic / forced teardown disable.
+    ProcessExit,
+    /// Enable failure rollback ONLY for motors whose prior state was PROVEN torque-off.
+    EnableRollbackProven,
+}
+
+/// Intent of a hardware torque-disable operation, enforced at the driver transmit choke point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisableKind {
+    /// User, program, MIT recovery, Feetech reset, or unknown-prior-state disable: while
+    /// safety state is stopped, gated at send time by the rest-pose rule (and per-motor
+    /// `0x0`/`0xD` exception) plus the single 1 s request lifetime from `started_at`.
+    DisableRequested {
+        /// Request start time on the driver's clock (`ArmDriver::clock_now`).
+        started_at: Instant,
+    },
+    /// Protective disable exempt from the stopped rest-pose rule and 1 s request lifetime:
+    /// used ONLY by `Thermal`, `ProcessExit`, and `EnableRollbackProven`.
+    DisableProtective {
+        reason: DisableProtectiveReason,
+    },
+}
+
+/// Driver-side stopped-disable policy injected by the supervisor so every driver transmit
+/// choke point enforces Rule A′ at send time without locks or heap allocations.
+#[derive(Clone, Debug)]
+pub struct StoppedDisableGate {
+    /// Atomic safety-stopped signal (`SafetyState::is_stopped() || has_latched_fault()`).
+    pub safety_stopped: Arc<AtomicBool>,
+    /// Whether the active profile has a calibrated `resting_pose` configured.
+    pub has_resting_pose: bool,
+    /// Arm joint indices checked by Rule A′ (excluding the gripper), inline up to `MAX_DOF`.
+    pub arm_joints: [usize; crate::rt_core::mailbox::MAX_DOF],
+    pub arm_joints_len: usize,
+    /// Rest pose positions indexed by joint index (shifted into motor coordinates by
+    /// `ZeroOffsetDriver` for hardware drivers whose internal cache is in raw motor space).
+    pub rest_positions: [f32; crate::rt_core::mailbox::MAX_DOF],
+    /// Per-joint tolerance around `rest_positions` (rad).
+    pub rest_pose_tolerance_rad: f32,
+}
+
+impl StoppedDisableGate {
+    #[inline]
+    pub fn is_safety_stopped(&self) -> bool {
+        self.safety_stopped.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub fn arm_joint_indices(&self) -> &[usize] {
+        &self.arm_joints[..self.arm_joints_len]
+    }
+
+    /// Returns a copy with `rest_positions[i]` shifted into motor coordinates (`rest + offset`)
+    /// so inner drivers comparing raw cached motor positions match calibrated joint-space rest.
+    pub fn with_motor_offsets(&self, offsets: &[f32]) -> Self {
+        let mut out = self.clone();
+        for (i, slot) in out.rest_positions.iter_mut().enumerate() {
+            let o = offsets.get(i).copied().unwrap_or(0.0);
+            if o != 0.0 {
+                *slot += o;
+            }
+        }
+        out
+    }
+
+    /// Evaluates Rule A′ pose check against fresh arm-joint positions matching `arm_joint_indices()`.
+    #[inline]
+    pub fn check_positions(&self, positions: &[f32]) -> bool {
+        if !self.has_resting_pose
+            || !self.rest_pose_tolerance_rad.is_finite()
+            || self.rest_pose_tolerance_rad <= 0.0
+            || self.arm_joints_len == 0
+            || positions.len() < self.arm_joints_len
+        {
+            return false;
+        }
+        for (&joint_idx, &pos) in self
+            .arm_joints[..self.arm_joints_len]
+            .iter()
+            .zip(positions.iter())
+        {
+            if joint_idx >= self.rest_positions.len() {
+                return false;
+            }
+            let rest = self.rest_positions[joint_idx];
+            if !pos.is_finite()
+                || !rest.is_finite()
+                || (pos - rest).abs() > self.rest_pose_tolerance_rad
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl ArmDriverError {
@@ -539,8 +655,16 @@ pub trait ArmDriver: Send {
         self.write_joint_targets(targets).map(|()| TxBatchOutcome::Complete)
     }
 
-    /// Enable or disable torque / power across all joints
+    /// Enable or disable torque / power across all joints.
+    /// Calling `set_torque(false)` defaults to `DisableKind::DisableRequested` (fail-closed).
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError>;
+
+    /// Blocking hardware torque disable with an explicit [`DisableKind`] enforced at the
+    /// driver's transmit choke point.
+    fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
+        let _ = kind;
+        self.set_torque(false)
+    }
 
     /// Start a torque transition without waiting for its confirmation. `Pending { wake }`: serve
     /// it with [`ArmDriver::poll_torque`] no later than `wake` (absolute, driver clock) until it
@@ -550,10 +674,25 @@ pub trait ArmDriver: Send {
         self.set_torque(enabled).map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
     }
 
+    /// Non-blocking hardware torque disable with an explicit [`DisableKind`].
+    fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        self.disable_torque(kind)
+            .map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
+    }
+
     /// Budgeted [`Self::begin_torque`]: when `max_rx_frames == 0`, performs no bus RX drain
     /// before transmitting (relying on the release's Step-2 poll boundary).
     fn begin_torque_budgeted(&mut self, enabled: bool, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
         self.begin_torque(enabled)
+    }
+
+    /// Budgeted non-blocking hardware torque disable with an explicit [`DisableKind`].
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: DisableKind,
+        _max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable_torque(kind)
     }
 
     /// Serve the pending torque transition once: one receive pass ending by `deadline` (and the
@@ -679,6 +818,10 @@ pub trait ArmDriver: Send {
     /// [`ESTOP_INHIBITED`]). Default: the driver does not check (the tick checks before its
     /// output).
     fn set_estop_gate(&mut self, _gate: crate::rt_core::urgent::EstopGate) {}
+
+    /// Inject the supervisor's stopped-disable policy so the driver's transmit choke point
+    /// enforces Rule A′ at send time for `DisableRequested` frames while stopped.
+    fn set_stopped_disable_gate(&mut self, _gate: StoppedDisableGate) {}
 
     /// Set the gripper joint index if the arm model defines a gripper
     fn set_gripper_index(&mut self, _index: Option<usize>) {}
@@ -860,6 +1003,8 @@ pub struct FeetechArmDriver<T: Transport> {
     partial_enable_known: bool,
     joint_torque_enabled: Vec<Option<bool>>,
     abort_flag: Option<Arc<AtomicBool>>,
+    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    stopped_disable_gate: Option<StoppedDisableGate>,
     pub last_enable_poll: Option<Instant>,
     gripper_index: Option<usize>,
     pub hw_angle_limits: Vec<Option<(u16, u16)>>,
@@ -909,6 +1054,8 @@ impl<T: Transport> FeetechArmDriver<T> {
             partial_enable_known: false,
             joint_torque_enabled: vec![None; dof],
             abort_flag: None,
+            estop_gate: None,
+            stopped_disable_gate: None,
             last_enable_poll: None,
             gripper_index: None,
             hw_angle_limits: vec![None; dof],
@@ -1921,6 +2068,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.abort_flag = Some(flag);
     }
 
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) {
+        self.estop_gate = Some(gate);
+    }
+
+    fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
+        self.stopped_disable_gate = Some(gate);
+    }
+
     fn refresh_enable_state(&mut self) -> Result<EnableState, ArmDriverError> {
         self.assert_clock_matches_transport();
         if self.servo_ids.is_empty() {
@@ -2193,31 +2348,39 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 Err(ArmDriverError::HardwareFault(err_msg))
             }
         } else {
-            let mut write_err = None;
-            for &id in &ids {
-                let pkt = feetech::build_set_torque(id, false);
-                if let Err(e) = self.transport.write_all(&pkt) {
-                    write_err = Some(e.into());
-                }
-                let _ = self.transport.flush();
-                let _ = self.drain_tx_echo(&pkt);
-            }
+            let started_at = self.clock_now();
+            self.disable_torque(DisableKind::DisableRequested { started_at })
+        }
+    }
 
-            let (count_0, _, _) = self.read_torque_enable_states(&ids);
-
-            if count_0 == ids.len() {
-                self.confirmed_enable_state = EnableState::Disabled;
-                self.partial_enable_known = false;
-            } else {
-                self.confirmed_enable_state = EnableState::Unknown;
-                self.partial_enable_known = false;
+    fn disable_torque(&mut self, _kind: DisableKind) -> Result<(), ArmDriverError> {
+        self.assert_clock_matches_transport();
+        self.invalidate_partial_pos_rx();
+        let ids = self.servo_ids.clone();
+        let mut write_err = None;
+        for &id in &ids {
+            let pkt = feetech::build_set_torque(id, false);
+            if let Err(e) = self.transport.write_all(&pkt) {
+                write_err = Some(e.into());
             }
+            let _ = self.transport.flush();
+            let _ = self.drain_tx_echo(&pkt);
+        }
 
-            if let Some(e) = write_err {
-                Err(e)
-            } else {
-                Ok(())
-            }
+        let (count_0, _, _) = self.read_torque_enable_states(&ids);
+
+        if count_0 == ids.len() {
+            self.confirmed_enable_state = EnableState::Disabled;
+            self.partial_enable_known = false;
+        } else {
+            self.confirmed_enable_state = EnableState::Unknown;
+            self.partial_enable_known = false;
+        }
+
+        if let Some(e) = write_err {
+            Err(e)
+        } else {
+            Ok(())
         }
     }
 
@@ -2535,6 +2698,9 @@ pub struct FashionStarArmDriver<T: Transport> {
     feedback_seq: Vec<u64>,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
+    abort_flag: Option<Arc<AtomicBool>>,
+    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    stopped_disable_gate: Option<StoppedDisableGate>,
 }
 
 impl<T: Transport> FashionStarArmDriver<T> {
@@ -2549,6 +2715,9 @@ impl<T: Transport> FashionStarArmDriver<T> {
             feedback_seq: vec![0; dof],
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
+            abort_flag: None,
+            estop_gate: None,
+            stopped_disable_gate: None,
         }
     }
 
@@ -2651,22 +2820,23 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         Err(ArmDriverError::Protocol("UNSUPPORTED: serial driver does not support budgeted torque transitions".into()))
     }
 
+    fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.abort_flag = Some(flag);
+    }
+
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) {
+        self.estop_gate = Some(gate);
+    }
+
+    fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
+        self.stopped_disable_gate = Some(gate);
+    }
+
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         if !enabled {
-            let mut last_err = None;
-            for &id in &self.servo_ids {
-                let pkt = fashionstar::build_set_torque(id, false);
-                if let Err(e) = self.transport.write_all(&pkt) {
-                    last_err = Some(e.into());
-                }
-            }
-            if let Err(e) = self.transport.flush() {
-                last_err = Some(e.into());
-            }
-            if let Some(e) = last_err {
-                return Err(e);
-            }
-            Ok(())
+            self.disable_torque(DisableKind::DisableRequested {
+                started_at: Instant::now(),
+            })
         } else {
             for &id in &self.servo_ids {
                 let pkt = fashionstar::build_set_torque(id, true);
@@ -2675,6 +2845,23 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
             self.transport.flush()?;
             Ok(())
         }
+    }
+
+    fn disable_torque(&mut self, _kind: DisableKind) -> Result<(), ArmDriverError> {
+        let mut last_err = None;
+        for &id in &self.servo_ids {
+            let pkt = fashionstar::build_set_torque(id, false);
+            if let Err(e) = self.transport.write_all(&pkt) {
+                last_err = Some(e.into());
+            }
+        }
+        if let Err(e) = self.transport.flush() {
+            last_err = Some(e.into());
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -2867,6 +3054,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     /// Atomic E-stop latch (`ArmDriver::set_abort_flag`), checked before enable transmissions.
     abort_flag: Option<Arc<AtomicBool>>,
+    /// Supervisor-injected stopped-disable gate enforced at send time for `DisableRequested`.
+    stopped_disable_gate: Option<StoppedDisableGate>,
     /// Strict non-sleeping RT mode (`ArmDriver::set_rt_mode`), disables retry sleeps on WouldBlock.
     rt_no_sleep: bool,
     motor_ids: Vec<u16>,
@@ -3009,8 +3198,14 @@ struct StopStamp {
 /// Classification of every Damiao CAN transmit routed through [`DamiaoArmDriver::send`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TxKind {
-    /// Safety torque-off (`CMD_DISABLE`): never stop-gated and exempt from the motion TX budget.
-    Disable,
+    /// User/program/MIT/unknown-prior-state torque-off (`CMD_DISABLE`) for `joint`: exempt from
+    /// the motion TX budget; while safety state is stopped, subject to send-time Rule A′
+    /// rest-pose evaluation, per-motor `0x0`/`0xD` exception, and the 1 s request lifetime.
+    DisableRequested { joint: usize, started_at: Instant },
+    /// Protective torque-off (`CMD_DISABLE`): exempt from the motion TX budget and never
+    /// refused by the stopped rest-pose rule or 1 s lifetime. Used ONLY for `Thermal`,
+    /// `ProcessExit`, and `EnableRollbackProven`.
+    DisableProtective { reason: DisableProtectiveReason },
     /// Motion target frame (`POS_VEL`, `MIT`, or `POS_FORCE`).
     Target,
     /// Non-rollback mode-switch hold frame.
@@ -3043,6 +3238,10 @@ enum TxRefusal {
     Deferred,
     /// Step 3: stop or E-stop gate refused this `TxKind` (pending or latched).
     StopInhibited,
+    /// Step 3/5: `DisableRequested` while stopped refused by Rule A′ (not at rest / stale / no rest pose).
+    TorqueOffWouldDrop,
+    /// Step 3/5: `DisableRequested` while stopped exceeded its 1 s total request lifetime.
+    DisableRequestExpired,
     /// Step 4 (pre-build): active MIT deadline fence tripped.
     MitFenceTripped(MitFenceTripReason),
     /// Step 4: send-time `build` returned `None` (or latched rollback lacked fresh feedback).
@@ -3259,7 +3458,7 @@ enum DamiaoTorque {
     /// fresh state-1 feedback from every motor.
     Enable { window: ConfirmWindow, unsent_mask: u32 },
     /// Disable frames sent, awaiting fresh state-0 feedback from every motor.
-    Disable { window: ConfirmWindow, mit_fenced: bool, after_seq: u64 },
+    Disable { window: ConfirmWindow, mit_fenced: bool, after_seq: u64, kind: DisableKind },
 }
 
 /// Bounded 0xCC feedback refresh for the position-force gripper during enable: `boundary` is the
@@ -3388,6 +3587,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_last_cmd: vec![None; dof],
             estop_gate: None,
             abort_flag: None,
+            stopped_disable_gate: None,
             rt_no_sleep: false,
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
@@ -3568,11 +3768,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     #[inline]
+    fn is_disable_tx_kind(kind: TxKind) -> bool {
+        matches!(
+            kind,
+            TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. }
+        )
+    }
+
+    #[inline]
+    fn disable_tx_kind(kind: DisableKind, joint: usize) -> TxKind {
+        match kind {
+            DisableKind::DisableRequested { started_at } => {
+                TxKind::DisableRequested { joint, started_at }
+            }
+            DisableKind::DisableProtective { reason } => TxKind::DisableProtective { reason },
+        }
+    }
+
+    #[inline]
     fn stop_gate_for_kind(&self, kind: TxKind) -> Result<bool, TxRefusal> {
         let pending = self.is_stop_pending();
         let latched = self.is_stop_latched();
         match kind {
-            TxKind::Disable => {}
+            TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. } => {}
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => {
                 if pending {
                     return Err(TxRefusal::StopInhibited);
@@ -3619,8 +3837,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::DeadlinePassed);
         }
 
-        // 2. Tick TX budget check (Disable / panic-disable exempt from motion TX budget).
-        let budgeted = !matches!(kind, TxKind::Disable);
+        // 2. Tick TX budget check (DisableRequested / DisableProtective exempt from motion TX budget).
+        let budgeted = !Self::is_disable_tx_kind(kind);
         if budgeted {
             let _ = self.ensure_tx_pass();
             if !self.can_start_tick_tx() {
@@ -3654,7 +3872,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if matches!(kind, TxKind::RollbackHold(_)) && !latched_before && latched_after {
             return Err(TxRefusal::StopInhibited);
         }
-        if !matches!(kind, TxKind::Disable)
+        if !Self::is_disable_tx_kind(kind)
             && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
         {
             return Err(TxRefusal::StopStampChanged);
@@ -4228,6 +4446,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             TxRefusal::DeadlinePassed => ArmDriverError::Transport(TransportError::Timeout),
             TxRefusal::Deferred => ArmDriverError::Transport(TransportError::WouldBlock),
             TxRefusal::StopInhibited | TxRefusal::StopStampChanged => ArmDriverError::EstopInhibited,
+            TxRefusal::TorqueOffWouldDrop => ArmDriverError::TorqueOffWouldDrop,
+            TxRefusal::DisableRequestExpired => ArmDriverError::DisableRequestExpired,
             TxRefusal::MitFenceTripped(reason) => ArmDriverError::MitFenceTripped(reason),
             TxRefusal::BuildRefused => ArmDriverError::HardwareFault("frame build refused (stale or invalid state)".into()),
             TxRefusal::Transport(e) => e.into(),
@@ -4837,6 +5057,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.mark_tx_pass_backpressured();
                     self.discard_pending_tx_stopped();
                     return Err(e.into());
+                }
+                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                    self.discard_pending_tx_stopped();
+                    return Err(Self::refusal_to_driver_err(r));
                 }
             }
         }
@@ -6225,6 +6449,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.enable_failed();
                     return Err(ArmDriverError::MitFenceTripped(reason));
                 }
+                Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                    self.torque_hs = None;
+                    self.enable_failed();
+                    return Err(Self::refusal_to_driver_err(r));
+                }
             }
         }
         if sent_any {
@@ -6347,11 +6576,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Disable: frames to every motor at once (a pending enable is abandoned), then the
     /// confirmation window. Safety torque-off is exempt from the motion TX frame budget.
-    fn begin_disable(&mut self) -> Result<TorqueProgress, ArmDriverError> {
-        self.begin_disable_budgeted(None)
+    fn begin_disable(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable_budgeted(kind, None)
     }
 
-    fn begin_disable_budgeted(&mut self, max_rx_frames: Option<u16>) -> Result<TorqueProgress, ArmDriverError> {
+    fn begin_disable_budgeted(
+        &mut self,
+        kind: DisableKind,
+        max_rx_frames: Option<u16>,
+    ) -> Result<TorqueProgress, ArmDriverError> {
         self.refresh_capture = None;
         if let Some(hs) = self.torque_hs.take() {
             if matches!(hs, DamiaoTorque::DrainBeforeEnable(_)) {
@@ -6391,7 +6624,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.disable_confirmed_sticky = false;
         let mut last_err = None;
         for idx in 0..self.motor_ids.len() {
-            if let Err(r) = self.send(TxKind::Disable, None, None, false, |d| {
+            let tx_kind = Self::disable_tx_kind(kind, idx);
+            if let Err(r) = self.send(tx_kind, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[idx]))
             }) {
                 last_err = Some(Self::refusal_to_driver_err(r));
@@ -6417,11 +6651,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let poll_start = self.now();
         let window = ConfirmWindow::new(TorqueDirection::Disable, self.motor_ids.len(), cmd_start, poll_start,
             DAMIAO_DISABLE_CONFIRM, &DAMIAO_ENABLE_RETRY_AT);
-        self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq });
+        self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
         Ok(TorqueProgress::Pending { wake: poll_start })
     }
 
-    fn poll_disable(&mut self, mut window: ConfirmWindow, mit_fenced: bool, after_seq: u64) -> Result<TorqueProgress, ArmDriverError> {
+    fn poll_disable(
+        &mut self,
+        mut window: ConfirmWindow,
+        mit_fenced: bool,
+        after_seq: u64,
+        kind: DisableKind,
+    ) -> Result<TorqueProgress, ArmDriverError> {
         if window.expire(self.now()).is_some() {
             if mit_fenced {
                 // unconfirmed: the motors may still be energized in MIT; keep the fence (no recovery,
@@ -6443,12 +6683,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
             }
             // Bounded driver-level handshake retry within `DAMIAO_DISABLE_CONFIRM` (150 ms),
-            // itself bounded by the supervisor's 1 s `STOPPED_DISABLE_RETRY_BOUND`.
+            // carrying the original `DisableKind` into `send`.
             Service::Retry { mask, wake } => {
                 for i in handshake::mask_joints(mask) {
                     let Some(&id) = self.motor_ids.get(i) else { continue };
                     tracing::debug!("Retrying disable for motor {} (CAN ID 0x{:X})", i, id);
-                    if let Err(r) = self.send(TxKind::Disable, None, None, false, |_| {
+                    let tx_kind = Self::disable_tx_kind(kind, i);
+                    if let Err(r) = self.send(tx_kind, None, None, false, |_| {
                         Some(damiao::build_disable_frame(id))
                     }) {
                         tracing::warn!("Retry transmit disable frame failed for motor {}: {:?}", id, r);
@@ -6457,13 +6698,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if let Err(e) = self.can.flush() {
                     tracing::warn!("Retry flush failed: {:?}", e);
                 }
-                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq });
+                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
                 Ok(TorqueProgress::Pending { wake })
             }
             // a disable window never reports a fault (no fault index is passed)
             Service::Wait { .. } | Service::Fault { .. } => {
                 let wake = window.wake();
-                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq });
+                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind });
                 Ok(TorqueProgress::Pending { wake })
             }
         }
@@ -6538,8 +6779,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(DamiaoTorque::Readback(r)) => self.poll_readback(r),
             Some(DamiaoTorque::PreEnableRefresh(refresh)) => self.poll_pre_enable_refresh(refresh),
             Some(DamiaoTorque::Enable { window, unsent_mask }) => self.poll_enable(window, unsent_mask),
-            Some(DamiaoTorque::Disable { window, mit_fenced, after_seq }) => {
-                self.poll_disable(window, mit_fenced, after_seq)
+            Some(DamiaoTorque::Disable { window, mit_fenced, after_seq, kind }) => {
+                self.poll_disable(window, mit_fenced, after_seq, kind)
             }
         };
         self.rx_deadline = None;
@@ -7082,7 +7323,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     /// it finishes. An unconfirmed disable returns Ok (callers check the enable state) unless the
     /// MIT fence is armed.
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
-        let mut progress = self.begin_torque(enabled)?;
+        if enabled {
+            let mut progress = self.begin_torque(true)?;
+            let mut first = true;
+            loop {
+                if let TorqueProgress::Done(_) = progress { return Ok(()); }
+                if !first { self.pause(Duration::from_micros(500)); }
+                first = false;
+                let deadline = self.now() + DAMIAO_RX_PASS;
+                progress = self.poll_torque(deadline)?;
+            }
+        } else {
+            let started_at = self.now();
+            self.disable_torque(DisableKind::DisableRequested { started_at })
+        }
+    }
+
+    fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
+        let mut progress = self.begin_disable_torque(kind)?;
         let mut first = true;
         loop {
             if let TorqueProgress::Done(_) = progress { return Ok(()); }
@@ -7094,7 +7352,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
-        if enabled { self.begin_enable() } else { self.begin_disable() }
+        if enabled {
+            self.begin_enable()
+        } else {
+            let started_at = self.now();
+            self.begin_disable(DisableKind::DisableRequested { started_at })
+        }
+    }
+
+    fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_disable(kind)
     }
 
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
@@ -7106,8 +7373,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if enabled {
             self.begin_enable_budgeted(Some(max_rx_frames))
         } else {
-            self.begin_disable_budgeted(Some(max_rx_frames))
+            let started_at = self.now();
+            self.begin_disable_budgeted(DisableKind::DisableRequested { started_at }, Some(max_rx_frames))
         }
+    }
+
+    fn begin_disable_torque_budgeted(
+        &mut self,
+        kind: DisableKind,
+        max_rx_frames: u16,
+    ) -> Result<TorqueProgress, ArmDriverError> {
+        if !self.can.supports_nonblocking_rt() {
+            return Err(ArmDriverError::Protocol(
+                "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
+            ));
+        }
+        self.begin_disable_budgeted(kind, Some(max_rx_frames))
     }
 
     fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
@@ -7176,12 +7457,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
         // Send disable to every unconfirmed motor; a send error on one motor must NEVER stop
         // attempts on the remaining motors. Panic-disable keeps its own deadline loop and routes
-        // every frame through `send(TxKind::Disable, ..)`.
+        // every frame through `send(TxKind::DisableProtective { reason: ProcessExit }, ..)`.
         for i in unconfirmed_before {
             let Some(&id) = self.motor_ids.get(i) else { continue };
-            if let Err(r) = self.send(TxKind::Disable, None, None, false, |_| {
-                Some(damiao::build_disable_frame(id))
-            }) {
+            if let Err(r) = self.send(
+                TxKind::DisableProtective {
+                    reason: DisableProtectiveReason::ProcessExit,
+                },
+                None,
+                None,
+                false,
+                |_| Some(damiao::build_disable_frame(id)),
+            ) {
                 tracing::warn!(
                     "Panic disable TX failed for Damiao joint J{} (CAN ID 0x{:X}): {:?}",
                     i + 1,
@@ -7449,6 +7736,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         }
                         return Err(ArmDriverError::Transport(TransportError::Timeout));
                     }
+                    Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                        return Err(Self::refusal_to_driver_err(r));
+                    }
                 }
             }
         }
@@ -7651,6 +7941,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             let reason = MitFenceTripReason::TxBudgetDeadlineBeforeBatch;
                             self.trip_fence(reason);
                             return Err(ArmDriverError::MitFenceTripped(reason));
+                        }
+                        Err(r @ (TxRefusal::TorqueOffWouldDrop | TxRefusal::DisableRequestExpired)) => {
+                            return Err(Self::refusal_to_driver_err(r));
                         }
                     }
                 }
@@ -7866,6 +8159,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.abort_flag = Some(flag); }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
+    fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) { self.stopped_disable_gate = Some(gate); }
 }
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
@@ -8296,6 +8590,9 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     /// `rx_empty_instant` when each joint's last sample was decoded.
     feedback_queue_bound: Vec<Option<Instant>>,
     fault_flags: Vec<u8>,
+    abort_flag: Option<Arc<AtomicBool>>,
+    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    stopped_disable_gate: Option<StoppedDisableGate>,
 }
 
 impl<C: CanTransport> RobStrideArmDriver<C> {
@@ -8314,6 +8611,9 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             rx_empty_instant: None,
             feedback_queue_bound: vec![None; dof],
             fault_flags: vec![0; dof],
+            abort_flag: None,
+            estop_gate: None,
+            stopped_disable_gate: None,
         }
     }
 
@@ -8511,22 +8811,23 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         }
     }
 
+    fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.abort_flag = Some(flag);
+    }
+
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) {
+        self.estop_gate = Some(gate);
+    }
+
+    fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
+        self.stopped_disable_gate = Some(gate);
+    }
+
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         if !enabled {
-            let mut last_err = None;
-            for &id in &self.motor_ids {
-                let frame = robstride::build_stop_frame(id, self.master_id);
-                if let Err(e) = self.can.transmit(&frame) {
-                    last_err = Some(e.into());
-                }
-            }
-            if let Err(e) = self.can.flush() {
-                last_err = Some(e.into());
-            }
-            if let Some(e) = last_err {
-                return Err(e);
-            }
-            Ok(())
+            self.disable_torque(DisableKind::DisableRequested {
+                started_at: Instant::now(),
+            })
         } else {
             for &id in &self.motor_ids {
                 let frame = robstride::build_enable_frame(id, self.master_id);
@@ -8535,6 +8836,23 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             self.can.flush()?;
             Ok(())
         }
+    }
+
+    fn disable_torque(&mut self, _kind: DisableKind) -> Result<(), ArmDriverError> {
+        let mut last_err = None;
+        for &id in &self.motor_ids {
+            let frame = robstride::build_stop_frame(id, self.master_id);
+            if let Err(e) = self.can.transmit(&frame) {
+                last_err = Some(e.into());
+            }
+        }
+        if let Err(e) = self.can.flush() {
+            last_err = Some(e.into());
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -8703,17 +9021,22 @@ mod tx_chokepoint_tests {
         }
     }
 
-    const ALL_TX_KINDS: [TxKind; 9] = [
-        TxKind::Disable,
-        TxKind::Target,
-        TxKind::Hold,
-        TxKind::RollbackHold(0),
-        TxKind::ModeWrite,
-        TxKind::Refresh,
-        TxKind::Recovery,
-        TxKind::ClearFault,
-        TxKind::Handshake,
-    ];
+    fn all_tx_kinds(started_at: Instant) -> [TxKind; 12] {
+        [
+            TxKind::DisableRequested { joint: 0, started_at },
+            TxKind::DisableProtective { reason: DisableProtectiveReason::Thermal },
+            TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
+            TxKind::DisableProtective { reason: DisableProtectiveReason::EnableRollbackProven },
+            TxKind::Target,
+            TxKind::Hold,
+            TxKind::RollbackHold(0),
+            TxKind::ModeWrite,
+            TxKind::Refresh,
+            TxKind::Recovery,
+            TxKind::ClearFault,
+            TxKind::Handshake,
+        ]
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum StopCase {
@@ -8752,13 +9075,15 @@ mod tx_chokepoint_tests {
         if deadline == DeadlineCase::Passed {
             return Expected::RefusedDeadline;
         }
-        // Step 2: Tick TX budget runs before stop gate (Disable exempt).
-        if budget == BudgetCase::Exhausted && !matches!(kind, TxKind::Disable) {
+        // Step 2: Tick TX budget runs before stop gate (DisableRequested / DisableProtective exempt).
+        if budget == BudgetCase::Exhausted
+            && !matches!(kind, TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. })
+        {
             return Expected::Deferred;
         }
         // Step 3: Stop gate by TxKind.
         match kind {
-            TxKind::Disable => Expected::Sent,
+            TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. } => Expected::Sent,
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => match stop {
                 StopCase::Pending => Expected::RefusedStop,
                 StopCase::NoStop | StopCase::Latched => Expected::Sent,
@@ -8779,11 +9104,19 @@ mod tx_chokepoint_tests {
         let limits = DamiaoLimits::default();
         let mut cells_checked = 0usize;
 
-        for &kind in &ALL_TX_KINDS {
+        let dummy_start = Instant::now();
+        let kinds = all_tx_kinds(dummy_start);
+        for &kind in &kinds {
             for &stop in &[StopCase::NoStop, StopCase::Pending, StopCase::Latched] {
                 for &budget in &[BudgetCase::Available, BudgetCase::Exhausted] {
                     for &deadline_case in &[DeadlineCase::Ok, DeadlineCase::Passed] {
                         let (bus, clock) = TestBus::new();
+                        let kind = match kind {
+                            TxKind::DisableRequested { joint, .. } => {
+                                TxKind::DisableRequested { joint, started_at: clock.now() }
+                            }
+                            other => other,
+                        };
                         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1])
                             .with_limits(limits);
 
@@ -8872,7 +9205,7 @@ mod tx_chokepoint_tests {
                 }
             }
         }
-        assert_eq!(cells_checked, ALL_TX_KINDS.len() * 3 * 2 * 2);
+        assert_eq!(cells_checked, kinds.len() * 3 * 2 * 2);
     }
 
     #[test]
@@ -8935,8 +9268,14 @@ mod tx_chokepoint_tests {
 
         // 3. Step 5 stop-generation stamp check: applied stop between admission and send
         //    refuses every non-Disable kind with StopStampChanged (0 TX), while Disable sends.
-        for &kind in &ALL_TX_KINDS {
-            let (bus, _clock) = TestBus::new();
+        for &kind in &all_tx_kinds(Instant::now()) {
+            let (bus, clock) = TestBus::new();
+            let kind = match kind {
+                TxKind::DisableRequested { joint, .. } => {
+                    TxKind::DisableRequested { joint, started_at: clock.now() }
+                }
+                other => other,
+            };
             let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
             let stops = StopRequests::new();
             drv.set_estop_gate(
@@ -8950,7 +9289,7 @@ mod tx_chokepoint_tests {
             let res = drv.send(kind, Some(old_stamp), None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             });
-            if matches!(kind, TxKind::Disable) {
+            if matches!(kind, TxKind::DisableRequested { .. } | TxKind::DisableProtective { .. }) {
                 assert!(res.is_ok(), "Disable must ignore stop stamp: {res:?}");
                 assert_eq!(bus.tx_len(), 1);
             } else {
@@ -9076,7 +9415,7 @@ mod tx_chokepoint_tests {
             assert_eq!(bus.tx_len(), 0);
         }
 
-        // C. Safety `Disable` still transmits even if both latch and pending flip during `build`.
+        // C. Protective `DisableProtective` still transmits even if both latch and pending flip during `build`.
         let (bus, _clock) = TestBus::new();
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
         let req = Arc::new(AtomicU64::new(0));
@@ -9084,12 +9423,18 @@ mod tx_chokepoint_tests {
         let latched = Arc::new(AtomicBool::new(false));
         drv.set_estop_gate(EstopGate::new(req.clone(), app));
         drv.set_abort_flag(latched.clone());
-        let res = drv.send(TxKind::Disable, None, None, false, |d| {
-            latched.store(true, Ordering::SeqCst);
-            req.fetch_add(1, Ordering::SeqCst);
-            Some(damiao::build_disable_frame(d.motor_ids[0]))
-        });
-        assert!(res.is_ok(), "Disable must remain ungated across build-time stop flip: {res:?}");
+        let res = drv.send(
+            TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
+            None,
+            None,
+            false,
+            |d| {
+                latched.store(true, Ordering::SeqCst);
+                req.fetch_add(1, Ordering::SeqCst);
+                Some(damiao::build_disable_frame(d.motor_ids[0]))
+            },
+        );
+        assert!(res.is_ok(), "DisableProtective must remain ungated across build-time stop flip: {res:?}");
         assert_eq!(bus.tx_len(), 1);
     }
 }

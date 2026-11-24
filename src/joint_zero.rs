@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::driver::{ArmDriver, ArmDriverError, JointMode, JointTarget};
+use crate::driver::{ArmDriver, ArmDriverError, DisableKind, JointMode, JointTarget, StoppedDisableGate};
 use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointState, MotorZeroSupport};
 
 /// Averaging window of the software zero.
@@ -94,11 +94,18 @@ pub struct ZeroOffsetDriver {
     offsets: Vec<f32>,
     /// Motor-side targets of the last write (reused: no allocation per write).
     motor_targets: Vec<JointTarget>,
+    /// Joint-space stopped-disable gate kept so offset updates re-shift `inner`'s motor-space rest pose.
+    stopped_disable_gate: Option<StoppedDisableGate>,
 }
 
 impl ZeroOffsetDriver {
     pub fn new(inner: Box<dyn ArmDriver>, offsets: &[f32]) -> Self {
-        Self { inner, offsets: offsets.to_vec(), motor_targets: Vec::with_capacity(offsets.len().max(8)) }
+        Self {
+            inner,
+            offsets: offsets.to_vec(),
+            motor_targets: Vec::with_capacity(offsets.len().max(8)),
+            stopped_disable_gate: None,
+        }
     }
 
     fn off(&self, i: usize) -> f32 { self.offsets.get(i).copied().unwrap_or(0.0) }
@@ -217,9 +224,16 @@ impl ArmDriver for ZeroOffsetDriver {
     fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool { self.inner.clear_fault_disables_arm_joint(arm_dof) }
     fn has_hardware_fault(&self) -> bool { self.inner.has_hardware_fault() }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> { self.inner.disable_torque(kind) }
     fn begin_torque(&mut self, enabled: bool) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.begin_torque(enabled) }
+    fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_disable_torque(kind)
+    }
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
         self.inner.begin_torque_budgeted(enabled, max_rx_frames)
+    }
+    fn begin_disable_torque_budgeted(&mut self, kind: DisableKind, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_disable_torque_budgeted(kind, max_rx_frames)
     }
     fn poll_torque(&mut self, deadline: Instant) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.poll_torque(deadline) }
     fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
@@ -246,6 +260,11 @@ impl ArmDriver for ZeroOffsetDriver {
     fn refresh_enable_state(&mut self) -> Result<EnableState, ArmDriverError> { self.inner.refresh_enable_state() }
     fn set_abort_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.inner.set_abort_flag(flag) }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.inner.set_estop_gate(gate) }
+    fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
+        let motor_gate = gate.with_motor_offsets(&self.offsets);
+        self.stopped_disable_gate = Some(gate);
+        self.inner.set_stopped_disable_gate(motor_gate);
+    }
     fn set_gripper_index(&mut self, index: Option<usize>) { self.inner.set_gripper_index(index) }
     fn is_enabled(&self) -> bool { self.inner.is_enabled() }
     fn motor_status(&self) -> Option<Vec<u8>> { self.inner.motor_status() }
@@ -264,7 +283,12 @@ impl ArmDriver for ZeroOffsetDriver {
     fn range_check(&self) -> Option<DriverRangeCheck> { self.inner.range_check() }
     fn motor_zero_support(&self) -> MotorZeroSupport { self.inner.motor_zero_support() }
     fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.set_zero_position(joint) }
-    fn set_joint_zero_offsets(&mut self, offsets: &[f32]) { self.offsets = offsets.to_vec(); }
+    fn set_joint_zero_offsets(&mut self, offsets: &[f32]) {
+        self.offsets = offsets.to_vec();
+        if let Some(ref gate) = self.stopped_disable_gate {
+            self.inner.set_stopped_disable_gate(gate.with_motor_offsets(&self.offsets));
+        }
+    }
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { Some(self.offsets.clone()) }
     fn take_recovery_writes(&mut self) -> Vec<usize> { self.inner.take_recovery_writes() }
     fn set_strict_mode_handover(&mut self, strict: bool) { self.inner.set_strict_mode_handover(strict) }
