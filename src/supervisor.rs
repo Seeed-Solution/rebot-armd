@@ -6451,7 +6451,15 @@ impl ArmSupervisor {
                 if rem.is_zero() {
                     return PanicDisableOutcome::TimedOut;
                 }
-                guard.attempt_panic_disable(rem)
+                // Reserve a small handoff margin before the outer `rx.recv_timeout(timeout)`
+                // expires so `Unconfirmed` from a bounded driver loop is delivered reliably
+                // under scheduler load instead of racing to `TimedOut`.
+                let inner_budget = if rem > Duration::from_millis(12) {
+                    rem - Duration::from_millis(6)
+                } else {
+                    rem
+                };
+                guard.attempt_panic_disable(inner_budget)
             }))
             .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during legacy panic-disable".into()))
         };
