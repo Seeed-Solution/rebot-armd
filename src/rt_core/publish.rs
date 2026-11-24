@@ -88,6 +88,8 @@ fn copy_into<T: Copy>(dst: &mut Vec<T>, src: &[T]) {
 struct Slot {
     meta: Option<SampleMeta>,
     obs: Option<ArmObservation>,
+    /// Preallocated fault-message buffer reused across `Idle <-> Fault` transitions (0 alloc on RT).
+    fault_msg_spare: String,
     rt: RtSample,
 }
 
@@ -195,6 +197,19 @@ impl StatePublisher {
     /// `ArmCore::take_observation_buffer`).
     pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
 
+    /// Moves the preallocated fault-message spare out of the back slot (0 alloc).
+    pub fn take_back_fault_spare(&mut self) -> String {
+        std::mem::take(&mut self.producer.back_mut().fault_msg_spare)
+    }
+
+    /// Returns the fault-message spare to the back slot before publishing (0 alloc, 0 drop).
+    pub fn restore_back_fault_spare(&mut self, spare: String) {
+        let slot = self.producer.back_mut();
+        if spare.capacity() >= slot.fault_msg_spare.capacity() {
+            slot.fault_msg_spare = spare;
+        }
+    }
+
     /// Puts `obs` into the back slot when it is empty (else back to the retire ring; never
     /// freed here when that ring has room). `ArmCore::publish`'s fallback for a displaced
     /// observation, which its encapsulation makes unreachable.
@@ -236,7 +251,12 @@ pub struct StateHub {
 
 /// A publisher for an arm with `dof` joints and its hub.
 pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
-    let slot = || Slot { meta: None, obs: None, rt: RtSample::with_dof(dof) };
+    let slot = || Slot {
+        meta: None,
+        obs: None,
+        fault_msg_spare: String::with_capacity(256),
+        rt: RtSample::with_dof(dof),
+    };
     let (producer, consumer) = triple_buffer(slot(), slot(), slot());
     let hub = Arc::new(StateHub {
         state: Mutex::new(HubState { consumer, latest: None }),

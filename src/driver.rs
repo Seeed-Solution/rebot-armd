@@ -443,6 +443,18 @@ pub trait ArmDriver: Send {
         self.write_joint_targets(targets).map(|()| TxBatchOutcome::Complete)
     }
 
+    /// Discard any carried-over pending TX frames (no-op for drivers without a TX queue).
+    fn discard_pending_tx(&mut self) {}
+
+    /// Configured inclusive maximum age for carried-over TX frames (default 45 ms).
+    fn tx_frame_max_age(&self) -> Duration { DAMIAO_TX_FRAME_MAX_AGE }
+
+    /// Observed age of the oldest frame dropped as expired during the most recent bounded write.
+    fn last_tx_expired_age(&self) -> Option<Duration> { None }
+
+    /// Observed age of the oldest frame currently queued in the pending TX queue.
+    fn oldest_pending_tx_age(&self) -> Option<Duration> { None }
+
     /// Enable or disable torque / power across all joints
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError>;
 
@@ -2789,6 +2801,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     tx_budget: TxBudget,
     /// Inline fixed-capacity queue of unsent motion frames carried to the next tick (zero alloc).
     pending_tx: PendingTxQueue,
+    /// Observed age of the oldest frame expired in the most recent bounded TX pass.
+    last_expired_oldest_age: Option<Duration>,
     /// Shared TX pass state across `receive_feedback()`, J7 handshakes, and `write_joint_targets*()` in one tick.
     tick_tx: Option<TickTxPass>,
     /// Round-robin start index for budget-constrained 0xCC refresh sweeps.
@@ -2949,13 +2963,17 @@ impl PendingTxQueue {
     }
 
     /// Drop entries with `now - queued_at >= max_age` (inclusive), compacting in place.
-    fn drop_stale(&mut self, now: Instant, max_age: Duration) -> usize {
+    /// Returns `(dropped_count, oldest_expired_age)`.
+    fn drop_stale(&mut self, now: Instant, max_age: Duration) -> (usize, Option<Duration>) {
         let mut write = 0usize;
         let mut dropped = 0usize;
+        let mut oldest: Option<Duration> = None;
         for read in 0..self.len {
             if let Some(entry) = self.buf[read] {
-                if now.saturating_duration_since(entry.queued_at) >= max_age {
+                let age = now.saturating_duration_since(entry.queued_at);
+                if age >= max_age {
                     dropped += 1;
+                    oldest = Some(oldest.map_or(age, |o| o.max(age)));
                 } else {
                     self.buf[write] = Some(entry);
                     write += 1;
@@ -2966,7 +2984,16 @@ impl PendingTxQueue {
             *slot = None;
         }
         self.len = write;
-        dropped
+        (dropped, oldest)
+    }
+
+    /// Maximum age among currently queued entries, or `None` when empty.
+    fn oldest_age(&self, now: Instant) -> Option<Duration> {
+        self.buf[..self.len]
+            .iter()
+            .flatten()
+            .map(|e| now.saturating_duration_since(e.queued_at))
+            .max()
     }
 
     /// Drop entries whose stop generation stamp no longer matches `current`, compacting in place.
@@ -3006,9 +3033,10 @@ impl PendingTxQueue {
             .map(|e| e.joint)
     }
 
-    /// Replace an existing `(joint, frame_id)` slot in place (preserving FIFO position,
-    /// dating the replacement from `queued_at` and marking it as a fresh command instance),
-    /// or push to the back if capacity permits.
+    /// Replace an existing `(joint, frame_id)` slot in place (preserving FIFO position and, when
+    /// the slot carries the same `stop_stamp`, preserving its original `queued_at` so coalescing
+    /// cannot renew the 45 ms expiry deadline indefinitely; marking it as a fresh command instance
+    /// for deferral metrics), or push to the back if capacity permits.
     fn upsert(
         &mut self,
         joint: usize,
@@ -3017,22 +3045,31 @@ impl PendingTxQueue {
         queued_at: Instant,
         stop_stamp: StopStamp,
     ) -> bool {
-        let entry = PendingTxFrame {
+        if let Some(idx) = self.find_key(joint, frame_id) {
+            let preserved_queued_at = self.buf[idx]
+                .filter(|prev| prev.stop_stamp == stop_stamp)
+                .map_or(queued_at, |prev| prev.queued_at);
+            self.buf[idx] = Some(PendingTxFrame {
+                joint,
+                frame_id,
+                cmd,
+                queued_at: preserved_queued_at,
+                stop_stamp,
+                was_deferred: false,
+            });
+            return true;
+        }
+        if self.len >= DAMIAO_PENDING_TX_CAPACITY {
+            return false;
+        }
+        self.buf[self.len] = Some(PendingTxFrame {
             joint,
             frame_id,
             cmd,
             queued_at,
             stop_stamp,
             was_deferred: false,
-        };
-        if let Some(idx) = self.find_key(joint, frame_id) {
-            self.buf[idx] = Some(entry);
-            return true;
-        }
-        if self.len >= DAMIAO_PENDING_TX_CAPACITY {
-            return false;
-        }
-        self.buf[self.len] = Some(entry);
+        });
         self.len += 1;
         true
     }
@@ -3219,6 +3256,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             refresh_capture: None,
             tx_budget: TxBudget::default(),
             pending_tx: PendingTxQueue::new(),
+            last_expired_oldest_age: None,
             tick_tx: None,
             refresh_cursor: 0,
             refresh_unfinished: 0,
@@ -3460,10 +3498,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::BuildRefused);
         };
 
-        // 5. Re-read physical stop latch, pending gate, and stop-generation stamp AFTER `build`,
-        //    immediately before `can.transmit`. Checking only the generation stamp would miss an
-        //    E-stop latch flip before `requested_estop_count` advances; also reject `RollbackHold`
-        //    if the latch transitioned false -> true during `build` (frame built unlatched).
+        // 5. Re-read deadline, physical stop latch, pending gate, and stop-generation stamp AFTER
+        //    `build`, immediately before `can.transmit` (host submission boundary). Checking only
+        //    the generation stamp would miss an E-stop latch flip before `requested_estop_count`
+        //    advances; re-checking `deadline` rejects frames whose age limit elapsed during `build`;
+        //    also reject `RollbackHold` if the latch transitioned false -> true during `build`.
+        if deadline.is_some_and(|d| d.passed(self.now())) {
+            return Err(TxRefusal::DeadlinePassed);
+        }
         let latched_after = self.stop_gate_for_kind(kind)?;
         if matches!(kind, TxKind::RollbackHold(_)) && !latched_before && latched_after {
             return Err(TxRefusal::StopInhibited);
@@ -4584,11 +4626,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         &mut self,
         pass_stop_stamp: StopStamp,
         pre_dropped_stale: usize,
-        fail_on_stale_drop: bool,
+        pre_oldest_expired: Option<Duration>,
+        stop_on_expiry: bool,
     ) -> Result<TxBatchOutcome, ArmDriverError> {
         let _ = self.ensure_tx_pass();
         let mut sent_any = false;
         let mut dropped_stale_in_pass = 0usize;
+        let mut oldest_expired = pre_oldest_expired;
         while let Some(entry) = self.pending_tx.front() {
             let entry_deadline = Deadline::after(entry.queued_at, self.tx_budget.frame_max_age);
             match self.send(
@@ -4613,8 +4657,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 Err(TxRefusal::DeadlinePassed) => {
                     let _ = self.pending_tx.pop_front();
+                    let age = self.now().saturating_duration_since(entry.queued_at);
+                    oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
                     dropped_stale_in_pass += 1;
                     crate::diagnostics::tick::record_tx_dropped_stale(1);
+                    if stop_on_expiry {
+                        // Fail closed immediately on the first mid-drain motion expiry:
+                        // submit zero later motion frames after an expired head.
+                        break;
+                    }
                 }
                 Err(TxRefusal::Deferred) => break,
                 Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
@@ -4674,14 +4725,21 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(e);
         }
         // Recheck freshness AFTER flush so frames expiring during send or flush never carry over.
-        let late_stale = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        let (late_stale, late_oldest) = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
         if late_stale > 0 {
             dropped_stale_in_pass += late_stale;
+            if let Some(age) = late_oldest {
+                oldest_expired = Some(oldest_expired.map_or(age, |o| o.max(age)));
+            }
             crate::diagnostics::tick::record_tx_dropped_stale(late_stale as u32);
         }
-        if fail_on_stale_drop && dropped_stale_in_pass > 0 {
+        let total_dropped_stale = pre_dropped_stale.saturating_add(dropped_stale_in_pass);
+        if stop_on_expiry && total_dropped_stale > 0 {
+            // Bounded motion expiry: drop any remaining queued motion frames so none survive
+            // into the stalled fault, and return typed `Expired` (classified as `CAN_TX_STALLED`).
             self.discard_pending_tx_stopped();
-            return Err(ArmDriverError::Transport(TransportError::Timeout));
+            self.last_expired_oldest_age = oldest_expired;
+            return Ok(TxBatchOutcome::Expired { dropped: total_dropped_stale, pending: 0 });
         }
         // Fail closed if any still-queued position-force frame aged past its 100 ms feedback bound
         // during the pass (never defer a stale J7 command).
@@ -4691,21 +4749,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: pf_joint });
             }
         }
-        let total_dropped_stale = pre_dropped_stale.saturating_add(dropped_stale_in_pass);
         let newly_deferred = self.pending_tx.mark_newly_deferred();
         let pending = self.pending_tx.len();
         crate::diagnostics::tick::record_tx_deferred(newly_deferred as u32, pending as u32);
         if total_dropped_stale > 0 {
+            self.last_expired_oldest_age = oldest_expired;
             Ok(TxBatchOutcome::Expired { dropped: total_dropped_stale, pending })
         } else if pending == 0 {
+            self.last_expired_oldest_age = None;
             Ok(TxBatchOutcome::Complete)
         } else {
+            self.last_expired_oldest_age = None;
             Ok(TxBatchOutcome::Deferred { pending })
         }
     }
 
     /// Drain carried-over pending target frames within the active tick's TX budget (no new targets staged).
     pub fn drain_pending_tx(&mut self) -> Result<TxBatchOutcome, ArmDriverError> {
+        self.last_expired_oldest_age = None;
         if self.torque_hs.is_some() {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::TorqueTransitionPending);
@@ -4728,11 +4789,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(ArmDriverError::EstopInhibited);
         }
-        let stale = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        let (stale, pre_oldest) = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
         }
-        self.drain_pending_pass(current_stamp, stale, false)
+        self.drain_pending_pass(current_stamp, stale, pre_oldest, false)
     }
 
     /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
@@ -7483,10 +7544,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if stopped_carry > 0 {
             crate::diagnostics::tick::record_tx_dropped_stopped(stopped_carry as u32);
         }
-        // 2. Drop stale carried-over frames (inclusive: age >= frame_max_age) before coalescing.
-        let stale = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
+        // 2. Drop stale carried-over frames (inclusive: age >= frame_max_age) before staging new targets.
+        //    Any carried-over motion expiry fails closed immediately: discard any remaining queued
+        //    motion frames and transmit ZERO replacement targets before reporting `Expired`.
+        self.last_expired_oldest_age = None;
+        let (stale, pre_oldest) = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
+            self.discard_pending_tx_stopped();
+            self.last_expired_oldest_age = pre_oldest;
+            return Ok(TxBatchOutcome::Expired { dropped: stale, pending: 0 });
         }
         // 3. Preflight all joint target commands and pending queue capacity before mutating or transmitting.
         let mut new_keys = 0usize;
@@ -7514,8 +7581,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             });
         }
         // 4. Coalesce current batch into pending slots BEFORE draining: existing keys keep their
-        //    FIFO position (preventing joint starvation) while storing unencoded command parameters
-        //    so every frame is built fresh at send time inside `send()`.
+        //    FIFO position (preventing joint starvation) and preserve original `queued_at` under
+        //    the same stop stamp (preventing indefinite deadline renewal), while storing unencoded
+        //    command parameters so every frame is built fresh at send time inside `send()`.
         let batch_ts = self.now();
         for (i, target) in targets.iter().enumerate() {
             let cmds = match self.pending_target_cmds_checked(i, target) {
@@ -7530,9 +7598,25 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
         }
-        // 5. Drain FIFO within the shared per-tick TX pass, carrying `stale` so losing carried-over
-        //    frames to expiry reports `TxBatchOutcome::Expired` (never `Complete`).
-        self.drain_pending_pass(batch_stamp, stale, true)
+        // 5. Drain FIFO within the shared per-tick TX pass; any expiry during drain or flush stops
+        //    further motion submissions immediately and reports `TxBatchOutcome::Expired`.
+        self.drain_pending_pass(batch_stamp, 0, None, true)
+    }
+
+    fn discard_pending_tx(&mut self) {
+        self.discard_pending_tx_stopped();
+    }
+
+    fn tx_frame_max_age(&self) -> Duration {
+        self.tx_budget.frame_max_age
+    }
+
+    fn last_tx_expired_age(&self) -> Option<Duration> {
+        self.last_expired_oldest_age
+    }
+
+    fn oldest_pending_tx_age(&self) -> Option<Duration> {
+        self.pending_tx.oldest_age(self.now())
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {

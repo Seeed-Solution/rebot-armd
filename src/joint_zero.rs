@@ -173,6 +173,24 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
+    fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+        if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_joint_targets_bounded(targets); }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone(); // plain fields: no allocation
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        let r = self.inner.write_joint_targets_bounded(&m);
+        self.motor_targets = m;
+        r
+    }
+    fn discard_pending_tx(&mut self) { self.inner.discard_pending_tx(); }
+    fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
+    fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
+    fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }
     fn write_estop_hold(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_estop_hold(targets); }
         let mut m = std::mem::take(&mut self.motor_targets);

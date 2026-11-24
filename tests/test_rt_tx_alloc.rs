@@ -438,8 +438,8 @@ fn safety_and_fenced_mit_failure_paths_do_not_allocate_or_free() {
     });
     d.can_mut().tx_step = Duration::from_millis(45);
     let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
-    assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::Timeout))), "{res:?}");
-    assert_eq!((a, f), (0, 0), "unfenced mid-pass stale drop Timeout touched allocator");
+    assert_eq!(res.unwrap(), TxBatchOutcome::Expired { dropped: 6, pending: 0 });
+    assert_eq!((a, f), (0, 0), "unfenced mid-pass stale drop Expired touched allocator");
 
     d.can_mut().tx_step = Duration::ZERO;
     d.can_mut().flush_err = Some(Mode::EnobufsAfter(0));

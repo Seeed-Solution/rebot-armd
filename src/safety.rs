@@ -33,6 +33,8 @@ pub enum FaultReason {
     },
     BusLoss,
     WatchdogTimeout,
+    /// Bounded CAN TX stalled: frames expired past the age limit or consecutive ticks deferred.
+    CanTxStalled,
     Other(String),
 }
 
@@ -63,6 +65,7 @@ fault_codes! {
         ControlDeadline,
         InvalidTelemetry,
         DriverWriteFailed,
+        CanTxStalled,
         HardwareFault,
         EnableFailed,
         ServoNoBrake,
@@ -87,8 +90,54 @@ impl FaultCode {
             FaultReason::ThermalTrip { .. } => FaultCode::ThermalTrip,
             FaultReason::BusLoss => FaultCode::BusLoss,
             FaultReason::WatchdogTimeout => FaultCode::WatchdogTimeout,
+            FaultReason::CanTxStalled => FaultCode::CanTxStalled,
             FaultReason::Other(_) => FaultCode::Other,
         }
+    }
+}
+
+/// Inline, allocation-free numeric diagnostics for [`FaultCode::CanTxStalled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxStallDetail {
+    pub queued: usize,
+    pub dropped: usize,
+    pub age_ms: u64,
+    pub limit_ms: u64,
+    pub consecutive_ticks: u32,
+    pub is_hold: bool,
+}
+
+impl TxStallDetail {
+    /// Formats a human-readable stall message into `out` without allocating while `out` has capacity.
+    pub fn write_message(&self, out: &mut String) {
+        use std::fmt::Write;
+        let _ = if self.dropped > 0 {
+            if self.is_hold {
+                write!(
+                    out,
+                    "CAN TX hold stalled: {} frames expired after {} ms ({} frames queued, limit {} ms)",
+                    self.dropped, self.age_ms, self.queued, self.limit_ms
+                )
+            } else {
+                write!(
+                    out,
+                    "CAN TX stalled: {} frames expired after {} ms ({} frames queued, limit {} ms)",
+                    self.dropped, self.age_ms, self.queued, self.limit_ms
+                )
+            }
+        } else if self.is_hold {
+            write!(
+                out,
+                "CAN TX hold stalled: {} frames queued with no hold sent for {} ms (limit {} ms)",
+                self.queued, self.age_ms, self.limit_ms
+            )
+        } else {
+            write!(
+                out,
+                "CAN TX stalled: {} frames queued across {} consecutive ticks (age {} ms, limit {} ms)",
+                self.queued, self.consecutive_ticks, self.age_ms, self.limit_ms
+            )
+        };
     }
 }
 
@@ -103,16 +152,27 @@ pub struct FaultInfo {
 crate::fieldwise_clone!(FaultInfo { code, message, recoverable });
 
 impl FaultReason {
-    pub fn message(&self) -> String {
+    /// Writes the human-readable fault message into `out` without allocating while `out` has capacity.
+    pub fn write_message(&self, out: &mut String) {
+        use std::fmt::Write;
         match self {
-            FaultReason::JointLimitExceeded { joint_name, value, min, max, .. } =>
-                format!("Joint '{joint_name}' at {value:.4} outside [{min:.4}, {max:.4}]"),
-            FaultReason::ThermalTrip { joint_idx, temperature, limit } =>
-                format!("Joint {} temperature {temperature:.1} C above limit {limit:.1} C", joint_idx + 1),
-            FaultReason::BusLoss => "No fresh feedback from every joint (bus loss)".into(),
-            FaultReason::WatchdogTimeout => "Control lease expired while torqued".into(),
-            FaultReason::Other(m) => m.clone(),
+            FaultReason::JointLimitExceeded { joint_name, value, min, max, .. } => {
+                let _ = write!(out, "Joint '{joint_name}' at {value:.4} outside [{min:.4}, {max:.4}]");
+            }
+            FaultReason::ThermalTrip { joint_idx, temperature, limit } => {
+                let _ = write!(out, "Joint {} temperature {temperature:.1} C above limit {limit:.1} C", joint_idx + 1);
+            }
+            FaultReason::BusLoss => out.push_str("No fresh feedback from every joint (bus loss)"),
+            FaultReason::WatchdogTimeout => out.push_str("Control lease expired while torqued"),
+            FaultReason::CanTxStalled => out.push_str("CAN TX stalled (bounded transmit queue did not drain within age limit)"),
+            FaultReason::Other(m) => out.push_str(m),
         }
+    }
+
+    pub fn message(&self) -> String {
+        let mut out = String::new();
+        self.write_message(&mut out);
+        out
     }
 }
 
@@ -246,6 +306,7 @@ pub struct SafetyManager {
     armed_arc: Arc<SafetyState>,
     moving_arc: Arc<SafetyState>,
     estop_arc: Arc<SafetyState>,
+    can_tx_stalled_arc: Arc<SafetyState>,
     retired_state_arcs: [Option<Arc<SafetyState>>; RETIRED_STATE_CAPACITY],
     retired_head: usize,
     retired_len: usize,
@@ -253,6 +314,8 @@ pub struct SafetyManager {
     epoch_id: u64,
     /// Code recorded by the trigger site of the current Fault.
     fault_code: Option<FaultCode>,
+    /// Inline numeric detail for [`FaultCode::CanTxStalled`] (0 alloc on RT latch).
+    tx_stall_detail: Option<TxStallDetail>,
 }
 
 impl Default for SafetyManager {
@@ -264,12 +327,14 @@ impl Default for SafetyManager {
             armed_arc: Arc::new(SafetyState::Armed),
             moving_arc: Arc::new(SafetyState::Moving),
             estop_arc: Arc::new(SafetyState::EStop),
+            can_tx_stalled_arc: Arc::new(SafetyState::Fault(FaultReason::CanTxStalled)),
             retired_state_arcs: std::array::from_fn(|_| None),
             retired_head: 0,
             retired_len: 0,
             off_thread_reclaim: false,
             epoch_id: 1,
             fault_code: None,
+            tx_stall_detail: None,
         }
     }
 }
@@ -348,7 +413,9 @@ impl SafetyManager {
         if *self.state_arc != SafetyState::EStop {
             tracing::warn!("Safety: {:?} -> EStop", *self.state_arc);
         }
-        let _ = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
+        if self.try_replace_state_arc(Arc::clone(&self.estop_arc)) {
+            self.tx_stall_detail = None;
+        }
         self.epoch_id = self.epoch_id.wrapping_add(1);
         self.epoch_id
     }
@@ -363,13 +430,65 @@ impl SafetyManager {
         }
     }
 
+    /// Inline detail of the active [`FaultCode::CanTxStalled`] fault, if any.
+    pub fn tx_stall_detail(&self) -> Option<TxStallDetail> {
+        self.tx_stall_detail
+    }
+
+    /// Writes the active fault message into `out` without allocating while `out` has capacity.
+    /// Returns the active [`FaultCode`] if stopped, else `None`.
+    pub fn write_fault_message(&self, out: &mut String) -> Option<FaultCode> {
+        out.clear();
+        match &*self.state_arc {
+            SafetyState::EStop => {
+                out.push_str("E-stop latched");
+                Some(FaultCode::Estop)
+            }
+            SafetyState::Fault(reason) => {
+                let code = self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason));
+                if code == FaultCode::CanTxStalled {
+                    if let Some(detail) = self.tx_stall_detail {
+                        detail.write_message(out);
+                        return Some(code);
+                    }
+                }
+                reason.write_message(out);
+                Some(code)
+            }
+            _ => None,
+        }
+    }
+
     pub fn fault(&self) -> Option<FaultInfo> {
-        let (code, message) = match &*self.state_arc {
-            SafetyState::EStop => (FaultCode::Estop, "E-stop latched".to_string()),
-            SafetyState::Fault(reason) => (self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason)), reason.message()),
-            _ => return None,
-        };
+        let mut message = String::new();
+        let code = self.write_fault_message(&mut message)?;
         Some(FaultInfo { code, message, recoverable: code.recoverable() })
+    }
+
+    /// Zero-allocation fallible latch for [`FaultCode::CanTxStalled`]: uses the preallocated
+    /// `can_tx_stalled_arc` and inline [`TxStallDetail`] so neither latching nor reclamation-ring
+    /// refusal touches the heap allocator. Returns `Ok(epoch)` when installed, `Err(epoch)` when
+    /// off-thread reclamation is saturated while already faulted (leaving the existing fault intact).
+    pub fn try_trigger_can_tx_stalled(&mut self, detail: TxStallDetail) -> Result<u64, u64> {
+        if !self.can_accept_fault_transition() {
+            self.epoch_id = self.epoch_id.wrapping_add(1);
+            return Err(self.epoch_id);
+        }
+        tracing::warn!(
+            queued = detail.queued,
+            dropped = detail.dropped,
+            age_ms = detail.age_ms,
+            limit_ms = detail.limit_ms,
+            consecutive_ticks = detail.consecutive_ticks,
+            is_hold = detail.is_hold,
+            "Safety: -> Fault(CanTxStalled) [CanTxStalled]"
+        );
+        self.fault_code = Some(FaultCode::CanTxStalled);
+        self.tx_stall_detail = Some(detail);
+        let replaced = self.try_replace_state_arc(Arc::clone(&self.can_tx_stalled_arc));
+        debug_assert!(replaced);
+        self.epoch_id = self.epoch_id.wrapping_add(1);
+        Ok(self.epoch_id)
     }
 
     /// Advance epoch and latch Fault immediately; the code follows from the reason.
@@ -413,6 +532,7 @@ impl SafetyManager {
         }
         tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", *self.state_arc, reason);
         self.fault_code = Some(code);
+        self.tx_stall_detail = None;
         let replaced = self.try_replace_state_arc(Arc::new(SafetyState::Fault(reason)));
         debug_assert!(replaced);
         self.epoch_id = self.epoch_id.wrapping_add(1);
@@ -439,6 +559,7 @@ impl SafetyManager {
                 }
                 tracing::info!("Safety: cleared -> Idle");
                 self.fault_code = None;
+                self.tx_stall_detail = None;
                 self.epoch_id = self.epoch_id.wrapping_add(1);
                 Ok(SafetyState::Idle)
             }

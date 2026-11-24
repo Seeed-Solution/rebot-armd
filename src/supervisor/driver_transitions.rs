@@ -1553,6 +1553,17 @@ impl SupervisorInner {
         self.servo_stream_active = false;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
+        self.tx_deferral_streak = 0;
+        self.tx_deferral_since = None;
+        self.hold_tx_unsent_since = None;
+        self.hold_tx_stalled_latched = false;
+        self.last_hold_tx_error_log = None;
+        self.pending_deferred_done = None;
+        if let Some(ref d) = self.driver {
+            if let Ok(mut drv) = d.lock() {
+                drv.discard_pending_tx();
+            }
+        }
         // Reset at the measured position; never retain a residual old trajectory target.
         copy_into(&mut self.commanded_positions, &self.measured_positions);
         copy_into(&mut self.target_positions, &self.measured_positions);

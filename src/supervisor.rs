@@ -7,7 +7,7 @@ use crate::supervisor_lock::SupervisorLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::rt_core::scratch::{copy_into, fill_n};
+use crate::rt_core::scratch::{copy_into, copy_limits, fill_n};
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
 use crate::model::{ArmConfig, ArmObservation, MotionLimit, MotionLimitReason, ObservationSchema, RestingPosePolicy};
 use crate::recording::{EpisodeRecorder, RecordFrame, RecordingError};
@@ -248,15 +248,59 @@ pub struct HeldObject {
     pub spill_safe: bool,
 }
 
+/// Owner identity bound to a [`DeferredActionDone`] so a later `Complete` never commits a
+/// stale or superseded action, macro child, or internal park gripper step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredCompletionTarget {
+    Action(u64),
+    MacroSub {
+        action_id: u64,
+        ticket: crate::macro_action::ChildTicket,
+    },
+    ParkRelease(ParkRelease),
+    Anonymous,
+}
+
 /// Action completion captured during trajectory stepping and published only after
-/// that tick's output passes tracking validation and is written to the driver.
-struct DeferredActionDone {
-    action_id: Option<u64>,
-    macro_sub: bool,
-    settled: Option<bool>,
-    holding: Option<bool>,
-    gripper_gap_rad: Option<f32>,
-    clear_releasing: bool,
+/// that tick's output passes tracking validation and is accepted (`Complete`) by the driver.
+pub(crate) struct DeferredActionDone {
+    pub(crate) target: DeferredCompletionTarget,
+    pub(crate) epoch_id: u64,
+    pub(crate) lease_generation: Option<u64>,
+    pub(crate) settled: Option<bool>,
+    pub(crate) holding: Option<bool>,
+    pub(crate) gripper_gap_rad: Option<f32>,
+    pub(crate) clear_releasing: bool,
+}
+
+/// Zero-allocation classification of a bounded driver output write in one release,
+/// explicitly bound to whether the submitted batch was a stopped hold (`is_hold`).
+#[derive(Debug)]
+pub(crate) enum TickOutput {
+    None,
+    Complete { is_hold: bool },
+    Deferred {
+        pending: usize,
+        now: Instant,
+        max_age: Duration,
+        oldest_age: Option<Duration>,
+        is_hold: bool,
+        sent_any: bool,
+    },
+    Expired {
+        dropped: usize,
+        pending: usize,
+        now: Instant,
+        max_age: Duration,
+        oldest_age: Option<Duration>,
+        is_hold: bool,
+        sent_any: bool,
+    },
+    Error {
+        message: String,
+        now: Instant,
+        is_hold: bool,
+    },
 }
 
 /// What [`SupervisorInner::tick_publish`] hands back.
@@ -584,6 +628,20 @@ pub struct SupervisorInner {
     pub(crate) estop_ack_overflow_gen: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
     pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Consecutive non-stopped ticks whose bounded CAN TX ended with pending deferred frames.
+    pub(crate) tx_deferral_streak: u32,
+    /// Driver-clock instant of the first tick in the current non-stopped TX deferral streak.
+    pub(crate) tx_deferral_since: Option<Instant>,
+    /// Driver-clock instant when stopped-hold TX first failed to submit any frame at all.
+    pub(crate) hold_tx_unsent_since: Option<Instant>,
+    /// True once `CAN_TX_STALLED` has been installed for the current stopped/fault session
+    /// (prevents repeated fault re-latching; cleared in `clear_fault_finish`).
+    pub(crate) hold_tx_stalled_latched: bool,
+    /// Last driver-clock instant when a stopped-hold TX error/stall was logged (<= 1/s throttle).
+    pub(crate) last_hold_tx_error_log: Option<Instant>,
+    /// Action / macro-sub / park-release completion awaiting bus acceptance (`Complete`) across
+    /// one or more transient `Deferred` ticks.
+    pub(crate) pending_deferred_done: Option<DeferredActionDone>,
 }
 
 /// Summary of the release's Step-2 hardware poll passed into Step-5 `tick_control`
@@ -864,6 +922,12 @@ impl SupervisorInner {
             ),
             estop_ack_overflow_gen: 0,
             before_publish_hook: None,
+            tx_deferral_streak: 0,
+            tx_deferral_since: None,
+            hold_tx_unsent_since: None,
+            hold_tx_stalled_latched: false,
+            last_hold_tx_error_log: None,
+            pending_deferred_done: None,
         }
     }
 
@@ -1212,7 +1276,10 @@ impl SupervisorInner {
     /// `generation` without re-running `tick_control`.
     pub fn publish_at(&mut self, timestamp: f64, generation: u64, keep: bool) -> TickPublished {
         let mut obs = self.core.take_observation_buffer();
-        self.fill_observation(timestamp, &mut obs);
+        {
+            let (obs_ref, fault_spare) = obs.split_mut();
+            self.fill_observation_with_spare(timestamp, obs_ref, Some(fault_spare));
+        }
         self.tick_phase(4);
         let body_end = self.tick_phase_mark.take();
         let control_hz = self.config.control_frequency_hz;
@@ -1246,6 +1313,15 @@ impl SupervisorInner {
     /// control tick fills its published sample this way, without allocating while no value
     /// changes its shape (armd 1.6 RT core). Every field is overwritten.
     pub fn fill_observation(&self, timestamp: f64, out: &mut ArmObservation) {
+        self.fill_observation_with_spare(timestamp, out, None);
+    }
+
+    fn fill_observation_with_spare(
+        &self,
+        timestamp: f64,
+        out: &mut ArmObservation,
+        mut fault_spare: Option<&mut String>,
+    ) {
         use crate::rt_core::scratch::{fill_n, set_opt, set_opt_eq};
         let tcp = if self.config.kinematics.is_some() {
             self.config.tcp_pose_f32(&self.measured_positions).map(|pose| {
@@ -1287,14 +1363,43 @@ impl SupervisorInner {
         out.torques.clone_from(&self.torques);
         out.temperatures.clone_from(&self.temperatures);
         out.is_torqued = self.is_torqued;
-        // `fault` is a function of the safety state and its code: rebuilt (a String) only
-        // when either changed
+        // `fault` is a function of the safety state, its code, and epoch: rebuilt in place using
+        // the slot's preallocated `fault_spare` (0 alloc / 0 free on `CanTxStalled` transitions).
         let state = self.safety.state();
-        if out.safety_state != *state || out.fault.as_ref().map(|f| f.code) != self.safety.fault_code() {
-            out.fault = self.safety.fault();
+        let fault_code = self.safety.fault_code();
+        let epoch_now = self.safety.epoch_id();
+        if out.safety_state != *state
+            || out.fault.as_ref().map(|f| f.code) != fault_code
+            || (fault_code.is_some() && out.epoch_id != epoch_now)
+        {
+            match fault_code {
+                None => {
+                    if let Some(old) = out.fault.take() {
+                        if let Some(spare) = fault_spare.as_deref_mut() {
+                            if old.message.capacity() >= spare.capacity() {
+                                *spare = old.message;
+                            }
+                        }
+                    }
+                }
+                Some(code) => {
+                    let mut msg = out
+                        .fault
+                        .take()
+                        .map(|f| f.message)
+                        .or_else(|| fault_spare.map(std::mem::take))
+                        .unwrap_or_default();
+                    let _ = self.safety.write_fault_message(&mut msg);
+                    out.fault = Some(crate::safety::FaultInfo {
+                        code,
+                        message: msg,
+                        recoverable: code.recoverable(),
+                    });
+                }
+            }
         }
         if out.safety_state != *state { out.safety_state = state.clone(); }
-        out.epoch_id = self.safety.epoch_id();
+        out.epoch_id = epoch_now;
         out.gravity_compensated = self.gravity_output_enabled();
         out.gravity_torques.clone_from(&self.gravity_torques);
         out.driver_capabilities = driver_capabilities;
@@ -2006,6 +2111,237 @@ impl SupervisorInner {
             .or_else(|| self.unload_settle.as_ref().and_then(|s| self.unload_still_violation(s)))
     }
 
+    /// Whether stopped-hold TX stalling is allowed to install `CAN_TX_STALLED`.
+    /// Never overwrites `EStop`, `ThermalTrip`, `MitOwner::Lost`, an already-latched
+    /// `CanTxStalled`, or a saturated off-thread reclamation queue.
+    fn can_escalate_to_can_tx_stalled(&self) -> bool {
+        if self.hold_tx_stalled_latched || self.e_stop_latched.load(Ordering::SeqCst) {
+            return false;
+        }
+        if matches!(
+            self.safety.state(),
+            SafetyState::EStop
+                | SafetyState::Fault(FaultReason::ThermalTrip { .. } | FaultReason::CanTxStalled)
+        ) {
+            return false;
+        }
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            return false;
+        }
+        self.safety.can_accept_fault_transition()
+    }
+
+    /// Rate-limit stopped-hold TX error/stall logs to at most once per second on the driver clock.
+    fn should_log_hold_tx_error(&mut self, now: Instant) -> bool {
+        let should = self
+            .last_hold_tx_error_log
+            .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(1));
+        if should {
+            self.last_hold_tx_error_log = Some(now);
+        }
+        should
+    }
+
+    /// Zero-allocation motion stall latch (`CAN_TX_STALLED`).
+    fn latch_can_tx_stalled_motion(&mut self, detail: crate::safety::TxStallDetail, now: Instant) {
+        self.tx_deferral_streak = 0;
+        self.tx_deferral_since = None;
+        self.hold_tx_unsent_since = None;
+        if let Some(ref d) = self.driver {
+            if let Ok(mut drv) = d.try_lock() {
+                drv.discard_pending_tx();
+            }
+        }
+        self.stop_motion();
+        self.tracking.invalidate();
+        self.commanded_velocities.fill(0.0);
+        if self.measured_positions.iter().all(|q| q.is_finite()) {
+            copy_into(&mut self.commanded_positions, &self.measured_positions);
+            copy_into(&mut self.target_positions, &self.measured_positions);
+        }
+        if !self.safety.state().is_stopped() && self.safety.try_trigger_can_tx_stalled(detail).is_ok() {
+            self.hold_tx_stalled_latched = true;
+            self.last_hold_tx_error_log = Some(now);
+        }
+    }
+
+    /// Classify one release's bounded TX outcome. Returns `true` iff the submitted batch completed
+    /// (`TickOutput::Complete`). Bounded `Deferred` carries over without faulting on both owners;
+    /// `Expired`, sustained deferral streaks (`resolved_tx_stall_ticks`), or stopped holds unable
+    /// to transmit for `>= max_age` latch `CAN_TX_STALLED` (at most once while stopped); real
+    /// transport errors latch `DRIVER_WRITE_FAILED` while operational and rate-limit logs while
+    /// stopped.
+    pub(crate) fn classify_tick_output(&mut self, output: TickOutput) -> bool {
+        match output {
+            TickOutput::None => {
+                if !self.is_torqued || self.disable_pending || self.shutdown_committed {
+                    self.tx_deferral_streak = 0;
+                    self.tx_deferral_since = None;
+                    self.hold_tx_unsent_since = None;
+                }
+                false
+            }
+            TickOutput::Complete { .. } => {
+                self.tx_deferral_streak = 0;
+                self.tx_deferral_since = None;
+                self.hold_tx_unsent_since = None;
+                true
+            }
+            TickOutput::Deferred { pending, now, max_age, oldest_age, is_hold, sent_any } => {
+                if is_hold || self.safety.state().is_stopped() {
+                    self.tx_deferral_streak = 0;
+                    self.tx_deferral_since = None;
+                    if sent_any {
+                        self.hold_tx_unsent_since = None;
+                    } else {
+                        let since = *self.hold_tx_unsent_since.get_or_insert(now);
+                        let unsent_age = now.saturating_duration_since(since);
+                        let observed_age = oldest_age.map_or(unsent_age, |a| a.max(unsent_age));
+                        if observed_age >= max_age {
+                            if self.can_escalate_to_can_tx_stalled() {
+                                let detail = crate::safety::TxStallDetail {
+                                    queued: pending,
+                                    dropped: 0,
+                                    age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                    limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                    consecutive_ticks: 0,
+                                    is_hold: true,
+                                };
+                                if self.safety.try_trigger_can_tx_stalled(detail).is_ok() {
+                                    self.hold_tx_stalled_latched = true;
+                                }
+                            }
+                            if self.should_log_hold_tx_error(now) {
+                                tracing::error!(
+                                    queued = pending,
+                                    age_ms = observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                    limit_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                    "Stopped hold CAN TX stalled with no frames sent within age limit"
+                                );
+                            }
+                        }
+                    }
+                    return false;
+                }
+
+                self.hold_tx_unsent_since = None;
+                self.tx_deferral_streak = self.tx_deferral_streak.saturating_add(1);
+                let since = *self.tx_deferral_since.get_or_insert(now);
+                let streak_age = now.saturating_duration_since(since);
+                let observed_age = oldest_age.map_or(streak_age, |a| a.max(streak_age));
+                let max_ticks = self.config.resolved_tx_stall_ticks();
+                if self.tx_deferral_streak >= max_ticks || observed_age >= max_age {
+                    let detail = crate::safety::TxStallDetail {
+                        queued: pending,
+                        dropped: 0,
+                        age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                        limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                        consecutive_ticks: self.tx_deferral_streak,
+                        is_hold: false,
+                    };
+                    self.latch_can_tx_stalled_motion(detail, now);
+                    tracing::error!(
+                        queued = detail.queued,
+                        consecutive_ticks = detail.consecutive_ticks,
+                        age_ms = detail.age_ms,
+                        limit_ms = detail.limit_ms,
+                        "CAN TX stalled across consecutive deferred ticks"
+                    );
+                }
+                false
+            }
+            TickOutput::Expired { dropped, pending, now, max_age, oldest_age, is_hold, sent_any } => {
+                if is_hold || self.safety.state().is_stopped() {
+                    self.tx_deferral_streak = 0;
+                    self.tx_deferral_since = None;
+                    if sent_any {
+                        self.hold_tx_unsent_since = None;
+                    } else {
+                        let since = *self.hold_tx_unsent_since.get_or_insert(now);
+                        let unsent_age = now.saturating_duration_since(since);
+                        let observed_age = oldest_age.unwrap_or(max_age).max(unsent_age).max(max_age);
+                        if self.can_escalate_to_can_tx_stalled() {
+                            let detail = crate::safety::TxStallDetail {
+                                queued: pending,
+                                dropped,
+                                age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                consecutive_ticks: 0,
+                                is_hold: true,
+                            };
+                            if self.safety.try_trigger_can_tx_stalled(detail).is_ok() {
+                                self.hold_tx_stalled_latched = true;
+                            }
+                        }
+                        if self.should_log_hold_tx_error(now) {
+                            tracing::error!(
+                                dropped,
+                                queued = pending,
+                                age_ms = observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                limit_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                                "Stopped hold CAN TX expired without sending any frame"
+                            );
+                        }
+                    }
+                    return false;
+                }
+
+                let age = oldest_age
+                    .or_else(|| self.tx_deferral_since.map(|s| now.saturating_duration_since(s)))
+                    .unwrap_or(max_age)
+                    .max(max_age);
+                let detail = crate::safety::TxStallDetail {
+                    queued: pending,
+                    dropped,
+                    age_ms: age.as_millis().min(u128::from(u64::MAX)) as u64,
+                    limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
+                    consecutive_ticks: self.tx_deferral_streak.saturating_add(1),
+                    is_hold: false,
+                };
+                self.latch_can_tx_stalled_motion(detail, now);
+                tracing::error!(
+                    dropped = detail.dropped,
+                    queued = detail.queued,
+                    age_ms = detail.age_ms,
+                    limit_ms = detail.limit_ms,
+                    "CAN TX stalled: frames expired past max age"
+                );
+                false
+            }
+            TickOutput::Error { message, now, is_hold } => {
+                self.tx_deferral_streak = 0;
+                self.tx_deferral_since = None;
+                if is_hold || self.safety.state().is_stopped() {
+                    self.tracking.invalidate();
+                    self.commanded_velocities.fill(0.0);
+                    if self.measured_positions.iter().all(|q| q.is_finite()) {
+                        copy_into(&mut self.commanded_positions, &self.measured_positions);
+                        copy_into(&mut self.target_positions, &self.measured_positions);
+                    }
+                    if self.should_log_hold_tx_error(now) {
+                        tracing::error!("Stopped hold output failed: {message}");
+                    }
+                } else {
+                    self.stop_motion();
+                    self.tracking.invalidate();
+                    self.commanded_velocities.fill(0.0);
+                    if self.measured_positions.iter().all(|q| q.is_finite()) {
+                        copy_into(&mut self.commanded_positions, &self.measured_positions);
+                        copy_into(&mut self.target_positions, &self.measured_positions);
+                    }
+                    if !self.safety.state().is_stopped() {
+                        self.safety.trigger_fault_coded(
+                            FaultCode::DriverWriteFailed,
+                            FaultReason::Other(format!("Control output failed: {message}")),
+                        );
+                    }
+                    tracing::error!("Control output failed: {message}");
+                }
+                false
+            }
+        }
+    }
+
     /// One control tick and its observation ([`Self::tick_control`], then
     /// [`Self::current_observation`] at the tick's timestamp).
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
@@ -2705,7 +3041,7 @@ impl SupervisorInner {
             && self.driver.is_some()
             && !self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT)
         {
-            self.execute_stop(StopPolicy::BusLossFallback);
+            self.execute_stop_in_tick(StopPolicy::BusLossFallback);
         }
         self.sync_torque_state_after_stop();
 
@@ -2838,6 +3174,17 @@ impl SupervisorInner {
         self.torque_guard_tick(servo_dt);
         // Supply-current estimate (src/power.rs).
         self.power_tick(servo_dt);
+        // If a macro child's final step is awaiting deferred TX acceptance, enforce contact and
+        // child deadline BEFORE submitting any further targets on this release.
+        if self.macro_run.is_some()
+            && matches!(
+                self.pending_deferred_done.as_ref().map(|d| d.target),
+                Some(DeferredCompletionTarget::MacroSub { .. })
+            )
+        {
+            self.step_macro_contact();
+            self.expire_macro_child(Instant::now());
+        }
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
@@ -2993,10 +3340,9 @@ impl SupervisorInner {
             }
         }
 
-        // 3.1 Handle pending normal unload settling phase
-        if self.pending_normal_unload && self.active_trajectory.is_none() {
-            if !self.step_park_release() { self.step_unload_settle(servo_dt); }
-        } else if self.servo_target.is_some() {
+        // 3.1 Servo streaming (park release / unload settle runs AFTER output acceptance below
+        //     so park never advances or cuts torque on a deferred or rejected release).
+        if !(self.pending_normal_unload && self.active_trajectory.is_none()) && self.servo_target.is_some() {
             // the target, copied into the scratch (the stream may replace it meanwhile)
             let mut target_buf = std::mem::take(&mut self.scratch.servo_target);
             copy_into(&mut target_buf, self.servo_target.as_deref().unwrap_or(&[]));
@@ -3318,30 +3664,85 @@ impl SupervisorInner {
         self.tick_phase(1);
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
-        let mut output_error = None;
-        let mut tick_output_accepted = false;
+        let mut tick_output = TickOutput::None;
+        let mut allow_output_accepted = false;
+        let mut driverless_accepted = false;
+        let mut gravity_exiting_or_failed = false;
+        let mut gravity_driverless_ok = false;
         // a torque transition in flight owns the bus until it ends (the driver refuses targets)
         let transition_owns_bus = self.torque_transition.is_some();
         if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
+            gravity_exiting_or_failed = self.gravity_comp.as_ref().is_some_and(|r| {
+                matches!(
+                    r.phase,
+                    crate::gravity_comp::GravityCompPhase::Exiting { .. }
+                        | crate::gravity_comp::GravityCompPhase::ExitFailed { .. }
+                )
+            });
             if self.driver.is_none() {
-                tick_output_accepted = true;
-            } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
-                if let Ok(mut driver) = d.lock() {
-                    if driver.enable_state() != EnableState::Disabled {
-                        let write_res = if self.safety.state().is_stopped() {
-                            driver.write_estop_hold(&targets)
-                        } else {
-                            driver.write_joint_targets(&targets)
-                        };
-                        match write_res {
-                            Ok(()) => tick_output_accepted = true,
-                            Err(e) => output_error = Some(e.to_string()),
+                driverless_accepted = true;
+                gravity_driverless_ok = true;
+            } else {
+                let mut targets = std::mem::take(&mut self.scratch.targets);
+                let built = self.gravity_comp_targets_into(&mut targets);
+                if built {
+                    if let Some(d) = self.driver.as_ref() {
+                        if let Ok(mut driver) = d.lock() {
+                            if driver.enable_state() != EnableState::Disabled {
+                                let is_hold = self.safety.state().is_stopped();
+                                let now = driver.clock_now();
+                                let max_age = driver.tx_frame_max_age();
+                                tick_output = if is_hold {
+                                    match driver.write_estop_hold(&targets) {
+                                        Ok(()) => TickOutput::Complete { is_hold: true },
+                                        Err(e) => TickOutput::Error {
+                                            message: e.to_string(),
+                                            now,
+                                            is_hold: true,
+                                        },
+                                    }
+                                } else {
+                                    match driver.write_joint_targets_bounded(&targets) {
+                                        Ok(crate::driver::TxBatchOutcome::Complete) => {
+                                            allow_output_accepted = true;
+                                            TickOutput::Complete { is_hold: false }
+                                        }
+                                        Ok(crate::driver::TxBatchOutcome::Deferred { pending }) => {
+                                            TickOutput::Deferred {
+                                                pending,
+                                                now,
+                                                max_age,
+                                                oldest_age: driver.oldest_pending_tx_age(),
+                                                is_hold: false,
+                                                sent_any: false,
+                                            }
+                                        }
+                                        Ok(crate::driver::TxBatchOutcome::Expired { dropped, pending }) => {
+                                            TickOutput::Expired {
+                                                dropped,
+                                                pending,
+                                                now,
+                                                max_age,
+                                                oldest_age: driver.last_tx_expired_age(),
+                                                is_hold: false,
+                                                sent_any: false,
+                                            }
+                                        }
+                                        Err(e) => TickOutput::Error {
+                                            message: e.to_string(),
+                                            now,
+                                            is_hold: false,
+                                        },
+                                    }
+                                };
+                            }
                         }
                     }
                 }
+                self.scratch.targets = targets;
             }
         } else if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus {
             let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
@@ -3386,17 +3787,19 @@ impl SupervisorInner {
                     // Rejection-fallback braking ramp, also while the rejection fault is latched.
                     // The rejected motion's caps (`FallbackRamp::limits`) stay in force, tightened
                     // by the current power governor limit; the ramp keeps its original caps.
-                    let ramp = self.tracking.fallback_ramp.clone().expect("checked above");
+                    let mut ramp = self.tracking.fallback_ramp.take().expect("checked above");
                     let governed = self.active_tracking_limits(servo_dt, time_scale);
-                    let mut tick_ramp = ramp.clone();
-                    for (l, g) in tick_ramp.limits.iter_mut().zip(&governed) {
+                    let mut orig_limits = std::mem::take(&mut self.scratch.fallback_limits);
+                    copy_limits(&mut orig_limits, &ramp.limits);
+                    for (l, g) in ramp.limits.iter_mut().zip(&governed) {
                         l.max_velocity = l.max_velocity.min(g.max_velocity);
                         l.max_acceleration = l.max_acceleration.min(g.max_acceleration);
                     }
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let mut pending = self.tracking_fallback_compute(tick_ramp, servo_dt, &mut tick_sweep_budget);
-                    pending.ramp = ramp;
-                    output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                    let mut pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
+                    std::mem::swap(&mut pending.ramp.limits, &mut orig_limits);
+                    self.scratch.fallback_limits = orig_limits;
+                    tick_output = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else if ramp_out_handover || tracking_owned {
@@ -3433,26 +3836,29 @@ impl SupervisorInner {
                     };
                     match eval_res {
                         Ok(out) => {
-                            let targets: Vec<JointTarget> = out
-                                .positions
-                                .iter()
-                                .zip(self.commanded_velocities.iter())
-                                .enumerate()
-                                .map(|(i, (&p, &v))| JointTarget {
-                                    position: p,
-                                    velocity: Some(v),
-                                    torque: if gravity_output_enabled {
-                                        self.gravity_torques_ramped.get(i).copied()
-                                    } else {
-                                        Some(0.0)
-                                    },
-                                    kp: None,
-                                    kd: None,
-                                })
-                                .collect();
-                            let write_res = self.write_output(targets, servo_dt);
-                            match write_res {
-                                Some(Ok(())) => {
+                            let mut targets = std::mem::take(&mut self.scratch.targets);
+                            targets.clear();
+                            targets.extend(
+                                out.positions
+                                    .iter()
+                                    .zip(self.commanded_velocities.iter())
+                                    .enumerate()
+                                    .map(|(i, (&p, &v))| JointTarget {
+                                        position: p,
+                                        velocity: Some(v),
+                                        torque: if gravity_output_enabled {
+                                            self.gravity_torques_ramped.get(i).copied()
+                                        } else {
+                                            Some(0.0)
+                                        },
+                                        kp: None,
+                                        kd: None,
+                                    }),
+                            );
+                            self.scratch.targets = targets;
+                            tick_output = self.write_output_scratch(servo_dt);
+                            match &tick_output {
+                                TickOutput::Complete { .. } => {
                                     let nominal = self.tracking.nominal_entry(&self.commanded_positions, servo_dt);
                                     self.tracking.record_issued_with_ws_depths(
                                         out.positions,
@@ -3464,13 +3870,14 @@ impl SupervisorInner {
                                     if out.withdrawn {
                                         self.tracking.withdrawal_ticks += 1;
                                     }
-                                    tick_output_accepted = true;
+                                    allow_output_accepted = true;
                                 }
-                                Some(Err(e)) => {
+                                TickOutput::Deferred { .. }
+                                | TickOutput::Expired { .. }
+                                | TickOutput::Error { .. }
+                                | TickOutput::None => {
                                     self.tracking.invalidate();
-                                    output_error = Some(e.to_string());
                                 }
-                                None => self.tracking.invalidate(),
                             }
                         }
                         Err(reject) => {
@@ -3509,7 +3916,7 @@ impl SupervisorInner {
                                     );
                                 }
                             }
-                            output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                            tick_output = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
                         }
                     }
                     self.tracking.last_tick_sweep_evals =
@@ -3539,13 +3946,12 @@ impl SupervisorInner {
                                 kd: None,
                             }));
                         self.scratch.targets = targets;
-                        match self.write_output_scratch(servo_dt) {
-                            Some(Ok(())) => tick_output_accepted = true,
-                            Some(Err(e)) => output_error = Some(e),
-                            None => {}
+                        tick_output = self.write_output_scratch(servo_dt);
+                        if matches!(tick_output, TickOutput::Complete { .. }) {
+                            allow_output_accepted = true;
                         }
                     } else {
-                        tick_output_accepted = true;
+                        driverless_accepted = true;
                     }
                 }
             } else {
@@ -3571,7 +3977,8 @@ impl SupervisorInner {
         // the bus (or the batch stopped at the next frame, `ArmDriver::set_estop_gate`); apply
         // it now instead of one period later. A batch the gate stopped is not a driver failure.
         if self.urgent_stop_unapplied() {
-            tick_output_accepted = false;
+            allow_output_accepted = false;
+            driverless_accepted = false;
             if self.estop_request_unapplied() {
                 self.consume_pending_estop();
             }
@@ -3582,22 +3989,21 @@ impl SupervisorInner {
                     stops.mark_applied(generation);
                 }
             }
-            if output_error.as_deref().is_some_and(|e| e.contains(crate::driver::ESTOP_INHIBITED)) { output_error = None; }
-        }
-        if let Some(error) = output_error {
-            tick_output_accepted = false;
-            self.stop_motion();
-            self.tracking.invalidate();
-            self.commanded_velocities.fill(0.0);
-            if self.measured_positions.iter().all(|q| q.is_finite()) {
-                self.commanded_positions = self.measured_positions.clone();
-                self.target_positions = self.measured_positions.clone();
+            match &tick_output {
+                TickOutput::Error { message, .. }
+                    if message.contains(crate::driver::ESTOP_INHIBITED) =>
+                {
+                    tick_output = TickOutput::None;
+                }
+                TickOutput::Complete { is_hold: false }
+                | TickOutput::Deferred { is_hold: false, .. }
+                | TickOutput::Expired { is_hold: false, .. } => {
+                    tick_output = TickOutput::None;
+                }
+                _ => {}
             }
-            if !self.safety.state().is_stopped() {
-                self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(format!("Control output failed: {error}")));
-            }
-            tracing::error!("Control output failed: {error}");
         }
+        let batch_completed = self.classify_tick_output(tick_output);
 
         if self.servo_stream_active
             && self.servo_target.is_none()
@@ -3611,36 +4017,115 @@ impl SupervisorInner {
             self.servo_stream_active = false;
         }
 
-        let tick_output_accepted = tick_output_accepted && !self.safety.state().is_stopped();
+        let tick_output_accepted =
+            (driverless_accepted || (allow_output_accepted && batch_completed))
+                && !self.safety.state().is_stopped();
+
+        let gravity_stiff_hold_completed =
+            gravity_exiting_or_failed && (gravity_driverless_ok || batch_completed);
+        self.step_gravity_comp_exit(servo_dt, gravity_stiff_hold_completed);
+
         if let Some(done) = deferred_done {
-            if tick_output_accepted {
-                if done.clear_releasing {
-                    self.releasing = false;
-                    self.held = None;
-                }
-                if !self.pending_normal_unload {
-                    self.safety.mark_motion_finished();
-                }
-                if done.macro_sub {
-                    if let Some(m) = self.macro_run.as_mut() {
-                        m.sub = SubState::Done(SubDone {
-                            settled: done.settled,
-                            holding: done.holding,
-                            gripper_gap_rad: done.gripper_gap_rad,
-                            at: Instant::now(),
-                        });
+            if !self.safety.state().is_stopped() {
+                self.pending_deferred_done = Some(done);
+            }
+        }
+        if self.macro_run.is_some() {
+            self.step_macro_contact();
+            self.expire_macro_child(Instant::now());
+        }
+        if self.pending_deferred_done.is_some() {
+            let current_epoch = self.safety.epoch_id();
+            let current_lease = self.active_lease.as_ref().map(|l| l.generation);
+            let done_still_valid = self.pending_deferred_done.as_ref().is_some_and(|done| {
+                !self.safety.state().is_stopped()
+                    && done.epoch_id == current_epoch
+                    && done.lease_generation == current_lease
+                    && self.active_trajectory.is_none()
+                    && self.servo_target.is_none()
+                    && match done.target {
+                        DeferredCompletionTarget::Action(id) => {
+                            self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
+                        }
+                        DeferredCompletionTarget::MacroSub { action_id, ticket } => {
+                            self.macro_run.as_ref().is_some_and(|m| {
+                                m.id == action_id
+                                    && m.ticket() == Some(ticket)
+                                    && !m.stop_requested
+                                    && m.sub == SubState::Running
+                            })
+                        }
+                        DeferredCompletionTarget::ParkRelease(phase) => {
+                            self.pending_normal_unload && self.park_release == Some(phase)
+                        }
+                        DeferredCompletionTarget::Anonymous => {
+                            !self.pending_normal_unload
+                                && !self.last_action.as_ref().is_some_and(|a| a.is_running())
+                        }
                     }
-                } else if let Some(id) = done.action_id {
-                    self.finish_action(
-                        id,
-                        "done",
-                        None,
-                        None,
-                        done.settled,
-                        done.holding,
-                        done.gripper_gap_rad,
-                    );
+            });
+            if !done_still_valid {
+                self.pending_deferred_done = None;
+            } else if tick_output_accepted {
+                if let Some(done) = self.pending_deferred_done.take() {
+                    if done.clear_releasing {
+                        self.releasing = false;
+                        self.held = None;
+                    }
+                    if !self.pending_normal_unload {
+                        self.safety.mark_motion_finished();
+                    }
+                    match done.target {
+                        DeferredCompletionTarget::MacroSub { action_id, ticket } => {
+                            if let Some(m) = self.macro_run.as_mut().filter(|m| {
+                                m.id == action_id
+                                    && m.ticket() == Some(ticket)
+                                    && !m.stop_requested
+                                    && m.sub == SubState::Running
+                            }) {
+                                m.sub = SubState::Done(SubDone {
+                                    settled: done.settled,
+                                    holding: done.holding,
+                                    gripper_gap_rad: done.gripper_gap_rad,
+                                    at: Instant::now(),
+                                });
+                            }
+                        }
+                        DeferredCompletionTarget::Action(id) => {
+                            self.finish_action(
+                                id,
+                                "done",
+                                None,
+                                None,
+                                done.settled,
+                                done.holding,
+                                done.gripper_gap_rad,
+                            );
+                        }
+                        DeferredCompletionTarget::ParkRelease(_)
+                        | DeferredCompletionTarget::Anonymous => {}
+                    }
                 }
+            }
+        }
+
+        // Park release and unload settle advance strictly after output acceptance so neither
+        // gripper release progression nor resting-pose settle/torque-off can advance across a
+        // deferred or rejected release.
+        if self.pending_normal_unload
+            && self.active_trajectory.is_none()
+            && self.pending_deferred_done.is_none()
+            && !self.safety.state().is_stopped()
+        {
+            if tick_output_accepted {
+                if !self.step_park_release() {
+                    self.step_unload_settle(servo_dt);
+                }
+            } else if let Some(settle) = self.unload_settle.as_mut() {
+                settle.pending_s += servo_dt;
+                settle.held_s = 0.0;
+                settle.held_since_s = None;
+                settle.samples.clear();
             }
         }
 
@@ -3701,14 +4186,15 @@ impl SupervisorInner {
                 self.handover_settling_since = None;
             } else if settling_since.elapsed() > Duration::from_millis(1500) {
                 self.stop_motion();
-                self.commanded_velocities = vec![0.0; self.config.dof];
+                self.commanded_velocities.fill(0.0);
                 self.safety.trigger_fault_coded(FaultCode::HandoverUnsettled, FaultReason::Other("Handover settling timeout".into()));
                 self.handover_settling_since = None;
             }
         }
 
-        // Tracking off: settle completion does not wait for an accepted output (e4f72b6).
-        self.reconcile_action(servo_dt, tick_output_accepted || !tracking_enabled);
+        // Settle and action completion require an accepted output on both tracking-on and
+        // tracking-off paths so deferred releases never finalize an action early.
+        self.reconcile_action(servo_dt, tick_output_accepted);
         self.expire_motion_limit();
         self.tick_phase(3);
         let timestamp = self.start_time.elapsed().as_secs_f64();

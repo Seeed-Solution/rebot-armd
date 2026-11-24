@@ -356,13 +356,12 @@ pub struct FallbackRamp {
 }
 
 /// A fallback step evaluated before any hold or fault changes the tracking state, with the
-/// state it was evaluated from.
+/// state it was evaluated from (previous issued pose is saved in `scratch.fallback_prev_confirmed`).
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct PendingFallback {
     pub step: Result<ValidatedFallback, String>,
     pub ramp: FallbackRamp,
-    pub prev_confirmed: Option<Vec<f32>>,
     /// Escape depths of the other workspace (full when `keepout_only`, park otherwise),
     /// kept unchanged when the step is recorded.
     pub other_depths: Option<(u64, crate::kinematics::SlotBuf)>,
@@ -1625,9 +1624,16 @@ impl crate::supervisor::SupervisorInner {
 
     /// Evaluate the rejection fallback toward `ramp.hold` from the current tracking state
     /// within `ramp.limits`, using the escape depths of the workspace `ramp.keepout_only`
-    /// selects. Read-only:
-    /// call it before any hold or fault invalidates the history.
-    pub fn tracking_fallback_compute(&self, ramp: FallbackRamp, dt: f64, budget: &mut usize) -> PendingFallback {
+    /// selects. Captures `last_issued_positions` into `scratch.fallback_prev_confirmed` (0 alloc)
+    /// before any hold or fault invalidates the history.
+    pub fn tracking_fallback_compute(&mut self, ramp: FallbackRamp, dt: f64, budget: &mut usize) -> PendingFallback {
+        if let Some(prev) = self.tracking.last_issued_positions.as_deref() {
+            crate::rt_core::scratch::copy_into(&mut self.scratch.fallback_prev_confirmed, prev);
+            self.scratch.fallback_prev_confirmed_valid = true;
+        } else {
+            self.scratch.fallback_prev_confirmed.clear();
+            self.scratch.fallback_prev_confirmed_valid = false;
+        }
         let active_limits = ramp.limits.as_slice();
         let fresh_meas = self.hardware_feedback_fresh(std::time::Duration::from_millis(100))
             && self.measured_positions.len() == self.config.dof
@@ -1651,7 +1657,6 @@ impl crate::supervisor::SupervisorInner {
         PendingFallback {
             step,
             ramp,
-            prev_confirmed: self.tracking.last_issued_positions.clone(),
             other_depths: other_depths.clone(),
         }
     }

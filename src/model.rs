@@ -1403,6 +1403,10 @@ pub struct ArmConfig {
     /// POS_VEL base mode without being reported (profiles from before this field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damiao_gripper: Option<DamiaoGripperDrive>,
+    /// Maximum consecutive control ticks with a pending CAN TX deferral before latching
+    /// `CAN_TX_STALLED`. None defaults to `ceil(45 ms / period)` (3 ticks at 50 Hz).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_stall_ticks: Option<u32>,
     /// Speed cap for every planned motion (actions, jog, home, park); None = no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_cap: Option<SpeedCap>,
@@ -1551,6 +1555,7 @@ impl Default for ArmConfig {
             joint_tracking: None,
             damiao_ranges: None,
             damiao_gripper: None,
+            tx_stall_ticks: None,
             speed_cap: None,
             backlash_approach: None,
             collision: None,
@@ -1580,6 +1585,15 @@ impl Default for ArmConfig {
 }
 
 impl ArmConfig {
+    /// Consecutive ticks with a pending CAN TX deferral before latching `CAN_TX_STALLED`.
+    /// Defaults to `ceil(45 ms / period)` (3 ticks at 50 Hz, minimum 1).
+    pub fn resolved_tx_stall_ticks(&self) -> u32 {
+        self.tx_stall_ticks.unwrap_or_else(|| {
+            let hz = u64::from(self.control_frequency_hz.max(1));
+            ((45u64.saturating_mul(hz).saturating_add(999)) / 1000).max(1) as u32
+        })
+    }
+
     /// Convert an `end_link` pose into the active TCP pose (`p_tcp = p_end + R_end * tcp_offset`).
     pub fn end_to_tcp(&self, end: &crate::kinematics::Pose) -> crate::kinematics::Pose {
         if self.tcp_offset == [0.0; 3] {
@@ -1940,6 +1954,9 @@ impl ArmConfig {
             || self.following_error.persistence_ms == 0
             || self.max_jerk.is_some_and(|j| !j.is_finite() || j <= 0.0) {
             return Err("Invalid control, temperature, following-error or jerk configuration".into());
+        }
+        if self.tx_stall_ticks == Some(0) {
+            return Err("tx_stall_ticks must be >= 1".into());
         }
         if let Some(cap) = self.planned_max_velocity {
             if !cap.is_finite() || cap <= 0.0 {
@@ -2318,6 +2335,7 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             damiao_gripper: Some(DamiaoGripperDrive::rebot_dm()),
+            tx_stall_ticks: None,
             speed_cap: None,
             // J1 backlash 0.28-0.30 deg (camera, real arm 2026-11-18): every saved-pose move and the
             // final grasp / place descent end from the same side (src/backlash.rs)

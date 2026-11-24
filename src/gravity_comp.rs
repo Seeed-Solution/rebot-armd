@@ -298,6 +298,10 @@ impl SupervisorInner {
     /// Leave the mode (API exit, stop, or a safety event). The arm is caught at the
     /// measured pose at once; the switch back to POS_VEL follows after `exit_hold_ms`.
     pub fn exit_gravity_comp(&mut self, code: &str, message: impl Into<String>) {
+        self.exit_gravity_comp_inner(code, message, true);
+    }
+
+    pub(crate) fn exit_gravity_comp_inner(&mut self, code: &str, message: impl Into<String>, write_now: bool) {
         let Some(run) = self.gravity_comp.as_mut() else { return; };
         if !run.phase.floating() { return; }
         let message = message.into();
@@ -313,7 +317,7 @@ impl SupervisorInner {
             self.commanded_velocities[i] = 0.0;
         }
         self.tracking.invalidate();
-        self.target_positions = self.commanded_positions.clone();
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
         let at = self.start_time.elapsed().as_secs_f64();
         if code == "REQUESTED" || code == "STOPPED" {
             tracing::info!("Gravity compensation exit: {code} {message}");
@@ -321,41 +325,118 @@ impl SupervisorInner {
             tracing::warn!("Gravity compensation exit: {code} {message}");
         }
         self.gravity_comp_last_exit = Some(GravityCompExit { code: code.into(), message, at });
-        self.gravity_comp_write_now();
-    }
-
-    /// Send this tick's gravity-comp targets immediately (exit paths outside the tick).
-    fn gravity_comp_write_now(&mut self) {
-        if !self.is_torqued || self.disable_pending { return; }
-        let Some(targets) = self.gravity_comp_targets() else { return; };
-        if let Some(d) = &self.driver {
-            if let Ok(mut drv) = d.lock() {
-                let r = if self.safety.state().is_stopped() {
-                    drv.write_estop_hold(&targets)
-                } else {
-                    drv.write_joint_targets(&targets)
-                };
-                if let Err(e) = r { tracing::error!("Gravity comp hold write failed: {e}"); }
-            }
+        if write_now {
+            self.gravity_comp_write_now();
         }
     }
 
-    /// Joint targets while the mode is on: MIT for J1-J6, position for the gripper.
-    pub fn gravity_comp_targets(&self) -> Option<Vec<JointTarget>> {
-        let run = self.gravity_comp.as_ref()?;
-        let mut targets: Vec<JointTarget> = (0..ARM)
-            .map(|i| JointTarget::mit(run.position[i], 0.0, run.kp[i], run.kd[i], run.tau_ff[i])).collect();
-        targets.push(JointTarget {
+    /// Send this tick's gravity-comp targets immediately (exit paths outside the tick),
+    /// routing the bounded result through the owner's output classifier.
+    fn gravity_comp_write_now(&mut self) {
+        let driver = self.driver.take();
+        let out = self.write_gravity_comp_immediate_with_driver(driver.as_ref(), false, false);
+        self.driver = driver;
+        let _ = self.classify_tick_output(out);
+    }
+
+    /// Shared immediate gravity-comp write using `scratch.targets` (0 alloc).
+    /// Callers pass `use_estop_hold` explicitly when the physical E-stop latch is already set
+    /// before `SafetyState::EStop` is installed, and `nonblocking = true` to preserve `try_lock`.
+    pub(crate) fn write_gravity_comp_immediate_with_driver(
+        &mut self,
+        driver: Option<&std::sync::Mutex<Box<dyn crate::driver::ArmDriver>>>,
+        use_estop_hold: bool,
+        nonblocking: bool,
+    ) -> crate::supervisor::TickOutput {
+        use crate::driver::TxBatchOutcome;
+        use crate::supervisor::TickOutput;
+        if !self.is_torqued || self.disable_pending { return TickOutput::None; }
+        let mut targets = std::mem::take(&mut self.scratch.targets);
+        let filled = self.gravity_comp_targets_into(&mut targets);
+        let out = if !filled {
+            TickOutput::None
+        } else if let Some(d) = driver {
+            let guard = if nonblocking { d.try_lock().ok() } else { d.lock().ok() };
+            if let Some(mut drv) = guard {
+                if drv.enable_state() == EnableState::Disabled {
+                    TickOutput::None
+                } else {
+                    let is_hold = use_estop_hold
+                        || self.safety.state().is_stopped()
+                        || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst);
+                    let write_res = if is_hold {
+                        drv.write_estop_hold(&targets).map(|()| TxBatchOutcome::Complete)
+                    } else {
+                        drv.write_joint_targets_bounded(&targets)
+                    };
+                    let now = drv.clock_now();
+                    let max_age = drv.tx_frame_max_age();
+                    match write_res {
+                        Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold },
+                        Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
+                            pending,
+                            now,
+                            max_age,
+                            oldest_age: drv.oldest_pending_tx_age(),
+                            is_hold,
+                            sent_any: true,
+                        },
+                        Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
+                            dropped,
+                            pending,
+                            now,
+                            max_age,
+                            oldest_age: drv.last_tx_expired_age(),
+                            is_hold,
+                            sent_any: false,
+                        },
+                        Err(e) => TickOutput::Error {
+                            message: e.to_string(),
+                            now,
+                            is_hold,
+                        },
+                    }
+                }
+            } else {
+                TickOutput::None
+            }
+        } else {
+            TickOutput::None
+        };
+        self.scratch.targets = targets;
+        out
+    }
+
+    /// Populate `out` with gravity-comp targets (MIT for J1-J6, position for gripper) without allocating.
+    pub(crate) fn gravity_comp_targets_into(&self, out: &mut Vec<JointTarget>) -> bool {
+        let Some(run) = self.gravity_comp.as_ref() else { return false; };
+        out.clear();
+        for i in 0..ARM {
+            out.push(JointTarget::mit(run.position[i], 0.0, run.kp[i], run.kd[i], run.tau_ff[i]));
+        }
+        out.push(JointTarget {
             position: self.commanded_positions[ARM],
             velocity: Some(self.commanded_velocities[ARM]),
             torque: Some(0.0), kp: None, kd: None,
         });
-        Some(targets)
+        true
+    }
+
+    /// Joint targets while the mode is on: MIT for J1-J6, position for the gripper.
+    pub fn gravity_comp_targets(&self) -> Option<Vec<JointTarget>> {
+        let mut targets = Vec::with_capacity(ARM + 1);
+        self.gravity_comp_targets_into(&mut targets).then_some(targets)
     }
 
     fn gravity_comp_exit_cause(&mut self, dt: f64) -> Option<(&'static str, String)> {
-        let run = self.gravity_comp.as_ref()?;
-        let policy = run.policy.clone();
+        let mut run = self.gravity_comp.take()?;
+        let cause = self.gravity_comp_exit_cause_inner(&mut run, dt);
+        self.gravity_comp = Some(run);
+        cause
+    }
+
+    fn gravity_comp_exit_cause_inner(&self, run: &mut GravityCompRun, dt: f64) -> Option<(&'static str, String)> {
+        let policy = &run.policy;
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
             return Some(("ESTOP", "E-stop".into()));
         }
@@ -382,7 +463,7 @@ impl SupervisorInner {
         if !self.feedback_numeric_valid || !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
             return Some(("FEEDBACK_STALE", format!("Feedback older than {} ms", policy.feedback_max_age_ms)));
         }
-        if let Some(msg) = self.gravity_comp_near_limit(&policy) { return Some(("GRAVITY_COMP_JOINT_LIMIT", msg)); }
+        if let Some(msg) = self.gravity_comp_near_limit(policy) { return Some(("GRAVITY_COMP_JOINT_LIMIT", msg)); }
         if run.phase == GravityCompPhase::RampIn {
             if let Some((i, d)) = (0..ARM).map(|i| (i, (self.measured_positions[i] - run.entry_pose[i]).abs()))
                 .find(|(_, d)| !d.is_finite() || *d > policy.ramp_max_deviation_rad) {
@@ -407,7 +488,6 @@ impl SupervisorInner {
             let limit = policy.directional_speed_limit(i, v, gravity.as_ref().map(|t| t[i]));
             if speed > limit && fastest.is_none_or(|(_, s, _)| speed > s) { fastest = Some((i, speed, limit)); }
         }
-        let run = self.gravity_comp.as_mut()?;
         run.prev_measured = Some(measured);
         match fastest {
             Some((i, speed, limit)) => {
@@ -422,46 +502,82 @@ impl SupervisorInner {
         None
     }
 
-    /// One control tick of the mode. Runs after the feedback read and the fault checks,
-    /// before the lease watchdog.
+    /// Pre-output control tick of gravity compensation (`RampIn` / `Active` only).
+    /// Runs after the feedback read and fault checks, before the lease watchdog.
+    /// `Exiting` / `ExitFailed` advance in [`Self::step_gravity_comp_exit`] AFTER this release's
+    /// stiff hold output completes cleanly.
     pub fn gravity_comp_tick(&mut self, dt: f64) {
         let Some(phase) = self.gravity_comp.as_ref().map(|r| r.phase.clone()) else { return; };
         match phase {
             GravityCompPhase::RampIn | GravityCompPhase::Active => {
                 if let Some((code, message)) = self.gravity_comp_exit_cause(dt) {
-                    self.exit_gravity_comp(code, message);
+                    self.exit_gravity_comp_inner(code, message, false);
                     return;
                 }
-                let Some(run) = self.gravity_comp.as_ref() else { return; };
-                let (policy, scale) = (run.policy.clone(), run.scale);
-                let Some(model) = self.gravity_comp_model_torque(&policy, scale) else {
-                    self.exit_gravity_comp("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed");
+                let Some(mut run) = self.gravity_comp.take() else { return; };
+                let model = self.gravity_comp_model_torque(&run.policy, run.scale);
+                let Some(model) = model else {
+                    self.gravity_comp = Some(run);
+                    self.exit_gravity_comp_inner("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed", false);
                     return;
                 };
                 let measured = arm6(&self.measured_positions);
-                let Some(run) = self.gravity_comp.as_mut() else { return; };
                 run.elapsed_s += dt;
                 let r = run.ramp();
                 for i in 0..ARM {
-                    let lim = policy.torque_limits_nm[i];
+                    let lim = run.policy.torque_limits_nm[i];
                     run.tau_ff[i] = ((1.0 - r) * run.entry_torque[i] + r * model[i]).clamp(-lim, lim);
-                    run.kp[i] = (1.0 - r) * policy.hold_kp[i];
-                    run.kd[i] = (1.0 - r) * policy.hold_kd[i] + r * run.damping_kd[i];
+                    run.kp[i] = (1.0 - r) * run.policy.hold_kp[i];
+                    run.kd[i] = (1.0 - r) * run.policy.hold_kd[i] + r * run.damping_kd[i];
                     run.position[i] = if r < 1.0 { run.entry_pose[i] } else { measured[i] };
                 }
                 if r >= 1.0 && run.phase == GravityCompPhase::RampIn {
                     run.phase = GravityCompPhase::Active;
                     tracing::info!("Gravity compensation ramp complete");
                 }
+                self.gravity_comp = Some(run);
                 // The hand moves the arm: the reference follows the measurement, so the
                 // tracking-error check sees no error from intended motion.
                 for i in 0..ARM {
                     self.commanded_positions[i] = measured[i];
                     self.commanded_velocities[i] = 0.0;
                 }
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
             }
             GravityCompPhase::Exiting { hold, elapsed_s } => {
+                // Once `exit_hold` of confirmed stiff holds has ALREADY completed on prior ticks
+                // and the arm is now stationary and fresh, complete the POS_VEL handback before
+                // this tick's output so tracking can validate and issue its baseline on the same tick.
+                let (exit_hold, max_age_ms, max_vel) = self.gravity_comp.as_ref().map_or((0.1, 100, 0.05), |r| {
+                    (r.policy.exit_hold_ms as f64 / 1000.0, r.policy.feedback_max_age_ms, r.policy.entry_max_velocity)
+                });
+                if elapsed_s + 1e-9 >= exit_hold {
+                    let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+                    let waiting_to_settle = tracking_active
+                        && self.feedback_numeric_valid
+                        && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms))
+                        && !self.gravity_comp_is_stationary(max_vel)
+                        && elapsed_s < exit_hold + 1.0;
+                    if !waiting_to_settle {
+                        self.gravity_comp_switch_back(hold);
+                    }
+                }
+            }
+            GravityCompPhase::ExitFailed { .. } => {}
+        }
+    }
+
+    /// Post-output advancement of gravity-comp exit handback (`Exiting` / `ExitFailed`).
+    /// `Exiting` advances ONLY when this release's stiff hold write completed (`Complete`),
+    /// preventing premature POS_VEL handback while stiff holds are skipped, deferred, or stalled.
+    pub(crate) fn step_gravity_comp_exit(&mut self, dt: f64, stiff_hold_completed: bool) {
+        let Some(phase) = self.gravity_comp.as_ref().map(|r| r.phase.clone()) else { return; };
+        match phase {
+            GravityCompPhase::RampIn | GravityCompPhase::Active => {}
+            GravityCompPhase::Exiting { hold, elapsed_s } => {
+                if !stiff_hold_completed && self.is_torqued && !self.disable_pending && !self.shutdown_committed {
+                    return;
+                }
                 let (exit_hold, max_age_ms, max_vel) = self.gravity_comp.as_ref().map_or((0.1, 100, 0.05), |r| {
                     (r.policy.exit_hold_ms as f64 / 1000.0, r.policy.feedback_max_age_ms, r.policy.entry_max_velocity)
                 });
@@ -485,6 +601,9 @@ impl SupervisorInner {
                 }
             }
             GravityCompPhase::ExitFailed { hold, retry_in_s } => {
+                if !stiff_hold_completed && self.is_torqued && !self.disable_pending {
+                    return;
+                }
                 let left = retry_in_s - dt;
                 if left > 0.0 {
                     if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::ExitFailed { hold, retry_in_s: left }; }

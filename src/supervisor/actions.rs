@@ -96,6 +96,7 @@ impl SupervisorInner {
 
     fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
         let now = self.now_s();
+        self.pending_deferred_done = None;
         // any new action ends a running macro (its orchestrator sees the record cancelled)
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
         #[cfg(feature = "policy-runtime")]
@@ -452,11 +453,25 @@ impl SupervisorInner {
         }
     }
 
+    /// True when macro action `id`'s current child owns either `active_trajectory` or a
+    /// pending deferred completion awaiting bus TX acceptance.
+    pub(super) fn macro_child_active_or_pending(&self, id: u64) -> bool {
+        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) {
+            return true;
+        }
+        let Some(ticket) = self.macro_run.as_ref().filter(|m| m.id == id).and_then(|m| m.ticket()) else {
+            return false;
+        };
+        self.pending_deferred_done.as_ref().is_some_and(|d| {
+            d.target == DeferredCompletionTarget::MacroSub { action_id: id, ticket }
+        })
+    }
+
     /// Stop the running sub-motion of macro action `id` where the arm is (J1..J6 commanded to
     /// the measured positions, the gripper keeps its command) and report it done to the
     /// orchestrator. False when no sub-motion of `id` is running.
     pub fn end_macro_motion_at_measured(&mut self, id: u64) -> bool {
-        if !self.macro_alive(id) || !self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { return false; }
+        if !self.macro_alive(id) || !self.macro_child_active_or_pending(id) { return false; }
         self.stop_motion();
         let n = self.measured_positions.len().min(self.commanded_positions.len()).min(6);
         if self.measured_positions[..n].iter().all(|q| q.is_finite()) {
@@ -543,7 +558,7 @@ impl SupervisorInner {
         let Some(m) = self.macro_run.as_ref() else { return false; };
         if m.stop_requested || m.sub != SubState::Running || !m.child.deadline.is_some_and(|d| now > d) { return false; }
         let id = m.id;
-        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        if self.macro_child_active_or_pending(id) { self.stop_motion(); }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
         let (code, message) = m.child.timeout.take().unwrap_or_else(|| ("TIMEOUT".into(), "Sub-motion did not finish in time".into()));
@@ -552,15 +567,16 @@ impl SupervisorInner {
         true
     }
 
-    /// The contact guard of the current macro child, once per tick while its motion runs:
+    /// The contact guard of the current macro child, once per tick while its motion runs
+    /// (including a final step awaiting deferred TX acceptance):
     /// peaks, and a residual above its joint's bound (0: unguarded) ends the child at the
     /// measured position, done (`stop_code` None, a descent meant to touch) or failed with
     /// `stop_code`.
-    fn step_macro_contact(&mut self) {
+    pub(super) fn step_macro_contact(&mut self) {
         let Some((id, guard)) = self.macro_run.as_ref()
             .filter(|m| !m.stop_requested && m.sub == SubState::Running)
             .and_then(|m| m.child.guard.map(|g| (m.id, g))) else { return; };
-        if !self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { return; }
+        if !self.macro_child_active_or_pending(id) { return; }
         let n = self.config.arm_dof().min(self.commanded_positions.len()).min(self.measured_positions.len());
         let trk = (0..n).map(|i| (self.commanded_positions[i] - self.measured_positions[i]).abs()).fold(0.0f32, f32::max);
         let residual = self.residual_torques;
@@ -1114,6 +1130,11 @@ impl SupervisorInner {
         let cause: Option<(&str, &str, String)> = match self.safety.state() {
             SafetyState::EStop => Some(("failed", "ESTOP_ACTIVE", "E-stop latched".into())),
             SafetyState::Fault(FaultReason::WatchdogTimeout) => Some(("failed", "WATCHDOG", "Lease watchdog expired".into())),
+            SafetyState::Fault(FaultReason::CanTxStalled) => Some((
+                "failed",
+                "CAN_TX_STALLED",
+                self.safety.fault().map_or_else(|| "CAN TX stalled".into(), |f| f.message),
+            )),
             SafetyState::Fault(r) => Some(("failed", "FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
             _ if !is_park && self.watchdog_park.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
             _ if lease_now != self.action_lease_generation => Some(("cancelled", "LEASE_LOST", "Control lease lost or released".into())),
@@ -1122,6 +1143,7 @@ impl SupervisorInner {
         if let Some((state, code, message)) = cause {
             // a macro sub-motion or a replay must not outlive its action
             if (is_macro || is_replay) && carried { self.stop_motion(); }
+            self.pending_deferred_done = None;
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
             #[cfg(feature = "policy-runtime")]
             if is_policy {
@@ -1129,6 +1151,7 @@ impl SupervisorInner {
                     "ESTOP_ACTIVE" => "ESTOP",
                     "WATCHDOG" => "WATCHDOG_TIMEOUT",
                     "LEASE_LOST" => "LEASE_LOST",
+                    "CAN_TX_STALLED" => "CAN_TX_STALLED",
                     _ => "FAULT",
                 };
                 self.terminate_policy_run(reason, state, Some(code), Some(message));
@@ -1146,13 +1169,27 @@ impl SupervisorInner {
             self.expire_macro_child(Instant::now());
         }
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
+        let pending_done_for_id = self.pending_deferred_done.as_ref().is_some_and(|d| {
+            matches!(
+                d.target,
+                DeferredCompletionTarget::Action(aid) | DeferredCompletionTarget::MacroSub { action_id: aid, .. }
+                    if aid == id
+            )
+        });
         if let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) {
             // between sub-motions the orchestrator owns the action; it ends here only when
             // something else took the arm or a stop arrived
-            if carried || self.zero_check_persisting == Some(id) { return; }
-            let superseded = self.active_trajectory.is_some() || self.servo_target.is_some();
+            let superseded = self.active_trajectory.is_some() && !carried || self.servo_target.is_some();
+            if superseded {
+                self.pending_deferred_done = None;
+                self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
+                return;
+            }
+            if carried || (pending_done_for_id && !run.stop_requested && run.sub == SubState::Running) || self.zero_check_persisting == Some(id) {
+                return;
+            }
             // a joint-space sub-motion (sequence pose step) settles before it counts as done
-            if !superseded && !run.stop_requested && run.sub == SubState::Running && self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
+            if !run.stop_requested && run.sub == SubState::Running && self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
                 if !tick_output_accepted { return; }
                 let (cmd, meas, vel) = (&self.commanded_positions, &self.measured_positions, &self.measured_velocities);
                 if let Some(settled) = self.quintic_settle.as_mut().and_then(|(_, settle)| settle.step(dt, cmd, meas, vel)) {
@@ -1163,9 +1200,7 @@ impl SupervisorInner {
                 }
                 return;
             }
-            let ended: Option<(&str, &str)> = if superseded {
-                Some(("cancelled", "SUPERSEDED"))
-            } else if run.sub == SubState::Running || run.stop_requested {
+            let ended: Option<(&str, &str)> = if run.sub == SubState::Running || run.stop_requested {
                 Some(("cancelled", "STOPPED"))
             } else { None };
             if let Some((state, code)) = ended { self.finish_action(id, state, Some(code), None, None, None, None); }
@@ -1180,18 +1215,20 @@ impl SupervisorInner {
             } else if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) {
                 self.finish_action(id, "done", None, None, None, None, None);
             } else if superseded {
+                self.pending_deferred_done = None;
                 self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
             } else {
                 self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park ended with torque still on".into()), None, None, None);
             }
             return;
         }
-        if carried || self.zero_check_persisting == Some(id) { return; }
+        if superseded {
+            self.pending_deferred_done = None;
+            self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
+            return;
+        }
+        if carried || pending_done_for_id || self.zero_check_persisting == Some(id) { return; }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
-            if superseded {
-                self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
-                return;
-            }
             if !tick_output_accepted { return; }
             let (cmd, meas, vel) = (&self.commanded_positions, &self.measured_positions, &self.measured_velocities);
             let result = self.quintic_settle.as_mut().and_then(|(_, settle)| settle.step(dt, cmd, meas, vel));
@@ -1200,17 +1237,13 @@ impl SupervisorInner {
             }
             return;
         }
-        if superseded {
-            self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
-        } else {
-            self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
-        }
+        self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
     }
 
     /// Apply one executor step of a Path / Gripper / Replay reference.
-    /// With tracking enabled, returns a deferred completion payload on `StepStatus::Done` so
-    /// `"done"` is only published after that tick's output has been validated and written
-    /// to the driver; with tracking off it publishes at once (e4f72b6) and returns None.
+    /// Always returns a deferred completion payload on `StepStatus::Done` (both tracking enabled
+    /// and disabled) so `"done"` and `releasing = false` are only published after that tick's
+    /// output is accepted (`Complete`) by the driver without an intervening stop or supersession.
     pub(super) fn apply_action_step(&mut self, action_id: Option<u64>, mut out: StepOut) -> Option<DeferredActionDone> {
         // swap: the previous command's vectors go back to the scratch for the next step
         std::mem::swap(&mut self.commanded_positions, &mut out.positions);
@@ -1230,32 +1263,31 @@ impl SupervisorInner {
         match status {
             StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
-                if !self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
-                    // Tracking off: publish completion now, before this tick's driver write,
-                    // exactly as before joint tracking (e4f72b6).
-                    if self.releasing && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_))) {
-                        self.releasing = false;
-                        self.held = None;
-                    }
-                    self.active_trajectory = None;
-                    self.commanded_velocities.fill(0.0);
-                    crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
-                    if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
-                    if macro_sub {
-                        if let Some(m) = self.macro_run.as_mut() {
-                            m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
-                        }
-                    } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
-                    return None;
-                }
                 let clear_releasing = self.releasing
                     && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
+                let target = if macro_sub {
+                    match (action_id, self.macro_run.as_ref().and_then(|m| m.ticket())) {
+                        (Some(id), Some(ticket)) => DeferredCompletionTarget::MacroSub { action_id: id, ticket },
+                        (Some(id), None) => DeferredCompletionTarget::Action(id),
+                        (None, _) => DeferredCompletionTarget::Anonymous,
+                    }
+                } else if let Some(id) = action_id {
+                    DeferredCompletionTarget::Action(id)
+                } else if self.pending_normal_unload {
+                    match self.park_release {
+                        Some(phase) => DeferredCompletionTarget::ParkRelease(phase),
+                        None => DeferredCompletionTarget::Anonymous,
+                    }
+                } else {
+                    DeferredCompletionTarget::Anonymous
+                };
                 self.active_trajectory = None;
                 self.commanded_velocities.fill(0.0);
-                self.target_positions = self.commanded_positions.clone();
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                 Some(DeferredActionDone {
-                    action_id,
-                    macro_sub,
+                    target,
+                    epoch_id: self.safety.epoch_id(),
+                    lease_generation: self.active_lease.as_ref().map(|l| l.generation),
                     settled,
                     holding,
                     gripper_gap_rad,

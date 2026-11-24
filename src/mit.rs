@@ -672,30 +672,26 @@ impl crate::supervisor::SupervisorInner {
         Ok((JointTarget::mit(q_w, v_w, kp_w, kd_w, tau), tau))
     }
 
-    /// Write one output batch (every ordinary output path). Without MIT: the driver write,
-    /// unchanged. With MIT active: the owned joints get MIT frames ([`Self::mit_prepare`]); the
-    /// feed-forward history advances only after a successful flush; a failed write cancels the
-    /// group. MIT lost: nothing is written (None).
-    pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), String>> {
-        self.write_output_slice(&mut targets, dt, None)
-    }
-
-    /// [`Self::write_output`] with explicit active joint limits (used by rejection-fallback braking
-    /// before `tracking.fallback_ramp` is installed).
-    pub(crate) fn write_output_with_limits(
-        &mut self,
-        mut targets: Vec<JointTarget>,
-        dt: f64,
-        limits: &[crate::model::JointLimit],
-    ) -> Option<Result<(), String>> {
-        self.write_output_slice(&mut targets, dt, Some(limits))
-    }
-
-    /// [`Self::write_output`] of the targets in the tick's scratch (`scratch.targets`, filled by
-    /// the caller): no allocation for the ordinary position output.
-    pub(crate) fn write_output_scratch(&mut self, dt: f64) -> Option<Result<(), String>> {
+    /// Write one output batch (every ordinary output path). Without MIT: the bounded driver write
+    /// (distinguishing `Complete`, transient `Deferred`, `Expired`, and hard `Error`). With MIT
+    /// active: the owned joints get MIT frames ([`Self::mit_prepare`]); the feed-forward history
+    /// advances only after `Complete`; any non-`Complete` cancels the group. MIT lost: `None`.
+    pub(crate) fn write_output_scratch(&mut self, dt: f64) -> crate::supervisor::TickOutput {
         let mut targets = std::mem::take(&mut self.scratch.targets);
         let r = self.write_output_slice(&mut targets, dt, None);
+        self.scratch.targets = targets;
+        r
+    }
+
+    /// [`Self::write_output_scratch`] with explicit active joint limits (used by rejection-fallback
+    /// braking before `tracking.fallback_ramp` is installed, reusing `scratch.targets` with 0 alloc).
+    pub(crate) fn write_output_scratch_with_limits(
+        &mut self,
+        dt: f64,
+        limits: &[crate::model::JointLimit],
+    ) -> crate::supervisor::TickOutput {
+        let mut targets = std::mem::take(&mut self.scratch.targets);
+        let r = self.write_output_slice(&mut targets, dt, Some(limits));
         self.scratch.targets = targets;
         r
     }
@@ -737,16 +733,23 @@ impl crate::supervisor::SupervisorInner {
         targets: &mut [JointTarget],
         dt: f64,
         override_limits: Option<&[crate::model::JointLimit]>,
-    ) -> Option<Result<(), String>> {
+    ) -> crate::supervisor::TickOutput {
+        use crate::driver::TxBatchOutcome;
+        use crate::supervisor::TickOutput;
         // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
         // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
-        if self.urgent_stop_unapplied() { return None; }
+        if self.urgent_stop_unapplied() { return TickOutput::None; }
+        let is_hold = self.safety.state().is_stopped();
         let ff = match self.mit.owner {
             MitOwner::Off => None,
-            MitOwner::Lost => return None,
+            MitOwner::Lost => return TickOutput::None,
             MitOwner::Active => match self.mit_prepare(targets, dt) {
                 Ok(ff) => Some(ff),
-                Err(e) => return Some(Err(format!("MIT output refused: {e}"))),
+                Err(e) => return TickOutput::Error {
+                    message: format!("MIT output refused: {e}"),
+                    now: self.mit_now(),
+                    is_hold,
+                },
             },
         };
         let active_pf_ceiling = self.config.gripper_index().and_then(|g| {
@@ -794,21 +797,56 @@ impl crate::supervisor::SupervisorInner {
                         }
                     }
                 }
-                let write_res = if self.safety.state().is_stopped() {
-                    drv.write_estop_hold(targets)
+                let write_res = if is_hold {
+                    drv.write_estop_hold(targets).map(|()| TxBatchOutcome::Complete)
                 } else {
-                    drv.write_joint_targets(targets)
+                    drv.write_joint_targets_bounded(targets)
                 };
-                write_res.map_err(|e| e.to_string())
-            });
+                let now = drv.clock_now();
+                let max_age = drv.tx_frame_max_age();
+                match write_res {
+                    Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold },
+                    Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
+                        pending,
+                        now,
+                        max_age,
+                        oldest_age: drv.oldest_pending_tx_age(),
+                        is_hold,
+                        sent_any: true,
+                    },
+                    Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
+                        dropped,
+                        pending,
+                        now,
+                        max_age,
+                        oldest_age: drv.last_tx_expired_age(),
+                        is_hold,
+                        sent_any: false,
+                    },
+                    Err(e) => TickOutput::Error {
+                        message: e.to_string(),
+                        now,
+                        is_hold,
+                    },
+                }
+            })
+            .unwrap_or(TickOutput::None);
         if let Some(ff) = ff {
             match &res {
-                Some(Ok(())) => {
+                TickOutput::Complete { .. } => {
                     self.mit.last_ff = ff;
                     self.mit.last_output = Some(self.mit_now());
                 }
-                Some(Err(e)) => self.mit_lose(format!("MIT batch write failed: {e}"), crate::safety::FaultCode::BusLoss),
-                None => {}
+                TickOutput::Error { message, .. } => {
+                    self.mit_lose(format!("MIT batch write failed: {message}"), crate::safety::FaultCode::BusLoss);
+                }
+                TickOutput::Deferred { pending, .. } => {
+                    self.mit_lose(format!("MIT batch write deferred ({pending} frames queued)"), crate::safety::FaultCode::BusLoss);
+                }
+                TickOutput::Expired { dropped, .. } => {
+                    self.mit_lose(format!("MIT batch write expired ({dropped} frames dropped)"), crate::safety::FaultCode::BusLoss);
+                }
+                TickOutput::None => {}
             }
         }
         res

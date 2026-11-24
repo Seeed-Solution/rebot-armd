@@ -659,22 +659,32 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
     assert_eq!((m.frames, m.dropped_stale, m.pending), (1, 2, 0));
     assert_eq!(bus.with(|s| s.tx_accepted.iter().map(|f| f.id).collect::<Vec<_>>()), vec![0x105]);
 
-    // A stalled single transmit pushing the current batch past 45 ms must fail closed (Timeout),
-    // never falsely reporting Complete after dropping the remaining frames as stale.
+    // A stalled single transmit pushing the current batch past 45 ms must fail closed uniformly as
+    // Expired { dropped: 6, pending: 0 } (never falsely reporting Complete), while legacy
+    // write_joint_targets maps Expired to Timeout.
     let (mut d, bus, _) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(100), frame_max_age: ms(45) });
     bus.with(|s| s.tx_script.push_back((TxRule::Ok, ms(45))));
     reset_tx_metrics();
-    let err = d.write_joint_targets_bounded(&targets_const(0.3)).unwrap_err();
-    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.3)).unwrap(),
+        TxBatchOutcome::Expired { dropped: 6, pending: 0 }
+    );
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.dropped_stale, m.pending), (1, 6, 0));
+
+    let (mut d, bus, _) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(100), frame_max_age: ms(45) });
+    bus.with(|s| s.tx_script.push_back((TxRule::Ok, ms(45))));
+    let err = d.write_joint_targets(&targets_const(0.3)).unwrap_err();
+    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
 }
 
 #[test]
 fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
     // Part A: defer 3 frames, advance 45 ms, raise budget, submit a fresh full 7-joint batch ->
-    // write_joint_targets_bounded MUST return Expired { dropped: 3, pending: 0 }, never Complete.
+    // write_joint_targets_bounded fails closed immediately with Expired { dropped: 3, pending: 0 }
+    // and sends ZERO replacement motion frames in the same tick.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
     assert_eq!(
@@ -690,33 +700,18 @@ fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
     assert_eq!(
         out,
         TxBatchOutcome::Expired { dropped: 3, pending: 0 },
-        "fresh write after carried-over expiry must not report Complete"
+        "fresh write after carried-over expiry must fail closed as Expired"
     );
     assert_eq!(d.pending_tx_len(), 0);
-    let sent_ids: Vec<(u32, f32)> = bus.with(|s| {
-        s.tx_accepted
-            .iter()
-            .map(|f| (f.id, pos_vel_target_rad(f)))
-            .collect()
-    });
-    assert_eq!(
-        sent_ids,
-        vec![
-            (0x101, -0.25),
-            (0x102, -0.25),
-            (0x103, -0.25),
-            (0x104, -0.25),
-            (0x105, -0.25),
-            (0x106, -0.25),
-            (0x107, -0.25),
-        ],
-        "fresh batch transmits all 7 current targets after dropping expired carry-over"
+    assert!(
+        bus.with(|s| s.tx_accepted.is_empty()),
+        "expired motion carry-over must not transmit replacement motion targets"
     );
     let m = take_tx_metrics();
-    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (7, 3, 0, 0));
+    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (0, 3, 0, 0));
 
-    // Part B: same expired carry-over followed by a fresh batch under constrained budget (max_frames = 4) ->
-    // reports Expired { dropped: 3, pending: 3 } so both stale loss and remaining pending count are visible.
+    // Part B: same expired carry-over under constrained budget (max_frames = 4) ->
+    // fails closed with Expired { dropped: 3, pending: 0 } and zero replacement sends.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
     assert_eq!(
@@ -729,14 +724,15 @@ fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
     d.begin_tx_tick();
     assert_eq!(
         d.write_joint_targets_bounded(&targets_const(-0.25)).unwrap(),
-        TxBatchOutcome::Expired { dropped: 3, pending: 3 }
+        TxBatchOutcome::Expired { dropped: 3, pending: 0 }
     );
-    assert_eq!(d.pending_tx_len(), 3);
+    assert_eq!(d.pending_tx_len(), 0);
+    assert!(bus.with(|s| s.tx_accepted.is_empty()));
     let m = take_tx_metrics();
-    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (4, 3, 3, 3));
+    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (0, 3, 0, 0));
 
-    // Part C: under legacy write_joint_targets, expired carry-over followed by a fresh full batch
-    // maps Expired -> Err(TransportError::Timeout) (never Ok(())).
+    // Part C: under legacy write_joint_targets, expired carry-over maps Expired -> Timeout
+    // with zero replacement sends.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
     assert_eq!(
@@ -754,8 +750,9 @@ fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
         "legacy write_joint_targets must map Expired carry-over to Timeout: {err:?}"
     );
     assert_eq!(d.pending_tx_len(), 0);
+    assert!(bus.with(|s| s.tx_accepted.is_empty()));
     let m = take_tx_metrics();
-    assert_eq!((m.frames, m.dropped_stale, m.pending), (7, 3, 0));
+    assert_eq!((m.frames, m.dropped_stale, m.pending), (0, 3, 0));
 }
 
 #[test]
@@ -1113,33 +1110,76 @@ fn legacy_supervisor_fails_closed_on_backpressured_final_release_batch() {
         .expect("start gripper open");
 
     // Inject ENOBUFS on every transmit on the final tick where the gripper open reaches Done.
+    // Tick 1 & 2 defer without faulting and MUST NOT mark the release done or clear releasing;
+    // Tick 3 hits the 3-tick stall threshold (50 Hz default) and latches CAN_TX_STALLED.
     bus.with(|s| {
         s.push_all_feedback();
         s.default_rule = TxRule::Enobufs;
     });
     inner.tick(0.02);
-
     assert!(
-        matches!(inner.safety.state(), SafetyState::Fault(_)),
-        "legacy bridge must fail closed on deferred TX: {:?}",
+        !inner.safety.state().is_stopped(),
+        "transient ENOBUFS deferral on tick 1 must carry over without faulting: {:?}",
         inner.safety.state()
     );
-    assert_eq!(inner.safety.fault().map(|f| f.code), Some(FaultCode::DriverWriteFailed));
+    assert_eq!(inner.last_action.as_ref().unwrap().state, "running");
+    assert!(inner.releasing, "deferred final release must not clear releasing flag");
+
+    bus.with(|s| s.push_all_feedback());
+    inner.tick(0.02);
+    assert!(
+        !inner.safety.state().is_stopped(),
+        "second deferred tick must still wait for stall threshold: {:?}",
+        inner.safety.state()
+    );
+    assert_eq!(inner.last_action.as_ref().unwrap().state, "running");
+    assert!(inner.releasing);
+
+    bus.with(|s| s.push_all_feedback());
+    inner.tick(0.02);
+    assert!(
+        matches!(inner.safety.state(), SafetyState::Fault(armd::safety::FaultReason::CanTxStalled)),
+        "sustained deferral past stall threshold must latch CAN_TX_STALLED: {:?}",
+        inner.safety.state()
+    );
+    assert_eq!(inner.safety.fault().map(|f| f.code), Some(FaultCode::CanTxStalled));
     let action = inner.last_action.as_ref().unwrap();
     assert_ne!(action.state, "done", "backpressured final release must not report done: {action:?}");
+    assert_eq!(action.code.as_deref(), Some("CAN_TX_STALLED"));
     assert!(inner.releasing, "backpressured final release must not clear releasing flag");
 }
 
 #[test]
 fn wrapper_default_bounded_write_fails_closed_and_flush_estop_drops_pending() {
-    // Part A: ZeroOffsetDriver uses ArmDriver::write_joint_targets_bounded default impl.
-    // Because DamiaoArmDriver::write_joint_targets discards pending frames on TxDeferred,
-    // the default impl must propagate Err(TxDeferred) instead of falsely returning Ok(Deferred).
+    // Part A1: ZeroOffsetDriver overrides write_joint_targets_bounded and preserves carryover cleanly.
     let (mut d, bus, _clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 3, max_duration: ms(5), frame_max_age: ms(45) });
     let mut wrapped = armd::joint_zero::ZeroOffsetDriver::new(Box::new(d), &[0.0; 7]);
     reset_tx_metrics();
-    let err = wrapped.write_joint_targets_bounded(&targets_const(0.2)).unwrap_err();
+    assert_eq!(
+        wrapped.write_joint_targets_bounded(&targets_const(0.2)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 4 }
+    );
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.deferred, m.dropped_stopped, m.pending), (3, 4, 0, 4));
+    assert_eq!(bus.with(|s| s.tx_accepted.len()), 3);
+
+    // Part A2: A wrapper that does NOT override ArmDriver::write_joint_targets_bounded falls back
+    // to write_joint_targets, which discards pending frames and propagates Err(TxDeferred).
+    struct DefaultBoundedWrapper(Box<dyn ArmDriver>);
+    impl ArmDriver for DefaultBoundedWrapper {
+        fn capabilities(&self) -> armd::driver::DriverCapabilities { self.0.capabilities() }
+        fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, ArmDriverError> { self.0.read_joint_states() }
+        fn write_joint_targets(&mut self, t: &[JointTarget]) -> Result<(), ArmDriverError> { self.0.write_joint_targets(t) }
+        fn set_torque(&mut self, e: bool) -> Result<(), ArmDriverError> { self.0.set_torque(e) }
+        fn enable_state(&self) -> armd::driver::EnableState { self.0.enable_state() }
+        fn clear_fault(&mut self) -> Result<(), ArmDriverError> { self.0.clear_fault() }
+    }
+    let (mut d, bus, _clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 3, max_duration: ms(5), frame_max_age: ms(45) });
+    let mut default_wrapped = DefaultBoundedWrapper(Box::new(d));
+    reset_tx_metrics();
+    let err = default_wrapped.write_joint_targets_bounded(&targets_const(0.2)).unwrap_err();
     assert!(matches!(err, ArmDriverError::TxDeferred { pending: 4 }), "{err:?}");
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.deferred, m.dropped_stopped, m.pending), (3, 4, 4, 0));
@@ -1459,7 +1499,8 @@ fn preflight_rejection_trips_mit_fence_and_clears_pending_queue() {
 fn frames_expiring_during_flush_drop_stale_and_return_timeout() {
     // Frame 0 succeeds, frame 1 hits WouldBlock, then successful flush() advances clock to 45 ms:
     // remaining 6 current-batch frames expire during flush -> dropped as stale, queue empty,
-    // and write_joint_targets_bounded fails closed with Timeout (never returning Deferred).
+    // and write_joint_targets_bounded reports Expired { dropped: 6, pending: 0 } uniformly
+    // (never Deferred), while legacy write_joint_targets maps Expired to Timeout.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
     let clock_hook = clock.clone();
@@ -1471,11 +1512,26 @@ fn frames_expiring_during_flush_drop_stale_and_return_timeout() {
         }));
     });
     reset_tx_metrics();
-    let err = d.write_joint_targets_bounded(&targets_const(0.3)).unwrap_err();
-    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.3)).unwrap(),
+        TxBatchOutcome::Expired { dropped: 6, pending: 0 }
+    );
     assert_eq!(d.pending_tx_len(), 0, "expired frames must not remain queued after flush");
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.would_block, m.dropped_stale, m.pending), (1, 1, 6, 0));
+
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
+    let clock_hook = clock.clone();
+    bus.with(|s| {
+        s.tx_script.push_back((TxRule::Ok, Duration::ZERO));
+        s.tx_script.push_back((TxRule::WouldBlock, Duration::ZERO));
+        s.on_flush = Some(Arc::new(move || {
+            clock_hook.advance(ms(45));
+        }));
+    });
+    let err = d.write_joint_targets(&targets_const(0.3)).unwrap_err();
+    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
 }
 
 #[test]

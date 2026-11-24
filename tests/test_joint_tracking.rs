@@ -4186,12 +4186,12 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "samples one period apart are evidence");
 }
 
-/// Review 4 #4: with tracking off (absent or disabled) a Path/Gripper/Replay action's
-/// `done` is published during stepping, before that tick's driver write, as in e4f72b6:
-/// a write failure on the final tick leaves the action `done` and latches
-/// DriverWriteFailed. Earlier ticks report `running`.
+/// With bounded TX deferral active on both tracking-on and tracking-off paths, a
+/// Path/Gripper/Replay action's `done` is gated on that tick's driver write completing:
+/// a write failure on the final tick fails the action and latches DriverWriteFailed
+/// instead of falsely reporting `done`. Earlier ticks report `running`.
 #[test]
-fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
+fn tracking_off_action_done_waits_for_final_tick_write_acceptance() {
     for jt in [None, Some(JointTrackingConfig::rebot_dm())] {
         let label = if jt.is_some() { "tracking disabled" } else { "tracking none" };
         let make_rig = || {
@@ -4230,7 +4230,7 @@ fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
         let obs = inner.tick(DT);
         let act = obs.action.expect("action status");
         assert_eq!(act.id, id);
-        assert_eq!(act.state, "done", "{label}: e4f72b6 publishes done before the failed final-tick write");
+        assert_eq!(act.state, "failed", "{label}: failed final-tick write must not report done");
         assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(FaultCode::DriverWriteFailed), "{label}: {:?}", obs.fault);
     }
 }
