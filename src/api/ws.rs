@@ -1169,6 +1169,7 @@ impl ConnectionTasks {
 struct QueuedOrdinary {
     value: Value,
     stamp: crate::supervisor::AdmissionStamp,
+    received_at: std::time::Instant,
 }
 
 struct OrdinaryQueueInner {
@@ -1198,7 +1199,7 @@ impl OrdinaryQueue {
         if g.closed || g.items.len() >= ORDINARY_IN_CAPACITY {
             return Err(value);
         }
-        g.items.push_back(QueuedOrdinary { value, stamp });
+        g.items.push_back(QueuedOrdinary { value, stamp, received_at: std::time::Instant::now() });
         drop(g);
         self.notify.notify_one();
         Ok(())
@@ -2417,7 +2418,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     None => break,
                 }
             };
-            let QueuedOrdinary { value, stamp } = queued;
+            let QueuedOrdinary { value, stamp, received_at } = queued;
             let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
             let (frame_kind, entry) = dispatch::classify(&value);
             // Fail closed before any legacy lock/reader path (including depth/teach) whenever
@@ -2498,6 +2499,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         let mut ctx = OwnerDispatchCtx {
                             inner: &mut inner,
                             stamp,
+                            received_at,
                             path: $path,
                             value: &value,
                             epoch: $epoch,

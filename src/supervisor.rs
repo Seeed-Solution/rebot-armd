@@ -1167,6 +1167,14 @@ pub struct SupervisorInner {
     pub(crate) park_continuation: Option<ParkContinuation>,
     /// Off-RT waiter notification for legacy WS park continuations (never touched on `rt_executor_owned`).
     pub(crate) park_continuation_notify: Arc<tokio::sync::Notify>,
+    /// Non-zero boot identity for this supervisor instance (`BootId::process()` on legacy,
+    /// replaced with `ExecutorConfig::boot` when transferred to the RT executor).
+    pub(crate) boot_id: crate::rt_core::broker::BootId,
+    /// Bounded planning deadline applied to off-lock legacy WS and `ArmSupervisor::{jog,home}` plans.
+    pub(crate) motion_plan_deadline: Duration,
+    /// Last executor/release clock instant observed on `tick_control_with_deadline` or transition wake,
+    /// mirrored into `RtSample.clock_now` so off-RT snapshots inherit the owner's exact clock origin.
+    pub(crate) last_clock_now: Option<Instant>,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -1808,6 +1816,9 @@ impl SupervisorInner {
             last_poll_feedback_valid: false,
             park_continuation: None,
             park_continuation_notify: Arc::new(tokio::sync::Notify::new()),
+            boot_id: crate::rt_core::broker::BootId::process(),
+            motion_plan_deadline: crate::rt_core::requests::motion::DEFAULT_MOTION_PLAN_DEADLINE,
+            last_clock_now: None,
         };
         inner.prepare_workspace_eval_bufs();
         inner.prepare_park_release_spare();
@@ -2421,11 +2432,14 @@ impl SupervisorInner {
         if let Some(ref hook) = self.before_publish_hook {
             hook();
         }
+        let clock_now = self.last_clock_now.unwrap_or(sampled_at);
         let meta = crate::rt_core::publish::RtMotionMeta {
+            boot_id: self.boot_id,
+            clock_now: Some(clock_now),
             workspace_revision: self.workspace_revision,
             motion_config_revision: self.motion_config_revision,
-            stop_generation: self.current_stop_gen(),
-            lease_generation: self.current_active_lease_gen(),
+            stop_generation: self.stop_requests.as_ref().map_or_else(|| self.current_stop_gen(), |s| s.applied()),
+            lease_generation: self.lease_valid_at(clock_now).map_or(0, |l| l.generation),
             config_inhibited: self.core.motion_inhibited_by_config(),
             calibration_busy: self.calibration_busy,
             holding_after_clear: self.holding_after_clear(),
@@ -2879,6 +2893,14 @@ impl SupervisorInner {
     }
 
     pub fn park_continuation(&self) -> Option<ParkContinuation> { self.park_continuation }
+
+    /// Non-zero boot identity of this supervisor/executor instance.
+    pub fn boot_id(&self) -> crate::rt_core::broker::BootId { self.boot_id }
+
+    /// Overrides the bounded planning deadline for legacy off-lock jog/home/park requests.
+    pub fn set_motion_plan_deadline(&mut self, deadline: Duration) {
+        self.motion_plan_deadline = deadline;
+    }
 
     pub(crate) fn notify_park_continuation(&self) {
         if !self.rt_executor_owned { self.park_continuation_notify.notify_waiters(); }
@@ -4355,6 +4377,9 @@ impl SupervisorInner {
     }
 
     fn tick_control_inner(&mut self, dt: f64, release_bound: Option<(Instant, Instant)>) -> f64 {
+        if let Some((now, _)) = release_bound {
+            self.last_clock_now = Some(now);
+        }
         let applied_tx_cap = if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.lock() {
                 let drv_now = drv.clock_now();
@@ -7738,6 +7763,13 @@ impl ArmSupervisor {
         }
     }
 
+    pub async fn set_motion_plan_deadline(&self, deadline: Duration) {
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.set_motion_plan_deadline(deadline);
+        }
+    }
+
     async fn run_prepared_motion(
         &self,
         stamp: AdmissionStamp,
@@ -7746,10 +7778,11 @@ impl ArmSupervisor {
     ) -> Result<u64, ArmError> {
         use crate::rt_core::requests::motion as req;
         const MAX_RETRIES: usize = 5;
+        let request_at = Instant::now();
         let mut snapshot = {
             let inner = self.inner.read().await;
             self.check_legacy_under_guard(&inner)?;
-            req::preflight_motion_request(&inner, stamp, &request, epoch_id)?
+            req::preflight_motion_request_at(&inner, stamp, &request, epoch_id, request_at)?
         };
         for attempt in 0..MAX_RETRIES {
             let (snap_plan, req_plan) = (snapshot.clone(), request.clone());
@@ -7759,7 +7792,6 @@ impl ArmSupervisor {
             let mut inner = self.inner.write().await;
             self.check_legacy_under_guard(&inner)?;
             if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-            inner.preflight_admission(stamp)?;
             let plan = prepared?;
             let res = match request.kind {
                 req::MotionKind::Jog => req::install_jog(&mut inner, stamp, &plan.slot, plan.heap_traj, epoch_id, false),
@@ -7769,7 +7801,10 @@ impl ArmSupervisor {
             match res {
                 Ok(installed) => return Ok(installed.epoch()),
                 Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_RETRIES => {
-                    let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, snapshot.config) else {
+                    if Instant::now() > snapshot.authority.deadline {
+                        return Err(req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, epoch_id));
+                    }
+                    let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, &snapshot) else {
                         return Err(req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, epoch_id));
                     };
                     snapshot = next;

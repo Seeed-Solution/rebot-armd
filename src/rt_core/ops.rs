@@ -587,6 +587,8 @@ pub trait CoreOps {
     /// Current local monotonic observation timestamp (seconds), used when publishing after
     /// a sub-release transition wake before delivering its terminal.
     fn now_timestamp(&self) -> f64 { 0.0 }
+    /// Associates the executor's non-zero boot identity with the owner core.
+    fn set_boot_id(&mut self, _boot: BootId) {}
 }
 
 /// Diagnostic fields recorded on the RT thread when an authorized stop arrives during a
@@ -710,6 +712,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
         "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED", "TERMINALS_BUSY", "STAMP_REUSED",
+        "WRONG_TARGET", "DEADLINE_EXPIRED",
     ];
     match &e {
         ArmError::Motion(m) => m.code(),
@@ -741,7 +744,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
 
 impl SupervisorInner {
     /// The lease valid at `now` (its generation names its holder).
-    fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
+    pub(crate) fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
         self.active_lease.as_ref().filter(|l| now.saturating_duration_since(l.acquired_at) < self.lease_timeout)
     }
 
@@ -1148,6 +1151,7 @@ impl CoreOps for SupervisorInner {
     }
 
     fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        self.last_clock_now = Some(budget.now);
         let trans = self.service_torque_transition(budget);
         let mut park_wake = None;
         let mut park_state_changed = false;
@@ -1217,6 +1221,10 @@ impl CoreOps for SupervisorInner {
 
     fn now_timestamp(&self) -> f64 {
         self.now_s()
+    }
+
+    fn set_boot_id(&mut self, boot: BootId) {
+        self.boot_id = boot;
     }
 }
 
@@ -1767,11 +1775,12 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// [`Self::new`] driven by a caller-supplied shared [`VirtualClock`].
     pub fn new_with_clock(
-        core: O,
+        mut core: O,
         boot: BootId,
         caps: Capacities,
         clock: VirtualClock,
     ) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        core.set_boot_id(boot);
         let (engine, broker, tw, stop) = ReleaseEngine::new(boot, caps);
         (Self { core, engine, clock, dt: 0.02 }, broker, tw, stop)
     }

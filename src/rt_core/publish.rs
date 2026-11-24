@@ -46,8 +46,10 @@ pub struct SampleMeta {
 }
 
 /// Scalar motion/authority metadata published alongside [`RtSample`] (Copy, 0 alloc on RT).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtMotionMeta {
+    pub boot_id: super::broker::BootId,
+    pub clock_now: Option<Instant>,
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
     pub stop_generation: u64,
@@ -57,8 +59,24 @@ pub struct RtMotionMeta {
     pub holding_after_clear: bool,
 }
 
+impl Default for RtMotionMeta {
+    fn default() -> Self {
+        Self {
+            boot_id: super::broker::BootId(0),
+            clock_now: None,
+            workspace_revision: 0,
+            motion_config_revision: 0,
+            stop_generation: 0,
+            lease_generation: 0,
+            config_inhibited: false,
+            calibration_busy: false,
+            holding_after_clear: false,
+        }
+    }
+}
+
 /// Per-joint feedback and motion-planning state of a sample; every vector has the profile's dof.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RtSample {
     pub positions: Vec<f32>,
     pub velocities: Vec<f32>,
@@ -67,6 +85,8 @@ pub struct RtSample {
     pub feedback_instants: Vec<Option<Instant>>,
     /// Per-joint count of distinct feedback samples.
     pub feedback_seqs: Vec<u64>,
+    pub boot_id: super::broker::BootId,
+    pub clock_now: Option<Instant>,
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
     pub stop_generation: u64,
@@ -74,6 +94,10 @@ pub struct RtSample {
     pub config_inhibited: bool,
     pub calibration_busy: bool,
     pub holding_after_clear: bool,
+}
+
+impl Default for RtSample {
+    fn default() -> Self { Self::with_dof(0) }
 }
 
 impl RtSample {
@@ -84,6 +108,8 @@ impl RtSample {
             commanded_velocities: Vec::with_capacity(dof),
             feedback_instants: Vec::with_capacity(dof),
             feedback_seqs: Vec::with_capacity(dof),
+            boot_id: super::broker::BootId(0),
+            clock_now: None,
             workspace_revision: 0,
             motion_config_revision: 0,
             stop_generation: 0,
@@ -239,6 +265,8 @@ impl StatePublisher {
         copy_into(&mut slot.rt.commanded_velocities, rt.commanded_velocities);
         copy_into(&mut slot.rt.feedback_instants, rt.feedback_instants);
         copy_into(&mut slot.rt.feedback_seqs, rt.feedback_seqs);
+        slot.rt.boot_id = rt.meta.boot_id;
+        slot.rt.clock_now = rt.meta.clock_now;
         slot.rt.workspace_revision = rt.meta.workspace_revision;
         slot.rt.motion_config_revision = rt.meta.motion_config_revision;
         slot.rt.stop_generation = rt.meta.stop_generation;

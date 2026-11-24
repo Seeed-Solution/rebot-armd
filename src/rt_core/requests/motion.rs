@@ -7,14 +7,14 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::driver::DriverCapabilities;
 use crate::kinematics::{WORKSPACE_EPS, WORKSPACE_PARK_ESCAPE_EPS};
 use crate::model::{ArmConfig, JointLimit, WorkspacePolicy};
 use crate::motion::{ActiveTrajectory, MotionError};
 use crate::power::{PowerBudget, PowerHold};
-use crate::rt_core::broker::{ActionId, Descriptor};
+use crate::rt_core::broker::{ActionId, BootId, Descriptor};
 use crate::rt_core::mailbox::MAX_DOF;
 use crate::rt_core::ops::{CommitCtx, Committed, PlanSlot, Primitive};
 use crate::rt_core::publish::Snapshot;
@@ -32,6 +32,20 @@ use crate::trajectory::{
 const EXACT_START_TOL: f32 = 1e-6;
 const PARK_DURATION_S: f64 = 1.5;
 const PARK_EXTRA_DURATION_S: f64 = 0.8;
+/// Default bounded planning deadline applied from request entry on legacy WS and direct
+/// `ArmSupervisor::{jog,home}` requests (and as default for `MotionPlanSnapshot::from_published`).
+pub const DEFAULT_MOTION_PLAN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Request-time authority & bounded deadline carried by a prepared motion plan and enforced
+/// atomically inside the single install path (`verify_slot_authority`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanAuthority {
+    pub boot: BootId,
+    pub epoch: u64,
+    pub lease_generation: u64,
+    pub stop_generation: u64,
+    pub deadline: Instant,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionKind { Jog, Home, Park }
@@ -127,9 +141,7 @@ pub struct MotionPlanSnapshot {
     pub power_hold: Option<PowerHold>,
     pub holding_after_clear: bool,
     pub mit_moving: bool,
-    pub epoch: u64,
-    pub stop_generation: u64,
-    pub lease_generation: u64,
+    pub authority: PlanAuthority,
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
 }
@@ -140,6 +152,21 @@ impl MotionPlanSnapshot {
     }
 
     pub fn from_supervisor_with_config(inner: &SupervisorInner, config: Arc<MotionConfigSnapshot>) -> Self {
+        let authority = PlanAuthority {
+            boot: inner.boot_id,
+            epoch: inner.safety.epoch_id(),
+            lease_generation: inner.current_active_lease_gen(),
+            stop_generation: inner.current_stop_gen(),
+            deadline: Instant::now() + inner.motion_plan_deadline,
+        };
+        Self::from_supervisor_with_authority(inner, config, authority)
+    }
+
+    pub fn from_supervisor_with_authority(
+        inner: &SupervisorInner,
+        config: Arc<MotionConfigSnapshot>,
+        authority: PlanAuthority,
+    ) -> Self {
         let workspace_revision = config.workspace_revision;
         let motion_config_revision = config.motion_config_revision;
         Self {
@@ -151,21 +178,22 @@ impl MotionPlanSnapshot {
             power_hold: inner.power.gov.hold,
             holding_after_clear: inner.holding_after_clear(),
             mit_moving: inner.mit_active() && inner.commanded_velocities.iter().any(|&v| v != 0.0),
-            epoch: inner.safety.epoch_id(),
-            stop_generation: inner.current_stop_gen(),
-            lease_generation: inner.current_active_lease_gen(),
+            authority,
             workspace_revision,
             motion_config_revision,
         }
     }
 
-    /// Reuses `config` for a `StartDrifted` retry ONLY while both owner revisions still match.
-    /// Returns `None` if workspace or motion config changed (caller must fail `PlanStale`).
-    pub fn refresh_for_drift_retry(inner: &SupervisorInner, config: Arc<MotionConfigSnapshot>) -> Option<Self> {
-        if config.workspace_revision != inner.workspace_revision || config.motion_config_revision != inner.motion_config_revision {
+    /// Reuses `prev.config` and preserves `prev.authority` (including original request boot,
+    /// epoch, lease_generation, stop_generation, and deadline) for a `StartDrifted` retry ONLY
+    /// while both owner revisions still match. Returns `None` if workspace or motion config changed.
+    pub fn refresh_for_drift_retry(inner: &SupervisorInner, prev: &MotionPlanSnapshot) -> Option<Self> {
+        if prev.config.workspace_revision != inner.workspace_revision
+            || prev.config.motion_config_revision != inner.motion_config_revision
+        {
             return None;
         }
-        Some(Self::from_supervisor_with_config(inner, config))
+        Some(Self::from_supervisor_with_authority(inner, Arc::clone(&prev.config), prev.authority))
     }
 
     /// Zero-lock snapshot from published `StateHub` telemetry + cached `MotionConfigSnapshot`.
@@ -179,6 +207,7 @@ impl MotionPlanSnapshot {
         {
             return None;
         }
+        let clock_now = snap.rt.clock_now.unwrap_or(snap.meta.sampled_at);
         Some(Self {
             config,
             commanded_positions: snap.obs.commanded_positions.clone(),
@@ -188,12 +217,28 @@ impl MotionPlanSnapshot {
             power_hold: None,
             holding_after_clear: snap.rt.holding_after_clear,
             mit_moving: false,
-            epoch: snap.obs.epoch_id,
-            stop_generation: snap.rt.stop_generation,
-            lease_generation: snap.rt.lease_generation,
+            authority: PlanAuthority {
+                boot: snap.rt.boot_id,
+                epoch: snap.obs.epoch_id,
+                lease_generation: snap.rt.lease_generation,
+                stop_generation: snap.rt.stop_generation,
+                deadline: clock_now + DEFAULT_MOTION_PLAN_DEADLINE,
+            },
             workspace_revision: snap.rt.workspace_revision,
             motion_config_revision: snap.rt.motion_config_revision,
         })
+    }
+
+    /// Overrides the snapshot's deadline (e.g. to bind to a client's exact broker request deadline).
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.authority.deadline = deadline;
+        self
+    }
+
+    /// Overrides the snapshot's authority tuple.
+    pub fn with_authority(mut self, authority: PlanAuthority) -> Self {
+        self.authority = authority;
+        self
     }
 }
 
@@ -217,6 +262,7 @@ pub struct PreparedMotionSlot {
     pub checked_workspace: bool,
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
+    pub authority: PlanAuthority,
     pub for_holding_after_clear: bool,
     pub for_mit_deferral: bool,
     pub continuation_action: Option<u64>,
@@ -246,9 +292,9 @@ pub struct PreparedMotionPlan {
 pub enum MotionInstallError {
     InvalidCommand, SpeedScaleRange, CommissioningRequired, GripperCloseTorqueFeedback,
     UnsupportedUnload, ConfigBusy, MotionBusy, CollisionHold, HandoverSettling,
-    EStopActive, FaultActive, NotArmed, EpochMismatch, LeaseLost, Stopped,
-    StampReused, TerminalsBusy, FeedbackStale, StartDrifted, PlanStale,
-    SoftLimitExceeded, ContinuationMismatch, EnableFailed,
+    EStopActive, FaultActive, NotArmed, WrongTarget, DeadlineExpired,
+    EpochMismatch, LeaseLost, Stopped, StampReused, TerminalsBusy,
+    FeedbackStale, StartDrifted, PlanStale, SoftLimitExceeded, ContinuationMismatch, EnableFailed,
 }
 
 impl MotionInstallError {
@@ -264,6 +310,8 @@ impl MotionInstallError {
             Self::EStopActive => "ESTOP_ACTIVE",
             Self::FaultActive => "FAULT_ACTIVE",
             Self::NotArmed => "NOT_ARMED",
+            Self::WrongTarget => "WRONG_TARGET",
+            Self::DeadlineExpired => "DEADLINE_EXPIRED",
             Self::EpochMismatch => "EPOCH_MISMATCH",
             Self::LeaseLost => "LEASE_LOST",
             Self::Stopped => "STOPPED",
@@ -293,6 +341,8 @@ impl MotionInstallError {
             Self::EStopActive => SafetyError::EStopActive.into(),
             Self::FaultActive => match inner.safety.state() { SafetyState::Fault(r) => SafetyError::FaultActive(r.clone()).into(), _ => SafetyError::EStopActive.into() },
             Self::NotArmed => SafetyError::NotArmed(inner.safety.state().clone()).into(),
+            Self::WrongTarget => rej("WRONG_TARGET", "prepared motion plan belongs to a different boot or arm target"),
+            Self::DeadlineExpired => rej("DEADLINE_EXPIRED", "motion plan deadline expired before install"),
             Self::EpochMismatch => SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: expected_epoch.unwrap_or(0) }.into(),
             Self::LeaseLost => SafetyError::LeaseLost.into(),
             Self::Stopped => SafetyError::Stopped.into(),
@@ -389,6 +439,7 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
                 duration: PARK_DURATION_S, power_scale: None, power_budget_hash: cfg.power_budget_hash,
                 tcp_offset: arm_cfg.tcp_offset, checked_workspace: cfg.workspace.is_some(),
                 workspace_revision: snap.workspace_revision, motion_config_revision: snap.motion_config_revision,
+                authority: snap.authority,
                 for_holding_after_clear: snap.holding_after_clear,
                 for_mit_deferral: !snap.holding_after_clear && snap.mit_moving,
                 continuation_action: None,
@@ -483,7 +534,8 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
             polynomials: p_arr, duration: traj.duration, power_scale,
             power_budget_hash: cfg.power_budget_hash, tcp_offset: arm_cfg.tcp_offset,
             checked_workspace: cfg.workspace.is_some(), workspace_revision: snap.workspace_revision,
-            motion_config_revision: snap.motion_config_revision, for_holding_after_clear: false,
+            motion_config_revision: snap.motion_config_revision, authority: snap.authority,
+            for_holding_after_clear: false,
             for_mit_deferral: false, continuation_action: None,
         },
         heap_traj: (!inline).then_some(traj),
@@ -492,6 +544,18 @@ pub fn prepare_motion(snap: &MotionPlanSnapshot, req: &MotionRequest) -> Result<
 
 /// Non-consuming Lock #1 preflight delegating to single-authority `verify_motion_authority`.
 pub fn preflight_motion_request(inner: &SupervisorInner, stamp: AdmissionStamp, req: &MotionRequest, expected_epoch: Option<u64>) -> Result<MotionPlanSnapshot, ArmError> {
+    preflight_motion_request_at(inner, stamp, req, expected_epoch, Instant::now())
+}
+
+/// Like [`preflight_motion_request`], anchoring the bounded plan deadline to the request's
+/// entry timestamp `request_at` and binding `PlanAuthority` to the request's admission stamp.
+pub fn preflight_motion_request_at(
+    inner: &SupervisorInner,
+    stamp: AdmissionStamp,
+    req: &MotionRequest,
+    expected_epoch: Option<u64>,
+    request_at: Instant,
+) -> Result<MotionPlanSnapshot, ArmError> {
     if let Some(s) = req.speed_scale {
         if !s.is_finite() || !(0.05..=1.0).contains(&s) { return Err(MotionError::InvalidCommand("speed_scale must be in [0.05, 1.0]".into()).into()); }
     }
@@ -507,7 +571,53 @@ pub fn preflight_motion_request(inner: &SupervisorInner, stamp: AdmissionStamp, 
         }
         return Err(err.into_arm_error(inner, req.action_kind, expected_epoch));
     }
-    Ok(MotionPlanSnapshot::from_supervisor(inner))
+    let authority = PlanAuthority {
+        boot: inner.boot_id,
+        epoch: expected_epoch.unwrap_or(stamp.estop_epoch),
+        lease_generation: stamp.lease_gen,
+        stop_generation: stamp.stop_gen,
+        deadline: request_at + inner.motion_plan_deadline,
+    };
+    Ok(MotionPlanSnapshot::from_supervisor_with_authority(
+        inner,
+        Arc::new(MotionConfigSnapshot::from_supervisor(inner)),
+        authority,
+    ))
+}
+
+/// Single shared authority + deadline check for EVERY prepared motion install (`install_jog`,
+/// `install_home`, `install_park`, and `install_park_continuation`) on both legacy and RT owners.
+/// Enforces `boot` (fail-closed on `BootId(0)`), `deadline`, `stop_generation`, `epoch`, and
+/// `lease_generation` without heap allocation.
+pub fn verify_slot_authority(
+    inner: &SupervisorInner,
+    slot: &PreparedMotionSlot,
+    expected_boot: BootId,
+    expected_epoch: Option<u64>,
+    now: Instant,
+) -> Result<(), MotionInstallError> {
+    let auth = slot.authority;
+    if auth.boot.is_zero() || expected_boot.is_zero() || auth.boot != expected_boot || auth.boot != inner.boot_id {
+        return Err(MotionInstallError::WrongTarget);
+    }
+    if now > auth.deadline {
+        return Err(MotionInstallError::DeadlineExpired);
+    }
+    if inner.urgent_stop_unapplied() || auth.stop_generation != inner.current_stop_gen() {
+        return Err(MotionInstallError::Stopped);
+    }
+    let live_epoch = inner.safety.epoch_id();
+    if auth.epoch != live_epoch || expected_epoch.is_some_and(|e| e != live_epoch) {
+        if inner.e_stop_latched.load(Ordering::SeqCst) || matches!(inner.safety.state(), SafetyState::EStop) {
+            return Err(MotionInstallError::EStopActive);
+        }
+        return Err(MotionInstallError::EpochMismatch);
+    }
+    let live_lease = inner.lease_valid_at(now).map_or(0, |l| l.generation);
+    if auth.lease_generation != live_lease {
+        return Err(MotionInstallError::LeaseLost);
+    }
+    Ok(())
 }
 
 fn check_common_blockers(inner: &SupervisorInner) -> Result<(), MotionInstallError> {
@@ -608,9 +718,20 @@ pub fn verify_motion_freshness(inner: &SupervisorInner, slot: &PreparedMotionSlo
     Ok(notes)
 }
 
-fn commit_quintic_slot(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool, action_kind: &'static str) -> Result<MotionInstalled, MotionInstallError> {
+fn commit_quintic_slot(
+    inner: &mut SupervisorInner,
+    stamp: AdmissionStamp,
+    slot: &PreparedMotionSlot,
+    heap_traj: Option<MultiJointQuinticTrajectory>,
+    expected_epoch: Option<u64>,
+    require_fresh_feedback: bool,
+    expected_boot: BootId,
+    now: Instant,
+    action_kind: &'static str,
+) -> Result<MotionInstalled, MotionInstallError> {
     let dof = usize::from(slot.dof);
     if dof == 0 || dof > MAX_DOF { return Err(MotionInstallError::InvalidCommand); }
+    verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
     verify_motion_authority(inner, slot.kind, slot.speed_scale_opt(), &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let (torque_clamped, power_clamped) = verify_motion_freshness(inner, slot)?;
     inner.preflight_admission(stamp).map_err(map_admission_err)?;
@@ -642,19 +763,35 @@ fn commit_quintic_slot(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot:
 }
 
 pub fn install_jog(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool) -> Result<MotionInstalled, MotionInstallError> {
+    let boot = inner.boot_id;
+    install_jog_at(inner, stamp, slot, heap_traj, expected_epoch, require_fresh_feedback, boot, Instant::now())
+}
+
+pub fn install_jog_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool, expected_boot: BootId, now: Instant) -> Result<MotionInstalled, MotionInstallError> {
     if slot.kind != MotionKind::Jog { return Err(MotionInstallError::InvalidCommand); }
-    commit_quintic_slot(inner, stamp, slot, heap_traj, expected_epoch, require_fresh_feedback, "joint_move")
+    commit_quintic_slot(inner, stamp, slot, heap_traj, expected_epoch, require_fresh_feedback, expected_boot, now, "joint_move")
 }
 
 pub fn install_home(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool) -> Result<MotionInstalled, MotionInstallError> {
+    let boot = inner.boot_id;
+    install_home_at(inner, stamp, slot, heap_traj, expected_epoch, require_fresh_feedback, boot, Instant::now())
+}
+
+pub fn install_home_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool, expected_boot: BootId, now: Instant) -> Result<MotionInstalled, MotionInstallError> {
     if slot.kind != MotionKind::Home { return Err(MotionInstallError::InvalidCommand); }
-    commit_quintic_slot(inner, stamp, slot, heap_traj, expected_epoch, require_fresh_feedback, "home")
+    commit_quintic_slot(inner, stamp, slot, heap_traj, expected_epoch, require_fresh_feedback, expected_boot, now, "home")
 }
 
 pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool) -> Result<MotionInstalled, MotionInstallError> {
+    let boot = inner.boot_id;
+    install_park_at(inner, stamp, slot, heap_traj, expected_epoch, require_fresh_feedback, boot, Instant::now())
+}
+
+pub fn install_park_at(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool, expected_boot: BootId, now: Instant) -> Result<MotionInstalled, MotionInstallError> {
     if slot.kind != MotionKind::Park { return Err(MotionInstallError::InvalidCommand); }
     let dof = usize::from(slot.dof);
     if dof == 0 || dof > MAX_DOF { return Err(MotionInstallError::InvalidCommand); }
+    verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
     verify_motion_authority(inner, MotionKind::Park, None, &slot.target[..dof], expected_epoch, require_fresh_feedback)?;
     let holding = inner.holding_after_clear();
     if holding {
@@ -716,7 +853,13 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
 }
 
 pub fn install_park_continuation(inner: &mut SupervisorInner, action_id: u64, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool) -> Result<MotionInstalled, MotionInstallError> {
+    let boot = inner.boot_id;
+    install_park_continuation_at(inner, action_id, slot, heap_traj, expected_epoch, require_fresh_feedback, boot, Instant::now())
+}
+
+pub fn install_park_continuation_at(inner: &mut SupervisorInner, action_id: u64, slot: &PreparedMotionSlot, heap_traj: Option<MultiJointQuinticTrajectory>, expected_epoch: Option<u64>, require_fresh_feedback: bool, expected_boot: BootId, now: Instant) -> Result<MotionInstalled, MotionInstallError> {
     if slot.kind != MotionKind::Park || slot.for_holding_after_clear || slot.for_mit_deferral { return Err(MotionInstallError::InvalidCommand); }
+    verify_slot_authority(inner, slot, expected_boot, expected_epoch, now)?;
     let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id && c.phase == ParkContinuationPhase::ReadyForPlan) else {
         return Err(MotionInstallError::ContinuationMismatch);
     };
@@ -734,11 +877,8 @@ pub fn install_park_continuation(inner: &mut SupervisorInner, action_id: u64, sl
         _ => {}
     }
     if inner.safety.epoch_id() != cont.epoch || expected_epoch.is_some_and(|e| e != cont.epoch) { return Err(MotionInstallError::EpochMismatch); }
-    let now = Instant::now();
     let live_lease_gen = if inner.lease_enabled {
-        inner.active_lease.as_ref()
-            .filter(|l| now.saturating_duration_since(l.acquired_at) < inner.lease_timeout)
-            .map(|l| l.generation)
+        inner.lease_valid_at(now).map(|l| l.generation)
     } else {
         inner.active_lease.as_ref().map(|l| l.generation)
     };
@@ -814,15 +954,15 @@ fn commit_broker(inner: &mut SupervisorInner, d: &Descriptor, ctx: &CommitCtx, f
 }
 
 pub(crate) fn commit_install_slot(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-    commit_broker(inner, d, ctx, |i, stamp, ep| install_jog(i, stamp, slot, None, Some(ep), true))
+    commit_broker(inner, d, ctx, |i, stamp, ep| install_jog_at(i, stamp, slot, None, Some(ep), true, ctx.boot, ctx.now))
 }
 pub(crate) fn commit_home(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-    commit_broker(inner, d, ctx, |i, stamp, ep| install_home(i, stamp, slot, None, Some(ep), true))
+    commit_broker(inner, d, ctx, |i, stamp, ep| install_home_at(i, stamp, slot, None, Some(ep), true, ctx.boot, ctx.now))
 }
 pub(crate) fn commit_park(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-    commit_broker(inner, d, ctx, |i, stamp, ep| install_park(i, stamp, slot, None, Some(ep), true))
+    commit_broker(inner, d, ctx, |i, stamp, ep| install_park_at(i, stamp, slot, None, Some(ep), true, ctx.boot, ctx.now))
 }
 pub(crate) fn commit_park_continuation(inner: &mut SupervisorInner, d: &Descriptor, slot: &PreparedMotionSlot, ctx: &CommitCtx) -> Result<Committed, &'static str> {
     let Some(action_id) = slot.continuation_action else { return Err("INVALID_COMMAND"); };
-    commit_broker(inner, d, ctx, |i, _, ep| install_park_continuation(i, action_id, slot, None, Some(ep), true))
+    commit_broker(inner, d, ctx, |i, _, ep| install_park_continuation_at(i, action_id, slot, None, Some(ep), true, ctx.boot, ctx.now))
 }

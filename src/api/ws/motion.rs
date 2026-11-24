@@ -143,7 +143,7 @@ fn dispatch_preset(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
         Ok(r) => r,
         Err(e) => return Some(format_motion_reject(ctx.inner, &reply_kind, e)),
     };
-    match req::preflight_motion_request(ctx.inner, ctx.stamp, &request, Some(ctx.epoch)) {
+    match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
         Ok(snapshot) => {
             *ctx.pending_motion = Some(PendingMotion { reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
             None
@@ -177,7 +177,7 @@ fn dispatch_motion_command(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
         Ok(r) => r,
         Err(e) => return Some(format_motion_reject(ctx.inner, &reply_kind, e)),
     };
-    match req::preflight_motion_request(ctx.inner, ctx.stamp, &request, Some(ctx.epoch)) {
+    match req::preflight_motion_request_at(ctx.inner, ctx.stamp, &request, Some(ctx.epoch), ctx.received_at) {
         Ok(snapshot) => {
             *ctx.pending_motion = Some(PendingMotion { reply_kind, request, snapshot, epoch: ctx.epoch, generation: ctx.local_generation });
             None
@@ -232,12 +232,17 @@ pub(super) async fn complete_pending_motion(
         if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(recv_connection, generation) {
             return Some(format_status_reject(&reply_kind, 409, "LEASE_LOST", "This connection lost the lease while planning", Some(inner.safety.epoch_id())));
         }
-        if let Err(err) = inner.preflight_admission(stamp) {
-            return Some(format_motion_reject(&inner, &reply_kind, ArmError::from(err).into()));
-        }
         let plan = match prepared {
             Ok(p) => p,
-            Err(e) => return Some(format_motion_reject(&inner, &reply_kind, e.into())),
+            Err(e) => {
+                if Instant::now() > snapshot.authority.deadline {
+                    return Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
+                }
+                if let Err(err) = inner.preflight_admission(stamp) {
+                    return Some(format_motion_reject(&inner, &reply_kind, ArmError::from(err).into()));
+                }
+                return Some(format_motion_reject(&inner, &reply_kind, e.into()));
+            }
         };
         let installed = match request.kind {
             req::MotionKind::Jog => req::install_jog(&mut inner, stamp, &plan.slot, plan.heap_traj, Some(epoch), false),
@@ -258,7 +263,10 @@ pub(super) async fn complete_pending_motion(
                 return Some(ack);
             }
             Err(req::MotionInstallError::StartDrifted) if attempt + 1 < MAX_START_DRIFT_RETRIES => {
-                let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, snapshot.config) else {
+                if Instant::now() > snapshot.authority.deadline {
+                    return Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::DeadlineExpired.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
+                }
+                let Some(next) = req::MotionPlanSnapshot::refresh_for_drift_retry(&inner, &snapshot) else {
                     return Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, Some(epoch)).into()));
                 };
                 snapshot = next;
@@ -301,7 +309,10 @@ fn spawn_park_continuation(
                 if inner.detached || inner.current_stop_gen() != request_stop_gen { return; }
                 let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id) else { return; };
                 if cont.phase == crate::supervisor::ParkContinuationPhase::ReadyForPlan {
-                    Some(req::MotionPlanSnapshot::from_supervisor(&inner))
+                    let mut snap = req::MotionPlanSnapshot::from_supervisor(&inner);
+                    snap.authority.stop_generation = request_stop_gen;
+                    snap.authority.deadline = deadline;
+                    Some(snap)
                 } else {
                     None
                 }

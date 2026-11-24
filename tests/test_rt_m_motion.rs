@@ -453,8 +453,7 @@ async fn validation_precedence_commissioning_motion_config_revision_and_zero_mut
 
     // 2e. Review regressions:
     //   - Blocker #1: refresh_for_drift_retry refuses stale config after workspace/motion revision bump.
-    let stale_cfg = snap.config.clone();
-    assert!(MotionPlanSnapshot::refresh_for_drift_retry(&inner, stale_cfg).is_none());
+    assert!(MotionPlanSnapshot::refresh_for_drift_retry(&inner, &snap).is_none());
     //   - Major #1: torque-hold clamped jog fails PlanStale if hold clears before install;
     //     preserves clamp attribution (`motion_limit`) when hold stays active.
     let q0 = inner.commanded_positions[0];
@@ -1175,4 +1174,186 @@ async fn b1_legacy_ws_stop_cancels_park_rearm_and_continuation_before_ack() {
             "install_park_continuation must verify original request stop_gen"
         );
     }
+}
+
+// ============================================================================
+// 8. Round 2 M1: Prepared plan authority (boot, epoch, lease, stop_gen, deadline)
+// ============================================================================
+
+#[test]
+fn m1_prepared_plan_authority_and_deadline_enforced_at_install() {
+    // 8a. ArmSupervisor::home queued behind a saturated Tokio blocking pool past its bounded
+    //     deadline is refused with DEADLINE_EXPIRED and produces zero motion.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()));
+        sup.set_lease_enabled(false).await;
+        sup.set_motion_plan_deadline(Duration::from_millis(45)).await;
+        {
+            let mut inner = sup.inner().write().await;
+            let stamp = inner.current_admission_stamp();
+            SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+            inner.commanded_positions = vec![0.8, 0.4];
+            inner.measured_positions = vec![0.8, 0.4];
+            inner.target_positions = vec![0.8, 0.4];
+        }
+        let ep = sup.get_observation().await.epoch_id;
+        // Saturate the 2-thread blocking pool past the 45ms motion deadline.
+        let entered = Arc::new(std::sync::Barrier::new(3));
+        let mut blockers = Vec::new();
+        for _ in 0..2 {
+            let b = entered.clone();
+            blockers.push(tokio::task::spawn_blocking(move || {
+                b.wait();
+                std::thread::sleep(Duration::from_millis(160));
+            }));
+        }
+        entered.wait();
+        let stamp = sup.capture_admission_stamp();
+        let err = sup.home(stamp, None, Some(ep)).await.unwrap_err();
+        for h in blockers { h.await.unwrap(); }
+        match err {
+            armd::ArmError::Rejected { code, .. } => assert_eq!(code, "DEADLINE_EXPIRED"),
+            other => panic!("expected DEADLINE_EXPIRED behind saturated blocking pool, got {other:?}"),
+        }
+        assert!(sup.inner().read().await.active_trajectory.is_none(), "expired home must not start motion");
+        assert_eq!(sup.get_observation().await.commanded_positions, vec![0.8, 0.4]);
+
+        // 8b. Legacy WS /api/v1/motion/home delayed past bounded deadline is refused DEADLINE_EXPIRED.
+        {
+            struct PauseGuard(String);
+            impl Drop for PauseGuard {
+                fn drop(&mut self) { armd::api::ws::set_test_ws_blocking_plan_paused(&self.0, false); }
+            }
+            let (drv, _) = MotionTestDriver::new(vec![0.8, 0.4], Duration::ZERO, Duration::ZERO, None);
+            let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+            sup.set_motion_plan_deadline(Duration::from_millis(50)).await;
+            let (mut ws, gen, ep, sup, _addr) = common::torqued_rig(sup, &[0.8, 0.4]).await;
+            let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+            armd::api::ws::set_test_ws_blocking_plan_paused(&conn_id, true);
+            let _guard = PauseGuard(conn_id.clone());
+            let unpause_conn = conn_id.clone();
+            tokio::spawn(async move {
+                let wait_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                while armd::api::ws::test_ws_blocking_plan_blocked_count(&unpause_conn) < 1
+                    && tokio::time::Instant::now() < wait_until
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                armd::api::ws::set_test_ws_blocking_plan_paused(&unpause_conn, false);
+            });
+            let resp = common::rpc(&mut ws, gen, ep, "/api/v1/motion/home", json!({})).await;
+            assert_eq!((&resp["type"], &resp["code"]), (&json!("command_reject"), &json!("DEADLINE_EXPIRED")), "{resp}");
+            assert!(sup.inner().read().await.active_trajectory.is_none());
+        }
+
+        // 8c. Executor broker: a pre-Stop prepared plan staged into a post-Stop descriptor is refused
+        //     with STOPPED inside the single install path (no motion starts).
+        {
+            let period = Duration::from_millis(5);
+            let period_ns = period.as_nanos() as u64;
+            let clock = ScriptedClock::new();
+            let (drv, _) = MotionTestDriver::new(vec![0.8, 0.4], Duration::from_millis(4), Duration::from_millis(4), Some(clock.clone()));
+            let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+            let handle = start_scripted_executor(&sup, period, clock.clone(), true).await;
+            clock.run_steps(period_ns, 2);
+            let _ = submit_enable_and_wait(&sup, &handle, &clock, period_ns, 1);
+
+            let pre_stop_snap = MotionPlanSnapshot::from_published(
+                &sup.hub().latest().unwrap(),
+                sup.hub().motion_config().unwrap(),
+            ).unwrap();
+            let pre_stop_home = req::prepare_motion(&pre_stop_snap, &MotionRequest::home(Some(0.5))).unwrap();
+            let pre_stop_jog = req::prepare_motion(&pre_stop_snap, &MotionRequest::jog(vec![0.5, 0.2], Some(0.5), None)).unwrap();
+
+            // Client Stop advances stop_generation on the executor.
+            let sg = handle.stop_requests().request();
+            clock.run_steps(period_ns, 2);
+            assert_eq!(handle.stop_requests().applied(), sg);
+            let _ = drain_replies(&handle);
+
+            // Stage pre-Stop prepared plans under the NEW post-Stop broker authority!
+            let post_stop_auth = auth_from_hub(&sup, &handle);
+            assert_eq!(post_stop_auth.stop_generation, sg);
+            let r_home = handle.broker().lock().unwrap().submit(
+                ClientId(1), 2, post_stop_auth, clock.now() + Duration::from_secs(10),
+                Submit::InstallHome(&|s: &mut PlanSlot| req::stage_home(s, &pre_stop_home.slot)),
+            ).unwrap();
+            clock.run_steps(period_ns, 2);
+            let rs = drain_replies(&handle);
+            assert!(rs.iter().any(|r| matches!(r, Reply::Refused { request, code: "STOPPED", .. } if *request == r_home)), "{rs:?}");
+
+            let r_jog = handle.broker().lock().unwrap().submit(
+                ClientId(1), 3, post_stop_auth, clock.now() + Duration::from_secs(10),
+                Submit::Install(&|s: &mut PlanSlot| req::stage_jog(s, &pre_stop_jog.slot)),
+            ).unwrap();
+            clock.run_steps(period_ns, 2);
+            let rs = drain_replies(&handle);
+            assert!(rs.iter().any(|r| matches!(r, Reply::Refused { request, code: "STOPPED", .. } if *request == r_jog)), "{rs:?}");
+            assert_eq!(sup.hub().latest().unwrap().obs.commanded_positions, vec![0.8, 0.4]);
+            assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+            drop(handle);
+        }
+
+        // 8d. Single install function verifies ALL 5 PlanAuthority fields (boot, deadline,
+        //     stop_generation, epoch, lease_generation) and refresh_for_drift_retry preserves them.
+        {
+            let mut inner = SupervisorInner::new(parkable_2dof_config());
+            let stamp = inner.current_admission_stamp();
+            SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+            inner.commanded_positions = vec![0.8, 0.4];
+            inner.measured_positions = vec![0.8, 0.4];
+            inner.target_positions = vec![0.8, 0.4];
+            let lease_gen = inner.acquire_lease("conn-a").unwrap();
+            let snap = MotionPlanSnapshot::from_supervisor(&inner);
+            let base = req::prepare_motion(&snap, &MotionRequest::home(Some(0.4))).unwrap();
+            let ep = inner.safety.epoch_id();
+
+            // Wrong boot + BootId(0) fail-closed.
+            let mut wrong_boot = base.slot;
+            wrong_boot.authority.boot = armd::rt_core::broker::BootId(inner.boot_id().0.wrapping_add(1).max(1));
+            let s = inner.current_admission_stamp();
+            assert_eq!(req::install_home(&mut inner, s, &wrong_boot, None, Some(ep), false), Err(MotionInstallError::WrongTarget));
+            let mut zero_boot = base.slot;
+            zero_boot.authority.boot = armd::rt_core::broker::BootId(0);
+            let s = inner.current_admission_stamp();
+            assert_eq!(req::install_home(&mut inner, s, &zero_boot, None, Some(ep), false), Err(MotionInstallError::WrongTarget));
+
+            // Expired deadline.
+            let mut expired = base.slot;
+            expired.authority.deadline = std::time::Instant::now() - Duration::from_millis(1);
+            let s = inner.current_admission_stamp();
+            assert_eq!(req::install_home(&mut inner, s, &expired, None, Some(ep), false), Err(MotionInstallError::DeadlineExpired));
+
+            // Stale stop_generation.
+            let mut stale_stop = base.slot;
+            stale_stop.authority.stop_generation = inner.current_stop_gen() + 1;
+            let s = inner.current_admission_stamp();
+            assert_eq!(req::install_home(&mut inner, s, &stale_stop, None, Some(ep), false), Err(MotionInstallError::Stopped));
+
+            // Stale epoch.
+            let mut stale_epoch = base.slot;
+            stale_epoch.authority.epoch = ep + 1;
+            let s = inner.current_admission_stamp();
+            assert_eq!(req::install_home(&mut inner, s, &stale_epoch, None, Some(ep), false), Err(MotionInstallError::EpochMismatch));
+
+            // Stale lease_generation.
+            let mut stale_lease = base.slot;
+            stale_lease.authority.lease_generation = lease_gen + 1;
+            let s = inner.current_admission_stamp();
+            assert_eq!(req::install_home(&mut inner, s, &stale_lease, None, Some(ep), false), Err(MotionInstallError::LeaseLost));
+
+            // refresh_for_drift_retry preserves original authority & deadline without extending.
+            let orig_auth = snap.authority;
+            inner.commanded_positions[0] += 0.05;
+            let refreshed = MotionPlanSnapshot::refresh_for_drift_retry(&inner, &snap).unwrap();
+            assert_eq!(refreshed.authority, orig_auth, "drift retry must preserve original request authority and deadline");
+        }
+    });
 }

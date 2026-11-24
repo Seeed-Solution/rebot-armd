@@ -231,6 +231,7 @@ pub(super) struct LeaseFreeCtx<'a> {
 pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) inner: &'a mut SupervisorInner,
     pub(super) stamp: AdmissionStamp,
+    pub(super) received_at: std::time::Instant,
     pub(super) path: &'a str,
     pub(super) value: &'a Value,
     pub(super) epoch: u64,
