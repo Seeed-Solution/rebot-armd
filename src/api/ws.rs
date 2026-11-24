@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -52,6 +52,10 @@ pub static TEST_LEASE_GRANTED_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 static TEST_WS_WRITE_HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TEST_WS_WRITE_PAUSED_CONNS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TEST_WS_WRITE_STALL_ONCE_CONNS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static TEST_WS_WRITE_TRACE_CONNS: LazyLock<Mutex<HashMap<String, Vec<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static TEST_WS_WRITE_TIMEOUT_CONNS: LazyLock<Mutex<HashMap<String, Duration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -195,8 +199,65 @@ async fn maybe_pause_worker_before_lock(connection_id: &str) {
 
 fn refresh_write_hooks_active() {
     let paused = !TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    let stall_once = !TEST_WS_WRITE_STALL_ONCE_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    let traced = !TEST_WS_WRITE_TRACE_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     let timed = !TEST_WS_WRITE_TIMEOUT_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-    TEST_WS_WRITE_HOOKS_ACTIVE.store(paused || timed, Ordering::Release);
+    TEST_WS_WRITE_HOOKS_ACTIVE.store(paused || stall_once || traced || timed, Ordering::Release);
+}
+
+/// Test hook: stall ONLY the next outbound WebSocket write on `connection_id` until its
+/// bounded timeout abandons it; subsequent writes proceed normally.
+#[doc(hidden)]
+pub fn set_test_ws_write_stall_once(connection_id: &str, enabled: bool) {
+    {
+        let mut set = TEST_WS_WRITE_STALL_ONCE_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        if enabled {
+            set.insert(connection_id.to_owned());
+        } else {
+            set.remove(connection_id);
+        }
+    }
+    refresh_write_hooks_active();
+}
+
+/// Test hook: record attempted outbound WebSocket frame kinds (`text:<type>`, `close:<reason>`)
+/// for `connection_id` in exact attempt order.
+#[doc(hidden)]
+pub fn enable_test_ws_write_trace(connection_id: &str) {
+    {
+        let mut map = TEST_WS_WRITE_TRACE_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(connection_id.to_owned(), Vec::new());
+    }
+    refresh_write_hooks_active();
+}
+
+/// Test hook: take and stop recording attempted outbound frame labels for `connection_id`.
+#[doc(hidden)]
+pub fn take_test_ws_write_trace(connection_id: &str) -> Vec<String> {
+    let trace = {
+        let mut map = TEST_WS_WRITE_TRACE_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(connection_id).unwrap_or_default()
+    };
+    refresh_write_hooks_active();
+    trace
+}
+
+fn record_test_ws_write_attempt(connection_id: &str, msg: &Message) {
+    let mut map = TEST_WS_WRITE_TRACE_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(log) = map.get_mut(connection_id) else { return; };
+    let label = match msg {
+        Message::Text(txt) => {
+            let ty = serde_json::from_str::<Value>(txt)
+                .ok()
+                .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| "observation".to_owned());
+            format!("text:{ty}")
+        }
+        Message::Close(Some(cf)) => format!("close:{}", cf.reason),
+        Message::Close(None) => "close:".to_owned(),
+        _ => "other".to_owned(),
+    };
+    log.push(label);
 }
 
 /// Test hook: pause or unpause outbound WebSocket writes for a single connection ID.
@@ -447,6 +508,13 @@ impl FatalClose {
         }
     }
 
+    fn write_timeout() -> Self {
+        Self {
+            code: "WRITE_TIMEOUT",
+            message: "WebSocket write timed out; closing connection",
+        }
+    }
+
     fn error_value(&self, estop_latched: bool) -> Value {
         let mut v = json!({
             "type": "error",
@@ -688,6 +756,34 @@ async fn write_ws_frame(
 ) -> Result<(), WriteErr> {
     tokio::time::timeout(timeout_dur, async {
         if TEST_WS_WRITE_HOOKS_ACTIVE.load(Ordering::Acquire) {
+            record_test_ws_write_attempt(connection_id, &msg);
+            let stall_once = {
+                let mut set = TEST_WS_WRITE_STALL_ONCE_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+                set.remove(connection_id)
+            };
+            if stall_once {
+                refresh_write_hooks_active();
+                struct OnceBlockedGuard(String);
+                impl Drop for OnceBlockedGuard {
+                    fn drop(&mut self) {
+                        let mut map = TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(c) = map.get_mut(&self.0) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                map.remove(&self.0);
+                            }
+                        }
+                        drop(map);
+                        refresh_write_hooks_active();
+                    }
+                }
+                {
+                    let mut map = TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+                    *map.entry(connection_id.to_owned()).or_insert(0) += 1;
+                }
+                let _guard = OnceBlockedGuard(connection_id.to_owned());
+                std::future::pending::<()>().await;
+            }
             let is_paused = || {
                 TEST_WS_WRITE_PAUSED_CONNS
                     .lock()
@@ -736,9 +832,10 @@ async fn write_ws_frame_bounded(
     fatal_notify: &tokio::sync::Notify,
 ) -> Result<(), WriteErr> {
     let write_fut = write_ws_frame(connection_id, sender, msg, timeout_dur);
+    // Keep fatal abandonment grace short so abandoning a stalled in-progress write leaves ample
+    // bounded budget to attempt queued urgent replies, the fatal frame, and Close.
     let fatal_grace = timeout_dur
-        .min(WS_FATAL_FLUSH_TIMEOUT)
-        .saturating_sub(Duration::from_millis(80))
+        .min(Duration::from_millis(120))
         .max(Duration::from_millis(20));
     tokio::select! {
         res = write_fut => res,
@@ -752,33 +849,19 @@ async fn write_ws_frame_bounded(
 }
 
 async fn send_best_effort_close(
+    connection_id: &str,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     frame: CloseFrame,
 ) {
+    let msg = Message::Close(Some(frame));
+    if TEST_WS_WRITE_HOOKS_ACTIVE.load(Ordering::Acquire) {
+        record_test_ws_write_attempt(connection_id, &msg);
+    }
     let _ = tokio::time::timeout(Duration::from_millis(50), async {
-        let _ = sender.send(Message::Close(Some(frame))).await;
+        let _ = sender.send(msg).await;
         let _ = sender.flush().await;
         let _ = sender.close().await;
     })
-    .await;
-}
-
-async fn send_timeout_close(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    undelivered_estop: bool,
-) {
-    let reason = if undelivered_estop {
-        "ESTOP_LATCHED:WRITE_TIMEOUT"
-    } else {
-        "WRITE_TIMEOUT"
-    };
-    send_best_effort_close(
-        sender,
-        CloseFrame {
-            code: 1013,
-            reason: reason.into(),
-        },
-    )
     .await;
 }
 
@@ -796,34 +879,40 @@ async fn flush_urgent_then_fatal_and_close(
     in_flight_stops: &AtomicUsize,
     urgent_done_notify: &tokio::sync::Notify,
 ) {
-    let grace = ws_write_timeout(connection_id).min(WS_FATAL_FLUSH_TIMEOUT);
-    let deadline = tokio::time::Instant::now() + grace;
-    let rem = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut write_failed = false;
+    let total_grace = ws_write_timeout(connection_id).min(WS_FATAL_FLUSH_TIMEOUT);
+    // Give each urgent reply and the fatal frame its own short bounded budget so a single stalled
+    // write never starves subsequent urgent replies, the fatal error frame, or Close.
+    let per_frame_budget = (total_grace / 4).clamp(Duration::from_millis(20), Duration::from_millis(80));
+    let fatal_budget = per_frame_budget.min(total_grace.max(Duration::from_millis(20)));
+    let urgent_budget = total_grace.saturating_sub(fatal_budget).max(per_frame_budget);
+    let urgent_deadline = tokio::time::Instant::now() + urgent_budget;
+    let urgent_rem = || urgent_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut socket_closed = false;
 
-    // 1. Flush all already-queued urgent E-stop and Stop replies BEFORE fatal error + Close.
-    while !write_failed {
+    // 1. Attempt all already-queued urgent E-stop and Stop replies BEFORE fatal error + Close.
+    while !socket_closed {
         if let Ok(mut val) = estop_out_rx.try_recv() {
-            let r = rem();
+            let r = urgent_rem();
             if r.is_zero() {
-                write_failed = true;
                 break;
             }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
-            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_ok() {
-                *estop_replies_delivered += 1;
-            } else {
-                write_failed = true;
+            match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await {
+                Ok(()) => { *estop_replies_delivered += 1; }
+                Err(WriteErr::Timeout) => {}
+                Err(WriteErr::Closed) => { socket_closed = true; }
             }
         } else if let Ok(mut val) = stop_out_rx.try_recv() {
-            let r = rem();
+            let r = urgent_rem();
             if r.is_zero() {
-                write_failed = true;
                 break;
             }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
-            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_err() {
-                write_failed = true;
+            if matches!(
+                write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await,
+                Err(WriteErr::Closed)
+            ) {
+                socket_closed = true;
             }
         } else {
             break;
@@ -831,11 +920,11 @@ async fn flush_urgent_then_fatal_and_close(
     }
 
     // 2. If urgent E-stop/Stop replies admitted before close are still in-flight, wait within
-    //    the same bounded grace so they flush BEFORE the fatal error frame and Close.
-    while !write_failed
+    //    the bounded urgent budget so they are attempted BEFORE the fatal error frame and Close.
+    while !socket_closed
         && (in_flight_estops.load(Ordering::SeqCst) > 0 || in_flight_stops.load(Ordering::SeqCst) > 0)
     {
-        let r = rem();
+        let r = urgent_rem();
         if r.is_zero() {
             break;
         }
@@ -843,24 +932,27 @@ async fn flush_urgent_then_fatal_and_close(
             biased;
             msg = estop_out_rx.recv() => match msg {
                 Some(mut val) => {
-                    let r2 = rem();
-                    if r2.is_zero() { write_failed = true; break; }
+                    let r2 = urgent_rem();
+                    if r2.is_zero() { break; }
                     enforce_monotonic_epoch(last_wire_epoch, &mut val);
-                    if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r2).await.is_ok() {
-                        *estop_replies_delivered += 1;
-                    } else {
-                        write_failed = true;
+                    match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r2)).await {
+                        Ok(()) => { *estop_replies_delivered += 1; }
+                        Err(WriteErr::Timeout) => {}
+                        Err(WriteErr::Closed) => { socket_closed = true; }
                     }
                 }
                 None => break,
             },
             msg = stop_out_rx.recv() => match msg {
                 Some(mut val) => {
-                    let r2 = rem();
-                    if r2.is_zero() { write_failed = true; break; }
+                    let r2 = urgent_rem();
+                    if r2.is_zero() { break; }
                     enforce_monotonic_epoch(last_wire_epoch, &mut val);
-                    if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r2).await.is_err() {
-                        write_failed = true;
+                    if matches!(
+                        write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r2)).await,
+                        Err(WriteErr::Closed)
+                    ) {
+                        socket_closed = true;
                     }
                 }
                 None => break,
@@ -871,22 +963,25 @@ async fn flush_urgent_then_fatal_and_close(
     }
 
     // Drain any final urgent reply pushed right before the in-flight guard dropped.
-    while !write_failed {
+    while !socket_closed {
         if let Ok(mut val) = estop_out_rx.try_recv() {
-            let r = rem();
-            if r.is_zero() { write_failed = true; break; }
+            let r = urgent_rem();
+            if r.is_zero() { break; }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
-            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_ok() {
-                *estop_replies_delivered += 1;
-            } else {
-                write_failed = true;
+            match write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await {
+                Ok(()) => { *estop_replies_delivered += 1; }
+                Err(WriteErr::Timeout) => {}
+                Err(WriteErr::Closed) => { socket_closed = true; }
             }
         } else if let Ok(mut val) = stop_out_rx.try_recv() {
-            let r = rem();
-            if r.is_zero() { write_failed = true; break; }
+            let r = urgent_rem();
+            if r.is_zero() { break; }
             enforce_monotonic_epoch(last_wire_epoch, &mut val);
-            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_err() {
-                write_failed = true;
+            if matches!(
+                write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), per_frame_budget.min(r)).await,
+                Err(WriteErr::Closed)
+            ) {
+                socket_closed = true;
             }
         } else {
             break;
@@ -895,34 +990,39 @@ async fn flush_urgent_then_fatal_and_close(
 
     let undelivered_estop = estop_admitted_count.load(Ordering::SeqCst) > *estop_replies_delivered;
     let close_frame = fatal.close_frame(undelivered_estop);
-    if !write_failed {
-        let r1 = rem();
-        if !r1.is_zero() {
-            let _ = write_ws_frame(
+
+    // 3. Always attempt the fatal error frame with its own short bounded budget BEFORE Close
+    //    (unless the underlying socket is already closed).
+    if !socket_closed
+        && matches!(
+            write_ws_frame(
                 connection_id,
                 sender,
                 Message::Text(fatal.error_value(undelivered_estop).to_string().into()),
-                r1,
+                fatal_budget,
             )
-            .await;
-        }
-        let r2 = rem();
-        if !r2.is_zero()
-            && write_ws_frame(connection_id, sender, Message::Close(Some(close_frame.clone())), r2)
-                .await
-                .is_ok()
-        {
-            let _ = tokio::time::timeout(Duration::from_millis(50), async {
-                let _ = sender.flush().await;
-                let _ = sender.close().await;
-            })
-            .await;
-            return;
-        }
+            .await,
+            Err(WriteErr::Closed)
+        )
+    {
+        socket_closed = true;
     }
-    // Grace expired or writer stayed blocked: attempt one bounded direct Close frame so any
-    // undelivered E-stop remains visible to the client in the CloseFrame reason.
-    send_best_effort_close(sender, close_frame).await;
+
+    // 4. Finally send Close (trying normal bounded write first, then best-effort direct Close
+    //    so any undelivered E-stop remains visible in the CloseFrame reason).
+    if !socket_closed
+        && write_ws_frame(connection_id, sender, Message::Close(Some(close_frame.clone())), fatal_budget)
+            .await
+            .is_ok()
+    {
+        let _ = tokio::time::timeout(Duration::from_millis(50), async {
+            let _ = sender.flush().await;
+            let _ = sender.close().await;
+        })
+        .await;
+        return;
+    }
+    send_best_effort_close(connection_id, sender, close_frame).await;
 }
 
 /// Dedicated latest-wins heartbeat handoff isolated from the bounded ordinary queue and slow worker tasks.
@@ -1799,7 +1899,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             deferred_losses.push_back((loss_gen, msg));
                         } else if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, msg, ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
-                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
+                                flush_urgent_then_fatal_and_close(
+                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
+                                    &mut estop_replies_delivered, &writer_in_flight_estops,
+                                    &writer_in_flight_stops, &writer_urgent_notify,
+                                ).await;
                             }
                             break;
                         }
@@ -1813,7 +1919,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             Ok(()) => { estop_replies_delivered += 1; }
                             Err(e) => {
                                 if e == WriteErr::Timeout {
-                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                    let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
+                                    flush_urgent_then_fatal_and_close(
+                                        &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                        &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
+                                        &mut estop_replies_delivered, &writer_in_flight_estops,
+                                        &writer_in_flight_stops, &writer_urgent_notify,
+                                    ).await;
                                 }
                                 break;
                             }
@@ -1826,7 +1938,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
                         if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
-                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
+                                flush_urgent_then_fatal_and_close(
+                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
+                                    &mut estop_replies_delivered, &writer_in_flight_estops,
+                                    &writer_in_flight_stops, &writer_urgent_notify,
+                                ).await;
                             }
                             break;
                         }
@@ -1857,7 +1975,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     Some(val) => {
                         if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
-                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
+                                flush_urgent_then_fatal_and_close(
+                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
+                                    &mut estop_replies_delivered, &writer_in_flight_estops,
+                                    &writer_in_flight_stops, &writer_urgent_notify,
+                                ).await;
                             }
                             break;
                         }
@@ -1900,7 +2024,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                         if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
-                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
+                                flush_urgent_then_fatal_and_close(
+                                    &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                    &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
+                                    &mut estop_replies_delivered, &writer_in_flight_estops,
+                                    &writer_in_flight_stops, &writer_urgent_notify,
+                                ).await;
                             }
                             break;
                         }
@@ -1922,7 +2052,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             }
                             if let Some(e) = write_failed {
                                 if e == WriteErr::Timeout {
-                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                    let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
+                                    flush_urgent_then_fatal_and_close(
+                                        &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                        &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
+                                        &mut estop_replies_delivered, &writer_in_flight_estops,
+                                        &writer_in_flight_stops, &writer_urgent_notify,
+                                    ).await;
                                 }
                                 break;
                             }
@@ -1939,7 +2075,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if let Ok(text) = serde_json::to_string(&obs) {
                             if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                                 if e == WriteErr::Timeout {
-                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                    let fatal = fatal_rx.try_recv().unwrap_or_else(|_| FatalClose::write_timeout());
+                                    flush_urgent_then_fatal_and_close(
+                                        &writer_connection, &mut sender, &fatal, &mut last_wire_epoch,
+                                        &mut estop_out_rx, &mut stop_out_rx, &writer_estop_admitted,
+                                        &mut estop_replies_delivered, &writer_in_flight_estops,
+                                        &writer_in_flight_stops, &writer_urgent_notify,
+                                    ).await;
                                 }
                                 break;
                             }

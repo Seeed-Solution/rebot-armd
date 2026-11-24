@@ -3016,3 +3016,126 @@ async fn full_stop_reply_queue_never_exits_reader_and_estop_registration_is_lock
         handle.stop_and_join();
     }
 }
+
+// 21. Round-5 Item 4:
+//     On write timeout, the writer abandons the in-progress stalled write, then attempts queued
+//     urgent E-stop replies and the fatal error frame (each with a short bounded budget) BEFORE
+//     sending Close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_timeout_abandons_stalled_write_and_attempts_queued_estop_replies_and_fatal_before_close() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // (a) Transient one-shot stall on an in-progress ordinary write + two queued E-stop replies:
+    //     in-progress write times out and is abandoned -> queued E-stop replies arrive on the wire,
+    //     followed by the fatal WRITE_TIMEOUT error frame, followed by Close.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn.clone());
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let ep = sup.get_observation().await.epoch_id;
+
+        armd::api::ws::enable_test_ws_write_trace(&conn);
+        armd::api::ws::set_test_ws_write_timeout(&conn, Some(Duration::from_millis(160)));
+        armd::api::ws::set_test_ws_write_stall_once(&conn, true);
+
+        // Trigger one ordinary frame so writer blocks inside `write_ws_frame`.
+        send(&mut ws, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/home", "body": {}})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn) >= 1).await;
+
+        // While the in-progress ordinary write is stalled, queue two E-stops so their replies sit in `estop_out_rx`.
+        send(&mut ws, json!({"type": "estop"})).await;
+        send(&mut ws, json!({"type": "e_stop"})).await;
+        wait_until(Duration::from_millis(100), || {
+            sup.inner().try_read().is_ok_and(|g| *g.safety.state() == SafetyState::EStop)
+        }).await;
+
+        // Collect all wire frames until Close.
+        let mut wire_events: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(400), ws.next()).await {
+                Ok(Some(Ok(Message::Text(txt)))) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        if let Some(ty) = v.get("type").and_then(|t| t.as_str()) {
+                            let tag = if ty == "error" {
+                                format!("error:{}", v["code"].as_str().unwrap_or(""))
+                            } else if ty == "epoch_sync" {
+                                format!("epoch_sync:{}", v["safety_state"].as_str().unwrap_or(""))
+                            } else {
+                                ty.to_string()
+                            };
+                            wire_events.push(tag);
+                        }
+                    }
+                }
+                Ok(Some(Ok(Message::Close(cf)))) => {
+                    wire_events.push(format!("close:{}", cf.map(|f| f.reason.to_string()).unwrap_or_default()));
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let estop_count = wire_events.iter().filter(|e| *e == "epoch_sync:EStop").count();
+        let last_estop = wire_events.iter().rposition(|e| e == "epoch_sync:EStop").expect("queued E-stop replies must arrive on wire");
+        let fatal_idx = wire_events.iter().position(|e| e == "error:WRITE_TIMEOUT").expect("fatal WRITE_TIMEOUT frame must arrive on wire");
+        let close_idx = wire_events.iter().position(|e| e.starts_with("close:")).expect("Close frame must arrive on wire");
+        assert!(estop_count >= 2, "expected both queued E-stop replies on wire, got {wire_events:?}");
+        assert!(last_estop < fatal_idx && fatal_idx < close_idx, "must deliver queued E-stop replies -> fatal error -> Close, got {wire_events:?}");
+
+        let trace = armd::api::ws::take_test_ws_write_trace(&conn);
+        let t_estop = trace.iter().rposition(|e| e == "text:epoch_sync").expect("epoch_sync traced");
+        let t_err = trace.iter().position(|e| e == "text:error").expect("error traced");
+        let t_close = trace.iter().position(|e| e.starts_with("close:")).expect("close traced");
+        assert!(t_estop < t_err && t_err < t_close, "attempt order must be epoch_sync -> error -> close: {trace:?}");
+    }
+
+    // (b) Permanently stalled socket: in-progress write times out and is abandoned -> queued E-stop
+    //     replies AND fatal frame are STILL attempted (each bounded) BEFORE CloseFrame(ESTOP_LATCHED).
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn.clone());
+        let ep = sup.get_observation().await.epoch_id;
+
+        armd::api::ws::enable_test_ws_write_trace(&conn);
+        armd::api::ws::set_test_ws_write_timeout(&conn, Some(Duration::from_millis(120)));
+        armd::api::ws::set_test_ws_write_paused(&conn, true);
+
+        send(&mut ws, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/home", "body": {}})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn) >= 1).await;
+
+        send(&mut ws, json!({"type": "estop"})).await;
+        wait_until(Duration::from_millis(80), || {
+            sup.inner().try_read().is_ok_and(|g| *g.safety.state() == SafetyState::EStop)
+        }).await;
+
+        let mut close_reason = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(400), ws.next()).await {
+                Ok(Some(Ok(Message::Close(Some(cf))))) => {
+                    close_reason = Some(cf.reason.to_string());
+                    break;
+                }
+                Ok(Some(Ok(_))) => {}
+                _ => break,
+            }
+        }
+        let reason = close_reason.expect("client must receive CloseFrame even when writes remain stalled");
+        assert!(reason.contains("ESTOP_LATCHED"), "CloseFrame must report ESTOP_LATCHED, got {reason:?}");
+        wait_until(Duration::from_secs(1), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+
+        let trace = armd::api::ws::take_test_ws_write_trace(&conn);
+        let t_estop = trace.iter().position(|e| e == "text:epoch_sync").expect("queued E-stop reply must be attempted before Close");
+        let t_err = trace.iter().position(|e| e == "text:error").expect("fatal error frame must be attempted before Close");
+        let t_close = trace.iter().position(|e| e.starts_with("close:ESTOP_LATCHED")).expect("ESTOP_LATCHED Close must be attempted");
+        assert!(t_estop < t_err && t_err < t_close, "permanent stall must attempt E-stop -> error -> Close(ESTOP_LATCHED): {trace:?}");
+    }
+}
