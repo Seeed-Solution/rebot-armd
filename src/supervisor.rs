@@ -2517,7 +2517,7 @@ impl SupervisorInner {
         self.driver_has_torque_feedback = self
             .driver
             .as_ref()
-            .map_or(true, |d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
         let pf_info = self
             .config
             .gripper_index()

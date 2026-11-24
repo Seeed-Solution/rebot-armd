@@ -3626,6 +3626,7 @@ fn install_begin_macro_committed(
 }
 
 /// Payload for [`install_macro_child`] (A7).
+#[allow(clippy::large_enum_variant)]
 pub enum MacroChildPayload {
     /// RT broker pinned slot (`StagedAction::{Cartesian, Joint, Gripper, Replay}`).
     Slot(PlanSlotRef<PlanSlot>),

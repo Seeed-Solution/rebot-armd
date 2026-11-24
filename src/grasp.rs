@@ -4781,7 +4781,7 @@ impl Orchestrator {
                 (Some(env), Some(snap)) => {
                     let roll_idx = env.config.arm_dof().saturating_sub(1);
                     let q_roll = f64::from(snap.rt.commanded_positions.get(roll_idx).copied().unwrap_or(0.0));
-                    let lim = env.config.limits.get(roll_idx).cloned().unwrap_or_else(|| crate::model::JointLimit::new("roll", -3.14, 3.14, 1.0, 1.0));
+                    let lim = env.config.limits.get(roll_idx).cloned().unwrap_or_else(|| crate::model::JointLimit::new("roll", -std::f32::consts::PI, std::f32::consts::PI, 1.0, 1.0));
                     let sign = env.config.arm_model.joint_map().get(roll_idx).map_or(1.0, |m| m.sign);
                     (q_roll, lim, sign)
                 }

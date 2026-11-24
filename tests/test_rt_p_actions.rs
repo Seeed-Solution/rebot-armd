@@ -1431,7 +1431,7 @@ fn a7_grasp_select_phase_a_live_refusal_and_phase_b_macro_hook() {
 #[test]
 fn review_b1_descent_rules_refuse_table_violation_on_direct_and_fitted_final_leg() {
     use armd::backlash::{DescentRules, Pre, Request as BacklashRequest};
-    use armd::motion::{plan_cartesian_opts, resolve_goal_opts, PathOpts};
+    use armd::motion::{plan_cartesian_opts, resolve_goal_opts};
     use armd::rt_core::requests::actions::resolve_cartesian_legs_with_rules;
 
     let (fx, _b, _clock, _stop) = fixture();
@@ -1446,7 +1446,7 @@ fn review_b1_descent_rules_refuse_table_violation_on_direct_and_fitted_final_leg
             r: None,
         },
     );
-    let direct = plan_cartesian_opts(&input, goal, Speed::default(), PathOpts::from(opts)).unwrap();
+    let direct = plan_cartesian_opts(&input, goal, Speed::default(), opts).unwrap();
     let end_tcp_z = input
         .arm
         .fk_f32(direct.last_slice())
