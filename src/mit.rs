@@ -548,6 +548,27 @@ impl crate::supervisor::SupervisorInner {
 
     pub fn mit_active(&self) -> bool { self.mit.owner == MitOwner::Active }
 
+    /// Zero-allocation predicate equivalent to `self.mit_motion_blocker().is_some()`.
+    pub fn has_mit_motion_blocker(&self) -> bool {
+        if !self.is_torqued {
+            return false;
+        }
+        let has_mit = self.config.joint_tracking.as_ref().is_some_and(|jt| {
+            jt.mit_requested()
+                && jt
+                    .joints
+                    .iter()
+                    .take(self.config.arm_dof())
+                    .any(|j| j.strategy == crate::tracking::TrackingStrategy::Mit)
+        });
+        if !has_mit {
+            return false;
+        }
+        self.mit.park_after_hand_back
+            || self.mit.revoke_pending
+            || !matches!(self.mit.owner, MitOwner::Active)
+    }
+
     /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
     pub fn mit_motion_blocker(&self) -> Option<String> {
         if !self.is_torqued || mit_joints(&self.config).is_empty() { return None; }

@@ -644,6 +644,20 @@ impl ReplayMotion {
 }
 
 impl SupervisorInner {
+    /// Zero-allocation mirror of [`Self::replay_preconditions`] for RT commit paths (`armd-control`).
+    pub(crate) fn replay_preconditions_static(&self) -> Result<(), &'static str> {
+        let own_recording = self.recording.as_ref().is_some_and(|r| matches!(r.owner, crate::teach::RecorderOwner::Sequence { action_id }
+            if self.macro_run.as_ref().is_some_and(|m| m.id == action_id)));
+        if !own_recording && (self.recorder.state() == &crate::recording::EpisodeState::Recording
+            || self.recorder.state() == &crate::recording::EpisodeState::Finalizing) {
+            return Err("MOTION_BUSY");
+        }
+        if self.gravity_comp.is_some() {
+            return Err("MOTION_BUSY");
+        }
+        self.action_preconditions_static()
+    }
+
     /// Busy rules of a replay, in addition to [`action_preconditions`](Self::action_preconditions).
     fn replay_preconditions(&self) -> Result<(), ArmError> {
         // a sequence run that records itself replays its episode steps into its own recording
@@ -808,8 +822,8 @@ impl SupervisorInner {
         Ok((traj, approach_scale))
     }
 
-    /// Zero-allocation validation of a prepared replay preserving the exact refusal precedence
-    /// of [`Self::check_prepared_replay`] (`INVALID_COMMAND`, `PLAN_STALE`, preconditions, `TOOL_MISMATCH`).
+    /// Zero-allocation validation of a prepared replay (`INVALID_COMMAND`, `PLAN_STALE`,
+    /// preconditions, stale J7 check when `gripper == true`, `TOOL_MISMATCH`).
     pub(crate) fn validate_prepared_replay(&self, dof: usize, path: &crate::rt_core::ops::PreparedPath, kind: crate::rt_core::ops::PathKind,
         duration: f64, epoch: u64) -> Result<(crate::rt_core::ops::EpisodeRef, f32, bool, f64), &'static str> {
         let crate::rt_core::ops::PathKind::Replay { episode, speed, gripper, sample_dt, tool_digest } = kind else {
@@ -821,7 +835,7 @@ impl SupervisorInner {
         if self.safety.epoch_id() != epoch {
             return Err("PLAN_STALE");
         }
-        self.replay_preconditions().map_err(crate::rt_core::ops::static_code)?;
+        self.replay_preconditions_static()?;
         if gripper && self.config.gripper_index().is_some() {
             self.check_pos_force_gripper_fresh_static()?;
         }
@@ -831,39 +845,9 @@ impl SupervisorInner {
         Ok((episode, speed, gripper, sample_dt))
     }
 
-    /// Shared checks for a prepared replay (from `&PreparedPath` or pinned `PlanSlotRef`).
-    fn check_prepared_replay(&self, dof: usize, path: &crate::rt_core::ops::PreparedPath, kind: crate::rt_core::ops::PathKind,
-        duration: f64, epoch: u64) -> Result<(crate::rt_core::ops::EpisodeRef, f32, bool, f64), ArmError> {
-        let crate::rt_core::ops::PathKind::Replay { episode, speed, gripper, sample_dt, tool_digest } = kind else {
-            return Err(MotionError::InvalidCommand("not a prepared replay".into()).into());
-        };
-        if path.is_empty() || dof != self.config.dof || dof > crate::rt_core::mailbox::MAX_DOF || !(sample_dt.is_finite() && sample_dt > 0.0) || !(duration.is_finite() && duration >= 0.0) {
-            return Err(MotionError::InvalidCommand("prepared replay without samples".into()).into());
-        }
-        if self.safety.epoch_id() != epoch {
-            return Err(MotionError::PlanStale("epoch changed while loading the episode".into()).into());
-        }
-        self.replay_preconditions()?;
-        if gripper && self.config.gripper_index().is_some() {
-            self.check_pos_force_gripper_fresh()?;
-        }
-        if crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest) != tool_digest {
-            return Err(rejected(409, "TOOL_MISMATCH", format!(
-                "Replay for episode '{}' was prepared for another tool than the active '{}'", episode.as_str(), self.config.active_tool.id)));
-        }
-        Ok((episode, speed, gripper, sample_dt))
-    }
-
     /// The motion of a prepared replay borrowing directly from an immutable pinned plan slot
-    /// (`PlanSlotRef`): zero sample vector copies and zero episode `String` allocation on commit.
-    pub(crate) fn prepared_replay_from_slot(&mut self, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
-        kind: crate::rt_core::ops::PathKind, duration: f64, power_scale: Option<f64>, epoch: u64)
-        -> Result<(ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2]), ArmError> {
-        let checked = self.check_prepared_replay(dof, &slot.path, kind, duration, epoch)?;
-        self.prepared_replay_from_slot_checked(dof, slot, checked, duration, power_scale, epoch)
-    }
-
-    /// [`Self::prepared_replay_from_slot`] after zero-allocation [`Self::validate_prepared_replay`].
+    /// (`PlanSlotRef`) after zero-allocation [`Self::validate_prepared_replay`]: zero sample
+    /// vector copies and zero episode `String` allocation on commit.
     pub(crate) fn prepared_replay_from_slot_checked(&mut self, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
         checked: (crate::rt_core::ops::EpisodeRef, f32, bool, f64), duration: f64, power_scale: Option<f64>, epoch: u64)
         -> Result<(ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2]), ArmError> {
@@ -892,11 +876,12 @@ impl SupervisorInner {
     }
 
     /// Fallback prepared replay when called through `CoreOps::commit_prepared(&PreparedPath)`
-    /// without a pinned [`crate::rt_core::broker::PlanSlotRef`].
-    pub(crate) fn prepared_replay_motion(&mut self, dof: usize, path: &crate::rt_core::ops::PreparedPath, kind: crate::rt_core::ops::PathKind,
-        duration: f64, power_scale: Option<f64>, epoch: u64)
+    /// without a pinned [`crate::rt_core::broker::PlanSlotRef`], after zero-allocation
+    /// [`Self::validate_prepared_replay`].
+    pub(crate) fn prepared_replay_motion_checked(&mut self, dof: usize, path: &crate::rt_core::ops::PreparedPath,
+        checked: (crate::rt_core::ops::EpisodeRef, f32, bool, f64), duration: f64, power_scale: Option<f64>, epoch: u64)
         -> Result<(ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2]), ArmError> {
-        let (episode, speed, gripper, sample_dt) = self.check_prepared_replay(dof, path, kind, duration, epoch)?;
+        let (episode, speed, gripper, sample_dt) = checked;
         let gripper_idx = self.config.gripper_index();
         let hold_gripper = gripper_idx.filter(|_| !gripper).map(|g| self.commanded_positions[g]);
         let samples: Vec<Vec<f32>> = path.samples().iter().map(|q| q[..dof].to_vec()).collect();

@@ -379,6 +379,10 @@ pub enum ArmError {
     #[error("{code}: {message}")]
     Rejected { status: u16, code: String, message: String },
 
+    /// Zero-allocation static refusal for RT paths (`armd-control` never allocates `String`).
+    #[error("{code}: {message}")]
+    RejectedStatic { status: u16, code: &'static str, message: &'static str },
+
     /// [`Rejected`](Self::Rejected) with extra reply fields (`owner`, `sequences`, `step`, `reason`).
     #[error("{code}: {message}")]
     Detailed { status: u16, code: String, message: String, details: Box<serde_json::Value> },
@@ -1183,6 +1187,9 @@ pub struct SupervisorInner {
     pub(crate) retired_trajectories: std::collections::VecDeque<ActiveTrajectory>,
     /// Retired `MacroRun` instances queued for off-thread drop on RT executor (0 free on RT).
     pub(crate) retired_macro_runs: std::collections::VecDeque<crate::macro_action::MacroRun>,
+    /// Retired `PolicyRun` instances queued for off-thread drop on RT executor (0 free on RT).
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) retired_policy_runs: std::collections::VecDeque<crate::policy_runtime::PolicyRun>,
     /// Preallocated reusable `UnloadSettle` ring returned on stop/finish (0 alloc / 0 free on RT).
     pub(crate) unload_settle_spare: Option<UnloadSettle>,
     /// Current control tick's J7 `PosForce` intent set by arm/motion/hold paths and consumed
@@ -1827,6 +1834,8 @@ impl SupervisorInner {
             ],
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             retired_macro_runs: std::collections::VecDeque::with_capacity(8),
+            #[cfg(feature = "policy-runtime")]
+            retired_policy_runs: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
             j7_intent: None,
         };
@@ -3434,6 +3443,38 @@ impl SupervisorInner {
         self.retired_macro_runs.pop_front()
     }
 
+    /// True when the supervisor has guaranteed off-thread retirement capacity for a new
+    /// `PolicyRun` so ending it on `armd-control` never frees heap fields on the RT thread.
+    #[cfg(feature = "policy-runtime")]
+    pub fn can_admit_policy_run(&self) -> bool {
+        !self.rt_executor_owned
+            || self.retired_policy_runs.len() + usize::from(self.policy_run.is_some())
+                < self.retired_policy_runs.capacity()
+    }
+
+    /// Queue a finished `PolicyRun` for off-thread drop when owned by the RT executor
+    /// (prevents dropping heap strings/vectors on `armd-control`).
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) fn retire_policy_run(&mut self, run: crate::policy_runtime::PolicyRun) {
+        if self.rt_executor_owned
+            && self.retired_policy_runs.len() < self.retired_policy_runs.capacity()
+        {
+            self.retired_policy_runs.push_back(run);
+        }
+    }
+
+    /// Number of retired `PolicyRun` instances currently queued for off-thread drop.
+    #[cfg(feature = "policy-runtime")]
+    pub fn retired_policy_runs_len(&self) -> usize {
+        self.retired_policy_runs.len()
+    }
+
+    /// Pop one retired `PolicyRun` for off-thread drop (0 alloc, 0 drop).
+    #[cfg(feature = "policy-runtime")]
+    pub fn pop_retired_policy_run(&mut self) -> Option<crate::policy_runtime::PolicyRun> {
+        self.retired_policy_runs.pop_front()
+    }
+
     /// Current exact count of suppressed `"Stopped hold output failed"` log events pending the
     /// next 1/s log window (or deferred-ring retry).
     pub fn hold_tx_error_suppressed(&self) -> u64 {
@@ -3728,12 +3769,13 @@ impl SupervisorInner {
     }
 
     /// Refuse new gripper targets while active `PosForce` J7 feedback is stale (`> 100 ms`).
+    /// Returns [`ArmError::RejectedStatic`] so callers on `armd-control` allocate zero memory.
     pub(crate) fn check_pos_force_gripper_fresh(&self) -> Result<(), ArmError> {
         if let Err(code) = self.check_pos_force_gripper_fresh_static() {
-            return Err(ArmError::Rejected {
+            return Err(ArmError::RejectedStatic {
                 status: 409,
-                code: code.into(),
-                message: "Gripper (J7) position-force feedback is stale (> 100 ms); new gripper targets are refused until fresh feedback returns".into(),
+                code,
+                message: "Gripper (J7) position-force feedback is stale (> 100 ms); new gripper targets are refused until fresh feedback returns",
             });
         }
         Ok(())
@@ -5672,7 +5714,7 @@ impl SupervisorInner {
         {
             #[cfg(feature = "policy-runtime")]
             if self.policy_run.is_some() {
-                self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
+                self.terminate_policy_run_static("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired"));
             }
             // Watchdog expired with torque on. When the arm is healthy and has a resting
             // pose, run the normal unload (park at home, settle, torque off). Otherwise

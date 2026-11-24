@@ -378,7 +378,7 @@ impl SupervisorInner {
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
         }
-        if self.mit_motion_blocker().is_some() { return Err(SafetyError::MotionBusy); }
+        if self.has_mit_motion_blocker() { return Err(SafetyError::MotionBusy); }
         self.validate_and_filter_servo_targets(targets, epoch_id)?;
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
@@ -409,7 +409,7 @@ impl SupervisorInner {
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
         }
-        if self.mit_motion_blocker().is_some() { return Err(SafetyError::MotionBusy); }
+        if self.has_mit_motion_blocker() { return Err(SafetyError::MotionBusy); }
         self.validate_and_filter_servo_targets(&mut targets, epoch_id)?;
         Err(SafetyError::DimensionMismatch { expected: self.config.dof, received: targets.len() })
     }
@@ -705,6 +705,24 @@ impl SupervisorInner {
         self.policy_input_age_range_ms().map(|(_, max_ms)| max_ms)
     }
 
+    /// Zero-allocation, non-blocking equivalent of `self.policy_input_age_range_ms().is_some()`
+    /// safe to call on `armd-control`.
+    pub(super) fn has_policy_input_age_range(&self) -> bool {
+        if self.config.dof == 0 {
+            return false;
+        }
+        match &self.driver {
+            None => true,
+            Some(d) => match d.try_lock() {
+                Ok(drv) => drv.feedback_all_within(self.config.dof, Duration::MAX),
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    p.into_inner().feedback_all_within(self.config.dof, Duration::MAX)
+                }
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            },
+        }
+    }
+
     pub fn policy_input_age_range_ms(&self) -> Option<(u64, u64)> {
         match &self.driver {
             None => Some((0, 0)),
@@ -871,7 +889,7 @@ impl SupervisorInner {
             }
             if !self.feedback_numeric_valid
                 || !self.driver_feedback_confirmed()
-                || self.policy_input_age_range_ms().is_none()
+                || !self.has_policy_input_age_range()
             {
                 return Err(ArmError::Rejected {
                     status: 409,
@@ -912,6 +930,9 @@ impl SupervisorInner {
             });
 
         self.check_terminal_fifo_for_new_action()?;
+        if !self.can_admit_policy_run() {
+            return Err(ArmError::Safety(SafetyError::MotionBusy));
+        }
         let action_id = self.begin_action("policy", req.tag);
         let run = PolicyRun {
             action_id,
@@ -1041,7 +1062,8 @@ impl SupervisorInner {
             }
             .into());
         }
-        if let SafetyState::Fault(r) = self.safety.state().clone() {
+        if let SafetyState::Fault(r) = self.safety.state() {
+            let r = r.clone();
             let reason = if matches!(r, FaultReason::WatchdogTimeout) {
                 "WATCHDOG_TIMEOUT"
             } else {
@@ -1171,7 +1193,7 @@ impl SupervisorInner {
             }
             if !self.feedback_numeric_valid
                 || !self.driver_feedback_confirmed()
-                || self.policy_input_age_range_ms().is_none()
+                || !self.has_policy_input_age_range()
             {
                 self.terminate_policy_run(
                     "FEEDBACK_UNCONFIRMED",
@@ -1250,11 +1272,11 @@ impl SupervisorInner {
 
         if self.config.gripper_index().is_some() {
             if let Err(err) = self.check_pos_force_gripper_fresh() {
-                self.terminate_policy_run(
+                self.terminate_policy_run_static(
                     "J7_FEEDBACK_STALE",
                     "failed",
                     Some("J7_FEEDBACK_STALE"),
-                    Some("Gripper (J7) position-force feedback is stale (> 100 ms)".into()),
+                    Some("Gripper (J7) position-force feedback is stale (> 100 ms)"),
                 );
                 return Err(err);
             }
@@ -1374,7 +1396,8 @@ impl SupervisorInner {
             return false;
         }
         // a fault or E-stop that the runner has not seen yet is not a normal completion
-        if let SafetyState::Fault(r) = self.safety.state().clone() {
+        if let SafetyState::Fault(r) = self.safety.state() {
+            let r = r.clone();
             self.terminate_policy_run("FAULT", "failed", Some("FAULT"), Some(format!("Fault active: {r:?}")));
             return true;
         }
@@ -1417,6 +1440,27 @@ impl SupervisorInner {
         }
     }
 
+    /// Zero-allocation termination helper for static messages on `armd-control`: fills a
+    /// preallocated `action_msg_spares` buffer and terminates without heap allocation or free.
+    pub(super) fn terminate_policy_run_static(
+        &mut self,
+        stop_reason: &'static str,
+        action_state: &'static str,
+        action_code: Option<&'static str>,
+        action_message: Option<&'static str>,
+    ) {
+        let Some(action_id) = self.policy_run.as_ref().map(|r| r.action_id) else {
+            return;
+        };
+        let msg = action_message.map(|text| {
+            let mut buf = self.take_action_msg_buf(action_id, 256);
+            buf.clear();
+            buf.push_str(text);
+            buf
+        });
+        self.terminate_policy_run(stop_reason, action_state, action_code, msg);
+    }
+
     pub(super) fn terminate_policy_run(
         &mut self,
         stop_reason: &str,
@@ -1428,18 +1472,28 @@ impl SupervisorInner {
             return;
         };
         self.end_policy_stream(run.action_id);
-        run.stop_reason = Some(stop_reason.to_string());
         self.set_action_policy_stats(run.action_id, run.step_stats.report());
-        self.record_policy_qualification(&run, stop_reason, action_state);
+        if !self.rt_executor_owned {
+            run.stop_reason = Some(stop_reason.to_string());
+            self.record_policy_qualification(&run, stop_reason, action_state);
+        }
         if run.mode == crate::policy_runtime::PolicyMode::Live {
-            self.servo_target = None;
+            self.release_servo_target();
             self.servo_settled_ticks.fill(0);
             self.servo_ws_min_depths = None;
-            self.target_positions = self.commanded_positions.clone();
+            copy_into(&mut self.target_positions, &self.commanded_positions);
         }
-        self.last_policy_obs = Some(run.to_observation(false));
+        if let Some(obs) = self.last_policy_obs.as_mut() {
+            run.to_observation_into(false, obs);
+            obs.stop_reason = Some(crate::model::HolderLabel::new(stop_reason));
+        } else {
+            let mut obs = run.to_observation(false);
+            obs.stop_reason = Some(crate::model::HolderLabel::new(stop_reason));
+            self.last_policy_obs = Some(obs);
+        }
+        let action_id = run.action_id;
         self.finish_action(
-            run.action_id,
+            action_id,
             action_state,
             action_code,
             action_message,
@@ -1447,6 +1501,7 @@ impl SupervisorInner {
             None,
             None,
         );
+        self.retire_policy_run(run);
     }
 }
 
@@ -1544,6 +1599,7 @@ pub mod targets {
     pub fn policy_code(e: &ArmError) -> &'static str {
         match e {
             ArmError::Safety(s) => safety_code(s),
+            ArmError::RejectedStatic { code, .. } => code,
             ArmError::Rejected { code, .. } => POLICY_CODES.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED"),
             ArmError::Internal(_) => "INTERNAL_ERROR",
             _ => "REJECTED",
@@ -1785,7 +1841,7 @@ pub mod targets {
             let Some(run) = self.policy_run.as_ref() else { return; };
             let stream = policy_stream(run.action_id);
             if self.core.target_authority().stream != Some(stream) { return; }
-            let input_known = self.policy_input_age_range_ms().is_some();
+            let input_known = self.has_policy_input_age_range();
             let run = self.policy_run.as_ref().expect("checked");
             let a = TargetAuthority {
                 stream: Some(stream),
@@ -1888,7 +1944,7 @@ pub mod targets {
             let Some(action_id) = self.policy_run.as_ref().map(|r| r.action_id).filter(|id| frame.stream == policy_stream(*id)) else {
                 return Err(Refusal::code("POLICY_NOT_ACTIVE"));
             };
-            let input_age_ms = self.policy_input_age_range_ms().map(|_| ms(frame.input_at));
+            let input_age_ms = self.has_policy_input_age_range().then(|| ms(frame.input_at));
             self.policy_step_slice(action_id, frame.positions(), input_age_ms, frame.vision_at.map(ms), frame.vision_frame_id)
                 .map_err(|e| Refusal::code(policy_code(&e)))
         }

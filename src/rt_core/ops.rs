@@ -702,6 +702,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         },
         ArmError::Unsupported(_) => "UNSUPPORTED",
         ArmError::WorkspaceRejected { .. } => "WORKSPACE_VIOLATION",
+        ArmError::RejectedStatic { code, .. } => code,
         ArmError::Rejected { code, .. } | ArmError::Detailed { code, .. } => {
             KNOWN.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED")
         }
@@ -857,15 +858,20 @@ impl CoreOps for SupervisorInner {
                 }
                 match child {
                     None => {
-                        let prepared = self.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch).map_err(static_code)?;
+                        let checked = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
+                        let prepared = self.prepared_replay_motion_checked(n, path, checked, duration_s, power_scale, epoch).map_err(static_code)?;
                         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
-                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
-                        let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
-                        SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
-                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                    Some(spec) => {
+                        self.commit_child_checks(&spec, &start[..n])?;
+                        let checked = self.validate_prepared_replay(n, path, kind, duration_s, epoch)?;
+                        self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                            let prepared = this.prepared_replay_motion_checked(n, path, checked, duration_s, power_scale, epoch)?;
+                            let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
+                            SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
+                        }).map(|parent| Committed::authorized(d, Some(parent)))
+                    }
                 }
             }
         }
@@ -921,11 +927,15 @@ impl CoreOps for SupervisorInner {
                         let admitted = self.check_admission(stamp).map_err(|e| static_code(ArmError::Safety(e)))?;
                         committed(SupervisorInner::install_prepared_replay(admitted, prepared).map(|(id, _)| id))
                     }
-                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        let prepared = this.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch)?;
-                        let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
-                        SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
-                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                    Some(spec) => {
+                        self.commit_child_checks(&spec, &start[..n])?;
+                        let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
+                        self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                            let prepared = this.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch)?;
+                            let admitted = this.check_admission(stamp).map_err(ArmError::from)?;
+                            SupervisorInner::install_macro_prepared_replay(admitted, id, prepared).map(drop)
+                        }).map(|parent| Committed::authorized(d, Some(parent)))
+                    }
                 }
             }
         }

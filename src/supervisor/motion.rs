@@ -1021,7 +1021,9 @@ impl SupervisorInner {
 
         self.config_motion_check()?;
         self.gravity_comp_motion_busy()?;
-        if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
+        if self.has_mit_motion_blocker() {
+            if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
+        }
         #[cfg(feature = "policy-runtime")]
         if self.policy_loading {
             return Err(MotionError::MotionBusy("a policy is loading".into()).into());
@@ -1288,6 +1290,20 @@ impl SupervisorInner {
         if self.macro_run.is_some() { return Some("a macro action is running".into()); }
         if self.pending_normal_unload { return Some("a park is running".into()); }
         self.busy_reason()
+    }
+
+    /// Zero-allocation predicate equivalent to `self.busy_reason().is_some()`.
+    pub(crate) fn has_busy_reason(&self) -> bool {
+        if self.calibration_busy || self.zero_check_persisting.is_some() {
+            return true;
+        }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading || self.policy_run.is_some() {
+            return true;
+        }
+        self.active_trajectory.is_some()
+            || self.servo_target.is_some()
+            || self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3)
     }
 
     pub(super) fn busy_reason(&self) -> Option<String> {

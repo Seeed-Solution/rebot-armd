@@ -2034,3 +2034,516 @@ fn rt_round5_b1_m1_m2_m3_paths_zero_alloc_and_zero_free() {
     assert!(stalled, "M2 stale J1 + WouldBlock must latch CAN_TX_STALLED");
     assert_eq!(inner.hold_tx_no_progress_ticks()[0], 0);
 }
+
+/// R2 + R1 zero-allocation proof on `armd-control`:
+/// Verifies strictly `(0, 0)` allocs and frees across EVERY RT stale-J7 rejection path and the
+/// unified R1 J7 tick-epilogue emitter:
+/// 1. R1 tick epilogue (`emit_pos_force_j7`): fresh Target, fresh Hold/Stop, and stale Freeze;
+/// 2. `consume_target_frame` / `consume_policy_target` -> `policy_step_slice` while J7 is stale
+///    (`streams.rs:1886, 1251`) -> `Refusal::code("J7_FEEDBACK_STALE")`, in-place policy obs update,
+///    preallocated action message, off-thread `PolicyRun` retirement, and `tick_publish`;
+/// 3. `commit_prepared_slot` standalone `gripper=true` replay while J7 is stale (`ops.rs:918`);
+/// 4. `commit_prepared` standalone `gripper=true` replay while J7 is stale (`ops.rs:860`);
+/// 5. `commit_primitive` `JointQuintic` moving J7 while J7 is stale (`ops.rs:809` -> `motion.rs:1051`);
+/// 6. Macro children while J7 is stale:
+///    - `commit_prepared_slot` child `gripper=true` replay (`ops.rs:924`),
+///    - `commit_prepared` child `gripper=true` replay (`ops.rs:864`),
+///    - `commit_primitive` child `Gripper`, `JointQuinticLimited` moving J7, and `Replay { gripper: true }`;
+/// 7. `reconcile_action` terminating a live `PolicyRun` when `J7_FEEDBACK_STALE` latches at 250 ms.
+#[test]
+fn rt_r2_stale_j7_refusals_and_r1_epilogue_zero_alloc_and_zero_free() {
+    use armd::rt_core::broker::{
+        plan_slots, ActionId, Authority, BootId, ClientId, CommandKind, Descriptor, RequestId, Stamp,
+    };
+    use armd::rt_core::ids::ArmId;
+    use armd::rt_core::mailbox::{Refusal, TargetFrame, MAX_DOF};
+    use armd::rt_core::ops::{
+        tool_digest_hash, ChildSpec, ChildTicket, CommitCtx, CoreOps, EpisodeRef, PathKind,
+        PlanSlot, Primitive,
+    };
+    use armd::safety::FaultCode;
+
+    let limits = b601_limits();
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        joint_tracking: None,
+        ..ArmConfig::rebot_dm()
+    };
+    let bus = SharedNoAllocBus::new(&limits);
+    bus.0.lock().unwrap().motors[6].4 = damiao::CTRL_MODE_POS_FORCE;
+    bus.0.lock().unwrap().motors[6].2 = -2.5;
+    let grip = armd::driver::gripper_drive_from_profile(&cfg).expect("pos-force drive");
+    let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_drive(grip)
+        .unwrap();
+    driver.read_joint_states().unwrap();
+    driver.read_joint_states().unwrap();
+    driver.check_mapping_ranges();
+    driver.set_rt_mode(true);
+
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit arm");
+        SupervisorInner::enable_torque(admitted).expect("arm pos-force");
+    }
+    inner.rt_executor_owned = true;
+    inner.safety.set_off_thread_reclaim(true);
+    inner.prewarm_rt_buffers();
+    for _ in 0..4 {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner.tick_publish(0.02, 1, false);
+        let _ = inner.core.hub().latest();
+    }
+    inner.safety.drain_log_events_off_thread();
+
+    // 1. R1 tick epilogue: fresh Target motion tick -> (0, 0).
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.clock.advance(Duration::from_millis(20));
+        g.push_all_feedback();
+    }
+    let (pub_fresh, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+    assert!(pub_fresh.kept.is_none());
+    drop(pub_fresh);
+    assert_eq!((a, f), (0, 0), "R1 fresh tick epilogue touched allocator");
+    let _ = inner.core.hub().latest();
+
+    // 2. Policy target refusal on `consume_target_frame` (`streams.rs:1886, 1251`) while J7 stale.
+    #[cfg(feature = "policy-runtime")]
+    {
+        use armd::policy_runtime::{PolicyMode, PolicyRunStart};
+        inner.follower = Some("sim".into());
+        inner.lease_enabled = true;
+        let lease_gen = inner.acquire_lease("r2-policy-conn").expect("lease");
+        let ep_pol = inner.safety.epoch_id();
+        let pol_id = {
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit policy");
+            SupervisorInner::begin_policy_run(
+                admitted,
+                PolicyRunStart {
+                    epoch_id: ep_pol,
+                    connection_id: "r2-policy-conn".into(),
+                    lease_generation: lease_gen,
+                    policy_id: "r2-pol".into(),
+                    artifact_digest: "0".repeat(64),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: None,
+                },
+            )
+            .expect("begin live policy")
+        };
+        // Warm up 1 accepted policy step + triple-buffer slots so steady-state buffers are primed.
+        let mut q_step = [0.0f32; MAX_DOF];
+        q_step[..7].copy_from_slice(&inner.commanded_positions);
+        inner.policy_step_slice(pol_id, &q_step[..7], Some(5), None, None).expect("warm step");
+        for _ in 0..4 {
+            {
+                let mut g = bus.0.lock().unwrap();
+                g.clock.advance(Duration::from_millis(20));
+                g.push_all_feedback();
+            }
+            let _ = inner.tick_publish(0.02, 1, false);
+            let _ = inner.core.hub().latest();
+        }
+        inner.safety.drain_log_events_off_thread();
+
+        // Make J7 stale (> 100 ms, still < 250 ms fault).
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.rx.clear();
+            g.pending_rx.clear();
+            g.mute_j7 = true;
+            g.clock.advance(Duration::from_millis(120));
+            g.push_all_feedback();
+        }
+        let (pub_stale, a_ep, f_ep) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(pub_stale.kept.is_none());
+        drop(pub_stale);
+        assert_eq!((a_ep, f_ep), (0, 0), "R1 stale J7 freeze tick epilogue touched allocator");
+        let _ = inner.core.hub().latest();
+
+        // Build live policy TargetFrame and consume it on `armd-control` inside `counted(...)`.
+        let now = std::time::Instant::now();
+        let boot = BootId(1);
+        let ctx = CommitCtx {
+            arm: ArmId::LOCAL,
+            boot,
+            now,
+            stop_generation: inner.current_stop_gen(),
+        };
+        let stamp_pol = inner
+            .policy_target_stamp(pol_id, ctx.stop_generation)
+            .expect("policy stamp");
+        let mut q_close = [0.0f32; MAX_DOF];
+        q_close[..7].copy_from_slice(&inner.commanded_positions);
+        q_close[6] = -2.45;
+        let frame = TargetFrame {
+            arm: ArmId::LOCAL,
+            boot,
+            stream: armd::supervisor::targets::policy_stream(pol_id),
+            seq: 1,
+            authority: stamp_pol.authority,
+            policy_generation: stamp_pol.authorization.max(1),
+            input_at: now,
+            vision_at: None,
+            vision_frame_id: None,
+            deadline: now + Duration::from_secs(1),
+            dof: 7,
+            q: q_close,
+            replaceable: false,
+        };
+
+        let (res, a_pol, f_pol) = counted(|| inner.consume_target_frame(&frame, &ctx));
+        assert_eq!(res, Err(Refusal::code("J7_FEEDBACK_STALE")));
+        assert_eq!(
+            (a_pol, f_pol),
+            (0, 0),
+            "R2 consume_policy_target stale-J7 refusal touched allocator"
+        );
+        assert!(inner.policy_run.is_none(), "policy run must terminate on stale J7");
+        assert_eq!(
+            inner.retired_policy_runs_len(),
+            1,
+            "terminated PolicyRun must retire off-thread (0 frees on RT)"
+        );
+        assert_eq!(
+            inner.last_policy_obs.as_ref().and_then(|o| o.stop_reason.as_deref()),
+            Some("J7_FEEDBACK_STALE")
+        );
+        assert_eq!(
+            inner.last_action.as_ref().and_then(|a| a.code.as_deref()),
+            Some("J7_FEEDBACK_STALE")
+        );
+
+        // Publishing the terminated policy observation + action on the next tick is also (0, 0)!
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let (pub_post, a_pub, f_pub) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(pub_post.kept.is_none());
+        drop(pub_post);
+        assert_eq!((a_pub, f_pub), (0, 0), "post-termination policy tick_publish touched allocator");
+        let _ = inner.core.hub().latest();
+
+        // Off-thread reclaim (outside counted).
+        assert!(inner.pop_retired_policy_run().is_some());
+        let _ = inner.release_lease("r2-policy-conn", lease_gen);
+        inner.lease_enabled = false;
+        inner.follower = None;
+    }
+
+    // Ensure J7 is still stale (> 100 ms, operational, not yet 250 ms fault) — reset freshness cleanly
+    // so we have full headroom before the 250 ms fault while testing all commit paths!
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.mute_j7 = false;
+        g.clock.advance(Duration::from_millis(20));
+        g.push_all_feedback();
+    }
+    let _ = inner.tick_publish(0.02, 1, false);
+    let _ = inner.core.hub().latest();
+    {
+        let mut g = bus.0.lock().unwrap();
+        g.rx.clear();
+        g.pending_rx.clear();
+        g.mute_j7 = true;
+        g.clock.advance(Duration::from_millis(120));
+        g.push_all_feedback();
+    }
+    let _ = inner.tick_publish(0.02, 1, false);
+    let _ = inner.core.hub().latest();
+    assert!(inner.safety.state().is_operational(), "must stay operational at 120 ms J7 age");
+
+    // 3-5. Standalone `commit_prepared_slot`, `commit_prepared`, and `commit_primitive` (`JointQuintic`)
+    //      while J7 is stale: strictly (0, 0) allocs/frees!
+    let boot = BootId(7);
+    let now = std::time::Instant::now();
+    let deadline = now + Duration::from_secs(5);
+    let ctx = CommitCtx {
+        arm: ArmId::LOCAL,
+        boot,
+        now,
+        stop_generation: inner.current_stop_gen(),
+    };
+    let auth = Authority {
+        epoch: inner.safety.epoch_id(),
+        stop_generation: ctx.stop_generation,
+        lease_generation: inner.current_active_lease_gen(),
+        config_revision: inner.workspace_revision,
+        parent_generation: 0,
+    };
+    let tool = tool_digest_hash(&inner.config.active_tool.config_digest);
+    let mut start = [0.0f32; MAX_DOF];
+    start[..7].copy_from_slice(&inner.commanded_positions);
+    let mut goal_j7 = start;
+    goal_j7[6] = 0.0;
+
+    let mut replay_slot = PlanSlot::default();
+    for k in 0..=10 {
+        let f = k as f32 / 10.0;
+        let mut q = start;
+        q[6] = start[6] + (0.0 - start[6]) * f;
+        replay_slot.path.push(&q[..7], k as f64 * 0.02).unwrap();
+    }
+    replay_slot.primitive = Primitive::Prepared {
+        child: None,
+        dof: 7,
+        start,
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("r2_standalone_ep").unwrap(),
+            speed: 1.0,
+            gripper: true,
+            sample_dt: 0.02,
+            tool_digest: tool,
+        },
+        duration_s: 0.2,
+        power_scale: None,
+    };
+    let jog_j7_prim = Primitive::JointQuintic {
+        dof: 7,
+        start,
+        q: goal_j7,
+        duration_s: 0.5,
+    };
+
+    let (mut pw, mut pr) = plan_slots(4, PlanSlot::default);
+    let h_rep = pw.stage(|s| s.copy_from(&replay_slot).unwrap()).unwrap();
+    let make_desc = |req_id: u64, parent_gen: u64, kind: CommandKind| Descriptor {
+        stamp: Stamp {
+            arm: ArmId::LOCAL,
+            boot,
+            request: RequestId(req_id),
+            client: ClientId(1),
+            client_seq: req_id,
+            authority: Authority { parent_generation: parent_gen, ..auth },
+            deadline,
+        },
+        kind,
+    };
+
+    let (standalone_codes, a_st, f_st) = counted(|| {
+        let d1 = make_desc(101, 0, CommandKind::Install { plan: h_rep });
+        let d2 = make_desc(102, 0, CommandKind::Install { plan: h_rep });
+        let d3 = make_desc(103, 0, CommandKind::Install { plan: h_rep });
+        let c_slot = inner.commit_prepared_slot(&d1, pr.pin(h_rep).unwrap(), &ctx).unwrap_err();
+        let c_prep = inner
+            .commit_prepared(&d2, &replay_slot.primitive, &replay_slot.path, &ctx)
+            .unwrap_err();
+        let c_jog = inner.commit_primitive(&d3, &jog_j7_prim, &ctx).unwrap_err();
+        [c_slot, c_prep, c_jog]
+    });
+    assert_eq!(
+        standalone_codes,
+        ["J7_FEEDBACK_STALE", "J7_FEEDBACK_STALE", "J7_FEEDBACK_STALE"]
+    );
+    assert_eq!(
+        (a_st, f_st),
+        (0, 0),
+        "R2 standalone replay/jog stale-J7 refusals touched allocator"
+    );
+    assert!(pr.retire(h_rep));
+    assert_eq!(pw.reclaim(), 1);
+
+    // 6. Macro children while J7 is stale: `commit_prepared_slot` child replay (`ops.rs:924`),
+    //    `commit_prepared` child replay (`ops.rs:864`), and `commit_primitive` child `Gripper`,
+    //    `JointQuinticLimited` (moving J7), and `Replay { gripper: true }` (`actions.rs:793-825`)
+    //    — ALL strictly (0, 0) allocs/frees!
+    let ep_seq = inner.safety.epoch_id();
+    let macro_id = {
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).expect("admit macro");
+        SupervisorInner::begin_sequence_action(admitted, Some("r2-child-seq".into()), ep_seq)
+            .expect("begin sequence macro")
+    };
+    let child_spec = ChildSpec {
+        ticket: ChildTicket { parent: ActionId(macro_id), child_seq: 1 },
+        timeout_s: 5.0,
+        timeout_code: "SEQUENCE_TIMEOUT",
+        contact: None,
+    };
+    let mut child_replay_slot = replay_slot.clone();
+    child_replay_slot.primitive = Primitive::Prepared {
+        child: Some(child_spec),
+        dof: 7,
+        start,
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("r2_child_ep").unwrap(),
+            speed: 1.0,
+            gripper: true,
+            sample_dt: 0.02,
+            tool_digest: tool,
+        },
+        duration_s: 0.2,
+        power_scale: None,
+    };
+    let h_child_rep = pw.stage(|s| s.copy_from(&child_replay_slot).unwrap()).unwrap();
+    let child_grip_prim = Primitive::Gripper {
+        child: Some(child_spec),
+        dof: 7,
+        start,
+        fraction: 0.0,
+        speed: 0.30,
+        grasp: true,
+    };
+    let child_quintic_prim = Primitive::JointQuinticLimited {
+        child: Some(child_spec),
+        dof: 7,
+        start,
+        q: goal_j7,
+        duration_s: 0.5,
+        max_velocity: [0.0; MAX_DOF],
+        settle_s: 0.1,
+    };
+    let child_raw_replay_prim = Primitive::Replay {
+        child: Some(child_spec),
+        dof: 7,
+        start,
+        episode: EpisodeRef::new("r2_child_raw_ep").unwrap(),
+        speed: 1.0,
+        gripper: true,
+    };
+
+    let (child_codes, a_ch, f_ch) = counted(|| {
+        let dc1 = make_desc(201, macro_id, CommandKind::Install { plan: h_child_rep });
+        let dc2 = make_desc(202, macro_id, CommandKind::Install { plan: h_child_rep });
+        let dc3 = make_desc(203, macro_id, CommandKind::Install { plan: h_child_rep });
+        let dc4 = make_desc(204, macro_id, CommandKind::Install { plan: h_child_rep });
+        let dc5 = make_desc(205, macro_id, CommandKind::Install { plan: h_child_rep });
+        let c_slot = inner
+            .commit_prepared_slot(&dc1, pr.pin(h_child_rep).unwrap(), &ctx)
+            .unwrap_err();
+        let c_prep = inner
+            .commit_prepared(&dc2, &child_replay_slot.primitive, &child_replay_slot.path, &ctx)
+            .unwrap_err();
+        let c_grip = inner.commit_primitive(&dc3, &child_grip_prim, &ctx).unwrap_err();
+        let c_qlim = inner.commit_primitive(&dc4, &child_quintic_prim, &ctx).unwrap_err();
+        let c_raw = inner.commit_primitive(&dc5, &child_raw_replay_prim, &ctx).unwrap_err();
+        [c_slot, c_prep, c_grip, c_qlim, c_raw]
+    });
+    assert_eq!(
+        child_codes,
+        [
+            "J7_FEEDBACK_STALE",
+            "J7_FEEDBACK_STALE",
+            "J7_FEEDBACK_STALE",
+            "J7_FEEDBACK_STALE",
+            "J7_FEEDBACK_STALE",
+        ]
+    );
+    assert_eq!(
+        (a_ch, f_ch),
+        (0, 0),
+        "R2 macro-child stale-J7 refusals touched allocator"
+    );
+    assert!(pr.retire(h_child_rep));
+    assert_eq!(pw.reclaim(), 1);
+    inner.finish_macro(macro_id, "cancelled", Some("STOPPED"), None, None, None);
+    // Clear legacy-populated `phase_ms` BTreeMap from `finish_macro` before RT Part 7 measurement.
+    inner.previous_action = None;
+    if let Some(a) = inner.last_action.as_mut() {
+        a.phase_ms.clear();
+    }
+    while let Some(m) = inner.pop_retired_macro_run() {
+        drop(m);
+    }
+
+    // 7. `reconcile_action` terminating a live `PolicyRun` when `J7_FEEDBACK_STALE` latches at 250 ms
+    //    (without any incoming policy frame): strictly (0, 0) allocs/frees across the latch tick!
+    #[cfg(feature = "policy-runtime")]
+    {
+        {
+            let mut g = bus.0.lock().unwrap();
+            g.mute_j7 = false;
+            g.clock.advance(Duration::from_millis(20));
+            g.push_all_feedback();
+        }
+        let _ = inner.tick_publish(0.02, 1, false);
+        let _ = inner.core.hub().latest();
+
+        use armd::policy_runtime::{PolicyMode, PolicyRunStart};
+        inner.follower = Some("sim".into());
+        inner.lease_enabled = true;
+        let lease_gen = inner.acquire_lease("r2-fault-pol").expect("lease");
+        let ep_pol = inner.safety.epoch_id();
+        let pol_id = {
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit policy");
+            SupervisorInner::begin_policy_run(
+                admitted,
+                PolicyRunStart {
+                    epoch_id: ep_pol,
+                    connection_id: "r2-fault-pol".into(),
+                    lease_generation: lease_gen,
+                    policy_id: "r2-fault-pol".into(),
+                    artifact_digest: "0".repeat(64),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: None,
+                },
+            )
+            .expect("begin live policy")
+        };
+        let mut q_step = [0.0f32; MAX_DOF];
+        q_step[..7].copy_from_slice(&inner.commanded_positions);
+        inner.policy_step_slice(pol_id, &q_step[..7], Some(5), None, None).expect("warm step");
+        for _ in 0..4 {
+            {
+                let mut g = bus.0.lock().unwrap();
+                g.clock.advance(Duration::from_millis(20));
+                g.push_all_feedback();
+            }
+            let _ = inner.tick_publish(0.02, 1, false);
+            let _ = inner.core.hub().latest();
+        }
+        inner.safety.drain_log_events_off_thread();
+
+        bus.0.lock().unwrap().mute_j7 = true;
+        let mut latched = false;
+        for tick in 1..=16 {
+            {
+                let mut g = bus.0.lock().unwrap();
+                g.clock.advance(Duration::from_millis(20));
+                g.push_all_feedback();
+            }
+            let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+            assert!(published.kept.is_none());
+            drop(published);
+            assert_eq!(
+                (a, f),
+                (0, 0),
+                "policy active J7_FEEDBACK_STALE latch tick {tick} touched allocator"
+            );
+            if inner.safety.fault_code() == Some(FaultCode::J7FeedbackStale) {
+                latched = true;
+                break;
+            }
+        }
+        assert!(latched, "expected J7_FEEDBACK_STALE to latch while policy active");
+        assert!(inner.policy_run.is_none());
+        assert_eq!(inner.retired_policy_runs_len(), 1);
+        assert!(inner.pop_retired_policy_run().is_some());
+    }
+}

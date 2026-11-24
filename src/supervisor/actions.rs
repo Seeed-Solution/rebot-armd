@@ -433,6 +433,27 @@ impl SupervisorInner {
         Ok(Some(id))
     }
 
+    /// Zero-allocation mirror of [`Self::action_preconditions`] returning static terminal codes
+    /// for RT commit paths (`armd-control`).
+    pub(crate) fn action_preconditions_static(&self) -> Result<(), &'static str> {
+        if self.handover_settling_since.is_some() { return Err("REJECTED"); }
+        if self.e_stop_latched.load(Ordering::SeqCst) { return Err("ESTOP_ACTIVE"); }
+        match self.safety.state() {
+            SafetyState::EStop => return Err("ESTOP_ACTIVE"),
+            SafetyState::Fault(_) => return Err("FAULT_ACTIVE"),
+            s if !s.is_operational() => return Err("NOT_ARMED"),
+            _ => {}
+        }
+        if self.pending_rearm || self.pending_normal_unload {
+            return Err("NOT_ARMED");
+        }
+        if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
+        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
+        if self.has_mit_motion_blocker() { return Err("MOTION_BUSY"); }
+        if self.has_busy_reason() { return Err("MOTION_BUSY"); }
+        Ok(())
+    }
+
     /// Preconditions shared by Cartesian and gripper actions.
     pub(crate) fn action_preconditions(&self) -> Result<(), ArmError> {
         if self.handover_settling_since.is_some() { return Err(SafetyError::HandoverSettling.into()); }
@@ -789,6 +810,55 @@ impl SupervisorInner {
             this.commit_child_checks(&spec, start)?;
             return Err("UNSUPPORTED");
         }
+        // Zero-allocation stale-J7 fast-fail before entering `commit_child_install` (preserves
+        // exact refusal precedence while keeping `armd-control` strictly 0 alloc / 0 free).
+        match primitive {
+            Primitive::Gripper { .. } => {
+                this.commit_child_checks(&spec, start)?;
+                if this.config.gripper_index().is_none() || this.config.gripper_policy.is_none() {
+                    return Err("UNSUPPORTED");
+                }
+                let epoch = this.macro_run.as_ref().map(|m| m.epoch).unwrap_or(0);
+                if epoch != this.safety.epoch_id() {
+                    return Err("EPOCH_MISMATCH");
+                }
+                this.action_preconditions_static()?;
+                this.check_pos_force_gripper_fresh_static()?;
+            }
+            Primitive::JointQuinticLimited { dof, q, .. } => {
+                this.commit_child_checks(&spec, start)?;
+                let epoch = this.macro_run.as_ref().map(|m| m.epoch).unwrap_or(0);
+                if epoch != this.safety.epoch_id() {
+                    return Err("PLAN_STALE");
+                }
+                this.action_preconditions_static()?;
+                if this.gravity_comp.is_some() {
+                    return Err("MOTION_BUSY");
+                }
+                let n = usize::from(*dof).min(q.len());
+                this.safety
+                    .validate_motion_command(Some(epoch), &q[..n], &this.config.limits)
+                    .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
+                if this.config.gripper_index().is_some_and(|g| {
+                    n > g
+                        && this.commanded_positions.len() > g
+                        && (q[g] - this.commanded_positions[g]).abs() > 1e-4
+                }) {
+                    this.check_pos_force_gripper_fresh_static()?;
+                }
+            }
+            Primitive::Replay { gripper, .. } => {
+                this.commit_child_checks(&spec, start)?;
+                if *gripper && this.config.gripper_index().is_some() {
+                    if this.config.active_tool.commissioning_required {
+                        return Err("COMMISSIONING_REQUIRED");
+                    }
+                    this.replay_preconditions_static()?;
+                    this.check_pos_force_gripper_fresh_static()?;
+                }
+            }
+            _ => {}
+        }
         let primitive = *primitive;
         this.commit_child_install(spec, start, now, move |this, id| match primitive {
             Primitive::JointQuinticLimited { dof, q, max_velocity, .. } => {
@@ -828,7 +898,7 @@ impl SupervisorInner {
     /// The checks of a child commit before anything is installed: the ticket's parent is the
     /// running macro, the ticket is its next child, no child runs, and `start` is the
     /// commanded position (every joint, gripper included, `>= START_TOLERANCE`).
-    fn commit_child_checks(&self, spec: &crate::rt_core::ops::ChildSpec, start: &[f32]) -> Result<u64, &'static str> {
+    pub(crate) fn commit_child_checks(&self, spec: &crate::rt_core::ops::ChildSpec, start: &[f32]) -> Result<u64, &'static str> {
         use crate::rt_core::ops::START_TOLERANCE;
         let id = spec.ticket.parent.0;
         let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id)) else { return Err("PARENT_REPLACED"); };
@@ -847,6 +917,9 @@ impl SupervisorInner {
     pub(crate) fn commit_child_install(&mut self, spec: crate::rt_core::ops::ChildSpec, start: &[f32], now: Instant,
         install: impl FnOnce(&mut Self, u64) -> Result<(), ArmError>) -> Result<crate::rt_core::broker::ActionId, &'static str> {
         let code = |e: ArmError| -> &'static str {
+            if let ArmError::RejectedStatic { code, .. } = e {
+                return code;
+            }
             let c = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
             crate::rt_core::ops::TERMINAL_CODES.iter().find(|k| **k == c).copied().unwrap_or("REJECTED")
         };
@@ -1186,6 +1259,10 @@ impl SupervisorInner {
         self.gravity_comp_motion_busy()?;
         let mut target = target;
         self.safety.validate_motion_command(Some(epoch), &target, &self.config.limits)?;
+        let moves_gripper = self.config.gripper_index().is_some_and(|g| (target[g] - self.commanded_positions[g]).abs() > 1e-4);
+        if moves_gripper {
+            self.check_pos_force_gripper_fresh()?;
+        }
         self.torque_hold_filter(&mut target);
         self.power_hold_filter(&mut target);
         let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &target,
@@ -1193,8 +1270,7 @@ impl SupervisorInner {
         let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
         let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
-        if self.config.gripper_index().is_some_and(|g| (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
-            self.check_pos_force_gripper_fresh()?;
+        if moves_gripper {
             self.gripper_hold_vel_ceiling = None;
         }
         self.servo_target = None;

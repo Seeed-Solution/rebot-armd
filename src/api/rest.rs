@@ -372,6 +372,13 @@ impl From<ArmError> for ApiError {
             ArmError::Rejected { status, code, message } => {
                 ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code)
             }
+            ArmError::RejectedStatic { status, code, message } => {
+                ApiError(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
+                    message.to_string(),
+                    code.to_string(),
+                )
+            }
             ArmError::Detailed { status, code, message, details } => {
                 let mut e = ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code);
                 e.details = Some(details);

@@ -4568,7 +4568,7 @@ fn dual_owner_stale_j7_closing_stop_and_estop_send_freeze_frame_and_refuse_new_t
                     .unwrap_err()
                 };
                 match err {
-                    armd::ArmError::Rejected { status: 409, code, .. } => {
+                    armd::ArmError::RejectedStatic { status: 409, code, .. } => {
                         assert_eq!(code, "J7_FEEDBACK_STALE", "{owner:?}: wrong reject code");
                     }
                     other => panic!("{owner:?}: expected 409 J7_FEEDBACK_STALE for {cmd:?}, got {other:?}"),
@@ -4585,7 +4585,7 @@ fn dual_owner_stale_j7_closing_stop_and_estop_send_freeze_frame_and_refuse_new_t
                     .unwrap_err()
             };
             match jog_err {
-                armd::ArmError::Rejected { status: 409, code, .. } => {
+                armd::ArmError::RejectedStatic { status: 409, code, .. } => {
                     assert_eq!(code, "J7_FEEDBACK_STALE", "{owner:?}: jog changing J7 must reject J7_FEEDBACK_STALE");
                 }
                 other => panic!("{owner:?}: expected 409 J7_FEEDBACK_STALE on jog changing J7, got {other:?}"),
@@ -5119,7 +5119,7 @@ fn dual_owner_stale_j7_gates_replay_sequence_policy_macros_and_never_sends_stale
 
     let assert_j7_stale_reject = |res: Result<(), armd::ArmError>, label: &str| {
         match res.expect_err(&format!("{label}: expected 409 J7_FEEDBACK_STALE")) {
-            armd::ArmError::Rejected { status: 409, code, .. } => {
+            armd::ArmError::RejectedStatic { status: 409, code, .. } => {
                 assert_eq!(code, "J7_FEEDBACK_STALE", "{label}: wrong reject code");
             }
             other => panic!("{label}: expected 409 J7_FEEDBACK_STALE, got {other:?}"),

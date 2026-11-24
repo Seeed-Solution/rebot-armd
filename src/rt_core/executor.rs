@@ -1515,6 +1515,8 @@ enum OffloadReclaim {
     RetiredStop(RetiredStopPayloads),
     ActiveTrajectory(crate::motion::ActiveTrajectory),
     MacroRun(crate::macro_action::MacroRun),
+    #[cfg(feature = "policy-runtime")]
+    PolicyRun(crate::policy_runtime::PolicyRun),
     Buf(String),
     LogLegacyJ6(crate::joint_zero::ZeroConvention),
 }
@@ -1529,6 +1531,8 @@ pub(crate) struct OffThreadSinks {
     reclaim_stop_rx: Mutex<Consumer<RetiredStopPayloads>>,
     reclaim_traj_rx: Mutex<Consumer<crate::motion::ActiveTrajectory>>,
     reclaim_macro_rx: Mutex<Consumer<crate::macro_action::MacroRun>>,
+    #[cfg(feature = "policy-runtime")]
+    reclaim_policy_rx: Mutex<Consumer<crate::policy_runtime::PolicyRun>>,
     reclaim_return_tx: Mutex<Producer<Arc<SafetyState>>>,
     /// `(consumer, last_reported_dropped, shutdown_reported_total)` guarded by one mutex so
     /// best-effort warning deltas never race and never reset `stats.safety_log_dropped`.
@@ -1628,6 +1632,13 @@ impl OffThreadSinks {
         }
         {
             let mut rx = self.reclaim_macro_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(run) = rx.pop() {
+                drop(run);
+            }
+        }
+        #[cfg(feature = "policy-runtime")]
+        {
+            let mut rx = self.reclaim_policy_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(run) = rx.pop() {
                 drop(run);
             }
@@ -2168,6 +2179,8 @@ pub(crate) fn spawn_executor(
     let (reclaim_traj_tx, reclaim_traj_rx) =
         RingBuffer::<crate::motion::ActiveTrajectory>::new(RECLAIM_TRAJ_CAPACITY);
     let (reclaim_macro_tx, reclaim_macro_rx) = RingBuffer::<crate::macro_action::MacroRun>::new(8);
+    #[cfg(feature = "policy-runtime")]
+    let (reclaim_policy_tx, reclaim_policy_rx) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(8);
     let (reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(
         FAULT_ARC_POOL_CAPACITY + FORMATTED_FAULT_ARC_POOL_CAPACITY + JOINT_LIMIT_ARC_POOL_CAPACITY,
     );
@@ -2202,6 +2215,8 @@ pub(crate) fn spawn_executor(
         reclaim_stop_rx: Mutex::new(reclaim_stop_rx),
         reclaim_traj_rx: Mutex::new(reclaim_traj_rx),
         reclaim_macro_rx: Mutex::new(reclaim_macro_rx),
+        #[cfg(feature = "policy-runtime")]
+        reclaim_policy_rx: Mutex::new(reclaim_policy_rx),
         reclaim_return_tx: Mutex::new(reclaim_return_tx),
         safety_log_rx: Mutex::new((safety_log_rx, 0, 0)),
         shutdown_hold_error: shutdown_hold_error.clone(),
@@ -2268,6 +2283,8 @@ pub(crate) fn spawn_executor(
                 reclaim_stop_tx,
                 reclaim_traj_tx,
                 reclaim_macro_tx,
+                #[cfg(feature = "policy-runtime")]
+                reclaim_policy_tx,
                 reclaim_return_rx,
                 safety_log_tx,
                 shutdown_hold_error,
@@ -2425,6 +2442,8 @@ struct ControlState {
     reclaim_stop_tx: Producer<RetiredStopPayloads>,
     reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
     reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
+    #[cfg(feature = "policy-runtime")]
+    reclaim_policy_tx: Producer<crate::policy_runtime::PolicyRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
     shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
@@ -2532,6 +2551,12 @@ impl ControlState {
                 let _ = self.offload_reclaim_tx.push(OffloadReclaim::MacroRun(run));
             }
         }
+        #[cfg(feature = "policy-runtime")]
+        while let Some(run) = core.pop_retired_policy_run() {
+            if let Err(rtrb::PushError::Full(run)) = self.reclaim_policy_tx.push(run) {
+                let _ = self.offload_reclaim_tx.push(OffloadReclaim::PolicyRun(run));
+            }
+        }
     }
 
     /// Moves retired fault `Arc<SafetyState>` snapshots, retired heap motion payloads, retired
@@ -2579,6 +2604,14 @@ impl ControlState {
                 break;
             };
             let _ = self.reclaim_macro_tx.push(run);
+            drained = true;
+        }
+        #[cfg(feature = "policy-runtime")]
+        while !self.reclaim_policy_tx.is_full() {
+            let Some(run) = core.pop_retired_policy_run() else {
+                break;
+            };
+            let _ = self.reclaim_policy_tx.push(run);
             drained = true;
         }
         let lost_inline = core.safety.advance_log_dropped_forwarded();
@@ -3881,6 +3914,8 @@ fn control_thread_main(
     reclaim_stop_tx: Producer<RetiredStopPayloads>,
     reclaim_traj_tx: Producer<crate::motion::ActiveTrajectory>,
     reclaim_macro_tx: Producer<crate::macro_action::MacroRun>,
+    #[cfg(feature = "policy-runtime")]
+    reclaim_policy_tx: Producer<crate::policy_runtime::PolicyRun>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
     shutdown_hold_error: Arc<Mutex<Option<SafetyLogEvent>>>,
@@ -3958,6 +3993,8 @@ fn control_thread_main(
         reclaim_stop_tx,
         reclaim_traj_tx,
         reclaim_macro_tx,
+        #[cfg(feature = "policy-runtime")]
+        reclaim_policy_tx,
         reclaim_return_rx,
         safety_log_tx,
         shutdown_hold_error,
@@ -5454,6 +5491,8 @@ mod tests {
         let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
         let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
         let (reclaim_macro_tx, _) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
         let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
@@ -5487,6 +5526,8 @@ mod tests {
             reclaim_stop_tx,
             reclaim_traj_tx,
             reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
             reclaim_return_rx,
             safety_log_tx,
             shutdown_hold_error: Arc::new(Mutex::new(None)),
@@ -5565,6 +5606,8 @@ mod tests {
         let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
         let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
         let (reclaim_macro_tx, mut reclaim_macro_rx) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
         let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (mut safety_log_tx, mut safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
@@ -5587,6 +5630,8 @@ mod tests {
             reclaim_stop_tx,
             reclaim_traj_tx,
             reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
             reclaim_return_rx,
             safety_log_tx,
             shutdown_hold_error: Arc::new(Mutex::new(None)),
@@ -5803,6 +5848,9 @@ mod tests {
             RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
         let (reclaim_macro_tx, _reclaim_macro_rx) =
             RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _reclaim_policy_rx) =
+            RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
         let (mut reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
         let (_, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
@@ -5835,6 +5883,8 @@ mod tests {
             reclaim_stop_tx,
             reclaim_traj_tx,
             reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
             reclaim_return_rx,
             safety_log_tx,
             shutdown_hold_error: Arc::new(Mutex::new(None)),
@@ -5931,6 +5981,8 @@ mod tests {
         let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
         let (reclaim_traj_tx, _) = RingBuffer::<crate::motion::ActiveTrajectory>::new(2);
         let (reclaim_macro_tx, _) = RingBuffer::<crate::macro_action::MacroRun>::new(2);
+        #[cfg(feature = "policy-runtime")]
+        let (reclaim_policy_tx, _) = RingBuffer::<crate::policy_runtime::PolicyRun>::new(2);
         let (_reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (safety_log_tx, _safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
@@ -5998,6 +6050,8 @@ mod tests {
             reclaim_stop_tx,
             reclaim_traj_tx,
             reclaim_macro_tx,
+            #[cfg(feature = "policy-runtime")]
+            reclaim_policy_tx,
             reclaim_return_rx,
             safety_log_tx,
             shutdown_hold_error: Arc::new(Mutex::new(None)),
