@@ -103,25 +103,36 @@ async fn successful_disable_write_without_feedback_is_not_reported_as_power_off(
     assert_eq!(obs.enable_state, EnableState::Enabled);
     assert!(supervisor.shutdown_ready().await);
 
-    // Part 2: A failed disable write keeps `disable_pending == true && is_torqued == true && !shutdown_ready()`
-    // and inhibits ordinary motion frames until a later disable write succeeds.
+    // Part 2: A failed disable write keeps `disable_pending == true && is_torqued == true && !shutdown_ready()`,
+    // inhibits ordinary motion frames, and continues stationary measured holds until a later disable write succeeds.
     let (supervisor, h) = setup(full_caps(), None).await;
     {
         let mut h = h.lock().unwrap();
         h.confirm_disable = false;
         h.disable_fails = true;
     }
+    supervisor.inner().write().await.commanded_positions[0] = 0.5;
     assert!(supervisor.disable_torque().await.is_err());
     let obs = supervisor.get_observation().await;
     assert!(obs.is_torqued && obs.disable_pending && obs.safety_state.is_stopped());
     assert!(!supervisor.shutdown_ready().await);
     supervisor.tick(0.02).await;
-    assert!(h.lock().unwrap().written.is_empty(), "Pending shutdown must not send ordinary motion frames");
+    {
+        let written = &h.lock().unwrap().written;
+        assert!(!written.is_empty(), "Pending unaccepted disable must keep holding at measured position");
+        assert!(
+            written.iter().all(|t| t[0].position == 0.0 && t[0].velocity == Some(0.0)),
+            "Pending disable must emit stationary measured holds only, never ordinary motion targets: {written:?}"
+        );
+    }
     supervisor.inner().write().await.last_disable_attempt = Some(Instant::now() - Duration::from_millis(251));
     h.lock().unwrap().disable_fails = false;
     let obs = supervisor.tick(0.02).await;
     assert!(!obs.is_torqued && !obs.disable_pending);
     assert!(supervisor.shutdown_ready().await);
+    h.lock().unwrap().written.clear();
+    supervisor.tick(0.02).await;
+    assert!(h.lock().unwrap().written.is_empty(), "Accepted disable must stop holds");
 }
 
 #[tokio::test]

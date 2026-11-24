@@ -7836,3 +7836,131 @@ fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fau
         );
     }
 }
+
+/// R11 B1: A pending disable (`AwaitRestGate` while collecting the K=3 rest window) must NOT
+/// suppress stationary holds. Holds continue on every tick until the rest gate passes and the
+/// first disable frame is dispatched (`torque_intent = Off`), after which holds stop immediately.
+#[test]
+fn r11_b1_pending_disable_continues_holds_until_first_disable_frame_accepted() {
+    use armd::TorqueIntent;
+
+    let mut r = ExecRig::new();
+    r.bus.with(|s| {
+        s.follow_commands = false;
+        s.immediate_replies = false;
+        for m in &mut s.motors {
+            m.q = 0.0;
+            m.v = 0.0;
+        }
+        s.push_all_feedback();
+    });
+    r.arm_now();
+    assert!(r.fx.core.is_torqued);
+    assert_eq!(r.fx.core.torque_intent, TorqueIntent::On);
+
+    // Latch E-stop first, then momentarily report off-rest to reset the K=3 window, then return
+    // to rest (clearing stale delayed replies from the off-rest pose) with ONLY 1 fresh rest
+    // sample (K=1 < 3 -> `PendingDrainOrWindow`).
+    r.fx.core.apply_stop_policy(StopPolicy::EStopLatch);
+    r.bus.with(|s| {
+        s.motors[0].q = 0.30;
+    });
+    r.step_with_feedback();
+    r.bus.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[0].q = 0.0;
+    });
+    r.step_with_feedback(); // K=1 (< 3)
+    // Clear delayed hold-replies from the K=1 tick so the TorqueOff submission tick stays at K=1.
+    r.bus.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
+    });
+
+    // Submit TorqueOff while K=1 (< 3): enters `AwaitRestGate` (Pending, 0 CMD_DISABLE frames).
+    // Holds MUST continue on this tick!
+    let gate_before = r.fx.core.driver.as_ref().unwrap().lock().unwrap().rest_pose_gate_status();
+    let eval_before = r.fx.core.may_disable_torque_while_stopped();
+    r.bus.clear_log();
+    r.submit_transition(TransitionOp::TorqueOff);
+    let r_submit = r.step();
+    let cmd_res = r_submit.command.unwrap().1;
+    assert!(
+        cmd_res.is_ok(),
+        "TorqueOff must defer into AwaitRestGate, got {cmd_res:?} (gate_before={gate_before:?}, eval_before={eval_before:?})"
+    );
+    assert!(r_submit.transition_ended.is_none(), "K<3 must stay pending in AwaitRestGate");
+    assert!(r.fx.core.disable_pending);
+    assert_eq!(r.fx.core.torque_intent, TorqueIntent::On);
+    assert_eq!(
+        spec_count_damiao_disables(&r.bus),
+        0,
+        "0 CMD_DISABLE frames while awaiting K=3 rest window"
+    );
+    let holds_tick1 = r.bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count();
+    assert_eq!(
+        holds_tick1, 7,
+        "B1: all 7 joints must keep receiving hold frames while disable is pending in AwaitRestGate"
+    );
+
+    // Tick with K=2 (< 3): still AwaitRestGate, 0 CMD_DISABLE, holds MUST continue!
+    r.bus.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
+    });
+    r.bus.clear_log();
+    let r_k2 = r.step_with_feedback();
+    assert!(r_k2.transition_ended.is_none(), "K=2 must still stay pending in AwaitRestGate");
+    assert_eq!(r.fx.core.torque_intent, TorqueIntent::On);
+    assert_eq!(spec_count_damiao_disables(&r.bus), 0);
+    let holds_tick2 = r.bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count();
+    assert_eq!(holds_tick2, 7, "B1: all 7 joints must continue receiving hold frames on K=2 tick");
+
+    // Tick with K=3: rest gate confirms and first CMD_DISABLE batch dispatches!
+    // Once accepted (`torque_intent == Off`), ZERO hold frames may be emitted on this or later ticks.
+    r.bus.with(|s| {
+        s.rx.clear();
+        s.pending.clear();
+    });
+    r.bus.clear_log();
+    let r_k3 = r.step_with_feedback();
+    let disables_k3 = spec_count_damiao_disables(&r.bus);
+    assert!(
+        disables_k3 >= 7,
+        "K=3 confirmed must dispatch first CMD_DISABLE batch (got {disables_k3})"
+    );
+    let (drv_dispatched, drv_pending) = {
+        let d = r.fx.core.driver.as_ref().unwrap().lock().unwrap();
+        (d.disable_frames_dispatched(), d.torque_transition_pending())
+    };
+    assert_eq!(
+        r.fx.core.torque_intent,
+        TorqueIntent::Off,
+        "B1: torque_intent must flip to Off as soon as first disable frame is dispatched (disables_k3={disables_k3}, drv_dispatched={drv_dispatched}, drv_pending={drv_pending}, sup_trans={}, r_k3={r_k3:?}, tx_log={:?})",
+        r.fx.core.torque_transition_pending(),
+        r.bus.tx_log()
+    );
+    let holds_after_accept =
+        r.bus.tx_log().iter().filter(|f| (0x101..=0x107).contains(&f.id)).count();
+    assert_eq!(
+        holds_after_accept, 0,
+        "B1: holds must stop immediately once the first disable frame is dispatched"
+    );
+
+    // Step until bounded repeats complete; zero holds throughout and clean Done.
+    let mut completed = false;
+    for _ in 0..10 {
+        r.bus.clear_log();
+        let step = r.step_with_feedback();
+        let any_hold = r.bus.tx_log().iter().any(|f| (0x101..=0x107).contains(&f.id));
+        assert!(!any_hold, "B1: no holds during disable repeat frames");
+        if step.transition_ended.map(|(_, o)| o) == Some(Outcome::Completed) {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "B1: disable transition must complete cleanly after repeats");
+    assert!(!r.fx.core.disable_pending);
+    assert_eq!(r.fx.core.torque_intent, TorqueIntent::Off);
+}

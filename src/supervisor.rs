@@ -6087,7 +6087,10 @@ impl SupervisorInner {
         match output {
             TickOutput::None => {
                 self.reset_hold_tx_joint_progress();
-                if !self.is_torqued || self.disable_pending || self.shutdown_committed {
+                if !self.is_torqued
+                    || self.torque_intent == TorqueIntent::Off
+                    || self.shutdown_committed
+                {
                     self.reset_tx_joint_progress();
                     self.j7_stale_since = None;
                 } else if count_release_streak && !has_pending_motion {
@@ -8225,8 +8228,14 @@ impl SupervisorInner {
         let mut gravity_driverless_ok = false;
         let mut gravity_handback_ran = false;
         self.j7_intent = None;
-        // a torque transition in flight owns the bus until it ends (the driver refuses targets)
+        // An enable transition owns the bus exclusively. A pending disable suppresses ordinary
+        // motion, while stationary holds continue until a disable is accepted (`torque_intent == Off`,
+        // i.e. rest gate passed and the first disable frame has been dispatched).
         let transition_owns_bus = self.torque_transition.is_some();
+        let enable_transition_owns_bus = matches!(
+            self.torque_transition,
+            Some(driver_transitions::TorqueTransition::Enable(_))
+        );
         if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
             let gc_stamp = self.current_j7_intent_stamp();
             self.j7_intent = Some(if self.safety.state().is_stopped() {
@@ -8276,11 +8285,15 @@ impl SupervisorInner {
                     }
                 }
             }
-        } else if !self.shutdown_committed && !self.disable_pending && !transition_owns_bus {
+        } else if !self.shutdown_committed && !enable_transition_owns_bus {
             let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
             let is_stopped_or_failed_hold = self.safety.state().is_stopped()
                 || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
-            let send_to_bus = self.is_torqued
+            let pending_disable_hold =
+                (self.disable_pending || transition_owns_bus) && self.torque_intent == TorqueIntent::On;
+            let send_to_bus = !self.disable_pending
+                && !transition_owns_bus
+                && self.is_torqued
                 && self.torque_intent == TorqueIntent::On
                 && feedback_fresh
                 && self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
@@ -8291,7 +8304,7 @@ impl SupervisorInner {
                 && !matches!(self.safety.state(), SafetyState::EStop)
                 && (self.tracking.fallback_ramp.is_some() || self.tracking.holding_fallback_pose);
 
-            if is_stopped_or_failed_hold && !has_fallback_ramp {
+            if (is_stopped_or_failed_hold && !has_fallback_ramp) || pending_disable_hold {
                 self.tracking.invalidate();
                 if self.stopped_hold_eligible() {
                     if self.driver.is_some() {
@@ -8574,17 +8587,20 @@ impl SupervisorInner {
         // suppresses a stop, hold, or freeze.
         let is_stopped_or_failed_hold_epilogue = self.safety.state().is_stopped()
             || self.enable_lifecycle == driver_transitions::EnableLifecycle::FailedHold;
+        let pending_disable_hold_epilogue =
+            (self.disable_pending || transition_owns_bus) && self.torque_intent == TorqueIntent::On;
         let j7_eligible = self.torque_intent == TorqueIntent::On
             && (self.is_torqued
-                || (is_stopped_or_failed_hold_epilogue && self.stopped_hold_eligible()));
+                || ((is_stopped_or_failed_hold_epilogue || pending_disable_hold_epilogue)
+                    && self.stopped_hold_eligible()));
         if !self.shutdown_committed
             && j7_eligible
-            && !self.disable_pending
-            && !transition_owns_bus
+            && !enable_transition_owns_bus
             && !self.urgent_stop_unapplied()
         {
             let current_stamp = self.current_j7_intent_stamp();
             let j7_is_hold = is_stopped_or_failed_hold_epilogue
+                || pending_disable_hold_epilogue
                 || self.e_stop_latched.load(Ordering::SeqCst);
             let j7_intent = if j7_is_hold {
                 crate::driver::PosForceIntent::stop(current_stamp)

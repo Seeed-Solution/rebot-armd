@@ -1372,6 +1372,11 @@ pub trait ArmDriver: Send {
     /// A transition started by [`ArmDriver::begin_torque`] is not finished.
     fn torque_transition_pending(&self) -> bool { false }
 
+    /// True once an active disable handshake has passed its rest-pose gate and transmitted at
+    /// least one disable frame (e.g. `DamiaoTorque::Disable` repeat passes). False while still
+    /// awaiting rest-pose evidence (`AwaitRestGate`) or idle.
+    fn disable_frames_dispatched(&self) -> bool { false }
+
     /// Aborts any pending enable handshake without transmitting further enable frames
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
@@ -11355,6 +11360,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    fn disable_frames_dispatched(&self) -> bool {
+        matches!(self.torque_hs, Some(DamiaoTorque::Disable { .. }))
+    }
+
     fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
         self.discard_pending_tx_stopped();
         self.last_hold_tx_sent_any = false;
@@ -11369,7 +11378,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 actual: targets.len(),
             });
         }
-        if self.torque_hs.is_some() {
+        if self.torque_hs.is_some()
+            && !matches!(self.torque_hs, Some(DamiaoTorque::AwaitRestGate { .. }))
+        {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::TorqueTransitionPending);
         }
@@ -12057,7 +12068,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 actual: n,
             });
         }
-        if self.torque_hs.is_some() {
+        if self.torque_hs.is_some()
+            && !matches!(self.torque_hs, Some(DamiaoTorque::AwaitRestGate { .. }))
+        {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
             return Err(ArmDriverError::TorqueTransitionPending);
         }
@@ -14190,7 +14203,10 @@ mod pos_force_emitter {
         let Some(pf_j) = driver.active_pos_force_joint() else {
             return Ok(PosForceEmitOutcome::NotApplicable);
         };
-        if driver.torque_hs.is_some()
+        let hs_blocks = driver.torque_hs.is_some()
+            && !(matches!(driver.torque_hs, Some(DamiaoTorque::AwaitRestGate { .. }))
+                && !matches!(intent.kind, PosForceIntentKind::Target { .. }));
+        if hs_blocks
             || (!driver.is_enabled && matches!(intent.kind, PosForceIntentKind::Target { .. }))
         {
             return Ok(PosForceEmitOutcome::NotApplicable);

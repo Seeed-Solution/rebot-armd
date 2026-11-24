@@ -1520,6 +1520,7 @@ impl SupervisorInner {
                     }
                 };
                 let done_now = matches!(res, crate::driver::TorqueProgress::Done(_));
+                let frames_dispatched = drv.disable_frames_dispatched();
                 let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                 let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
                 self.owner_driver_snapshot = OwnerDriverSnapshot::capture_from_driver(
@@ -1540,10 +1541,15 @@ impl SupervisorInner {
                         let terminal = self.torque_off_finish_rt().map(|()| Rt::Done);
                         self.core.begin_transition(terminal);
                     }
-                } else if pending_disable {
-                    self.torque_transition = Some(TorqueTransition::Disable { kind });
                 } else {
-                    let _ = self.arm_background_disable_retry_with_kind(kind, drv_now);
+                    if frames_dispatched {
+                        self.disable_first_frame_accepted();
+                    }
+                    if pending_disable {
+                        self.torque_transition = Some(TorqueTransition::Disable { kind });
+                    } else {
+                        let _ = self.arm_background_disable_retry_with_kind(kind, drv_now);
+                    }
                 }
                 return Ok(());
             }
@@ -1623,22 +1629,33 @@ impl SupervisorInner {
         })
     }
 
-    /// State at the first disable frame: MIT off, `disable_pending` until confirmed.
+    /// State when a disable request is in flight: `disable_pending` blocks new motion and
+    /// enable/clear-fault transitions, while holds and MIT hold context stay active until the
+    /// rest gate passes and the first disable frame is actually dispatched.
     fn disable_requested(&mut self) {
         self.disable_requested_at(Instant::now());
     }
 
     fn disable_requested_at(&mut self, now: Instant) {
-        self.mit_torque_off();
         self.disable_pending = true;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
         self.last_disable_attempt = Some(now);
     }
 
+    /// State once the rest-pose gate has passed and the first disable frame has been dispatched
+    /// (while bounded repeat frames are still finishing): records `torque_intent = Off` and stops
+    /// holds while keeping `disable_pending = true` until the handshake completes.
+    pub(crate) fn disable_first_frame_accepted(&mut self) {
+        self.mit_torque_off();
+        self.torque_intent = TorqueIntent::Off;
+        self.measured_hold.clear();
+    }
+
     /// State once an explicit disable (passing the rest-pose gate) or protective disable has been
     /// accepted and transmitted: records `torque_intent = Off` by decision and stops holding.
     pub(crate) fn disable_accepted(&mut self) {
+        self.mit_torque_off();
         self.torque_intent = TorqueIntent::Off;
         self.is_torqued = false;
         self.pending_rearm = false;
@@ -1688,7 +1705,7 @@ impl SupervisorInner {
     /// or watchdog event, and stop ONLY after an accepted disable records `torque_intent = Off`.
     #[inline]
     pub(crate) fn stopped_hold_eligible(&self) -> bool {
-        self.torque_intent == TorqueIntent::On || self.is_torqued
+        self.torque_intent == TorqueIntent::On
     }
 
     /// Refreshes [`Self::owner_driver_snapshot`] from an already-locked driver reference without
@@ -3560,7 +3577,7 @@ impl SupervisorInner {
                 None
             }
             Some(d) => {
-                let (res, requested_at, post_now, disable_kind) = {
+                let (res, requested_at, post_now, disable_kind, frames_dispatched) = {
                     let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
                     let requested_at = drv.clock_now();
                     let disable_kind = crate::driver::DisableKind::DisableRequested {
@@ -3568,6 +3585,7 @@ impl SupervisorInner {
                         rollback: false,
                     };
                     let res = drv.begin_disable_torque_budgeted(disable_kind, 0);
+                    let frames_dispatched = drv.disable_frames_dispatched();
                     let post_now = drv.clock_now();
                     let mut ages_buf = std::mem::take(&mut self.scratch.ages);
                     let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
@@ -3581,13 +3599,13 @@ impl SupervisorInner {
                     );
                     self.scratch.ages = ages_buf;
                     self.scratch.fb.bounds = bounds_buf;
-                    (res, requested_at, post_now, disable_kind)
+                    (res, requested_at, post_now, disable_kind, frames_dispatched)
                 };
                 self.disable_requested_at(requested_at);
-                Some((res, post_now, disable_kind))
+                Some((res, post_now, disable_kind, frames_dispatched))
             }
         };
-        if let Some((_, _, disable_kind)) = started {
+        if let Some((_, _, disable_kind, _)) = started {
             self.active_disable_kind = Some(disable_kind);
         }
         Ok(match started {
@@ -3595,15 +3613,18 @@ impl SupervisorInner {
                 self.disable_accepted();
                 self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), post_now, disable_kind)) => {
+            Some((Ok(crate::driver::TorqueProgress::Pending { .. }), post_now, disable_kind, frames_dispatched)) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
                 self.torque_transition = Some(TorqueTransition::Disable { kind: disable_kind });
                 Ok(Rt::Pending { wake: post_now })
             }
-            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _)) => {
+            Some((Ok(crate::driver::TorqueProgress::Done(_)), _, _, _)) => {
                 self.disable_accepted();
                 self.torque_off_finish_rt().map(|()| Rt::Done)
             }
-            Some((Err(e), post_now, disable_kind)) => {
+            Some((Err(e), post_now, disable_kind, _)) => {
                 let refused = matches!(
                     e,
                     crate::driver::ArmDriverError::TorqueOffWouldDrop
@@ -3700,6 +3721,7 @@ impl SupervisorInner {
             self.scratch.ages = ages_buf;
             self.scratch.fb.bounds = bounds_buf;
             let still_pending = drv.torque_transition_pending();
+            let frames_dispatched = drv.disable_frames_dispatched();
             drop(drv);
             match poll_res {
                 Ok(crate::driver::TorqueProgress::Done(_)) => {
@@ -3715,6 +3737,9 @@ impl SupervisorInner {
                     self.background_disable_retry = None;
                 }
                 Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                    if frames_dispatched {
+                        self.disable_first_frame_accepted();
+                    }
                     if let Some(BackgroundDisableRetry::Active {
                         kind,
                         started_at,
@@ -3820,6 +3845,7 @@ impl SupervisorInner {
 
         let res = drv.begin_disable_torque_budgeted(kind, 0);
         let handshake_pending = drv.torque_transition_pending();
+        let frames_dispatched = drv.disable_frames_dispatched();
         let post_now = drv.clock_now();
         let mut ages_buf = std::mem::take(&mut self.scratch.ages);
         let mut bounds_buf = std::mem::take(&mut self.scratch.fb.bounds);
@@ -3850,7 +3876,12 @@ impl SupervisorInner {
                 self.background_disable_retry = None;
                 return None;
             }
-            Ok(crate::driver::TorqueProgress::Pending { .. }) | Err(_) => {}
+            Ok(crate::driver::TorqueProgress::Pending { .. }) => {
+                if frames_dispatched {
+                    self.disable_first_frame_accepted();
+                }
+            }
+            Err(_) => {}
         }
 
         let next_attempts = attempts.saturating_add(1);
@@ -3911,6 +3942,7 @@ impl SupervisorInner {
                 let span = budget.deadline.saturating_duration_since(budget.now);
                 let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
                 let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                let frames_dispatched = drv.disable_frames_dispatched();
                 let rx = drv.take_last_poll_rx();
                 let post_now = drv.clock_now();
                 let mut ages_buf = std::mem::take(&mut self.scratch.ages);
@@ -3928,6 +3960,9 @@ impl SupervisorInner {
                 drop(drv);
                 match r {
                     Ok(Drv::Pending { wake }) => {
+                        if frames_dispatched {
+                            self.disable_first_frame_accepted();
+                        }
                         self.torque_transition = Some(TorqueTransition::Disable { kind });
                         Some(TransitionPoll { progress: Ok(Rt::Pending { wake: to_exec(wake) }), rx })
                     }

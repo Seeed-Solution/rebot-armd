@@ -1126,6 +1126,7 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn torque_transition_pending(&self) -> bool { self.torque_hs.is_some() }
+    fn disable_frames_dispatched(&self) -> bool { matches!(self.torque_hs, Some((false, _))) }
 
     fn abort_enable(&mut self) {
         if matches!(self.torque_hs, Some((true, _))) {
