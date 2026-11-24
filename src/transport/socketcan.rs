@@ -43,6 +43,44 @@ fn read_kernel_realtime_ns() -> Option<i128> {
     timespec_to_ns(ts)
 }
 
+/// Bracket a `CLOCK_REALTIME` read with two `CLOCK_MONOTONIC` reads (vDSO, zero heap allocation)
+/// and return `(realtime_ns, realtime_ns - monotonic_mid_ns)`. Fails closed (`None`) on syscall
+/// error or non-monotonic bracket.
+#[cfg(target_os = "linux")]
+fn read_kernel_realtime_and_offset_ns() -> Option<(i128, i128)> {
+    let mut m1 = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut rt = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut m2 = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut m1) != 0 {
+            return None;
+        }
+        if libc::clock_gettime(libc::CLOCK_REALTIME, &mut rt) != 0 {
+            return None;
+        }
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut m2) != 0 {
+            return None;
+        }
+    }
+    let m1_ns = timespec_to_ns_raw(m1)?;
+    let rt_ns = timespec_to_ns(rt)?;
+    let m2_ns = timespec_to_ns_raw(m2)?;
+    if m2_ns < m1_ns {
+        return None;
+    }
+    let mono_mid = m1_ns + (m2_ns - m1_ns) / 2;
+    Some((rt_ns, rt_ns - mono_mid))
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn timespec_to_ns_raw(ts: libc::timespec) -> Option<i128> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return None;
+    }
+    Some(i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec))
+}
+
 #[cfg(target_os = "linux")]
 #[inline]
 fn timespec_to_ns(ts: libc::timespec) -> Option<i128> {
@@ -56,8 +94,8 @@ fn timespec_to_ns(ts: libc::timespec) -> Option<i128> {
 }
 
 /// Convert a kernel `CLOCK_REALTIME` receive timestamp to a monotonic `Instant` anchored at
-/// `(mono_now, real_now_ns)`. Returns `None` if `real_now_ns` is unavailable or `rx_ns` lies
-/// unreasonably ahead of `real_now_ns`.
+/// `(mono_now, real_now_ns)`. Returns `None` if `real_now_ns` is unavailable or `rx_ns` is
+/// future-dated (`rx_ns > real_now_ns`); future timestamps are rejected, never clamped.
 #[cfg(target_os = "linux")]
 fn kernel_realtime_ns_to_monotonic(
     rx_ns: i128,
@@ -65,14 +103,11 @@ fn kernel_realtime_ns_to_monotonic(
     real_now_ns: Option<i128>,
 ) -> Option<std::time::Instant> {
     let now_ns = real_now_ns?;
-    if now_ns >= rx_ns {
-        let age_ns = (now_ns - rx_ns).min(i128::from(u64::MAX)) as u64;
-        mono_now.checked_sub(std::time::Duration::from_nanos(age_ns))
-    } else {
-        // Minor skew or backward wall-clock step: clamp to `mono_now` rather than fabricating a
-        // future instant; causal torque checks compare raw `KernelRealtimeNs` directly.
-        Some(mono_now)
+    if rx_ns > now_ns {
+        return None;
     }
+    let age_ns = (now_ns - rx_ns).min(i128::from(u64::MAX)) as u64;
+    mono_now.checked_sub(std::time::Duration::from_nanos(age_ns))
 }
 
 /// Parse kernel RX timestamp (nanoseconds since Unix epoch) from a `recvmsg` control message chain.
@@ -311,6 +346,15 @@ impl CanTransport for SocketCanTransport {
         read_kernel_realtime_ns().map(CanRxTime::KernelRealtimeNs)
     }
 
+    fn rx_clock_sample(&self) -> Option<crate::transport::RxClockSample> {
+        read_kernel_realtime_and_offset_ns().map(|(r_ns, offset_ns)| {
+            crate::transport::RxClockSample {
+                rx_now: CanRxTime::KernelRealtimeNs(r_ns),
+                realtime_minus_monotonic_ns: Some(offset_ns),
+            }
+        })
+    }
+
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let sk_frame = if frame.is_extended {
             let id = ExtendedId::new(frame.id)
@@ -479,6 +523,17 @@ mod tests {
         let mapped = kernel_realtime_ns_to_monotonic(rx_25ms_ago_ns, mono_now, Some(real_now_ns))
             .expect("25ms age maps to monotonic instant");
         assert_eq!(mono_now.duration_since(mapped), std::time::Duration::from_millis(25));
+
+        // 5. Future-dated kernel RX timestamps are rejected (never clamped to mono_now).
+        assert_eq!(
+            kernel_realtime_ns_to_monotonic(real_now_ns + 1, mono_now, Some(real_now_ns)),
+            None
+        );
+        assert_eq!(
+            kernel_realtime_ns_to_monotonic(real_now_ns + 50_000_000, mono_now, Some(real_now_ns)),
+            None
+        );
+        assert!(read_kernel_realtime_and_offset_ns().is_some());
     }
 }
 

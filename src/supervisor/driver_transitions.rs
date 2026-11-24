@@ -3014,6 +3014,9 @@ impl SupervisorInner {
         }
         let d = self.driver.as_ref()?;
         let mut drv = d.lock().ok()?;
+        if self.control_release_seq > 0 {
+            drv.begin_control_release(self.control_release_seq);
+        }
         if !drv.torque_transition_pending() {
             return None;
         }
@@ -3076,6 +3079,9 @@ impl SupervisorInner {
                 let Ok(mut drv) = d.lock() else {
                     return Some(TransitionPoll { progress: Err("FEEDBACK_UNAVAILABLE"), rx: None });
                 };
+                if self.control_release_seq > 0 {
+                    drv.begin_control_release(self.control_release_seq);
+                }
                 let drv_now = drv.clock_now();
                 let span = budget.deadline.saturating_duration_since(budget.now);
                 let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);

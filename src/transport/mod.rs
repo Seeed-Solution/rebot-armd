@@ -329,6 +329,19 @@ pub trait AsyncTransport: Send {
     }
 }
 
+/// Maximum permitted drift in `CLOCK_REALTIME - CLOCK_MONOTONIC` between `write_done`
+/// (or window start) and decode before rest-pose evidence is discarded and restarted (1 ms).
+pub const MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS: i128 = 1_000_000;
+
+/// Coherent sample of the transport's RX clock domain alongside the optional
+/// `CLOCK_REALTIME - CLOCK_MONOTONIC` offset (in nanoseconds) when `rx_now` is
+/// [`CanRxTime::KernelRealtimeNs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RxClockSample {
+    pub rx_now: CanRxTime,
+    pub realtime_minus_monotonic_ns: Option<i128>,
+}
+
 /// Kernel or transport receive-clock timestamp carried alongside a CAN frame.
 ///
 /// Causal ordering after a torque-changing write compares `rx_time` against the
@@ -398,6 +411,18 @@ pub trait CanTransport: Send {
     /// drivers reuse their cached clock with zero allocation.
     fn rx_clock_now(&self) -> Option<CanRxTime> {
         None
+    }
+
+    /// Coherent sample of the transport's RX clock together with `CLOCK_REALTIME - CLOCK_MONOTONIC`
+    /// (in nanoseconds) when [`Self::rx_clock_now`] uses `KernelRealtimeNs`.
+    ///
+    /// Transports delivering [`CanRxTime::KernelRealtimeNs`] must override this (e.g.
+    /// [`SocketCanTransport`]) so rest-pose decode can detect wall-clock steps `> 1 ms`.
+    fn rx_clock_sample(&self) -> Option<RxClockSample> {
+        self.rx_clock_now().map(|rx_now| RxClockSample {
+            rx_now,
+            realtime_minus_monotonic_ns: None,
+        })
     }
 
     /// Transmit a CAN frame

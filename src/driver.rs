@@ -11,7 +11,10 @@ pub use crate::protocol::damiao::{build_pos_force_frame, DAMIAO_GRIPPER_POSFORCE
 use crate::protocol::fashionstar::{self, FashionStarPacket};
 use crate::protocol::feetech;
 use crate::protocol::robstride::{self, RobStrideLimits};
-use crate::transport::{CanFrame, CanRxTime, CanTransport, Transport, TransportError};
+use crate::transport::{
+    CanFrame, CanRxTime, CanTransport, Transport, TransportError,
+    MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS,
+};
 
 pub mod handshake;
 pub use handshake::{TorqueOutcome, TorqueProgress};
@@ -605,18 +608,28 @@ pub enum RestPoseGateStatus {
     RefusedNonRest,
 }
 
-/// Zero-allocation K=3 consecutive causal evidence accumulator shared across all drivers (S2).
+/// Result of feeding one agreeing rest-pose sample into [`CausalWindow`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowRecord {
+    Accepted,
+    IgnoredOlder,
+    OffsetDrifted,
+}
+
+/// Zero-allocation K=3 consecutive causal rest-pose evidence accumulator shared across all drivers.
 ///
-/// Confirmation requires `count >= EVIDENCE_WINDOW_SAMPLES` (3), `distinct_passes >= 2`,
-/// `last_rx - first_rx >= EVIDENCE_WINDOW_MIN_SPAN` (20 ms, spanning >= 2 control ticks),
-/// and `now - last_rx <= max_age`. Any disagreeing sample or gap `> max_gap` resets the window.
+/// Confirmation requires `count >= EVIDENCE_WINDOW_SAMPLES` (3) **distinct control releases**,
+/// `last_rx - first_rx >= EVIDENCE_WINDOW_MIN_SPAN` (20 ms), and `now - last_rx <= max_age`.
+/// Multiple queued frames within the same control release update `last_rx` without incrementing
+/// `count`. Any disagreeing sample, gap `> max_gap`, or `CLOCK_REALTIME - CLOCK_MONOTONIC` offset
+/// change `> 1 ms` resets the window.
 #[derive(Clone, Copy, Debug, Default)]
 struct CausalWindow {
     count: u8,
     first_rx: Option<Instant>,
     last_rx: Option<Instant>,
-    last_pass: u64,
-    distinct_passes: u8,
+    last_release: u64,
+    anchor_offset_ns: Option<i128>,
 }
 
 impl CausalWindow {
@@ -626,9 +639,30 @@ impl CausalWindow {
     }
 
     #[inline]
-    fn record_agree(&mut self, rx_at: Instant, pass_id: u64, max_gap: Duration) {
+    fn record_agree(
+        &mut self,
+        rx_at: Instant,
+        release_id: u64,
+        max_gap: Duration,
+        offset_ns: Option<i128>,
+    ) -> WindowRecord {
+        if self.count > 0 {
+            match (self.anchor_offset_ns, offset_ns) {
+                (Some(anchor), Some(cur))
+                    if (cur - anchor).abs() > MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS =>
+                {
+                    self.reset();
+                    return WindowRecord::OffsetDrifted;
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    self.reset();
+                    return WindowRecord::OffsetDrifted;
+                }
+                _ => {}
+            }
+        }
         if self.last_rx.is_some_and(|prev| rx_at < prev) {
-            return;
+            return WindowRecord::IgnoredOlder;
         }
         if self.count == 0
             || self
@@ -638,16 +672,17 @@ impl CausalWindow {
             self.count = 1;
             self.first_rx = Some(rx_at);
             self.last_rx = Some(rx_at);
-            self.last_pass = pass_id;
-            self.distinct_passes = 1;
+            self.last_release = release_id;
+            self.anchor_offset_ns = offset_ns;
+        } else if release_id == self.last_release {
+            // Same control release: multiple queued samples never count as > 1 tick.
+            self.last_rx = Some(rx_at);
         } else {
             self.count = self.count.saturating_add(1);
-            if pass_id != self.last_pass {
-                self.distinct_passes = self.distinct_passes.saturating_add(1);
-                self.last_pass = pass_id;
-            }
+            self.last_release = release_id;
             self.last_rx = Some(rx_at);
         }
+        WindowRecord::Accepted
     }
 
     #[inline]
@@ -658,7 +693,6 @@ impl CausalWindow {
     #[inline]
     fn is_confirmed(&self, now: Instant, max_age: Duration) -> bool {
         self.count >= EVIDENCE_WINDOW_SAMPLES
-            && self.distinct_passes >= 2
             && self
                 .first_rx
                 .zip(self.last_rx)
@@ -768,6 +802,11 @@ pub trait ArmDriver: Send {
     fn supports_budgeted_disable_await(&self) -> bool {
         false
     }
+
+    /// Notify the driver that a new control release (`release_seq`) has begun.
+    /// Once invoked by the owner, rest-pose K=3 ticks count distinct `release_seq` values
+    /// rather than individual receive/drain passes.
+    fn begin_control_release(&mut self, _release_seq: u64) {}
 
     /// True when `joint` has a verified hold mode capable of receiving stationary hold frames
     /// without enable or mode-switch side effects.
@@ -1463,8 +1502,19 @@ pub struct FeetechArmDriver<T: Transport> {
     line_poisoned: bool,
     /// Host monotonic instant when continuous silence on a poisoned serial line began (S2).
     line_poison_quiet_since: Option<Instant>,
-    /// Monotonic pass counter distinguishing separate control releases for the rest-pose window.
-    evidence_pass_id: u64,
+    /// Active control-release id distinguishing separate ticks for the rest-pose K=3 window.
+    control_release_id: u64,
+    /// True once the owner has called `begin_control_release`, preventing receive passes from
+    /// advancing `control_release_id` independently.
+    control_release_managed: bool,
+    /// Pending stopped disable awaiting rest-pose K=3 confirmation or poisoned-line drain within
+    /// the single 1 s request lifetime (0 torque-off packets transmitted while pending).
+    pending_disable: Option<DisableKind>,
+    /// Per-servo host monotonic instant of the last motion/enable write (`write_joint_targets` or
+    /// `set_torque(true)`): rest-pose samples must come from requests sent at/after this instant.
+    last_motion_write_at: Vec<Option<Instant>>,
+    /// `(frames, exhausted)` summary of the most recent `poll_torque` pass.
+    last_poll_rx: Option<(u16, bool)>,
     /// Per-servo K=3 causal confirmation window for the rest-pose gate.
     rest_pose_window: Vec<CausalWindow>,
     /// Preallocated goal-position scratch buffer for zero-alloc `FailedHold` / stopped holds (R1).
@@ -1528,7 +1578,11 @@ impl<T: Transport> FeetechArmDriver<T> {
             rx_timestamps: Vec::with_capacity(256),
             line_poisoned: false,
             line_poison_quiet_since: None,
-            evidence_pass_id: 0,
+            control_release_id: 0,
+            control_release_managed: false,
+            pending_disable: None,
+            last_motion_write_at: vec![None; dof],
+            last_poll_rx: None,
             rest_pose_window: vec![CausalWindow::default(); dof],
             hold_positions_buf: Vec::with_capacity(hold_cap),
             hold_sync_pkt_buf: Vec::with_capacity(16 + hold_cap * 3),
@@ -2361,7 +2415,9 @@ impl<T: Transport> FeetechArmDriver<T> {
                         if pkt.id == feetech::BROADCAST_ID {
                             continue;
                         }
+                        let decode_now = self.clock_now();
                         if pkt_rx_at < req_written_at
+                            || pkt_rx_at > decode_now
                             || pkt_rx_at.saturating_duration_since(req_written_at) >= READ_TIMEOUT
                         {
                             continue;
@@ -2740,6 +2796,13 @@ impl<T: Transport> FeetechArmDriver<T> {
                     if pkt.id == feetech::BROADCAST_ID {
                         continue;
                     }
+                    let decode_now = self.clock_now();
+                    if pkt_rx_at > decode_now {
+                        if let Some(joint_idx) = self.servo_ids.iter().position(|&id| id == pkt.id) {
+                            self.rest_pose_window[joint_idx].reset();
+                        }
+                        continue;
+                    }
                     if let Some((req_written_at, timeout)) = window {
                         if pkt_rx_at < req_written_at
                             || pkt_rx_at.saturating_duration_since(req_written_at) >= timeout
@@ -2779,18 +2842,24 @@ impl<T: Transport> FeetechArmDriver<T> {
                                 }
                                 self.last_feedback_instant[joint_idx] = Some(pkt_rx_at);
                                 self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
-                                // S2: Feed causal position sample into per-joint K=3 rest-pose window.
+                                // Feed causal post-motion position sample into per-joint K=3 rest-pose window.
+                                let after_motion = self.last_motion_write_at[joint_idx].is_none_or(|w| {
+                                    pkt_rx_at >= w
+                                        && window.is_some_and(|(req_at, _)| req_at >= w)
+                                });
                                 if let Some(ref gate) = self.stopped_disable_gate {
                                     if gate.is_arm_joint(joint_idx) {
                                         let pos = self.cached_states[joint_idx].position;
-                                        if joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
+                                        if after_motion
+                                            && joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
                                             && gate.joint_at_rest(joint_idx, pos)
                                         {
-                                            let pass_id = self.evidence_pass_id;
-                                            self.rest_pose_window[joint_idx].record_agree(
+                                            let release_id = self.control_release_id;
+                                            let _ = self.rest_pose_window[joint_idx].record_agree(
                                                 pkt_rx_at,
-                                                pass_id,
+                                                release_id,
                                                 STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                                None,
                                             );
                                         } else {
                                             self.rest_pose_window[joint_idx].record_disagree();
@@ -2860,6 +2929,344 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.partial_pos_rx = rx;
         self.partial_pos_rx_timestamps = ts;
     }
+    fn execute_disable_writes(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
+        self.assert_clock_matches_transport();
+        self.invalidate_partial_pos_rx();
+        let ids = self.servo_ids.clone();
+        let mut wrote_any = false;
+        let mut refused_err = None;
+        let mut write_err = None;
+        for &id in &ids {
+            match self.write_torque_off(id, kind) {
+                Ok(()) => wrote_any = true,
+                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
+                    if refused_err.is_none() {
+                        refused_err = Some(e);
+                    }
+                }
+                Err(e) => {
+                    write_err = Some(e);
+                }
+            }
+        }
+        if !wrote_any {
+            if let Some(e) = refused_err.take().or_else(|| write_err.take()) {
+                return Err(e);
+            }
+        }
+        let _ = self.read_torque_enable_states(&ids);
+        if let Some(e) = refused_err.or(write_err) {
+            Err(e)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_joint_states_inner(&mut self, advance_unmanaged_release: bool) -> Result<Vec<JointState>, ArmDriverError> {
+        self.assert_clock_matches_transport();
+        let dof = self.servo_ids.len();
+        if dof == 0 {
+            return Ok(Vec::new());
+        }
+
+        const MAX_SYNC_READ_SERVOS: usize = 3;
+        const MAX_READ_DURATION: Duration = Duration::from_millis(8);
+        self.read_poll_count += 1;
+        if advance_unmanaged_release && !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
+        let start_time = self.clock_now();
+        let mut temp_chunk = [0u8; 1];
+
+        const INCOMPLETE_FRAME_TTL: Duration = Duration::from_millis(25);
+        if let Some(inc_idx) = self.incomplete_chunk_idx.take() {
+            let inc_ts = self.incomplete_frame_started_at.take().unwrap_or_else(|| self.clock_now());
+            if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
+                self.invalidate_partial_pos_rx();
+                self.poison_line();
+            } else if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
+                let expected_ids: std::collections::HashSet<u8> = inc_chunk.iter().copied().collect();
+                let mut replied_ids = std::collections::HashSet::new();
+                self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts, INCOMPLETE_FRAME_TTL);
+
+                let reassembly_start = self.clock_now();
+                const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(2);
+                let mut drain_buf = [0u8; 32];
+
+                while replied_ids.len() < inc_chunk.len()
+                    && self.elapsed_since(reassembly_start) < REASSEMBLY_TIMEOUT
+                    && self.elapsed_since(start_time) < MAX_READ_DURATION
+                    && self.elapsed_since(inc_ts) < INCOMPLETE_FRAME_TTL
+                {
+                    match self.transport.read(&mut drain_buf) {
+                        Ok(n) if n > 0 => {
+                            let byte_rx_at = self.clock_now();
+                            if byte_rx_at.saturating_duration_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
+                                break;
+                            }
+                            self.partial_pos_rx.extend_from_slice(&drain_buf[..n]);
+                            self.partial_pos_rx_timestamps.resize(self.partial_pos_rx.len(), byte_rx_at);
+                            self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts, INCOMPLETE_FRAME_TTL);
+                        }
+                        _ => {
+                            if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
+                                break;
+                            }
+                            self.clock_yield();
+                        }
+                    }
+                }
+
+                let all_replied = replied_ids.len() == inc_chunk.len();
+                let inc_timed_out = self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL;
+
+                if !all_replied && !inc_timed_out {
+                    if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.partial_pos_rx, &inc_chunk, 10) {
+                        let tail_offset = self.partial_pos_rx.len() - tail.len();
+                        let tail_bytes = tail.to_vec();
+                        let tail_ts = if self.partial_pos_rx_timestamps.len() == self.partial_pos_rx.len() {
+                            self.partial_pos_rx_timestamps[tail_offset..].to_vec()
+                        } else {
+                            vec![inc_ts; tail_bytes.len()]
+                        };
+                        self.partial_pos_rx = tail_bytes;
+                        self.partial_pos_rx_timestamps = tail_ts;
+                        self.incomplete_chunk_idx = Some(inc_idx);
+                        self.incomplete_frame_started_at = Some(inc_ts);
+                    } else {
+                        self.invalidate_partial_pos_rx();
+                        self.poison_line();
+                    }
+                } else {
+                    if !all_replied && inc_timed_out {
+                        self.poison_line();
+                    }
+                    self.invalidate_partial_pos_rx();
+                }
+            } else {
+                self.invalidate_partial_pos_rx();
+            }
+        }
+
+        let did_enable_poll = self.incomplete_chunk_idx.is_none()
+            && self.reported_enable.contains(&Some(1))
+            && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| self.elapsed_since(t) >= Duration::from_millis(200)));
+        if did_enable_poll {
+            self.last_enable_poll = Some(self.clock_now());
+            if !self.poll_poisoned_line_idle() {
+                self.reported_enable.fill(None);
+            } else if let Ok(sync_read) = feetech::build_sync_read(&self.servo_ids, feetech::REG_TORQUE_ENABLE, 1) {
+                self.transport.clear_input_buffer();
+                self.clear_rx();
+                let _ = self.transport.write_all(&sync_read);
+                let _ = self.transport.flush();
+                let req_written_at = self.clock_now();
+                let _ = self.drain_tx_echo(&sync_read);
+
+                let mut temp_en = [0u8; 1];
+                const ENABLE_POLL_TIMEOUT: Duration = Duration::from_millis(3);
+                let mut replies: std::collections::HashMap<u8, Option<(u8, Instant)>> = std::collections::HashMap::new();
+                let mut had_duplicate = false;
+
+                while replies.len() < self.servo_ids.len()
+                    && self.elapsed_since(req_written_at) < ENABLE_POLL_TIMEOUT
+                    && self.elapsed_since(start_time) < Duration::from_millis(10)
+                {
+                    if let Ok(n) = self.transport.read(&mut temp_en) {
+                        if n > 0 {
+                            let rx_at = self.clock_now();
+                            if rx_at < req_written_at
+                                || rx_at.saturating_duration_since(req_written_at) >= ENABLE_POLL_TIMEOUT
+                                || self.elapsed_since(start_time) >= Duration::from_millis(10)
+                            {
+                                break;
+                            }
+                            self.push_rx(&temp_en[..n], rx_at);
+                        }
+                    }
+                    while !self.rx_buffer.is_empty() {
+                        match feetech::parse_response(&self.rx_buffer) {
+                            Ok((pkt, consumed)) => {
+                                let pkt_rx_at = self
+                                    .rx_timestamps
+                                    .get(consumed - 1)
+                                    .copied()
+                                    .unwrap_or(req_written_at);
+                                self.drain_rx_prefix(consumed);
+                                let decode_now = self.clock_now();
+                                if pkt_rx_at < req_written_at
+                                    || pkt_rx_at > decode_now
+                                    || pkt_rx_at.saturating_duration_since(req_written_at) >= ENABLE_POLL_TIMEOUT
+                                {
+                                    continue;
+                                }
+                                if pkt.id != feetech::BROADCAST_ID && self.servo_ids.contains(&pkt.id) && pkt.params.len() == 1 {
+                                    replies
+                                        .entry(pkt.id)
+                                        .and_modify(|slot| {
+                                            *slot = None;
+                                            had_duplicate = true;
+                                        })
+                                        .or_insert(Some((pkt.params[0], pkt_rx_at)));
+                                }
+                            }
+                            Err(feetech::FeetechError::IncompleteFrame { .. }) => break,
+                            Err(_) => {
+                                self.drain_rx_prefix(1);
+                            }
+                        }
+                    }
+                    if replies.len() < self.servo_ids.len() {
+                        self.clock_yield();
+                    }
+                }
+
+                if replies.len() < self.servo_ids.len() || had_duplicate {
+                    self.poison_line();
+                }
+                self.clear_rx();
+
+                let now = self.clock_now();
+                let servo_ids_len = self.servo_ids.len();
+                for idx in 0..servo_ids_len {
+                    let id = self.servo_ids[idx];
+                    if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
+                        self.reported_enable[idx] = None;
+                        continue;
+                    }
+                    match replies.get(&id).copied() {
+                        Some(Some((v @ (0 | 1), reply_rx_at))) => {
+                            self.record_reported_enable(idx, v, reply_rx_at);
+                        }
+                        Some(_) => {
+                            self.reported_enable[idx] = None;
+                        }
+                        None => {
+                            self.missed_enable_polls[idx] = self.missed_enable_polls[idx].saturating_add(1);
+                            if self.missed_enable_polls[idx] >= 3
+                                || self.last_enable_confirmed[idx].is_none_or(|t| now.saturating_duration_since(t) > Duration::from_millis(600))
+                            {
+                                self.reported_enable[idx] = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let chunks: Vec<Vec<u8>> = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).map(|c| c.to_vec()).collect();
+        let num_chunks = chunks.len();
+        let start_chunk = self.poll_cursor % num_chunks;
+
+        if self.incomplete_chunk_idx.is_some() {
+            return Ok(self.cached_states.clone());
+        }
+
+        'chunk_loop: for offset in 0..num_chunks {
+            let chunk_idx = (start_chunk + offset) % num_chunks;
+            let chunk = &chunks[chunk_idx];
+
+            if self.elapsed_since(start_time) >= MAX_READ_DURATION {
+                self.poll_cursor = chunk_idx;
+                break 'chunk_loop;
+            }
+
+            if !self.poll_poisoned_line_idle() {
+                self.poll_cursor = chunk_idx;
+                break 'chunk_loop;
+            }
+            self.transport.clear_input_buffer();
+            self.clear_rx();
+            if self.elapsed_since(start_time) >= MAX_READ_DURATION {
+                self.poll_cursor = chunk_idx;
+                break 'chunk_loop;
+            }
+            let sync_read = feetech::build_sync_read(chunk, feetech::REG_PRESENT_POSITION_L, 8)
+                .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
+
+            self.transport.write_all(&sync_read)?;
+            self.transport.flush()?;
+            let req_written_at = self.clock_now();
+            self.drain_tx_echo(&sync_read)?;
+
+            let expected_ids: std::collections::HashSet<u8> = chunk.iter().copied().collect();
+            let mut replied_ids = std::collections::HashSet::new();
+            const CHUNK_TIMEOUT: Duration = Duration::from_millis(4);
+
+            while replied_ids.len() < chunk.len()
+                && self.elapsed_since(req_written_at) < CHUNK_TIMEOUT
+                && self.elapsed_since(start_time) < MAX_READ_DURATION
+            {
+                self.decode_position_frames_windowed(&expected_ids, &mut replied_ids, req_written_at, CHUNK_TIMEOUT);
+                if replied_ids.len() >= chunk.len() {
+                    break;
+                }
+
+                match self.transport.read(&mut temp_chunk) {
+                    Ok(n) if n > 0 => {
+                        let byte_rx_at = self.clock_now();
+                        if byte_rx_at < req_written_at
+                            || byte_rx_at.saturating_duration_since(req_written_at) >= CHUNK_TIMEOUT
+                            || byte_rx_at.saturating_duration_since(start_time) >= MAX_READ_DURATION
+                        {
+                            break;
+                        }
+                        self.push_rx(&temp_chunk[..n], byte_rx_at);
+                    }
+                    _ => {}
+                }
+
+                self.decode_position_frames_windowed(&expected_ids, &mut replied_ids, req_written_at, CHUNK_TIMEOUT);
+
+                if replied_ids.len() < chunk.len() {
+                    self.clock_yield();
+                }
+            }
+
+            if replied_ids.len() < chunk.len() {
+                self.missed_poll_replies += 1;
+                if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.rx_buffer, chunk, 10) {
+                    let tail_offset = self.rx_buffer.len() - tail.len();
+                    let tail_started_at = self
+                        .rx_timestamps
+                        .get(tail_offset)
+                        .copied()
+                        .unwrap_or(req_written_at);
+                    if tail_started_at >= req_written_at
+                        && tail_started_at.saturating_duration_since(req_written_at) < CHUNK_TIMEOUT
+                    {
+                        let tail_bytes = tail.to_vec();
+                        let tail_ts = if self.rx_timestamps.len() == self.rx_buffer.len() {
+                            self.rx_timestamps[tail_offset..].to_vec()
+                        } else {
+                            vec![tail_started_at; tail_bytes.len()]
+                        };
+                        self.partial_pos_rx = tail_bytes;
+                        self.partial_pos_rx_timestamps = tail_ts;
+                        self.incomplete_chunk_idx = Some(chunk_idx);
+                        self.incomplete_frame_started_at = Some(tail_started_at);
+                        self.clear_rx();
+                        self.poll_cursor = (chunk_idx + 1) % num_chunks;
+                        break 'chunk_loop;
+                    }
+                }
+                self.poison_line();
+            }
+            self.incomplete_chunk_idx = None;
+            self.incomplete_frame_started_at = None;
+            self.partial_pos_rx.clear();
+            self.partial_pos_rx_timestamps.clear();
+            self.clear_rx();
+            self.poll_cursor = (chunk_idx + 1) % num_chunks;
+        }
+
+        if self.rx_buffer.len() > 512 {
+            let trim = self.rx_buffer.len() - 256;
+            self.rx_buffer.drain(..trim);
+        }
+
+        Ok(self.cached_states.clone())
+    }
 }
 
 impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
@@ -2870,6 +3277,15 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
     fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
         self.evaluate_rest_pose_gate()
+    }
+
+    fn supports_budgeted_disable_await(&self) -> bool {
+        true
+    }
+
+    fn begin_control_release(&mut self, release_seq: u64) {
+        self.control_release_managed = true;
+        self.control_release_id = release_seq;
     }
 
     fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
@@ -3012,12 +3428,71 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         Err(ArmDriverError::Protocol("UNSUPPORTED: serial driver does not support budgeted RX".into()))
     }
 
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        out.clear();
+        out.extend_from_slice(&self.cached_states);
+        Some(())
+    }
+
     fn begin_torque_budgeted(&mut self, _enabled: bool, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
         Err(ArmDriverError::Protocol("UNSUPPORTED: serial driver does not support budgeted torque transitions".into()))
     }
 
-    fn poll_torque_budgeted(&mut self, _deadline: Instant, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+    fn poll_torque(&mut self, _deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+        self.assert_clock_matches_transport();
+        let Some(kind) = self.pending_disable.take() else {
+            return Err(ArmDriverError::Protocol("no torque transition pending".into()));
+        };
+        let (started_at, rollback) = match kind {
+            DisableKind::DisableRequested { started_at, rollback } => (started_at, rollback),
+            DisableKind::DisableProtective { .. } => {
+                self.execute_disable_writes(kind)?;
+                return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+            }
+        };
+        if !rollback && !self.is_stopped_for_disable() {
+            self.execute_disable_writes(kind)?;
+            return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
+        }
+        let exp = started_at + STOPPED_DISABLE_REQUEST_LIFETIME;
+        if self.clock_now() >= exp {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
+        let _ = self.read_joint_states_inner(false);
+        self.last_poll_rx = Some((1, false));
+        if self.clock_now() >= exp {
+            return Err(ArmDriverError::DisableRequestExpired);
+        }
+        match self.evaluate_rest_pose_gate() {
+            RestPoseGateStatus::Confirmed => {
+                self.execute_disable_writes(kind)?;
+                Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+            }
+            RestPoseGateStatus::RefusedNonRest => Err(ArmDriverError::TorqueOffWouldDrop),
+            RestPoseGateStatus::PendingDrainOrWindow | RestPoseGateStatus::StaleOrMissing => {
+                self.pending_disable = Some(kind);
+                let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
+                Ok(TorqueProgress::Pending { wake })
+            }
+        }
+    }
+
+    fn poll_torque_budgeted(&mut self, deadline: Instant, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+        if self.pending_disable.is_some() {
+            return self.poll_torque(deadline);
+        }
         Err(ArmDriverError::Protocol("UNSUPPORTED: serial driver does not support budgeted torque transitions".into()))
+    }
+
+    fn take_last_poll_rx(&mut self) -> Option<(u16, bool)> {
+        self.last_poll_rx.take()
+    }
+
+    fn torque_transition_pending(&self) -> bool {
+        self.pending_disable.is_some()
     }
 
     fn motor_status(&self) -> Option<Vec<u8>> {
@@ -3225,6 +3700,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.invalidate_partial_pos_rx();
         let ids = self.servo_ids.clone();
         if enabled {
+            self.pending_disable = None;
             self.check_hardware_status()?;
             if self.is_aborted() {
                 return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
@@ -3310,6 +3786,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                     write_err = Some(e);
                     break;
                 }
+                self.last_motion_write_at[idx] = Some(self.clock_now());
             }
 
             self.strict_stop_check(Some(start_stamp))?;
@@ -3344,48 +3821,57 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
-        self.assert_clock_matches_transport();
-        self.invalidate_partial_pos_rx();
-        let ids = self.servo_ids.clone();
-        let mut wrote_any = false;
-        let mut refused_err = None;
-        let mut write_err = None;
-        for &id in &ids {
-            match self.write_torque_off(id, kind) {
-                Ok(()) => wrote_any = true,
-                Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
-                    if refused_err.is_none() {
-                        refused_err = Some(e);
-                    }
+        let prev_managed = self.control_release_managed;
+        self.control_release_managed = true;
+        let mut last_release_at = self.clock_now();
+        let res = (|| {
+            let mut progress = self.begin_disable_torque(kind)?;
+            let mut first = true;
+            loop {
+                if let TorqueProgress::Done(_) = progress {
+                    return Ok(());
                 }
-                Err(e) => {
-                    write_err = Some(e);
+                if !first {
+                    self.clock_sleep(Duration::from_millis(2));
                 }
+                first = false;
+                let now = self.clock_now();
+                if now.saturating_duration_since(last_release_at) >= EVIDENCE_PROBE_INTERVAL {
+                    last_release_at = now;
+                    self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+                }
+                let deadline = self.clock_now() + Duration::from_millis(8);
+                progress = self.poll_torque(deadline)?;
             }
-        }
-        if !wrote_any {
-            if let Some(e) = refused_err.take().or_else(|| write_err.take()) {
-                return Err(e);
-            }
-        }
-
-        let _ = self.read_torque_enable_states(&ids);
-
-        if let Some(e) = refused_err.or(write_err) {
-            Err(e)
-        } else {
-            Ok(())
-        }
+        })();
+        self.control_release_managed = prev_managed;
+        res
     }
 
     fn begin_disable_torque(&mut self, kind: DisableKind) -> Result<TorqueProgress, ArmDriverError> {
-        self.disable_torque(kind)?;
-        let outcome = if self.enable_state() == EnableState::Disabled {
-            TorqueOutcome::Confirmed
-        } else {
-            TorqueOutcome::Unconfirmed
-        };
-        Ok(TorqueProgress::Done(outcome))
+        self.assert_clock_matches_transport();
+        self.pending_disable = None;
+        if let DisableKind::DisableRequested { started_at, rollback } = kind {
+            if rollback || self.is_stopped_for_disable() {
+                let exp = started_at + STOPPED_DISABLE_REQUEST_LIFETIME;
+                if self.clock_now() >= exp {
+                    return Err(ArmDriverError::DisableRequestExpired);
+                }
+                match self.evaluate_rest_pose_gate() {
+                    RestPoseGateStatus::Confirmed => {}
+                    RestPoseGateStatus::PendingDrainOrWindow => {
+                        self.pending_disable = Some(kind);
+                        let wake = (self.clock_now() + EVIDENCE_PROBE_INTERVAL).min(exp);
+                        return Ok(TorqueProgress::Pending { wake });
+                    }
+                    RestPoseGateStatus::StaleOrMissing | RestPoseGateStatus::RefusedNonRest => {
+                        return Err(ArmDriverError::TorqueOffWouldDrop);
+                    }
+                }
+            }
+        }
+        self.execute_disable_writes(kind)?;
+        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
     }
 
     fn begin_disable_torque_budgeted(
@@ -3511,9 +3997,14 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let sync_pkt = feetech::build_sync_write_positions(&positions)
             .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
 
+        for w in &mut self.rest_pose_window {
+            w.reset();
+        }
         self.transport.write_all(&sync_pkt)?;
         self.transport.flush()?;
         self.drain_tx_echo(&sync_pkt)?;
+        let write_done = self.clock_now();
+        self.last_motion_write_at.fill(Some(write_done));
         if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
             let fallback_ts = self.clock_now();
             self.rx_timestamps.resize(self.rx_buffer.len(), fallback_ts);
@@ -3524,307 +4015,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-        self.assert_clock_matches_transport();
-        let dof = self.servo_ids.len();
-        if dof == 0 {
-            return Ok(Vec::new());
-        }
-
-        const MAX_SYNC_READ_SERVOS: usize = 3;
-        const MAX_READ_DURATION: Duration = Duration::from_millis(8);
-        self.read_poll_count += 1;
-        self.evidence_pass_id = self.evidence_pass_id.wrapping_add(1);
-        let start_time = self.clock_now();
-        let mut temp_chunk = [0u8; 1];
-
-        const INCOMPLETE_FRAME_TTL: Duration = Duration::from_millis(25);
-        if let Some(inc_idx) = self.incomplete_chunk_idx.take() {
-            let inc_ts = self.incomplete_frame_started_at.take().unwrap_or_else(|| self.clock_now());
-            if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
-                self.invalidate_partial_pos_rx();
-                self.poison_line();
-            } else if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
-                let expected_ids: std::collections::HashSet<u8> = inc_chunk.iter().copied().collect();
-                let mut replied_ids = std::collections::HashSet::new();
-                self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts, INCOMPLETE_FRAME_TTL);
-
-                let reassembly_start = self.clock_now();
-                const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(2);
-                let mut drain_buf = [0u8; 32];
-
-                while replied_ids.len() < inc_chunk.len()
-                    && self.elapsed_since(reassembly_start) < REASSEMBLY_TIMEOUT
-                    && self.elapsed_since(start_time) < MAX_READ_DURATION
-                    && self.elapsed_since(inc_ts) < INCOMPLETE_FRAME_TTL
-                {
-                    match self.transport.read(&mut drain_buf) {
-                        Ok(n) if n > 0 => {
-                            let byte_rx_at = self.clock_now();
-                            if byte_rx_at.saturating_duration_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
-                                break;
-                            }
-                            self.partial_pos_rx.extend_from_slice(&drain_buf[..n]);
-                            self.partial_pos_rx_timestamps.resize(self.partial_pos_rx.len(), byte_rx_at);
-                            self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts, INCOMPLETE_FRAME_TTL);
-                        }
-                        _ => {
-                            if self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL {
-                                break;
-                            }
-                            self.clock_yield();
-                        }
-                    }
-                }
-
-                let all_replied = replied_ids.len() == inc_chunk.len();
-                let inc_timed_out = self.elapsed_since(inc_ts) >= INCOMPLETE_FRAME_TTL;
-
-                if !all_replied && !inc_timed_out {
-                    if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.partial_pos_rx, &inc_chunk, 10) {
-                        let tail_offset = self.partial_pos_rx.len() - tail.len();
-                        let tail_bytes = tail.to_vec();
-                        let tail_ts = if self.partial_pos_rx_timestamps.len() == self.partial_pos_rx.len() {
-                            self.partial_pos_rx_timestamps[tail_offset..].to_vec()
-                        } else {
-                            vec![inc_ts; tail_bytes.len()]
-                        };
-                        self.partial_pos_rx = tail_bytes;
-                        self.partial_pos_rx_timestamps = tail_ts;
-                        self.incomplete_chunk_idx = Some(inc_idx);
-                        self.incomplete_frame_started_at = Some(inc_ts);
-                    } else {
-                        self.invalidate_partial_pos_rx();
-                        self.poison_line();
-                    }
-                } else {
-                    if !all_replied && inc_timed_out {
-                        self.poison_line();
-                    }
-                    self.invalidate_partial_pos_rx();
-                }
-            } else {
-                self.invalidate_partial_pos_rx();
-            }
-        }
-
-        let did_enable_poll = self.incomplete_chunk_idx.is_none()
-            && self.reported_enable.contains(&Some(1))
-            && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| self.elapsed_since(t) >= Duration::from_millis(200)));
-        if did_enable_poll {
-            self.last_enable_poll = Some(self.clock_now());
-            if !self.poll_poisoned_line_idle() {
-                self.reported_enable.fill(None);
-            } else if let Ok(sync_read) = feetech::build_sync_read(&self.servo_ids, feetech::REG_TORQUE_ENABLE, 1) {
-                self.transport.clear_input_buffer();
-                self.clear_rx();
-                let _ = self.transport.write_all(&sync_read);
-                let _ = self.transport.flush();
-                let req_written_at = self.clock_now();
-                let _ = self.drain_tx_echo(&sync_read);
-
-                let mut temp_en = [0u8; 1];
-                const ENABLE_POLL_TIMEOUT: Duration = Duration::from_millis(3);
-                let mut replies: std::collections::HashMap<u8, Option<(u8, Instant)>> = std::collections::HashMap::new();
-                let mut had_duplicate = false;
-
-                while replies.len() < self.servo_ids.len()
-                    && self.elapsed_since(req_written_at) < ENABLE_POLL_TIMEOUT
-                    && self.elapsed_since(start_time) < Duration::from_millis(10)
-                {
-                    if let Ok(n) = self.transport.read(&mut temp_en) {
-                        if n > 0 {
-                            let rx_at = self.clock_now();
-                            if rx_at < req_written_at
-                                || rx_at.saturating_duration_since(req_written_at) >= ENABLE_POLL_TIMEOUT
-                                || self.elapsed_since(start_time) >= Duration::from_millis(10)
-                            {
-                                break;
-                            }
-                            self.push_rx(&temp_en[..n], rx_at);
-                        }
-                    }
-                    while !self.rx_buffer.is_empty() {
-                        match feetech::parse_response(&self.rx_buffer) {
-                            Ok((pkt, consumed)) => {
-                                let pkt_rx_at = self
-                                    .rx_timestamps
-                                    .get(consumed - 1)
-                                    .copied()
-                                    .unwrap_or(req_written_at);
-                                self.drain_rx_prefix(consumed);
-                                if pkt_rx_at < req_written_at
-                                    || pkt_rx_at.saturating_duration_since(req_written_at) >= ENABLE_POLL_TIMEOUT
-                                {
-                                    continue;
-                                }
-                                if pkt.id != feetech::BROADCAST_ID && self.servo_ids.contains(&pkt.id) && pkt.params.len() == 1 {
-                                    replies
-                                        .entry(pkt.id)
-                                        .and_modify(|slot| {
-                                            *slot = None;
-                                            had_duplicate = true;
-                                        })
-                                        .or_insert(Some((pkt.params[0], pkt_rx_at)));
-                                }
-                            }
-                            Err(feetech::FeetechError::IncompleteFrame { .. }) => break,
-                            Err(_) => {
-                                self.drain_rx_prefix(1);
-                            }
-                        }
-                    }
-                    if replies.len() < self.servo_ids.len() {
-                        self.clock_yield();
-                    }
-                }
-
-                if replies.len() < self.servo_ids.len() || had_duplicate {
-                    // S2/E3: Timed-out or ambiguous enable poll poisons the line until 20 ms idle.
-                    self.poison_line();
-                }
-                self.clear_rx();
-
-                let now = self.clock_now();
-                let servo_ids_len = self.servo_ids.len();
-                for idx in 0..servo_ids_len {
-                    let id = self.servo_ids[idx];
-                    if self.unmatched_1b_read.get(idx).copied().unwrap_or(false) {
-                        self.reported_enable[idx] = None;
-                        continue;
-                    }
-                    match replies.get(&id).copied() {
-                        Some(Some((v @ (0 | 1), reply_rx_at))) => {
-                            self.record_reported_enable(idx, v, reply_rx_at);
-                        }
-                        Some(_) => {
-                            self.reported_enable[idx] = None;
-                        }
-                        None => {
-                            self.missed_enable_polls[idx] = self.missed_enable_polls[idx].saturating_add(1);
-                            if self.missed_enable_polls[idx] >= 3
-                                || self.last_enable_confirmed[idx].is_none_or(|t| now.saturating_duration_since(t) > Duration::from_millis(600))
-                            {
-                                self.reported_enable[idx] = None;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let chunks: Vec<Vec<u8>> = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).map(|c| c.to_vec()).collect();
-        let num_chunks = chunks.len();
-        let start_chunk = self.poll_cursor % num_chunks;
-
-        if self.incomplete_chunk_idx.is_some() {
-            return Ok(self.cached_states.clone());
-        }
-
-        'chunk_loop: for offset in 0..num_chunks {
-            let chunk_idx = (start_chunk + offset) % num_chunks;
-            let chunk = &chunks[chunk_idx];
-
-            if self.elapsed_since(start_time) >= MAX_READ_DURATION {
-                self.poll_cursor = chunk_idx;
-                break 'chunk_loop;
-            }
-
-            if !self.poll_poisoned_line_idle() {
-                self.poll_cursor = chunk_idx;
-                break 'chunk_loop;
-            }
-            self.transport.clear_input_buffer();
-            self.clear_rx();
-            if self.elapsed_since(start_time) >= MAX_READ_DURATION {
-                self.poll_cursor = chunk_idx;
-                break 'chunk_loop;
-            }
-            let sync_read = feetech::build_sync_read(chunk, feetech::REG_PRESENT_POSITION_L, 8)
-                .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
-
-            self.transport.write_all(&sync_read)?;
-            self.transport.flush()?;
-            let req_written_at = self.clock_now();
-            self.drain_tx_echo(&sync_read)?;
-
-            let expected_ids: std::collections::HashSet<u8> = chunk.iter().copied().collect();
-            let mut replied_ids = std::collections::HashSet::new();
-            const CHUNK_TIMEOUT: Duration = Duration::from_millis(4);
-
-            while replied_ids.len() < chunk.len()
-                && self.elapsed_since(req_written_at) < CHUNK_TIMEOUT
-                && self.elapsed_since(start_time) < MAX_READ_DURATION
-            {
-                self.decode_position_frames_windowed(&expected_ids, &mut replied_ids, req_written_at, CHUNK_TIMEOUT);
-                if replied_ids.len() >= chunk.len() {
-                    break;
-                }
-
-                match self.transport.read(&mut temp_chunk) {
-                    Ok(n) if n > 0 => {
-                        let byte_rx_at = self.clock_now();
-                        if byte_rx_at < req_written_at
-                            || byte_rx_at.saturating_duration_since(req_written_at) >= CHUNK_TIMEOUT
-                            || byte_rx_at.saturating_duration_since(start_time) >= MAX_READ_DURATION
-                        {
-                            break;
-                        }
-                        self.push_rx(&temp_chunk[..n], byte_rx_at);
-                    }
-                    _ => {}
-                }
-
-                self.decode_position_frames_windowed(&expected_ids, &mut replied_ids, req_written_at, CHUNK_TIMEOUT);
-
-                if replied_ids.len() < chunk.len() {
-                    self.clock_yield();
-                }
-            }
-
-            if replied_ids.len() < chunk.len() {
-                self.missed_poll_replies += 1;
-                if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.rx_buffer, chunk, 10) {
-                    let tail_offset = self.rx_buffer.len() - tail.len();
-                    let tail_started_at = self
-                        .rx_timestamps
-                        .get(tail_offset)
-                        .copied()
-                        .unwrap_or(req_written_at);
-                    if tail_started_at >= req_written_at
-                        && tail_started_at.saturating_duration_since(req_written_at) < CHUNK_TIMEOUT
-                    {
-                        let tail_bytes = tail.to_vec();
-                        let tail_ts = if self.rx_timestamps.len() == self.rx_buffer.len() {
-                            self.rx_timestamps[tail_offset..].to_vec()
-                        } else {
-                            vec![tail_started_at; tail_bytes.len()]
-                        };
-                        self.partial_pos_rx = tail_bytes;
-                        self.partial_pos_rx_timestamps = tail_ts;
-                        self.incomplete_chunk_idx = Some(chunk_idx);
-                        self.incomplete_frame_started_at = Some(tail_started_at);
-                        self.clear_rx();
-                        self.poll_cursor = (chunk_idx + 1) % num_chunks;
-                        break 'chunk_loop;
-                    }
-                }
-                // S2/E3: Timed-out position chunk poisons the line until 20 ms continuous idle.
-                self.poison_line();
-            }
-            self.incomplete_chunk_idx = None;
-            self.incomplete_frame_started_at = None;
-            self.partial_pos_rx.clear();
-            self.partial_pos_rx_timestamps.clear();
-            self.clear_rx();
-            self.poll_cursor = (chunk_idx + 1) % num_chunks;
-        }
-
-        if self.rx_buffer.len() > 512 {
-            let trim = self.rx_buffer.len() - 256;
-            self.rx_buffer.drain(..trim);
-        }
-
-        Ok(self.cached_states.clone())
+        self.read_joint_states_inner(true)
     }
 }
 
@@ -3843,7 +4034,8 @@ pub struct FashionStarArmDriver<T: Transport> {
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
     rx_timestamps: Vec<Instant>,
-    rx_pass_id: u64,
+    control_release_id: u64,
+    control_release_managed: bool,
     rest_pose_window: Vec<CausalWindow>,
     clock: Option<Arc<dyn crate::transport::DriverClock>>,
     abort_flag: Option<Arc<AtomicBool>>,
@@ -3867,7 +4059,8 @@ impl<T: Transport> FashionStarArmDriver<T> {
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
             rx_timestamps: Vec::with_capacity(256),
-            rx_pass_id: 0,
+            control_release_id: 0,
+            control_release_managed: false,
             rest_pose_window: vec![CausalWindow::default(); dof],
             clock,
             abort_flag: None,
@@ -4029,6 +4222,11 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
     fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
         self.evaluate_rest_pose_gate()
+    }
+
+    fn begin_control_release(&mut self, release_seq: u64) {
+        self.control_release_managed = true;
+        self.control_release_id = release_seq;
     }
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
@@ -4284,6 +4482,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         }
 
         for (i, target) in targets.iter().enumerate() {
+            self.rest_pose_window[i].reset();
             let angle_tenth = fashionstar::rad_to_tenth_deg(target.position);
             let pkt = fashionstar::build_set_angle(self.servo_ids[i], angle_tenth, 20, 1000);
             self.transport.write_all(&pkt)?;
@@ -4300,8 +4499,10 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
         let mut temp_chunk = [0u8; 1];
         let start_time = self.now();
-        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
-        let pass_id = self.rx_pass_id;
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
+        let release_id = self.control_release_id;
         const MAX_READ_DURATION: Duration = Duration::from_millis(3);
         const MAX_TOTAL_BYTES: usize = 256;
         let mut total_bytes_read = 0;
@@ -4347,6 +4548,11 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                             && cmd_id == fashionstar::CMD_QUERY_SERVO_ANGLE
                             && content.len() >= 2
                         {
+                            let decode_now = self.now();
+                            if pkt_rx_at > decode_now {
+                                self.rest_pose_window[joint_idx].reset();
+                                break;
+                            }
                             let tenth_deg = i16::from_le_bytes([content[0], content[1]]);
                             let pos = fashionstar::tenth_deg_to_rad(tenth_deg);
                             self.cached_states[joint_idx].position = pos;
@@ -4364,10 +4570,11 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                                     if joint_state_valid(&self.cached_states[joint_idx], self.capabilities())
                                         && gate.joint_at_rest(joint_idx, pos)
                                     {
-                                        self.rest_pose_window[joint_idx].record_agree(
+                                        let _ = self.rest_pose_window[joint_idx].record_agree(
                                             pkt_rx_at,
-                                            pass_id,
+                                            release_id,
                                             STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                            None,
                                         );
                                     } else {
                                         self.rest_pose_window[joint_idx].record_disagree();
@@ -4595,11 +4802,14 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     last_feedback_seq: Vec<u64>,
     /// Incremented whenever joint `i`'s feedback continuity breaks (`> 100 ms` gap or non-finite).
     feedback_continuity_epoch: Vec<u64>,
-    /// Per-motor causal settle boundary captured after a motion/enable write returns from
+    /// Per-motor causal boundary captured after the last motion/enable write returns from
     /// `can.transmit()`. Used ONLY inside the rest-pose disable gate.
-    motor_torque_settle_until: Vec<Option<MotorTorqueSettle>>,
-    /// Monotonic RX drain/poll pass id distinguishing separate ticks for S2 K-windows.
-    rx_pass_id: u64,
+    rest_pose_boundary: Vec<Option<RestPoseBoundary>>,
+    /// Active control-release id distinguishing separate ticks for the rest-pose K=3 window.
+    control_release_id: u64,
+    /// True once the owner has called `begin_control_release`, preventing receive passes from
+    /// advancing `control_release_id` independently.
+    control_release_managed: bool,
     /// Per-motor K=3 causal confirmation window for rest pose (the ONLY strict evidence gate).
     rest_pose_window: Vec<CausalWindow>,
     /// `rx_seq` snapshot when `CMD_ENABLE` was transmitted for motor `i`.
@@ -4683,57 +4893,94 @@ pub struct DamiaoArmDriver<C: CanTransport> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct MotorTorqueSettle {
+struct RestPoseBoundary {
     /// Host monotonic instant captured AFTER `can.transmit()` returned `Ok(())`.
     write_done: Instant,
     /// Kernel or transport receive-clock timestamp captured immediately when `can.transmit()`
     /// returned `Ok(())`. Causal rest-pose evidence requires `rx_time > write_done_rx_clock + SETTLE`
     /// on this exact clock domain (`None` fails closed).
     write_done_rx_clock: Option<CanRxTime>,
+    /// `CLOCK_REALTIME - CLOCK_MONOTONIC` (ns) sampled at `write_done` when `write_done_rx_clock`
+    /// is `KernelRealtimeNs`. A drift `> 1 ms` at decode discards the sample and restarts the window.
+    write_done_offset_ns: Option<i128>,
 }
 
-/// S1: True iff `rx_time` is a present kernel/transport receive timestamp strictly after
-/// `boundary.write_done_rx_clock + TORQUE_CAUSAL_SETTLE_WINDOW` on the same clock domain, AND
-/// host monotonic elapsed time since `boundary.write_done` is also strictly greater than the
-/// settle window (guarding against forward wall-clock jumps). Host dequeue time (`None`) never counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestBoundaryCheck {
+    Satisfied,
+    InSettle,
+    OffsetDrifted,
+}
+
+/// Evaluate whether `rx_time` satisfies `boundary` for the rest-pose gate:
+/// - On `KernelRealtimeNs`, compares `CLOCK_REALTIME - CLOCK_MONOTONIC` sampled at `write_done`
+///   vs. decode; any drift `> MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS` (1 ms) or missing offset
+///   returns [`RestBoundaryCheck::OffsetDrifted`] so the caller discards and restarts the window.
+/// - Compares `rx_time` against `write_done_rx_clock + TORQUE_CAUSAL_SETTLE_WINDOW` in the SAME
+///   clock domain AND verifies host monotonic elapsed time `> TORQUE_CAUSAL_SETTLE_WINDOW`.
 #[inline]
-fn can_settle_boundary_satisfied(
-    boundary: MotorTorqueSettle,
-    rx_time: Option<CanRxTime>,
+fn check_rest_pose_boundary(
+    boundary: RestPoseBoundary,
+    rx_t: CanRxTime,
     decode_now: Instant,
-) -> bool {
-    let Some(rx_t) = rx_time else {
-        return false;
-    };
+    decode_offset_ns: Option<i128>,
+) -> RestBoundaryCheck {
     let Some(tx_t) = boundary.write_done_rx_clock else {
-        return false;
+        return RestBoundaryCheck::InSettle;
     };
-    rx_t.is_after_settle(tx_t, TORQUE_CAUSAL_SETTLE_WINDOW)
+    match (rx_t, tx_t) {
+        (CanRxTime::KernelRealtimeNs(_), CanRxTime::KernelRealtimeNs(_)) => {
+            let (Some(w_off), Some(d_off)) = (boundary.write_done_offset_ns, decode_offset_ns) else {
+                return RestBoundaryCheck::OffsetDrifted;
+            };
+            if (d_off - w_off).abs() > MAX_REALTIME_MONOTONIC_OFFSET_DRIFT_NS {
+                return RestBoundaryCheck::OffsetDrifted;
+            }
+        }
+        (CanRxTime::Monotonic(_), CanRxTime::Monotonic(_)) => {}
+        _ => return RestBoundaryCheck::InSettle,
+    }
+    if rx_t.is_after_settle(tx_t, TORQUE_CAUSAL_SETTLE_WINDOW)
         && decode_now
             .checked_duration_since(boundary.write_done)
             .is_some_and(|d| d > TORQUE_CAUSAL_SETTLE_WINDOW)
+    {
+        RestBoundaryCheck::Satisfied
+    } else {
+        RestBoundaryCheck::InSettle
+    }
 }
 
-/// Convert a present kernel/transport [`CanRxTime`] to a monotonic `Instant` for freshness age
-/// checks (clamped at `decode_now`). Never invoked when `rx_time` is `None`.
+/// Convert a present kernel/transport [`CanRxTime`] to `(monotonic_rx_at, realtime_minus_monotonic_ns)`.
+///
+/// Rejects future-dated timestamps (`None`, NEVER clamped to `decode_now`):
+/// - `Monotonic(ts)` with `ts > decode_now` -> `None`
+/// - `KernelRealtimeNs(rx_ns)` with `rx_ns > now_ns` or missing `RxClockSample` / offset -> `None`
 #[inline]
 fn can_rx_time_to_monotonic<C: CanTransport>(
     can: &C,
     rx_time: CanRxTime,
     decode_now: Instant,
-) -> Instant {
+) -> Option<(Instant, Option<i128>)> {
     match rx_time {
-        CanRxTime::Monotonic(ts) => ts.min(decode_now),
-        CanRxTime::KernelRealtimeNs(rx_ns) => {
-            if let Some(CanRxTime::KernelRealtimeNs(now_ns)) = can.rx_clock_now() {
-                if now_ns >= rx_ns {
-                    let age_ns = (now_ns - rx_ns).min(i128::from(u64::MAX)) as u64;
-                    if let Some(mapped) = decode_now.checked_sub(Duration::from_nanos(age_ns)) {
-                        return mapped;
-                    }
-                }
+        CanRxTime::Monotonic(ts) => {
+            if ts > decode_now {
+                return None;
             }
-            decode_now
+            Some((ts, None))
+        }
+        CanRxTime::KernelRealtimeNs(rx_ns) => {
+            let sample = can.rx_clock_sample()?;
+            let CanRxTime::KernelRealtimeNs(now_ns) = sample.rx_now else {
+                return None;
+            };
+            let offset_ns = sample.realtime_minus_monotonic_ns?;
+            if rx_ns > now_ns {
+                return None;
+            }
+            let age_ns = (now_ns - rx_ns).min(i128::from(u64::MAX)) as u64;
+            let mapped = decode_now.checked_sub(Duration::from_nanos(age_ns))?;
+            Some((mapped, Some(offset_ns)))
         }
     }
 }
@@ -5252,8 +5499,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             rx_seq: 0,
             last_feedback_seq: vec![0; dof],
             feedback_continuity_epoch: vec![0; dof],
-            motor_torque_settle_until: vec![None; dof],
-            rx_pass_id: 0,
+            rest_pose_boundary: vec![None; dof],
+            control_release_id: 0,
+            control_release_managed: false,
             rest_pose_window: vec![CausalWindow::default(); dof],
             motor_enable_seq: vec![0; dof],
             motor_post_enable_feedback: vec![false; dof],
@@ -5776,11 +6024,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
 
         // 6. Account budget attempt, reset per-motor rest-pose/enable boundaries BEFORE any
-        //    enable/mode write reaches the transport, transmit, and record diagnostics.
+        //    motion/enable/mode write reaches the transport, transmit, and record diagnostics.
         if budgeted {
             self.record_tx_pass_attempt();
         }
-        let mut enable_tx_idx: Option<usize> = None;
+        let mut motion_or_enable_idx: Option<usize> = None;
         if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
             if frame.data == damiao::CMD_ENABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
@@ -5788,7 +6036,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.motor_post_enable_feedback[idx] = false;
                     self.motor_enable_seq[idx] = self.rx_seq;
                     self.mode_readback_boundary[idx] = None;
-                    enable_tx_idx = Some(idx);
+                    motion_or_enable_idx = Some(idx);
                 }
             } else if frame.data == damiao::CMD_DISABLE {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| u32::from(id) == frame.id) {
@@ -5802,14 +6050,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if let Some(idx) = self.motor_ids.iter().position(|&id| id == target_id) {
                     self.mode_readback_boundary[idx] = None;
                 }
+            } else if matches!(kind, TxKind::Target | TxKind::Hold | TxKind::Recovery) {
+                if let Some(idx) = self.damiao_command_motor_index(&frame) {
+                    self.rest_pose_window[idx].reset();
+                    motion_or_enable_idx = Some(idx);
+                }
             }
         }
         let t0 = self.now();
         let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
         let res = self.can.transmit(&frame);
         let write_done = self.now();
-        let write_done_rx_clock = if enable_tx_idx.is_some() && res.is_ok() {
-            Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)))
+        let write_done_clock = if motion_or_enable_idx.is_some() && res.is_ok() {
+            Some(self.capture_rx_clock_sample(write_done))
         } else {
             None
         };
@@ -5824,14 +6077,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         crate::diagnostics::tick::record_tx_attempt(attempt_kind, wall_ns, cpu_ns);
         match res {
             Ok(()) => {
-                // Record the kernel/transport-clock settle boundary AFTER `transmit()` returns
-                // for the rest-pose gate.
-                if let Some(idx) = enable_tx_idx {
-                    let boundary = MotorTorqueSettle {
+                // Record the same-clock boundary + CLOCK_REALTIME - CLOCK_MONOTONIC offset AFTER
+                // `transmit()` returns for the rest-pose gate (after last motion/enable command).
+                if let (Some(idx), Some((write_done_rx_clock, write_done_offset_ns))) =
+                    (motion_or_enable_idx, write_done_clock)
+                {
+                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
                         write_done,
-                        write_done_rx_clock,
-                    };
-                    self.motor_torque_settle_until[idx] = Some(boundary);
+                        write_done_rx_clock: Some(write_done_rx_clock),
+                        write_done_offset_ns,
+                    });
                 }
                 Ok(frame)
             }
@@ -6870,7 +7125,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Pure RX-only drain (no autonomous recovery/refresh TX, no `begin_tx_tick`, zero heap
     /// allocation). Returns `true` when the transport explicitly reported an empty RX queue.
     fn drain_rx_frames_only(&mut self, deadline: Option<Deadline>, max_frames: usize) -> bool {
-        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let mut frames = 0usize;
         while frames < max_frames {
             if deadline.is_some_and(|d| d.passed(self.now())) {
@@ -8002,7 +8256,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// `deadline`, stopping on `Timeout` / `WouldBlock` and marking the empty-queue boundary.
     /// Every frame consumed counts against the release's RX budget and `last_poll_rx`.
     fn drain_rx_for_boundary(&mut self, deadline: Deadline) -> bool {
-        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let max_frames = self.remaining_rx_frame_limit();
         self.last_read_drained = false;
         let t0 = self.now();
@@ -8761,12 +9014,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     #[inline]
-    fn boundary_satisfied(
-        boundary: MotorTorqueSettle,
-        rx_time: Option<CanRxTime>,
-        decode_now: Instant,
-    ) -> bool {
-        can_settle_boundary_satisfied(boundary, rx_time, decode_now)
+    fn damiao_command_motor_index(&self, frame: &CanFrame) -> Option<usize> {
+        if frame.is_extended || frame.is_rtr || frame.dlc != 8 || frame.id == 0x7FF {
+            return None;
+        }
+        self.motor_ids.iter().position(|&id| {
+            let base = u32::from(id);
+            frame.id == base
+                || frame.id == (0x100 + base)
+                || frame.id == (u32::from(damiao::POS_FORCE_BASE_ID) + base)
+        })
+    }
+
+    #[inline]
+    fn capture_rx_clock_sample(&self, mono_now: Instant) -> (CanRxTime, Option<i128>) {
+        if let Some(sample) = self.can.rx_clock_sample() {
+            (sample.rx_now, sample.realtime_minus_monotonic_ns)
+        } else {
+            (CanRxTime::Monotonic(mono_now), None)
+        }
     }
 
     /// Verified hold mode for joint `i` (`None` when mode has not been verified by a causal
@@ -9301,7 +9567,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn drain_rx_before_command_limit(&mut self, max_frames: usize) -> bool {
-        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let limit = self.rx_frame_limit.map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
         self.last_read_drained = false;
         let start = self.now();
@@ -9333,6 +9598,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn poll_torque_inner(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
         self.begin_tx_tick();
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
@@ -9404,6 +9672,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn supports_budgeted_disable_await(&self) -> bool {
         true
+    }
+
+    fn begin_control_release(&mut self, release_seq: u64) {
+        self.control_release_managed = true;
+        self.control_release_id = release_seq;
     }
 
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
@@ -9980,15 +10253,27 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
-        let mut progress = self.begin_disable_torque(kind)?;
-        let mut first = true;
-        loop {
-            if let TorqueProgress::Done(_) = progress { return Ok(()); }
-            if !first { self.pause(Duration::from_micros(500)); }
-            first = false;
-            let deadline = self.now() + DAMIAO_RX_PASS;
-            progress = self.poll_torque(deadline)?;
-        }
+        let prev_managed = self.control_release_managed;
+        self.control_release_managed = true;
+        let mut last_release_at = self.now();
+        let res = (|| {
+            let mut progress = self.begin_disable_torque(kind)?;
+            let mut first = true;
+            loop {
+                if let TorqueProgress::Done(_) = progress { return Ok(()); }
+                if !first { self.pause(Duration::from_micros(500)); }
+                first = false;
+                let now = self.now();
+                if now.saturating_duration_since(last_release_at) >= EVIDENCE_PROBE_INTERVAL {
+                    last_release_at = now;
+                    self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+                }
+                let deadline = self.now() + DAMIAO_RX_PASS;
+                progress = self.poll_torque(deadline)?;
+            }
+        })();
+        self.control_release_managed = prev_managed;
+        res
     }
 
     fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
@@ -11563,11 +11848,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
         self.receive_feedback()?;
         Ok(self.cached_states.clone())
     }
 
     fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
         self.receive_feedback()?;
         out.clear();
         out.extend_from_slice(&self.cached_states);
@@ -11584,6 +11875,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(ArmDriverError::Protocol(
                 "UNSUPPORTED: CAN transport does not support non-blocking RT I/O".into(),
             ));
+        }
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
         }
         self.last_poll_rx = None;
         self.rx_deadline = Some(deadline);
@@ -11735,6 +12029,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             };
             let decode_now = self.now();
+            let Some((rx_at, _)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
+                return;
+            };
             let motor_idx = self.motor_ids.iter().position(|&id| id == reply.motor_id);
             // L2: Accept causal post-boundary on-tick `RID_CTRL_MODE` readback replies even during
             // ordinary `read_joint_states` (`record_register_replies == false`).
@@ -11760,7 +12057,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
             if record_register_replies {
-                let rx_at = can_rx_time_to_monotonic(&self.can, rx_t, decode_now);
                 if self.register_replies.len() < 64 { self.register_replies.push(reply); }
                 if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, rx_at, self.rx_seq, self.rx_empty_seq)); }
             }
@@ -11786,12 +12082,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             }
             if let Ok(feedback) = damiao::unpack_feedback_frame(frame, &self.limits[idx]) {
-                // Host dequeue time never counts: require a kernel/transport receive timestamp.
+                // Host dequeue time never counts: require a kernel/transport receive timestamp,
+                // and reject future-dated timestamps completely (never clamp).
                 let Some(rx_t) = rx_time else {
                     return;
                 };
                 let decode_now = self.now();
-                let rx_at = can_rx_time_to_monotonic(&self.can, rx_t, decode_now);
+                let Some((rx_at, decode_offset_ns)) = can_rx_time_to_monotonic(&self.can, rx_t, decode_now) else {
+                    self.rest_pose_window[idx].reset();
+                    return;
+                };
                 let queue_bound = self.rx_empty_instant;
                 let seq = self.rx_seq;
                 let prev_rx = self.last_feedback_instant[idx];
@@ -11827,25 +12127,53 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.motor_post_enable_feedback[idx] = true;
                 }
                 // Per-motor K=3 causal rest-pose window for arm joints under StoppedDisableGate
-                // (the ONLY place with strict causal settle + K=3 evidence).
-                let pass_id = self.rx_pass_id;
-                let rest_settle_ok = self.motor_torque_settle_until[idx]
-                    .is_none_or(|boundary| Self::boundary_satisfied(boundary, Some(rx_t), decode_now));
-                if let Some(ref gate) = self.stopped_disable_gate {
-                    if gate.is_arm_joint(idx) {
-                        if rest_settle_ok
-                            && !self.awaiting_rx_boundary
-                            && queue_bound.is_some()
-                            && joint_state_valid(&self.cached_states[idx], self.capabilities())
-                            && gate.joint_at_rest(idx, feedback.position)
-                        {
-                            self.rest_pose_window[idx].record_agree(
-                                rx_at,
-                                pass_id,
-                                STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-                            );
-                        } else {
-                            self.rest_pose_window[idx].record_disagree();
+                // (the ONLY place with strict causal settle + offset-drift + K=3 evidence).
+                let boundary_check = match self.rest_pose_boundary[idx] {
+                    None => RestBoundaryCheck::Satisfied,
+                    Some(boundary) => {
+                        check_rest_pose_boundary(boundary, rx_t, decode_now, decode_offset_ns)
+                    }
+                };
+                match boundary_check {
+                    RestBoundaryCheck::OffsetDrifted => {
+                        self.rest_pose_window[idx].reset();
+                        let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
+                        self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                            write_done: decode_now,
+                            write_done_rx_clock: Some(cur_rx),
+                            write_done_offset_ns: cur_off,
+                        });
+                    }
+                    RestBoundaryCheck::InSettle => {
+                        self.rest_pose_window[idx].reset();
+                    }
+                    RestBoundaryCheck::Satisfied => {
+                        if let Some(ref gate) = self.stopped_disable_gate {
+                            if gate.is_arm_joint(idx) {
+                                if !self.awaiting_rx_boundary
+                                    && queue_bound.is_some()
+                                    && joint_state_valid(&self.cached_states[idx], self.capabilities())
+                                    && gate.joint_at_rest(idx, feedback.position)
+                                {
+                                    let release_id = self.control_release_id;
+                                    if self.rest_pose_window[idx].record_agree(
+                                        rx_at,
+                                        release_id,
+                                        STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                        decode_offset_ns,
+                                    ) == WindowRecord::OffsetDrifted
+                                    {
+                                        let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
+                                        self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                                            write_done: decode_now,
+                                            write_done_rx_clock: Some(cur_rx),
+                                            write_done_offset_ns: cur_off,
+                                        });
+                                    }
+                                } else {
+                                    self.rest_pose_window[idx].record_disagree();
+                                }
+                            }
                         }
                     }
                 }
@@ -11901,7 +12229,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // Every hardware receive pass opens a fresh per-tick TX budget window; recovery writes,
         // 0xCC refreshes, J7 handshakes, and the tick's target batch share one TickTxPass once any TX starts.
         self.begin_tx_tick();
-        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
         let max_frames = self.remaining_rx_frame_limit();
         let t0 = self.now();
         let mut frames_processed = 0;
@@ -12190,16 +12517,15 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     rx_empty_instant: Option<Instant>,
     /// `rx_empty_instant` when each joint's last sample was decoded.
     feedback_queue_bound: Vec<Option<Instant>>,
-    /// Per-motor causal settle deadline (`write_done + TORQUE_CAUSAL_SETTLE_WINDOW`) after a
-    /// torque-changing write returns from `can.transmit()`.
-    /// Per-motor causal settle boundary captured after a torque-changing write returns from
-    /// `can.transmit()`. Frames whose kernel/transport receive time is not strictly greater than
-    /// `write_done + TORQUE_CAUSAL_SETTLE_WINDOW` are never evidence for that motor's torque
-    /// state, mode, or rest pose.
-    motor_torque_settle_until: Vec<Option<MotorTorqueSettle>>,
-    /// Monotonic RX drain pass counter for S2 K-windows.
-    rx_pass_id: u64,
-    /// Per-motor K=3 causal rest-pose evidence window (S2).
+    /// Per-motor causal boundary captured after the last motion/enable write returns from
+    /// `can.transmit()`. Used ONLY inside the rest-pose disable gate.
+    rest_pose_boundary: Vec<Option<RestPoseBoundary>>,
+    /// Active control-release id distinguishing separate ticks for the rest-pose K=3 window.
+    control_release_id: u64,
+    /// True once the owner has called `begin_control_release`, preventing receive passes from
+    /// advancing `control_release_id` independently.
+    control_release_managed: bool,
+    /// Per-motor K=3 causal rest-pose evidence window.
     rest_pose_window: Vec<CausalWindow>,
     /// True once the most recent RX receive/drain pass reached an empty queue (`Timeout`/`WouldBlock`).
     last_read_drained: bool,
@@ -12231,8 +12557,9 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             feedback_continuity_epoch: vec![0; dof],
             rx_empty_instant: None,
             feedback_queue_bound: vec![None; dof],
-            motor_torque_settle_until: vec![None; dof],
-            rx_pass_id: 0,
+            rest_pose_boundary: vec![None; dof],
+            control_release_id: 0,
+            control_release_managed: false,
             rest_pose_window: vec![CausalWindow::default(); dof],
             last_read_drained: false,
             awaiting_rx_boundary: false,
@@ -12369,23 +12696,23 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
         Ok(())
     }
 
+    #[inline]
+    fn capture_rx_clock_sample(&self, mono_now: Instant) -> (CanRxTime, Option<i128>) {
+        if let Some(sample) = self.can.rx_clock_sample() {
+            (sample.rx_now, sample.realtime_minus_monotonic_ns)
+        } else {
+            (CanRxTime::Monotonic(mono_now), None)
+        }
+    }
+
     /// Per-write transmit choke point for RobStride type-4 stop / fault-clear CAN frames:
     /// re-evaluates stop state, freshness, rest pose (K=3 window), and 1 s request lifetime
-    /// immediately before each `can.transmit`, and arms the per-motor causal settle window after
-    /// `transmit()` returns.
-    fn send_type4_frame(&mut self, idx: usize, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
+    /// immediately before each `can.transmit`.
+    fn send_type4_frame(&mut self, _idx: usize, frame: &CanFrame, kind: DisableKind) -> Result<(), ArmDriverError> {
         if let DisableKind::DisableRequested { started_at, rollback } = kind {
             self.check_disable_requested(started_at, rollback)?;
         }
         self.can.transmit(frame)?;
-        let write_done = self.now();
-        let write_done_rx_clock = Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)));
-        if let Some(slot) = self.motor_torque_settle_until.get_mut(idx) {
-            *slot = Some(MotorTorqueSettle {
-                write_done,
-                write_done_rx_clock,
-            });
-        }
         Ok(())
     }
 
@@ -12400,8 +12727,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
     /// drains to `Timeout | WouldBlock`.
     fn drain_rx_bounded(&mut self, max_frames: usize, deadline: Option<Instant>, max_span: Duration) -> (u16, bool, bool) {
         self.last_read_drained = false;
-        self.rx_pass_id = self.rx_pass_id.wrapping_add(1);
-        let pass_id = self.rx_pass_id;
+        let release_id = self.control_release_id;
         let t0 = self.now();
         let mut frames_processed = 0usize;
         let mut rx_drained = false;
@@ -12417,8 +12743,8 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                     if let Ok(feedback) = robstride::unpack_feedback_frame(&frame, &self.limits) {
                         if let Some(idx) = self.motor_ids.iter().position(|&id| id == feedback.motor_id) {
                             let decode_now = self.now();
-                            // S1: Host dequeue time never counts. Reject frames without a kernel/
-                            // transport RX timestamp completely for causal evidence.
+                            // Host dequeue time never counts; reject missing or future-dated
+                            // timestamps completely (never clamp).
                             let Some(rx_t) = rx_time else {
                                 self.last_feedback_instant[idx] = None;
                                 self.feedback_queue_bound[idx] = None;
@@ -12427,8 +12753,12 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                     self.feedback_continuity_epoch[idx].wrapping_add(1);
                                 continue;
                             };
-                            let in_settle = self.motor_torque_settle_until[idx]
-                                .is_some_and(|boundary| !can_settle_boundary_satisfied(boundary, Some(rx_t), decode_now));
+                            let Some((rx_at, decode_offset_ns)) =
+                                can_rx_time_to_monotonic(&self.can, rx_t, decode_now)
+                            else {
+                                self.rest_pose_window[idx].reset();
+                                continue;
+                            };
                             self.cached_states[idx] = JointState {
                                 position: feedback.position,
                                 velocity: feedback.velocity,
@@ -12436,18 +12766,6 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                                 temperature: feedback.mos_temperature,
                             };
                             self.fault_flags[idx] = feedback.fault_flags;
-                            if in_settle {
-                                // S1/E1: Feedback received on/before write_done + SETTLE is never
-                                // evidence for rest pose; clear freshness/queue bounds so it
-                                // cannot authorize a stopped disable.
-                                self.last_feedback_instant[idx] = None;
-                                self.feedback_queue_bound[idx] = None;
-                                self.rest_pose_window[idx].reset();
-                                self.feedback_continuity_epoch[idx] =
-                                    self.feedback_continuity_epoch[idx].wrapping_add(1);
-                                continue;
-                            }
-                            let rx_at = can_rx_time_to_monotonic(&self.can, rx_t, decode_now);
                             let prev_rx = self.last_feedback_instant[idx];
                             let prev_qb = self.feedback_queue_bound[idx];
                             if prev_rx.is_none_or(|p| rx_at.saturating_duration_since(p) > STOPPED_DISABLE_FEEDBACK_MAX_AGE)
@@ -12460,20 +12778,55 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
                             self.last_feedback_instant[idx] = Some(rx_at);
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                            if let Some(ref gate) = self.stopped_disable_gate {
-                                if gate.is_arm_joint(idx) {
-                                    if !self.awaiting_rx_boundary
-                                        && self.rx_empty_instant.is_some()
-                                        && joint_state_valid(&self.cached_states[idx], self.capabilities())
-                                        && gate.joint_at_rest(idx, feedback.position)
-                                    {
-                                        self.rest_pose_window[idx].record_agree(
-                                            rx_at,
-                                            pass_id,
-                                            STOPPED_DISABLE_FEEDBACK_MAX_AGE,
-                                        );
-                                    } else {
-                                        self.rest_pose_window[idx].record_disagree();
+                            let boundary_check = match self.rest_pose_boundary[idx] {
+                                None => RestBoundaryCheck::Satisfied,
+                                Some(boundary) => check_rest_pose_boundary(
+                                    boundary,
+                                    rx_t,
+                                    decode_now,
+                                    decode_offset_ns,
+                                ),
+                            };
+                            match boundary_check {
+                                RestBoundaryCheck::OffsetDrifted => {
+                                    self.rest_pose_window[idx].reset();
+                                    let (cur_rx, cur_off) = self.capture_rx_clock_sample(decode_now);
+                                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                                        write_done: decode_now,
+                                        write_done_rx_clock: Some(cur_rx),
+                                        write_done_offset_ns: cur_off,
+                                    });
+                                }
+                                RestBoundaryCheck::InSettle => {
+                                    self.rest_pose_window[idx].reset();
+                                }
+                                RestBoundaryCheck::Satisfied => {
+                                    if let Some(ref gate) = self.stopped_disable_gate {
+                                        if gate.is_arm_joint(idx) {
+                                            if !self.awaiting_rx_boundary
+                                                && self.rx_empty_instant.is_some()
+                                                && joint_state_valid(&self.cached_states[idx], self.capabilities())
+                                                && gate.joint_at_rest(idx, feedback.position)
+                                            {
+                                                if self.rest_pose_window[idx].record_agree(
+                                                    rx_at,
+                                                    release_id,
+                                                    STOPPED_DISABLE_FEEDBACK_MAX_AGE,
+                                                    decode_offset_ns,
+                                                ) == WindowRecord::OffsetDrifted
+                                                {
+                                                    let (cur_rx, cur_off) =
+                                                        self.capture_rx_clock_sample(decode_now);
+                                                    self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
+                                                        write_done: decode_now,
+                                                        write_done_rx_clock: Some(cur_rx),
+                                                        write_done_offset_ns: cur_off,
+                                                    });
+                                                }
+                                            } else {
+                                                self.rest_pose_window[idx].record_disagree();
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -12569,6 +12922,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn rest_pose_gate_status(&self) -> RestPoseGateStatus {
         self.evaluate_rest_pose_gate()
+    }
+
+    fn begin_control_release(&mut self, release_seq: u64) {
+        self.control_release_managed = true;
+        self.control_release_id = release_seq;
     }
 
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false, load_feedback: false } }
@@ -12691,6 +13049,9 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         deadline: Instant,
         max_rx_frames: u16,
     ) -> Result<(u16, bool), ArmDriverError> {
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
         let (frames_processed, rx_drained, hit_err) = self.drain_rx_bounded(
             usize::from(max_rx_frames.min(64)),
             Some(deadline),
@@ -12814,10 +13175,12 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 self.rest_pose_window[idx].reset();
                 self.can.transmit(&frame)?;
                 let write_done = self.now();
-                let write_done_rx_clock = Some(self.can.rx_clock_now().unwrap_or(CanRxTime::Monotonic(write_done)));
-                self.motor_torque_settle_until[idx] = Some(MotorTorqueSettle {
+                let (write_done_rx_clock, write_done_offset_ns) =
+                    self.capture_rx_clock_sample(write_done);
+                self.rest_pose_boundary[idx] = Some(RestPoseBoundary {
                     write_done,
-                    write_done_rx_clock,
+                    write_done_rx_clock: Some(write_done_rx_clock),
+                    write_done_offset_ns,
                 });
             }
             self.strict_stop_check(Some(start_stamp))?;
@@ -12961,9 +13324,11 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 torque,
                 &self.limits,
             );
+            self.rest_pose_window[i].reset();
             let t0 = Instant::now();
             let cpu0 = crate::diagnostics::tick::thread_cpu_ns();
             let res = self.can.transmit(&frame);
+            let write_done = self.now();
             let wall_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             let cpu_ns = crate::diagnostics::tick::thread_cpu_ns().saturating_sub(cpu0);
             let kind = match &res {
@@ -12974,12 +13339,22 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             };
             crate::diagnostics::tick::record_tx_attempt(kind, wall_ns, cpu_ns);
             res?;
+            let (write_done_rx_clock, write_done_offset_ns) =
+                self.capture_rx_clock_sample(write_done);
+            self.rest_pose_boundary[i] = Some(RestPoseBoundary {
+                write_done,
+                write_done_rx_clock: Some(write_done_rx_clock),
+                write_done_offset_ns,
+            });
         }
         self.can.flush()?;
         Ok(())
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        if !self.control_release_managed {
+            self.control_release_id = self.control_release_id.wrapping_add(1).max(1);
+        }
         let _ = self.drain_rx_bounded(64, None, Duration::from_micros(2000));
         Ok(self.cached_states.clone())
     }
@@ -13802,9 +14177,9 @@ mod tx_chokepoint_tests {
             let t1 = now.checked_sub(Duration::from_millis(10)).unwrap_or(now);
             for w in windows.iter_mut() {
                 w.reset();
-                w.record_agree(t0, 1, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
-                w.record_agree(t1, 2, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
-                w.record_agree(now, 3, STOPPED_DISABLE_FEEDBACK_MAX_AGE);
+                let _ = w.record_agree(t0, 1, STOPPED_DISABLE_FEEDBACK_MAX_AGE, None);
+                let _ = w.record_agree(t1, 2, STOPPED_DISABLE_FEEDBACK_MAX_AGE, None);
+                let _ = w.record_agree(now, 3, STOPPED_DISABLE_FEEDBACK_MAX_AGE, None);
             }
         };
 

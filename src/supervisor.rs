@@ -750,6 +750,9 @@ pub struct SupervisorInner {
     /// Owner-owned torque decision state (`On` by default on hardware until an accepted disable
     /// or `DisableProtective` sets `Off`; never inferred from feedback telemetry).
     pub torque_intent: driver_transitions::TorqueIntent,
+    /// Monotonic control-release sequence counter pushed to the driver once per release so
+    /// rest-pose K=3 ticks count control releases, never individual RX receive passes.
+    pub(crate) control_release_seq: u64,
     /// Inline per-joint measured-position hold state (zero alloc on RT).
     pub(crate) measured_hold: driver_transitions::MeasuredHoldTracker,
     /// Inline owner-held driver snapshot refreshed whenever the owner already holds the driver
@@ -1576,6 +1579,7 @@ impl SupervisorInner {
             torque_transition: None,
             enable_lifecycle: driver_transitions::EnableLifecycle::Disarmed,
             torque_intent: driver_transitions::TorqueIntent::Off,
+            control_release_seq: 0,
             measured_hold: driver_transitions::MeasuredHoldTracker::new(dof),
             owner_driver_snapshot: driver_transitions::OwnerDriverSnapshot::new(dof),
             last_disable_attempt: None,
@@ -3941,6 +3945,7 @@ impl SupervisorInner {
         budget: &crate::rt_core::ops::ServiceBudget,
         release_deadline: Option<Instant>,
     ) -> crate::rt_core::ops::HardwarePoll {
+        self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
         let was_thermal_active = self.thermal_protection_active();
         // Install the release publish-margin TX cap BEFORE enable-transition polling, background
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
@@ -4010,6 +4015,9 @@ impl SupervisorInner {
             self.feedback_numeric_valid = false;
             match d.lock() {
                 Ok(mut driver) => {
+                    if self.control_release_seq > 0 {
+                        driver.begin_control_release(self.control_release_seq);
+                    }
                     let applied_step2_tx_cap = if let (Some(b), Some(rd)) = (budget, release_deadline) {
                         let drv_now = driver.clock_now();
                         let cap = self.driver_tx_release_cap(drv_now, b.now, rd);
@@ -4246,10 +4254,11 @@ impl SupervisorInner {
         }
 
         // Reuse Step 2's single budgeted hardware poll when present; legacy callers without
-        // a preceding `poll_hardware` perform the receive pass here.
+        // a preceding `poll_hardware` advance the control-release counter and perform RX here.
         let rx = if self.pending_rx_poll.active {
             std::mem::take(&mut self.pending_rx_poll)
         } else {
+            self.control_release_seq = self.control_release_seq.wrapping_add(1).max(1);
             self.poll_hardware_rx(None, None, None)
         };
         let invalid_feedback = rx.invalid_feedback;
