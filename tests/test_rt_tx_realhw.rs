@@ -539,17 +539,31 @@ fn dual_owner_sustained_deferral_beyond_45ms_latches_single_can_tx_stalled() {
             assert_eq!(rig.inner().safety.fault().map(|f| f.code), Some(FaultCode::CanTxStalled));
         }
 
-        // (b) Custom tx_stall_ticks = Some(2): latches CAN_TX_STALLED on exact tick 2.
+        // (b) Custom tx_stall_ticks = Some(4) (minimum at 50 Hz = ceil(45/20) + 1) under partial
+        //     deferral (max_frames = 4 so carried frames complete within 20 ms without expiring):
+        //     latches CAN_TX_STALLED on exact tick 4 via consecutive deferred ticks.
         let mut cfg2 = base_cfg();
-        cfg2.tx_stall_ticks = Some(2);
-        let mut rig2 = DualRig::new(owner, cfg2, None);
-        rig2.bus.with(|s| s.tx_enobufs = true);
-        rig2.step();
-        assert!(rig2.inner().safety.state().is_operational(), "{owner:?}: tick 1 < 2");
+        cfg2.tx_stall_ticks = Some(4);
+        let mut rig2 = DualRig::new(
+            owner,
+            cfg2,
+            Some(TxBudget {
+                max_frames: 4,
+                max_duration: ms(10),
+                frame_max_age: ms(45),
+            }),
+        );
+        for tick in 1..=3 {
+            rig2.step();
+            assert!(
+                rig2.inner().safety.state().is_operational(),
+                "{owner:?}: partial deferral tick {tick} < 4 must stay operational"
+            );
+        }
         rig2.step();
         assert_eq!(rig2.inner().safety.fault().map(|f| f.code), Some(FaultCode::CanTxStalled));
         let msg = rig2.inner().safety.fault().unwrap().message;
-        assert!(msg.contains("queued") && msg.contains("2 consecutive ticks"), "{msg}");
+        assert!(msg.contains("queued") && msg.contains("4 consecutive ticks"), "{msg}");
     }
 
     // (c) Mid-drain head expiry followed by a younger fresh slot: breaks immediately on the
@@ -1123,7 +1137,7 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
         //    resets the periodic deferral streak.
         {
             let mut cfg_s2 = base_cfg();
-            cfg_s2.tx_stall_ticks = Some(2);
+            cfg_s2.tx_stall_ticks = Some(4); // minimum at 50 Hz = ceil(45/20) + 1
             let mut rig_s2 = DualRig::new(owner, cfg_s2, None);
             rig_s2.inner_mut().enter_gravity_comp(Default::default()).expect("enter gravity comp");
             rig_s2.step();
@@ -1131,13 +1145,19 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             // must NOT increment periodic `tx_deferral_streak`!
             rig_s2.bus.with(|s| s.tx_enobufs = true);
             rig_s2.inner_mut().exit_gravity_comp("REQUESTED", "major8");
-            // 1st periodic deferred release (streak = 1 < tx_stall_ticks = 2): MUST stay operational!
-            rig_s2.step();
-            assert!(
-                rig_s2.inner().safety.state().is_operational(),
-                "{owner:?}: off-tick exit deferral + 1 control release must not trip tx_stall_ticks=2"
-            );
-            // Bus clears -> recovers cleanly!
+            // Clear the off-tick pending queue so periodic ticks start fresh from tick 1 without
+            // hitting 45 ms expiry early; if off-tick exit had counted as streak 1, then 3 periodic
+            // deferred releases would reach streak 4 and trip CAN_TX_STALLED.
+            rig_s2.inner().driver.as_ref().unwrap().lock().unwrap().discard_pending_tx();
+            for tick in 1..=3 {
+                rig_s2.step();
+                assert!(
+                    rig_s2.inner().safety.state().is_operational(),
+                    "{owner:?}: off-tick exit deferral + {tick} control releases must not trip tx_stall_ticks=4"
+                );
+            }
+            // Bus clears on next tick after discarding aged frames -> recovers cleanly!
+            rig_s2.inner().driver.as_ref().unwrap().lock().unwrap().discard_pending_tx();
             rig_s2.bus.with(|s| s.tx_enobufs = false);
             for _ in 0..7 {
                 rig_s2.step();
@@ -1147,16 +1167,18 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
 
             // Also verify `TickOutput::None` with no pending motion resets an active streak:
             // with tracking enabled, `recovery_suspended = true` produces `TickOutput::None`
-            // while torqued and operational. 1 deferred release -> discard pending & skip output ->
-            // next deferred release is streak 1 again (< 2), NOT streak 2!
+            // while torqued and operational. 2 deferred releases (streak = 2) -> discard pending &
+            // skip output (resets streak to 0) -> 3 deferred releases (ages 0, 20, 40 ms; streak = 3 < 4)
+            // MUST stay operational (without reset, streak would hit 4 on release 2)!
             let mut jt = armd::model::JointTrackingConfig::rebot_dm();
             jt.enabled = true;
             let mut cfg_none = base_cfg();
-            cfg_none.tx_stall_ticks = Some(2);
+            cfg_none.tx_stall_ticks = Some(4);
             cfg_none.joint_tracking = Some(jt);
             let mut rig_none = DualRig::new(owner, cfg_none, None);
             rig_none.bus.with(|s| s.tx_enobufs = true);
-            rig_none.step(); // streak = 1 (< 2)
+            rig_none.step(); // streak = 1 (< 4)
+            rig_none.step(); // streak = 2 (< 4)
             assert!(rig_none.inner().safety.state().is_operational());
             if let Some(d) = rig_none.inner().driver.as_ref() {
                 d.lock().unwrap().discard_pending_tx();
@@ -1168,12 +1190,14 @@ fn dual_owner_deferred_action_gravity_and_park_gates() {
             rig_none.step_dt(0.02, false);
             rig_none.inner_mut().tracking.recovery_joints.clear();
             rig_none.inner_mut().tracking.recovery_suspended = false;
-            rig_none.step(); // streak = 1 (< 2) -> still operational!
-            assert!(
-                rig_none.inner().safety.state().is_operational(),
-                "{owner:?}: TickOutput::None without pending motion must reset tx_deferral_streak: {:?}",
-                rig_none.inner().safety.fault()
-            );
+            for tick in 1..=3 {
+                rig_none.step(); // streak = 1, 2, 3 (< 4; ages 0, 20, 40 ms < 45 ms)
+                assert!(
+                    rig_none.inner().safety.state().is_operational(),
+                    "{owner:?}: TickOutput::None without pending motion must reset tx_deferral_streak (tick {tick}): {:?}",
+                    rig_none.inner().safety.fault()
+                );
+            }
         }
     }
 }
@@ -1184,7 +1208,8 @@ fn profile_tx_budget_and_stall_ticks_validation() {
     let dm = ArmConfig::rebot_dm();
     assert_eq!(dm.tx_budget_ms, Some(10));
     assert_eq!(dm.resolved_tx_budget_ms(), 10);
-    assert_eq!(dm.resolved_tx_stall_ticks(), 3);
+    assert_eq!(dm.min_tx_stall_ticks(), 4);
+    assert_eq!(dm.resolved_tx_stall_ticks(), 4);
     let b = dm.damiao_tx_budget();
     assert_eq!(b.max_duration, DAMIAO_TX_MAX_DURATION);
     assert_eq!(b.max_duration, ms(10));
@@ -1219,17 +1244,54 @@ fn profile_tx_budget_and_stall_ticks_validation() {
     assert_eq!(cfg.damiao_tx_budget().max_duration, ms(45));
 
     let mut cfg2 = ArmConfig::rebot_dm();
-    cfg2.tx_stall_ticks = Some(0);
-    assert!(cfg2.validate().is_err(), "tx_stall_ticks = 0 must be rejected");
+    for bad in [0, 1, 2, 3] {
+        cfg2.tx_stall_ticks = Some(bad);
+        let err = cfg2.validate().unwrap_err();
+        assert!(
+            err.contains("tx_stall_ticks") && err.contains(">= 4"),
+            "50 Hz tx_stall_ticks={bad} must be rejected with clear error, got: {err}"
+        );
+    }
     cfg2.tx_stall_ticks = Some(4);
     assert!(cfg2.validate().is_ok());
     assert_eq!(cfg2.resolved_tx_stall_ticks(), 4);
+    cfg2.tx_stall_ticks = Some(7);
+    assert!(cfg2.validate().is_ok());
+    assert_eq!(cfg2.resolved_tx_stall_ticks(), 7);
 
     cfg2.tx_stall_ticks = None;
-    cfg2.control_frequency_hz = 100; // period 10 ms -> ceil(45/10) = 5
-    assert_eq!(cfg2.resolved_tx_stall_ticks(), 5);
-    cfg2.control_frequency_hz = 25; // period 40 ms -> ceil(45/40) = 2
+    cfg2.control_frequency_hz = 100; // period 10 ms -> ceil(45/10) + 1 = 6
+    cfg2.tx_budget_ms = Some(5);
+    assert_eq!(cfg2.min_tx_stall_ticks(), 6);
+    assert_eq!(cfg2.resolved_tx_stall_ticks(), 6);
+    cfg2.tx_stall_ticks = Some(5);
+    assert!(cfg2.validate().is_err(), "100 Hz tx_stall_ticks = 5 (< 6) must be rejected");
+    cfg2.tx_stall_ticks = Some(6);
+    assert!(cfg2.validate().is_ok());
+
+    cfg2.tx_stall_ticks = None;
+    cfg2.control_frequency_hz = 25; // period 40 ms -> ceil(45/40) + 1 = 3
+    cfg2.tx_budget_ms = Some(10);
+    assert_eq!(cfg2.min_tx_stall_ticks(), 3);
+    assert_eq!(cfg2.resolved_tx_stall_ticks(), 3);
+    cfg2.tx_stall_ticks = Some(2);
+    assert!(cfg2.validate().is_err(), "25 Hz tx_stall_ticks = 2 (< 3) must be rejected");
+    cfg2.tx_stall_ticks = Some(3);
+    assert!(cfg2.validate().is_ok());
+
+    cfg2.tx_stall_ticks = None;
+    cfg2.control_frequency_hz = 10; // period 100 ms -> ceil(45/100) + 1 = 2
+    cfg2.tx_budget_ms = Some(10);
+    assert_eq!(cfg2.min_tx_stall_ticks(), 2);
     assert_eq!(cfg2.resolved_tx_stall_ticks(), 2);
+    cfg2.tx_stall_ticks = Some(1);
+    let err_10hz = cfg2.validate().unwrap_err();
+    assert!(
+        err_10hz.contains("tx_stall_ticks") && err_10hz.contains(">= 2") && err_10hz.contains("10 Hz"),
+        "10 Hz tx_stall_ticks = 1 must be rejected with clear error, got: {err_10hz}"
+    );
+    cfg2.tx_stall_ticks = Some(2);
+    assert!(cfg2.validate().is_ok());
 }
 
 /// B3 + TX-realhw integration: `FaultKind::CanTxStalled` latched via `SafetyManager::latch`
@@ -1585,5 +1647,109 @@ fn dual_owner_can_tx_stalled_clear_requires_tx_probe_and_post_probe_feedback() {
         rig.clear_fault_and_enable();
         assert_eq!(rig.inner().safety.latched_fault_kinds(), 0);
         assert!(rig.inner().safety.state().is_operational());
+    }
+}
+
+/// Round-2 Item 3:
+/// At 10 Hz (period = 100 ms), `min_tx_stall_ticks() == default == ceil(45/100) + 1 = 2`:
+/// - `tx_stall_ticks = 1` is rejected at profile load (`validate()`).
+/// - A single deferral does NOT latch `CAN_TX_STALLED` on either Legacy or RT Executor.
+/// - A sustained deferral latches `CAN_TX_STALLED` on both owners (both under the 45 ms age limit
+///   and under the `N = 2` consecutive-tick threshold).
+#[test]
+fn dual_owner_10hz_single_deferral_does_not_latch_sustained_does() {
+    let mut check_cfg = base_cfg();
+    check_cfg.control_frequency_hz = 10;
+    check_cfg.tx_stall_ticks = Some(1);
+    assert!(
+        check_cfg.validate().is_err(),
+        "10 Hz profile with tx_stall_ticks = 1 must be rejected at profile load"
+    );
+    check_cfg.tx_stall_ticks = None;
+    assert!(check_cfg.validate().is_ok());
+    assert_eq!(check_cfg.resolved_tx_stall_ticks(), 2);
+
+    const DT_10HZ: f64 = 0.1;
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // (a) Standard 10 Hz with default 45 ms frame_max_age:
+        //     Tick 1 deferral (age 0 ms, streak 1 < 2) MUST NOT latch;
+        //     Tick 2 sustained deferral MUST latch CAN_TX_STALLED.
+        let mut cfg = base_cfg();
+        cfg.control_frequency_hz = 10;
+        cfg.tx_stall_ticks = None;
+        let mut rig = DualRig::new(owner, cfg, None);
+        rig.bus.with(|s| s.tx_enobufs = true);
+
+        rig.step_dt(DT_10HZ, true);
+        assert!(
+            rig.inner().safety.state().is_operational(),
+            "{owner:?}: single deferral at 10 Hz must NOT latch CAN_TX_STALLED: {:?}",
+            rig.inner().safety.fault()
+        );
+        assert_eq!(
+            rig.inner().driver.as_ref().unwrap().lock().unwrap().pending_motion_tx_len(),
+            7,
+            "{owner:?}: deferred frames should remain queued after single 10 Hz deferral"
+        );
+
+        rig.step_dt(DT_10HZ, true);
+        assert_eq!(
+            *rig.inner().safety.state(),
+            SafetyState::Fault(FaultReason::CanTxStalled),
+            "{owner:?}: sustained deferral at 10 Hz must latch CAN_TX_STALLED"
+        );
+        assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::CanTxStalled));
+
+        // (b) Isolate consecutive-tick threshold N = 2 at 10 Hz (frame_max_age = 150 ms > 100 ms
+        //     period): single deferral recovers cleanly on next tick; two consecutive deferrals
+        //     latch CAN_TX_STALLED on exact tick 2 ("2 consecutive ticks").
+        let mut cfg_streak = base_cfg();
+        cfg_streak.control_frequency_hz = 10;
+        cfg_streak.tx_stall_ticks = None;
+        let mut rig_s = DualRig::new(
+            owner,
+            cfg_streak,
+            Some(TxBudget {
+                max_frames: DAMIAO_TX_MAX_FRAMES,
+                max_duration: ms(10),
+                frame_max_age: ms(150),
+            }),
+        );
+        // Single transient deferral followed by recovery -> stays operational with 0 faults!
+        rig_s.bus.with(|s| s.tx_enobufs = true);
+        rig_s.step_dt(DT_10HZ, true);
+        assert!(
+            rig_s.inner().safety.state().is_operational(),
+            "{owner:?}: single transient deferral at 10 Hz must stay operational"
+        );
+        rig_s.bus.with(|s| s.tx_enobufs = false);
+        rig_s.step_dt(DT_10HZ, true);
+        assert!(
+            rig_s.inner().safety.state().is_operational(),
+            "{owner:?}: recovery tick after single 10 Hz deferral must stay operational"
+        );
+        assert_eq!(
+            rig_s.inner().driver.as_ref().unwrap().lock().unwrap().pending_motion_tx_len(),
+            0
+        );
+
+        // Sustained 2-tick deferral -> tick 1 stays operational, tick 2 latches CAN_TX_STALLED!
+        rig_s.bus.with(|s| s.tx_enobufs = true);
+        rig_s.step_dt(DT_10HZ, true);
+        assert!(
+            rig_s.inner().safety.state().is_operational(),
+            "{owner:?}: 1st of 2 consecutive 10 Hz deferrals must not latch"
+        );
+        rig_s.step_dt(DT_10HZ, true);
+        assert_eq!(
+            rig_s.inner().safety.fault_code(),
+            Some(FaultCode::CanTxStalled),
+            "{owner:?}: 2nd consecutive 10 Hz deferral must latch CAN_TX_STALLED"
+        );
+        let msg = rig_s.inner().safety.fault().unwrap().message;
+        assert!(
+            msg.contains("2 consecutive ticks"),
+            "{owner:?}: expected '2 consecutive ticks' in stall message, got: {msg}"
+        );
     }
 }

@@ -991,17 +991,23 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     assert!(!inner.safety.state().is_stopped(), "transient deferral must not fault: {:?}", inner.safety.state());
     assert_eq!((a, f), (0, 0), "transient Deferred tick_publish touched allocator");
 
-    // Second transient Deferred tick (streak = 2 < 3 at 50 Hz): still operational, 0 allocs, 0 frees.
-    bus.0.lock().unwrap().tx_count = 0;
-    let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
-    assert!(published.kept.is_none());
-    drop(published);
-    let _ = inner.core.hub().latest();
-    assert!(!inner.safety.state().is_stopped(), "second deferred tick must stay operational: {:?}", inner.safety.state());
-    assert_eq!((a, f), (0, 0), "second transient Deferred tick_publish touched allocator");
+    // Second and third transient Deferred ticks (streak = 2, 3 < 4 at 50 Hz): still operational, 0 allocs, 0 frees.
+    for tick_idx in 2..=3 {
+        bus.0.lock().unwrap().tx_count = 0;
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.kept.is_none());
+        drop(published);
+        let _ = inner.core.hub().latest();
+        assert!(
+            !inner.safety.state().is_stopped(),
+            "deferred tick {tick_idx} (< min_tx_stall_ticks = 4 at 50 Hz) must stay operational: {:?}",
+            inner.safety.state()
+        );
+        assert_eq!((a, f), (0, 0), "deferred tick {tick_idx} tick_publish touched allocator");
+    }
 
-    // (c) Stall-threshold tick (streak = 3) latches CAN_TX_STALLED and publishes non-empty
-    // CAN_TX_STALLED message with 0 allocs, 0 frees.
+    // (c) Stall-threshold tick (streak = 4 == ceil(45/20) + 1) latches CAN_TX_STALLED and publishes
+    // non-empty CAN_TX_STALLED message with 0 allocs, 0 frees.
     bus.0.lock().unwrap().tx_count = 0;
     let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
     assert!(published.kept.is_none());
@@ -1128,7 +1134,7 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
         guard.mode = Mode::EnobufsAfter(2);
         guard.tx_count = 0;
     }
-    for tick in 1..=3 {
+    for tick in 1..=4 {
         jog_bus.0.lock().unwrap().tx_count = 0;
         let (published, a, f) = counted(|| jog_inner.tick_publish(0.02, 1, false));
         assert!(published.kept.is_none());

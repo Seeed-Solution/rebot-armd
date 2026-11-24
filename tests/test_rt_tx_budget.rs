@@ -1128,30 +1128,25 @@ fn legacy_supervisor_fails_closed_on_backpressured_final_release_batch() {
         .expect("start gripper open");
 
     // Inject ENOBUFS on every transmit on the final tick where the gripper open reaches Done.
-    // Tick 1 & 2 defer without faulting and MUST NOT mark the release done or clear releasing;
-    // Tick 3 hits the 3-tick stall threshold (50 Hz default) and latches CAN_TX_STALLED.
+    // Ticks 1..=3 defer without faulting and MUST NOT mark the release done or clear releasing;
+    // Tick 4 hits the 4-tick stall threshold (50 Hz default = ceil(45/20) + 1) and latches CAN_TX_STALLED.
     bus.with(|s| {
         s.push_all_feedback();
         s.default_rule = TxRule::Enobufs;
     });
-    inner.tick(0.02);
-    assert!(
-        !inner.safety.state().is_stopped(),
-        "transient ENOBUFS deferral on tick 1 must carry over without faulting: {:?}",
-        inner.safety.state()
-    );
-    assert_eq!(inner.last_action.as_ref().unwrap().state, "running");
-    assert!(inner.releasing, "deferred final release must not clear releasing flag");
-
-    bus.with(|s| s.push_all_feedback());
-    inner.tick(0.02);
-    assert!(
-        !inner.safety.state().is_stopped(),
-        "second deferred tick must still wait for stall threshold: {:?}",
-        inner.safety.state()
-    );
-    assert_eq!(inner.last_action.as_ref().unwrap().state, "running");
-    assert!(inner.releasing);
+    for tick in 1..=3 {
+        if tick > 1 {
+            bus.with(|s| s.push_all_feedback());
+        }
+        inner.tick(0.02);
+        assert!(
+            !inner.safety.state().is_stopped(),
+            "transient ENOBUFS deferral on tick {tick} (< 4 at 50 Hz) must carry over without faulting: {:?}",
+            inner.safety.state()
+        );
+        assert_eq!(inner.last_action.as_ref().unwrap().state, "running");
+        assert!(inner.releasing, "deferred final release must not clear releasing flag");
+    }
 
     bus.with(|s| s.push_all_feedback());
     inner.tick(0.02);

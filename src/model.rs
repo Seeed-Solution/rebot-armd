@@ -1605,13 +1605,23 @@ impl Default for ArmConfig {
 }
 
 impl ArmConfig {
+    /// Minimum (and default) consecutive deferred control ticks before latching `CAN_TX_STALLED`:
+    /// `ceil(frame_max_age / period) + 1` with `frame_max_age = 45 ms` (`DAMIAO_TX_FRAME_MAX_AGE`),
+    /// ensuring a single deferral never latches before a queued frame can reach 45 ms age
+    /// (e.g. 2 at 10 Hz, 3 at 25 Hz, 4 at 50 Hz, 6 at 100 Hz).
+    pub fn min_tx_stall_ticks(&self) -> u32 {
+        let hz = u64::from(self.control_frequency_hz.max(1));
+        let ceil_age_ticks = (45u64.saturating_mul(hz).saturating_add(999)) / 1000;
+        (ceil_age_ticks + 1) as u32
+    }
+
     /// Consecutive ticks with a pending CAN TX deferral before latching `CAN_TX_STALLED`.
-    /// Defaults to `ceil(45 ms / period)` (3 ticks at 50 Hz, minimum 1).
+    /// Defaults to [`Self::min_tx_stall_ticks`] (`ceil(45 ms / period) + 1`: 4 ticks at 50 Hz,
+    /// 2 ticks at 10 Hz). Values below the minimum are rejected by [`Self::validate`] and clamped
+    /// at runtime as defense-in-depth.
     pub fn resolved_tx_stall_ticks(&self) -> u32 {
-        self.tx_stall_ticks.unwrap_or_else(|| {
-            let hz = u64::from(self.control_frequency_hz.max(1));
-            ((45u64.saturating_mul(hz).saturating_add(999)) / 1000).max(1) as u32
-        })
+        let min_ticks = self.min_tx_stall_ticks();
+        self.tx_stall_ticks.map_or(min_ticks, |ticks| ticks.max(min_ticks))
     }
 
     /// Effective Damiao per-tick CAN TX start-cutoff (ms): explicit `tx_budget_ms` when set,
@@ -2009,8 +2019,16 @@ impl ArmConfig {
                 ));
             }
         }
-        if self.tx_stall_ticks == Some(0) {
-            return Err("tx_stall_ticks must be >= 1".into());
+        {
+            let min_stall_ticks = self.min_tx_stall_ticks();
+            if let Some(ticks) = self.tx_stall_ticks {
+                if ticks < min_stall_ticks {
+                    return Err(format!(
+                        "tx_stall_ticks ({ticks}) must be >= {min_stall_ticks} (ceil(45 ms / period) + 1 at {} Hz)",
+                        self.control_frequency_hz
+                    ));
+                }
+            }
         }
         if let Some(cap) = self.planned_max_velocity {
             if !cap.is_finite() || cap <= 0.0 {

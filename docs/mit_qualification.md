@@ -44,12 +44,14 @@ loop, 20 Hz `GET /observation`):
   bus-service starvation under combined CAN, SD/eMMC, and USB gadget load is verified on device;
   use `ARMD_RT_PRIORITY=50` for on-device qualification A/B runs.
 - Bounded per-tick CAN TX (`src/driver.rs`, `TxBudget`: default 16 attempts, 10 ms start-cutoff
-  overridable via profile `tx_budget_ms`, 45 ms inclusive queued-frame expiry) removes the
-  3 × 100 µs `WouldBlock` retry sleeps, maps SocketCAN `ENOBUFS` to `TransportError::NoBufferSpace`,
-  treats bounded deferral as carry-over on both legacy and RT executor owners (latching
-  `CAN_TX_STALLED` only on 45 ms expiry or consecutive deferred ticks), keeps MIT partial-batch /
-  preflight / flush failures fail-closed (tripping the fence and clearing cached frames), and
-  exposes per-frame wall and `CLOCK_THREAD_CPUTIME_ID` timing plus queue-pressure counters in
+  overridable via profile `tx_budget_ms <= period / 2`, 45 ms inclusive queued-frame expiry)
+  removes the 3 × 100 µs `WouldBlock` retry sleeps, maps SocketCAN `ENOBUFS` to
+  `TransportError::NoBufferSpace`, treats bounded deferral as carry-over on unfenced output for
+  both legacy and RT executor owners (latching `CAN_TX_STALLED` only on 45 ms expiry or
+  `tx_stall_ticks >= ceil(45 ms / period) + 1` consecutive deferred ticks), keeps MIT-fenced output
+  as an explicit fail-closed exception (tripping the deadline fence immediately on deferral,
+  partial batch, preflight, or flush failure and clearing cached/pending frames), and exposes
+  per-frame wall and `CLOCK_THREAD_CPUTIME_ID` timing plus queue-pressure counters in
   `GET /api/v1/diagnostics/tick` (`tx.*`, `max_tx`, and `tx_*` fields on `max_tick` / `max_lock`).
 
 ### Measured B601-DM TX budget sizing (2026-11-24)
@@ -87,7 +89,18 @@ any remaining unstarted frames to the next tick instead of faulting.
 | TIMEOUT readback nonzero and equal to the record | same | same |
 | Profile gains and effort limit at or below the record's `max_kp`, `max_kd`, `effort_ceiling_nm` (and TMAX) | same | same |
 | Handover only from fresh (< 45 ms), stationary, confirmed position control; mode ACK, hold transmit, flush and feedback newer than the ACK | first tick at rest after arming | MIT stays inactive, motions are refused; an unconfirmed rollback latches a fault and blocks clearance |
-| Feedback age or gap between dynamic batches ≥ 45 ms, RX backlog, partial or failed batch | every tick (supervisor) and before every transmit (driver) | group cancelled, BUS_LOSS latched wherever the loss is detected (also over another fault), no further frame; read-only status polls only after the operator's fault clearance and 2 × `measured_expiry_ms` (at least 250 ms); reconnect needs a rearm (fresh readback, base modes restored); ages or gaps from 36 ms on are counted and logged as near misses |
+| Feedback age or gap between dynamic batches ≥ 45 ms, RX backlog, partial or failed batch, or MIT-fenced TX deferral (`TxRefusal::Deferred` / `TxBudgetExhausted`) | every tick (supervisor) and before every transmit (driver, `src/driver.rs`) | **Explicit exception to carry-over deferral:** MIT-fenced output trips the deadline fence immediately on deferral instead of carrying frames over across ticks; group cancelled, BUS_LOSS latched wherever the loss is detected (also over another fault), no further frame; read-only status polls only after the operator's fault clearance and 2 × `measured_expiry_ms` (at least 250 ms); reconnect needs a rearm (fresh readback, base modes restored); ages or gaps from 36 ms on are counted and logged as near misses |
+
+**MIT-fenced deferral exception (by design) / MIT 围栏输出延后例外（按设计）：**
+Unfenced output (`POS_VEL`, `POS_FORCE`, unfenced gravity-compensation hold/targets) carries
+deferred CAN frames across ticks and latches `CAN_TX_STALLED` only on 45 ms frame expiry or
+`tx_stall_ticks >= ceil(45 ms / period) + 1` consecutive deferred ticks (e.g. 4 at 50 Hz, 2 at
+10 Hz). MIT-fenced output (`src/driver.rs`, `MitFenceTripReason::TxBudgetExhausted`) is the
+explicit exception: any TX budget exhaustion or backpressure deferral trips the MIT deadline fence
+immediately and clears cached/pending frames rather than carrying impedance targets across ticks,
+so a deferred frame cannot outlive the motor's command-timeout fence.
+
+非围栏输出（`POS_VEL`、`POS_FORCE`、无围栏重力补偿保持与目标）在发生有界发送延后时跨周期顺延，仅在帧龄达到 45 ms 过期或连续延后达到 `tx_stall_ticks >= ceil(45 ms / period) + 1` 个控制周期（例如 50 Hz 为 4、10 Hz 为 2）时锁存 `CAN_TX_STALLED`。带 MIT 截止围栏的输出（`src/driver.rs` 中的 `MitFenceTripReason::TxBudgetExhausted`）是按设计的明确例外：任意发送预算耗尽或背压延后都会立即触发 MIT 截止围栏并清空缓存与待发帧，不跨周期顺延，防止阻抗控制目标越过电机指令超时围栏。
 
 TIMEOUT is RAM only. A power cycle resets it to 0 and the next arm refuses until it is
 commissioned again.
