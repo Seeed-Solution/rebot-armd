@@ -1258,6 +1258,7 @@ impl SupervisorInner {
                     } else {
                         crate::driver::DisableKind::DisableRequested {
                             started_at: driver.clock_now(),
+                            rollback: true,
                         }
                     };
                     let res = driver.disable_torque(rb_kind);
@@ -1314,6 +1315,7 @@ impl SupervisorInner {
                     } else {
                         crate::driver::DisableKind::DisableRequested {
                             started_at: driver.clock_now(),
+                            rollback: true,
                         }
                     };
                     let sent = driver.begin_disable_torque_budgeted(rb_kind, 0);
@@ -1398,6 +1400,7 @@ impl SupervisorInner {
                     } else {
                         crate::driver::DisableKind::DisableRequested {
                             started_at: driver.clock_now(),
+                            rollback: true,
                         }
                     };
                     if use_cached {
@@ -1438,16 +1441,35 @@ impl SupervisorInner {
                 } else {
                     None
                 };
+                if disable_outcome.is_some_and(|(_, refused, _)| refused) {
+                    let _ = driver.read_cached_joint_states_into(&mut scratch_states);
+                }
                 drop(driver);
                 self.scratch.states = scratch_states;
                 self.scratch.ages = scratch_ages;
                 self.scratch.loads = scratch_loads;
                 if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
                     if refused {
+                        for (i, s) in self.scratch.states.iter().enumerate().take(self.config.dof) {
+                            if s.position.is_finite() {
+                                self.measured_positions[i] = s.position;
+                                self.commanded_positions[i] = s.position;
+                                self.target_positions[i] = s.position;
+                            }
+                        }
+                        self.commanded_velocities.fill(0.0);
                         self.is_torqued = true;
                         self.disable_pending = false;
                         self.active_disable_kind = None;
                         self.last_disable_attempt = None;
+                        self.safety.latch(
+                            crate::safety::FaultKind::Other,
+                            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
+                                buf.push_str(
+                                    "Hardware torque enable failed: post-enable feedback unavailable and rollback refused to prevent arm drop; motors remain holding",
+                                );
+                            }),
+                        );
                     } else if use_cached {
                         if confirmed_off {
                             self.disable_confirmed();
@@ -1479,6 +1501,7 @@ impl SupervisorInner {
                     } else {
                         crate::driver::DisableKind::DisableRequested {
                             started_at: driver.clock_now(),
+                            rollback: true,
                         }
                     };
                     if use_cached {
@@ -1519,16 +1542,35 @@ impl SupervisorInner {
                 } else {
                     None
                 };
+                if disable_outcome.is_some_and(|(_, refused, _)| refused) {
+                    let _ = driver.read_cached_joint_states_into(&mut scratch_states);
+                }
                 drop(driver);
                 self.scratch.states = scratch_states;
                 self.scratch.ages = scratch_ages;
                 self.scratch.loads = scratch_loads;
                 if let Some((rb_kind, refused, confirmed_off)) = disable_outcome {
                     if refused {
+                        for (i, s) in self.scratch.states.iter().enumerate().take(self.config.dof) {
+                            if s.position.is_finite() {
+                                self.measured_positions[i] = s.position;
+                                self.commanded_positions[i] = s.position;
+                                self.target_positions[i] = s.position;
+                            }
+                        }
+                        self.commanded_velocities.fill(0.0);
                         self.is_torqued = true;
                         self.disable_pending = false;
                         self.active_disable_kind = None;
                         self.last_disable_attempt = None;
+                        self.safety.latch(
+                            crate::safety::FaultKind::Other,
+                            crate::safety::FaultDetail::formatted(FaultCode::EnableFailed, |buf| {
+                                buf.push_str(
+                                    "Hardware torque enable failed: post-enable feedback unavailable and rollback refused to prevent arm drop; motors remain holding",
+                                );
+                            }),
+                        );
                     } else if use_cached {
                         if confirmed_off {
                             self.disable_confirmed();
@@ -1673,7 +1715,10 @@ impl SupervisorInner {
             .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))?;
         self.torque_off_check_rt()?;
         let started_at = self.driver_clock_now();
-        let disable_kind = crate::driver::DisableKind::DisableRequested { started_at };
+        let disable_kind = crate::driver::DisableKind::DisableRequested {
+            started_at,
+            rollback: false,
+        };
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable_bounded(disable_kind) {
@@ -1694,7 +1739,10 @@ impl SupervisorInner {
     fn torque_off_in_place(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
         self.torque_off_check(stillness_verified)?;
         let started_at = self.driver_clock_now();
-        let disable_kind = crate::driver::DisableKind::DisableRequested { started_at };
+        let disable_kind = crate::driver::DisableKind::DisableRequested {
+            started_at,
+            rollback: false,
+        };
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable(disable_kind) {
@@ -1813,6 +1861,7 @@ impl SupervisorInner {
                     let drv_now = drv.clock_now();
                     let disable_kind = crate::driver::DisableKind::DisableRequested {
                         started_at: drv_now,
+                        rollback: false,
                     };
                     Some((drv.begin_disable_torque_budgeted(disable_kind, 0), drv_now, disable_kind))
                 }

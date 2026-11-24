@@ -164,6 +164,17 @@ fn test_feetech_torque_enable_rollback() {
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // Provide feedback first
     let mut rx_fb = Vec::new();
@@ -640,6 +651,17 @@ fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // Provide feedback first
     let mut rx_fb = Vec::new();
@@ -2070,6 +2092,17 @@ fn test_feetech_missing_rollback_readback_leaves_state_unknown() {
     let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
+    let mut arm_joints = [0usize; armd::rt_core::mailbox::MAX_DOF];
+    arm_joints[0] = 0;
+    arm_joints[1] = 1;
+    driver.set_stopped_disable_gate(armd::driver::StoppedDisableGate {
+        safety_stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        has_resting_pose: true,
+        arm_joints,
+        arm_joints_len: 2,
+        rest_positions: [0.0; armd::rt_core::mailbox::MAX_DOF],
+        rest_pose_tolerance_rad: 0.05,
+    });
 
     // Provide feedback first
     let mut rx_fb = Vec::new();

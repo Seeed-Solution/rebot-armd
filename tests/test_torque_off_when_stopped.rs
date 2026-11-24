@@ -1872,7 +1872,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
             let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
             let t0 = drv.clock_now();
             let p = drv
-                .begin_disable_torque(DisableKind::DisableRequested { started_at: t0 })
+                .begin_disable_torque(DisableKind::DisableRequested {
+                    started_at: t0,
+                    rollback: false,
+                })
                 .expect("initial disable at rest must start");
             assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
             t0
@@ -1956,7 +1959,10 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
         {
             let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
             let p = drv
-                .begin_disable_torque(DisableKind::DisableRequested { started_at: t_req })
+                .begin_disable_torque(DisableKind::DisableRequested {
+                    started_at: t_req,
+                    rollback: false,
+                })
                 .expect("disable started within 1 s must start");
             assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
         }
@@ -2306,6 +2312,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
         drv.transport_mut().provide_rx(&rx_rb);
         let req_res = drv.disable_torque(DisableKind::DisableRequested {
             started_at: drv.clock_now(),
+            rollback: false,
         });
         let req_tx = drv.transport_mut().take_tx();
         let req_disables = count_feetech_torque_off_writes(&req_tx);
@@ -2444,6 +2451,7 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
 
         let req_res = sim.begin_disable_torque(DisableKind::DisableRequested {
             started_at: Instant::now(),
+            rollback: false,
         });
         std::thread::sleep(Duration::from_millis(25));
         let req_count = disable_cmds.lock().unwrap().len();
@@ -2527,6 +2535,224 @@ fn chokepoint_matrix_all_disable_paths_by_pose_asserts_bus_trace() {
                 7,
                 "Damiao DisableProtective({reason:?}) ({pose:?}) must transmit all 7 disable frames"
             );
+        }
+    }
+}
+
+/// Round 5 item 2: partial enable at a raised pose followed by an enable-finish error (both
+/// `read_res.is_err()` and `!is_feedback_valid() / enable_state != Enabled` branches while
+/// safety is still `Idle`) MUST gate rollback via `DisableRequested { rollback: true }`:
+/// 0 disable frames transmitted to the enabled motors, motors remain holding, and a recoverable
+/// `EnableFailed` fault explains it.
+#[test]
+fn partial_enable_at_raised_pose_then_enable_error_refuses_rollback_holds_and_latches_recoverable_fault() {
+    use armd::driver::{ArmDriverError, DisableKind, JointTarget, StoppedDisableGate};
+    use armd::model::JointState;
+    use std::sync::atomic::AtomicBool;
+
+    struct EnableFinishFailWrapper {
+        inner: DamiaoArmDriver<FakeBus>,
+        bus: FakeBus,
+        fail_read_err: bool,
+        post_enable_armed: bool,
+        in_post_enable: bool,
+    }
+
+    impl ArmDriver for EnableFinishFailWrapper {
+        fn capabilities(&self) -> armd::driver::DriverCapabilities {
+            self.inner.capabilities()
+        }
+        fn enable_state(&self) -> EnableState {
+            self.inner.enable_state()
+        }
+        fn has_any_joint_enabled(&self) -> bool {
+            self.inner.has_any_joint_enabled()
+        }
+        fn has_known_partial_enable(&self) -> bool {
+            self.inner.has_known_partial_enable()
+        }
+        fn clock_now(&self) -> Instant {
+            self.inner.clock_now()
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            self.inner.feedback_ages()
+        }
+        fn feedback_instants(&self) -> Vec<Option<Instant>> {
+            self.inner.feedback_instants()
+        }
+        fn feedback_seqs(&self) -> Vec<u64> {
+            self.inner.feedback_seqs()
+        }
+        fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
+            self.inner.feedback_queue_bounds()
+        }
+        fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+            self.inner.feedback_receive_instants()
+        }
+        fn is_feedback_valid(&self) -> bool {
+            self.inner.is_feedback_valid()
+        }
+        fn fresh_joint_positions_into(
+            &self,
+            joints: &[usize],
+            max_age: Duration,
+            out: &mut [f32],
+        ) -> bool {
+            self.inner.fresh_joint_positions_into(joints, max_age, out)
+        }
+        fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+            self.inner.read_cached_joint_states_into(out)
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            if self.in_post_enable && self.fail_read_err {
+                return Err(ArmDriverError::HardwareFault(
+                    "injected post-enable read failure".into(),
+                ));
+            }
+            self.inner.read_joint_states()
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.inner.write_joint_targets(targets)
+        }
+        fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+            if enabled && self.post_enable_armed {
+                // Partially enable J1..J6 via the real Damiao handshake (J7 stays silent) so
+                // motors 1..6 are physically enabled (`0x1`) at the raised pose and
+                // `last_enable_write_seq[0..6]` is recorded, then return `Ok(())` so
+                // `SupervisorInner::set_torque(true)` enters `enable_finish_inner` while
+                // `safety.state()` is STILL `Idle`!
+                let _ = self.inner.begin_torque(true)?;
+                self.bus.with(|s| {
+                    for j in 0..6 {
+                        s.motors[j].state_override = None;
+                        s.motors[j].enabled = true;
+                        s.push_feedback(j);
+                    }
+                });
+                let dl = self.inner.clock_now() + Duration::from_millis(5);
+                let _ = self.inner.poll_torque(dl);
+                self.inner.abort_enable();
+                self.in_post_enable = true;
+                return Ok(());
+            }
+            self.inner.set_torque(enabled)
+        }
+        fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
+            self.inner.disable_torque(kind)
+        }
+        fn set_stopped_disable_gate(&mut self, gate: StoppedDisableGate) {
+            self.inner.set_stopped_disable_gate(gate);
+        }
+        fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
+            self.inner.set_abort_flag(flag);
+        }
+    }
+
+    for fail_read_err in [true, false] {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        // Start with Unknown prior state at raised pose q = 0.40 (J1..J6 status 0x8, J7 silent).
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[6].silent = true;
+            for j in 0..6 {
+                s.motors[j].enabled = false;
+                s.motors[j].state_override = Some(0x8);
+                s.motors[j].q = 0.40;
+                s.push_feedback(j);
+            }
+        });
+        dm.read_joint_states().unwrap();
+        assert_eq!(dm.enable_state(), EnableState::Unknown);
+
+        let wrapper = EnableFinishFailWrapper {
+            inner: dm,
+            bus: bus.clone(),
+            fail_read_err,
+            post_enable_armed: true,
+            in_post_enable: false,
+        };
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(wrapper));
+        inner.lease_enabled = false;
+        assert_eq!(*inner.safety.state(), SafetyState::Idle);
+
+        bus.clear_log();
+        let err = inner.set_torque(true).unwrap_err();
+        assert!(
+            matches!(err, SafetyError::FeedbackUnavailable),
+            "fail_read_err={fail_read_err}: expected FeedbackUnavailable, got {err:?}"
+        );
+
+        // 1. ZERO disable frames transmitted to any enabled motor (J1..J6)!
+        let disable_frames_to_enabled: Vec<u32> = bus
+            .tx_log()
+            .iter()
+            .filter(|f| f.data == damiao::CMD_DISABLE && (1..=6).contains(&f.id))
+            .map(|f| f.id)
+            .collect();
+        assert!(
+            disable_frames_to_enabled.is_empty(),
+            "fail_read_err={fail_read_err}: rollback while Idle at raised pose MUST NOT send disable frames to enabled motors, got {disable_frames_to_enabled:?}"
+        );
+
+        // 2. Enabled motors remain physically enabled & holding at raised pose!
+        assert!(bus.with(|s| (0..6).all(|j| s.motors[j].enabled)));
+        assert!(inner.is_torqued);
+        assert!(!inner.disable_pending);
+        for j in 0..6 {
+            assert!(
+                (inner.commanded_positions[j] - 0.40).abs() < 0.02,
+                "fail_read_err={fail_read_err}: holding commanded_positions[{j}] must stay at raised pose ~0.40, got {}",
+                inner.commanded_positions[j]
+            );
+        }
+
+        // 3. A recoverable fault (`EnableFailed`) explains why rollback was refused!
+        assert!(
+            matches!(inner.safety.state(), SafetyState::Fault(_)),
+            "fail_read_err={fail_read_err}: must latch recoverable Fault, got {:?}",
+            inner.safety.state()
+        );
+        assert_eq!(
+            inner.safety.fault().map(|f| f.code),
+            Some(FaultCode::EnableFailed),
+            "fault code must be EnableFailed"
+        );
+
+        // 4. Recoverable: once arm is lowered to rest and all 7 motors respond, torque-off + clear_fault -> Idle!
+        bus.with(|s| {
+            s.motors[6].silent = false;
+            s.rx.clear();
+            s.pending.clear();
+            for j in 0..7 {
+                s.motors[j].q = 0.0;
+                s.motors[j].state_override = None;
+            }
+            s.push_all_feedback();
+        });
+        // Disable fail_read_err by clearing fault after lowering/confirming torque off on a fresh
+        // non-failing read path when `!fail_read_err`.
+        if !fail_read_err {
+            clock.advance(Duration::from_millis(10));
+            inner.tick(0.02);
+            let st = inner.set_torque(false).expect("disable at rest must succeed");
+            assert!(matches!(st, SafetyState::Fault(_)));
+            assert!(!inner.is_torqued);
+            clock.advance(Duration::from_millis(10));
+            bus.with(|s| s.push_all_feedback());
+            let cleared = inner.clear_fault().expect("EnableFailed fault must be recoverable");
+            assert_eq!(cleared, SafetyState::Idle);
         }
     }
 }

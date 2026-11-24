@@ -418,7 +418,10 @@ impl SupervisorInner {
                     if let Ok(mut driver) = d.lock() {
                         let started_at = driver.clock_now();
                         let _ = driver.disable_torque(
-                            crate::driver::DisableKind::DisableRequested { started_at },
+                            crate::driver::DisableKind::DisableRequested {
+                                started_at,
+                                rollback: false,
+                            },
                         );
                     }
                 }

@@ -259,11 +259,16 @@ pub enum DisableProtectiveReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisableKind {
     /// User, program, MIT recovery, Feetech reset, or unknown-prior-state disable: while
-    /// safety state is stopped, gated at send time by the rest-pose rule (and per-motor
-    /// `0x0`/`0xD` exception) plus the single 1 s request lifetime from `started_at`.
+    /// safety state is stopped — OR in EVERY safety state when `rollback` is true — gated at
+    /// send time by the rest-pose rule (and per-motor post-enable-write `0x0`/`0xD` exception)
+    /// plus the single 1 s request lifetime from `started_at`.
     DisableRequested {
         /// Request start time on the driver's clock (`ArmDriver::clock_now`).
         started_at: Instant,
+        /// True for an enable-failure rollback of an Unknown or partial prior enable state:
+        /// always enforces the rest-pose gate regardless of safety state unless the target
+        /// motor is proven never-enabled / physically off.
+        rollback: bool,
     },
     /// Protective disable exempt from the stopped rest-pose rule and 1 s request lifetime:
     /// used ONLY by `Thermal`, `ProcessExit`, and `EnableRollbackProven`.
@@ -1378,9 +1383,9 @@ impl<T: Transport> FeetechArmDriver<T> {
     fn check_stopped_disable_requested(
         &self,
         started_at: Instant,
-        force_gate: bool,
+        rollback: bool,
     ) -> Result<(), ArmDriverError> {
-        if !force_gate && !self.is_stopped_for_disable() {
+        if !rollback && !self.is_stopped_for_disable() {
             return Ok(());
         }
         if self.elapsed_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
@@ -1409,11 +1414,10 @@ impl<T: Transport> FeetechArmDriver<T> {
         &mut self,
         servo_id: u8,
         kind: DisableKind,
-        force_gate_if_requested: bool,
     ) -> Result<(), ArmDriverError> {
         match kind {
-            DisableKind::DisableRequested { started_at } => {
-                self.check_stopped_disable_requested(started_at, force_gate_if_requested)?;
+            DisableKind::DisableRequested { started_at, rollback } => {
+                self.check_stopped_disable_requested(started_at, rollback)?;
             }
             DisableKind::DisableProtective { .. } => {}
         }
@@ -2277,7 +2281,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let mut wrote_any = false;
         let mut write_err = None;
         for &id in &faulted_ids {
-            match self.write_torque_off(id, DisableKind::DisableRequested { started_at }, false) {
+            match self.write_torque_off(
+                id,
+                DisableKind::DisableRequested { started_at, rollback: false },
+            ) {
                 Ok(()) => wrote_any = true,
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     if !wrote_any {
@@ -2473,24 +2480,26 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             } else {
                 let mut rb_write_err = false;
                 let rb_started_at = self.clock_now();
-                let rb_kind = if prev_all_proven_off {
-                    DisableKind::DisableProtective {
-                        reason: DisableProtectiveReason::EnableRollbackProven,
-                    }
-                } else {
-                    DisableKind::DisableRequested {
-                        started_at: rb_started_at,
-                    }
-                };
-                // Under supervisor supervision (`stopped_disable_gate.is_some()`), an Unknown or
-                // mixed prior enable state does NOT count as proven off and must pass Rule A′ even
-                // before `SupervisorInner::enable_failed` latches `Fault(EnableFailed)`.
-                let force_gate = !prev_all_proven_off && self.stopped_disable_gate.is_some();
                 for (i, &id) in ids.iter().enumerate() {
-                    if prev_joint_enabled.get(i).copied().flatten() == Some(true) {
+                    let prev_state = prev_joint_enabled.get(i).copied().flatten();
+                    if prev_state == Some(true) {
                         continue;
                     }
-                    if self.write_torque_off(id, rb_kind, force_gate).is_err() {
+                    // Use `DisableProtective { EnableRollbackProven }` ONLY when this servo was
+                    // proven torque-off before enable; Unknown prior state routes through
+                    // `DisableRequested { rollback: true }` which enforces Rule A′ in every
+                    // safety state.
+                    let rb_kind = if prev_all_proven_off || prev_state == Some(false) {
+                        DisableKind::DisableProtective {
+                            reason: DisableProtectiveReason::EnableRollbackProven,
+                        }
+                    } else {
+                        DisableKind::DisableRequested {
+                            started_at: rb_started_at,
+                            rollback: true,
+                        }
+                    };
+                    if self.write_torque_off(id, rb_kind).is_err() {
                         rb_write_err = true;
                         self.joint_torque_enabled[i] = None;
                         continue;
@@ -2533,7 +2542,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
         } else {
             let started_at = self.clock_now();
-            self.disable_torque(DisableKind::DisableRequested { started_at })
+            self.disable_torque(DisableKind::DisableRequested { started_at, rollback: false })
         }
     }
 
@@ -2545,7 +2554,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let mut refused_err = None;
         let mut write_err = None;
         for &id in &ids {
-            match self.write_torque_off(id, kind, false) {
+            match self.write_torque_off(id, kind) {
                 Ok(()) => wrote_any = true,
                 Err(e @ (ArmDriverError::TorqueOffWouldDrop | ArmDriverError::DisableRequestExpired)) => {
                     if refused_err.is_none() {
@@ -3045,6 +3054,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         if !enabled {
             self.disable_torque(DisableKind::DisableRequested {
                 started_at: Instant::now(),
+                rollback: false,
             })
         } else {
             for &id in &self.servo_ids {
@@ -3057,14 +3067,14 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
-        if let DisableKind::DisableRequested { started_at } = kind {
+        if let DisableKind::DisableRequested { started_at, rollback } = kind {
             let stopped = self
                 .stopped_disable_gate
                 .as_ref()
                 .is_some_and(StoppedDisableGate::is_safety_stopped)
                 || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
                 || self.estop_gate.as_ref().is_some_and(|g| g.pending());
-            if stopped {
+            if rollback || stopped {
                 if Instant::now().saturating_duration_since(started_at)
                     >= STOPPED_DISABLE_REQUEST_LIFETIME
                 {
@@ -3486,7 +3496,9 @@ enum TxKind {
     /// User/program/MIT/unknown-prior-state torque-off (`CMD_DISABLE`) for `joint`: exempt from
     /// the motion TX budget; while safety state is stopped, subject to send-time Rule A′
     /// rest-pose evaluation, per-motor `0x0`/`0xD` exception, and the 1 s request lifetime.
-    DisableRequested { joint: usize, started_at: Instant },
+    /// Requested torque-disable frame (`CMD_DISABLE`): subject to Rule A′ and 1 s request
+    /// lifetime at send time whenever safety state is stopped OR `rollback` is true.
+    DisableRequested { joint: usize, started_at: Instant, rollback: bool },
     /// Protective torque-off (`CMD_DISABLE`): exempt from the motion TX budget and never
     /// refused by the stopped rest-pose rule or 1 s lifetime. Used ONLY for `Thermal`,
     /// `ProcessExit`, and `EnableRollbackProven`.
@@ -4220,8 +4232,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     #[inline]
     fn disable_tx_kind(kind: DisableKind, joint: usize) -> TxKind {
         match kind {
-            DisableKind::DisableRequested { started_at } => {
-                TxKind::DisableRequested { joint, started_at }
+            DisableKind::DisableRequested { started_at, rollback } => {
+                TxKind::DisableRequested { joint, started_at, rollback }
             }
             DisableKind::DisableProtective { reason } => TxKind::DisableProtective { reason },
         }
@@ -4315,21 +4327,24 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Evaluates Rule A′ and the single 1 s request lifetime at send time for `DisableRequested`
-    /// while the safety state is stopped (Fault or E-stop). Zero heap allocations.
+    /// while the safety state is stopped (Fault or E-stop) OR unconditionally when `rollback` is
+    /// true (rollback of an Unknown or partial enable). Zero heap allocations.
     fn check_stopped_disable_requested(
         &self,
         joint: usize,
         started_at: Instant,
+        rollback: bool,
     ) -> Result<(), TxRefusal> {
-        if !self.is_stopped_for_disable() {
+        if !rollback && !self.is_stopped_for_disable() {
             return Ok(());
         }
         if self.now().saturating_duration_since(started_at) >= STOPPED_DISABLE_REQUEST_LIFETIME {
             return Err(TxRefusal::DisableRequestExpired);
         }
-        // Per-motor MIT / already-off exception: motors whose fresh (<= 100 ms) status is
-        // already disabled (`0x0`) or watchdog-expired (`0xD`) are physically off, so sending
-        // them a disable changes nothing regardless of arm pose.
+        // Per-motor MIT / already-off exception: motors whose fresh (<= 100 ms) status arrived
+        // strictly after the latest enable write and is already disabled (`0x0`) or
+        // watchdog-expired (`0xD`) are physically off, so sending them a disable changes nothing
+        // regardless of arm pose.
         if self.motor_freshly_physically_off(joint) {
             return Ok(());
         }
@@ -4356,8 +4371,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let pending = self.is_stop_pending();
         let latched = self.is_stop_latched();
         match kind {
-            TxKind::DisableRequested { joint, started_at } => {
-                self.check_stopped_disable_requested(joint, started_at)?;
+            TxKind::DisableRequested { joint, started_at, rollback } => {
+                self.check_stopped_disable_requested(joint, started_at, rollback)?;
             }
             TxKind::DisableProtective { .. } => {}
             TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => {
@@ -7907,7 +7922,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // disables is already disabled (`0`) or has tripped its own command-timeout watchdog (`0xD`).
         self.clear_cached_targets();
         let started_at = self.now();
-        let res = self.disable_torque(DisableKind::DisableRequested { started_at });
+        let res = self.disable_torque(DisableKind::DisableRequested { started_at, rollback: false });
         let boundary = self
             .last_enable_command_rx_seq
             .map_or(req_boundary, |s| s.max(req_boundary));
@@ -8189,7 +8204,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         } else {
             let started_at = self.now();
-            self.disable_torque(DisableKind::DisableRequested { started_at })
+            self.disable_torque(DisableKind::DisableRequested { started_at, rollback: false })
         }
     }
 
@@ -8210,7 +8225,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.begin_enable()
         } else {
             let started_at = self.now();
-            self.begin_disable(DisableKind::DisableRequested { started_at })
+            self.begin_disable(DisableKind::DisableRequested { started_at, rollback: false })
         }
     }
 
@@ -8228,7 +8243,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.begin_enable_budgeted(Some(max_rx_frames))
         } else {
             let started_at = self.now();
-            self.begin_disable_budgeted(DisableKind::DisableRequested { started_at }, Some(max_rx_frames))
+            self.begin_disable_budgeted(
+                DisableKind::DisableRequested { started_at, rollback: false },
+                Some(max_rx_frames),
+            )
         }
     }
 
@@ -10001,6 +10019,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         if !enabled {
             self.disable_torque(DisableKind::DisableRequested {
                 started_at: Instant::now(),
+                rollback: false,
             })
         } else {
             for &id in &self.motor_ids {
@@ -10013,14 +10032,14 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     }
 
     fn disable_torque(&mut self, kind: DisableKind) -> Result<(), ArmDriverError> {
-        if let DisableKind::DisableRequested { started_at } = kind {
+        if let DisableKind::DisableRequested { started_at, rollback } = kind {
             let stopped = self
                 .stopped_disable_gate
                 .as_ref()
                 .is_some_and(StoppedDisableGate::is_safety_stopped)
                 || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
                 || self.estop_gate.as_ref().is_some_and(|g| g.pending());
-            if stopped {
+            if rollback || stopped {
                 if Instant::now().saturating_duration_since(started_at)
                     >= STOPPED_DISABLE_REQUEST_LIFETIME
                 {
@@ -10238,7 +10257,7 @@ mod tx_chokepoint_tests {
 
     fn all_tx_kinds(started_at: Instant) -> [TxKind; 12] {
         [
-            TxKind::DisableRequested { joint: 0, started_at },
+            TxKind::DisableRequested { joint: 0, started_at, rollback: false },
             TxKind::DisableProtective { reason: DisableProtectiveReason::Thermal },
             TxKind::DisableProtective { reason: DisableProtectiveReason::ProcessExit },
             TxKind::DisableProtective { reason: DisableProtectiveReason::EnableRollbackProven },
@@ -10327,8 +10346,8 @@ mod tx_chokepoint_tests {
                     for &deadline_case in &[DeadlineCase::Ok, DeadlineCase::Passed] {
                         let (bus, clock) = TestBus::new();
                         let kind = match kind {
-                            TxKind::DisableRequested { joint, .. } => {
-                                TxKind::DisableRequested { joint, started_at: clock.now() }
+                            TxKind::DisableRequested { joint, rollback, .. } => {
+                                TxKind::DisableRequested { joint, started_at: clock.now(), rollback }
                             }
                             other => other,
                         };
@@ -10499,8 +10518,8 @@ mod tx_chokepoint_tests {
         for &kind in &all_tx_kinds(Instant::now()) {
             let (bus, clock) = TestBus::new();
             let kind = match kind {
-                TxKind::DisableRequested { joint, .. } => {
-                    TxKind::DisableRequested { joint, started_at: clock.now() }
+                TxKind::DisableRequested { joint, rollback, .. } => {
+                    TxKind::DisableRequested { joint, started_at: clock.now(), rollback }
                 }
                 other => other,
             };
@@ -10684,7 +10703,7 @@ mod tx_chokepoint_tests {
         });
         let started_at = clock.now();
         let res = drv.send(
-            TxKind::DisableRequested { joint: 0, started_at },
+            TxKind::DisableRequested { joint: 0, started_at, rollback: false },
             None,
             None,
             false,
@@ -10722,7 +10741,7 @@ mod tx_chokepoint_tests {
         bus.clear_tx();
         let t0 = clock.now();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { joint: 0, started_at: t0 }, None, None, false, |d| {
+            drv.send(TxKind::DisableRequested { joint: 0, started_at: t0, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -10735,7 +10754,7 @@ mod tx_chokepoint_tests {
         drv.read_joint_states().unwrap();
         bus.clear_tx();
         assert!(drv
-            .send(TxKind::DisableRequested { joint: 0, started_at: t0 }, None, None, false, |d| {
+            .send(TxKind::DisableRequested { joint: 0, started_at: t0, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             })
             .is_ok());
@@ -10745,7 +10764,7 @@ mod tx_chokepoint_tests {
         clock.advance(Duration::from_millis(101));
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { joint: 0, started_at: t0 }, None, None, false, |d| {
+            drv.send(TxKind::DisableRequested { joint: 0, started_at: t0, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -10759,7 +10778,7 @@ mod tx_chokepoint_tests {
         drv.read_joint_states().unwrap();
         bus.clear_tx();
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { joint: 0, started_at: t0 }, None, None, false, |d| {
+            drv.send(TxKind::DisableRequested { joint: 0, started_at: t0, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             }),
             Err(TxRefusal::DisableRequestExpired)
@@ -10793,23 +10812,23 @@ mod tx_chokepoint_tests {
         bus2.clear_tx();
         let t2 = clock2.now();
         assert!(drv2
-            .send(TxKind::DisableRequested { joint: 0, started_at: t2 }, None, None, false, |d| {
+            .send(TxKind::DisableRequested { joint: 0, started_at: t2, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             })
             .is_ok());
         assert!(drv2
-            .send(TxKind::DisableRequested { joint: 1, started_at: t2 }, None, None, false, |d| {
+            .send(TxKind::DisableRequested { joint: 1, started_at: t2, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[1]))
             })
             .is_ok());
         assert!(matches!(
-            drv2.send(TxKind::DisableRequested { joint: 2, started_at: t2 }, None, None, false, |d| {
+            drv2.send(TxKind::DisableRequested { joint: 2, started_at: t2, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[2]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
         ));
         assert!(matches!(
-            drv2.send(TxKind::DisableRequested { joint: 3, started_at: t2 }, None, None, false, |d| {
+            drv2.send(TxKind::DisableRequested { joint: 3, started_at: t2, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[3]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -10821,7 +10840,7 @@ mod tx_chokepoint_tests {
         bus2.clear_tx();
         for joint in 0..2 {
             assert!(matches!(
-                drv2.send(TxKind::DisableRequested { joint, started_at: t2 }, None, None, false, |d| {
+                drv2.send(TxKind::DisableRequested { joint, started_at: t2, rollback: false }, None, None, false, |d| {
                     Some(damiao::build_disable_frame(d.motor_ids[joint]))
                 }),
                 Err(TxRefusal::TorqueOffWouldDrop)
@@ -10829,15 +10848,25 @@ mod tx_chokepoint_tests {
         }
         assert_eq!(bus2.tx_len(), 0);
 
-        // 6. Not stopped -> raised + stale + > 1 s all pass normal disable rules.
+        // 6. Not stopped -> rollback=false passes raised+stale+>1s, while rollback=true STILL
+        //    enforces Rule A′ even when safety_stopped is false!
         safety_stopped.store(false, Ordering::SeqCst);
         drv.read_joint_states().unwrap();
         bus.push_feedback(1, 0.80, 1, &limits);
         drv.read_joint_states().unwrap();
+        let t_rb = clock.now();
+        bus.clear_tx();
+        assert!(matches!(
+            drv.send(TxKind::DisableRequested { joint: 0, started_at: t_rb, rollback: true }, None, None, false, |d| {
+                Some(damiao::build_disable_frame(d.motor_ids[0]))
+            }),
+            Err(TxRefusal::TorqueOffWouldDrop)
+        ));
+        assert_eq!(bus.tx_len(), 0, "rollback=true must enforce Rule A′ even when not stopped");
         clock.advance(Duration::from_millis(500));
         bus.clear_tx();
         assert!(drv
-            .send(TxKind::DisableRequested { joint: 0, started_at: t0 }, None, None, false, |d| {
+            .send(TxKind::DisableRequested { joint: 0, started_at: t0, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[0]))
             })
             .is_ok());
@@ -10906,7 +10935,7 @@ mod tx_chokepoint_tests {
         let t_dis = clock.now();
         // Motor 2 MUST be refused (pre-write 0x0 cannot satisfy already-off exception).
         assert!(matches!(
-            drv.send(TxKind::DisableRequested { joint: 1, started_at: t_dis }, None, None, false, |d| {
+            drv.send(TxKind::DisableRequested { joint: 1, started_at: t_dis, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[1]))
             }),
             Err(TxRefusal::TorqueOffWouldDrop)
@@ -10915,7 +10944,7 @@ mod tx_chokepoint_tests {
 
         // Motor 3 was NEVER written CMD_ENABLE yet, and has fresh 0x0 feedback -> allowed!
         assert!(drv
-            .send(TxKind::DisableRequested { joint: 2, started_at: t_dis }, None, None, false, |d| {
+            .send(TxKind::DisableRequested { joint: 2, started_at: t_dis, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[2]))
             })
             .is_ok());
@@ -10927,7 +10956,7 @@ mod tx_chokepoint_tests {
         drv.read_joint_states().unwrap();
         bus.clear_tx();
         assert!(drv
-            .send(TxKind::DisableRequested { joint: 1, started_at: t_dis }, None, None, false, |d| {
+            .send(TxKind::DisableRequested { joint: 1, started_at: t_dis, rollback: false }, None, None, false, |d| {
                 Some(damiao::build_disable_frame(d.motor_ids[1]))
             })
             .is_ok());
@@ -10972,7 +11001,7 @@ mod tx_chokepoint_tests {
         bus_r.clear_tx();
         assert!(matches!(
             drv_r.send(
-                TxKind::DisableRequested { joint: 1, started_at: clock_r.now() },
+                TxKind::DisableRequested { joint: 1, started_at: clock_r.now(), rollback: false },
                 None,
                 None,
                 false,

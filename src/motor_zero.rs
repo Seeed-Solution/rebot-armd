@@ -258,7 +258,10 @@ pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZer
         if let Some(d) = inner.driver.as_ref() {
             let mut drv = d.lock().map_err(|_| CalibError::new(500, "INTERNAL", "driver unavailable"))?;
             let started_at = drv.clock_now();
-            drv.disable_torque(crate::driver::DisableKind::DisableRequested { started_at })
+            drv.disable_torque(crate::driver::DisableKind::DisableRequested {
+                started_at,
+                rollback: false,
+            })
                 .map_err(|e| CalibError::new(500, "MOTOR_ZERO_NOT_DISABLED", format!("disable failed: {e}")))?;
         }
         Ok((q, reference(inner), Instant::now()))
