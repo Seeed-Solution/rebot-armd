@@ -352,6 +352,8 @@ async fn legacy_raised_in_fault_refuses_with_torque_off_would_drop_and_no_force_
         .await
         .unwrap();
     assert_eq!(rest_resp.status(), reqwest::StatusCode::CONFLICT);
+    let rest_body: serde_json::Value = rest_resp.json().await.unwrap();
+    assert_eq!(rest_body["code"], "LEASE_ACTIVE", "{rest_body}");
     assert!(sup.get_observation().await.is_torqued);
 
     // 5. SDK-facing ArmSupervisor::set_torque(false) returns SafetyError::TorqueOffWouldDrop.
@@ -361,9 +363,11 @@ async fn legacy_raised_in_fault_refuses_with_torque_off_would_drop_and_no_force_
             joint,
             position,
             rest,
+            reason,
             message,
         }) => {
             assert_eq!(joint.as_deref(), Some("joint_2"));
+            assert_eq!(reason.as_deref(), Some("outside_rest_pose"));
             assert!((position.unwrap() - 0.35).abs() < 1e-4);
             assert!(rest.unwrap().abs() < 1e-4);
             assert!(message.to_lowercase().contains("would drop"));
@@ -401,6 +405,14 @@ fn executor_raised_in_fault_refuses_with_torque_off_would_drop_both_transition_a
     r.submit_transition(TransitionOp::TorqueOff);
     let rep = r.step();
     assert_eq!(rep.command.unwrap().1, Err("TORQUE_OFF_WOULD_DROP"));
+    assert!(
+        matches!(
+            r.fx.core.last_stopped_torque_off_refusal(),
+            Some(StoppedTorqueOffRefusal::JointOutsideRest { joint_index: 2, .. })
+        ),
+        "executor refusal must preserve bounded first-joint detail: {:?}",
+        r.fx.core.last_stopped_torque_off_refusal()
+    );
     assert!(r.fx.core.is_torqued);
     assert!(!r.fx.core.disable_pending);
     assert_eq!(
@@ -510,6 +522,10 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
     let rep = r.step();
     assert!(!r.fx.core.hardware_feedback_fresh(Duration::from_millis(100)));
     assert_eq!(rep.command.unwrap().1, Err("TORQUE_OFF_WOULD_DROP"));
+    assert_eq!(
+        r.fx.core.last_stopped_torque_off_refusal(),
+        Some(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+    );
     assert!(r.fx.core.is_torqued);
 }
 
@@ -719,4 +735,133 @@ fn cockpit_html_exposes_stopped_torque_off_inline_message_without_override() {
         assert!(!line.contains("force"), "torque call must not pass force override: {line}");
     }
     assert!(!html.contains("confirm-anyway"), "cockpit must not expose a confirm-anyway override");
+    assert!(html.contains("no_resting_pose"), "cockpit must localize uncalibrated resting_pose refusal");
+    assert!(html.contains("stale_feedback"), "cockpit must localize stale_feedback refusal");
+}
+
+#[test]
+fn hardware_without_calibrated_resting_pose_refuses_stopped_torque_off_on_both_owners() {
+    // Hardware with resting_pose: None must NOT trust home_positions for stopped torque-off.
+    let make_uncalibrated = || {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.resting_pose = None;
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        (inner, bus, clock)
+    };
+
+    // 1. Legacy owner
+    let (mut inner, _bus, _clock) = make_uncalibrated();
+    inner.set_torque(true).unwrap();
+    inner.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
+    assert_eq!(
+        inner.may_disable_torque_while_stopped(),
+        Err(StoppedTorqueOffRefusal::NoRestingPoseConfigured)
+    );
+    assert!(matches!(
+        inner.set_torque(false),
+        Err(SafetyError::TorqueOffWouldDrop {
+            joint: None,
+            ref reason,
+            ..
+        }) if reason.as_deref() == Some("no_resting_pose")
+    ));
+    assert!(inner.is_torqued);
+
+    // 2. Executor owner
+    let (inner, bus, clock) = make_uncalibrated();
+    let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(
+        inner,
+        BOOT,
+        Capacities { commands: 4, plans: 1, replies: 8 },
+    );
+    bus.with(|s| s.push_all_feedback());
+    let auth = fx.core.authority(&fx.ctx(fx.now()));
+    b.submit(ClientId(1), 1, auth, fx.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn)).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    for _ in 0..20 {
+        bus.with(|s| s.push_all_feedback());
+        let rep = fx.step();
+        clock.advance(RELEASE);
+        if rep.transition_ended.is_some() { break; }
+    }
+    assert!(fx.core.is_torqued);
+    fx.core.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
+    bus.with(|s| s.push_all_feedback());
+    let auth2 = fx.core.authority(&fx.ctx(fx.now()));
+    b.submit(ClientId(1), 2, auth2, fx.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOff)).unwrap();
+    let rep = fx.step();
+    assert_eq!(rep.command.unwrap().1, Err("TORQUE_OFF_WOULD_DROP"));
+    assert_eq!(
+        fx.core.last_stopped_torque_off_refusal(),
+        Some(StoppedTorqueOffRefusal::NoRestingPoseConfigured)
+    );
+    assert!(fx.core.is_torqued);
+}
+
+#[test]
+fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing_feedback_refuses() {
+    // 1. Silent gripper (J7 stale > 150 ms) while J1..J6 are fresh (<= 100 ms) at rest:
+    // rest-pose admission must PASS because gripper is excluded from rule 1.
+    let (mut inner, bus, clock) = make_driver_rig();
+    inner.set_torque(true).unwrap();
+    inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
+        s.motors[6].silent = true;
+    });
+    clock.advance(Duration::from_millis(150));
+    bus.with(|s| {
+        for j in 0..6 {
+            s.push_feedback(j);
+        }
+    });
+    inner.tick(0.02);
+    assert_eq!(
+        inner.may_disable_torque_while_stopped(),
+        Ok(()),
+        "silent gripper must not block rest-pose admission when J1..J6 are fresh and at rest"
+    );
+
+    // If an arm joint (J3) goes stale (> 100 ms), admission MUST refuse.
+    bus.with(|s| s.motors[2].silent = true);
+    clock.advance(Duration::from_millis(120));
+    bus.with(|s| {
+        for j in [0, 1, 3, 4, 5] {
+            s.push_feedback(j);
+        }
+    });
+    inner.tick(0.02);
+    assert_eq!(
+        inner.may_disable_torque_while_stopped(),
+        Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback)
+    );
+
+    // 2. Driverless invalid / missing / stale synthetic feedback refuses.
+    let mut mock = SupervisorInner::new(ArmConfig::rebot_dm());
+    mock.set_torque(true).unwrap();
+    mock.safety.trigger_fault_coded(FaultCode::Other, FaultReason::Other("fault".into()));
+
+    mock.feedback_numeric_valid = false;
+    assert_eq!(mock.may_disable_torque_while_stopped(), Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback));
+    mock.feedback_numeric_valid = true;
+
+    mock.measured_positions[0] = f32::NAN;
+    assert_eq!(mock.may_disable_torque_while_stopped(), Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback));
+    mock.measured_positions[0] = 0.0;
+
+    mock.last_can_feedback_instant = Some(Instant::now() - Duration::from_millis(200));
+    assert_eq!(mock.may_disable_torque_while_stopped(), Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback));
 }
