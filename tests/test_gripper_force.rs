@@ -112,6 +112,26 @@ fn rig_with(config: ArmConfig, load: Load) -> (SupervisorInner, Arc<Mutex<Rig>>)
 
 fn rig(load: Load) -> (SupervisorInner, Arc<Mutex<Rig>>) { rig_with(ArmConfig::rebot_dm(), load) }
 
+/// A calibrated baseline of the rig's free torque (FREE_NM in both directions and speed bands),
+/// as `gripper_calibrate` would learn it: contact at FREE_NM + 0.15 N·m (0.55, where the former
+/// absolute rule used contact_torque_nm 0.6). Without it the closing threshold is the
+/// uncalibrated 0.85 N·m.
+fn calibrated(inner: &mut SupervisorInner) {
+    use armd::gripper_baseline::{Direction, FreeTorqueBaseline, MoveRecord, MoveSamples};
+    inner.follower = Some("rig".into());
+    let p = inner.config.gripper_policy.clone().unwrap();
+    let tool = inner.config.active_tool.clone();
+    let mut b = FreeTorqueBaseline::new(p.closed_rad, p.open_rad, Some(tool.id), Some(tool.config_digest), Some("rig".into()));
+    for (dir, from, to) in [(Direction::Close, p.open_rad, p.closed_rad), (Direction::Open, p.closed_rad, p.open_rad)] {
+        for speed in [1.0f32, 0.3] {
+            let mut samples = MoveSamples::default();
+            for i in 0..=300 { samples.push(from + (to - from) * i as f32 / 300.0, FREE_NM, speed); }
+            b.learn(&MoveRecord { direction: dir, start_rad: from, end_rad: to, samples, calibration: true }, 1.0);
+        }
+    }
+    inner.gripper_baseline = Some(b);
+}
+
 /// Start with the jaw at closed (rig and supervisor command).
 fn jaw_closed(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>) {
     rig.lock().unwrap().q[6] = 0.0;
@@ -150,9 +170,9 @@ fn without_regulator() -> ArmConfig {
     config
 }
 
-/// Margin above the cap: the latch needs GRIPPER_FORCE_CAP_TICKS ticks and the rig's torque
-/// rises 0.07 N·m per tick at 1.05 rad/s, plus one tick of feedback delay.
-const CAP_MARGIN_NM: f32 = 0.25;
+/// Margin above the cap: the first sample over the cap latches (GRIPPER_FORCE_CAP_TICKS 1), so
+/// at most one tick of the incident's rise passes: 3.32 N·m/rad x 1.05 rad/s x 20 ms = 0.07 N·m.
+const CAP_MARGIN_NM: f32 = RISE_NM_PER_RAD * 1.05 * DT as f32 + 1e-3;
 
 /// Without the cap and the contact detection (rc10 behaviour), the incident profile breaks the
 /// finger: the rig reproduces the incident.
@@ -212,6 +232,7 @@ fn incident_close_without_grasp_detection_stops_at_the_cap() {
 fn incident_servo_stream_is_capped() {
     for regulated in [true, false] {
     let (mut inner, rig) = rig_with(if regulated { ArmConfig::rebot_dm() } else { without_regulator() }, Load::Incident);
+    calibrated(&mut inner);
     let epoch = inner.safety.epoch_id();
     let mut target = INSPECT.to_vec();
     // leader arm ramp toward closed, 1 rad/s, then held at closed
@@ -333,16 +354,23 @@ fn grasp_tracking_contact(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>) ->
 #[test]
 fn incident_grasp_stops_at_contact_plus_squeeze() {
     let (mut inner, rig) = rig(Load::Incident);
+    calibrated(&mut inner);
     let (a, contact, stop, max_cmd) = grasp_tracking_contact(&mut inner, &rig);
     eprintln!("incident contact {contact:?}, stop {stop:?}, max command after contact {max_cmd:.3}, J7 {:.3}, holding {:?}",
         inner.measured_positions[6], a.holding);
-    let contact = contact.expect("contact detected");
-    assert!((contact - CONTACT_RAD).abs() < 0.08, "contact at {contact}");
-    let squeeze = GripperPolicy::rebot_dm().squeeze_rad;
-    assert!((stop.unwrap() - (contact + squeeze)).abs() < 1e-5);
-    assert!(max_cmd <= stop.unwrap() + 1e-4, "command {max_cmd} past the stop {stop:?}");
     assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
-    assert!(inner.commanded_positions[6] <= stop.unwrap() + 1e-4);
+    match contact {
+        Some(contact) => {
+            assert!((contact - CONTACT_RAD).abs() < 0.08, "contact at {contact}");
+            let squeeze = GripperPolicy::rebot_dm().squeeze_rad;
+            assert!((stop.unwrap() - (contact + squeeze)).abs() < 1e-5);
+            assert!(max_cmd <= stop.unwrap() + 1e-4, "command {max_cmd} past the stop {stop:?}");
+            assert!(inner.commanded_positions[6] <= stop.unwrap() + 1e-4);
+        }
+        // the baseline contact needs 3 ticks; the incident rises 0.07 N·m per tick from 0.85,
+        // so the cap may latch first: the jaw then holds at the cap trip
+        None => assert!(inner.gripper_force_trips >= 1 && inner.measured_positions[6] < CONTACT_RAD + 0.25, "no contact and no cap trip"),
+    }
     let r = rig.lock().unwrap();
     assert!(!r.broke && r.peak_tau < cap() + CAP_MARGIN_NM, "peak {:.3}", r.peak_tau);
 }
@@ -572,11 +600,17 @@ fn close_stream(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>, speed: f32, 
     run
 }
 
+/// One tick of the post-latch grip ramp on a contact of `stiffness` (N·m), its largest step.
+fn stream_ramp_tick_nm(stiffness: f32) -> f32 {
+    stiffness * armd::supervisor::GRIPPER_STREAM_CAP_RAMP_RAD_S * DT as f32 + 1e-3
+}
+
 /// Seconds of a stream from open to closed at `speed`, plus a 5 s hold.
 fn stream_secs(speed: f32) -> f64 { f64::from(-INSPECT[6] / speed) + 5.0 }
 
 /// Item 1: a torque-cap latch under a stream that keeps asking for closed holds (no
-/// re-squeeze); regulator off, so the latch is what bounds the force.
+/// re-squeeze cycle); regulator off, so the latch is what bounds the force. After the latch the
+/// grip ramps back in once (GRIPPER_STREAM_CAP_RAMP_*) to about 0.6 x cap and holds there.
 #[test]
 fn stream_latch_does_not_release_while_closing() {
     for stiffness in [3.0f32, 10.0, 30.0] {
@@ -585,9 +619,10 @@ fn stream_latch_does_not_release_while_closing() {
         eprintln!("latch only, k {stiffness}: {run:?}");
         if run.trips > 0 {
             assert_eq!(run.trips, 1, "k {stiffness}: one trip, no re-squeeze cycle: {run:?}");
-            assert_eq!(run.cycles, 0, "k {stiffness}: {run:?}");
+            assert!(run.cycles <= 1, "k {stiffness}: one ramp back in after the latch: {run:?}");
             assert!(inner.gripper_stalled && inner.gripper_force_capped);
-            assert!(run.held_nm < 0.05, "k {stiffness}: held at {:.3} N·m", run.held_nm);
+            assert!((0.55..=0.65).contains(&run.held_nm), "k {stiffness}: held at {:.3} N·m", run.held_nm);
+            assert!(run.after_impact_nm <= cap() + stream_ramp_tick_nm(stiffness), "k {stiffness}: {run:?}");
         } else {
             // soft enough that the impact stays under the cap: the ordinary stall rule holds it
             assert!(run.after_impact_nm <= cap() + 1e-3, "k {stiffness}: {run:?}");
@@ -597,7 +632,8 @@ fn stream_latch_does_not_release_while_closing() {
 
 /// Item 2 + 3: rigid block at 3 / 10 / 30 N·m/rad under a 30 fps closing stream at 1 rad/s
 /// (incident leader ramp) and 0.3 rad/s. After the impact sample the torque stays at or
-/// below 1.2 x cap and settles near contact_torque_nm; no re-squeeze cycles over the 5 s hold.
+/// below 1.2 x cap and settles near contact_torque_nm (or, when the impact sample is over the
+/// cap, the cap latch holds the jaw at the block); no re-squeeze cycles over the 5 s hold.
 /// The impact sample itself is stiffness x the POS_VEL lag at contact (no feedback precedes it);
 /// it stays under stiffness x max_lead_rad.
 #[test]
@@ -612,8 +648,18 @@ fn rigid_stream_contact_is_regulated() {
                 run.impact_nm, run.after_impact_nm, run.held_nm, run.cycles, run.trips);
             assert!(run.impact_nm <= stiffness * max_lead() + 1e-3, "{run:?}");
             assert!(run.after_impact_nm <= 1.2 * cap(), "k {stiffness} {speed} rad/s: {run:?}");
-            assert_eq!(run.cycles, 0, "k {stiffness} {speed} rad/s: {run:?}");
-            assert!(run.held_nm <= contact + 0.2 && run.held_nm >= 0.5 * contact, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+            if stiffness * max_lead().min(speed / 4.5) > cap() {
+                // the impact sample is over the cap: the first over-cap sample latches
+                // (GRIPPER_FORCE_CAP_TICKS 1) at the measured jaw; while the stream still closes
+                // the grip ramps back in once to about 0.6 x cap and holds there
+                assert_eq!(run.trips, 1, "k {stiffness} {speed} rad/s: {run:?}");
+                assert!(run.cycles <= 1, "k {stiffness} {speed} rad/s: {run:?}");
+                assert!(run.after_impact_nm <= cap() + stream_ramp_tick_nm(stiffness), "k {stiffness} {speed} rad/s: {run:?}");
+                assert!((0.55..=0.65).contains(&run.held_nm), "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+            } else {
+                assert_eq!(run.cycles, 0, "k {stiffness} {speed} rad/s: {run:?}");
+                assert!(run.held_nm <= contact + 0.2 && run.held_nm >= 0.5 * contact, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+            }
             let r = rig.lock().unwrap();
             assert!((r.q[6] + 2.0).abs() < 1e-3, "jaw at the block: {}", r.q[6]);
         }
@@ -708,5 +754,210 @@ fn rigid_policy_stream_is_regulated() {
         eprintln!("policy k {stiffness}: impact {:.3} N·m, after impact {after:.3}", r.log[c].2);
         assert!(after <= 1.2 * cap(), "k {stiffness}: {after}");
         assert!(inner.is_policy_run_active(id));
+    }
+}
+
+/// Stop and E-stop end the stream's gripper state: after a torque-cap latch under a closing
+/// stream, the J7 command does not advance again on the following low-torque samples (before,
+/// the stream target outlived the stop until the 200 ms frame timeout).
+#[test]
+fn stop_and_estop_end_the_stream_gripper_state() {
+    for estop in [false, true] {
+        let (mut inner, rig) = rig_with(without_regulator(), Load::Rigid(-2.0, 10.0));
+        let epoch = inner.safety.epoch_id();
+        let mut target = INSPECT.to_vec();
+        let mut g = INSPECT[6];
+        let mut tripped_for = 0;
+        for _ in 0..(10.0 / DT) as usize {
+            g = (g + DT as f32).min(0.0);
+            target[6] = g;
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            inner.servo(admitted, target.clone(), epoch).unwrap();
+            inner.tick(DT);
+            if inner.gripper_force_trips > 0 { tripped_for += 1; }
+            if tripped_for >= 5 { break; }
+        }
+        assert!(inner.gripper_force_trips > 0, "no trip");
+        if estop {
+            inner.requested_estop_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            inner.stop_motion();
+        }
+        inner.tick(DT);
+        let at_stop = inner.commanded_positions[6];
+        assert!(inner.gripper_stream_target.is_none() && inner.gripper_stream_contact.is_none(), "estop {estop}");
+        // the block reads about 0 N·m at the held jaw: low-torque samples
+        let mut max_cmd = at_stop;
+        for _ in 0..100 {
+            inner.tick(DT);
+            max_cmd = max_cmd.max(inner.commanded_positions[6]);
+        }
+        let r = rig.lock().unwrap();
+        eprintln!("estop {estop}: J7 command {at_stop:.4} -> max {max_cmd:.4}, measured {:.4}, tau {:.3}", r.q[6], r.tau[6]);
+        assert!(max_cmd <= at_stop + 1e-6, "estop {estop}: J7 command advanced {at_stop} -> {max_cmd}");
+        assert!((at_stop - r.q[6]).abs() < 0.02, "estop {estop}: holds the measured jaw: cmd {at_stop}, jaw {}", r.q[6]);
+    }
+}
+
+/// Post-impact samples of a run: every torque after the first sample at the block.
+fn post_impact(rig: &Arc<Mutex<Rig>>) -> (f32, f32, usize) {
+    let r = rig.lock().unwrap();
+    let block = match r.load { Load::Rigid(b, _) => b, _ => 0.0 };
+    let c = r.log.iter().position(|&(_, q, _)| q >= block - 1e-6).expect("reached the block");
+    let after = r.log[c + 1..].iter().map(|e| e.2).fold(0.0, f32::max);
+    (r.log[c].2, after, r.log.len() - c)
+}
+
+/// Very stiff contacts (250 and 1000 N·m/rad) under a closing stream: the impact sample is
+/// stiffness x the command's lead at contact (not bounded by feedback); after it every torque
+/// sample stays at or below the cap: the latch ramp sizes its steps from the stiffness seen
+/// at the trip.
+#[test]
+fn very_stiff_stream_contact_stays_under_the_cap_after_the_impact() {
+    for regulated in [true, false] {
+        for speed in [1.0f32, 0.3] {
+            for stiffness in [250.0f32, 1000.0] {
+                let (mut inner, rig) = rig_with(if regulated { ArmConfig::rebot_dm() } else { without_regulator() }, Load::Rigid(-2.0, stiffness));
+                let run = close_stream(&mut inner, &rig, speed, stream_secs(speed));
+                let (impact, after, n) = post_impact(&rig);
+                eprintln!("stream k {stiffness} {speed} rad/s regulated {regulated}: impact {impact:.2} N·m, after impact max {after:.3} N·m over {n} samples, held {:.3}, trips {}",
+                    run.held_nm, run.trips);
+                assert!(after <= cap() + 1e-3, "k {stiffness} {speed} rad/s: {after}");
+                assert!(run.held_nm <= cap() && run.held_nm >= 0.5, "k {stiffness} {speed} rad/s: held {}", run.held_nm);
+                assert!(run.trips <= 2, "k {stiffness}: trips {}", run.trips);
+            }
+        }
+    }
+}
+
+/// The same contacts closed by a grasp: after the impact sample every torque sample stays at
+/// or below the cap and the grasp holds.
+#[test]
+fn very_stiff_grasp_stays_under_the_cap_after_the_impact() {
+    for stiffness in [250.0f32, 1000.0] {
+        let (mut inner, rig) = rig(Load::Rigid(-2.0, stiffness));
+        rig.lock().unwrap().log.clear();
+        let epoch = inner.safety.epoch_id();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (id, _) = inner.start_gripper(admitted, close(true), epoch).unwrap();
+        let a = run(&mut inner, id, 12.0);
+        for _ in 0..100 { inner.tick(DT); }
+        let (impact, after, n) = post_impact(&rig);
+        eprintln!("grasp k {stiffness}: impact {impact:.2} N·m, after impact max {after:.3} N·m over {n} samples, holding {:?}, trips {}", a.holding, inner.gripper_force_trips);
+        assert!(after <= cap() + 1e-3, "k {stiffness}: {after}");
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "k {stiffness}: {a:?}");
+    }
+}
+
+/// CapRamp: steps keep the predicted torque at or below the hold torque for the estimated
+/// stiffness, the estimate only grows with observed steps, and the third trip on a contact
+/// ends the ramping.
+#[test]
+fn cap_ramp_steps_are_sized_by_stiffness() {
+    use armd::motion::{CapRamp, CAP_RAMP_MARGIN_NM, CAP_RAMP_MAX_TRIPS};
+    for k in [3.0f32, 30.0, 250.0, 1000.0] {
+        // trip with the command 0.2 rad ahead of the jaw on a linear contact
+        let mut r = CapRamp::from_trip(k * 0.2, 0.2);
+        let (mut q, mut peak) = (0.0f32, 0.0f32);
+        for _ in 0..2000 {
+            let tau = k * q;
+            peak = peak.max(tau);
+            q += r.step(tau, 0.6, 0.005);
+        }
+        assert!(peak <= 0.6 + 1e-4, "k {k}: peak {peak}");
+        assert!(k * q >= 0.6 - CAP_RAMP_MARGIN_NM - 1e-3, "k {k}: settled at {}", k * q);
+    }
+    // a soft first estimate on a stiff contact: the first step's response raises it
+    let mut r = CapRamp::from_trip(0.6, 0.2); // k_est 3
+    let k = 300.0f32;
+    let mut q = 0.0f32;
+    let mut taus = Vec::new();
+    for _ in 0..50 { let tau = k * q; taus.push(tau); q += r.step(tau, 0.6, 0.0005); }
+    assert!(r.k_est >= 0.9 * k, "k_est {}", r.k_est);
+    assert!(taus.iter().all(|t| *t <= 0.6 + k * 0.0005 + 1e-4), "{taus:?}");
+    // trips
+    let mut r = CapRamp::from_trip(1.2, 0.01);
+    for _ in 1..CAP_RAMP_MAX_TRIPS { assert!(!r.exhausted()); r.trip(1.2, 0.01); }
+    assert!(r.exhausted());
+    assert_eq!(r.step(0.0, 0.6, 0.005), 0.0);
+}
+
+/// The third torque-cap trip on one contact under a stream stops the stream, and the latch
+/// no longer ramps on that contact (frames that keep closing do not press again).
+#[test]
+fn third_cap_trip_stops_the_stream() {
+    let (mut inner, rig) = rig_with(without_regulator(), Load::Rigid(-2.0, 10.0));
+    let epoch = inner.safety.epoch_id();
+    let mut target = INSPECT.to_vec();
+    let mut g = INSPECT[6];
+    let mut send = |inner: &mut SupervisorInner, g: f32| {
+        let mut t = target.clone();
+        t[6] = g;
+        target = t.clone();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        inner.servo(admitted, t, epoch).unwrap();
+        inner.tick(DT);
+    };
+    while inner.gripper_force_trips == 0 { g = (g + DT as f32).min(0.0); send(&mut inner, g); }
+    for _ in 0..20 { send(&mut inner, 0.0); }
+    // two more trips on this contact: the second by a contact ten times stiffer than estimated
+    inner.gripper_cap_ramp.as_mut().unwrap().trip(1.2, 0.12);
+    { let mut r = rig.lock().unwrap(); r.load = Load::Rigid(-2.0, 100.0); }
+    let trips = inner.gripper_force_trips;
+    for _ in 0..50 {
+        if inner.gripper_force_trips > trips { break; }
+        send(&mut inner, 0.0);
+    }
+    assert!(inner.gripper_force_trips > trips, "no third trip");
+    assert!(inner.gripper_cap_ramp.unwrap().exhausted());
+    assert!(inner.servo_target.is_none() && inner.gripper_stream_target.is_none(), "stream not stopped");
+    // a stream that keeps asking for closed: no press on this contact any more
+    rig.lock().unwrap().peak_tau = 0.0;
+    let cmd = inner.commanded_positions[6];
+    for _ in 0..100 { send(&mut inner, 0.0); }
+    let peak = rig.lock().unwrap().peak_tau;
+    eprintln!("after the third trip: J7 command {cmd:.4} -> {:.4}, peak {peak:.3} N·m", inner.commanded_positions[6]);
+    assert!(inner.commanded_positions[6] <= cmd + 1e-6 && peak <= 0.05, "pressed again: peak {peak}");
+}
+
+/// Stop or E-stop during a plain gripper close onto a soft object, with the command ahead of
+/// the jaw: within one tick the J7 command is the measured jaw and the object is not compressed
+/// further.
+#[test]
+fn stop_during_a_gripper_action_holds_the_measured_jaw() {
+    for estop in [false, true] {
+        let (mut inner, rig) = rig(Load::Rigid(-2.0, 1.5));
+        let epoch = inner.safety.epoch_id();
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        let (_id, _) = inner.start_gripper(admitted, close(false), epoch).unwrap();
+        let mut lead = 0.0;
+        for _ in 0..(10.0 / DT) as usize {
+            inner.tick(DT);
+            let q = rig.lock().unwrap().q[6];
+            lead = inner.commanded_positions[6] - q;
+            if q >= -2.0 - 1e-6 && lead >= 0.15 { break; }
+        }
+        let tau_at_stop = rig.lock().unwrap().tau[6];
+        assert!(lead >= 0.15 && tau_at_stop < cap(), "lead {lead}, tau {tau_at_stop}");
+        if estop {
+            inner.requested_estop_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            inner.stop_motion();
+        }
+        inner.tick(DT);
+        let (cmd, meas) = (inner.commanded_positions[6], inner.measured_positions[6]);
+        eprintln!("estop {estop}: lead {lead:.3} rad, tau {tau_at_stop:.3} N·m at the stop; one tick later command {cmd:.4}, jaw {meas:.4}");
+        assert!((cmd - meas).abs() < 1e-3, "estop {estop}: command {cmd} vs jaw {meas}");
+        rig.lock().unwrap().peak_tau = 0.0;
+        for _ in 0..50 {
+            inner.tick(DT);
+            assert!((inner.commanded_positions[6] - cmd).abs() < 1e-6, "estop {estop}: command moved");
+        }
+        let peak = rig.lock().unwrap().peak_tau;
+        assert!(peak <= 0.01, "estop {estop}: still compressing, {peak} N·m");
     }
 }

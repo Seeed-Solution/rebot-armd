@@ -30,10 +30,17 @@ use super::urgent::{
     urgent_stop_channel, RetiredStopPayloads, StopRequests, UrgentStop, UrgentStopClient,
     UrgentStopError, UrgentStopOutcome, URGENT_STOP_CAPACITY,
 };
-use crate::diagnostics::tick::{LockPhases, ThreadUsage, TickSample, UsageMark};
+use crate::diagnostics::tick::{
+    LockPhases, ThreadUsage, TickSample, UsageMark, RELEASE_FLAG_CLEAR_OK,
+    RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED, RELEASE_FLAG_INJECT_ALLOC,
+    RELEASE_FLAG_SAFETY_LATCH, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
+};
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
 use crate::persist::{PublishOutcome, StagedWrite};
-use crate::safety::{SafetyError, SafetyState};
+use crate::safety::{
+    ClearFaultError, FaultKind, SafetyError, SafetyLogEvent, SafetyState, FAULT_ARC_POOL_CAPACITY,
+    FORMATTED_FAULT_ARC_POOL_CAPACITY, JOINT_LIMIT_ARC_POOL_CAPACITY, SAFETY_LOG_CAPACITY,
+};
 use crate::supervisor::{ArmError, PendingZeroCheckPersist, SupervisorInner};
 
 /// Elapsed time above which a tick counts as late in the log (as in 1.5).
@@ -207,10 +214,20 @@ pub struct ExecutorStats {
     pub skipped_releases: AtomicU64,
     /// Diagnostic `TickSample` values dropped because the off-thread ring was full.
     pub diag_dropped: AtomicU64,
+    /// Monotonic count of deferred safety log events dropped due to queue overflow (never reset).
+    pub safety_log_dropped: AtomicU64,
     /// Sub-release transition wakes executed by `armd-control`.
     pub wakes: AtomicU64,
     /// Allocator calls observed across full sub-release wake bodies (when `alloc_timing` is enabled).
     pub wake_alloc_calls: AtomicU64,
+    /// Release sequence (`TickSample::release_seq`) of the most recent fault latch on `armd-control`.
+    pub last_fault_latch_release_seq: AtomicU64,
+    /// Release sequence (`TickSample::release_seq`) of the most recent E-stop applied on `armd-control`.
+    pub last_estop_release_seq: AtomicU64,
+    /// Release sequence (`TickSample::release_seq`) of the most recent `ClearFault` serviced on `armd-control`.
+    pub last_clear_release_seq: AtomicU64,
+    /// Release sequence (`TickSample::release_seq`) of the most recent injected test allocation on `armd-control`.
+    pub last_inject_alloc_release_seq: AtomicU64,
 }
 
 impl ExecutorStats {
@@ -267,7 +284,7 @@ pub enum MaintenanceOp {
     ShutdownReady,
     PlanningSnapshot,
     Observation,
-    ClearFault,
+    ClearFault { expected_epoch: Option<u64> },
     SetJointZeroOffsets { offsets: Vec<f32> },
     SetMotorZero { joint: usize },
     #[doc(hidden)]
@@ -275,13 +292,14 @@ pub enum MaintenanceOp {
 }
 
 /// Reply payload of one [`MaintenanceOp`].
+#[allow(clippy::large_enum_variant)] // bounded stack refusal keeps RT ClearFault zero-alloc
 pub enum MaintenanceResult {
     ShutdownRequested(bool),
     ShutdownCommitted(bool),
     ShutdownReady(bool),
     PlanningSnapshot(PlanningSnapshot),
     Observation(Box<ArmObservation>),
-    FaultCleared(Result<SafetyState, SafetyError>),
+    FaultCleared(Result<SafetyState, ClearFaultError>),
     JointZeroOffsetsSet(Result<(), String>),
     MotorZeroSet(Result<(), String>),
     ProbeReturned,
@@ -298,6 +316,7 @@ struct MaintReply {
     result: MaintenanceResult,
     returned_offsets: Option<Vec<f32>>,
     returned_probe: Option<Box<dyn Any + Send>>,
+    returned_driver_config_error: Option<String>,
 }
 
 enum MaintWaiter {
@@ -753,6 +772,10 @@ pub struct PersistTestHooks {
     pub payload_drop_probe: Option<Arc<Mutex<Option<Box<dyn Any + Send>>>>>,
     /// Positive control: performs one deliberate heap allocation+drop inside the next sub-release wake body.
     pub inject_wake_alloc_once: Option<Arc<AtomicBool>>,
+    /// Positive control: performs one deliberate `Box::new` allocation inside the next release
+    /// body when the `AtomicBool` is true, storing the raw pointer in the `AtomicPtr` for
+    /// off-thread reclamation so the release measures `lock_alloc_calls == 1`.
+    pub inject_release_alloc_once: Option<Arc<(AtomicBool, std::sync::atomic::AtomicPtr<u64>)>>,
     /// Runs on `armd-control` while handling `MaintenanceOp::CommitShutdown` before replying.
     pub on_commit_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Overrides `PANIC_DISABLE_TIMEOUT` for deterministic deadline-observer tests.
@@ -830,6 +853,11 @@ pub(crate) struct OffThreadSinks {
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
     reclaim_stop_rx: Mutex<Consumer<RetiredStopPayloads>>,
+    reclaim_return_tx: Mutex<Producer<Arc<SafetyState>>>,
+    /// `(consumer, last_reported_dropped, shutdown_reported_total)` guarded by one mutex so
+    /// best-effort warning deltas never race and never reset `stats.safety_log_dropped`.
+    safety_log_rx: Mutex<(Consumer<SafetyLogEvent>, u64, u64)>,
+    stats: Arc<ExecutorStats>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
@@ -837,6 +865,11 @@ pub(crate) struct OffThreadSinks {
 }
 
 impl OffThreadSinks {
+    /// Authoritative monotonic count of dropped deferred safety log events (never reset).
+    pub(crate) fn safety_log_dropped(&self) -> u64 {
+        self.stats.safety_log_dropped.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn drain_diag(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
         let mut rx = self.diag_rx.lock().unwrap_or_else(|e| e.into_inner());
         let mut batch = Vec::new();
@@ -857,7 +890,15 @@ impl OffThreadSinks {
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
         {
             let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
-            while let Ok(arc) = rx.pop() {
+            let mut ret_tx = self.reclaim_return_tx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(mut arc) = rx.pop() {
+                if !ret_tx.is_abandoned() && !ret_tx.is_full() {
+                    if let Some(slot) = Arc::get_mut(&mut arc) {
+                        crate::safety::SafetyManager::reset_recycled_fault_arc(slot);
+                        let _ = ret_tx.push(arc);
+                        continue;
+                    }
+                }
                 drop(arc);
             }
         }
@@ -867,6 +908,18 @@ impl OffThreadSinks {
                 drop(retired);
             }
         }
+        {
+            let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
+            let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
+            let delta = total.saturating_sub(log_g.1);
+            if delta > 0 {
+                log_g.1 = total;
+                crate::safety::emit_safety_log_dropped(delta, total);
+            }
+            while let Ok(ev) = log_g.0.pop() {
+                ev.emit();
+            }
+        }
         self.maint_client.drain_replies();
         self.urgent_stop_client.drain_replies();
         if self.persist_worker_exited.load(Ordering::Acquire) {
@@ -874,6 +927,18 @@ impl OffThreadSinks {
             while let Ok(rep) = rx.pop() {
                 drop(rep);
             }
+        }
+    }
+
+    /// Final off-thread drain at executor/dispatcher shutdown: emits any remaining events and a
+    /// shutdown summary carrying the authoritative monotonic safety drop count.
+    pub(crate) fn flush_and_report_shutdown(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
+        self.drain_all(tick_stats);
+        let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
+        let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
+        if total > 0 && total != log_g.2 {
+            log_g.2 = total;
+            crate::safety::emit_safety_log_shutdown_summary(total);
         }
     }
 }
@@ -1038,7 +1103,7 @@ impl RtExecutorShared {
         // Final off-thread drain and reclamation.
         self.maint_client.finish_stopped();
         self.urgent_stop_client.finish_stopped();
-        self.sinks.drain_all(&self.tick_stats);
+        self.sinks.flush_and_report_shutdown(&self.tick_stats);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
         }
@@ -1158,15 +1223,32 @@ impl RtExecutorHandle {
     }
 
     pub fn clear_fault(&self) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
-        match self.call_maintenance(MaintenanceOp::ClearFault)? {
-            MaintenanceResult::FaultCleared(r) => Ok(r),
+        self.clear_fault_for_epoch(None)
+    }
+
+    pub fn clear_fault_for_epoch(
+        &self,
+        expected_epoch: Option<u64>,
+    ) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
+        match self.call_maintenance(MaintenanceOp::ClearFault { expected_epoch })? {
+            MaintenanceResult::FaultCleared(r) => Ok(r.map_err(SafetyError::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub async fn clear_fault_async(&self) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
-        match self.call_maintenance_async(MaintenanceOp::ClearFault).await? {
-            MaintenanceResult::FaultCleared(r) => Ok(r),
+        self.clear_fault_for_epoch_async(None).await
+    }
+
+    pub async fn clear_fault_for_epoch_async(
+        &self,
+        expected_epoch: Option<u64>,
+    ) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::ClearFault { expected_epoch })
+            .await?
+        {
+            MaintenanceResult::FaultCleared(r) => Ok(r.map_err(SafetyError::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -1259,6 +1341,10 @@ pub(crate) fn spawn_executor(
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
     let (reclaim_stop_tx, reclaim_stop_rx) = RingBuffer::<RetiredStopPayloads>::new(URGENT_STOP_CAPACITY);
+    let (reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(
+        FAULT_ARC_POOL_CAPACITY + FORMATTED_FAULT_ARC_POOL_CAPACITY + JOINT_LIMIT_ARC_POOL_CAPACITY,
+    );
+    let (safety_log_tx, safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(SAFETY_LOG_CAPACITY);
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -1284,6 +1370,9 @@ pub(crate) fn spawn_executor(
         estop_reg: estop_reg.clone(),
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
         reclaim_stop_rx: Mutex::new(reclaim_stop_rx),
+        reclaim_return_tx: Mutex::new(reclaim_return_tx),
+        safety_log_rx: Mutex::new((safety_log_rx, 0, 0)),
+        stats: stats.clone(),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
@@ -1342,6 +1431,8 @@ pub(crate) fn spawn_executor(
                 estop_overflow_gen,
                 reclaim_state_tx,
                 reclaim_stop_tx,
+                reclaim_return_rx,
+                safety_log_tx,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
@@ -1426,6 +1517,9 @@ struct ControlState {
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_stop_tx: Producer<RetiredStopPayloads>,
+    reclaim_return_rx: Consumer<Arc<SafetyState>>,
+    safety_log_tx: Producer<SafetyLogEvent>,
+    stats: Arc<ExecutorStats>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     /// Reply for a maintenance op serviced before Step 3 commit / Step 6 publish, held until
@@ -1462,10 +1556,21 @@ impl ControlState {
         }
     }
 
-    /// Moves retired fault `Arc<SafetyState>` snapshots and retired heap motion payloads off
-    /// `armd-control` into bounded SPSC reclamation rings (never popping when full so nothing
-    /// drops on `armd-control`).
+    /// Moves retired fault `Arc<SafetyState>` snapshots, retired heap motion payloads, and
+    /// deferred [`SafetyLogEvent`]s off `armd-control` into bounded SPSC rings, and replenishes
+    /// clean recycled fault slots without allocating or dropping on `armd-control`.
     fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
+        while core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY
+            || core.safety.formatted_fault_arc_pool_len() < FORMATTED_FAULT_ARC_POOL_CAPACITY
+            || core.safety.joint_limit_arc_pool_len() < JOINT_LIMIT_ARC_POOL_CAPACITY
+        {
+            let Ok(arc) = self.reclaim_return_rx.pop() else {
+                break;
+            };
+            if let Err(unusable) = core.safety.return_fault_arc(arc) {
+                let _ = self.reclaim_state_tx.push(unusable);
+            }
+        }
         let mut drained = false;
         while !self.reclaim_state_tx.is_full() {
             let Some(arc) = core.safety.pop_retired_state_arc() else {
@@ -1479,6 +1584,18 @@ impl ControlState {
                 break;
             };
             let _ = self.reclaim_stop_tx.push(retired);
+            drained = true;
+        }
+        let lost_inline = core.safety.advance_log_dropped_forwarded();
+        if lost_inline > 0 {
+            self.stats.safety_log_dropped.fetch_add(lost_inline, Ordering::Relaxed);
+            drained = true;
+        }
+        while let Some(ev) = core.safety.pop_log_event() {
+            if self.safety_log_tx.push(ev).is_err() {
+                core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
+                self.stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
+            }
             drained = true;
         }
         if drained {
@@ -1509,8 +1626,12 @@ impl ControlState {
         core: &mut SupervisorInner,
         ctx: &super::ops::CommitCtx,
         release_deadline: Instant,
+        step_num: u64,
+        release_flags: &mut u32,
+        maint_req_id: &mut u64,
     ) {
         let Ok(req) = self.maint_req_rx.pop() else { return; };
+        *maint_req_id = req.id;
         let mut returned_offsets = None;
         let mut returned_probe = None;
         let result = match req.op {
@@ -1536,9 +1657,15 @@ impl ControlState {
                 MaintenanceResult::PlanningSnapshot(core.planning_snapshot(ctx))
             }
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
-            MaintenanceOp::ClearFault => {
+            MaintenanceOp::ClearFault { expected_epoch } => {
                 self.shutdown_committed = false;
-                let res = core.clear_fault_executor(release_deadline);
+                let res = core.clear_fault_executor_bounded_for_epoch(release_deadline, expected_epoch);
+                if res.is_ok() {
+                    *release_flags |= RELEASE_FLAG_CLEAR_OK;
+                } else {
+                    *release_flags |= RELEASE_FLAG_CLEAR_REFUSED;
+                }
+                self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
                 MaintenanceResult::FaultCleared(res)
             }
             MaintenanceOp::SetJointZeroOffsets { offsets } => {
@@ -1572,11 +1699,13 @@ impl ControlState {
                 MaintenanceResult::ProbeReturned
             }
         };
+        let returned_driver_config_error = core.retired_driver_config_error.take();
         self.pending_maint_reply = Some(MaintReply {
             id: req.id,
             result,
             returned_offsets,
             returned_probe,
+            returned_driver_config_error,
         });
     }
 
@@ -1594,6 +1723,7 @@ impl ControlState {
                 result: MaintenanceResult::Stopped,
                 returned_offsets: reply.returned_offsets,
                 returned_probe: reply.returned_probe,
+                returned_driver_config_error: reply.returned_driver_config_error,
             });
         }
         while let Ok(req) = self.maint_req_rx.pop() {
@@ -1607,6 +1737,7 @@ impl ControlState {
                 result: MaintenanceResult::Stopped,
                 returned_offsets,
                 returned_probe,
+                returned_driver_config_error: None,
             });
         }
     }
@@ -2377,6 +2508,8 @@ fn control_thread_main(
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_stop_tx: Producer<RetiredStopPayloads>,
+    reclaim_return_rx: Consumer<Arc<SafetyState>>,
+    safety_log_tx: Producer<SafetyLogEvent>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -2443,6 +2576,9 @@ fn control_thread_main(
         estop_overflow_gen,
         reclaim_state_tx,
         reclaim_stop_tx,
+        reclaim_return_rx,
+        safety_log_tx,
+        stats: Arc::clone(&stats),
         maint_req_rx,
         maint_rep_tx,
         pending_maint_reply: None,
@@ -2536,6 +2672,11 @@ fn control_thread_main(
             }
             let _ = crate::diagnostics::alloc::take();
             let body_start = now_inst();
+            let latch_count_before = core.safety.latch_count();
+            let kinds_before = core.safety.latched_fault_kinds();
+            let estop_applied_before = core.applied_estop_count;
+            let mut release_flags: u32 = 0;
+            let mut maint_req_id: u64 = 0;
             core.defer_zero_check_persist = true;
             core.persist_capacity_available =
                 !state.persist_job_tx.is_abandoned() && state.persist_job_tx.slots() > 0;
@@ -2554,7 +2695,14 @@ fn control_thread_main(
                     // in `core.pending_estop_acks` (keeping their `Arc<SafetyState>` alive) and
                     // deliver them ONLY after Step 6 publishes the corresponding snapshot.
                     state.service_persistence(core, ctx);
-                    state.service_one_maintenance(core, ctx, release_deadline);
+                    state.service_one_maintenance(
+                        core,
+                        ctx,
+                        release_deadline,
+                        step_num,
+                        &mut release_flags,
+                        &mut maint_req_id,
+                    );
                     control_stop.load(Ordering::Acquire)
                 },
             );
@@ -2601,6 +2749,30 @@ fn control_thread_main(
             state.flush_pending_maint_reply(&core);
             state.emit_estop_ack_if_advanced(&mut core);
             state.drain_retired_states(&mut core);
+            if let Some((armed, slot)) = state.hooks.inject_release_alloc_once.as_deref() {
+                if armed.swap(false, Ordering::AcqRel) {
+                    let ptr = Box::into_raw(Box::new(0xB3_u64));
+                    slot.store(ptr, Ordering::Release);
+                    release_flags |= RELEASE_FLAG_INJECT_ALLOC;
+                    stats.last_inject_alloc_release_seq.store(step_num, Ordering::Release);
+                }
+            }
+            let kinds_after = core.safety.latched_fault_kinds();
+            let newly_set_kinds = kinds_after & !kinds_before;
+            if core.safety.latch_count() != latch_count_before || newly_set_kinds != 0 {
+                release_flags |= RELEASE_FLAG_SAFETY_LATCH;
+                if (newly_set_kinds & FaultKind::ThermalTrip.bit()) != 0 {
+                    release_flags |= RELEASE_FLAG_THERMAL_TRIP;
+                }
+                if (newly_set_kinds & FaultKind::WatchdogTimeout.bit()) != 0 {
+                    release_flags |= RELEASE_FLAG_WATCHDOG_LATCH;
+                }
+                stats.last_fault_latch_release_seq.store(step_num, Ordering::Release);
+            }
+            if core.applied_estop_count > estop_applied_before {
+                release_flags |= RELEASE_FLAG_ESTOP_APPLIED;
+                stats.last_estop_release_seq.store(step_num, Ordering::Release);
+            }
             let control_hz = core.config.control_frequency_hz;
             let done = now_inst();
             let allocs = crate::diagnostics::alloc::take();
@@ -2640,6 +2812,10 @@ fn control_thread_main(
                 waited_for: None,
                 longest_hold: None,
                 late: !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1)),
+                release_seq: step_num,
+                safety_epoch: core.safety.epoch_id(),
+                maint_req_id,
+                release_flags,
             };
             if diag_tx.push(sample).is_err() {
                 stats.diag_dropped.fetch_add(1, Ordering::Relaxed);
@@ -2986,6 +3162,7 @@ mod tests {
                     result: MaintenanceResult::ShutdownCommitted(true),
                     returned_offsets: None,
                     returned_probe: None,
+                    returned_driver_config_error: None,
                 })
                 .unwrap();
             exited.store(true, Ordering::Release);
@@ -3123,6 +3300,8 @@ mod tests {
         let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
         let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
+        let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (safety_log_tx, _) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -3150,6 +3329,9 @@ mod tests {
             estop_overflow_gen: Arc::new(AtomicU64::new(0)),
             reclaim_state_tx,
             reclaim_stop_tx,
+            reclaim_return_rx,
+            safety_log_tx,
+            stats: Arc::new(ExecutorStats::default()),
             maint_req_rx,
             maint_rep_tx,
             pending_maint_reply: None,

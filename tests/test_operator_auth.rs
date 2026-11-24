@@ -366,12 +366,16 @@ async fn permission_matrix_program_vs_operator_and_live_revocation() {
     assert_eq!(r["code"], "OPERATOR_REQUIRED", "{r}");
     assert_eq!(sup.get_observation().await.safety_state, SafetyState::EStop);
 
-    // Operator force-preempts (after cooldown) and clears EStop -> Idle
+    // Operator force-preempts (after cooldown) and clears EStop -> Idle.
+    // Re-read current epoch: during the 3.1 s torqued sleep without heartbeats, WatchdogTimeout
+    // also latches over EStop and advances the epoch, so a stale pre-sleep epoch is rejected.
     tokio::time::sleep(Duration::from_millis(3100)).await;
     let granted_op2 = acquire(&mut op_ws, "cockpit_op", true).await;
     assert_eq!(granted_op2["type"], "lease_granted", "{granted_op2}");
     let op_gen = granted_op2["generation"].as_u64().unwrap();
-    let r = common::rpc(&mut op_ws, op_gen, e_epoch, "/api/v1/safety/clear_fault", json!({})).await;
+    let e_epoch_now = sup.get_observation().await.epoch_id;
+    assert!(e_epoch_now >= e_epoch);
+    let r = common::rpc(&mut op_ws, op_gen, e_epoch_now, "/api/v1/safety/clear_fault", json!({})).await;
     assert_eq!(r["type"], "command_ack", "{r}");
     assert_eq!(sup.get_observation().await.safety_state, SafetyState::Idle);
 

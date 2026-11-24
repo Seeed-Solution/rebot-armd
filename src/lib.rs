@@ -12,8 +12,10 @@ pub mod collision;
 pub mod dynamics;
 #[cfg(not(target_arch = "wasm32"))] pub mod estimate;
 #[cfg(not(target_arch = "wasm32"))] pub mod grasp;
+#[cfg(not(target_arch = "wasm32"))] pub mod grasp_select;
 pub mod gravity;
 #[cfg(not(target_arch = "wasm32"))] pub mod gravity_comp;
+pub mod gripper_baseline;
 #[cfg(not(target_arch = "wasm32"))] pub mod gripper_calib;
 #[cfg(not(target_arch = "wasm32"))] pub mod keepout;
 #[cfg(not(target_arch = "wasm32"))] pub mod joint_zero;
@@ -65,7 +67,7 @@ pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, Join
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,
 };
-pub use safety::{FaultCode, FaultInfo, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
+pub use safety::{FaultCode, FaultInfo, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 #[cfg(not(target_arch = "wasm32"))] pub use supervisor::{
     AdmissionStamp, Admitted, ArmError, ArmSupervisor, MotionStartKind, MotionStartOp,
     PreemptError, SupervisorInner,

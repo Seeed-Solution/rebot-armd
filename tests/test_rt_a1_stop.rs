@@ -1887,14 +1887,24 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
                 let greq = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
                 let adm1 = inner.check_admission(stamp).unwrap();
                 let adm2 = inner.check_admission(stamp).unwrap();
+                let adm3 = inner.check_admission(stamp).unwrap();
+                let adm4 = inner.check_admission(stamp).unwrap();
                 assert!(inner.authorized_stop());
                 assert_stopped(
                     inner.start_macro_gripper(adm1, macro_id, greq.clone()).unwrap_err(),
                     "start_macro_gripper",
                 );
                 assert_stopped(
-                    inner.start_macro_gripper_within(adm2, macro_id, greq, Some(5.0), true).unwrap_err(),
+                    inner.start_macro_gripper_within(adm2, macro_id, greq.clone(), Some(5.0), true).unwrap_err(),
                     "start_macro_gripper_within",
+                );
+                assert_stopped(
+                    inner.start_macro_gripper_learning(adm3, macro_id, greq.clone(), armd::motion::LearnMode::Calibration).unwrap_err(),
+                    "start_macro_gripper_learning",
+                );
+                assert_stopped(
+                    inner.start_macro_gripper_learning_within(adm4, macro_id, greq, armd::motion::LearnMode::Calibration, Some(5.0), false).unwrap_err(),
+                    "start_macro_gripper_learning_within",
                 );
                 assert_no_motion(&inner, Some(macro_id), "MacroChildGripper");
             }
@@ -2035,10 +2045,35 @@ async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
                 let stamp = sup.capture_admission_stamp();
                 let mut inner = sup.inner().write().await;
                 let greq = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
-                let adm = inner.check_admission(stamp).unwrap();
+                let adm1 = inner.check_admission(stamp).unwrap();
+                let adm2 = inner.check_admission(stamp).unwrap();
                 assert!(inner.authorized_stop());
-                assert_stopped(inner.start_gripper(adm, greq, ep).unwrap_err(), "start_gripper");
+                assert_stopped(inner.start_gripper(adm1, greq.clone(), ep).unwrap_err(), "start_gripper");
+                assert_stopped(
+                    inner.start_gripper_with_baseline(adm2, greq, ep, armd::supervisor::GripperBaselineCmd::Reset).unwrap_err(),
+                    "start_gripper_with_baseline",
+                );
                 assert_no_motion(&inner, None, "Gripper");
+            }
+            MotionStartKind::GripperCalibrate => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                {
+                    let mut inner = sup.inner().write().await;
+                    let adm = inner.check_admission(stamp).unwrap();
+                    assert!(inner.authorized_stop());
+                    assert_stopped(
+                        armd::gripper_calib::begin_calibration(&mut inner, adm, &sup, ep, None).unwrap_err(),
+                        "gripper_calib::begin_calibration",
+                    );
+                    assert_no_motion(&inner, None, "GripperCalibrate(begin)");
+                }
+                assert_stopped(
+                    armd::gripper_calib::start_calibration(&sup, stamp).await.unwrap_err(),
+                    "gripper_calib::start_calibration",
+                );
+                let inner = sup.inner().read().await;
+                assert_no_motion(&inner, None, "GripperCalibrate(start)");
             }
             MotionStartKind::GripperZeroCheck => {
                 let (sup, _, ep) = make_armed().await;
@@ -2308,6 +2343,8 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
         "src/backlash.rs",
         "src/grasp.rs",
         "src/place.rs",
+        "src/gripper_calib.rs",
+        "src/gripper_baseline.rs",
     ] {
         let src = std::fs::read_to_string(manifest_dir.join(rel)).unwrap();
         let prod = src.split("#[cfg(test)]").next().unwrap_or(&src);
@@ -2332,9 +2369,13 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
         ("src/supervisor/actions.rs", "pub fn begin_orchestrated_action("),
         ("src/supervisor/actions.rs", "pub fn install_macro_path("),
         ("src/supervisor/actions.rs", "pub fn start_macro_gripper("),
+        ("src/supervisor/actions.rs", "pub fn start_macro_gripper_learning("),
+        ("src/supervisor/actions.rs", "pub fn start_macro_gripper_learning_within("),
         ("src/supervisor/actions.rs", "pub fn install_macro_quintic("),
         ("src/supervisor/actions.rs", "pub fn start_gripper("),
+        ("src/supervisor/actions.rs", "pub fn start_gripper_with_baseline("),
         ("src/supervisor/actions.rs", "pub fn start_gripper_zero_check("),
+        ("src/gripper_calib.rs", "pub fn begin_calibration("),
         ("src/supervisor/streams.rs", "pub fn servo("),
         ("src/supervisor/streams.rs", "pub fn begin_policy_run("),
         ("src/supervisor/streams.rs", "pub fn authorize_servo_stream("),
@@ -3520,5 +3561,107 @@ async fn per_connection_bounded_terminal_fifo_delivers_all_in_order_and_refuses_
         let term5 = collect_terminals(&mut ws, 1, Duration::from_secs(3)).await;
         assert_eq!(term5.len(), 1);
         assert_eq!(term5[0].0, id5);
+    }
+}
+
+// 21. Merge invariants (A1 + B3/B3-F + I16):
+//     (a) Every B3 SafetyManager::latch (new kind, repeat kind, E-stop) and clear_with_check
+//         keeps epoch_mirror synchronized with epoch_id so lock-free capture_admission_stamp()
+//         never drifts.
+//     (b) WS /api/v1/action/gripper_calibrate rejects stale stamps after Stop/E-stop AND
+//         respects TERMINALS_BUSY when the per-connection terminal FIFO is saturated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_b3_epoch_mirror_sync_and_i16_gripper_calibrate_admission_and_fifo() {
+    use armd::safety::{ClearContext, FaultDetail, FaultKind};
+
+    // (a) epoch_mirror stays in lockstep with epoch_id across latch (new, repeat, E-stop) and clear.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let mut inner = sup.inner().write().await;
+        let mirror = inner.safety.epoch_mirror();
+        assert_eq!(mirror.load(Ordering::SeqCst), inner.safety.epoch_id());
+
+        let ep1 = inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+        assert_eq!(ep1, inner.safety.epoch_id());
+        assert_eq!(mirror.load(Ordering::SeqCst), ep1);
+        assert_eq!(sup.capture_admission_stamp().estop_epoch, ep1);
+
+        // Repeat latch of the same kind still advances epoch_id AND epoch_mirror.
+        let ep2 = inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+        assert_eq!(ep2, ep1 + 1);
+        assert_eq!(mirror.load(Ordering::SeqCst), ep2);
+        assert_eq!(sup.capture_admission_stamp().estop_epoch, ep2);
+
+        // E-stop latch advances epoch_id AND epoch_mirror.
+        let ep3 = inner.safety.latch(FaultKind::Estop, FaultDetail::Estop);
+        assert_eq!(ep3, ep2 + 1);
+        assert_eq!(mirror.load(Ordering::SeqCst), ep3);
+        assert_eq!(sup.capture_admission_stamp().estop_epoch, ep3);
+
+        // clear_with_check advances epoch_id AND epoch_mirror.
+        let cleared = inner.safety.clear_with_check(&ClearContext::all_conditions_met()).unwrap();
+        assert_eq!(cleared, SafetyState::Idle);
+        let ep4 = inner.safety.epoch_id();
+        assert_eq!(ep4, ep3 + 1);
+        assert_eq!(mirror.load(Ordering::SeqCst), ep4);
+        assert_eq!(sup.capture_admission_stamp().estop_epoch, ep4);
+    }
+
+    // (b) WS /api/v1/action/gripper_calibrate rejects stale stamp after Stop AND refuses when FIFO saturated.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 30_000;
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        sup.test_set_terminal_fifo_capacity(2);
+        let addr = serve(sup.clone()).await;
+        let (mut ws, gen) = controller(addr).await;
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let ep = sup.get_observation().await.epoch_id;
+        let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+
+        // Saturated terminal FIFO refuses /api/v1/action/gripper_calibrate with 503 TERMINALS_BUSY.
+        sup.test_set_terminal_dispatch_paused(true);
+        for _ in 0..2 {
+            let ack = rpc(&mut ws, gen, ep, "/api/v1/motion/jog", json!({
+                "target_positions": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "duration_secs": 2.0
+            })).await;
+            assert_eq!(ack["type"], "command_ack", "{ack}");
+            assert_eq!(rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await["type"], "command_ack");
+            sup.tick(0.02).await;
+        }
+        assert_eq!(sup.test_pending_terminal_count(), 2);
+        let busy = rpc(&mut ws, gen, ep, armd::gripper_calib::CALIBRATE_PATH, json!({})).await;
+        assert_eq!(
+            (busy["type"].as_str(), busy["status"].as_u64(), busy["code"].as_str()),
+            (Some("command_reject"), Some(503), Some("TERMINALS_BUSY")),
+            "{busy}"
+        );
+        assert!(sup.inner().read().await.gripper_calibration.is_none());
+        sup.test_set_terminal_dispatch_paused(false);
+        wait_until(Duration::from_secs(3), || sup.test_pending_terminal_count() == 0).await;
+
+        // Stale stamp after urgent Stop while worker is paused before acquiring lock.
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+        send(&mut ws, json!({
+            "type": "command", "request_id": 9801, "generation": gen, "epoch_id": ep,
+            "path": armd::gripper_calib::CALIBRATE_PATH, "body": {}
+        })).await;
+        wait_until(Duration::from_secs(1), || {
+            armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1
+        }).await;
+        send(&mut ws, json!({
+            "type": "command", "request_id": 9802, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/motion/stop", "body": {}
+        })).await;
+        let stop_ack = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+        assert_eq!((stop_ack["type"].as_str(), stop_ack["request_id"].as_u64()), (Some("command_ack"), Some(9802)), "{stop_ack}");
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+        let rej = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+        assert_eq!(rej["type"], "command_reject", "{rej}");
+        assert_eq!(rej["request_id"], 9801);
+        assert_eq!(rej["code"], "STOPPED", "{rej}");
+        assert!(sup.inner().read().await.gripper_calibration.is_none());
     }
 }

@@ -3004,10 +3004,10 @@ async fn immutable_estop_ack_journal_clear_fault_full_ring_and_legacy_handoff() 
 
         let fault_epoch = sup.observation().await.unwrap().epoch_id;
 
-        // First verify a real `trigger_e_stop_checked()` while in Fault pins `(Fault(fault_case), fault_epoch)`.
+        // First verify a real `trigger_e_stop_checked()` while in Fault preserves `Fault(fault_case)` and advances epoch.
         let (es0_st, es0_ep) = sup.trigger_e_stop_checked().await.unwrap();
         assert_eq!(es0_st, SafetyState::Fault(fault_case.clone()));
-        assert_eq!(es0_ep, fault_epoch);
+        assert_eq!(es0_ep, fault_epoch + 1);
         // Let all 3 triple-buffer observation slots settle after the initial E-stop latch.
         let settled_at = handle.stats().steps.load(Ordering::Relaxed);
         wait_until_async(Duration::from_secs(1), || {

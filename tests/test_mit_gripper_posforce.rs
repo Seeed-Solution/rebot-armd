@@ -2848,10 +2848,12 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             assert!(done.gripper_gap_rad.is_some());
             assert!(sup2.inner().read().await.measured_positions[J7].abs() < 0.05);
 
-            // 8c. pos_vel close AND pos_force open keep timeout_s == 8.0 and ARE clamped to phase_timeout_s.
-            for (label, speed_cfg, start_q, cmd) in [
-                ("pos_vel_close", None, -5.7_f32, GripperCommand::Close),
-                ("pos_force_open", Some(0.30_f32), 0.0_f32, GripperCommand::Open),
+            // 8c. pos_force open keeps timeout_s == 8.0; pos_vel close uses the unified
+            //     gripper_policy.close_speed_rad_s (0.3 rad/s) with the derived 1.2x deadline;
+            //     both ARE clamped to phase_timeout_s.
+            for (label, speed_cfg, start_q, cmd, expect_explicit_8s) in [
+                ("pos_vel_close", None, -5.7_f32, GripperCommand::Close, false),
+                ("pos_force_open", Some(0.30_f32), 0.0_f32, GripperCommand::Open, true),
             ] {
                 let (sup_inner3, _, _) = make_sup(speed_cfg, start_q);
                 let sup3 = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
@@ -2889,10 +2891,54 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                 let res = ctx3.gripper(label, cmd).await;
                 watcher.await.unwrap();
                 assert!(t0.elapsed() < Duration::from_secs(1), "{label} was not clamped to phase_timeout_s");
-                assert_eq!(*seen_timeout.lock().unwrap(), Some(8.0), "{label} did not keep timeout_s == 8.0");
+                let got_timeout = *seen_timeout.lock().unwrap();
+                if expect_explicit_8s {
+                    assert_eq!(got_timeout, Some(8.0), "{label} did not keep timeout_s == 8.0");
+                } else {
+                    let t = got_timeout.expect("pos_vel_close timeout observed");
+                    let min_t = armd::motion::GRIPPER_TRAVEL_TIME_FACTOR * (5.7 / 0.3);
+                    assert!(
+                        t >= min_t && t <= armd::motion::GRIPPER_MAX_DEFAULT_TIMEOUT_S,
+                        "{label}: expected unified derived deadline in [{min_t:.2}, {}], got {t:.2}",
+                        armd::motion::GRIPPER_MAX_DEFAULT_TIMEOUT_S
+                    );
+                }
                 match res {
                     Err(armd::macro_action::Stop::Fail(code, _)) => assert_eq!(code, "GRASP_TIMEOUT", "{label}"),
                     other => panic!("{label}: expected GRASP_TIMEOUT at phase_timeout_s, got {other:?}"),
+                }
+            }
+
+            // 8c-min. Unified closing speed: macro closes use min(gripper_policy.close_speed_rad_s,
+            //         damiao_gripper.close_speed_rad_s) quantized to 0.01 rad/s in both orderings.
+            for (policy_speed, damiao_speed, expect_planned) in [
+                (0.20_f32, 0.30_f32, 0.20_f64),
+                (0.30_f32, 0.259_f32, 0.25_f64),
+            ] {
+                let (mut sup_m, _, _) = make_sup(Some(damiao_speed), -1.0);
+                sup_m.config.gripper_policy.as_mut().unwrap().close_speed_rad_s = Some(policy_speed);
+                assert!((sup_m.effective_planned_close_speed() - expect_planned).abs() < 1e-9);
+                let ep = sup_m.safety.epoch_id();
+                let stamp = sup_m.current_admission_stamp();
+                let adm_seq = sup_m.check_admission(stamp).unwrap();
+                let id_m = sup_m.begin_sequence_action(adm_seq, None, ep).unwrap();
+                let req = GripperRequest {
+                    command: GripperCommand::Close,
+                    fraction: None,
+                    grasp: true,
+                    speed: f64::from(policy_speed),
+                    timeout_s: None,
+                    tag: None,
+                };
+                let adm_g = sup_m.check_admission(stamp).unwrap();
+                sup_m.start_macro_gripper_within(adm_g, id_m, req, Some(60.0), true).unwrap();
+                match &sup_m.active_trajectory.as_ref().unwrap().reference {
+                    armd::motion::Reference::Gripper(gm) => {
+                        assert!((gm.planned_speed - expect_planned).abs() < 1e-9,
+                            "policy={policy_speed} damiao={damiao_speed}: planned_speed {} != {expect_planned}",
+                            gm.planned_speed);
+                    }
+                    other => panic!("expected Gripper reference, got {other:?}"),
                 }
             }
 

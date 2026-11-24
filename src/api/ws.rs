@@ -394,6 +394,8 @@ enum ActionStart {
     DryRunGrasp(Value),
     Sequence(Box<crate::sequences::RunPlan>),
     CalibHover(Box<crate::calib_hover::HoverPlan>),
+    /// `gripper_calibrate` (epoch, tag): begun with the supervisor handle at the call site.
+    GripperCalibrate(u64, Option<String>),
     MeasureMultiview(Box<crate::measure_multiview::Plan>),
     #[cfg(feature = "policy-runtime")]
     Policy(Box<PendingPolicyStart>),
@@ -1432,6 +1434,9 @@ fn prepare_action(
                     request.speed = (2.0 * scale).clamp(0.01, 2.0);
                 }
             }
+            if body.get("baseline").is_some_and(|v| !v.is_null()) {
+                return Err(invalid_command("baseline is not a gripper action field; calibrate with /api/v1/action/gripper_calibrate"));
+            }
             let (id, duration) = inner.start_gripper(admitted, request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
@@ -1478,6 +1483,12 @@ fn prepare_action(
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
             return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?)));
+        }
+        crate::gripper_calib::CALIBRATE_PATH => {
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
+            let tag = motion::tag(body).map_err(ArmError::from)?;
+            return Ok(ActionStart::GripperCalibrate(epoch, tag));
         }
         crate::measure_multiview::PATH => {
             let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
@@ -1667,6 +1678,15 @@ fn check_operator_privilege(
     body: &Value,
     epoch: u64,
 ) -> Option<ApiError> {
+    if path == "/api/v1/safety/clear_fault"
+        && inner.consume_pending_estop()
+        && inner.safety.epoch_id() != epoch
+    {
+        return Some(ArmError::Safety(SafetyError::EpochMismatch {
+            expected: inner.safety.epoch_id(),
+            received: epoch,
+        }).into());
+    }
     if ws_auth.is_operator() {
         return None;
     }
@@ -1696,6 +1716,8 @@ fn check_operator_privilege(
         {
             Some(ApiError::operator_required("run_sequence (record)"))
         }
+        // learns the free-motion torque of the jaw (stored on the device)
+        crate::gripper_calib::CALIBRATE_PATH => Some(ApiError::operator_required("gripper_calibrate")),
         "/api/v1/action/gripper_zero_check"
             if body.get("store_offset").and_then(Value::as_bool) == Some(true) =>
         {
@@ -1717,10 +1739,10 @@ fn check_operator_privilege(
             if inner.e_stop_latched.load(Ordering::SeqCst) {
                 return Some(ApiError::operator_required("clear_fault (EStop latched)"));
             }
-            if let Some(fault) = inner.safety.fault() {
-                if !fault.recoverable || fault.code == crate::safety::FaultCode::Collision {
-                    return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
-                }
+            if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+                && !inner.safety.recoverable()
+            {
+                return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
             }
             None
         }
@@ -2860,6 +2882,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             response = Some(json!({"type":"lease_released", "success":released}));
                         } else {
+                            inner.consume_pending_estop();
                             let epoch = inner.safety.epoch_id();
                             if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
                                 response = Some(if kind == "command" {
@@ -2906,6 +2929,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     ack["job_id"] = json!(job_id);
                                                     ack
                                                 }
+                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                            }),
+                                            Ok(ActionStart::GripperCalibrate(epoch, tag)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::gripper_calib::begin_calibration(&mut inner, admitted, &recv_supervisor, epoch, tag)) {
+                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
                                                 Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                             }),
                                             Ok(ActionStart::MeasureMultiview(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::measure_multiview::begin(&mut inner, admitted, &recv_supervisor, *plan, recv_deps.source.clone())) {

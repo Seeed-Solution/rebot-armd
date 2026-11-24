@@ -194,7 +194,7 @@ fn escalates_to_fault_collision_after_max_auto_resumes() {
     assert_eq!(fault.code, FaultCode::Collision);
     assert!(!fault.recoverable);
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)) && obs.is_torqued);
-    assert_eq!(serde_json::to_value(&fault).unwrap()["code"], "COLLISION");
+    assert_eq!(serde_json::to_value(fault).unwrap()["code"], "COLLISION");
     let c = obs.collision.unwrap();
     assert!(!c.active && c.trips_in_window == 3, "{c:?}");
     // stays latched: no auto-resume from a Fault
@@ -464,4 +464,49 @@ fn short_resting_tolerances_are_refused_and_never_exempt() {
     inner.target_positions = q.clone();
     ticks(&mut inner, 3);
     assert_eq!(inner.collision_supported_joints(), [false; 6]);
+}
+
+#[test]
+fn escalation_reaches_latch_when_another_fault_or_estop_is_already_active() {
+    use armd::safety::{FaultDetail, FaultKind};
+
+    // (a) WatchdogTimeout (recoverable) already latched while torqued: collision escalation
+    // MUST still reach `SafetyManager::latch(FaultKind::CollisionLatched, ...)`, upgrading
+    // displayed fault to COLLISION, flipping recoverable() to false, and advancing epoch_id.
+    let p = CollisionPolicy { max_auto_resumes: 2, ..policy() };
+    let (mut inner, arm) = rig(Some(p));
+    inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+    assert!(inner.safety.recoverable());
+    assert_eq!(inner.safety.fault_code(), Some(FaultCode::WatchdogTimeout));
+    let ep_before = inner.safety.epoch_id();
+
+    arm.set_residual(0, 7.0);
+    // 3 trips (each persist_ticks=4) exceed max_auto_resumes=2 without entering a recoverable hold.
+    let obs = ticks(&mut inner, 12);
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::WatchdogTimeout));
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::CollisionLatched));
+    assert!(!inner.safety.recoverable(), "escalated collision over WatchdogTimeout must be non-recoverable");
+    assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(FaultCode::Collision));
+    assert!(!obs.collision.unwrap().active, "no recoverable CollisionHold while stopped");
+    assert_eq!(obs.epoch_id, ep_before + 1, "collision escalation latch must advance epoch");
+    // Further ticks while CollisionLatched is already recorded must not churn epoch.
+    let obs_next = ticks(&mut inner, 8);
+    assert_eq!(obs_next.epoch_id, obs.epoch_id);
+
+    // (b) EStop already active while torqued: collision escalation MUST still latch CollisionLatched,
+    // advancing epoch and keeping EStop in record for two-stage clear.
+    let (mut inner, arm) = rig(Some(p));
+    inner.apply_stop_policy(armd::StopPolicy::EStopLatch);
+    let ep_estop = inner.safety.epoch_id();
+    arm.set_residual(1, 9.0);
+    let obs = ticks(&mut inner, 12);
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::Estop));
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::CollisionLatched));
+    assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(FaultCode::Collision));
+    assert_eq!(obs.epoch_id, ep_estop + 1);
+    assert!(!obs.collision.unwrap().active);
+    arm.clear();
+    // Two-stage clear: CollisionLatched -> EStop -> Idle.
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::EStop);
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
 }

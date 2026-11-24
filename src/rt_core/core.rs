@@ -168,7 +168,7 @@ impl ArmCore {
     /// one, allocated, only before the slot held one: the first ticks).
     pub fn take_observation_buffer(&mut self) -> ObservationBuffer {
         self.buffer_out = true;
-        ObservationBuffer(self.publisher.take_back_observation().unwrap_or_else(ArmObservation::blank))
+        ObservationBuffer(self.publisher.take_back_observation().unwrap_or_else(ArmObservation::blank_rt))
     }
 
     /// Publishes one tick's observation, filled in place, back into the slot it came from:

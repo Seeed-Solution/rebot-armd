@@ -28,7 +28,7 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
                 Some(v) if v.as_str() == Some(crate::mit::RECOVERY_CONFIRM_VALUE) => true,
                 Some(_) => return Err(invalid_command(&format!("mit_recovery must be \"{}\"", crate::mit::RECOVERY_CONFIRM_VALUE))),
             };
-            inner.clear_fault_confirmed(mit_recovery)?;
+            inner.clear_fault_confirmed_for_epoch(mit_recovery, Some(epoch))?;
         }
         "/api/v1/motion/servo" => {
             let targets = positions(body.get("targets"))?;

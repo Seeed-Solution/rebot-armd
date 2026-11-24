@@ -229,6 +229,63 @@ pub enum ArmDriverError {
     TxQueueFull { queued: usize, new: usize, capacity: usize },
 }
 
+impl ArmDriverError {
+    /// Writes this error's exact `Display` output into `out` without heap allocation.
+    ///
+    /// Lives alongside [`ArmDriverError`] and delegates to its `Display` implementation so every
+    /// variant (including future variants) renders identically to API/log text without a second
+    /// match table to keep in sync.
+    pub fn write_bounded<const N: usize>(&self, out: &mut crate::safety::BoundedText<N>) {
+        match self {
+            Self::Transport(TransportError::Io(io_err)) => {
+                if let Some(code) = io_err.raw_os_error() {
+                    let _ = core::fmt::write(
+                        out,
+                        format_args!(
+                            "Transport error: I/O error: {}",
+                            crate::transport::format_os_error(Some(code), io_err.kind())
+                        ),
+                    );
+                    return;
+                }
+                let _ = core::fmt::write(out, format_args!("{self}"));
+            }
+            _ => {
+                let _ = core::fmt::write(out, format_args!("{self}"));
+            }
+        }
+    }
+
+    /// Converts this error into a bounded, allocation-free [`crate::safety::ClearFaultDriverError`]
+    /// whose off-thread `Display` output matches [`ArmDriverError`]'s `Display` verbatim.
+    pub fn to_clear_fault_error(&self) -> crate::safety::ClearFaultDriverError {
+        use crate::safety::{BoundedText, ClearFaultDriverError as C};
+        match self {
+            Self::Transport(TransportError::Timeout) => C::TransportTimeout,
+            Self::Transport(TransportError::WouldBlock) => C::TransportWouldBlock,
+            Self::Transport(TransportError::NotOpen) => C::TransportNotOpen,
+            Self::Transport(TransportError::ChecksumMismatch { expected, actual }) => {
+                C::TransportChecksumMismatch { expected: *expected, actual: *actual }
+            }
+            Self::Transport(TransportError::FrameTooShort { expected, actual }) => {
+                C::TransportFrameTooShort { expected: *expected, actual: *actual }
+            }
+            Self::JointCountMismatch { expected, actual } => {
+                C::JointCountMismatch { expected: *expected, actual: *actual }
+            }
+            Self::Timeout(id) => C::JointTimeout(*id),
+            Self::EstopInhibited => C::EstopInhibited,
+            Self::Protocol(s) => C::Protocol(BoundedText::new(s)),
+            Self::HardwareFault(s) => C::HardwareFault(BoundedText::new(s)),
+            other => {
+                let mut buf = BoundedText::empty();
+                other.write_bounded(&mut buf);
+                C::Formatted(buf)
+            }
+        }
+    }
+}
+
 /// Outcome of a bounded target write ([`ArmDriver::write_joint_targets_bounded`]) or pending
 /// queue drain ([`DamiaoArmDriver::drain_pending_tx`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,6 +469,16 @@ pub trait ArmDriver: Send {
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool {
         out.clear();
         match self.motor_status() { Some(s) => { out.extend_from_slice(&s); true } None => false }
+    }
+    /// True when [`Self::clear_fault_disables_joints`] includes any joint index `< arm_dof`,
+    /// without allocating a `Vec`.
+    fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool {
+        self.clear_fault_disables_joints().into_iter().any(|j| j < arm_dof)
+    }
+    /// True when [`Self::check_hardware_status`] would report a hardware fault, without
+    /// allocating a formatted error string.
+    fn has_hardware_fault(&self) -> bool {
+        self.check_hardware_status().is_err()
     }
 
     /// Fixed device-side velocity ceiling, when the active output mode has one.
@@ -713,6 +780,10 @@ pub trait ArmDriver: Send {
     /// (after the hold-off) so fresh feedback can return; target writes stay refused until the
     /// next confirmed enable.
     fn acknowledge_mit_fence_trip(&mut self) {}
+
+    /// True when every joint `0..dof` has received fresh feedback with a receive sequence strictly
+    /// after the most recent [`Self::mit_expiry_recover`] request.
+    fn mit_feedback_after_recovery(&self, _dof: usize) -> bool { true }
 
     /// Write the motor command timeout of `joints` to `counts` in RAM (never flash), check the
     /// acknowledgement and confirm it with a separate read. Torque off only.
@@ -1758,6 +1829,20 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             .collect()
     }
 
+    fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool {
+        self.motor_status
+            .iter()
+            .enumerate()
+            .any(|(i, &s)| i < arm_dof && s != 0 && !self.is_benign_gripper_overload(i, s))
+    }
+
+    fn has_hardware_fault(&self) -> bool {
+        self.motor_status
+            .iter()
+            .enumerate()
+            .any(|(i, &s)| s != 0 && !self.is_benign_gripper_overload(i, s))
+    }
+
     fn has_known_partial_enable(&self) -> bool {
         self.partial_enable_known
     }
@@ -2764,6 +2849,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_fence_holdoff: Duration,
     /// The operator cleared the trip (`acknowledge_mit_fence_trip`): polls may resume.
     mit_fence_acked: bool,
+    /// RX sequence boundary captured at the start of the most recent [`ArmDriver::mit_expiry_recover`]
+    /// request; final MIT clear requires every joint's `last_feedback_seq` to exceed this boundary.
+    last_mit_recovery_rx_seq: Option<u64>,
     /// MIT tracking armed a fence since the last confirmed enable: base-mode restores use POS_VEL
     /// frames only.
     mit_tracking_used: bool,
@@ -3207,6 +3295,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
             mit_fence_acked: false,
+            last_mit_recovery_rx_seq: None,
             mit_tracking_used: false,
             torque_hs: None,
             rx_deadline: None,
@@ -6134,6 +6223,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.mit_fence = None;
                 self.mit_fence_trip = None;
                 self.mit_fence_acked = false;
+                self.last_mit_recovery_rx_seq = None;
                 self.mit_tracking_used = false;
                 self.mit_fence_last_cmd.fill(None);
                 Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
@@ -6544,9 +6634,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn clock_now(&self) -> Instant { self.now() }
 
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
-        // after a trip the poll obeys the same clearance + quiet-period gate as every other poll
+        // Enforce the post-trip quiet period directly without requiring or mutating
+        // `mit_fence_acked`: autonomous background CAN refreshes stay inhibited until
+        // `acknowledge_mit_fence_trip()` runs AFTER `clear_check` passes.
         if let Some((_, at)) = &self.mit_fence_trip {
-            if !self.poll_tx_allowed() {
+            if self.since(*at) < self.mit_fence_holdoff {
                 let remaining = self.mit_fence_holdoff.saturating_sub(self.since(*at));
                 return Err(format!("{}: the motors' command timeout may still be running; no frame is sent for {} ms more after the loss",
                     crate::mit::QUIET_PERIOD_CODE, remaining.as_millis().max(1)));
@@ -6587,9 +6679,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn mit_expiry_recover(&mut self) -> Result<(), String> {
+        self.last_mit_recovery_rx_seq = None;
         self.discard_pending_tx_stopped();
         self.begin_tx_tick();
         let start_stamp = self.current_stop_stamp();
+        let req_boundary = self
+            .rx_boundary()
+            .map_err(|e| format!("receive boundary before MIT recovery: {e}"))?;
         // 1. clear-error (FF..FB on the motor's ID) to every motor reporting an error state
         let faulted: Vec<usize> = (0..self.motor_ids.len()).filter(|&i| self.motor_status[i] >= 8).collect();
         for &i in &faulted {
@@ -6615,13 +6711,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // 2. no cached frame may ever be replayed; then the disable of every motor
         self.clear_cached_targets();
         let res = self.set_torque(false);
+        let boundary = self
+            .last_enable_command_rx_seq
+            .map_or(req_boundary, |s| s.max(req_boundary));
         let unconfirmed: Vec<String> = (0..self.motor_ids.len()).filter(|&i| {
-            !(self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+            !(self.motor_feedback_after(i, self.last_enable_command, Some(boundary))
+                && self.last_feedback_seq[i] > boundary
                 && self.motor_status[i] == 0)
         }).map(|i| format!("J{}", i + 1)).collect();
         if res.is_err() || !unconfirmed.is_empty() {
             return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
         }
+        self.last_mit_recovery_rx_seq = Some(boundary);
         self.disable_confirmed_sticky = true;
         self.mit_fence = None;
         Ok(())
@@ -6629,6 +6730,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn acknowledge_mit_fence_trip(&mut self) {
         if self.mit_fence_trip.is_some() { self.mit_fence_acked = true; }
+    }
+
+    fn mit_feedback_after_recovery(&self, dof: usize) -> bool {
+        !self.awaiting_rx_boundary
+            && self.last_mit_recovery_rx_seq.is_some_and(|req| {
+                self.last_feedback_seq.len() == dof
+                    && self.last_feedback_seq.iter().all(|&seq| seq > req)
+            })
     }
 
     fn joint_modes_uncertain(&self) -> bool {
@@ -7592,6 +7701,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.feedback_queue_bound); }
     fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.last_feedback_instant); }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { out.clear(); out.extend_from_slice(&self.motor_status); true }
+    fn clear_fault_disables_arm_joint(&self, _arm_dof: usize) -> bool { false }
+    fn has_hardware_fault(&self) -> bool {
+        self.motor_status.iter().any(|&st| damiao_fault_name(st).is_some())
+    }
     fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
         out.clear();
         out.extend_from_slice(&self.recovery_written_joints);
@@ -8166,6 +8279,12 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
             }
         }
         Ok(())
+    }
+
+    fn clear_fault_disables_arm_joint(&self, _arm_dof: usize) -> bool { false }
+
+    fn has_hardware_fault(&self) -> bool {
+        self.fault_flags.iter().any(|&flags| flags != 0)
     }
 
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> {

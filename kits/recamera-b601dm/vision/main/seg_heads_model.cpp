@@ -159,7 +159,8 @@ ma_err_t SegHeadsModel::decode() {
                 det.grasp_width_px = static_cast<float>(cs.width_px);
             }
             // the outline before mask_buf_ is reused: crop cells -> input -> letterbox undone -> frame
-            det.contour = rv::mask_exterior_contour(mask_buf_.data(), b.crop_w, b.crop_h, b.crop_w);
+            det.contour = rv::mask_exterior_contour(mask_buf_.data(), b.crop_w, b.crop_h, b.crop_w, rv::kMaxContourVertices,
+                                                   0.7f, acc_buf_.data(), b.crop_w);
             rv::contour_to_frame_norm(det.contour, rv::seg_cells_to_frame(info_, geom_, b, frame_w_, frame_h_));
             det.mask_focus = focused;
             mask_ms += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();

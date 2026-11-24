@@ -54,6 +54,8 @@ async fn estop_and_typed_reasons_map_to_codes() {
     assert!(!fault.recoverable);
     assert!(fault.message.contains("Joint 2"), "{}", fault.message);
 
+    // ThermalTrip outranks BusLoss in the fault severity order; verify BusLoss mapping independently.
+    let supervisor = sim();
     supervisor.inner().write().await.safety.trigger_fault(FaultReason::BusLoss);
     assert_eq!(supervisor.get_observation().await.fault.unwrap().code, FaultCode::BusLoss);
 }

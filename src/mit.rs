@@ -34,6 +34,10 @@ use crate::tracking::{JointTrackingConfig, TrackingStrategy};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::driver::JointTarget;
 
+/// Bounded, zero-allocation error text returned by Step-5 output writes.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type OutputErrorText = crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>;
+
 /// WS path of the TIMEOUT commissioning.
 pub const TIMEOUT_PATH: &str = "/api/v1/calibration/mit_timeout";
 /// WS path that stores the qualification record.
@@ -676,7 +680,7 @@ impl crate::supervisor::SupervisorInner {
     /// unchanged. With MIT active: the owned joints get MIT frames ([`Self::mit_prepare`]); the
     /// feed-forward history advances only after a successful flush; a failed write cancels the
     /// group. MIT lost: nothing is written (None).
-    pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), String>> {
+    pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), OutputErrorText>> {
         self.write_output_slice(&mut targets, dt, None)
     }
 
@@ -687,13 +691,13 @@ impl crate::supervisor::SupervisorInner {
         mut targets: Vec<JointTarget>,
         dt: f64,
         limits: &[crate::model::JointLimit],
-    ) -> Option<Result<(), String>> {
+    ) -> Option<Result<(), OutputErrorText>> {
         self.write_output_slice(&mut targets, dt, Some(limits))
     }
 
     /// [`Self::write_output`] of the targets in the tick's scratch (`scratch.targets`, filled by
     /// the caller): no allocation for the ordinary position output.
-    pub(crate) fn write_output_scratch(&mut self, dt: f64) -> Option<Result<(), String>> {
+    pub(crate) fn write_output_scratch(&mut self, dt: f64) -> Option<Result<(), OutputErrorText>> {
         let mut targets = std::mem::take(&mut self.scratch.targets);
         let r = self.write_output_slice(&mut targets, dt, None);
         self.scratch.targets = targets;
@@ -732,12 +736,13 @@ impl crate::supervisor::SupervisorInner {
         Some(self.gripper_hold_vel_ceiling.map_or(ceiling, |hold_v| ceiling.min(hold_v)))
     }
 
+    #[allow(clippy::result_large_err)] // inline bounded text avoids RT heap allocation
     fn write_output_slice(
         &mut self,
         targets: &mut [JointTarget],
         dt: f64,
         override_limits: Option<&[crate::model::JointLimit]>,
-    ) -> Option<Result<(), String>> {
+    ) -> Option<Result<(), OutputErrorText>> {
         // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
         // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
         if self.urgent_stop_unapplied() { return None; }
@@ -746,7 +751,11 @@ impl crate::supervisor::SupervisorInner {
             MitOwner::Lost => return None,
             MitOwner::Active => match self.mit_prepare(targets, dt) {
                 Ok(ff) => Some(ff),
-                Err(e) => return Some(Err(format!("MIT output refused: {e}"))),
+                Err(e) => {
+                    let mut buf = OutputErrorText::empty();
+                    let _ = core::fmt::write(&mut buf, format_args!("MIT output refused: {e}"));
+                    return Some(Err(buf));
+                }
             },
         };
         let active_pf_ceiling = self.config.gripper_index().and_then(|g| {
@@ -799,7 +808,11 @@ impl crate::supervisor::SupervisorInner {
                 } else {
                     drv.write_joint_targets(targets)
                 };
-                write_res.map_err(|e| e.to_string())
+                write_res.map_err(|e| {
+                    let mut buf = OutputErrorText::empty();
+                    e.write_bounded(&mut buf);
+                    buf
+                })
             });
         if let Some(ff) = ff {
             match &res {
@@ -824,16 +837,22 @@ impl crate::supervisor::SupervisorInner {
         self.servo_stream_active = false;
         self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            self.commanded_positions = self.measured_positions.clone();
-            self.target_positions = self.measured_positions.clone();
+            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
         }
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
-        // latched also over another fault (an E-stop stays the stronger state)
-        if *self.safety.state() != crate::safety::SafetyState::EStop {
-            self.safety.trigger_fault_coded(code, crate::safety::FaultReason::Other(format!(
-                "MIT_LOST: {reason}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)")));
-        }
+        self.safety.latch(
+            crate::safety::FaultKind::from_code(code),
+            crate::safety::FaultDetail::formatted(code, |buf| {
+                let _ = core::fmt::write(
+                    buf,
+                    format_args!(
+                        "MIT_LOST: {reason}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)"
+                    ),
+                );
+            }),
+        );
     }
 
     /// Deadline supervision while MIT owns joints: the driver fence, every joint's feedback age
@@ -855,13 +874,18 @@ impl crate::supervisor::SupervisorInner {
         if self.mit.owner == MitOwner::Lost {
             // a trip seen after the group was cancelled for another reason is still a loss
             let tripped = self.driver.as_ref().and_then(|d| d.lock().ok()).and_then(|drv| drv.mit_fence_trip());
-            let code = self.safety.fault().map(|f| f.code);
             if let Some(t) = tripped {
-                if code != Some(crate::safety::FaultCode::BusLoss) && code != Some(crate::safety::FaultCode::Estop) {
-                    self.safety.trigger_fault_coded(crate::safety::FaultCode::BusLoss,
-                        crate::safety::FaultReason::Other(format!("MIT_LOST: driver deadline fence: {t}; if a motor's command timeout expired, \
-                            clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)")));
-                }
+                self.safety.latch(
+                    crate::safety::FaultKind::BusLoss,
+                    crate::safety::FaultDetail::formatted(crate::safety::FaultCode::BusLoss, |buf| {
+                        let _ = core::fmt::write(
+                            buf,
+                            format_args!(
+                                "MIT_LOST: driver deadline fence: {t}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)"
+                            ),
+                        );
+                    }),
+                );
             }
             return;
         }
@@ -1039,7 +1063,12 @@ impl crate::supervisor::SupervisorInner {
                         if let (Some(t), Some(slot)) = (hold[j].torque, self.mit.last_ff.get_mut(j)) { *slot = t; }
                     }
                     self.mit.last_output = Some(self.mit_now());
-                    self.safety.trigger_fault_coded(crate::safety::FaultCode::HardwareFault, crate::safety::FaultReason::Other(msg.clone()));
+                    self.safety.latch(
+                        crate::safety::FaultKind::Other,
+                        crate::safety::FaultDetail::formatted(crate::safety::FaultCode::HardwareFault, |buf| {
+                            let _ = core::fmt::write(buf, format_args!("{msg}"));
+                        }),
+                    );
                 }
                 self.mit.handover_error = Some(msg.clone());
                 Err(msg)
@@ -1082,11 +1111,37 @@ impl crate::supervisor::SupervisorInner {
     /// motors, a disable of every motor confirmed per motor, then Idle with torque off and the
     /// MIT group reset (fence disarmed, history cleared; the qualification record is untouched
     /// and the next arm reads the TIMEOUT again). A motor that does not confirm keeps the fault.
-    pub(crate) fn mit_expiry_recovery(&mut self) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
-        use crate::safety::SafetyError;
-        let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-            Some(mut drv) => drv.mit_expiry_recover(),
-            None => Err("no driver".into()),
+    pub(crate) fn mit_expiry_recovery_for_epoch(
+        &mut self,
+        expected_epoch: Option<u64>,
+    ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
+        use crate::driver::EnableState;
+        use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
+        // Single authoritative clear_check FIRST before issuing any recovery disable/reset commands.
+        let mut pre_ctx = self.build_mit_recovery_clear_context();
+        pre_ctx.expected_epoch = expected_epoch;
+        pre_ctx.pending_estop = self.estop_request_unapplied();
+        if let Err(refusal) = self.safety.clear_check(&pre_ctx) {
+            if refusal == ClearRefusal::EStopActive {
+                self.consume_pending_estop();
+                if let Some(received) = expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(SafetyError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        });
+                    }
+                }
+            }
+            return Err(refusal.into_safety_error());
+        }
+        let (pre_recovery_seqs, res) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            Some(mut drv) => {
+                let pre = drv.feedback_seqs();
+                let r = drv.mit_expiry_recover();
+                (pre, r)
+            }
+            None => (Vec::new(), Err("no driver".into())),
         };
         if let Err(e) = res {
             let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
@@ -1099,29 +1154,173 @@ impl crate::supervisor::SupervisorInner {
         self.servo_stream_active = false;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
+        self.is_torqued = false;
+        self.disable_pending = false;
+        self.pending_rearm = false;
+
+        // Refresh supervisor feedback from samples received strictly AFTER the recovery request
+        // (verified by per-joint receive sequence advance AND driver post-recovery RX boundary) —
+        // never evaluate final `clear_check` on cached or pre-recovery feedback.
+        let post_read = self.driver.as_ref().and_then(|d| {
+            d.lock().ok().and_then(|mut drv| {
+                let states = drv.read_joint_states().ok()?;
+                let post_seqs = drv.feedback_seqs();
+                let seqs_after_recovery = pre_recovery_seqs.len() == self.config.dof
+                    && post_seqs.len() == self.config.dof
+                    && post_seqs
+                        .iter()
+                        .zip(&pre_recovery_seqs)
+                        .all(|(&post, &pre)| post > pre);
+                let rx_boundary_ok = drv.mit_feedback_after_recovery(self.config.dof);
+                let ages = drv.feedback_ages();
+                let loads = drv.joint_loads();
+                let caps = drv.capabilities();
+                let fb_fresh = seqs_after_recovery
+                    && rx_boundary_ok
+                    && drv.is_feedback_valid()
+                    && ages.len() == self.config.dof
+                    && ages
+                        .iter()
+                        .all(|a| a.is_some_and(|t| t <= crate::supervisor::THERMAL_FEEDBACK_FRESHNESS_LIMIT))
+                    && Self::states_valid(&states, caps, self.config.dof, loads.as_deref());
+                let hw_err = drv.check_hardware_status().err().map(|e| e.to_clear_fault_error());
+                let hw_fault = drv.has_hardware_fault();
+                let state = drv.enable_state();
+                let partial = drv.has_known_partial_enable();
+                let enable_known = state != EnableState::Unknown || partial;
+                let oldest_age = ages
+                    .iter()
+                    .copied()
+                    .try_fold(std::time::Duration::ZERO, |m, a| a.map(|t| m.max(t)));
+                let threshold = self.config.max_temperature - crate::supervisor::THERMAL_CLEAR_MARGIN_C;
+                let thermal_below = fb_fresh
+                    && caps.temperature_feedback
+                    && !states.is_empty()
+                    && states.iter().all(|s| s.temperature.is_finite() && s.temperature <= threshold);
+                let mut rx_buf = Vec::new();
+                let next_cd = self.evaluate_thermal_cooldown_with_driver(
+                    drv.as_ref(),
+                    &ages,
+                    thermal_below,
+                    &mut rx_buf,
+                );
+                Some((
+                    states,
+                    loads,
+                    caps.temperature_feedback,
+                    fb_fresh,
+                    hw_err,
+                    hw_fault,
+                    enable_known,
+                    oldest_age,
+                    next_cd,
+                ))
+            })
+        });
+        let (post_fb_fresh, post_temp_fb, post_hw_err, post_hw_fault, post_enable_known) =
+            if let Some((states, loads, temp_fb, fb_fresh, hw_err, hw_fault, enable_known, oldest_age, next_cd)) = post_read {
+                self.feedback_numeric_valid = fb_fresh;
+                if fb_fresh {
+                    self.last_can_feedback_instant =
+                        oldest_age.and_then(|age| std::time::Instant::now().checked_sub(age));
+                    Self::apply_feedback(
+                        &mut self.measured_positions,
+                        &mut self.measured_velocities,
+                        &mut self.torques,
+                        &mut self.temperatures,
+                        &mut self.loads,
+                        self.config.dof,
+                        &states,
+                        loads.as_deref(),
+                    );
+                    if temp_fb {
+                        self.thermal_cooldown = next_cd;
+                        let temps_copy = self.temperatures.clone();
+                        if let Some((joint_idx, temperature)) = temps_copy
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|(_, t)| t.is_finite() && *t > self.config.max_temperature)
+                            .max_by(|a, b| a.1.total_cmp(&b.1))
+                        {
+                            self.thermal_cooldown.reset();
+                            self.safety.latch(
+                                FaultKind::ThermalTrip,
+                                FaultDetail::ThermalTrip {
+                                    joint_idx,
+                                    temperature,
+                                    limit: self.config.max_temperature,
+                                },
+                            );
+                        }
+                    } else {
+                        self.thermal_cooldown.reset();
+                    }
+                } else {
+                    self.last_can_feedback_instant = None;
+                    self.thermal_cooldown.reset();
+                }
+                (fb_fresh, temp_fb, hw_err, hw_fault, enable_known)
+            } else {
+                self.feedback_numeric_valid = false;
+                self.last_can_feedback_instant = None;
+                self.thermal_cooldown.reset();
+                (false, false, None, false, false)
+            };
+
+        if post_fb_fresh && self.measured_positions.iter().all(|q| q.is_finite()) {
+            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+
+        // An E-stop that arrived while the disables were confirmed wins: never end in Idle.
+        self.consume_pending_estop();
+        let mut post_ctx = self.build_mit_recovery_clear_context();
+        post_ctx.expected_epoch = expected_epoch;
+        post_ctx.pending_estop = self.estop_request_unapplied();
+        post_ctx.feedback_fresh = post_fb_fresh;
+        post_ctx.thermal_sensor_available = post_temp_fb;
+        post_ctx.hardware_error = post_hw_err;
+        post_ctx.hardware_reset_required = post_hw_fault;
+        post_ctx.enable_state_known = post_enable_known;
+        if let Some(received) = expected_epoch {
+            if received != self.safety.epoch_id() {
+                return Err(SafetyError::EpochMismatch {
+                    expected: self.safety.epoch_id(),
+                    received,
+                });
+            }
+        }
+        if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.safety.clear_with_check(&post_ctx);
+            self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
+            return Err(SafetyError::EStopActive);
+        }
+        if let Err(refusal) = self.safety.clear_with_check(&post_ctx) {
+            if refusal == ClearRefusal::EStopActive {
+                self.consume_pending_estop();
+                if let Some(received) = expected_epoch {
+                    if received != self.safety.epoch_id() {
+                        return Err(SafetyError::EpochMismatch {
+                            expected: self.safety.epoch_id(),
+                            received,
+                        });
+                    }
+                }
+            }
+            return Err(refusal.into_safety_error());
+        }
         self.mit.owner = MitOwner::Off;
         self.mit.joints.clear();
         self.mit.last_ff.clear();
         self.mit.last_output = None;
         self.mit.armed_ok = false;
         self.mit.revoke_pending = false;
-        if self.measured_positions.iter().all(|q| q.is_finite()) {
-            self.commanded_positions = self.measured_positions.clone();
-            self.target_positions = self.measured_positions.clone();
+        if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            drv.acknowledge_mit_fence_trip();
         }
-        self.commanded_velocities.fill(0.0);
-        self.commanded_accelerations.fill(0.0);
-        self.is_torqued = false;
-        self.disable_pending = false;
-        self.pending_rearm = false;
-        // an E-stop that arrived while the disables were confirmed wins: never end in Idle
-        self.consume_pending_estop();
-        if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
-            self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
-            return Err(SafetyError::EStopActive);
-        }
-        crate::supervisor::SupervisorInner::check_concurrent_estop(self)?;
-        self.safety.clear_fault()?;
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
@@ -1137,8 +1336,16 @@ impl crate::supervisor::SupervisorInner {
     /// (`{"mit_recovery": "torque_off_all"}`). Without it, the recovery state is refused with
     /// [`RECOVERY_CONFIRM_CODE`]; every other state clears as `clear_fault`.
     pub fn clear_fault_confirmed(&mut self, mit_recovery: bool) -> Result<crate::safety::SafetyState, crate::supervisor::ArmError> {
+        self.clear_fault_confirmed_for_epoch(mit_recovery, None)
+    }
+
+    pub fn clear_fault_confirmed_for_epoch(
+        &mut self,
+        mit_recovery: bool,
+        expected_epoch: Option<u64>,
+    ) -> Result<crate::safety::SafetyState, crate::supervisor::ArmError> {
         self.mit.recovery_confirmed = mit_recovery;
-        let res = self.clear_fault();
+        let res = self.clear_fault_for_epoch(expected_epoch);
         self.mit.recovery_confirmed = false;
         res.map_err(|e| match e {
             crate::safety::SafetyError::ClearFaultRejected(m) if m.starts_with(RECOVERY_CONFIRM_CODE) =>

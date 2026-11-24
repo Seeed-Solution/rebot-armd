@@ -704,12 +704,13 @@ impl WasmEngine {
             self.collision.sensitivity = sensitivity;
         }
         let supported = self.supported_joints(q_meas, &policy);
-        let collision = self.collision.step(
+        let collision = self.collision.step_guard(
             residual.as_ref(),
             dt_s,
             self.simulation_s,
             &policy,
             operational,
+            torqued && !self.collision_fault,
             &supported,
         );
         self.collision_fault |= collision.escalated;
