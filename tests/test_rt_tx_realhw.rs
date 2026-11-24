@@ -6844,3 +6844,259 @@ fn dual_owner_torque_on_first_0x307_is_zero_vel_hold_at_measured_position() {
         }
     }
 }
+
+/// PR P + J7 single effective TX cutoff & stop/hold/freeze exception on BOTH owners
+/// (Legacy and RT Executor):
+/// (a) Fresh J7 `Target` motion respects the active action/macro deadline (`drv_action_cutoff`):
+///     ZERO `0x307` target frames reach the wire after the deadline, with no `CAN_TX_STALLED`.
+/// (b) Stale J7 (`> 100 ms`) FREEZE frame STILL goes out after an expired action/macro deadline
+///     (while arm motion frames are refused by the cutoff).
+/// (c) STOP arriving at/after an expired action/macro deadline STILL transmits J7's zero-velocity
+///     STOP HOLD frame (`vel_raw == 0`, measured pos, configured cap).
+/// (d) Mid-batch arm TX crossing the action/macro deadline (after `TickTxPass` was already opened
+///     under `drv_action_cutoff`) refuses remaining arm motion frames while STILL transmitting
+///     J7's FREEZE frame (proving `TickTxPass::deadline` is not poisoned by an expired action cutoff).
+#[test]
+fn dual_owner_tx_cutoff_blocks_j7_target_but_allows_stop_hold_freeze() {
+    use std::sync::atomic::AtomicBool;
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+    let wide_budget = TxBudget { max_frames: 16, max_duration: ms(15), frame_max_age: ms(45) };
+
+    // Helper: create a DualRig with an active sequence macro whose parent deadline is `now + 5 ms`
+    // and whose running child drives J1..J6 + closes J7 toward 0.0 rad.
+    let setup_macro_close = |owner: Owner| -> (DualRig, u64) {
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), Some(wide_budget));
+        rig.inner_mut().commanded_positions[6] = -2.5;
+        rig.inner_mut().target_positions[6] = -2.5;
+        rig.inner_mut().measured_positions[6] = -2.5;
+        rig.bus.with(|s| {
+            s.motors[6].q = -2.5;
+            s.push_all_feedback();
+        });
+        rig.step();
+
+        let macro_id = {
+            let inner = rig.inner_mut();
+            let ep = inner.safety.epoch_id();
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).expect("admit sequence macro");
+            let id = SupervisorInner::begin_sequence_action(admitted, Some("cutoff-test".into()), ep)
+                .expect("begin sequence macro");
+            let mut goal = inner.commanded_positions.clone();
+            for g in goal.iter_mut().take(6) {
+                *g += 0.25;
+            }
+            goal[6] = 0.0;
+            let limits = inner.planning_limits();
+            let stamp2 = inner.current_admission_stamp();
+            let admitted2 = inner.check_admission(stamp2).expect("admit macro child");
+            SupervisorInner::install_macro_quintic(admitted2, id, goal, &limits)
+                .expect("install macro child");
+            id
+        };
+        // Step 1 tick before deadline so the macro child is actively executing motion on J1..J7.
+        rig.bus.clear_log();
+        rig.step();
+        let pre_j7 = j7_pf_frames(&rig.bus.tx_log());
+        assert_eq!(pre_j7.len(), 1, "{owner:?}: expected closing 0x307 before deadline");
+        assert!(
+            u16::from_le_bytes([pre_j7[0].data[4], pre_j7[0].data[5]]) > 0,
+            "{owner:?}: J7 must be executing Target motion before cutoff test"
+        );
+        (rig, macro_id)
+    };
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // --- (a) Fresh J7 Target motion blocked by expired action/macro deadline ---
+        {
+            let (mut rig, macro_id) = setup_macro_close(owner);
+            let dl = rig.clock.now() + ms(5);
+            if let Some(m) = rig.inner_mut().macro_run.as_mut() {
+                m.deadline = Some(dl);
+                m.timeout_code = armd::safety::BoundedText::new("SEQUENCE_TIMEOUT");
+            }
+            let clk = rig.clock.clone();
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_cb = Arc::clone(&fired);
+            rig.inner_mut().post_stop_check_hook = Some(Arc::new(move || {
+                if !fired_cb.swap(true, Ordering::SeqCst) {
+                    clk.advance(ms(8)); // 8 ms > 5 ms action cutoff, < 15 ms tx budget < 18 ms release cap
+                }
+            }));
+
+            rig.bus.clear_log();
+            rig.bus.with(|s| s.push_all_feedback());
+            rig.step_dt(DT, false);
+            rig.inner_mut().post_stop_check_hook = None;
+
+            assert!(fired.load(Ordering::SeqCst), "{owner:?} (a): hook must have fired");
+            let log = rig.bus.tx_log();
+            assert!(
+                log.iter().all(|f| !(0x101..=0x106).contains(&f.id)),
+                "{owner:?} (a): expected ZERO arm motion frames past action cutoff: {log:?}"
+            );
+            assert!(
+                j7_pf_frames(&log).is_empty(),
+                "{owner:?} (a): fresh J7 Target MUST respect action/macro deadline cutoff (0 frames): {log:?}"
+            );
+            assert!(
+                rig.inner().safety.state().is_operational(),
+                "{owner:?} (a): action cutoff must NOT latch CAN_TX_STALLED: {:?}",
+                rig.inner().safety.state()
+            );
+            assert!(
+                rig.inner().macro_run.as_ref().is_none_or(|m| m.id != macro_id || m.finishing),
+                "{owner:?} (a): expired macro must terminate cleanly after cutoff"
+            );
+        }
+
+        // --- (b) EXCEPTION: Stale J7 (> 100 ms) FREEZE frame STILL goes out after action deadline ---
+        {
+            let (mut rig, _macro_id) = setup_macro_close(owner);
+            let last_fresh_j7 = rig.inner().measured_positions[6];
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[6].mute_feedback = true;
+            });
+            rig.clock.advance(ms(115));
+
+            let dl = rig.clock.now() + ms(5);
+            if let Some(m) = rig.inner_mut().macro_run.as_mut() {
+                m.deadline = Some(dl);
+                m.timeout_code = armd::safety::BoundedText::new("SEQUENCE_TIMEOUT");
+            }
+            let clk = rig.clock.clone();
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_cb = Arc::clone(&fired);
+            rig.inner_mut().post_stop_check_hook = Some(Arc::new(move || {
+                if !fired_cb.swap(true, Ordering::SeqCst) {
+                    clk.advance(ms(8));
+                }
+            }));
+
+            rig.bus.clear_log();
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            rig.inner_mut().post_stop_check_hook = None;
+
+            assert!(fired.load(Ordering::SeqCst), "{owner:?} (b): hook must have fired");
+            let log = rig.bus.tx_log();
+            assert!(
+                log.iter().all(|f| !(0x101..=0x106).contains(&f.id)),
+                "{owner:?} (b): arm motion frames must still be blocked past action cutoff: {log:?}"
+            );
+            assert_j7_freeze_frames(
+                &j7_pf_frames(&log),
+                last_fresh_j7,
+                pf_cur,
+                &format!("{owner:?} (b) J7 FREEZE after expired action deadline"),
+            );
+            assert!(
+                rig.inner().safety.state().is_operational(),
+                "{owner:?} (b): stale-J7 freeze past action cutoff must NOT latch CAN_TX_STALLED: {:?}",
+                rig.inner().safety.state()
+            );
+        }
+
+        // --- (c) EXCEPTION: STOP arriving at/after action deadline STILL sends J7 STOP HOLD ---
+        {
+            let (mut rig, _macro_id) = setup_macro_close(owner);
+            let stops = armd::rt_core::urgent::StopRequests::new();
+            rig.inner_mut().attach_stop_requests(stops.clone());
+            let dl = rig.clock.now() + ms(5);
+            if let Some(m) = rig.inner_mut().macro_run.as_mut() {
+                m.deadline = Some(dl);
+                m.timeout_code = armd::safety::BoundedText::new("SEQUENCE_TIMEOUT");
+            }
+            let clk = rig.clock.clone();
+            let stops_cb = stops.clone();
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_cb = Arc::clone(&fired);
+            rig.inner_mut().post_stop_check_hook = Some(Arc::new(move || {
+                if !fired_cb.swap(true, Ordering::SeqCst) {
+                    clk.advance(ms(8));
+                    let _ = stops_cb.request();
+                }
+            }));
+
+            rig.bus.clear_log();
+            rig.bus.with(|s| s.push_all_feedback());
+            rig.step_dt(DT, false);
+            rig.inner_mut().post_stop_check_hook = None;
+
+            assert!(fired.load(Ordering::SeqCst), "{owner:?} (c): hook must have fired");
+            let log = rig.bus.tx_log();
+            assert!(
+                log.iter().all(|f| !(0x101..=0x106).contains(&f.id)),
+                "{owner:?} (c): arm motion must not go out after cutoff + STOP: {log:?}"
+            );
+            let j7 = j7_pf_frames(&log);
+            assert_eq!(
+                j7.len(),
+                1,
+                "{owner:?} (c): STOP after expired action deadline MUST still emit J7 Hold frame: {log:?}"
+            );
+            let v_wire = u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]);
+            let i_wire = u16::from_le_bytes([j7[0].data[6], j7[0].data[7]]);
+            assert_eq!(v_wire, 0, "{owner:?} (c): J7 STOP Hold must have vel_raw == 0");
+            assert_eq!(i_wire, pf_cur, "{owner:?} (c): J7 STOP Hold must carry configured cap");
+        }
+
+        // --- (d) EXCEPTION: mid-batch arm TX crosses action deadline (TickTxPass already open
+        //         under drv_action_cutoff) + stale J7 -> arm stops at cutoff, J7 FREEZE STILL sends ---
+        {
+            let (mut rig, _macro_id) = setup_macro_close(owner);
+            let last_fresh_j7 = rig.inner().measured_positions[6];
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[6].mute_feedback = true;
+            });
+            rig.clock.advance(ms(115));
+
+            let dl = rig.clock.now() + ms(5);
+            if let Some(m) = rig.inner_mut().macro_run.as_mut() {
+                m.deadline = Some(dl);
+                m.timeout_code = armd::safety::BoundedText::new("SEQUENCE_TIMEOUT");
+            }
+            let clk = rig.clock.clone();
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_cb = Arc::clone(&fired);
+            rig.bus.with(|s| {
+                s.on_tx = Some(Arc::new(move || {
+                    if !fired_cb.swap(true, Ordering::SeqCst) {
+                        // Frame 0 (J1) sent before action cutoff; advance clock across 5 ms cutoff
+                        // while staying strictly inside 15 ms tx budget and 18 ms release cap.
+                        clk.advance(ms(8));
+                    }
+                }));
+            });
+
+            rig.bus.clear_log();
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.step_dt(DT, false);
+            rig.bus.with(|s| s.on_tx = None);
+
+            assert!(fired.load(Ordering::SeqCst), "{owner:?} (d): mid-batch on_tx hook must fire");
+            let log = rig.bus.tx_log();
+            let arm_frames: Vec<_> = log.iter().filter(|f| (0x101..=0x106).contains(&f.id)).collect();
+            assert_eq!(
+                arm_frames.len(),
+                1,
+                "{owner:?} (d): mid-batch cutoff must stop arm motion after frame 0: {log:?}"
+            );
+            assert_j7_freeze_frames(
+                &j7_pf_frames(&log),
+                last_fresh_j7,
+                pf_cur,
+                &format!("{owner:?} (d) J7 FREEZE after mid-batch action cutoff (unpoisoned TickTxPass)"),
+            );
+            assert!(
+                rig.inner().safety.state().is_operational(),
+                "{owner:?} (d): mid-batch cutoff + J7 freeze must NOT latch CAN_TX_STALLED: {:?}",
+                rig.inner().safety.state()
+            );
+        }
+    }
+}
