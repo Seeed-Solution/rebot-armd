@@ -18,9 +18,7 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
             return lease::execute_clear_fault(inner, body, epoch);
         }
         "/api/v1/motion/servo" => {
-            let targets = positions(body.get("targets"))?;
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            SupervisorInner::servo(admitted, targets, epoch).map_err(ArmError::from)?;
+            return servo::execute_servo_command(inner, stamp, body, epoch);
         }
         "/api/v1/motion/jog" => {
             let speed_scale = crate::motion::num(body, "speed_scale").map_err(ArmError::from)?;

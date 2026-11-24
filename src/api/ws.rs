@@ -31,6 +31,9 @@ use calibration::*;
 mod config;
 #[allow(unused_imports)]
 use config::*;
+mod servo;
+#[allow(unused_imports)]
+use servo::*;
 
 pub type ConnectionRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>;
 
@@ -430,7 +433,7 @@ fn cancelled_reply(value: &Value, code: &str, epoch: Option<u64>) -> Option<Valu
     } else if kind == "preset" {
         reply["type"] = json!("preset_reject");
         reply["name"] = value.get("name").cloned().unwrap_or(Value::Null);
-    } else if kind == "servo" || value.get("positions").is_some() || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") {
+    } else if servo::is_servo_frame(kind, value) {
         reply["type"] = json!("servo_reject");
         reply["reason"] = json!("stopped");
     } else {
@@ -458,7 +461,7 @@ fn ws_status_reject(kind: &str, value: &Value, status: u16, code: &str, msg: &st
         Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":status, "code":code, "error":code, "message":msg}))
     } else if kind == "preset" {
         Some(json!({"type":"preset_reject", "name":value.get("name"), "status":status, "code":code, "error":code, "message":msg}))
-    } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
+    } else if servo::is_servo_frame(kind, value) {
         Some(json!({"type":"servo_reject", "reason":servo_reason, "status":status, "code":code, "error":code, "message":msg}))
     } else {
         None
@@ -1217,9 +1220,7 @@ impl OrdinaryQueue {
                     let kind = item.value.get("type").and_then(Value::as_str).unwrap_or("");
                     let exempt_disable = code == "STOPPED" && is_torque_disable_command(&item.value);
                     let cancellable = !exempt_disable
-                        && (matches!(kind, "command" | "preset" | "servo")
-                            || item.value.get("positions").is_some()
-                            || item.value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream"));
+                        && (matches!(kind, "command" | "preset") || servo::is_servo_frame(kind, &item.value));
                     if cancellable {
                         to_cancel.push(item.value);
                     } else {
@@ -2462,8 +2463,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             &recv_client_label,
                         );
                         let is_dry_run = kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/action/grasp") && value.get("body").and_then(|b| b.get("dry_run")).and_then(Value::as_bool) == Some(true);
-                        if (kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream")) && value.get("generation").and_then(Value::as_u64).is_none() {
-                            response = Some(json!({"type":"servo_reject", "reason":"missing_generation"}));
+                        if let Some(reject) = servo::missing_generation_reject(kind, &value) {
+                            response = Some(reject);
                         } else if !authorized && !is_dry_run {
                             response = Some(lease::lease_loss_reply(&inner, kind, &value, &recv_connection, local_generation));
                         } else if kind == "release_lease" {
@@ -2539,29 +2540,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 }
                             } else if kind == "preset" {
                                 response = Some(motion::handle_preset(&mut inner, stamp, &value, epoch));
-                            } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
-                                match value.get("sequence_id").and_then(Value::as_u64) {
-                                    _ if inner.calibration_busy => response = Some(json!({"type":"servo_reject", "reason":"calibration_busy"})),
-                                    None => response = Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})),
-                                    Some(sequence) if last_sequence.is_some_and(|last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) => {
-                                        response = Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"}));
-                                    }
-                                    Some(sequence) => {
-                                        last_sequence = Some(sequence);
-                                        response = match positions(value.get("positions")).and_then(|targets| {
-                                            let admitted = inner.check_admission(stamp).map_err(|error| ApiError::from(ArmError::from(error)))?;
-                                            SupervisorInner::servo(admitted, targets, epoch).map_err(|error| ApiError::from(ArmError::from(error)))
-                                        }) {
-                                            Ok(()) => None,
-                                            Err(error) => {
-                                                let stopped = error.code.as_deref() == Some("STOPPED");
-                                                let mut r = rejection(error, "servo_reject", epoch);
-                                                if stopped { r["reason"] = json!("stopped"); }
-                                                Some(r)
-                                            }
-                                        };
-                                    }
-                                }
+                            } else if servo::is_servo_frame(kind, &value) {
+                                response = servo::handle_servo_frame(&mut inner, stamp, &value, epoch, &mut last_sequence);
                             } else { response = None; }
                         }
                     }
