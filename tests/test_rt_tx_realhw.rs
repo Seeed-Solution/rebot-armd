@@ -5802,3 +5802,209 @@ fn dual_owner_single_j7_emitter_covers_all_fenced_and_invalid_target_paths() {
         }
     }
 }
+
+/// Round 7 B1 regression: every J7 `PosForceIntent` carries the `(stop_gen, estop_epoch)` stamp
+/// at which it was set, and the single J7 emitter treats any `Target` whose stamp is older than
+/// the current generation/epoch as `Hold` (measured hold when fresh, freeze when stale), never
+/// re-stamping an old `Target` with a newer stop generation.
+///
+/// Covers:
+/// 1. Direct driver `emit_pos_force_j7`: older `stop_gen` (fresh & stale) and older `estop_epoch`
+///    degrade `Target` to `Hold`/`Freeze` (`vel_raw == 0` at measured/last-fresh pos).
+/// 2. Dual-owner (Legacy + RT Executor, fresh AND stale J7): `Target` set (closing J7 toward 0.0)
+///    -> authorized `STOP` arrives mid-arm-write during J2 transmit -> tick applies `authorized_stop`
+///    and epilogue runs on that same tick -> emits exact 1 `0x307` Hold/Freeze frame (`vel_raw == 0`
+///    at `-2.5`), NEVER the pre-STOP closing `Target`!
+#[test]
+fn dual_owner_b1_stop_during_arm_write_degrades_prestamped_j7_target_to_hold() {
+    use armd::driver::{
+        ArmDriver, DamiaoArmDriver, PosForceEmitOutcome, PosForceIntent, PosForceIntentStamp,
+    };
+    use armd::rt_core::urgent::StopRequests;
+
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+
+    // 1. Direct-driver check: older `stop_gen` and older `estop_epoch` both degrade `Target` -> `Hold`/`Freeze`.
+    {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            s.motors[6].q = -2.5;
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let pf_cfg = armd::driver::GripperPosForce {
+            joint: 6,
+            current_raw: pf_cur,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        };
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_gripper_pos_force(pf_cfg)
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        drv.set_torque(true).expect("enable");
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.motors[6].q = -2.5;
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
+        drv.read_joint_states().unwrap();
+
+        // Older stop_gen (0 vs current 1), fresh J7 -> Hold at -2.5 with vel_raw = 0 (NOT closing target 0.0).
+        let stale_stop_intent = PosForceIntent::target(
+            0.0,
+            Some(0.30),
+            None,
+            PosForceIntentStamp { stop_gen: 0, estop_epoch: 1 },
+        );
+        let newer_stop_current = PosForceIntentStamp { stop_gen: 1, estop_epoch: 1 };
+        bus.clear_log();
+        drv.begin_tx_tick();
+        let out = drv.emit_pos_force_j7(stale_stop_intent, newer_stop_current).unwrap();
+        assert!(matches!(out, PosForceEmitOutcome::Sent { joint: 6, .. }));
+        let j7 = j7_pf_frames(&bus.tx_log());
+        assert_eq!(j7.len(), 1);
+        assert!((f32::from_le_bytes(j7[0].data[0..4].try_into().unwrap()) - (-2.5)).abs() < 1e-2);
+        assert_eq!(u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]), 0);
+
+        // Older estop_epoch (1 vs current 2), fresh J7 -> Hold at -2.5 with vel_raw = 0.
+        let newer_epoch_current = PosForceIntentStamp { stop_gen: 0, estop_epoch: 2 };
+        bus.clear_log();
+        drv.begin_tx_tick();
+        let out2 = drv.emit_pos_force_j7(stale_stop_intent, newer_epoch_current).unwrap();
+        assert!(matches!(out2, PosForceEmitOutcome::Sent { joint: 6, .. }));
+        let j7_2 = j7_pf_frames(&bus.tx_log());
+        assert_eq!(j7_2.len(), 1);
+        assert!((f32::from_le_bytes(j7_2[0].data[0..4].try_into().unwrap()) - (-2.5)).abs() < 1e-2);
+        assert_eq!(u16::from_le_bytes([j7_2[0].data[4], j7_2[0].data[5]]), 0);
+
+        // Older stop_gen with STALE J7 (> 100 ms) -> Freeze frame at -2.5 with vel_raw = 0.
+        bus.with(|s| {
+            s.motors[6].mute_feedback = true;
+            s.rx.clear();
+            s.pending.clear();
+        });
+        clock.advance(ms(120));
+        bus.clear_log();
+        drv.begin_tx_tick();
+        let out3 = drv.emit_pos_force_j7(stale_stop_intent, newer_stop_current).unwrap();
+        assert!(matches!(out3, PosForceEmitOutcome::Sent { joint: 6, freeze: true, .. }));
+        let j7_3 = j7_pf_frames(&bus.tx_log());
+        assert_eq!(j7_3.len(), 1);
+        assert!((f32::from_le_bytes(j7_3[0].data[0..4].try_into().unwrap()) - (-2.5)).abs() < 1e-2);
+        assert_eq!(u16::from_le_bytes([j7_3[0].data[4], j7_3[0].data[5]]), 0);
+        assert_eq!(u16::from_le_bytes([j7_3[0].data[6], j7_3[0].data[7]]), pf_cur);
+    }
+
+    // 2. Dual-owner (Legacy + RT Executor, BOTH fresh J7 and stale J7):
+    //    Closing Target set -> STOP fires mid-arm-write during J2 transmit -> authorized_stop
+    //    applies -> epilogue emits exact 1 Hold/Freeze frame (vel_raw == 0 at -2.5), NEVER target!
+    for owner in [Owner::Legacy, Owner::Executor] {
+        for j7_stale in [false, true] {
+            let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            let stops = match &mut rig.owner {
+                RigOwner::Legacy(inner) => {
+                    let s = StopRequests::new();
+                    inner.attach_stop_requests(s.clone());
+                    let gate = inner.estop_gate();
+                    inner.driver.as_ref().unwrap().lock().unwrap().set_estop_gate(gate);
+                    s
+                }
+                RigOwner::Executor { fx, .. } => {
+                    let s = fx.stops().clone();
+                    fx.core.attach_stop_requests(s.clone());
+                    let gate = fx.core.estop_gate();
+                    fx.core.driver.as_ref().unwrap().lock().unwrap().set_estop_gate(gate);
+                    s
+                }
+            };
+            rig.inner_mut().commanded_positions[6] = -2.5;
+            rig.inner_mut().target_positions[6] = -2.5;
+            rig.inner_mut().measured_positions[6] = -2.5;
+            rig.bus.with(|s| {
+                s.motors[6].q = -2.5;
+                s.push_all_feedback();
+            });
+            rig.step();
+
+            // Command J7 to close toward 0.0 rad (nonzero velocity -> Target intent).
+            {
+                let inner = rig.inner_mut();
+                let ep = inner.safety.epoch_id();
+                let mut goal = inner.commanded_positions.clone();
+                goal[6] = 0.0;
+                let stamp = inner.current_admission_stamp();
+                let admitted = inner.check_admission(stamp).expect("admit close jog");
+                SupervisorInner::jog_action(admitted, goal, Some(1.0), Some(ep), "joint_move")
+                    .expect("start J7 close motion");
+            }
+            if j7_stale {
+                rig.bus.with(|s| {
+                    s.rx.clear();
+                    s.pending.clear();
+                    s.motors[6].mute_feedback = true;
+                });
+                rig.clock.advance(ms(115));
+                rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            } else {
+                rig.bus.with(|s| s.push_all_feedback());
+            }
+
+            // Inject authorized STOP mid-arm-write (on J2 transmit, after Target intent was stamped!).
+            let stop_gen_before = rig.inner().current_stop_gen();
+            let stops_cb = stops.clone();
+            let tx_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tx_count_cb = tx_count.clone();
+            rig.bus.with(|s| {
+                s.on_tx = Some(Arc::new(move || {
+                    if tx_count_cb.fetch_add(1, Ordering::SeqCst) == 1 {
+                        let _ = stops_cb.request();
+                    }
+                }));
+            });
+
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+            assert!(
+                rig.inner().current_stop_gen() > stop_gen_before,
+                "{owner:?} stale={j7_stale}: STOP must have advanced stop_gen"
+            );
+            assert_eq!(
+                stops.current(),
+                stops.applied(),
+                "{owner:?} stale={j7_stale}: STOP must be applied in the same tick"
+            );
+            let log = rig.bus.tx_log();
+            let j7 = j7_pf_frames(&log);
+            assert_eq!(
+                j7.len(),
+                1,
+                "{owner:?} stale={j7_stale}: epilogue must emit exact 1 J7 0x307 hold/freeze frame after mid-write STOP: {log:?}"
+            );
+            let pos = f32::from_le_bytes(j7[0].data[0..4].try_into().unwrap());
+            let vel = u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]);
+            let cur = u16::from_le_bytes([j7[0].data[6], j7[0].data[7]]);
+            assert!(
+                (pos - (-2.5)).abs() < 1e-2,
+                "{owner:?} stale={j7_stale}: pre-STOP closing Target leaked after STOP! wire pos={pos} != -2.5"
+            );
+            assert_eq!(
+                vel, 0,
+                "{owner:?} stale={j7_stale}: epilogue must emit vel_raw==0 Hold/Freeze after mid-write STOP, got vel_raw={vel}"
+            );
+            assert_eq!(cur, pf_cur);
+        }
+    }
+}

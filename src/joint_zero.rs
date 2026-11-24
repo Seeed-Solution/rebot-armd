@@ -235,19 +235,23 @@ impl ArmDriver for ZeroOffsetDriver {
     fn emit_pos_force_j7(
         &mut self,
         intent: crate::driver::PosForceIntent,
+        current: crate::driver::PosForceIntentStamp,
     ) -> Result<crate::driver::PosForceEmitOutcome, ArmDriverError> {
-        let mapped = match intent {
-            crate::driver::PosForceIntent::Target { position, velocity, current_raw } => {
+        let mapped = match intent.kind {
+            crate::driver::PosForceIntentKind::Target { position, velocity, current_raw } => {
                 let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
-                crate::driver::PosForceIntent::Target {
-                    position: position + offset,
-                    velocity,
-                    current_raw,
+                crate::driver::PosForceIntent {
+                    kind: crate::driver::PosForceIntentKind::Target {
+                        position: position + offset,
+                        velocity,
+                        current_raw,
+                    },
+                    stamp: intent.stamp,
                 }
             }
-            other => other,
+            _ => intent,
         };
-        self.inner.emit_pos_force_j7(mapped)
+        self.inner.emit_pos_force_j7(mapped, current)
     }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
     fn last_hold_tx_due_mask(&self) -> u64 { self.inner.last_hold_tx_due_mask() }

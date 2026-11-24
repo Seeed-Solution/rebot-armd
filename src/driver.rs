@@ -454,14 +454,21 @@ pub const fn pos_force_boot_fallback_current(
     }
 }
 
-/// Desired position-force J7 gripper behavior for a control tick or driver operation.
-///
-/// Control-loop paths (motion, servo, stopped hold, E-stop, replay, policy, gripper actions,
-/// MIT, gravity compensation) ONLY set a `PosForceIntent` and NEVER construct or write a `0x307`
-/// frame directly. The single J7 emitter ([`ArmDriver::emit_pos_force_j7`]) resolves
-/// `(intent, freshness)` into the exact `0x307` wire frame.
+/// Stop-generation and E-stop/safety epoch stamp captured when a J7 [`PosForceIntent`] is
+/// produced. Every J7 intent carries this stamp; the single J7 emitter treats any `Target`
+/// whose stamp is older than the current `(stop_gen, estop_epoch)` as `Hold` (never re-stamping
+/// an old `Target` with a newer generation).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PosForceIntentStamp {
+    /// Owner stop generation (`SupervisorInner::current_stop_gen()` / `EstopGate::stop_gen`).
+    pub stop_gen: u64,
+    /// Safety / E-stop epoch (`SupervisorInner::safety.epoch_id()` / `EstopGate::estop_gen`).
+    pub estop_epoch: u64,
+}
+
+/// Desired position-force J7 gripper action before stop-generation / epoch resolution.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PosForceIntent {
+pub enum PosForceIntentKind {
     /// Drive the gripper toward `position` with requested `velocity` (rad/s, clamped by the
     /// active `PosForce` close/open ceiling) and optional `current_raw` cap (always clamped to
     /// `<= configured current_raw`).
@@ -476,6 +483,40 @@ pub enum PosForceIntent {
     /// Stopped / E-stop hold at the current fresh measured J7 position (`vel_raw = 0`, configured
     /// current cap) when fresh, or the freeze / boot-fallback frame when stale.
     Stop,
+}
+
+/// Stamped position-force J7 gripper intent for a control tick or driver operation.
+///
+/// Control-loop paths (motion, servo, stopped hold, E-stop, replay, policy, gripper actions,
+/// MIT, gravity compensation) ONLY set a stamped `PosForceIntent` and NEVER construct or write a
+/// `0x307` frame directly. The single J7 emitter ([`ArmDriver::emit_pos_force_j7`]) resolves
+/// `(intent, current_stamp, freshness)` into the exact `0x307` wire frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PosForceIntent {
+    pub kind: PosForceIntentKind,
+    pub stamp: PosForceIntentStamp,
+}
+
+impl PosForceIntent {
+    pub const fn target(
+        position: f32,
+        velocity: Option<f32>,
+        current_raw: Option<u16>,
+        stamp: PosForceIntentStamp,
+    ) -> Self {
+        Self {
+            kind: PosForceIntentKind::Target { position, velocity, current_raw },
+            stamp,
+        }
+    }
+
+    pub const fn hold(stamp: PosForceIntentStamp) -> Self {
+        Self { kind: PosForceIntentKind::Hold, stamp }
+    }
+
+    pub const fn stop(stamp: PosForceIntentStamp) -> Self {
+        Self { kind: PosForceIntentKind::Stop, stamp }
+    }
 }
 
 /// Outcome of the single J7 position-force tick emitter ([`ArmDriver::emit_pos_force_j7`]).
@@ -655,7 +696,13 @@ pub trait ArmDriver: Send {
     /// caller target, or returned early).
     ///
     /// Always unfenced: a tripped MIT fence suppresses only MIT arm joints, never J7.
-    fn emit_pos_force_j7(&mut self, _intent: PosForceIntent) -> Result<PosForceEmitOutcome, ArmDriverError> {
+    /// Any `Target` intent whose `(stop_gen, estop_epoch)` stamp differs from `current` is
+    /// degraded to `Hold` inside this single emitter (never re-stamped with a newer generation).
+    fn emit_pos_force_j7(
+        &mut self,
+        _intent: PosForceIntent,
+        _current: PosForceIntentStamp,
+    ) -> Result<PosForceEmitOutcome, ArmDriverError> {
         Ok(PosForceEmitOutcome::NotApplicable)
     }
 
@@ -3753,6 +3800,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         StopStamp { estop_gen, stop_gen }
     }
 
+    /// Current driver-gate `(stop_gen, estop_epoch)` stamp for direct-driver callers of
+    /// [`ArmDriver::emit_pos_force_j7`].
+    #[inline]
+    pub fn current_j7_intent_stamp(&self) -> PosForceIntentStamp {
+        let s = self.current_stop_stamp();
+        PosForceIntentStamp {
+            stop_gen: s.stop_gen,
+            estop_epoch: s.estop_gen,
+        }
+    }
+
     /// Number of unsent target frames currently queued for the next tick.
     pub fn pending_tx_len(&self) -> usize { self.pending_tx.len() }
 
@@ -4585,7 +4643,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         &mut self,
         kind: TxKind,
         expected_stamp: Option<StopStamp>,
-        intent: PosForceIntent,
+        intent: PosForceIntentKind,
         allow_freeze: bool,
         retry: bool,
         fenced: bool,
@@ -4597,7 +4655,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let now = d.now();
             let (pos, vel_raw, cur_raw) = if d.pos_force_feedback_valid(i, now) {
                 match intent {
-                    PosForceIntent::Target { position, velocity, current_raw } => {
+                    PosForceIntentKind::Target { position, velocity, current_raw } => {
                         if !position.is_finite() || velocity.is_some_and(|v| !v.is_finite()) {
                             return None;
                         }
@@ -4623,7 +4681,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         }
                         (position, vel_raw, cur)
                     }
-                    PosForceIntent::Hold | PosForceIntent::Stop => {
+                    PosForceIntentKind::Hold | PosForceIntentKind::Stop => {
                         let measured = d.fresh_measured_position_at(i, POS_FORCE_FEEDBACK_MAX_AGE, now)?;
                         (measured, 0u16, pf.current_raw)
                     }
@@ -4655,9 +4713,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ///
     /// Always runs unfenced (`fenced = false`) with `allow_freeze = true` so a tripped MIT fence
     /// suppresses ONLY MIT arm joints and J7 (`TIMEOUT=0`) always receives its resolved frame.
+    ///
+    /// Single stop-generation / E-stop epoch enforcement rule: any `Target` intent whose
+    /// `(stop_gen, estop_epoch)` stamp is older than `current` (differs from `current`) is
+    /// degraded to `Hold` (stationary measured hold when fresh, freeze when stale) and is NEVER
+    /// re-stamped with the newer generation.
     fn emit_pos_force_j7_impl(
         &mut self,
         intent: PosForceIntent,
+        current: PosForceIntentStamp,
     ) -> Result<PosForceEmitOutcome, ArmDriverError> {
         let Some(pf_j) = self.active_pos_force_joint() else {
             return Ok(PosForceEmitOutcome::NotApplicable);
@@ -4665,7 +4729,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if !self.is_enabled || self.torque_hs.is_some() {
             return Ok(PosForceEmitOutcome::NotApplicable);
         }
-        let is_target_intent = matches!(intent, PosForceIntent::Target { .. });
+        let stamp_stale = intent.stamp.stop_gen != current.stop_gen
+            || intent.stamp.estop_epoch != current.estop_epoch;
+        let effective_kind = match intent.kind {
+            PosForceIntentKind::Target { .. } if stamp_stale => PosForceIntentKind::Hold,
+            other => other,
+        };
+        let is_target_intent = matches!(effective_kind, PosForceIntentKind::Target { .. });
         if is_target_intent {
             self.strict_stop_check(None)?;
         } else {
@@ -4684,14 +4754,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pf_refresh_sent |= self.try_send_pf_refresh(start_stamp)?;
         }
 
-        let mut active_intent = intent;
+        let mut active_kind = effective_kind;
         let mut retried = false;
         let sent_frame = loop {
-            let kind = match active_intent {
-                PosForceIntent::Target { .. } => TxKind::Target,
-                PosForceIntent::Hold | PosForceIntent::Stop => TxKind::RollbackHold(pf_j),
+            let kind = match active_kind {
+                PosForceIntentKind::Target { .. } => TxKind::Target,
+                PosForceIntentKind::Hold | PosForceIntentKind::Stop => TxKind::RollbackHold(pf_j),
             };
-            match self.emit_pos_force_frame(kind, Some(start_stamp), active_intent, true, false, false) {
+            match self.emit_pos_force_frame(kind, Some(start_stamp), active_kind, true, false, false) {
                 Ok(frame) => break Some(frame),
                 Err(TxRefusal::PosForceFeedbackExpired(_)) => {
                     let _ = self.check_pos_force_freshness_for_tx();
@@ -4706,8 +4776,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     if !retried {
                         retried = true;
                         // An invalid/unencodable target never suppresses J7: degrade to Hold.
-                        if matches!(active_intent, PosForceIntent::Target { .. }) {
-                            active_intent = PosForceIntent::Hold;
+                        if matches!(active_kind, PosForceIntentKind::Target { .. }) {
+                            active_kind = PosForceIntentKind::Hold;
                         }
                         continue;
                     }
@@ -5446,9 +5516,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             for slot in 0..hold_slots {
                 let hold_res = if self.is_pos_force_mode_hold_slot(i, modes[i], dual_hold, slot) {
                     let intent = if self.rollback_requires_fresh(policy) {
-                        PosForceIntent::Hold
+                        PosForceIntentKind::Hold
                     } else {
-                        PosForceIntent::Target {
+                        PosForceIntentKind::Target {
                             position: hold[i].position,
                             velocity: hold[i].velocity,
                             current_raw: None,
@@ -6099,8 +6169,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.external_pos_force_emitter || !self.pf_deferred_motion {
             return Ok(arm_out);
         }
-        let intent = self.pf_deferred_intent.unwrap_or(PosForceIntent::Hold);
-        match self.emit_pos_force_j7_impl(intent)? {
+        let cur_intent_stamp = self.current_j7_intent_stamp();
+        let intent = self.pf_deferred_intent.unwrap_or_else(|| PosForceIntent::hold(cur_intent_stamp));
+        match self.emit_pos_force_j7_impl(intent, cur_intent_stamp)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
             PosForceEmitOutcome::Sent { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
@@ -6300,9 +6371,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             for slot in 0..hold_slots {
                 let hold_res = if self.is_pos_force_mode_hold_slot(i, modes[i], dual_hold, slot) {
                     let intent = if self.rollback_requires_fresh(policy) {
-                        PosForceIntent::Hold
+                        PosForceIntentKind::Hold
                     } else {
-                        PosForceIntent::Target {
+                        PosForceIntentKind::Target {
                             position: hold[i].position,
                             velocity: hold[i].velocity,
                             current_raw: None,
@@ -7305,7 +7376,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let hold = match self.emit_pos_force_frame(
             TxKind::Handshake,
             self.enable_stop_stamp,
-            PosForceIntent::Target {
+            PosForceIntentKind::Target {
                 position: hold_pos,
                 velocity: Some(close_speed),
                 current_raw: None,
@@ -9094,7 +9165,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.external_pos_force_emitter || matches!(arm_res, Err(ArmDriverError::EstopInhibited)) {
             return arm_res;
         }
-        match self.emit_pos_force_j7_impl(PosForceIntent::Stop) {
+        let stop_intent_stamp = self.current_j7_intent_stamp();
+        match self.emit_pos_force_j7_impl(PosForceIntent::stop(stop_intent_stamp), stop_intent_stamp) {
             Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
             Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
                 let pf_bit = joint.saturating_mul(2);
@@ -9163,8 +9235,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         Ok(())
     }
 
-    fn emit_pos_force_j7(&mut self, intent: PosForceIntent) -> Result<PosForceEmitOutcome, ArmDriverError> {
-        self.emit_pos_force_j7_impl(intent)
+    fn emit_pos_force_j7(
+        &mut self,
+        intent: PosForceIntent,
+        current: PosForceIntentStamp,
+    ) -> Result<PosForceEmitOutcome, ArmDriverError> {
+        self.emit_pos_force_j7_impl(intent, current)
     }
 
     fn last_hold_tx_sent_any(&self) -> bool {
@@ -9249,6 +9325,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.trip_fence(MitFenceTripReason::EstopBeforeBatch { total_joints });
                 return Err(e);
             }
+            let pre_arm_intent_stamp = self.current_j7_intent_stamp();
             let arm_res: Result<TxBatchOutcome, ArmDriverError> = (|| {
                 if let Some(pf_j) = self.active_pos_force_joint() {
                     if !self.pos_force_feedback_valid(pf_j, self.now()) {
@@ -9440,14 +9517,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 return arm_res;
             };
             let j7_intent = match &arm_res {
-                Ok(TxBatchOutcome::Complete) => PosForceIntent::Target {
-                    position: targets[pf_j].position,
-                    velocity: targets[pf_j].velocity,
-                    current_raw: None,
-                },
-                _ => PosForceIntent::Hold,
+                Ok(TxBatchOutcome::Complete) => PosForceIntent::target(
+                    targets[pf_j].position,
+                    targets[pf_j].velocity,
+                    None,
+                    pre_arm_intent_stamp,
+                ),
+                _ => PosForceIntent::hold(pre_arm_intent_stamp),
             };
-            return match self.emit_pos_force_j7_impl(j7_intent) {
+            let current_intent_stamp = self.current_j7_intent_stamp();
+            return match self.emit_pos_force_j7_impl(j7_intent, current_intent_stamp) {
                 Ok(PosForceEmitOutcome::NotApplicable) => arm_res,
                 Ok(PosForceEmitOutcome::Sent { pf_status, .. }) => {
                     self.last_tx_pf_status = pf_status;
@@ -9551,6 +9630,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
         }
+        let pre_arm_intent_stamp = self.current_j7_intent_stamp();
         let arm_out = self.drain_pending_pass(batch_stamp, 0, None, true)?;
         if self.external_pos_force_emitter {
             return Ok(arm_out);
@@ -9559,14 +9639,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Ok(arm_out);
         };
         let j7_intent = match arm_out {
-            TxBatchOutcome::Expired { .. } => PosForceIntent::Hold,
-            _ => PosForceIntent::Target {
-                position: targets[pf_j].position,
-                velocity: targets[pf_j].velocity,
-                current_raw: None,
-            },
+            TxBatchOutcome::Expired { .. } => PosForceIntent::hold(pre_arm_intent_stamp),
+            _ => PosForceIntent::target(
+                targets[pf_j].position,
+                targets[pf_j].velocity,
+                None,
+                pre_arm_intent_stamp,
+            ),
         };
-        match self.emit_pos_force_j7_impl(j7_intent)? {
+        let current_intent_stamp = self.current_j7_intent_stamp();
+        match self.emit_pos_force_j7_impl(j7_intent, current_intent_stamp)? {
             PosForceEmitOutcome::NotApplicable => Ok(arm_out),
             PosForceEmitOutcome::Sent { pf_status, .. } => {
                 self.last_tx_pf_status = pf_status;
@@ -9993,7 +10075,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.emit_pos_force_frame(
                         TxKind::Recovery,
                         Some(rx_stop_stamp),
-                        PosForceIntent::Target {
+                        PosForceIntentKind::Target {
                             position: pos,
                             velocity: Some(recovery_vel),
                             current_raw: None,
@@ -10989,7 +11071,8 @@ mod tx_chokepoint_tests {
         // 1. No prior target ever commanded -> emits 0x307 with pos=0.0, vel_raw=0, i_des=0.
         bus.clear_tx();
         drv.begin_tx_tick();
-        let out0 = drv.emit_pos_force_j7(PosForceIntent::Stop).expect("boot fallback emit");
+        let stamp = drv.current_j7_intent_stamp();
+        let out0 = drv.emit_pos_force_j7(PosForceIntent::stop(stamp), stamp).expect("boot fallback emit");
         assert!(matches!(out0, PosForceEmitOutcome::Sent { joint: 0, freeze: true, .. }));
         let log0: Vec<CanFrame> = bus.tx.lock().unwrap().clone();
         let j7_0: Vec<CanFrame> = log0.iter().copied().filter(|f| f.id == 0x307).collect();

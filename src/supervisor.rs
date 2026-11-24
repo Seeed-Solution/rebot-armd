@@ -4020,6 +4020,17 @@ impl SupervisorInner {
         }
     }
 
+    /// Current owner `(stop_gen, estop_epoch)` stamp attached to every J7 [`PosForceIntent`]
+    /// and compared in the single J7 emitter so a pre-STOP / pre-E-stop `Target` is always
+    /// degraded to `Hold` and never re-stamped with a newer generation.
+    #[inline]
+    pub(crate) fn current_j7_intent_stamp(&self) -> crate::driver::PosForceIntentStamp {
+        crate::driver::PosForceIntentStamp {
+            stop_gen: self.current_stop_gen(),
+            estop_epoch: self.safety.epoch_id(),
+        }
+    }
+
     /// Single owner-side J7 `PosForce` (`0x307`) emitter invoked strictly ONCE per control tick
     /// via [`Self::emit_j7_tick_epilogue`] in `tick_control_inner` (shared by BOTH Legacy and RT
     /// Executor owners).
@@ -4031,6 +4042,7 @@ impl SupervisorInner {
         drv: &mut dyn ArmDriver,
         j7_is_hold: bool,
         intent: crate::driver::PosForceIntent,
+        current_stamp: crate::driver::PosForceIntentStamp,
         tick_output: &mut TickOutput,
         allow_output_accepted: &mut bool,
     ) {
@@ -4040,7 +4052,7 @@ impl SupervisorInner {
         }
         let now = drv.clock_now();
         let max_age = drv.tx_frame_max_age();
-        match drv.emit_pos_force_j7(intent) {
+        match drv.emit_pos_force_j7(intent, current_stamp) {
             Ok(PosForceEmitOutcome::NotApplicable) => {}
             Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
                 let pf_bit_hold = if joint.saturating_mul(2) < 64 {
@@ -4260,6 +4272,7 @@ impl SupervisorInner {
         &mut self,
         j7_is_hold: bool,
         intent: crate::driver::PosForceIntent,
+        current_stamp: crate::driver::PosForceIntentStamp,
         tick_output: &mut TickOutput,
         allow_output_accepted: &mut bool,
     ) {
@@ -4275,6 +4288,7 @@ impl SupervisorInner {
             &mut **drv,
             j7_is_hold,
             intent,
+            current_stamp,
             tick_output,
             allow_output_accepted,
         );
@@ -6409,10 +6423,11 @@ impl SupervisorInner {
         // a torque transition in flight owns the bus until it ends (the driver refuses targets)
         let transition_owns_bus = self.torque_transition.is_some();
         if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
+            let gc_stamp = self.current_j7_intent_stamp();
             self.j7_intent = Some(if self.safety.state().is_stopped() {
-                crate::driver::PosForceIntent::Stop
+                crate::driver::PosForceIntent::stop(gc_stamp)
             } else {
-                crate::driver::PosForceIntent::Hold
+                crate::driver::PosForceIntent::hold(gc_stamp)
             });
             // If a prior release completed `exit_hold_ms` (and stationary settle when tracking is
             // enabled), execute POS_VEL handback on this dedicated transition release using the
@@ -6728,18 +6743,21 @@ impl SupervisorInner {
             && !transition_owns_bus
             && !self.urgent_stop_unapplied()
         {
+            let current_stamp = self.current_j7_intent_stamp();
             let j7_is_hold = self.safety.state().is_stopped()
                 || self.e_stop_latched.load(Ordering::SeqCst);
             let j7_intent = if j7_is_hold {
-                crate::driver::PosForceIntent::Stop
+                crate::driver::PosForceIntent::stop(current_stamp)
             } else if matches!(tick_output, TickOutput::Error { .. } | TickOutput::Expired { .. }) {
-                crate::driver::PosForceIntent::Hold
+                crate::driver::PosForceIntent::hold(current_stamp)
             } else {
-                self.j7_intent.unwrap_or(crate::driver::PosForceIntent::Hold)
+                self.j7_intent
+                    .unwrap_or_else(|| crate::driver::PosForceIntent::hold(current_stamp))
             };
             self.emit_j7_tick_epilogue(
                 j7_is_hold,
                 j7_intent,
+                current_stamp,
                 &mut tick_output,
                 &mut allow_output_accepted,
             );

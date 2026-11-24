@@ -421,10 +421,11 @@ impl SupervisorInner {
         // Never write a 0x307 frame outside the tick epilogue's ONE J7 emitter: record intent
         // only so an in-tick urgent E-stop emits J7 strictly once in the epilogue and an off-tick
         // exit hands J7 off to the next control tick.
+        let intent_stamp = self.current_j7_intent_stamp();
         self.j7_intent = Some(if is_hold {
-            crate::driver::PosForceIntent::Stop
+            crate::driver::PosForceIntent::stop(intent_stamp)
         } else {
-            crate::driver::PosForceIntent::Hold
+            crate::driver::PosForceIntent::hold(intent_stamp)
         });
         out
     }
