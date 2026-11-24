@@ -128,8 +128,12 @@ impl SequenceStore {
 
     /// Ids of the sequences that reference pose `id` (and the running one when it pinned it).
     pub fn using_pose(&self, id: &str) -> Vec<String> {
+        self.using_pose_with_pins(id, self.pins.as_ref())
+    }
+
+    pub(crate) fn using_pose_with_pins(&self, id: &str, active_pins: Option<&RunPins>) -> Vec<String> {
         let mut out: Vec<String> = self.file.sequences.iter().filter(|s| s.pose_ids().any(|p| p == id)).map(|s| s.id.clone()).collect();
-        if let Some(p) = self.pins.as_ref().filter(|p| p.pose_ids.iter().any(|x| x == id)) {
+        if let Some(p) = active_pins.filter(|p| p.pose_ids.iter().any(|x| x == id)) {
             if !out.contains(&p.sequence_id) { out.push(p.sequence_id.clone()); }
         }
         out
@@ -137,8 +141,12 @@ impl SequenceStore {
 
     /// Ids of the sequences that reference episode `id` (and the running one when it pinned it).
     pub fn using_episode(&self, id: &str) -> Vec<String> {
+        self.using_episode_with_pins(id, self.pins.as_ref())
+    }
+
+    pub(crate) fn using_episode_with_pins(&self, id: &str, active_pins: Option<&RunPins>) -> Vec<String> {
         let mut out: Vec<String> = self.file.sequences.iter().filter(|s| s.episode_ids().any(|e| e == id)).map(|s| s.id.clone()).collect();
-        if let Some(p) = self.pins.as_ref().filter(|p| p.episode_ids.iter().any(|x| x == id)) {
+        if let Some(p) = active_pins.filter(|p| p.episode_ids.iter().any(|x| x == id)) {
             if !out.contains(&p.sequence_id) { out.push(p.sequence_id.clone()); }
         }
         out
@@ -159,14 +167,26 @@ pub fn validate_file(file: &SequenceFile) -> Result<(), String> {
 }
 
 impl SupervisorInner {
+    /// Pins for the currently running sequence action; returns `None` immediately once the
+    /// action reaches a terminal state (even before the async orchestrator `cleanup` runs).
+    pub fn active_sequence_pins(&self) -> Option<&RunPins> {
+        self.sequences.pins.as_ref().filter(|p| {
+            self.last_action
+                .as_ref()
+                .is_some_and(|a| a.id == p.action_id && a.is_running())
+        })
+    }
+
     /// Sequences that reference pose `id` (IN_USE on delete).
     pub fn sequences_using_pose(&self, id: &str) -> Vec<String> {
         if id.is_empty() { return Vec::new(); }
-        self.sequences.using_pose(id)
+        self.sequences.using_pose_with_pins(id, self.active_sequence_pins())
     }
 
     /// Sequences that reference episode `id` (IN_USE on delete).
-    pub fn sequences_using_episode(&self, id: &str) -> Vec<String> { self.sequences.using_episode(id) }
+    pub fn sequences_using_episode(&self, id: &str) -> Vec<String> {
+        self.sequences.using_episode_with_pins(id, self.active_sequence_pins())
+    }
 
     pub fn sequences_write(&self) -> Option<PendingWrite> {
         self.sequences.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&self.sequences.file).unwrap_or_default()))
@@ -282,7 +302,7 @@ pub fn precheck(inner: &SupervisorInner, prepared: &PreparedSequences) -> Result
         let steps = serde_json::to_value(&seq.steps).unwrap_or(Value::Null);
         check_steps(inner, &steps)?;
     }
-    if let Some(p) = inner.sequences.pins.as_ref().filter(|p| !prepared.next.sequences.iter().any(|s| s.id == p.sequence_id)) {
+    if let Some(p) = inner.active_sequence_pins().filter(|p| !prepared.next.sequences.iter().any(|s| s.id == p.sequence_id)) {
         if inner.sequences.get(&p.sequence_id).is_some() {
             return Err(rejected(409, "SEQUENCE_RUNNING", "the sequence is running; stop it first"));
         }
@@ -378,7 +398,7 @@ pub fn delete(inner: &mut SupervisorInner, body: &Value) -> Result<Option<Pendin
 pub fn prepare_delete(inner: &SupervisorInner, body: &Value) -> Result<PreparedSequences, ArmError> {
     let base_revision = check_store_revision(inner, body)?;
     let id = body.get("id").and_then(Value::as_str).ok_or_else(|| invalid("id must be a string"))?;
-    if inner.sequences.pins.as_ref().is_some_and(|p| p.sequence_id == id) {
+    if inner.active_sequence_pins().is_some_and(|p| p.sequence_id == id) {
         return Err(rejected(409, "SEQUENCE_RUNNING", "the sequence is running; stop it first"));
     }
     let mut next = inner.sequences.file.clone();
@@ -411,7 +431,7 @@ pub fn view(inner: &SupervisorInner, s: &Sequence) -> Value {
     let mut v = serde_json::to_value(s).unwrap_or_default();
     v["stale_steps"] = json!(stale);
     v["missing_steps"] = json!(missing);
-    v["running"] = json!(inner.sequences.pins.as_ref().is_some_and(|p| p.sequence_id == s.id));
+    v["running"] = json!(inner.active_sequence_pins().is_some_and(|p| p.sequence_id == s.id));
     v
 }
 
@@ -862,5 +882,47 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
             };
             ctx.wait_child(ticket).await.map(|_| ())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ArmConfig;
+
+    #[tokio::test]
+    async fn active_sequence_pins_reject_delete_while_running_and_release_at_terminal() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let mut inner = sup.inner().write().await;
+        let (seq, _) = save(&mut inner, &json!({
+            "name": "pin_lifecycle",
+            "steps": [{"type": "wait", "s": 0.05}],
+        }))
+        .unwrap();
+        let action_id = inner.begin_action("sequence", None);
+        inner.sequences.pins = Some(RunPins {
+            sequence_id: seq.id.clone(),
+            action_id,
+            pose_ids: vec!["pose_a".into()],
+            episode_ids: vec!["ep_a".into()],
+        });
+
+        // While running, delete is rejected with SEQUENCE_RUNNING and view/refs see the pin.
+        let err = prepare_delete(&inner, &json!({"id": seq.id})).unwrap_err();
+        assert!(matches!(err, ArmError::Rejected { status: 409, ref code, .. } if code == "SEQUENCE_RUNNING"), "{err:?}");
+        assert_eq!(view(&inner, &seq)["running"], json!(true));
+        assert_eq!(inner.sequences_using_pose("pose_a"), vec![seq.id.clone()]);
+        assert_eq!(inner.sequences_using_episode("ep_a"), vec![seq.id.clone()]);
+
+        // Immediately upon terminal transition (even before async `cleanup` clears `pins`),
+        // `active_sequence_pins()` drops to None and delete succeeds.
+        inner.finish_action(action_id, "done", None, None, None, None, None);
+        assert!(inner.sequences.pins.is_some(), "simulate pre-cleanup window");
+        assert!(inner.active_sequence_pins().is_none());
+        assert_eq!(view(&inner, &seq)["running"], json!(false));
+        assert!(inner.sequences_using_pose("pose_a").is_empty());
+        assert!(inner.sequences_using_episode("ep_a").is_empty());
+        let prepared = prepare_delete(&inner, &json!({"id": seq.id})).unwrap();
+        precheck(&inner, &prepared).unwrap();
     }
 }
