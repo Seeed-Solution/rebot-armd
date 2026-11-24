@@ -15,6 +15,7 @@
 //!   `SelectedGraspMacro` hook.
 
 mod common;
+mod mit_support;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -4032,6 +4033,11 @@ struct RecordingHoldDriver {
     q: Arc<Mutex<Vec<f32>>>,
     written: Arc<Mutex<Vec<(Vec<f32>, Vec<f32>)>>>,
     read_sleep_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// When `Some((limit, step))`, once `set_tx_release_deadline(Some(cap))` installs a cutoff
+    /// `<= limit`, the next `gripper_pos_force_info()` inside `mit.rs:823`'s final driver lock
+    /// advances `clock` by `step` (simulating a deadline falling inside the TX critical section).
+    bump_when_cutoff_le: Arc<Mutex<Option<(Instant, Duration)>>>,
+    armed_cutoff: Arc<Mutex<Option<Instant>>>,
     clock: Option<VirtualClock>,
 }
 
@@ -4041,6 +4047,8 @@ impl RecordingHoldDriver {
             q: Arc::new(Mutex::new(init_q.to_vec())),
             written: Arc::new(Mutex::new(Vec::new())),
             read_sleep_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bump_when_cutoff_le: Arc::new(Mutex::new(None)),
+            armed_cutoff: Arc::new(Mutex::new(None)),
             clock,
         }
     }
@@ -4118,6 +4126,23 @@ impl armd::driver::ArmDriver for RecordingHoldDriver {
         Ok(armd::driver::TxBatchOutcome::Complete)
     }
     fn set_torque(&mut self, _enable: bool) -> Result<(), armd::driver::ArmDriverError> { Ok(()) }
+    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+        *self.armed_cutoff.lock().unwrap() = deadline;
+    }
+    fn gripper_pos_force_info(&self) -> Option<armd::driver::GripperPosForceInfo> {
+        if let Some(cap) = *self.armed_cutoff.lock().unwrap() {
+            let mut guard = self.bump_when_cutoff_le.lock().unwrap();
+            if let Some((limit, step)) = *guard {
+                if cap <= limit {
+                    *guard = None;
+                    if let Some(ref c) = self.clock {
+                        c.advance(step);
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 fn driven_inner(drv: RecordingHoldDriver) -> SupervisorInner {
@@ -4258,63 +4283,56 @@ fn r3_m3_deadline_between_before_output_and_check_sends_no_target_both_owners() 
         )));
     }
 
-    // === 1b) Executor: PARENT deadline falls strictly BETWEEN Check #1 (pre-step) and Check #2 (transmit) ===
+    // === 1b) Executor: PARENT deadline falls inside final TX lock (generic ArmDriver, mit.rs:850) ===
     {
         let (mut fx, mut b, clock, drv, parent, r_b, q_before) = setup_executor_moving(Some(65), 10.0);
         let base_now = clock.now();
         let parent_dl = fx.core.macro_run.as_ref().unwrap().deadline.unwrap();
         assert!(base_now < parent_dl);
-        let after_deadline = parent_dl + Duration::from_millis(3);
-
-        let saw_before_output = Arc::new(AtomicBool::new(false));
-        let post_bo_reads = Arc::new(AtomicUsize::new(0));
-        {
-            let flag = Arc::clone(&saw_before_output);
-            fx.on_checkpoint(move |cp| {
-                if cp == Checkpoint::BeforeOutput {
-                    flag.store(true, Ordering::SeqCst);
-                }
-            });
-        }
-        let rep = fx.step_with_clock(|| {
-            if !saw_before_output.load(Ordering::SeqCst) {
-                return base_now;
-            }
-            let idx = post_bo_reads.fetch_add(1, Ordering::SeqCst);
-            // idx 0 = BeforeOutput, idx 1 = driver_tx_release_cap, idx 2 = Check #1 (pre-step) -> ALL BEFORE deadline!
-            // idx 3 = Check #2 (transmit point), idx 4 = post-output -> AFTER deadline!
-            if idx <= 2 {
-                base_now
-            } else {
-                after_deadline
-            }
-        });
-        assert!(post_bo_reads.load(Ordering::SeqCst) >= 4, "must have run both Check #1 and Check #2");
-        assert_eq!(rep.ended, Some((parent, Outcome::Failed("PLACE_TIMEOUT"))));
+        let advance_delta = (parent_dl + Duration::from_millis(3)).saturating_duration_since(base_now);
+        // Advance the shared VirtualClock strictly inside `mit.rs:823`'s final driver lock once
+        // `install_effective_tx_cutoff` has armed `parent_dl` -> `mit.rs:850` TX choke point MUST
+        // refuse with 0 writes on this tick, and next tick holds + emits PLACE_TIMEOUT once!
+        *drv.bump_when_cutoff_le.lock().unwrap() = Some((parent_dl, advance_delta + Duration::from_millis(1)));
+        let rep = fx.step();
         assert!(
-            (fx.core.commanded_positions[0] - q_before[0]).abs() < 1e-6,
-            "Executor Check #2 must roll back stepped reference to hold pose: before={} after={}",
-            q_before[0],
-            fx.core.commanded_positions[0]
+            drv.written.lock().unwrap().is_empty(),
+            "TX choke point must refuse all writes after parent deadline elapsed before TX"
         );
+        assert!(fx.core.safety.state().is_operational(), "deadline refusal must not latch a fault");
+        assert!(fx.core.active_trajectory.is_none());
         assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        assert!(rep.ended.is_none(), "RT+driver defers MacroFinish until next tick's hold write");
+        let q_held = fx.core.commanded_positions.clone();
+        assert!(q_held[0] > q_before[0], "Step 3 ran before TX refusal; next tick must hold it");
+
+        // Next tick transmits the stationary hold (no further advance) and delivers PLACE_TIMEOUT once.
+        let rep_hold = fx.step();
+        assert_eq!(rep_hold.ended, Some((parent, Outcome::Failed("PLACE_TIMEOUT"))));
+        assert!((fx.core.commanded_positions[0] - q_held[0]).abs() < 1e-6);
         let (w_pos, w_vel) = drv.last_write();
         assert!(
-            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
-            "Executor Check #2 must transmit stationary hold only (never stepped target), got pos={} vel={:?}",
+            (w_pos[0] - q_held[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
+            "next tick after refused TX must send stationary hold, got pos={} vel={:?}",
             w_pos[0],
             w_vel
         );
+        // Subsequent ticks emit no duplicate terminal.
+        assert!(fx.step().ended.is_none());
         let reps = drain_all(&mut b);
-        assert!(reps.iter().any(|(_, r)| matches!(
-            r,
-            Reply::Terminal { request, action, outcome: Outcome::Failed("PLACE_TIMEOUT"), .. }
-                if *request == r_b && *action == parent
-        )));
+        let term_count = reps
+            .iter()
+            .filter(|(_, r)| matches!(
+                r,
+                Reply::Terminal { request, action, outcome: Outcome::Failed("PLACE_TIMEOUT"), .. }
+                    if *request == r_b && *action == parent
+            ))
+            .count();
+        assert_eq!(term_count, 1, "PLACE_TIMEOUT terminal must be delivered exactly once");
     }
 
-    // === 1c) Executor: CHILD deadline falls between BeforeOutput/Check #1 and Check #2 (parent alive) ===
-    for expire_at_tx_only in [false, true] {
+    // === 1c) Executor: CHILD deadline falls before pre-step AND inside TX critical section ===
+    for expire_at_tx in [false, true] {
         // Parent deadline far away (+10s), child timeout = 0.045s (45ms from install):
         // after install(+20ms) + mid(+20ms) = 40ms elapsed -> 5ms left at BeforeOutput!
         let (mut fx, _b, clock, drv, parent, _r_b, q_before) = setup_executor_moving(Some(10_000), 0.045);
@@ -4323,45 +4341,56 @@ fn r3_m3_deadline_between_before_output_and_check_sends_no_target_both_owners() 
         assert!(base_now < child_dl, "child must still be before deadline at BeforeOutput");
         let after_child_dl = child_dl + Duration::from_millis(3);
 
-        let saw_before_output = Arc::new(AtomicBool::new(false));
-        let post_bo_reads = Arc::new(AtomicUsize::new(0));
-        {
-            let flag = Arc::clone(&saw_before_output);
-            fx.on_checkpoint(move |cp| {
-                if cp == Checkpoint::BeforeOutput {
-                    flag.store(true, Ordering::SeqCst);
-                }
-            });
-        }
-        let threshold = if expire_at_tx_only { 2 } else { 0 };
-        let rep = fx.step_with_clock(|| {
-            if !saw_before_output.load(Ordering::SeqCst) {
-                return base_now;
+        let rep = if !expire_at_tx {
+            let saw_before_output = Arc::new(AtomicBool::new(false));
+            let post_bo_reads = Arc::new(AtomicUsize::new(0));
+            {
+                let flag = Arc::clone(&saw_before_output);
+                fx.on_checkpoint(move |cp| {
+                    if cp == Checkpoint::BeforeOutput {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                });
             }
-            let idx = post_bo_reads.fetch_add(1, Ordering::SeqCst);
-            if idx <= threshold { base_now } else { after_child_dl }
-        });
+            fx.step_with_clock(|| {
+                if !saw_before_output.load(Ordering::SeqCst) {
+                    return base_now;
+                }
+                let idx = post_bo_reads.fetch_add(1, Ordering::SeqCst);
+                if idx == 0 { base_now } else { after_child_dl }
+            })
+        } else {
+            let delta = after_child_dl.saturating_duration_since(base_now);
+            *drv.bump_when_cutoff_le.lock().unwrap() = Some((child_dl, delta + Duration::from_millis(1)));
+            fx.step()
+        };
         assert!(rep.ended.is_none(), "child deadline expiry must leave parent running");
         assert_eq!(fx.active(), Some(parent));
+        assert!(fx.core.safety.state().is_operational());
         assert!(matches!(
             fx.core.macro_run.as_ref().map(|m| m.sub),
             Some(SubState::Failed { code, .. }) if code.as_str() == "CHILD_TIMEOUT"
         ));
-        assert!(
-            (fx.core.commanded_positions[0] - q_before[0]).abs() < 1e-6,
-            "Executor child expiry (tx_only={expire_at_tx_only}) must not advance reference"
-        );
         assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
-        let (w_pos, w_vel) = drv.last_write();
-        assert!(
-            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
-            "Executor child expiry (tx_only={expire_at_tx_only}) must transmit stationary hold only"
-        );
+        if !expire_at_tx {
+            assert!((fx.core.commanded_positions[0] - q_before[0]).abs() < 1e-6);
+            let (w_pos, w_vel) = drv.last_write();
+            assert!((w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6));
+        } else {
+            assert!(
+                drv.written.lock().unwrap().is_empty(),
+                "child deadline refused TX must send 0 writes on that tick"
+            );
+            let q_held = fx.core.commanded_positions.clone();
+            assert!(fx.step().ended.is_none());
+            let (w_pos, w_vel) = drv.last_write();
+            assert!((w_pos[0] - q_held[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6));
+        }
     }
 
     // Helper: construct a fresh Legacy SupervisorInner with a running macro parent + joint child.
-    let setup_legacy_moving = |parent_deadline: Option<Instant>, child_deadline: Option<Instant>| {
-        let drv = RecordingHoldDriver::new(&INSPECT, None);
+    let setup_legacy_moving = |clock: Option<VirtualClock>, parent_deadline: Option<Instant>, child_deadline: Option<Instant>| {
+        let drv = RecordingHoldDriver::new(&INSPECT, clock);
         let mut inner = driven_inner(drv.clone());
         let ep = inner.safety.epoch_id();
         let s = inner.current_admission_stamp();
@@ -4389,82 +4418,72 @@ fn r3_m3_deadline_between_before_output_and_check_sends_no_target_both_owners() 
         (inner, drv, id, q_before)
     };
 
-    // === 2a) Legacy: PARENT deadline before Check #1 AND between Check #1 and Check #2 ===
-    for expire_at_tx_only in [false, true] {
-        let now0 = Instant::now();
-        let parent_dl = now0 + Duration::from_secs(60);
-        let (mut inner, drv, id, q_before) = setup_legacy_moving(Some(parent_dl), None);
-        let before_dl = parent_dl - Duration::from_millis(5);
-        let after_dl = parent_dl + Duration::from_millis(5);
-        let reads = AtomicUsize::new(0);
-        let mut clock_fn = || {
-            let idx = reads.fetch_add(1, Ordering::SeqCst);
-            if expire_at_tx_only && idx == 0 {
-                // Check #1 sees before_dl -> Step 3 steps trajectory; Check #2 (idx == 1) sees after_dl!
-                before_dl
-            } else {
-                after_dl
-            }
-        };
-        inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
-        assert!(
-            reads.load(Ordering::SeqCst) >= if expire_at_tx_only { 3 } else { 2 },
-            "legacy tick must perform fresh clock reads"
-        );
-        assert!(
-            (inner.commanded_positions[0] - q_before[0]).abs() < 1e-6,
-            "Legacy parent expiry (tx_only={expire_at_tx_only}) must not advance reference: before={} after={}",
-            q_before[0],
-            inner.commanded_positions[0]
-        );
-        assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
-        let (w_pos, w_vel) = drv.last_write();
-        assert!(
-            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
-            "Legacy parent expiry (tx_only={expire_at_tx_only}) must send stationary hold only, got pos={} vel={:?}",
-            w_pos[0],
-            w_vel
-        );
+    // === 2a) Legacy: PARENT deadline before pre-step AND inside TX critical section ===
+    for expire_at_tx in [false, true] {
+        let clock = VirtualClock::starting_at(Instant::now());
+        let parent_dl = clock.now() + Duration::from_secs(60);
+        let (mut inner, drv, id, q_before) = setup_legacy_moving(Some(clock.clone()), Some(parent_dl), None);
+        if !expire_at_tx {
+            let after_dl = parent_dl + Duration::from_millis(5);
+            let mut clock_fn = || after_dl;
+            inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
+            assert!((inner.commanded_positions[0] - q_before[0]).abs() < 1e-6);
+            assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+            let (w_pos, w_vel) = drv.last_write();
+            assert!((w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6));
+        } else {
+            // Advance clock to 5ms before deadline, then advance past deadline inside `mit.rs:823`
+            // final driver lock -> TX choke point refuses with 0 writes!
+            clock.advance(Duration::from_secs(60) - Duration::from_millis(5));
+            *drv.bump_when_cutoff_le.lock().unwrap() = Some((parent_dl, Duration::from_millis(10)));
+            let mut clock_fn = || clock.now();
+            inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
+            assert!(
+                drv.written.lock().unwrap().is_empty(),
+                "Legacy TX choke point must refuse all writes after parent deadline"
+            );
+            assert!(inner.safety.state().is_operational());
+            assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+            let q_held = inner.commanded_positions.clone();
+            // Next tick sends stationary hold.
+            inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
+            let (w_pos, w_vel) = drv.last_write();
+            assert!((w_pos[0] - q_held[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6));
+        }
         let act = inner.last_action.as_ref().expect("finished action record");
         assert_eq!(act.id, id);
         assert_eq!(act.state, "failed");
         assert_eq!(act.code.as_deref(), Some("PLACE_TIMEOUT"));
     }
 
-    // === 2b) Legacy: CHILD deadline between Check #1 and Check #2 (parent alive, zero coast) ===
+    // === 2b) Legacy: CHILD deadline inside TX critical section (parent alive, next tick holds) ===
     {
-        let now0 = Instant::now();
-        let parent_dl = now0 + Duration::from_secs(120);
-        let child_dl = now0 + Duration::from_secs(60);
-        let (mut inner, drv, id, q_before) = setup_legacy_moving(Some(parent_dl), Some(child_dl));
-        let before_dl = child_dl - Duration::from_millis(5);
-        let after_dl = child_dl + Duration::from_millis(5);
-        let reads = AtomicUsize::new(0);
-        let mut clock_fn = || {
-            let idx = reads.fetch_add(1, Ordering::SeqCst);
-            if idx == 0 { before_dl } else { after_dl }
-        };
+        let clock = VirtualClock::starting_at(Instant::now());
+        let parent_dl = clock.now() + Duration::from_secs(120);
+        let child_dl = clock.now() + Duration::from_secs(60);
+        let (mut inner, drv, id, _q_before) =
+            setup_legacy_moving(Some(clock.clone()), Some(parent_dl), Some(child_dl));
+        clock.advance(Duration::from_secs(60) - Duration::from_millis(5));
+        *drv.bump_when_cutoff_le.lock().unwrap() = Some((child_dl, Duration::from_millis(10)));
+        let mut clock_fn = || clock.now();
         inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
+        assert!(drv.written.lock().unwrap().is_empty(), "0 writes on refused tick");
+        assert!(inner.safety.state().is_operational());
         assert!(inner.macro_alive(id), "child timeout must keep legacy parent alive");
         assert!(matches!(
             inner.macro_run.as_ref().map(|m| m.sub),
             Some(SubState::Failed { code, .. }) if code.as_str() == "CHILD_TIMEOUT"
         ));
-        assert!(
-            (inner.commanded_positions[0] - q_before[0]).abs() < 1e-6,
-            "Legacy child expiry at Check #2 must roll back with zero braking coast"
-        );
         assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        let q_held = inner.commanded_positions.clone();
+        inner.tick_control_legacy_with_clock(DT, &mut clock_fn);
         let (w_pos, w_vel) = drv.last_write();
-        assert!(
-            (w_pos[0] - q_before[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6),
-            "Legacy child expiry must send stationary hold only"
-        );
+        assert!((w_pos[0] - q_held[0]).abs() < 1e-6 && w_vel.iter().all(|v| v.abs() < 1e-6));
     }
 
     // === 2c) Legacy: real wall-clock `inner.tick(DT)` where deadline passes during RX read ===
     {
-        let (mut inner, drv, id, q_before) = setup_legacy_moving(None, None);
+        let (mut inner, drv, id, q_before) = setup_legacy_moving(None, None, None);
         // Set parent deadline 10ms in the future (still alive when `tick()` starts!), and stall
         // driver RX read for 30ms so the fresh `Instant::now()` before Step 3 catches expiry.
         inner.macro_run.as_mut().unwrap().deadline = Some(Instant::now() + Duration::from_millis(10));
@@ -4481,5 +4500,546 @@ fn r3_m3_deadline_between_before_output_and_check_sends_no_target_both_owners() 
             "Legacy real-clock tick must transmit stationary hold only"
         );
         assert_eq!(obs.action.as_ref().map(|a| (a.id, a.state.as_str(), a.code.as_deref())), Some((id, "failed", Some("PLACE_TIMEOUT"))));
+    }
+}
+
+/// Wrapper around a real `DamiaoArmDriver<FakeBus>` that can advance its shared `MockClock`
+/// strictly INSIDE the final driver lock (`mit.rs:823` `gripper_pos_force_info`), simulating a
+/// deadline that falls inside the TX critical section right before `write_joint_targets_bounded`.
+struct LockCriticalSectionDriver {
+    inner: armd::driver::DamiaoArmDriver<mit_support::FakeBus>,
+    clock: armd::transport::MockClock,
+    armed_cutoff: Option<Instant>,
+    bump_when_cutoff_le: Arc<Mutex<Option<(Instant, Duration)>>>,
+    bumped_inside_lock: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LockCriticalSectionDriver {
+    fn new(
+        inner: armd::driver::DamiaoArmDriver<mit_support::FakeBus>,
+        clock: armd::transport::MockClock,
+        bump_when_cutoff_le: Arc<Mutex<Option<(Instant, Duration)>>>,
+        bumped_inside_lock: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            inner,
+            clock,
+            armed_cutoff: None,
+            bump_when_cutoff_le,
+            bumped_inside_lock,
+        }
+    }
+}
+
+impl armd::driver::ArmDriver for LockCriticalSectionDriver {
+    fn capabilities(&self) -> armd::driver::DriverCapabilities { self.inner.capabilities() }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
+    fn clock_now(&self) -> Instant { self.inner.clock_now() }
+    fn enable_state(&self) -> armd::driver::EnableState { self.inner.enable_state() }
+    fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.inner.feedback_all_within(dof, max_age)
+    }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.inner.feedback_instants() }
+    fn feedback_seqs(&self) -> Vec<u64> { self.inner.feedback_seqs() }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_instants_into(out) }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_receive_instants_into(out) }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { self.inner.feedback_seqs_into(out) }
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_queue_bounds_into(out) }
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { self.inner.take_recovery_writes_into(out) }
+    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+        self.inner.read_joint_states()
+    }
+    fn read_joint_states_into(&mut self, out: &mut Vec<armd::model::JointState>) -> Result<(), armd::driver::ArmDriverError> {
+        self.inner.read_joint_states_into(out)
+    }
+    fn read_joint_states_budgeted(
+        &mut self,
+        out: &mut Vec<armd::model::JointState>,
+        deadline: Instant,
+        max_rx_frames: u16,
+    ) -> Result<(u16, bool), armd::driver::ArmDriverError> {
+        self.inner.read_joint_states_budgeted(out, deadline, max_rx_frames)
+    }
+    fn read_cached_joint_states_into(&self, out: &mut Vec<armd::model::JointState>) -> Option<()> {
+        self.inner.read_cached_joint_states_into(out)
+    }
+    fn write_joint_targets(&mut self, targets: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
+        self.inner.write_joint_targets(targets)
+    }
+    fn write_joint_targets_bounded(
+        &mut self,
+        targets: &[armd::driver::JointTarget],
+    ) -> Result<armd::driver::TxBatchOutcome, armd::driver::ArmDriverError> {
+        self.inner.write_joint_targets_bounded(targets)
+    }
+    fn write_estop_hold_bounded(
+        &mut self,
+        targets: &[armd::driver::JointTarget],
+    ) -> Result<armd::driver::TxBatchOutcome, armd::driver::ArmDriverError> {
+        self.inner.write_estop_hold_bounded(targets)
+    }
+    fn discard_pending_tx(&mut self) { armd::driver::ArmDriver::discard_pending_tx(&mut self.inner); }
+    fn set_tx_release_deadline(&mut self, deadline: Option<Instant>) {
+        self.armed_cutoff = deadline;
+        self.inner.set_tx_release_deadline(deadline);
+    }
+    fn tx_frame_max_age(&self) -> Duration { self.inner.tx_frame_max_age() }
+    fn last_tx_expired_age(&self) -> Option<Duration> { self.inner.last_tx_expired_age() }
+    fn oldest_pending_tx_age(&self) -> Option<Duration> { self.inner.oldest_pending_tx_age() }
+    fn pending_motion_tx_len(&self) -> usize { self.inner.pending_motion_tx_len() }
+    fn pending_hold_tx_len(&self) -> usize { self.inner.pending_hold_tx_len() }
+    fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
+    fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
+    fn set_torque(&mut self, enable: bool) -> Result<(), armd::driver::ArmDriverError> {
+        self.inner.set_torque(enable)
+    }
+    fn gripper_pos_force_info(&self) -> Option<armd::driver::GripperPosForceInfo> {
+        if let Some(cap) = self.armed_cutoff {
+            let mut guard = self.bump_when_cutoff_le.lock().unwrap();
+            if let Some((limit, step)) = *guard {
+                if cap <= limit {
+                    *guard = None;
+                    self.clock.advance(step);
+                    self.bumped_inside_lock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        self.inner.gripper_pos_force_info()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_m3_single_effective_cutoff_blocks_tx_critical_section_on_both_owners() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use armd::driver::{ArmDriver, DamiaoArmDriver, TxBudget};
+    use armd::protocol::damiao::DamiaoLimits;
+    use armd::transport::MockClock;
+    use mit_support::FakeBus;
+
+    let dm_limits = || -> Vec<DamiaoLimits> {
+        ArmConfig::rebot_dm()
+            .damiao_ranges
+            .unwrap()
+            .iter()
+            .map(|r| r.limits())
+            .collect()
+    };
+
+    let build_damiao_supervisor = |clock: &MockClock,
+                                   bump_lock: Arc<Mutex<Option<(Instant, Duration)>>>,
+                                   bumped_count: Arc<AtomicUsize>| {
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            for (m, &q0) in s.motors.iter_mut().zip(INSPECT.iter()) {
+                m.q = q0;
+            }
+            s.immediate_replies = false;
+            s.follow_commands = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_tx_budget(TxBudget::default());
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let wrapped = LockCriticalSectionDriver::new(drv, clock.clone(), bump_lock, bumped_count);
+        let cfg = ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(wrapped));
+        inner.lease_enabled = false;
+        inner.tick(DT);
+        let stamp = inner.current_admission_stamp();
+        let admitted = inner.check_admission(stamp).unwrap();
+        SupervisorInner::enable_torque(admitted).expect("arm damiao");
+        for _ in 0..3 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(DT);
+        }
+        assert!(inner.safety.state().is_operational());
+        bus.clear_log();
+        (inner, bus)
+    };
+
+    // === 1) EXECUTOR OWNER (real DamiaoArmDriver<FakeBus> + shared MockClock) ===
+    // Test BOTH critical-section expiry points:
+    //   (a) inside final driver lock (`mit.rs:823` -> `mit.rs:850`, before frame 0): 0 frames on wire!
+    //   (b) mid-batch inside `DamiaoArmDriver::send()` (frame 0 < deadline, `on_tx` advances past
+    //       deadline -> frames 1..6 refused before `can.transmit`): 0 frames on wire >= deadline!
+    for mid_batch in [false, true] {
+        let clock = MockClock::new();
+        let bump_lock = Arc::new(Mutex::new(None));
+        let bumped_count = Arc::new(AtomicUsize::new(0));
+        let (mut inner, bus) =
+            build_damiao_supervisor(&clock, Arc::clone(&bump_lock), Arc::clone(&bumped_count));
+        inner.rt_executor_owned = true;
+        let vclock = VirtualClock::from_mock_clock(clock.clone());
+        let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BOOT,
+            Capacities { commands: 8, plans: 4, replies: 32 },
+            vclock,
+        );
+        bus.with(|s| s.push_all_feedback());
+        fx.step();
+
+        // Begin macro with parent deadline = now + 65ms (after begin +20ms, install +20ms, mid +20ms
+        // = 60ms elapsed -> 5ms remaining at the start of the expiry tick!).
+        let mut begin = BeginMacroSpec::new(MacroKind::Place, BOOT);
+        let parent_dl = fx.now() + Duration::from_millis(65);
+        begin.macro_deadline = Some(parent_dl);
+        begin.timeout_code = armd::safety::BoundedText::new("PLACE_TIMEOUT");
+        let r_b = b
+            .submit(
+                ClientId(1),
+                1,
+                auth(&fx),
+                fx.now() + DEFAULT_ACTION_DEADLINE,
+                Submit::Action(ActionSubmit::BeginMacro(begin)),
+            )
+            .unwrap();
+        bus.with(|s| s.push_all_feedback());
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let parent = fx.active().unwrap();
+        let _ = drain_all(&mut b);
+
+        let snap = snap_of(&fx);
+        let mut target = snap.commanded_positions.clone();
+        target[0] += 0.40;
+        let max_vel: Vec<f32> = snap.env.planning_limits(None).iter().map(|l| l.max_velocity).collect();
+        let c = ChildSpec {
+            ticket: ChildTicket { parent, child_seq: 1 },
+            timeout_s: 10.0,
+            timeout_code: "CHILD_TIMEOUT",
+            contact: None,
+        };
+        let slot = prepare_child_joint_slot(&snap.commanded_positions, &target, &max_vel, 0.2, None, c).unwrap();
+        submit_child(&mut b, ClientId(1), 2, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, BOOT, slot, true).unwrap();
+        bus.with(|s| s.push_all_feedback());
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let _ = drain_all(&mut b);
+
+        bus.with(|s| s.push_all_feedback());
+        assert!(fx.step().ended.is_none());
+        assert!(fx.now() < parent_dl, "must still be strictly before parent_dl");
+        assert!(fx.core.commanded_velocities[0].abs() > 1e-4);
+
+        bus.clear_log();
+        bus.with(|s| s.push_all_feedback());
+        let tx_hook_fired = Arc::new(AtomicBool::new(false));
+        if !mid_batch {
+            // Advance MockClock past `parent_dl` strictly INSIDE the final driver lock (`mit.rs:823`).
+            *bump_lock.lock().unwrap() = Some((parent_dl, Duration::from_millis(8)));
+        } else {
+            // Frame 0 hits `can.transmit` BEFORE `parent_dl`, then `on_tx` advances `MockClock`
+            // past `parent_dl` -> `DamiaoArmDriver::send()` MUST refuse frames 1..6 BEFORE wire TX!
+            let clk = clock.clone();
+            let fired = Arc::clone(&tx_hook_fired);
+            bus.with(|s| {
+                s.on_tx = Some(Arc::new(move || {
+                    if !fired.swap(true, Ordering::SeqCst) {
+                        clk.advance(Duration::from_millis(8));
+                    }
+                }));
+            });
+        }
+
+        let rep_exp = fx.step();
+        let (tx_frames, tx_times) = bus.with(|s| (s.tx_log.clone(), s.tx_times.clone()));
+        assert_eq!(tx_frames.len(), tx_times.len());
+        for (idx, t_opt) in tx_times.iter().enumerate() {
+            let t = t_opt.expect("FakeBus with MockClock records tx timestamp");
+            assert!(
+                t < parent_dl,
+                "Executor (mid_batch={mid_batch}) transmitted frame #{idx} AT/AFTER parent_dl! t={t:?} dl={parent_dl:?}"
+            );
+        }
+        if !mid_batch {
+            assert_eq!(bumped_count.load(Ordering::SeqCst), 1, "clock must have bumped inside final driver lock");
+            assert!(tx_frames.is_empty(), "0 frames may hit wire when deadline falls inside final driver lock");
+        } else {
+            assert!(tx_hook_fired.load(Ordering::SeqCst), "mid-batch on_tx hook must have fired");
+            assert_eq!(
+                tx_frames.len(),
+                1,
+                "only pre-deadline frame 0 may hit wire; frames 1..6 must be refused by DamiaoArmDriver::send()"
+            );
+            bus.with(|s| s.on_tx = None);
+        }
+        assert!(fx.core.safety.state().is_operational(), "deadline refusal must not latch CAN_TX_STALLED or fault");
+        assert!(fx.core.active_trajectory.is_none(), "expired macro must quiesce child immediately");
+        assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        assert!(rep_exp.ended.is_none(), "RT+driver waits for next tick's hold write before terminal");
+
+        // Next tick: stationary hold transmits cleanly (full 7-joint batch, no further advance)
+        // and emits `PLACE_TIMEOUT` terminal EXACTLY ONCE!
+        let q_hold = fx.core.commanded_positions.clone();
+        bus.clear_log();
+        bus.with(|s| s.push_all_feedback());
+        let rep_hold = fx.step();
+        assert_eq!(rep_hold.ended, Some((parent, Outcome::Failed("PLACE_TIMEOUT"))));
+        assert!((fx.core.commanded_positions[0] - q_hold[0]).abs() < 1e-6);
+        assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        assert_eq!(bus.tx_log().len(), 7, "hold tick must complete full 7-joint stationary hold batch");
+
+        // Additional ticks: stationary hold, ZERO duplicate terminals!
+        for _ in 0..2 {
+            bus.with(|s| s.push_all_feedback());
+            assert!(fx.step().ended.is_none());
+        }
+        let reps = drain_all(&mut b);
+        let term_count = reps
+            .iter()
+            .filter(|(_, r)| matches!(
+                r,
+                Reply::Terminal { request, action, outcome: Outcome::Failed("PLACE_TIMEOUT"), .. }
+                    if *request == r_b && *action == parent
+            ))
+            .count();
+        assert_eq!(term_count, 1, "Executor PLACE_TIMEOUT terminal must be delivered exactly once");
+    }
+
+    // === 2) EXECUTOR CHILD DEADLINE inside `DamiaoArmDriver::send()` (parent alive) ===
+    {
+        let clock = MockClock::new();
+        let bump_lock = Arc::new(Mutex::new(None));
+        let bumped_count = Arc::new(AtomicUsize::new(0));
+        let (mut inner, bus) =
+            build_damiao_supervisor(&clock, Arc::clone(&bump_lock), Arc::clone(&bumped_count));
+        inner.rt_executor_owned = true;
+        let vclock = VirtualClock::from_mock_clock(clock.clone());
+        let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BOOT,
+            Capacities { commands: 8, plans: 4, replies: 32 },
+            vclock,
+        );
+        bus.with(|s| s.push_all_feedback());
+        fx.step();
+        let mut begin = BeginMacroSpec::new(MacroKind::Place, BOOT);
+        begin.macro_deadline = Some(fx.now() + Duration::from_secs(10));
+        begin.timeout_code = armd::safety::BoundedText::new("PLACE_TIMEOUT");
+        b.submit(ClientId(1), 1, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, Submit::Action(ActionSubmit::BeginMacro(begin))).unwrap();
+        bus.with(|s| s.push_all_feedback());
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let parent = fx.active().unwrap();
+        let _ = drain_all(&mut b);
+
+        let snap = snap_of(&fx);
+        let mut target = snap.commanded_positions.clone();
+        target[0] += 0.40;
+        let max_vel: Vec<f32> = snap.env.planning_limits(None).iter().map(|l| l.max_velocity).collect();
+        let c = ChildSpec {
+            ticket: ChildTicket { parent, child_seq: 1 },
+            timeout_s: 0.045,
+            timeout_code: "CHILD_TIMEOUT",
+            contact: None,
+        };
+        let slot = prepare_child_joint_slot(&snap.commanded_positions, &target, &max_vel, 0.2, None, c).unwrap();
+        submit_child(&mut b, ClientId(1), 2, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, BOOT, slot, true).unwrap();
+        bus.with(|s| s.push_all_feedback());
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let _ = drain_all(&mut b);
+        bus.with(|s| s.push_all_feedback());
+        assert!(fx.step().ended.is_none());
+        let child_dl = fx.core.macro_run.as_ref().unwrap().child.deadline.unwrap();
+        assert!(fx.now() < child_dl);
+
+        bus.clear_log();
+        bus.with(|s| s.push_all_feedback());
+        let clk = clock.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        bus.with(|s| {
+            s.on_tx = Some(Arc::new(move || {
+                if !fired.swap(true, Ordering::SeqCst) {
+                    clk.advance(Duration::from_millis(8));
+                }
+            }));
+        });
+        assert!(fx.step().ended.is_none());
+        bus.with(|s| s.on_tx = None);
+        let (tx_frames, tx_times) = bus.with(|s| (s.tx_log.clone(), s.tx_times.clone()));
+        assert_eq!(tx_frames.len(), 1, "only frame 0 before child_dl may hit wire");
+        assert!(tx_times[0].unwrap() < child_dl);
+        assert!(fx.core.safety.state().is_operational());
+        assert_eq!(fx.active(), Some(parent), "child timeout must leave parent running");
+        assert!(matches!(
+            fx.core.macro_run.as_ref().map(|m| m.sub),
+            Some(SubState::Failed { code, .. }) if code.as_str() == "CHILD_TIMEOUT"
+        ));
+        assert!(fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    // === 3) LEGACY OWNER (real ArmSupervisor + DamiaoArmDriver<FakeBus> + TerminalBroadcaster) ===
+    // Verify BOTH inside final driver lock (0 frames) AND mid-batch inside `DamiaoArmDriver::send()`
+    // (0 frames >= deadline), AND assert `TerminalBroadcaster` delivers `PLACE_TIMEOUT` EXACTLY ONCE!
+    for mid_batch in [false, true] {
+        let clock = MockClock::new();
+        let bump_lock = Arc::new(Mutex::new(None));
+        let bumped_count = Arc::new(AtomicUsize::new(0));
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            for (m, &q0) in s.motors.iter_mut().zip(INSPECT.iter()) {
+                m.q = q0;
+            }
+            s.immediate_replies = false;
+            s.follow_commands = true;
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_tx_budget(TxBudget::default());
+        drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        let wrapped = LockCriticalSectionDriver::new(
+            drv,
+            clock.clone(),
+            Arc::clone(&bump_lock),
+            Arc::clone(&bumped_count),
+        );
+        let cfg = ArmConfig {
+            collision: None,
+            lease_timeout_ms: 600_000,
+            // 10 Hz -> 98ms release cap so a 50ms action deadline is strictly tighter than the
+            // release cap (never colliding with line 4912's RX cap) while having 49ms margin
+            // against CI CPU jitter before reaching the TX critical section.
+            control_frequency_hz: 10,
+            ..ArmConfig::rebot_dm()
+        };
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(wrapped)));
+        sup.set_lease_enabled(false).await;
+        sup.start_dispatcher().unwrap();
+        let delivered = Arc::new(Mutex::new(Vec::<armd::ArmObservation>::new()));
+        let delivered_sink = Arc::clone(&delivered);
+        let _sub = sup.test_subscribe_action_terminals(move |obs| {
+            delivered_sink.lock().unwrap().push(obs.clone());
+            true
+        });
+
+        let (id, parent_dl) = {
+            let mut inner = sup.inner().write().await;
+            inner.tick(DT);
+            let s = inner.current_admission_stamp();
+            let a = inner.check_admission(s).unwrap();
+            SupervisorInner::enable_torque(a).unwrap();
+            for _ in 0..3 {
+                clock.advance(Duration::from_millis(20));
+                bus.with(|st| st.push_all_feedback());
+                inner.tick(DT);
+            }
+            let ep = inner.safety.epoch_id();
+            let s2 = inner.current_admission_stamp();
+            let a2 = inner.check_admission(s2).unwrap();
+            let id = SupervisorInner::begin_orchestrated_action(a2, "place", None, ep).unwrap();
+            let mut target = inner.commanded_positions.clone();
+            target[0] += 0.40;
+            let lims = inner.config.limits.clone();
+            let s3 = inner.current_admission_stamp();
+            let a3 = inner.check_admission(s3).unwrap();
+            SupervisorInner::install_macro_quintic(a3, id, target, &lims).unwrap();
+            for _ in 0..2 {
+                clock.advance(Duration::from_millis(20));
+                bus.with(|st| st.push_all_feedback());
+                inner.tick(DT);
+            }
+            // Arm parent deadline 25ms ahead (< 45ms frame_max_age and < 98ms release cap, >> 1ms tick time).
+            let dl_owner = Instant::now() + Duration::from_millis(25);
+            let dl_drv = clock.now() + Duration::from_millis(25);
+            if let Some(m) = inner.macro_run.as_mut() {
+                m.deadline = Some(dl_owner);
+                m.timeout_code = armd::safety::BoundedText::new("PLACE_TIMEOUT");
+            }
+            (id, dl_drv)
+        };
+
+        bus.clear_log();
+        bus.with(|s| s.push_all_feedback());
+        let tx_hook_fired = Arc::new(AtomicBool::new(false));
+        if !mid_batch {
+            // Advance driver `MockClock` by +30ms (> 25ms deadline, < 45ms frame_max_age) strictly INSIDE `mit.rs:823` lock!
+            *bump_lock.lock().unwrap() = Some((parent_dl + Duration::from_millis(5), Duration::from_millis(30)));
+        } else {
+            // Frame 0 hits `can.transmit` BEFORE deadline; `on_tx` advances `MockClock` by +30ms
+            // (> 25ms deadline, < 45ms frame_max_age) -> `DamiaoArmDriver::send()` MUST refuse frames 1..6 BEFORE wire TX!
+            let clk = clock.clone();
+            let fired = Arc::clone(&tx_hook_fired);
+            bus.with(|s| {
+                s.on_tx = Some(Arc::new(move || {
+                    if !fired.swap(true, Ordering::SeqCst) {
+                        clk.advance(Duration::from_millis(30));
+                    }
+                }));
+            });
+        }
+
+        // Run production Legacy `sup.tick(DT)` (uses real `Instant::now()` + `TerminalBroadcaster`!).
+        sup.tick(DT).await;
+        bus.with(|s| s.on_tx = None);
+
+        let (tx_frames, tx_times) = bus.with(|s| (s.tx_log.clone(), s.tx_times.clone()));
+        for (idx, t_opt) in tx_times.iter().enumerate() {
+            let t = t_opt.expect("FakeBus timestamp");
+            assert!(
+                t < parent_dl,
+                "Legacy (mid_batch={mid_batch}) transmitted frame #{idx} AT/AFTER parent_dl! t={t:?} dl={parent_dl:?}"
+            );
+        }
+        if !mid_batch {
+            assert_eq!(bumped_count.load(Ordering::SeqCst), 1);
+            assert!(tx_frames.is_empty(), "Legacy must put 0 frames on wire when deadline falls in driver lock");
+        } else {
+            assert!(tx_hook_fired.load(Ordering::SeqCst));
+            assert_eq!(tx_frames.len(), 1, "Legacy mid-batch must refuse frames 1..6 inside DamiaoArmDriver::send()");
+        }
+
+        // Verify next ticks hold cleanly and deliver NO duplicate terminal!
+        let q_hold = sup.inner().read().await.commanded_positions.clone();
+        assert!(
+            sup.inner().read().await.safety.state().is_operational(),
+            "Legacy (mid_batch={mid_batch}) must stay operational, got {:?}",
+            sup.inner().read().await.safety.state()
+        );
+        assert!(sup.inner().read().await.active_trajectory.is_none());
+        assert!(sup.inner().read().await.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        for _ in 0..2 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| s.push_all_feedback());
+            sup.tick(DT).await;
+            let inner = sup.inner().read().await;
+            assert!((inner.commanded_positions[0] - q_hold[0]).abs() < 1e-6);
+            assert!(inner.commanded_velocities.iter().all(|v| v.abs() < 1e-6));
+        }
+
+        // Wait for dispatcher to flush terminal and assert EXACTLY ONE `PLACE_TIMEOUT` terminal!
+        let wait_dl = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < wait_dl {
+            if delivered.lock().unwrap().iter().any(|o| o.action.as_ref().is_some_and(|a| a.id == id)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let matching: Vec<_> = delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.action.as_ref().is_some_and(|a| a.id == id))
+            .cloned()
+            .collect();
+        assert_eq!(matching.len(), 1, "Legacy TerminalBroadcaster must deliver PLACE_TIMEOUT exactly once");
+        assert_eq!(
+            matching[0].action.as_ref().map(|a| (a.state.as_str(), a.code.as_deref())),
+            Some(("failed", Some("PLACE_TIMEOUT")))
+        );
     }
 }

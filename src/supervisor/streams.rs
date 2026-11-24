@@ -570,6 +570,7 @@ impl SupervisorInner {
                     TickOutput::Expired { .. }
                     | TickOutput::Error { .. }
                     | TickOutput::EstopInhibited { .. }
+                    | TickOutput::ActionDeadlineRefused { .. }
                     | TickOutput::None => {
                         self.tracking.invalidate();
                     }

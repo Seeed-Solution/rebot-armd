@@ -808,6 +808,7 @@ impl crate::supervisor::SupervisorInner {
                 .map(|c| self.gripper_hold_vel_ceiling.map_or(c, |h| c.min(h)))
                 .or_else(|| self.active_joint_velocity_ceiling(g))
         });
+        let cutoff = self.active_tx_cutoff;
         let res = self.driver.as_ref().and_then(|d| d.lock().ok())
             .map(|mut drv| {
                 // Enforce the active authorized velocity ceiling across both moving ticks and
@@ -847,12 +848,45 @@ impl crate::supervisor::SupervisorInner {
                         }
                     }
                 }
+                // Single TX cutoff choke point under the driver lock:
+                // - Safety/stopped holds restore the unclipped release cap so an action deadline
+                //   never blocks a safety hold.
+                // - Motion targets check the action cutoff right before calling the driver (guarding
+                //   non-CAN/sim/mock drivers and any wait on `d.lock()`), while `DamiaoArmDriver`
+                //   additionally enforces the exact same `tx_release_deadline` per-frame inside `send()`.
+                let action_cap = cutoff.and_then(|c| c.drv_action_cutoff);
+                if is_hold {
+                    if let Some(c) = cutoff {
+                        if c.drv_action_cutoff.is_some() {
+                            drv.set_tx_release_deadline(Some(c.drv_release_cap));
+                        }
+                    }
+                } else if let Some(cap) = action_cap {
+                    let pre_now = drv.clock_now();
+                    if pre_now >= cap {
+                        drv.discard_pending_tx();
+                        return TickOutput::ActionDeadlineRefused { drv_now: pre_now };
+                    }
+                }
                 let write_res = if is_hold {
                     drv.write_estop_hold_bounded(targets)
                 } else {
                     drv.write_joint_targets_bounded(targets)
                 };
                 let now = drv.clock_now();
+                if !is_hold
+                    && matches!(
+                        write_res,
+                        Ok(TxBatchOutcome::Deferred { .. })
+                            | Err(crate::driver::ArmDriverError::Transport(
+                                crate::transport::TransportError::Timeout
+                            ))
+                    )
+                    && action_cap.is_some_and(|cap| now >= cap)
+                {
+                    drv.discard_pending_tx();
+                    return TickOutput::ActionDeadlineRefused { drv_now: now };
+                }
                 let max_age = drv.tx_frame_max_age();
                 let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
                 match write_res {
@@ -913,7 +947,7 @@ impl crate::supervisor::SupervisorInner {
                 TickOutput::Expired { dropped, .. } => {
                     self.mit_lose(format!("MIT batch write expired ({dropped} frames dropped)"), crate::safety::FaultCode::BusLoss);
                 }
-                TickOutput::None => {}
+                TickOutput::ActionDeadlineRefused { .. } | TickOutput::None => {}
             }
         }
         res

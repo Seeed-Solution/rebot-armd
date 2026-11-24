@@ -697,6 +697,23 @@ pub(crate) struct DeferredActionDone {
     pub(crate) clear_releasing: bool,
 }
 
+/// Single per-tick TX cutoff computed ONCE in the owner:
+/// `drv_effective = min(control-release deadline, active action/macro parent & child deadlines)`
+/// translated into the driver clock domain and installed at the driver TX choke point.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EffectiveTxCutoff {
+    /// Control-release deadline minus publish margin in the driver clock domain (safety holds use
+    /// this ceiling so an action deadline never clips a safety/E-stop hold).
+    pub(crate) drv_release_cap: Instant,
+    /// Active action/macro deadline translated into the driver clock domain (`None` when idle or
+    /// already quiesced/finishing).
+    pub(crate) drv_action_cutoff: Option<Instant>,
+    /// Owner-clock anchor sampled together with `drv_anchor` when translating deadlines.
+    pub(crate) owner_anchor: Instant,
+    /// Driver-clock anchor sampled together with `owner_anchor`.
+    pub(crate) drv_anchor: Instant,
+}
+
 /// Zero-allocation classification of a bounded driver output write in one release,
 /// explicitly bound to whether the submitted batch was a stopped hold (`is_hold`).
 #[derive(Debug)]
@@ -706,6 +723,10 @@ pub(crate) enum TickOutput {
     /// Driver refused target/hold because an E-stop or authorized stop is pending/latched.
     /// Zero-allocation typed refusal (avoids formatting or matching `ESTOP_INHIBITED`).
     EstopInhibited { is_hold: bool },
+    /// Driver TX choke point refused target writes because the active action/macro deadline
+    /// elapsed before transmit (zero frames placed on the wire after the deadline; never counted
+    /// as a CAN bus stall).
+    ActionDeadlineRefused { drv_now: Instant },
     Complete { is_hold: bool },
     Deferred {
         pending: usize,
@@ -1095,6 +1116,8 @@ pub struct SupervisorInner {
     pub tool_commissioning_revision: u64,
     /// Single-pass Step-2 hardware poll state consumed once by `tick_control` in the same release.
     pub(crate) pending_rx_poll: PendingRxPoll,
+    /// Active per-tick TX cutoff installed for the current control output pass (`None` outside tick).
+    pub(crate) active_tx_cutoff: Option<EffectiveTxCutoff>,
     /// Authorized-stop generations wired into `estop_gate()` when owned by an RT executor.
     pub(crate) stop_requests: Option<crate::rt_core::urgent::StopRequests>,
     /// True on the empty shell left inside `ArmSupervisor::inner` after executor ownership transfer.
@@ -1846,6 +1869,7 @@ impl SupervisorInner {
             tool_commissioning_confirmed_at: None,
             tool_commissioning_revision: 1,
             pending_rx_poll: PendingRxPoll::default(),
+            active_tx_cutoff: None,
             stop_requests: None,
             detached: false,
             persist_capacity_available: true,
@@ -4249,6 +4273,13 @@ impl SupervisorInner {
                 }
                 false
             }
+            TickOutput::ActionDeadlineRefused { .. } => {
+                // TX was refused by the active action/macro deadline, not a CAN bus stall:
+                // clear any bus-stall streak and leave `batch_completed = false` so the tick's
+                // post-output reconciliation terminates the expired action cleanly.
+                self.reset_tx_joint_progress();
+                false
+            }
             TickOutput::Complete { .. } => {
                 self.reset_tx_joint_progress();
                 self.hold_tx_unsent_since = None;
@@ -4724,24 +4755,73 @@ impl SupervisorInner {
         self.tick_control_inner(dt, None, now_fn)
     }
 
+    /// Computes the single per-tick TX cutoff ONCE in the owner:
+    ///   `effective_cutoff = min(control-release deadline, active action/macro parent & child deadlines)`
+    /// translated into the driver clock domain, and installs it as THE deadline on `self.driver`
+    /// via `set_tx_release_deadline`. Safety/stopped holds are never clipped by an action deadline.
+    fn install_effective_tx_cutoff(
+        &self,
+        release_deadline: Option<Instant>,
+        now_fn: &mut dyn FnMut() -> Instant,
+    ) -> (bool, Option<EffectiveTxCutoff>) {
+        let Some(ref d) = self.driver else {
+            return (false, None);
+        };
+        let Ok(mut drv) = d.lock() else {
+            return (false, None);
+        };
+        let owner_now = now_fn();
+        let drv_now = drv.clock_now();
+        let drv_release_cap = match release_deadline {
+            Some(rd) => self.driver_tx_release_cap(drv_now, owner_now, rd),
+            None => {
+                let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+                drv_now + period.saturating_sub(self.tx_release_publish_margin())
+            }
+        };
+        let drv_action_cutoff = if self.safety.state().is_stopped() {
+            None
+        } else {
+            self.active_action_deadline()
+                .map(|dl| drv_now + dl.saturating_duration_since(owner_now))
+        };
+        let drv_effective = drv_action_cutoff.map_or(drv_release_cap, |ac| drv_release_cap.min(ac));
+        drv.set_tx_release_deadline(Some(drv_effective));
+        (
+            true,
+            Some(EffectiveTxCutoff {
+                drv_release_cap,
+                drv_action_cutoff,
+                owner_anchor: owner_now,
+                drv_anchor: drv_now,
+            }),
+        )
+    }
+
     fn tick_control_inner(
         &mut self,
         dt: f64,
         release_deadline: Option<Instant>,
         now_fn: &mut dyn FnMut() -> Instant,
     ) -> f64 {
-        let applied_tx_cap = if let Some(ref d) = self.driver {
-            if let Ok(mut drv) = d.lock() {
-                let drv_now = drv.clock_now();
-                let cap = match release_deadline {
-                    Some(release_deadline) => self.driver_tx_release_cap(drv_now, now_fn(), release_deadline),
-                    None => {
-                        let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
-                        drv_now + period.saturating_sub(self.tx_release_publish_margin())
-                    }
-                };
-                drv.set_tx_release_deadline(Some(cap));
-                true
+        // Legacy callers without a preceding Step-2 `poll_hardware_for_release` run `poll_hardware_rx`
+        // below; bound any stale-joint recovery TX during RX intake to the control-release cap.
+        let applied_rx_tx_cap = if !self.pending_rx_poll.active {
+            if let Some(ref d) = self.driver {
+                if let Ok(mut drv) = d.lock() {
+                    let drv_now = drv.clock_now();
+                    let cap = match release_deadline {
+                        Some(rd) => self.driver_tx_release_cap(drv_now, now_fn(), rd),
+                        None => {
+                            let period = Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+                            drv_now + period.saturating_sub(self.tx_release_publish_margin())
+                        }
+                    };
+                    drv.set_tx_release_deadline(Some(cap));
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -5563,33 +5643,20 @@ impl SupervisorInner {
         self.torque_guard_tick(servo_dt);
         // Supply-current estimate (src/power.rs).
         self.power_tick(servo_dt);
-        // Enforce whole-macro parent and child deadlines in ONE function with a FRESH clock read
-        // immediately BEFORE stepping any trajectory or submitting bus targets: an expired parent
-        // or child quiesces to a stationary hold in THIS tick so no post-deadline motion target is
-        // advanced or transmitted. Snapshot the pre-step pose on the stack (zero alloc) so the
-        // transmit-point fresh-clock recheck can roll back if a deadline expires during Step 3.
+        // Pre-step deadline check ONLY to avoid advancing the reference when a macro parent or
+        // child deadline has already elapsed before Step 3.
         if self.macro_run.is_some() {
             let pre_step_now = now_fn();
             if !self.enforce_macro_deadlines(pre_step_now) {
                 self.step_macro_contact();
             }
         }
-        let macro_pre_step_hold: Option<actions::MacroPreStepHold> = self.macro_run.as_ref().and_then(|m| {
-            self.active_trajectory
-                .as_ref()
-                .filter(|a| a.action_id == Some(m.id))
-                .map(|a| {
-                    let dof = self.commanded_positions.len().min(crate::rt_core::mailbox::MAX_DOF);
-                    let mut positions = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
-                    positions[..dof].copy_from_slice(&self.commanded_positions[..dof]);
-                    actions::MacroPreStepHold {
-                        action_id: m.id,
-                        is_gripper: matches!(a.reference, Reference::Gripper(_)),
-                        dof,
-                        positions,
-                    }
-                })
-        });
+        // Compute effective_cutoff = min(control-release deadline, active action/macro parent &
+        // child deadlines) ONCE for this tick and pass it as THE deadline to the driver TX choke
+        // point. If a deadline elapses anywhere during Step 3, tracking, or the driver lock/TX
+        // critical section, the TX choke point refuses writes past the cutoff and the next tick holds.
+        let (applied_output_tx_cap, tx_cutoff) = self.install_effective_tx_cutoff(release_deadline, now_fn);
+        self.active_tx_cutoff = tx_cutoff;
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
@@ -6107,17 +6174,6 @@ impl SupervisorInner {
             let _ = self.mit_hand_back("park");
         }
         self.mit_maybe_activate();
-        // Second fresh-clock macro deadline check immediately at the transmit point: if the parent
-        // or child deadline expired after the pre-step check (including during Step 3), roll back
-        // any stepped macro reference to the pre-step hold pose so no post-deadline target is sent.
-        if self.macro_run.is_some() {
-            let tx_now = now_fn();
-            let rollback = reference_stepped.then_some(macro_pre_step_hold.as_ref()).flatten();
-            if self.enforce_macro_deadlines_inner(tx_now, rollback) {
-                deferred_done = None;
-                reference_stepped = false;
-            }
-        }
         let gravity_output_enabled = self.gravity_output_enabled();
         self.tick_phase(1);
         // Hold only while torque may be active and fresh valid feedback permits output.
@@ -6348,6 +6404,7 @@ impl SupervisorInner {
                                 | TickOutput::Expired { .. }
                                 | TickOutput::Error { .. }
                                 | TickOutput::EstopInhibited { .. }
+                                | TickOutput::ActionDeadlineRefused { .. }
                                 | TickOutput::None => {
                                     self.tracking.invalidate();
                                 }
@@ -6467,7 +6524,7 @@ impl SupervisorInner {
                 }
             }
             match &tick_output {
-                TickOutput::EstopInhibited { .. } => {
+                TickOutput::EstopInhibited { .. } | TickOutput::ActionDeadlineRefused { .. } => {
                     tick_output = TickOutput::None;
                 }
                 TickOutput::Complete { is_hold: false }
@@ -6478,6 +6535,10 @@ impl SupervisorInner {
                 _ => {}
             }
         }
+        let action_deadline_refused_at = match tick_output {
+            TickOutput::ActionDeadlineRefused { drv_now } => Some(drv_now),
+            _ => None,
+        };
         let has_pending_motion = matches!(tick_output, TickOutput::None)
             && self.max_tx_joint_no_progress_ticks() > 0
             && self.driver.as_ref().is_some_and(|d| {
@@ -6507,7 +6568,13 @@ impl SupervisorInner {
             self.step_gravity_comp_exit(servo_dt, gravity_stiff_hold_completed);
         }
 
-        let tick_now = now_fn();
+        let mut tick_now = now_fn();
+        if let (Some(drv_refused_now), Some(c)) = (action_deadline_refused_at, self.active_tx_cutoff) {
+            let translated = c.owner_anchor + drv_refused_now.saturating_duration_since(c.drv_anchor);
+            if translated > tick_now {
+                tick_now = translated;
+            }
+        }
         if let Some(done) = deferred_done {
             if !self.safety.state().is_stopped() {
                 self.pending_deferred_done = Some(done);
@@ -6746,7 +6813,8 @@ impl SupervisorInner {
             }
         }
 
-        if applied_tx_cap {
+        self.active_tx_cutoff = None;
+        if applied_rx_tx_cap || applied_output_tx_cap {
             if let Some(ref d) = self.driver {
                 if let Ok(mut drv) = d.lock() {
                     drv.set_tx_release_deadline(None);
