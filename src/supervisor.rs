@@ -2164,10 +2164,12 @@ impl SupervisorInner {
             self.e_stop_latched.store(true, Ordering::SeqCst);
             return true;
         }
-        // Protective-cut exception (decision b, 2026-11-24): process shutdown/panic is NOT a user
-        // torque-off request; it intentionally bypasses `may_disable_torque_while_stopped` and
-        // disables the motors in any pose (leaving energized motors with no controller when
-        // Damiao TIMEOUT = 0 is worse than the arm dropping).
+        // Signal-path shutdown vs protective-cut exception (decision b, 2026-11-24):
+        // - A normal SIGTERM / Ctrl-C with a known-enabled arm latches E-Stop and refuses shutdown
+        //   (returns `false`), keeping the process running and in control (motors stay holding).
+        // - Exception (b) covers actual process exit (panic / forced teardown, or repeated shutdown
+        //   when hardware enable state is `Unknown` with `!is_torqued || disable_pending`), which
+        //   disables motors in any pose without consulting `may_disable_torque_while_stopped`.
         if !self.safety.state().is_stopped() {
             self.execute_stop(StopPolicy::EStopLatch);
         }

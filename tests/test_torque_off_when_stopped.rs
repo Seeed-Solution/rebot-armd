@@ -1194,10 +1194,11 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
         "ThermalTrip must NOT consult eval_stopped_torque_off"
     );
 
-    // 2. Process shutdown / panic protective cut: raised pose AND resting_pose = None ->
-    // `attempt_panic_disable` and `request_shutdown` disable motors regardless of pose without
-    // consulting `eval_stopped_torque_off`.
-    let (mut inner_s, bus_s, _clock_s) = make_driver_rig();
+    // 2. Signal path (`request_shutdown` for normal SIGTERM / Ctrl-C) with a known-enabled arm
+    //    at a raised pose: refuses shutdown (returns false) on both first and repeated signals,
+    //    latches EStop, keeps process in control and motors enabled (does NOT drop the arm), and
+    //    does NOT consult `eval_stopped_torque_off`.
+    let (mut inner_s, bus_s, clock_s) = make_driver_rig();
     inner_s.config.resting_pose = None;
     inner_s.set_torque(true).unwrap();
     bus_s.with(|s| {
@@ -1208,24 +1209,58 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
     inner_s.tick(0.02);
     assert!(inner_s.is_torqued);
 
-    // First request_shutdown while torqued latches E-Stop (not yet shutdown_ready);
-    // panic/forced teardown disables motors unconditionally at the raised pose.
-    assert!(!inner_s.request_shutdown());
+    bus_s.with(|s| s.tx_log.clear());
+    assert!(!inner_s.request_shutdown(), "first SIGTERM/Ctrl-C on known-enabled arm must refuse shutdown");
+    assert!(!inner_s.request_shutdown(), "repeated SIGTERM/Ctrl-C on known-enabled arm must still refuse shutdown");
     assert_eq!(*inner_s.safety.state(), SafetyState::EStop);
+    assert!(inner_s.is_torqued, "normal signal must keep known-enabled raised arm holding");
+    assert!(
+        bus_s.with(|s| s.motors.iter().all(|m| m.enabled)),
+        "normal signal must not disable known-enabled motors at a raised pose"
+    );
+    assert!(
+        bus_s.with(|s| s.tx_log.iter().all(|f| f.data != armd::protocol::damiao::CMD_DISABLE)),
+        "no disable frame sent on normal signal with known-enabled arm"
+    );
     assert_eq!(inner_s.last_stopped_torque_off_refusal(), None);
 
-    let outcome = inner_s.attempt_panic_disable(Duration::from_secs(1));
-    assert_eq!(outcome, armd::supervisor::PanicDisableOutcome::Confirmed);
-    assert!(!inner_s.is_torqued, "panic/shutdown disable must cut torque at a raised pose");
+    // 3. Repeated signal teardown when enable state is Unknown and disable_pending is active:
+    //    signal path issues the protective disable at the raised pose without consulting Rule A'.
+    inner_s.disable_pending = true;
+    clock_s.advance(Duration::from_millis(300)); // feedback stale -> driver enable_state == Unknown
+    assert!(!inner_s.request_shutdown(), "first signal while Unknown records shutdown_refused_unknown");
+    bus_s.with(|s| s.push_all_feedback()); // bus recovers for the repeated-signal teardown disable
     assert!(
-        bus_s.with(|s| s.motors.iter().all(|m| !m.enabled)),
-        "all motors must be disabled on wire after shutdown/panic disable at a raised pose"
+        inner_s.request_shutdown(),
+        "repeated shutdown signal while state was Unknown must complete protective disable at raised pose"
     );
-    assert!(inner_s.request_shutdown(), "shutdown_ready must be true once disabled");
+    assert!(!inner_s.is_torqued);
+    assert!(bus_s.with(|s| s.motors.iter().all(|m| !m.enabled)));
+    assert_eq!(inner_s.last_stopped_torque_off_refusal(), None);
+
+    // 4. Actual forced process exit / panic path (`attempt_panic_disable`) at a raised pose:
+    //    disables motors unconditionally without consulting `eval_stopped_torque_off`.
+    let (mut inner_p, bus_p, _clock_p) = make_driver_rig();
+    inner_p.config.resting_pose = None;
+    inner_p.set_torque(true).unwrap();
+    bus_p.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.45;
+        s.push_all_feedback();
+    });
+    inner_p.tick(0.02);
+    let outcome = inner_p.attempt_panic_disable(Duration::from_secs(1));
+    assert_eq!(outcome, armd::supervisor::PanicDisableOutcome::Confirmed);
+    assert!(!inner_p.is_torqued, "panic/forced teardown must cut torque at a raised pose");
+    assert!(
+        bus_p.with(|s| s.motors.iter().all(|m| !m.enabled)),
+        "all motors must be disabled on wire after panic/forced teardown at a raised pose"
+    );
+    assert!(inner_p.request_shutdown(), "shutdown_ready must be true once disabled");
     assert_eq!(
-        inner_s.last_stopped_torque_off_refusal(),
+        inner_p.last_stopped_torque_off_refusal(),
         None,
-        "shutdown/panic disable must NOT consult eval_stopped_torque_off"
+        "panic/forced teardown must NOT consult eval_stopped_torque_off"
     );
 }
 
