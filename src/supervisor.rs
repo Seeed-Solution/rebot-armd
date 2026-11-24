@@ -343,6 +343,8 @@ pub struct SupervisorInner {
     /// (`None` for protective cuts such as thermal trip / shutdown or when no stopped disable
     /// request is active).
     pub stopped_disable_retry_until: Option<Instant>,
+    /// Active background/transition disable intent carried into driver sends and periodic retries.
+    pub(crate) active_disable_kind: Option<crate::driver::DisableKind>,
     pub(crate) last_stopped_torque_off_refusal: Option<StoppedTorqueOffRefusal>,
     pub output_suspended: bool,
     pub feedback_numeric_valid: bool,
@@ -922,6 +924,7 @@ impl SupervisorInner {
             torque_transition: None,
             last_disable_attempt: None,
             stopped_disable_retry_until: None,
+            active_disable_kind: None,
             last_stopped_torque_off_refusal: None,
             output_suspended: false,
             feedback_numeric_valid: true,
@@ -1166,6 +1169,19 @@ impl SupervisorInner {
             Some(stops) => gate.with_stops(stops.clone()),
             None => gate,
         }
+    }
+
+    /// Current time on the attached driver's clock (or `Instant::now()` when driverless).
+    pub(crate) fn driver_clock_now(&self) -> Instant {
+        self.driver
+            .as_ref()
+            .and_then(|d| d.lock().ok().map(|drv| drv.clock_now()))
+            .unwrap_or_else(Instant::now)
+    }
+
+    /// Active disable intent carried by an in-flight or pending background disable, if any.
+    pub fn active_disable_kind(&self) -> Option<crate::driver::DisableKind> {
+        self.active_disable_kind
     }
 
     /// Driver-side Rule A′ gate injected into every attached hardware/sim driver so the
@@ -2202,9 +2218,12 @@ impl SupervisorInner {
         let unknown = self.driver_enable_state_unknown();
         if unknown && self.shutdown_refused_unknown && (!self.is_torqued || self.disable_pending) {
             self.stopped_disable_retry_until = None;
+            let exit_kind = crate::driver::DisableKind::DisableProtective {
+                reason: crate::driver::DisableProtectiveReason::ProcessExit,
+            };
             if self.rt_executor_owned {
                 if self.torque_transition.is_none() {
-                    let _ = self.request_disable_bounded();
+                    let _ = self.request_disable_bounded(exit_kind);
                 }
             } else {
                 let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
@@ -3399,13 +3418,19 @@ impl SupervisorInner {
                 // so any new disable request must pass a fresh rest-pose check.
                 self.disable_pending = false;
                 self.stopped_disable_retry_until = None;
+                self.active_disable_kind = None;
                 self.last_disable_attempt = None;
             } else if self
                 .last_disable_attempt
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
             {
-                if let Err(e) = self.request_disable_bounded() {
-                    if !self.safety.deferred_logging() {
+                let kind = self.active_disable_kind.unwrap_or_else(|| {
+                    crate::driver::DisableKind::DisableRequested {
+                        started_at: self.driver_clock_now(),
+                    }
+                });
+                if let Err(e) = self.request_disable_bounded(kind) {
+                    if !e.refused_by_chokepoint && !self.safety.deferred_logging() {
                         tracing::warn!("Torque shutdown remains unconfirmed: {}", e.message.as_str());
                     }
                 }

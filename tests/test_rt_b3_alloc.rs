@@ -1961,6 +1961,8 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
             ArmDriverError::PosForcePreEnableHoldBudgetExhausted { .. } => "PosForcePreEnableHoldBudgetExhausted",
             ArmDriverError::PosForcePreEnableHoldTxFailed { .. } => "PosForcePreEnableHoldTxFailed",
             ArmDriverError::TxQueueFull { .. } => "TxQueueFull",
+            ArmDriverError::TorqueOffWouldDrop => "TorqueOffWouldDrop",
+            ArmDriverError::DisableRequestExpired => "DisableRequestExpired",
         }
     }
 
@@ -2012,6 +2014,8 @@ fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_
         ArmDriverError::PosForcePreEnableHoldBudgetExhausted { joint: 6 },
         ArmDriverError::PosForcePreEnableHoldTxFailed { joint: 6, kind: TxFailKind::Enobufs },
         ArmDriverError::TxQueueFull { queued: 30, new: 7, capacity: 32 },
+        ArmDriverError::TorqueOffWouldDrop,
+        ArmDriverError::DisableRequestExpired,
     ];
     #[cfg(unix)]
     {

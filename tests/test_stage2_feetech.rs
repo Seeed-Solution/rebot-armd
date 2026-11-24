@@ -1806,10 +1806,22 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
     driver.write_joint_targets(&targets).unwrap();
     assert!(!driver.transport_mut().take_tx().is_empty());
 
-    // 6. set_torque(false) must succeed while aborted
+    // 6. Requested disable (`set_torque(false)`) without a resting-pose gate is refused while
+    //    aborted (Rule A′ at the transmit choke point, 0 bus writes); protective disable still
+    //    succeeds while aborted.
+    assert!(matches!(
+        driver.set_torque(false),
+        Err(ArmDriverError::TorqueOffWouldDrop)
+    ));
+    assert!(driver.transport_mut().take_tx().is_empty());
+
     let rx_tq_off = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
     driver.transport_mut().provide_rx(&rx_tq_off);
-    driver.set_torque(false).unwrap();
+    driver
+        .disable_torque(armd::driver::DisableKind::DisableProtective {
+            reason: armd::driver::DisableProtectiveReason::ProcessExit,
+        })
+        .unwrap();
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 

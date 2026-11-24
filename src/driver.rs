@@ -2232,6 +2232,9 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         if enabled {
             self.check_hardware_status()?;
             let prev_joint_enabled = self.joint_torque_enabled.clone();
+            let prev_all_proven_off = self.confirmed_enable_state == EnableState::Disabled
+                && !prev_joint_enabled.is_empty()
+                && prev_joint_enabled.iter().all(|s| *s == Some(false));
             if self.is_aborted() {
                 return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
             }
@@ -2368,14 +2371,29 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 Ok(())
             } else {
                 let mut rb_write_err = false;
+                let rb_started_at = self.clock_now();
+                let rb_kind = if prev_all_proven_off {
+                    DisableKind::DisableProtective {
+                        reason: DisableProtectiveReason::EnableRollbackProven,
+                    }
+                } else {
+                    DisableKind::DisableRequested {
+                        started_at: rb_started_at,
+                    }
+                };
+                // Under supervisor supervision (`stopped_disable_gate.is_some()`), an Unknown or
+                // mixed prior enable state does NOT count as proven off and must pass Rule A′ even
+                // before `SupervisorInner::enable_failed` latches `Fault(EnableFailed)`.
+                let force_gate = !prev_all_proven_off && self.stopped_disable_gate.is_some();
                 for (i, &id) in ids.iter().enumerate() {
                     if prev_joint_enabled.get(i).copied().flatten() == Some(true) {
                         continue;
                     }
-                    let pkt = feetech::build_set_torque(id, false);
-                    let _ = self.transport.write_all(&pkt);
-                    let _ = self.transport.flush();
-                    let _ = self.drain_tx_echo(&pkt);
+                    if self.write_torque_off(id, rb_kind, force_gate).is_err() {
+                        rb_write_err = true;
+                        self.joint_torque_enabled[i] = None;
+                        continue;
+                    }
 
                     match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
                         Ok(0) => {
@@ -7022,6 +7040,26 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
     }
 
+    fn has_any_joint_enabled(&self) -> bool {
+        if self.enable_state() == EnableState::Enabled {
+            return true;
+        }
+        if self.awaiting_rx_boundary || self.motor_status.is_empty() {
+            return false;
+        }
+        const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
+        (0..self.motor_ids.len()).any(|i| {
+            self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+                && self
+                    .last_feedback_instant
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|t| self.since(t) <= FRESHNESS_LIMIT)
+                && self.motor_status.get(i).copied() == Some(1)
+        })
+    }
+
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
     }
@@ -7239,7 +7277,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // gate this through `may_disable_torque_while_stopped` unless every motor the recovery
         // disables is already disabled (`0`) or has tripped its own command-timeout watchdog (`0xD`).
         self.clear_cached_targets();
-        let res = self.set_torque(false);
+        let started_at = self.now();
+        let res = self.disable_torque(DisableKind::DisableRequested { started_at });
         let boundary = self
             .last_enable_command_rx_seq
             .map_or(req_boundary, |s| s.max(req_boundary));

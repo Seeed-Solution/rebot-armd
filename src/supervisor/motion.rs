@@ -394,7 +394,10 @@ impl SupervisorInner {
                 self.mit_torque_off();
                 if let Some(ref d) = self.driver {
                     if let Ok(mut driver) = d.lock() {
-                        let _ = driver.set_torque(false);
+                        let started_at = driver.clock_now();
+                        let _ = driver.disable_torque(
+                            crate::driver::DisableKind::DisableRequested { started_at },
+                        );
                     }
                 }
             }
@@ -422,10 +425,14 @@ impl SupervisorInner {
                     },
                 );
                 self.stopped_disable_retry_until = None;
+                let thermal_disable = crate::driver::DisableKind::DisableProtective {
+                    reason: crate::driver::DisableProtectiveReason::Thermal,
+                };
+                self.active_disable_kind = Some(thermal_disable);
                 if !self.disable_pending
                     || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
                 {
-                    if let Err(e) = self.request_disable_bounded() {
+                    if let Err(e) = self.request_disable_bounded(thermal_disable) {
                         if !self.safety.deferred_logging() {
                             tracing::error!("Thermal shutdown not confirmed: {}", e.message.as_str());
                         }
