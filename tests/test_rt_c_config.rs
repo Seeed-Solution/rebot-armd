@@ -2164,11 +2164,18 @@ async fn codex_review_regression_invariants_executor() {
     assert!(!rig.keepout_path.exists(), "destination file must not be renamed after pre-rename stop");
     assert!(!rig.is_config_inhibited().await, "hold must be Cleared after pre-rename stop");
 
-    // 9c. Maintenance `set_joint_zero_offsets_async` refusal under E-stop allocates 0 on armd-control.
+    // 9c. Maintenance `set_joint_zero_offsets_async` refusal allocates 0 on armd-control.
     let _ = rig.sup.trigger_e_stop().await;
     let handle_ref = rig.sup.executor_handle().unwrap();
-    let legacy_err = handle_ref.set_joint_zero_offsets_async(vec![0.0; 7]).await.unwrap();
-    assert!(legacy_err.is_err());
+    let legacy_err = handle_ref
+        .set_joint_zero_offsets_async(vec![0.0; 7])
+        .await
+        .unwrap()
+        .expect_err("executor must refuse set_joint_zero_offsets_async");
+    assert!(
+        legacy_err.contains("EXECUTOR_UNSUPPORTED"),
+        "expected EXECUTOR_UNSUPPORTED, got: {legacy_err}"
+    );
 
     rig.assert_executor_zero_alloc("stale workspace + pre-rename VerifyAuthority + E-stop zero refusal");
     drop(_detached);
@@ -3098,4 +3105,101 @@ async fn watchdog_holds_without_parking_during_config_reconciliation_legacy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watchdog_holds_without_parking_during_config_reconciliation_executor() {
     run_watchdog_no_park_during_config_reconciliation_test(RtOwner::Executor).await;
+}
+
+// ============================================================================
+// 14. Round 4 M3 — Public RtExecutorHandle refuses excluded zero setters
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_public_handle_refuses_joint_zero_and_motor_zero_with_executor_unsupported() {
+    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    let handle = rig
+        .sup
+        .executor_handle()
+        .expect("RT executor handle must be present in OWNER_EXECUTOR");
+
+    let pub_before = rig.sup.published_config().await.unwrap();
+    let obs_before = rig
+        .sup
+        .hub()
+        .latest()
+        .expect("executor published observation")
+        .obs
+        .clone();
+    let dof = pub_before.config.dof;
+    assert_eq!(pub_before.joint_zero_offsets.len(), dof);
+
+    // Arm is Idle with torque off — the exact state where the old setters mutated live state.
+    let err_sync_jz = handle
+        .set_joint_zero_offsets(vec![0.15; dof])
+        .expect("maintenance channel healthy")
+        .expect_err("public handle set_joint_zero_offsets must fail closed");
+    assert!(
+        err_sync_jz.contains("EXECUTOR_UNSUPPORTED"),
+        "expected EXECUTOR_UNSUPPORTED, got: {err_sync_jz}"
+    );
+
+    let err_async_jz = handle
+        .set_joint_zero_offsets_async(vec![-0.2; dof])
+        .await
+        .expect("maintenance channel healthy")
+        .expect_err("public handle set_joint_zero_offsets_async must fail closed");
+    assert!(
+        err_async_jz.contains("EXECUTOR_UNSUPPORTED"),
+        "expected EXECUTOR_UNSUPPORTED, got: {err_async_jz}"
+    );
+
+    let err_sync_mz = handle
+        .set_motor_zero(0)
+        .expect("maintenance channel healthy")
+        .expect_err("public handle set_motor_zero must fail closed");
+    assert!(
+        err_sync_mz.contains("EXECUTOR_UNSUPPORTED"),
+        "expected EXECUTOR_UNSUPPORTED, got: {err_sync_mz}"
+    );
+
+    let err_async_mz = handle
+        .set_motor_zero_async(1)
+        .await
+        .expect("maintenance channel healthy")
+        .expect_err("public handle set_motor_zero_async must fail closed");
+    assert!(
+        err_async_mz.contains("EXECUTOR_UNSUPPORTED"),
+        "expected EXECUTOR_UNSUPPORTED, got: {err_async_mz}"
+    );
+
+    // Neither live positions/offsets nor PublishedConfig nor disk files changed.
+    let pub_after = rig.sup.published_config().await.unwrap();
+    let obs_after = rig
+        .sup
+        .hub()
+        .latest()
+        .expect("executor published observation")
+        .obs
+        .clone();
+    assert_eq!(pub_after.joint_zero_offsets, pub_before.joint_zero_offsets);
+    assert_eq!(pub_after.calibration_revision, pub_before.calibration_revision);
+    assert_eq!(pub_after.workspace_revision, pub_before.workspace_revision);
+    assert_eq!(obs_after.positions, obs_before.positions);
+    assert_eq!(obs_after.commanded_positions, obs_before.commanded_positions);
+    assert!(!rig.calib_path.exists(), "calibration.json must not be created");
+    assert!(!rig.poses_path.exists(), "poses.json must not be created");
+
+    rig.assert_executor_zero_alloc("public RtExecutorHandle zero refusals");
+
+    // Stopped handle still returns OwnerError::Stopped.
+    let stop_handle = handle.clone();
+    tokio::task::spawn_blocking(move || stop_handle.stop_and_join())
+        .await
+        .unwrap();
+    assert!(matches!(
+        handle.set_joint_zero_offsets(vec![0.0; dof]),
+        Err(armd::rt_core::executor::OwnerError::Stopped)
+    ));
+    assert!(matches!(
+        handle.set_motor_zero(0),
+        Err(armd::rt_core::executor::OwnerError::Stopped)
+    ));
+    let _ = rig;
 }

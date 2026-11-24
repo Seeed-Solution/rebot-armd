@@ -836,7 +836,6 @@ pub enum MaintenanceOp {
     ClearFault { expected_epoch: Option<u64> },
     SetJointZeroOffsets {
         offsets: Vec<f32>,
-        precomputed_floor: Option<(f32, &'static str)>,
     },
     SetMotorZero { joint: usize },
     TakeBaselinePending {
@@ -1843,7 +1842,6 @@ struct RtExecutorShared {
     clock: Option<Arc<dyn ExecutorClock>>,
     baseline_identity: BaselineIdentity,
     boot: BootId,
-    published_config: Arc<super::requests::config::PublishedConfigHub>,
 }
 
 impl RtExecutorShared {
@@ -2096,44 +2094,18 @@ impl RtExecutorHandle {
     }
 
     pub fn set_joint_zero_offsets(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
-        let applied = offsets.clone();
-        let precomputed_floor = self
-            .shared
-            .published_config
-            .precompute_effective_floor_for_offsets(&offsets);
-        match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets {
-            offsets,
-            precomputed_floor,
-        })? {
-            MaintenanceResult::JointZeroOffsetsSet(r) => {
-                if r.is_ok() {
-                    self.shared.published_config.apply_joint_zero_offsets(&applied);
-                }
-                Ok(r.map_err(String::from))
-            }
+        match self.call_maintenance(MaintenanceOp::SetJointZeroOffsets { offsets })? {
+            MaintenanceResult::JointZeroOffsetsSet(r) => Ok(r.map_err(String::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub async fn set_joint_zero_offsets_async(&self, offsets: Vec<f32>) -> Result<Result<(), String>, OwnerError> {
-        let applied = offsets.clone();
-        let precomputed_floor = self
-            .shared
-            .published_config
-            .precompute_effective_floor_for_offsets(&offsets);
         match self
-            .call_maintenance_async(MaintenanceOp::SetJointZeroOffsets {
-                offsets,
-                precomputed_floor,
-            })
+            .call_maintenance_async(MaintenanceOp::SetJointZeroOffsets { offsets })
             .await?
         {
-            MaintenanceResult::JointZeroOffsetsSet(r) => {
-                if r.is_ok() {
-                    self.shared.published_config.apply_joint_zero_offsets(&applied);
-                }
-                Ok(r.map_err(String::from))
-            }
+            MaintenanceResult::JointZeroOffsetsSet(r) => Ok(r.map_err(String::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -2517,7 +2489,6 @@ pub(crate) fn spawn_executor(
         clock: hooks.clock.clone(),
         baseline_identity,
         boot: cfg.boot,
-        published_config,
     });
     Ok((RtExecutorHandle { shared }, sinks))
 }
@@ -2783,41 +2754,15 @@ impl ControlState {
                 self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
                 MaintenanceResult::FaultCleared(res)
             }
-            MaintenanceOp::SetJointZeroOffsets {
-                mut offsets,
-                precomputed_floor,
-            } => {
-                let res = if *core.safety.state() != SafetyState::Idle
-                    || core.is_torqued
-                    || core.disable_pending
-                    || core.active_trajectory.is_some()
-                {
-                    Err("Arm must be Idle with torque off and no active trajectory to set joint zero offsets")
-                } else {
-                    match core.set_joint_zero_offsets_in_place(&mut offsets, precomputed_floor) {
-                        Ok(retired) => {
-                            returned_baseline = retired;
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    }
-                };
+            MaintenanceOp::SetJointZeroOffsets { offsets } => {
                 returned_offsets = Some(offsets);
-                MaintenanceResult::JointZeroOffsetsSet(res)
+                MaintenanceResult::JointZeroOffsetsSet(Err(
+                    "EXECUTOR_UNSUPPORTED: set_joint_zero_offsets is not available while the RT executor owns the arm; use the legacy owner",
+                ))
             }
-            MaintenanceOp::SetMotorZero { joint } => {
-                let res = if core.driver.is_some() {
-                    Err("UNSUPPORTED: motor zero requires legacy path when hardware driver is attached")
-                } else if *core.safety.state() != SafetyState::Idle
-                    || core.is_torqued
-                    || core.disable_pending
-                {
-                    Err("Arm must be Idle with torque off to set motor zero")
-                } else {
-                    core.set_motor_zero_in_place(joint)
-                };
-                MaintenanceResult::MotorZeroSet(res)
-            }
+            MaintenanceOp::SetMotorZero { .. } => MaintenanceResult::MotorZeroSet(Err(
+                "EXECUTOR_UNSUPPORTED: set_motor_zero is not available while the RT executor owns the arm; use the legacy owner",
+            )),
             MaintenanceOp::TakeBaselinePending { fresh_pending, clear_dirty } => {
                 let moves = if core.gripper_baseline_pending.is_empty() {
                     returned_pending = Some(fresh_pending);

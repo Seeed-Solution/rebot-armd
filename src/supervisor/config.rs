@@ -114,89 +114,6 @@ impl SupervisorInner {
         Ok(())
     }
 
-    /// Zero-allocation in-place install of joint zero offsets for the RT executor.
-    ///
-    /// Swaps `next` with `self.joint_zero_offsets` so the caller returns the old `Vec<f32>`
-    /// for off-thread drop, and returns any invalidated `FreeTorqueBaseline` for off-thread drop.
-    /// Returns a static error string on refusal (0 heap allocations on `armd-control`).
-    pub(crate) fn set_joint_zero_offsets_in_place(
-        &mut self,
-        next: &mut Vec<f32>,
-        precomputed_floor: Option<(f32, &'static str)>,
-    ) -> Result<Option<crate::gripper_baseline::FreeTorqueBaseline>, &'static str> {
-        if self.rt_executor_owned && self.driver.is_some() {
-            return Err("EXECUTOR_CAPABILITY_UNSUPPORTED: software joint zero with attached driver is unsupported on RT executor");
-        }
-        if self.is_torqued || self.disable_pending {
-            return Err("torque is on");
-        }
-        if next.len() != self.config.dof || !next.iter().all(|o| o.is_finite()) {
-            return Err("joint zero offsets length or values are invalid");
-        }
-        let any_driver_limits = if let Some(d) = self.driver.as_ref() {
-            let mut drv = d.lock().map_err(|_| "driver unavailable")?;
-            drv.set_joint_zero_offsets(next);
-            (0..self.config.dof).any(|i| drv.position_limits(i).is_some())
-        } else {
-            false
-        };
-        std::mem::swap(&mut self.joint_zero_offsets, next);
-        self.tracking.invalidate();
-        if next.as_slice() != self.joint_zero_offsets.as_slice() {
-            self.calibration_revision += 1;
-            if let Some((floor, source)) = precomputed_floor {
-                self.floor_source = source;
-                if let Some(ws) = self.config.workspace.as_mut() {
-                    if ws.floor_z_m != floor {
-                        ws.floor_z_m = floor;
-                        self.workspace_revision += 1;
-                        self.retire_servo_ws_min_depths();
-                    }
-                }
-            }
-        }
-        if any_driver_limits {
-            let _ = self.reapply_driver_limits_bounded();
-        }
-        let mut gripper_zero_moved = false;
-        for (i, (&o, &n)) in next.iter().zip(self.joint_zero_offsets.iter()).enumerate() {
-            let d = o - n;
-            if d == 0.0 {
-                continue;
-            }
-            if Some(i) == self.config.gripper_index() {
-                gripper_zero_moved = true;
-            }
-            for v in [
-                &mut self.measured_positions,
-                &mut self.commanded_positions,
-                &mut self.target_positions,
-            ] {
-                if let Some(p) = v.get_mut(i) {
-                    *p += d;
-                }
-            }
-        }
-        let retired_baseline = if gripper_zero_moved && self.gripper_baseline.is_some() {
-            let b = self.gripper_baseline.take();
-            self.gripper_last_contact = None;
-            self.gripper_baseline_pending.clear();
-            self.gripper_baseline_generation += 1;
-            self.gripper_baseline_dirty = true;
-            b
-        } else {
-            None
-        };
-        if next.len() > 5
-            && self.joint_zero_offsets.len() > 5
-            && next[5] != self.joint_zero_offsets[5]
-        {
-            self.zero_convention = Default::default();
-        }
-        self.zero_check_pending = true;
-        Ok(retired_baseline)
-    }
-
     /// The reference pose in joint angles (`home_positions` derived from `zero_reference`).
     pub fn zero_reference_joints(&self) -> Option<Vec<f32>> {
         self.config.zero_reference.as_ref().map(|_| self.config.home_positions.clone())
@@ -231,34 +148,6 @@ impl SupervisorInner {
             }
         }
         self.zero_convention = v;
-    }
-
-    /// Zero-allocation RT-safe mock motor-zero (refuses attached hardware drivers fail-closed).
-    pub(crate) fn set_motor_zero_in_place(&mut self, joint: usize) -> Result<(), &'static str> {
-        if self.driver.is_some() {
-            return Err("EXECUTOR_CAPABILITY_UNSUPPORTED: hardware motor zero requires synchronous CAN register I/O unsupported on RT executor");
-        }
-        if self.is_torqued || self.disable_pending {
-            return Err("torque is on");
-        }
-        if joint >= self.config.dof {
-            return Err("joint index out of range");
-        }
-        if joint == 5 {
-            self.zero_convention = Default::default();
-        }
-        self.zero_check_pending = true;
-        let r = -self.joint_zero_offsets.get(joint).copied().unwrap_or(0.0);
-        for v in [
-            &mut self.measured_positions,
-            &mut self.commanded_positions,
-            &mut self.target_positions,
-        ] {
-            if let Some(p) = v.get_mut(joint) {
-                *p = r;
-            }
-        }
-        Ok(())
     }
 
     /// Make the current position of `joint` (0-based) its zero: the driver's

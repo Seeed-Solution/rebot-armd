@@ -2224,7 +2224,14 @@ async fn off_thread_reclamation_and_diagnostics_under_paused_dispatcher() {
         let probe = Box::new(DropProbe { dropped_on: dropped_on.clone() });
         handle.probe_owned_payload(probe).expect("probe maintenance op succeeds while dispatcher paused");
         if i % 4 == 0 {
-            handle.set_joint_zero_offsets(vec![0.0; 7]).unwrap().unwrap();
+            let err = handle
+                .set_joint_zero_offsets(vec![0.0; 7])
+                .unwrap()
+                .expect_err("joint zero must be refused on RT executor");
+            assert!(
+                err.contains("EXECUTOR_UNSUPPORTED"),
+                "expected EXECUTOR_UNSUPPORTED refusal, got: {err}"
+            );
         }
     }
     let tids = dropped_on.lock().unwrap().clone();
