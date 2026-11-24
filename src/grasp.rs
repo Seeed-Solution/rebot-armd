@@ -3235,8 +3235,9 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, O
 
 /// Begin a planned grasp under the write lock: the action record (with its `task`) and the
 /// orchestrator. Returns (action id, expected duration).
-pub fn begin(inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64), ArmError> {
-    let id = inner.begin_macro(stamp, "grasp", &planned.input, planned.request.tag.clone())?;
+pub fn begin(inner: &mut SupervisorInner, admitted: crate::supervisor::Admitted, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
+    let stamp = admitted.stamp();
+    let id = inner.begin_macro(admitted, "grasp", &planned.input, planned.request.tag.clone())?;
     if let Some(task) = &planned.request.task {
         inner.update_action(id, |a| a.task = Some(task.clone()));
     }
@@ -3245,10 +3246,10 @@ pub fn begin(inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, sourc
     Ok((id, duration))
 }
 
-/// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, task
-/// check, begin and spawn the orchestrator. Returns (action id, expected duration).
-pub async fn start(supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, body: &Value) -> Result<(u64, f64), ApiError> {
-    let stamp = supervisor.capture_admission_stamp();
+/// Start a grasp (tests, in-process agents): caller passes the `AdmissionStamp` captured at
+/// admission (never re-sampled internally). Prepares, plans, runs task preflight, validates
+/// `stamp` under the owner lock, and spawns the orchestrator. Returns (action id, expected duration).
+pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::AdmissionStamp, source: Arc<dyn DetectionSource>, body: &Value) -> Result<(u64, f64), ApiError> {
     let pending = {
         let inner = supervisor.inner().read().await;
         prepare(&inner, body, stamp.estop_epoch)?
@@ -3257,7 +3258,8 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSou
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
     preflight(source.as_ref(), &mut planned).await?;
     let mut inner = supervisor.inner().write().await;
-    Ok(begin(&mut inner, supervisor, source, planned, stamp)?)
+    let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
+    Ok(begin(&mut inner, admitted, supervisor, source, planned)?)
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "grasp", ..)`.
@@ -6102,13 +6104,15 @@ mod tests {
             let mut inner = sup.inner().write().await;
             inner.lease_enabled = false;
             let stamp = inner.current_admission_stamp();
-            inner.enable_torque(stamp).unwrap();
+            let admitted = inner.check_admission(stamp).unwrap();
+            inner.enable_torque(admitted).unwrap();
             inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.loads = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.35];
             let stamp = inner.current_admission_stamp();
             let plan_in = inner.plan_input().unwrap();
-            (inner.begin_macro(stamp, "grasp", &plan_in, None).unwrap(), stamp)
+            let admitted = inner.check_admission(stamp).unwrap();
+            (inner.begin_macro(admitted, "grasp", &plan_in, None).unwrap(), stamp)
         };
 
         let source = Arc::new(DummyDetectionSource);

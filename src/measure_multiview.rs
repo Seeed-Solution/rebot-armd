@@ -591,8 +591,9 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
 }
 
 /// Begin the action and spawn its orchestrator. Returns (action id, deadline bound s).
-pub fn begin(inner: &mut SupervisorInner, sup: &Arc<ArmSupervisor>, plan: Plan, source: Arc<dyn DetectionSource>, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64), ArmError> {
-    let id = inner.begin_orchestrated_action(stamp, "measure_multiview", None, plan.epoch)?;
+pub fn begin(inner: &mut SupervisorInner, admitted: crate::supervisor::Admitted, sup: &Arc<ArmSupervisor>, plan: Plan, source: Arc<dyn DetectionSource>) -> Result<(u64, f64), ArmError> {
+    let stamp = admitted.stamp();
+    let id = inner.begin_orchestrated_action(admitted, "measure_multiview", None, plan.epoch)?;
     let deadline = plan.deadline_s;
     tracing::info!("measure_multiview {id} started ({} views, baseline {:.3} m, speed_scale {:.2}, bound {deadline:.0} s)",
         plan.request.views, plan.request.baseline_m, plan.request.speed_scale);
@@ -1269,7 +1270,11 @@ async fn move_joints(ctx: &MacroCtx, plan: &Plan, phase: &str, q: &[f64; 6]) -> 
         let target = inner.joint_goal_target(q);
         let limits = inner.joint_goal_limits(plan.request.speed_scale);
         inner.set_action_phase(ctx.id, phase, 0.0, None, None);
-        match inner.install_macro_quintic(ctx.stamp, ctx.id, target, &limits) {
+        let admitted = match inner.check_admission(ctx.stamp) {
+            Ok(a) => a,
+            Err(e) => return Err((ctx.map_install_err(&mut inner, e.into()), false)),
+        };
+        match inner.install_macro_quintic(admitted, ctx.id, target, &limits) {
             Ok(l) => ctx.arm_child(&mut inner, phase, l * 2.0 + 5.0).ok_or((Stop::Cancelled, true))?,
             Err(e) => {
                 if let Some(detail) = e.workspace_detail() { inner.set_action_workspace_violation(ctx.id, detail); }

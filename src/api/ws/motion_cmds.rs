@@ -14,7 +14,8 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
             let enabled = body.get("enable").and_then(Value::as_bool)
                 .ok_or_else(|| invalid_command("enable must be boolean"))?;
             if enabled {
-                inner.enable_torque(stamp).map_err(ArmError::from)?;
+                let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
+                inner.enable_torque(admitted).map_err(ArmError::from)?;
             } else {
                 inner.disable_torque().map_err(ArmError::from)?;
             }
@@ -29,12 +30,18 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
             };
             inner.clear_fault_confirmed(mit_recovery)?;
         }
-        "/api/v1/motion/servo" => { inner.servo(stamp, positions(body.get("targets"))?, epoch).map_err(ArmError::from)?; }
+        "/api/v1/motion/servo" => {
+            let targets = positions(body.get("targets"))?;
+            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
+            inner.servo(admitted, targets, epoch).map_err(ArmError::from)?;
+        }
         "/api/v1/motion/jog" => {
             let speed_scale = motion::num(body, "speed_scale").map_err(ArmError::from)?;
+            let target_positions = positions(body.get("target_positions"))?;
+            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
             let (_, id, duration) = inner.jog_action_with_speed_scale(
-                stamp,
-                positions(body.get("target_positions"))?,
+                admitted,
+                target_positions,
                 body.get("duration_secs").and_then(Value::as_f64),
                 Some(epoch),
                 "joint_move",
@@ -43,13 +50,14 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
             return Ok(Some((id, duration)));
         }
         "/api/v1/motion/home" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
             inner.check_commissioning_for_ordinary_motion("home")?;
-            let (_, id, duration) = inner.jog_action(stamp, inner.config.home_positions.clone(), body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "home")?;
+            let home = inner.config.home_positions.clone();
+            let (_, id, duration) = inner.jog_action(admitted, home, body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "home")?;
             return Ok(Some((id, duration)));
         }
         "/api/v1/motion/unload" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
             inner.gravity_comp_motion_busy().map_err(ArmError::from)?;
             inner.collision_hold_check().map_err(ArmError::from)?;
             if inner.handover_settling_since.is_some() {
@@ -61,7 +69,7 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
             if !inner.safety.state().is_operational() && !inner.holding_after_clear() {
                 return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
             }
-            let id = inner.unload_action(stamp)?;
+            let id = inner.unload_action(admitted)?;
             let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
             return Ok(id.map(|id| (id, duration)));
         }
@@ -69,7 +77,9 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
             let enable = body.get("enable").and_then(Value::as_bool)
                 .ok_or_else(|| invalid_command("enable must be boolean"))?;
             if enable {
-                inner.enter_gravity_comp(stamp, gravity_comp_request(body)?)?;
+                let req = gravity_comp_request(body)?;
+                let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
+                inner.enter_gravity_comp(admitted, req)?;
             } else {
                 inner.exit_gravity_comp("REQUESTED", "Exit requested");
             }
@@ -139,11 +149,12 @@ impl PendingMacro {
 
 impl PlannedMacro {
     /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
-    pub(super) fn start(self, inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64), ArmError> {
+    pub(super) fn start(self, inner: &mut SupervisorInner, admitted: crate::supervisor::Admitted, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps) -> Result<(u64, f64), ArmError> {
+        let stamp = admitted.stamp();
         match self {
-            Self::Grasp(planned) => crate::grasp::begin(inner, supervisor, deps.source.clone(), planned, stamp),
+            Self::Grasp(planned) => crate::grasp::begin(inner, admitted, supervisor, deps.source.clone(), planned),
             Self::Place(planned) => {
-                let id = inner.begin_macro(stamp, "place", &planned.input, planned.request.tag.clone())?;
+                let id = inner.begin_macro(admitted, "place", &planned.input, planned.request.tag.clone())?;
                 if planned.orientation_levelled {
                     inner.update_action(id, |a| {
                         a.orientation = Some("levelled".into());

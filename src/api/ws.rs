@@ -1291,15 +1291,15 @@ fn prepare_action(
     if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
     let (kind, parsed) = match path {
         "/api/v1/action/move_to" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             ("move_to", motion::parse_move_to(body))
         }
         "/api/v1/action/move_relative" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             ("move_relative", motion::parse_move_relative(body))
         }
         "/api/v1/action/gripper" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
             let mut request = motion::parse_gripper(body).map_err(ArmError::from)?;
             if let Some(scale) = motion::num(body, "speed_scale").map_err(ArmError::from)? {
                 if !(0.05..=1.0).contains(&scale) {
@@ -1318,12 +1318,13 @@ fn prepare_action(
                     request.speed = (2.0 * scale).clamp(0.01, 2.0);
                 }
             }
-            let (id, duration) = inner.start_gripper(stamp, request, epoch)?;
+            let (id, duration) = inner.start_gripper(admitted, request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
         "/api/v1/action/gripper_zero_check" => {
+            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
             let (id, duration) = inner.start_gripper_zero_check_with_auth(
-                stamp,
+                admitted,
                 body,
                 epoch,
                 Some((auth.clone(), ws_token.map(str::to_string))),
@@ -1334,37 +1335,38 @@ fn prepare_action(
             if body.get("dry_run").and_then(Value::as_bool) == Some(true) {
                 return Ok(ActionStart::DryRunGrasp(body.clone()));
             }
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?)));
         }
         "/api/v1/action/place" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?)));
         }
         "/api/v1/action/replay" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             let request = crate::replay::parse_replay(body).map_err(ArmError::from)?;
             return Ok(ActionStart::Replay(inner.replay_input(request, epoch)?));
         }
         "/api/v1/action/move_to_pose" => {
-            let (id, duration) = crate::poses::start_action(inner, stamp, body, epoch)?;
+            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
+            let (id, duration) = crate::poses::start_action(inner, admitted, body, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
         "/api/v1/action/run_sequence" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?)));
         }
         crate::calib_hover::PATH => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?)));
         }
         crate::measure_multiview::PATH => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             return Ok(ActionStart::MeasureMultiview(Box::new(crate::measure_multiview::prepare(inner, body, epoch)?)));
         }
         #[cfg(feature = "policy-runtime")]
         "/api/v1/action/policy/start" => {
-            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
+            let _ = inner.check_admission(stamp).map_err(ArmError::from)?;
             let request = crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
             let _ = crate::policy_runtime::compute_policy_deadline(request.max_seconds).map_err(ArmError::from)?;
             inner.check_policy_start_preconditions_with(
@@ -2401,22 +2403,30 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         } else if inner.detached {
                             drop(inner);
                             owner_transferred()
-                        } else if let Err(err) = inner.check_admission_stamp(stamp) {
-                            command_reject(&inner, &request_id, ArmError::from(err).into())
                         } else {
-                            match joined {
-                                Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                                Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
-                                Ok(Ok(planned)) => {
-                                    if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                        json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                    } else {
-                                        match planned.start(&mut inner, &recv_supervisor, &recv_deps, stamp) {
-                                            Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                            Err(error) => command_reject(&inner, &request_id, error.into()),
+                            match inner.check_admission(stamp) {
+                                Err(err) => command_reject(&inner, &request_id, ArmError::from(err).into()),
+                                Ok(admitted) => match joined {
+                                    Err(e) => {
+                                        drop(admitted);
+                                        command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())
+                                    }
+                                    Ok(Err(error)) => {
+                                        drop(admitted);
+                                        command_reject(&inner, &request_id, error.into())
+                                    }
+                                    Ok(Ok(planned)) => {
+                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                            drop(admitted);
+                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                        } else {
+                                            match planned.start(&mut inner, admitted, &recv_supervisor, &recv_deps) {
+                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                                Err(error) => command_reject(&inner, &request_id, error.into()),
+                                            }
                                         }
                                     }
-                                }
+                                },
                             }
                         }
                     };
@@ -2700,12 +2710,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
                                             Ok(ActionStart::Replay(input)) => { pending_replay = Some((value["request_id"].clone(), input, local_generation)); None }
                                             Ok(ActionStart::DryRunGrasp(body)) => { pending_dry_run_grasp = Some((value["request_id"].clone(), body)); None }
-                                            Ok(ActionStart::Sequence(plan)) => Some(match crate::sequences::begin(&mut inner, &recv_supervisor, *plan, stamp) {
+                                            Ok(ActionStart::Sequence(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::sequences::begin(&mut inner, admitted, &recv_supervisor, *plan)) {
                                                 Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
                                                 Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                             }),
-                                            Ok(ActionStart::CalibHover(plan)) => Some(match crate::calib_hover::begin(&mut inner, &recv_supervisor, *plan,
-                                                recv_calib.upstream.clone(), crate::calib_hover::jobs_dir(&recv_calib.path), stamp) {
+                                            Ok(ActionStart::CalibHover(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::calib_hover::begin(&mut inner, admitted, &recv_supervisor, *plan,
+                                                recv_calib.upstream.clone(), crate::calib_hover::jobs_dir(&recv_calib.path))) {
                                                 Ok((id, duration, job_id)) => {
                                                     let mut ack = command_ack(&inner, &value["request_id"], Some((id, duration)));
                                                     ack["job_id"] = json!(job_id);
@@ -2713,7 +2723,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                 }
                                                 Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                             }),
-                                            Ok(ActionStart::MeasureMultiview(plan)) => Some(match crate::measure_multiview::begin(&mut inner, &recv_supervisor, *plan, recv_deps.source.clone(), stamp) {
+                                            Ok(ActionStart::MeasureMultiview(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::measure_multiview::begin(&mut inner, admitted, &recv_supervisor, *plan, recv_deps.source.clone())) {
                                                 Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
                                                 Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                             }),
@@ -2804,7 +2814,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     }
                                     Some(sequence) => {
                                         last_sequence = Some(sequence);
-                                        response = match positions(value.get("positions")).and_then(|targets| inner.servo(stamp, targets, epoch).map_err(|error| ApiError::from(ArmError::from(error)))) {
+                                        response = match positions(value.get("positions")).and_then(|targets| {
+                                            let admitted = inner.check_admission(stamp).map_err(|error| ApiError::from(ArmError::from(error)))?;
+                                            inner.servo(admitted, targets, epoch).map_err(|error| ApiError::from(ArmError::from(error)))
+                                        }) {
                                             Ok(()) => None,
                                             Err(error) => {
                                                 let stopped = error.code.as_deref() == Some("STOPPED");
@@ -2864,24 +2877,28 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             response = Some(r);
                         } else {
                             if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-                            if let Err(err) = inner.check_admission_stamp(stamp) {
-                                response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
-                            } else {
-                                response = match solved {
-                                    Ok(None) => None,
-                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
-                                    Ok(Some((_, Err(error)))) => Some(command_reject(&inner, &request_id, ArmError::from(error).into())),
-                                    Ok(Some((input, Ok((q, prepared))))) => Some(
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.install_joint_goal_prepared(stamp, &input, &q, speed_scale, kind, tag, same_side, prepared) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
+                            match inner.check_admission(stamp) {
+                                Err(err) => {
+                                    response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
+                                }
+                                Ok(admitted) => {
+                                    response = match solved {
+                                        Ok(None) => { drop(admitted); None }
+                                        Err(e) => { drop(admitted); Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())) }
+                                        Ok(Some((_, Err(error)))) => { drop(admitted); Some(command_reject(&inner, &request_id, ArmError::from(error).into())) }
+                                        Ok(Some((input, Ok((q, prepared))))) => Some(
+                                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                                drop(admitted);
+                                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                            } else {
+                                                match inner.install_joint_goal_prepared(admitted, &input, &q, speed_scale, kind, tag, same_side, prepared) {
+                                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                                                }
                                             }
-                                        }
-                                    ),
-                                };
+                                        ),
+                                    };
+                                }
                             }
                         }
                     } else {
@@ -2927,28 +2944,33 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             response = Some(r);
                         } else {
                             if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-                            if let Err(err) = inner.check_admission_stamp(stamp) {
-                                response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
-                            } else {
-                                response = match planned {
-                                    Ok(None) => None,
-                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
-                                    Ok(Some((_, Err((error, joint_goal))))) => {
-                                        let mut api: ApiError = ArmError::from(error).into();
-                                        if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(motion::JOINT_PATH_HINT); }
-                                        Some(command_reject(&inner, &request_id, api))
-                                    }
-                                    Ok(Some((input, Ok((path, pre, approach))))) => Some(
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.install_path_same_side(stamp, &input, path, pre, approach.as_ref(), kind, tag) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                            }
+                            match inner.check_admission(stamp) {
+                                Err(err) => {
+                                    response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
+                                }
+                                Ok(admitted) => {
+                                    response = match planned {
+                                        Ok(None) => { drop(admitted); None }
+                                        Err(e) => { drop(admitted); Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())) }
+                                        Ok(Some((_, Err((error, joint_goal))))) => {
+                                            drop(admitted);
+                                            let mut api: ApiError = ArmError::from(error).into();
+                                            if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(motion::JOINT_PATH_HINT); }
+                                            Some(command_reject(&inner, &request_id, api))
                                         }
-                                    ),
-                                };
+                                        Ok(Some((input, Ok((path, pre, approach))))) => Some(
+                                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                                drop(admitted);
+                                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                            } else {
+                                                match inner.install_path_same_side(admitted, &input, path, pre, approach.as_ref(), kind, tag) {
+                                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                                                }
+                                            }
+                                        ),
+                                    };
+                                }
                             }
                         }
                     }
@@ -3027,24 +3049,30 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while checking replay"});
                         if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
                         response = Some(r);
-                    } else if let Err(err) = inner.check_admission_stamp(stamp) {
-                        response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
                     } else {
-                        response = match planned {
-                            Ok(None) => None,
-                            Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("replay check task failed: {e}")).into())),
-                            Ok(Some(Err(error))) => Some(command_reject(&inner, &request_id, error.into())),
-                            Ok(Some(Ok(plan))) => Some(
-                                if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                } else {
-                                    match inner.install_replay(stamp, plan) {
-                                        Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                        Err(error) => command_reject(&inner, &request_id, error.into()),
-                                    }
-                                }
-                            ),
-                        };
+                        match inner.check_admission(stamp) {
+                            Err(err) => {
+                                response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
+                            }
+                            Ok(admitted) => {
+                                response = match planned {
+                                    Ok(None) => { drop(admitted); None }
+                                    Err(e) => { drop(admitted); Some(command_reject(&inner, &request_id, ArmError::Internal(format!("replay check task failed: {e}")).into())) }
+                                    Ok(Some(Err(error))) => { drop(admitted); Some(command_reject(&inner, &request_id, error.into())) }
+                                    Ok(Some(Ok(plan))) => Some(
+                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                            drop(admitted);
+                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                        } else {
+                                            match inner.install_replay(admitted, plan) {
+                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                                Err(error) => command_reject(&inner, &request_id, error.into()),
+                                            }
+                                        }
+                                    ),
+                                };
+                            }
+                        }
                     }
                 }
                 #[cfg(feature = "policy-runtime")]
@@ -3190,7 +3218,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while loading policy", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                                 } else if inner.safety.epoch_id() != epoch_id {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":inner.safety.epoch_id()})
-                                } else if let Err(err) = inner.check_admission_stamp(policy_stamp) {
+                                } else if let Err(err) = inner.check_admission(policy_stamp).map(drop) {
                                     command_reject(&inner, &request_id, ArmError::from(err).into())
                                 } else if !inner.policy_live_allowed() && !ws_auth_c.is_operator() {
                                     // the operator session may have expired or been locked while loading
@@ -3232,7 +3260,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     i_am_at_the_arm,
                                                     verified_release_gate,
                                                 };
-                                                match inner.begin_policy_run(policy_stamp, start_req) {
+                                                match inner.check_admission(policy_stamp).map_err(ArmError::from).and_then(|admitted| inner.begin_policy_run(admitted, start_req)) {
                                                 Ok(action_id) => {
                                                     let digest = prepared_policy.artifact_digest().to_string();
                                                     let backend = prepared_policy.backend_name().to_string();

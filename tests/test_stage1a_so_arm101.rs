@@ -195,8 +195,8 @@ fn test_gripper_zero_check_rejected_when_not_supported() {
     assert!(!c.gripper_policy.as_ref().unwrap().zero_check_supported);
     let mut sup = SupervisorInner::new(c.clone());
     sup.lease_enabled = false;
-    { let __s = sup.current_admission_stamp(); sup.enable_torque(__s) }.unwrap();
-    let res = { let s = sup.current_admission_stamp(); sup.start_gripper_zero_check(s, &json!({}), sup.safety.epoch_id()) };
+    { let __s = sup.current_admission_stamp(); sup.check_admission(__s).and_then(|__a| sup.enable_torque(__a)) }.unwrap();
+    let res = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.start_gripper_zero_check(__a, &json!({}), sup.safety.epoch_id())) } };
     match res {
         Err(ArmError::Motion(MotionError::Unsupported(msg))) => {
             assert!(msg.contains("not supported"), "expected message containing 'not supported', got: {msg}");
@@ -208,8 +208,8 @@ fn test_gripper_zero_check_rejected_when_not_supported() {
     c.gripper_policy.as_mut().unwrap().zero_check_supported = true;
     let mut sup_ok = SupervisorInner::new(c);
     sup_ok.lease_enabled = false;
-    { let __s = sup_ok.current_admission_stamp(); sup_ok.enable_torque(__s) }.unwrap();
-    let res_ok = { let s = sup_ok.current_admission_stamp(); sup_ok.start_gripper_zero_check(s, &json!({}), sup_ok.safety.epoch_id()) };
+    { let __s = sup_ok.current_admission_stamp(); sup_ok.check_admission(__s).and_then(|__a| sup_ok.enable_torque(__a)) }.unwrap();
+    let res_ok = { let s = sup_ok.current_admission_stamp(); { let __s = s; sup_ok.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_ok.start_gripper_zero_check(__a, &json!({}), sup_ok.safety.epoch_id())) } };
     assert!(res_ok.is_ok(), "expected Ok when zero_check_supported is true, got: {res_ok:?}");
 }
 
@@ -249,7 +249,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
     // move_to_pose against 6+0 supervisor must reject with POSE_DOF_MISMATCH
     let mut sup60 = SupervisorInner::new(c60.clone());
     sup60.poses.list.poses.push(pose_51);
-    let move_err = { let s = sup60.current_admission_stamp(); sup60.move_to_pose(s, "test_51", false, 1.0, None, 0) }.unwrap_err();
+    let move_err = { let s = sup60.current_admission_stamp(); { let __s = s; sup60.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup60.move_to_pose(__a, "test_51", false, 1.0, None, 0)) } }.unwrap_err();
     match move_err {
         ArmError::Rejected { code, message, .. } => {
             assert_eq!(code, "POSE_DOF_MISMATCH");
@@ -371,7 +371,7 @@ fn test_profile_id_pose_and_replay_rejection() {
 
     let mut sup = SupervisorInner::new(c_so101.clone());
     sup.poses.list.poses.push(pose_100);
-    let move_err = { let s = sup.current_admission_stamp(); sup.move_to_pose(s, "pose_100", false, 1.0, None, 0) }.unwrap_err();
+    let move_err = { let s = sup.current_admission_stamp(); { let __s = s; sup.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup.move_to_pose(__a, "pose_100", false, 1.0, None, 0)) } }.unwrap_err();
     match move_err {
         ArmError::Rejected { code, message, .. } => {
             assert_eq!(code, "POSE_DOF_MISMATCH");
@@ -469,7 +469,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
 
     let mut sup_5d = SupervisorInner::new(c_so101.clone());
     sup_5d.poses.list.poses.push(legacy_pose_6.clone());
-    let move_err = { let s = sup_5d.current_admission_stamp(); sup_5d.move_to_pose(s, "legacy", false, 1.0, None, 0) }.unwrap_err();
+    let move_err = { let s = sup_5d.current_admission_stamp(); { let __s = s; sup_5d.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| sup_5d.move_to_pose(__a, "legacy", false, 1.0, None, 0)) } }.unwrap_err();
     match move_err {
         ArmError::Rejected { code, message, .. } => {
             assert_eq!(code, "POSE_DOF_MISMATCH");

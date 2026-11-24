@@ -41,21 +41,56 @@ pub struct AdmissionStamp {
     pub lease_gen: u64,
 }
 
-/// Proof token produced ONLY by [`SupervisorInner::check_admission_stamp`] under the owner lock.
+/// Opaque, single-use admission proof token created ONLY by [`SupervisorInner::check_admission`]
+/// under the owner lock.
 ///
-/// Its inner field is private, so callers outside the supervisor gate cannot construct it:
+/// It cannot be constructed externally, cloned, copied, or sent across threads/`.await` points,
+/// and every function that starts motion or output consumes it by value:
 ///
 /// ```compile_fail
-/// use armd::{AdmissionStamp, AdmittedMotion};
-/// let _forged = AdmittedMotion(AdmissionStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0 });
+/// use armd::{AdmissionStamp, Admitted};
+/// let _forged = Admitted(AdmissionStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0 });
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmittedMotion(AdmissionStamp);
+///
+/// ```compile_fail
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<armd::Admitted>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<armd::Admitted>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<armd::Admitted>();
+/// ```
+///
+/// Calling a motion or output start without an [`Admitted`] token does not compile:
+///
+/// ```compile_fail
+/// use armd::{ArmConfig, SupervisorInner};
+/// let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+/// let _ = inner.jog(vec![0.0; 7], None, None);
+/// ```
+///
+/// ```compile_fail
+/// use armd::{ArmConfig, SupervisorInner};
+/// let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+/// let _ = inner.enable_torque();
+/// ```
+#[must_use = "Admitted token must be consumed by a motion/output start"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct Admitted {
+    stamp: AdmissionStamp,
+    _not_send_sync: std::marker::PhantomData<*mut ()>,
+}
 
-impl AdmittedMotion {
+impl Admitted {
     /// The validated stamp captured at request admission.
-    pub fn stamp(self) -> AdmissionStamp {
-        self.0
+    pub fn stamp(&self) -> AdmissionStamp {
+        self.stamp
     }
 }
 
@@ -120,19 +155,19 @@ impl MotionStartKind {
 }
 
 /// Single sealed execution contract for [`SupervisorInner::start_motion`]: an operation can only
-/// receive [`AdmittedMotion`] after [`SupervisorInner::check_admission_stamp`] succeeds under
-/// the owner lock.
+/// run when handed a single-use [`Admitted`] token produced by [`SupervisorInner::check_admission`]
+/// under the owner lock.
 ///
 /// ```compile_fail
 /// use armd::{ArmConfig, SupervisorInner};
 /// let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
-/// // Calling start_motion without an AdmissionStamp fails to compile:
+/// // Calling start_motion without an Admitted token fails to compile:
 /// let _ = inner.start_motion(());
 /// ```
 pub trait MotionStartOp {
     type Output;
     fn kind(&self) -> MotionStartKind;
-    fn execute(self, inner: &mut SupervisorInner, admitted: AdmittedMotion) -> Result<Self::Output, ArmError>;
+    fn execute(self, inner: &mut SupervisorInner, admitted: Admitted) -> Result<Self::Output, ArmError>;
 }
 
 #[derive(Debug, Error)]
@@ -1043,10 +1078,7 @@ impl SupervisorInner {
         self.lease_gen_mirror.store(self.current_active_lease_gen(), Ordering::SeqCst);
     }
 
-    /// Single owner-lock motion-start gate checked as the FIRST step of every function that
-    /// starts motion or output. Compares the caller's admission-captured [`AdmissionStamp`]
-    /// against the current `(stop_gen, estop_epoch, lease_gen)` without re-sampling.
-    pub fn check_admission_stamp(&self, stamp: AdmissionStamp) -> Result<AdmittedMotion, SafetyError> {
+    fn verify_admission_stamp(&self, stamp: AdmissionStamp) -> Result<(), SafetyError> {
         if stamp.stop_gen != self.current_stop_gen() {
             return Err(SafetyError::Stopped);
         }
@@ -1066,16 +1098,44 @@ impl SupervisorInner {
                 received: stamp.estop_epoch,
             });
         }
-        Ok(AdmittedMotion(stamp))
+        if self.e_stop_latched.load(Ordering::SeqCst)
+            || matches!(self.safety.state(), SafetyState::EStop)
+        {
+            return Err(SafetyError::EStopActive);
+        }
+        Ok(())
     }
 
-    /// Unified motion-start wrapper: validates `stamp` under the owner lock before executing `op`.
-    pub fn start_motion<Op: MotionStartOp>(
-        &mut self,
-        stamp: AdmissionStamp,
-        op: Op,
-    ) -> Result<Op::Output, ArmError> {
-        let admitted = self.check_admission_stamp(stamp)?;
+    /// Single owner-lock motion/output admission gate: the SOLE constructor of [`Admitted`].
+    /// Compares the caller's admission-captured [`AdmissionStamp`] against current owner state
+    /// without re-sampling.
+    pub fn check_admission(&self, stamp: AdmissionStamp) -> Result<Admitted, SafetyError> {
+        self.verify_admission_stamp(stamp)?;
+        Ok(Admitted {
+            stamp,
+            _not_send_sync: std::marker::PhantomData,
+        })
+    }
+
+    /// Re-verifies an [`Admitted`] token against live owner state without consuming it (used
+    /// by wrapper methods that run preconditions before moving `admitted` to their leaf install).
+    pub(crate) fn verify_admitted(&self, admitted: &Admitted) -> Result<AdmissionStamp, SafetyError> {
+        self.verify_admission_stamp(admitted.stamp)?;
+        Ok(admitted.stamp)
+    }
+
+    /// Consumes a single-use [`Admitted`] token by value and re-verifies its stamp against live
+    /// owner state under the owner lock without re-sampling.
+    pub(crate) fn consume_admitted(&self, admitted: Admitted) -> Result<AdmissionStamp, SafetyError> {
+        let stamp = admitted.stamp;
+        drop(admitted);
+        self.verify_admission_stamp(stamp)?;
+        Ok(stamp)
+    }
+
+    /// Unified motion-start wrapper: requires an [`Admitted`] token by value under the owner lock.
+    pub fn start_motion<Op: MotionStartOp>(&mut self, admitted: Admitted, op: Op) -> Result<Op::Output, ArmError> {
+        self.verify_admitted(&admitted)?;
         op.execute(self, admitted)
     }
 
@@ -4837,15 +4897,17 @@ impl ArmSupervisor {
         }
         let mut inner = self.inner.clone().write_owned().await;
         self.check_legacy_under_guard(&inner)?;
-        inner.check_admission_stamp(stamp).map_err(ArmError::Safety)?;
         // Post-lock double-check: verify atomic e-stop latch again after acquiring write lock
         if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
-        tokio::task::spawn_blocking(move || inner.enable_torque(stamp))
-            .await
-            .map_err(|e| ArmError::Internal(format!("enable_torque blocking task failed: {e}")))?
-            .map_err(ArmError::Safety)
+        tokio::task::spawn_blocking(move || {
+            let admitted = inner.check_admission(stamp)?;
+            inner.enable_torque(admitted)
+        })
+        .await
+        .map_err(|e| ArmError::Internal(format!("enable_torque blocking task failed: {e}")))?
+        .map_err(ArmError::Safety)
     }
 
     pub async fn disable_torque(&self) -> Result<SafetyState, ArmError> {
@@ -4986,7 +5048,8 @@ impl ArmSupervisor {
         if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
-        inner.servo(stamp, targets, epoch_id)?;
+        let admitted = inner.check_admission(stamp)?;
+        inner.servo(admitted, targets, epoch_id)?;
         Ok(())
     }
 
@@ -5020,7 +5083,8 @@ impl ArmSupervisor {
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
-        inner.jog(stamp, target_positions, duration_secs, epoch_id)
+        let admitted = inner.check_admission(stamp)?;
+        inner.jog(admitted, target_positions, duration_secs, epoch_id)
     }
 
     pub async fn home(
@@ -5032,7 +5096,8 @@ impl ArmSupervisor {
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
         let home_pos = inner.config.home_positions.clone();
-        inner.jog_action(stamp, home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
+        let admitted = inner.check_admission(stamp)?;
+        inner.jog_action(admitted, home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
     }
 
     pub async fn stop_motion(&self) {
@@ -6177,7 +6242,8 @@ mod observation_snapshot_tests {
             let mut inner = sup.inner().write().await;
             let g = inner.acquire_lease(conn).unwrap();
             let stamp = inner.current_admission_stamp();
-            inner.enable_torque(stamp).unwrap();
+            let admitted = inner.check_admission(stamp).unwrap();
+            inner.enable_torque(admitted).unwrap();
             (g, inner.safety.epoch_id())
         };
         let policy_stop_gen = Arc::new(AtomicU64::new(0));

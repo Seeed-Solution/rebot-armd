@@ -586,11 +586,11 @@ fn supervisor_tick_publish_with_damiao_tx_instrumentation_does_not_allocate() {
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
     inner.lease_enabled = false;
     inner.tick(0.02);
-    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.expect("arm");
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.expect("arm");
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.3;
     let epoch = inner.safety.epoch_id();
-    { let s = inner.current_admission_stamp(); inner.jog(s, q, Some(2.0), Some(epoch)) }.expect("jog");
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog(__a, q, Some(2.0), Some(epoch))) } }.expect("jog");
     for _ in 0..5 {
         let _ = inner.tick_publish(0.02, 1, false);
         let _ = inner.core.hub().latest();

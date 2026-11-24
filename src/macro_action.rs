@@ -361,7 +361,11 @@ impl MacroCtx {
         let ticket = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
-            match inner.install_macro_path_same_side_with_rules(self.stamp, self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
+            let admitted = match inner.check_admission(self.stamp) {
+                Ok(a) => a,
+                Err(e) => return Err(before(self.map_install_err(&mut inner, e.into()))),
+            };
+            match inner.install_macro_path_same_side_with_rules(admitted, self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
                 Ok(l) => self.arm_child(&mut inner, phase, l * 2.0 + 5.0),
                 Err(e) => {
                     if let Some(detail) = e.workspace_detail() {
@@ -415,8 +419,12 @@ impl MacroCtx {
                 return Err(fail(self.timeout_code, self.timeout_message.clone()));
             }
             let remaining_s = self.deadline.duration_since(now).as_secs_f64();
+            let admitted = match inner.check_admission(self.stamp) {
+                Ok(a) => a,
+                Err(e) => return Err(self.map_install_err(&mut inner, e.into())),
+            };
             let (duration, timeout_s, is_pos_force_close) = match inner
-                .start_macro_gripper_within(self.stamp, self.id, request, Some(remaining_s), true)
+                .start_macro_gripper_within(admitted, self.id, request, Some(remaining_s), true)
             {
                 Ok(v) => v,
                 Err(ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg)))

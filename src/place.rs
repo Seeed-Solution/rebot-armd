@@ -262,23 +262,28 @@ pub fn expected_duration(planned: &PlannedPlace) -> f64 {
     moves + if planned.request.release { 2.0 } else { 0.0 }
 }
 
-/// Start a place without a WS lease check (tests, in-process agents): prepare, plan, begin
-/// and spawn the orchestrator. Returns (action id, expected duration).
-pub async fn start(supervisor: &Arc<ArmSupervisor>, body: &Value) -> Result<(u64, f64), ApiError> {
-    let stamp = supervisor.capture_admission_stamp();
+/// Start a place (tests, in-process agents): caller passes the `AdmissionStamp` captured at
+/// admission (never re-sampled internally). Prepares, plans, validates `stamp` under the owner
+/// lock, and spawns the orchestrator. Returns (action id, expected duration).
+pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::AdmissionStamp, body: &Value) -> Result<(u64, f64), ApiError> {
     let pending = {
         let inner = supervisor.inner().read().await;
         prepare(&inner, body, stamp.estop_epoch)?
     };
     let planned = tokio::task::spawn_blocking(move || plan(pending)).await
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-    let id = supervisor.inner().write().await.begin_macro(stamp, "place", &planned.input, planned.request.tag.clone())?;
-    if planned.orientation_levelled {
-        supervisor.inner().write().await.update_action(id, |a| {
-            a.orientation = Some("levelled".into());
-        });
-    }
-    let duration = expected_duration(&planned) + supervisor.inner().read().await.approach_estimate_s("place_final", planned.request.approach);
+    let (id, duration) = {
+        let mut inner = supervisor.inner().write().await;
+        let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
+        let id = inner.begin_macro(admitted, "place", &planned.input, planned.request.tag.clone())?;
+        if planned.orientation_levelled {
+            inner.update_action(id, |a| {
+                a.orientation = Some("levelled".into());
+            });
+        }
+        let duration = expected_duration(&planned) + inner.approach_estimate_s("place_final", planned.request.approach);
+        (id, duration)
+    };
     spawn(supervisor.clone(), id, planned, stamp);
     Ok((id, duration))
 }

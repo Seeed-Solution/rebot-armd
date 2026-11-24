@@ -1335,7 +1335,8 @@ mod tests {
         let mut native = crate::supervisor::SupervisorInner::new(config);
         native.lease_enabled = false;
         let stamp = native.current_admission_stamp();
-        native.enable_torque(stamp).unwrap();
+        let admitted = native.check_admission(stamp).unwrap();
+        native.enable_torque(admitted).unwrap();
         let positions: Vec<f32> = INSPECT.into_iter().map(|v| v as f32).chain([0.0]).collect();
         native.commanded_positions = positions.clone();
         native.measured_positions = positions.clone();

@@ -143,7 +143,7 @@ fn a_prepared_replay_commits_from_the_slot_and_checks_the_tool_it_was_prepared_f
 fn a_prepared_path_child_of_a_running_macro() {
     let (mut fx, mut b) = fixture();
     let epoch = fx.core.safety.epoch_id();
-    let id = fx.core.begin_orchestrated_action(fx.core.current_admission_stamp(), "sequence", None, epoch).unwrap();
+    let id = { let __s = fx.core.current_admission_stamp(); fx.core.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| fx.core.begin_orchestrated_action(__a, "sequence", None, epoch)) }.unwrap();
     let path = planned_path(&fx);
     let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
     assert_eq!(snap.authority.parent_generation, id);

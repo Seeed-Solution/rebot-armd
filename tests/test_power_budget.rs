@@ -92,7 +92,7 @@ fn rig_at(config: ArmConfig, q: [f32; 7]) -> (SupervisorInner, SimArm) {
     inner.commanded_positions = q.to_vec();
     inner.measured_positions = q.to_vec();
     inner.target_positions = q.to_vec();
-    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, arm)
@@ -376,7 +376,7 @@ fn stream_frame(inner: &mut SupervisorInner, target: &mut [f32; 7], rate: f32) -
     // keep the target within one-tick reach of the command (no dirty jumps)
     for j in 0..7 { target[j] = target[j].clamp(inner.commanded_positions[j] - 0.3, inner.commanded_positions[j] + 0.3); }
     let epoch = inner.safety.epoch_id();
-    { let s = inner.current_admission_stamp(); inner.servo(s, target.to_vec(), epoch) }
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.to_vec(), epoch)) } }
 }
 
 /// Teleop servo stream against a speed-dependent load: slowed to the band between soft and
@@ -426,11 +426,11 @@ fn servo_stream_at_high_load_is_slowed_then_held() {
     let epoch = inner.safety.epoch_id();
     let mut further = held.clone();
     further[1] += 0.1;
-    { let s = inner.current_admission_stamp(); inner.servo(s, further, epoch) }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, further, epoch)) } }.unwrap();
     assert_eq!(inner.servo_target.as_ref().unwrap()[1], held[1], "push direction clamped");
     let mut back = held.clone();
     back[1] -= 0.05;
-    { let s = inner.current_admission_stamp(); inner.servo(s, back.clone(), epoch) }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, back.clone(), epoch)) } }.unwrap();
     assert_eq!(inner.servo_target.as_ref().unwrap()[1], back[1], "yielding passes");
     // the load goes away: below soft for 300 ms ends the hold
     arm.with(|s| { s.bias = [0.0; 7]; s.visc = [0.0; 7]; });
@@ -460,7 +460,7 @@ fn incident(torque_guard: bool) -> (Option<usize>, Option<usize>, Vec<f32>) {
         if torque_at.is_none() && power_at.is_none() {
             target[J4] = inner.commanded_positions[J4] + 0.03;
             let epoch = inner.safety.epoch_id();
-            let _ = { let s = inner.current_admission_stamp(); inner.servo(s, target.to_vec(), epoch) };
+            let _ = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, target.to_vec(), epoch)) } };
         }
         let obs = inner.tick(DT);
         amps.push(power(&obs).bus_a);
@@ -497,7 +497,7 @@ fn planned_move_is_slowed_and_fails_with_power_limit() {
     target[2] += 0.5;
     target[3] += 0.5;
     let epoch = inner.safety.epoch_id();
-    let (_, id, planned) = { let s = inner.current_admission_stamp(); inner.jog_action(s, target.clone(), None, Some(epoch), "joint_move") }.unwrap();
+    let (_, id, planned) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, target.clone(), None, Some(epoch), "joint_move")) } }.unwrap();
     arm.with(|s| { s.visc[1] = 36.0; s.visc[2] = 36.0; s.visc[3] = 10.0; });
     let mut n = 0;
     let mut min_scale = 1.0f32;
@@ -517,7 +517,7 @@ fn planned_move_is_slowed_and_fails_with_power_limit() {
     back[2] += 0.2;
     let back: Vec<f32> = back.iter().zip(&inner.commanded_positions).enumerate().map(|(j, (b, c))| if j == 1 || j == 2 { c + 0.3 } else { *b }).collect();
     let epoch = inner.safety.epoch_id();
-    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, back, None, Some(epoch), "joint_move") }.unwrap();
+    let (_, id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, back, None, Some(epoch), "joint_move")) } }.unwrap();
     for k in 0..200 {
         let obs = inner.tick(DT);
         if std::env::var_os("TRACE").is_some() && k % 5 == 0 { eprintln!("{k}: fast {:.2} s {:.2} tau {:?} v {:?} pa {:?}", inner.power.fast_a, power(&obs).scale, &obs.torques[..4], &inner.commanded_velocities[..4], power(&obs).per_joint_a); }
@@ -543,7 +543,7 @@ fn static_overload_does_not_hold() {
     let mut t = inner.commanded_positions.clone();
     t[1] -= 0.1;
     let epoch = inner.safety.epoch_id();
-    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, Some(epoch), "joint_move") }.unwrap();
+    let (_, id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, t, None, Some(epoch), "joint_move")) } }.unwrap();
     for _ in 0..400 { inner.tick(DT); if !inner.last_action.as_ref().unwrap().is_running() { break; } }
     let a = inner.last_action.clone().unwrap();
     assert_eq!((a.id, a.state.as_str()), (id, "done"), "{a:?}");
@@ -647,7 +647,7 @@ fn fast_stretched_move_is_slowed_to_fit() {
     let full = swing(STRETCHED, -1.0).duration;
     let epoch = inner.safety.epoch_id();
     let t0 = std::time::Instant::now();
-    let (_, id, planned) = { let s = inner.current_admission_stamp(); inner.jog_action(s, target, None, Some(epoch), "joint_move") }.unwrap();
+    let (_, id, planned) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, target, None, Some(epoch), "joint_move")) } }.unwrap();
     let plan_us = t0.elapsed().as_secs_f64() * 1e6;
     let scale = inner.last_action.as_ref().unwrap().power_scale.unwrap();
     eprintln!("stretched joint_move: {full:.2} s at the limits -> {planned:.2} s, power_scale {scale:.3}; jog_action took {plan_us:.0} µs");
@@ -671,7 +671,7 @@ fn fast_stretched_move_is_slowed_to_fit() {
     let mut target = STRETCHED.to_vec();
     target[1] -= 1.0;
     let epoch = inner.safety.epoch_id();
-    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, target, None, Some(epoch), "joint_move") }.unwrap();
+    let (_, id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, target, None, Some(epoch), "joint_move")) } }.unwrap();
     assert!(inner.last_action.as_ref().unwrap().power_scale.is_none());
     let (mut peak, mut min_gov) = (0.0f32, 1.0f32);
     for _ in 0..1500 {
@@ -705,7 +705,7 @@ fn cartesian_path_fit_and_action_record() {
     goal.p[2] += 0.03;
     let path = armd::motion::plan_cartesian(&input, goal, armd::motion::Speed { linear: 0.05, angular: 0.5 }).unwrap();
     assert_eq!(path.power_scale, 1.0);
-    let (id, _) = { let s = inner.current_admission_stamp(); inner.install_path(s, &input, path, "move_to", None) }.unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &input, path, "move_to", None)) } }.unwrap();
     let a = inner.last_action.clone().unwrap();
     assert_eq!((a.id, a.power_scale), (id, Some(1.0)));
     assert!(serde_json::to_value(&a).unwrap()["power_scale"] == 1.0);

@@ -318,8 +318,9 @@ pub fn jobs_dir(calibration_path: &Path) -> PathBuf { calibration_path.with_file
 
 /// Begin the run (parent action `calib_hover`, tag = job id) and spawn its orchestrator.
 /// Returns (action id, deadline bound s, job id).
-pub fn begin(inner: &mut SupervisorInner, sup: &Arc<ArmSupervisor>, mut plan: HoverPlan, upstream: crate::api::proxy::DetectorUpstream, dir: PathBuf, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64, String), ArmError> {
-    let id = inner.begin_orchestrated_action(stamp, "calib_hover", Some(plan.job.id.clone()), plan.epoch)?;
+pub fn begin(inner: &mut SupervisorInner, admitted: crate::supervisor::Admitted, sup: &Arc<ArmSupervisor>, mut plan: HoverPlan, upstream: crate::api::proxy::DetectorUpstream, dir: PathBuf) -> Result<(u64, f64, String), ArmError> {
+    let stamp = admitted.stamp();
+    let id = inner.begin_orchestrated_action(admitted, "calib_hover", Some(plan.job.id.clone()), plan.epoch)?;
     plan.job.state = "running".into();
     plan.job.code = None; plan.job.message = None; plan.job.end = None;
     plan.job.action_id = Some(id);

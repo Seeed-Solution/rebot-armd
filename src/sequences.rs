@@ -654,8 +654,9 @@ fn gripper_request(action: GripperAction, fraction: Option<f64>) -> crate::motio
 }
 
 /// Begin the parent action and spawn its orchestrator. Returns (action id, expected duration).
-pub fn begin(inner: &mut SupervisorInner, sup: &Arc<ArmSupervisor>, plan: RunPlan, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64), ArmError> {
-    let id = inner.begin_sequence_action(stamp, plan.request.tag.clone(), plan.epoch)?;
+pub fn begin(inner: &mut SupervisorInner, admitted: crate::supervisor::Admitted, sup: &Arc<ArmSupervisor>, plan: RunPlan) -> Result<(u64, f64), ArmError> {
+    let stamp = admitted.stamp();
+    let id = inner.begin_sequence_action(admitted, plan.request.tag.clone(), plan.epoch)?;
     let pose_ids = plan.steps.iter().filter_map(|(_, s)| match s { PinnedStep::Pose { pose_id, .. } => Some(pose_id.clone()), _ => None }).collect();
     let episode_ids = plan.steps.iter().filter_map(|(_, s)| match s { PinnedStep::Replay { episode_id, .. } => Some(episode_id.clone()), _ => None }).collect();
     inner.sequences.pins = Some(RunPins { sequence_id: plan.sequence.id.clone(), action_id: id, pose_ids, episode_ids });
@@ -802,7 +803,11 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
                 if let (PoseGripper::Pose, Some(g)) = (gripper, gripper_idx) { target[g] = positions[g]; }
                 let mut limits = inner.planning_limits();
                 for (i, l) in limits.iter_mut().enumerate() { if Some(i) != gripper_idx { l.max_velocity *= *speed_scale as f32; } }
-                let limit = match inner.install_macro_quintic(ctx.stamp, ctx.id, target, &limits) {
+                let admitted = match inner.check_admission(ctx.stamp) {
+                    Ok(a) => a,
+                    Err(e) => return Err(ctx.map_install_err(&mut inner, e.into())),
+                };
+                let limit = match inner.install_macro_quintic(admitted, ctx.id, target, &limits) {
                     Ok(v) => v,
                     Err(e) => return Err(ctx.map_install_err(&mut inner, e)),
                 };
@@ -833,7 +838,11 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
             let ticket = {
                 let mut inner = ctx.sup.inner().write().await;
                 if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
-                let limit = match inner.install_macro_replay(ctx.stamp, ctx.id, planned) {
+                let admitted = match inner.check_admission(ctx.stamp) {
+                    Ok(a) => a,
+                    Err(e) => return Err(ctx.map_install_err(&mut inner, e.into())),
+                };
+                let limit = match inner.install_macro_replay(admitted, ctx.id, planned) {
                     Ok(v) => v,
                     Err(e) => return Err(ctx.map_install_err(&mut inner, e)),
                 };

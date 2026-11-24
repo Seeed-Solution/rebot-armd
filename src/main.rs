@@ -774,20 +774,29 @@ mod shutdown_tests {
     fn refused_shutdown_latches_stop_until_explicit_recovery_and_rearm() {
         let mut inner = physical(EnableState::Enabled);
         let old_epoch = inner.safety.epoch_id();
-        inner.servo(inner.current_admission_stamp(), vec![0.1; 6], old_epoch).unwrap();
+        let st = inner.current_admission_stamp();
+        inner.check_admission(st).and_then(|a| inner.servo(a, vec![0.1; 6], old_epoch)).unwrap();
         assert!(!request_shutdown(&mut inner));
         assert_eq!(inner.safety.state(), &SafetyState::EStop);
         let new_epoch = inner.safety.epoch_id();
         assert_ne!(new_epoch, old_epoch);
-        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], old_epoch).is_err());
-        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], new_epoch).is_err());
-        assert!(inner.enable_torque(inner.current_admission_stamp()).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.check_admission(st).and_then(|a| inner.servo(a, vec![0.1; 6], old_epoch)).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.check_admission(st).and_then(|a| inner.servo(a, vec![0.1; 6], new_epoch)).is_err());
+        let st = inner.current_admission_stamp();
+        assert!(inner.check_admission(st).and_then(|a| inner.enable_torque(a)).is_err());
         inner.clear_fault().unwrap();
         assert_eq!(inner.safety.state(), &SafetyState::Idle);
-        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], inner.safety.epoch_id()).is_err());
         let st = inner.current_admission_stamp();
-        inner.enable_torque(st).unwrap();
-        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], inner.safety.epoch_id()).is_ok());
+        let ep_now = inner.safety.epoch_id();
+        assert!(inner.check_admission(st).and_then(|a| inner.servo(a, vec![0.1; 6], ep_now)).is_err());
+        let st = inner.current_admission_stamp();
+        let adm = inner.check_admission(st).unwrap();
+        inner.enable_torque(adm).unwrap();
+        let st = inner.current_admission_stamp();
+        let ep_now = inner.safety.epoch_id();
+        assert!(inner.check_admission(st).and_then(|a| inner.servo(a, vec![0.1; 6], ep_now)).is_ok());
     }
 
     #[test]
@@ -810,7 +819,7 @@ mod shutdown_tests {
         let mut inner = physical(EnableState::Disabled);
         assert!(request_shutdown(&mut inner));
         let st = inner.current_admission_stamp();
-        assert!(inner.enable_torque(st).is_err());
+        assert!(inner.check_admission(st).and_then(|a| inner.enable_torque(a)).is_err());
         let mut unknown = physical(EnableState::Unknown);
         assert!(!request_shutdown(&mut unknown));
     }

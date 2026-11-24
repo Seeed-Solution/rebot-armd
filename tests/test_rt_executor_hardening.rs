@@ -1337,13 +1337,13 @@ async fn emergency_disable_reaches_driver_while_persistence_stalled_in_dir_sync(
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = false;
-        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
         inner.gripper_calib_path = Some(calib_path.clone());
         let epoch = inner.safety.epoch_id();
-        let _ = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s,
+        let _ = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_gripper_zero_check(__a,
                 &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}),
                 epoch,
-            ) }
+            )) } }
             .unwrap();
     }
     assert!(bus.with(|s| s.motors.iter().all(|m| m.enabled)));

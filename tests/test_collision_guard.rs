@@ -37,7 +37,7 @@ fn rig(policy: Option<CollisionPolicy>) -> (SupervisorInner, TestArm) {
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
-    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
     (inner, arm)
@@ -55,7 +55,7 @@ fn start_move(inner: &mut SupervisorInner) -> u64 {
     let spec = GoalSpec::Absolute { p: [p0[0] + 0.06, p0[1], p0[2]], r: None };
     let goal = resolve_goal(&input, &spec);
     let path = plan_cartesian(&input, goal, Speed { linear: 0.05, angular: 0.5 }).unwrap();
-    { let s = inner.current_admission_stamp(); inner.install_path(s, &input, path, "move_to", None) }.unwrap().0
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_path(__a, &input, path, "move_to", None)) } }.unwrap().0
 }
 
 fn code_of(e: ArmError) -> (u16, String) {
@@ -116,9 +116,9 @@ fn trip_cancels_a_running_move_to_holds_rejects_motion_and_auto_resumes() {
 
     // motion is refused with COLLISION_HOLD (409)
     assert_eq!(code_of(inner.plan_input().unwrap_err()), (409, "COLLISION_HOLD".into()));
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); inner.jog_action(s, INSPECT.to_vec(), None, None, "joint_move") }.unwrap_err()), (409, "COLLISION_HOLD".into()));
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, INSPECT.to_vec(), None, None, "joint_move")) } }.unwrap_err()), (409, "COLLISION_HOLD".into()));
     let epoch = inner.safety.epoch_id();
-    assert_eq!(code_of({ let s = inner.current_admission_stamp(); inner.servo(s, INSPECT.to_vec(), epoch) }.unwrap_err().into()), (409, "COLLISION_HOLD".into()));
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).and_then(|__a| inner.servo(__a, INSPECT.to_vec(), epoch)) } }.unwrap_err().into()), (409, "COLLISION_HOLD".into()));
 
     // residual still high: the hold stays
     let obs = ticks(&mut inner, 30);
@@ -147,7 +147,7 @@ fn gravity_comp_entry_ends_a_collision_hold() {
     arm.set_residual(2, -8.0);
     ticks(&mut inner, 5);
     assert!(inner.collision.hold.is_some(), "tripped");
-    { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
     assert!(inner.collision.hold.is_none(), "entry ends the hold");
     let obs = ticks(&mut inner, 5);
     assert!(inner.gravity_comp.is_some());
@@ -162,7 +162,7 @@ fn no_detection_in_gravity_comp_mode() {
         eprintln!("skipped: gravity model URDF not found ({:?})", inner.gravity_comp_support());
         return;
     }
-    { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.enter_gravity_comp(__a, Default::default())) } }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.gravity_comp.is_some());
     arm.set_residual(1, 12.0);
@@ -350,8 +350,8 @@ fn trip_during_a_grasp_sub_motion_ends_the_macro_with_collision() {
     let p0 = kinematics::fk(&kinematics::q6(&INSPECT)).p;
     let goal = resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.06, p0[1], p0[2]], r: None });
     let path = plan_cartesian(&input, goal, Speed { linear: 0.05, angular: 0.5 }).unwrap();
-    let id = { let s = inner.current_admission_stamp(); inner.begin_macro(s, "grasp", &input, None) }.unwrap();
-    { let s = inner.current_admission_stamp(); inner.install_macro_path(s, id, &input, path) }.unwrap();
+    let id = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_macro(__a, "grasp", &input, None)) } }.unwrap();
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_macro_path(__a, id, &input, path)) } }.unwrap();
     ticks(&mut inner, 10);
     arm.set_residual(1, 9.0);
     let obs = ticks(&mut inner, 4);
@@ -359,7 +359,7 @@ fn trip_during_a_grasp_sub_motion_ends_the_macro_with_collision() {
     assert_eq!((a.id, a.kind.as_str(), a.state.as_str(), a.code.as_deref()), (id, "grasp", "failed", Some("COLLISION")), "{a:?}");
     assert!(inner.macro_run.is_none() && inner.active_trajectory.is_none());
     let close = armd::motion::GripperRequest { command: armd::motion::GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: Some(8.0), tag: None };
-    assert!({ let s = inner.current_admission_stamp(); inner.start_macro_gripper(s, id, close) }.is_err());
+    assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.start_macro_gripper(__a, id, close)) } }.is_err());
 }
 
 /// Full place orchestrator on the 50 Hz ticker: a trip during the approach ends it with
@@ -374,7 +374,7 @@ async fn trip_during_place_ends_it_and_no_phase_follows() {
         inner.commanded_positions = INSPECT.to_vec();
         inner.measured_positions = INSPECT.to_vec();
         inner.target_positions = INSPECT.to_vec();
-        { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
+        { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
     }
     let ticker = sup.clone();
     tokio::spawn(async move {
@@ -383,7 +383,7 @@ async fn trip_during_place_ends_it_and_no_phase_follows() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     let p0 = kinematics::fk(&kinematics::q6(&INSPECT)).p;
-    let (id, _) = armd::place::start(&sup, &json!({"position": [p0[0] + 0.05, p0[1], p0[2] - 0.06]})).await.unwrap();
+    let (id, _) = armd::place::start(&sup, sup.capture_admission_stamp(), &json!({"position": [p0[0] + 0.05, p0[1], p0[2] - 0.06]})).await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         assert!(std::time::Instant::now() < deadline, "approach not reached");

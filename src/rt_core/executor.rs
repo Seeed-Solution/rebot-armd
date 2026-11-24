@@ -2995,11 +2995,13 @@ mod tests {
         let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
         core.lease_enabled = false;
         let stamp = core.current_admission_stamp();
-        core.enable_torque(stamp).unwrap();
+        let admitted = core.check_admission(stamp).unwrap();
+        core.enable_torque(admitted).unwrap();
         let epoch = core.safety.epoch_id();
         let stamp = core.current_admission_stamp();
+        let admitted = core.check_admission(stamp).unwrap();
         let (action_id, _) = core
-            .start_gripper_zero_check(stamp, &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}), epoch)
+            .start_gripper_zero_check(admitted, &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}), epoch)
             .unwrap();
         core.zero_check_persisting = Some(action_id);
         let action_before = core.last_action.clone().expect("running zero_check action");

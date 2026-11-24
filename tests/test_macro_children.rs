@@ -33,7 +33,7 @@ fn driven() -> (SupervisorInner, TestArm) {
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
     inner.target_positions = INSPECT.to_vec();
-    { let __s = inner.current_admission_stamp(); inner.enable_torque(__s) }.unwrap();
+    { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| inner.enable_torque(__a)) }.unwrap();
     for _ in 0..5 { inner.tick(DT); }
     (inner, arm)
 }
@@ -46,7 +46,7 @@ fn inner() -> SupervisorInner {
 
 fn begin(inner: &mut SupervisorInner) -> u64 {
     let epoch = inner.safety.epoch_id();
-    { let s = inner.current_admission_stamp(); inner.begin_orchestrated_action(s, "sequence", None, epoch) }.unwrap()
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_orchestrated_action(__a, "sequence", None, epoch)) } }.unwrap()
 }
 
 /// A J1 joint-space child `dq` away from the commanded state.
@@ -54,7 +54,7 @@ fn install(inner: &mut SupervisorInner, id: u64, dq: f32) -> Result<f64, armd::A
     let mut target = inner.commanded_positions.clone();
     target[0] += dq;
     let limits = inner.planning_limits();
-    { let s = inner.current_admission_stamp(); inner.install_macro_quintic(s, id, target, &limits) }
+    { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_macro_quintic(__a, id, target, &limits)) } }
 }
 
 fn run_until_done(inner: &mut SupervisorInner, t: ChildTicket) {
@@ -98,7 +98,7 @@ fn stop_between_preparation_and_install_installs_nothing() {
     // the stop arrives before the install
     inner.request_macro_stop();
     let limits = inner.planning_limits();
-    assert!({ let s = inner.current_admission_stamp(); inner.install_macro_quintic(s, id, target, &limits) }.is_err(), "install after the stop is refused");
+    assert!({ let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.install_macro_quintic(__a, id, target, &limits)) } }.is_err(), "install after the stop is refused");
     assert!(inner.active_trajectory.is_none(), "no physical child");
     assert_eq!(inner.macro_children(id), None, "the run record is gone");
     let a = inner.last_action.clone().unwrap();
@@ -204,18 +204,18 @@ fn child_primitive_commit_checks_parent_sequence_start_and_busy() {
     let id = begin(&mut inner);
     let now = Instant::now();
     // not the next child, a stale start, a parent that is not running: nothing installed
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &joint_child(&inner, id, 2, 0.05, 30.0, None), now) }, Err("PLAN_STALE"));
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &joint_child(&inner, id, 2, 0.05, 30.0, None), now) }, Err("PLAN_STALE"));
     let mut stale = joint_child(&inner, id, 1, 0.05, 30.0, None);
     if let Primitive::JointQuinticLimited { start, .. } = &mut stale { start[6] += 1e-3; }
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &stale, now) }, Err("PLAN_STALE"), "the gripper counts");
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &joint_child(&inner, id + 7, 1, 0.05, 30.0, None), now) }, Err("PARENT_REPLACED"));
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &stale, now) }, Err("PLAN_STALE"), "the gripper counts");
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &joint_child(&inner, id + 7, 1, 0.05, 30.0, None), now) }, Err("PARENT_REPLACED"));
     assert!(inner.active_trajectory.is_none());
     assert_eq!(inner.macro_children(id), Some(0));
     // the next child installs; a second while it runs is busy
     let target = inner.commanded_positions[0] + 0.05;
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &joint_child(&inner, id, 1, 0.05, 30.0, None), now) }, Ok(ActionId(id)));
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &joint_child(&inner, id, 1, 0.05, 30.0, None), now) }, Ok(ActionId(id)));
     assert_eq!(inner.macro_children(id), Some(1));
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &joint_child(&inner, id, 2, 0.05, 30.0, None), now) }, Err("MOTION_BUSY"));
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &joint_child(&inner, id, 2, 0.05, 30.0, None), now) }, Err("MOTION_BUSY"));
     let t = inner.macro_run.as_ref().unwrap().ticket().unwrap();
     run_until_done(&mut inner, t);
     assert!((inner.commanded_positions[0] - target).abs() < 1e-3);
@@ -227,7 +227,7 @@ fn child_primitive_commit_checks_parent_sequence_start_and_busy() {
         child: Some(ChildSpec { ticket: ChildTicket { parent: ActionId(id), child_seq: 2 }, timeout_s: 10.0, timeout_code: "GRIPPER_TIMEOUT", contact: None }),
         dof: dof as u8, start, fraction: 0.5, speed: 1.0, grasp: false,
     };
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &gripper, Instant::now()) }, Ok(ActionId(id)));
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &gripper, Instant::now()) }, Ok(ActionId(id)));
     let t = inner.macro_run.as_ref().unwrap().ticket().unwrap();
     assert_eq!(t.child_seq, 2);
     run_until_done(&mut inner, t);
@@ -238,7 +238,7 @@ fn child_primitive_commit_checks_parent_sequence_start_and_busy() {
 fn a_child_primitive_timeout_and_the_macro_terminal_record() {
     let mut inner = inner();
     let id = begin(&mut inner);
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &joint_child(&inner, id, 1, 0.6, 0.0, None), Instant::now()) }, Ok(ActionId(id)));
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &joint_child(&inner, id, 1, 0.6, 0.0, None), Instant::now()) }, Ok(ActionId(id)));
     let t = inner.macro_run.as_ref().unwrap().ticket().unwrap();
     std::thread::sleep(Duration::from_millis(2));
     inner.tick(DT);
@@ -262,7 +262,7 @@ fn a_child_primitive_timeout_and_the_macro_terminal_record() {
 fn a_contact_guard_with_a_stop_code_fails_the_child() {
     let (mut inner, arm) = driven();
     let id = begin(&mut inner);
-    assert_eq!({ let s = inner.current_admission_stamp(); inner.commit_macro_child(s, &joint_child(&inner, id, 1, 0.5, 30.0, Some(j2_guard(2.0, Some("COLLISION")))), Instant::now()) }, Ok(ActionId(id)));
+    assert_eq!({ let a = inner.check_admission(inner.current_admission_stamp()).unwrap(); inner.commit_macro_child(a, &joint_child(&inner, id, 1, 0.5, 30.0, Some(j2_guard(2.0, Some("COLLISION")))), Instant::now()) }, Ok(ActionId(id)));
     let t = inner.macro_run.as_ref().unwrap().ticket().unwrap();
     for _ in 0..5 { inner.tick(DT); }
     arm.set_residual(1, 3.0);
@@ -284,7 +284,7 @@ fn a_newer_action_records_the_superseded_macros_terminal() {
     let mut q = inner.commanded_positions.clone();
     q[0] -= 0.05;
     inner.stop_motion();
-    let (_, jog, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, q, Some(0.5), None, "joint_move") }.unwrap();
+    let (_, jog, _) = { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.jog_action(__a, q, Some(0.5), None, "joint_move")) } }.unwrap();
     assert!(inner.macro_run.is_none() && jog != id);
     let rec = inner.core.last_macro().unwrap();
     assert_eq!((rec.action, rec.children, rec.outcome), (ActionId(id), 1, Outcome::Superseded));

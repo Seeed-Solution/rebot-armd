@@ -641,7 +641,7 @@ async fn positive_m1_t4_http_ingestion_concat_norm_and_live_commit() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-m1".into(),
                 lease_generation: lease_gen,
@@ -655,7 +655,7 @@ async fn positive_m1_t4_http_ingestion_concat_norm_and_live_commit() {
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -763,7 +763,7 @@ async fn positive_t1_video_model_commits_cleanly() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-t1".into(),
                 lease_generation: lease_gen,
@@ -777,7 +777,7 @@ async fn positive_t1_video_model_commits_cleanly() {
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -1284,7 +1284,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-neg".into(),
                 lease_generation: lease_gen,
@@ -1298,7 +1298,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -1947,7 +1947,7 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-b1".into(),
                 lease_generation: lease_gen,
@@ -1961,7 +1961,7 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -2187,7 +2187,7 @@ async fn b2_mid_inference_temporal_clip_oldest_endpoint_expires_blocks_commit() 
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-b2".into(),
                 lease_generation: lease_gen,
@@ -2201,7 +2201,7 @@ async fn b2_mid_inference_temporal_clip_oldest_endpoint_expires_blocks_commit() 
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -2326,7 +2326,7 @@ async fn m3_unbroken_renewal_mid_inference_discards_target_holds_and_resumes() {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-m3".into(),
                 lease_generation: lease_gen,
@@ -2340,7 +2340,7 @@ async fn m3_unbroken_renewal_mid_inference_discards_target_holds_and_resumes() {
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -2560,7 +2560,7 @@ async fn run_m3_fail_closed_case(case: &str) -> (String, usize, usize, u64) {
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-m3-fc".into(),
                 lease_generation: lease_gen,
@@ -2574,7 +2574,7 @@ async fn run_m3_fail_closed_case(case: &str) -> (String, usize, usize, u64) {
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -2733,7 +2733,7 @@ async fn run_m4_counter_case(
 
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-m4".into(),
                 lease_generation: lease_gen,
@@ -2747,7 +2747,7 @@ async fn run_m4_counter_case(
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -2933,7 +2933,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
 
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-m1-hold".into(),
                     lease_generation: lease_gen,
@@ -2947,7 +2947,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
                     tag: None,
                     i_am_at_the_arm: true,
                     verified_release_gate: Some(gate),
-                }) }
+                })) } }
                 .unwrap()
         };
 
@@ -3075,7 +3075,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
 
         let action_id = {
             let mut inner = sup.inner().write().await;
-            { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+            { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                     epoch_id: epoch,
                     connection_id: "conn-m1-lease".into(),
                     lease_generation: lease_gen,
@@ -3089,7 +3089,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
                     tag: None,
                     i_am_at_the_arm: true,
                     verified_release_gate: Some(gate),
-                }) }
+                })) } }
                 .unwrap()
         };
 
@@ -3219,7 +3219,7 @@ async fn b02_missing_oldest_captured_at_ms_rejected_400_without_mutation_or_targ
     let epoch = sup.get_observation().await.epoch_id;
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-b02".into(),
                 lease_generation: lease_gen,
@@ -3233,7 +3233,7 @@ async fn b02_missing_oldest_captured_at_ms_rejected_400_without_mutation_or_targ
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -3402,7 +3402,7 @@ async fn m02_unbroken_renewal_commit_past_old_ticket_expiry_holds_and_resumes() 
     let epoch = sup.get_observation().await.epoch_id;
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-m02".into(),
                 lease_generation: lease_gen,
@@ -3416,7 +3416,7 @@ async fn m02_unbroken_renewal_commit_past_old_ticket_expiry_holds_and_resumes() 
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 
@@ -3570,7 +3570,7 @@ async fn r2_late_handshake_renewal_between_ticks_stops_with_handshake_expired() 
     let epoch = sup.get_observation().await.epoch_id;
     let action_id = {
         let mut inner = sup.inner().write().await;
-        { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
+        { let s = inner.current_admission_stamp(); { let __s = s; inner.check_admission(__s).map_err(armd::ArmError::from).and_then(|__a| inner.begin_policy_run(__a, PolicyRunStart {
                 epoch_id: epoch,
                 connection_id: "conn-r2-8".into(),
                 lease_generation: lease_gen,
@@ -3584,7 +3584,7 @@ async fn r2_late_handshake_renewal_between_ticks_stops_with_handshake_expired() 
                 tag: None,
                 i_am_at_the_arm: true,
                 verified_release_gate: Some(gate),
-            }) }
+            })) } }
             .unwrap()
     };
 

@@ -169,7 +169,7 @@ fn the_rt_enable_sends_the_j7_position_force_handshake_like_the_blocking_enable(
     // the blocking path (legacy set_torque) as the reference
     let mut blocking = rig_with(pos_force);
     blocking.bus.clear_log();
-    { let __s = blocking.fx.core.current_admission_stamp(); blocking.fx.core.enable_torque(__s) }.expect("blocking enable");
+    { let __s = blocking.fx.core.current_admission_stamp(); blocking.fx.core.check_admission(__s).and_then(|__a| blocking.fx.core.enable_torque(__a)) }.expect("blocking enable");
     let reference = handshake_frames(&blocking.bus);
     // the RT transition path
     let mut r = rig_with(pos_force);
