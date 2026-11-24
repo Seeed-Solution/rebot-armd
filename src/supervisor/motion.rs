@@ -79,9 +79,12 @@ impl SupervisorInner {
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
-        self.active_trajectory = None;
+        if let Some(old_traj) = self.active_trajectory.take() {
+            self.retire_active_trajectory(old_traj);
+        }
+        self.pending_deferred_done = None;
         self.pending_normal_unload = false;
-        self.unload_settle = None;
+        self.clear_unload_settle();
         self.zero_check_persisting = None;
         self.end_gripper_stream();
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
@@ -89,6 +92,10 @@ impl SupervisorInner {
 
     pub fn execute_stop(&mut self, policy: StopPolicy) {
         self.apply_stop_policy(policy);
+    }
+
+    pub(crate) fn execute_stop_in_tick(&mut self, policy: StopPolicy) {
+        self.apply_stop_policy_in_tick(policy, true);
     }
 
     /// Execute the `StopPolicy::EStopLatch` transition without ever blocking on `driver`.
@@ -102,6 +109,7 @@ impl SupervisorInner {
         self.pending_normal_unload = false;
         self.unload_settle = None;
         self.active_trajectory = None;
+        self.pending_deferred_done = None;
         self.release_servo_target();
         self.gripper_stream_target = None;
         self.gripper_stream_contact = None;
@@ -163,6 +171,7 @@ impl SupervisorInner {
                 let mut hold = [0.0f32; 6];
                 for (dst, &src) in hold.iter_mut().zip(&self.commanded_positions) { *dst = src; }
                 run.phase = crate::gravity_comp::GravityCompPhase::Exiting { hold, elapsed_s: 0.0 };
+                self.gravity_comp_handback_ready = false;
                 run.position = hold;
                 for (dst, &src) in run.kp.iter_mut().zip(&run.policy.hold_kp) { *dst = src; }
                 for (dst, &src) in run.kd.iter_mut().zip(&run.policy.hold_kd) { *dst = src; }
@@ -183,21 +192,34 @@ impl SupervisorInner {
             self.measured_velocities.fill(0.0);
         }
         // Send the stiff MIT exit hold immediately when uncontended; never block on a held mutex.
-        if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
-            if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), driver) {
-                if let Ok(mut drv) = d.try_lock() {
-                    if let Err(e) = drv.write_estop_hold(&targets) {
-                        let mut msg = crate::safety::BoundedText::<160>::empty();
-                        e.write_bounded(&mut msg);
-                        self.safety.log_gravity_comp_hold_write_failed(msg);
-                    }
-                }
-            }
-        }
+        let hold_out = if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
+            self.write_gravity_comp_immediate_with_driver(driver, true, true)
+        } else {
+            crate::supervisor::TickOutput::None
+        };
         self.safety.latch(crate::safety::FaultKind::Estop, crate::safety::FaultDetail::Estop);
+        // If an urgent E-stop request is still pending (requested != applied), `pending_stop_check`
+        // intentionally returns `EstopInhibited` and defers the hold to the first eligible stopped
+        // release; do not log or classify that as a hold write failure.
+        let suppress_pending_estop = matches!(
+            &hold_out,
+            crate::supervisor::TickOutput::EstopInhibited { .. }
+        );
+        if !suppress_pending_estop {
+            if let crate::supervisor::TickOutput::Error { ref message, .. } = hold_out {
+                let mut msg = crate::safety::BoundedText::<160>::empty();
+                msg.push_str(message.as_str());
+                self.safety.log_gravity_comp_hold_write_failed(msg);
+            }
+            let _ = self.classify_tick_output(hold_out, false, false);
+        }
     }
 
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
+        self.apply_stop_policy_in_tick(policy, false);
+    }
+
+    pub(crate) fn apply_stop_policy_in_tick(&mut self, policy: StopPolicy, in_tick: bool) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
             match policy {
@@ -425,12 +447,13 @@ impl SupervisorInner {
                 }
             }
             StopPolicy::BusLossFallback => {
-                self.exit_gravity_comp("BUS_LOSS", "CAN feedback lost");
+                self.exit_gravity_comp_inner("BUS_LOSS", "CAN feedback lost", !in_tick);
                 // Bus loss / disconnect: hold position locked, latch fault, advance epoch
                 // Maintain holding torque: DO NOT disable hardware torque to prevent gravitational collapse!
                 self.pending_normal_unload = false;
                 self.unload_settle = None;
                 self.active_trajectory = None;
+                self.pending_deferred_done = None;
                 self.release_servo_target();
                 self.gripper_stream_target = None;
                 self.gripper_stream_contact = None;
@@ -689,6 +712,7 @@ impl SupervisorInner {
             self.pending_normal_unload = false;
             self.unload_settle = None;
             self.active_trajectory = None;
+            self.pending_deferred_done = None;
             self.release_servo_target();
             self.gripper_stream_target = None;
             self.gripper_stream_contact = None;

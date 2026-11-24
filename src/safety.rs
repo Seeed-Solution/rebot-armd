@@ -33,6 +33,8 @@ pub enum FaultReason {
     },
     BusLoss,
     WatchdogTimeout,
+    /// Bounded CAN TX stalled: frames expired past the age limit or consecutive ticks deferred.
+    CanTxStalled,
     Other(String),
 }
 
@@ -63,6 +65,7 @@ fault_codes! {
         ControlDeadline,
         InvalidTelemetry,
         DriverWriteFailed,
+        CanTxStalled,
         HardwareFault,
         EnableFailed,
         ServoNoBrake,
@@ -93,8 +96,59 @@ impl FaultCode {
             FaultReason::ThermalTrip { .. } => FaultCode::ThermalTrip,
             FaultReason::BusLoss => FaultCode::BusLoss,
             FaultReason::WatchdogTimeout => FaultCode::WatchdogTimeout,
+            FaultReason::CanTxStalled => FaultCode::CanTxStalled,
             FaultReason::Other(_) => FaultCode::Other,
         }
+    }
+}
+
+/// Inline, allocation-free numeric diagnostics for [`FaultCode::CanTxStalled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxStallDetail {
+    pub queued: usize,
+    pub dropped: usize,
+    pub age_ms: u64,
+    pub limit_ms: u64,
+    pub consecutive_ticks: u32,
+    pub is_hold: bool,
+}
+
+impl TxStallDetail {
+    /// Formats a human-readable stall message directly into a [`core::fmt::Write`] sink
+    /// without heap allocation.
+    pub fn write_message_into(&self, out: &mut impl core::fmt::Write) {
+        let _ = if self.dropped > 0 {
+            if self.is_hold {
+                write!(
+                    out,
+                    "CAN TX hold stalled: {} frames expired after {} ms ({} frames queued, limit {} ms)",
+                    self.dropped, self.age_ms, self.queued, self.limit_ms
+                )
+            } else {
+                write!(
+                    out,
+                    "CAN TX stalled: {} frames expired after {} ms ({} frames queued, limit {} ms)",
+                    self.dropped, self.age_ms, self.queued, self.limit_ms
+                )
+            }
+        } else if self.is_hold {
+            write!(
+                out,
+                "CAN TX hold stalled: {} frames queued with no hold sent for {} ms (limit {} ms)",
+                self.queued, self.age_ms, self.limit_ms
+            )
+        } else {
+            write!(
+                out,
+                "CAN TX stalled: {} frames queued across {} consecutive ticks (age {} ms, limit {} ms)",
+                self.queued, self.consecutive_ticks, self.age_ms, self.limit_ms
+            )
+        };
+    }
+
+    /// Formats a human-readable stall message into `out` without allocating while `out` has capacity.
+    pub fn write_message(&self, out: &mut String) {
+        self.write_message_into(out);
     }
 }
 
@@ -123,6 +177,9 @@ impl FaultReason {
             FaultReason::WatchdogTimeout => {
                 let _ = w.write_str("Control lease expired while torqued");
             }
+            FaultReason::CanTxStalled => {
+                let _ = w.write_str("CAN TX stalled (bounded transmit queue did not drain within age limit)");
+            }
             FaultReason::Other(m) => {
                 let _ = w.write_str(m);
             }
@@ -130,15 +187,9 @@ impl FaultReason {
     }
 
     pub fn message(&self) -> String {
-        match self {
-            FaultReason::JointLimitExceeded { joint_name, value, min, max, .. } =>
-                format!("Joint '{joint_name}' at {value:.4} outside [{min:.4}, {max:.4}]"),
-            FaultReason::ThermalTrip { joint_idx, temperature, limit } =>
-                format!("Joint {} temperature {temperature:.1} C above limit {limit:.1} C", joint_idx + 1),
-            FaultReason::BusLoss => "No fresh feedback from every joint (bus loss)".into(),
-            FaultReason::WatchdogTimeout => "Control lease expired while torqued".into(),
-            FaultReason::Other(m) => m.clone(),
-        }
+        let mut out = String::new();
+        self.write_message_into(&mut out);
+        out
     }
 }
 
@@ -323,8 +374,8 @@ impl StaticFault {
 /// Fault kind tracked in [`SafetyManager`]'s fixed-size latched-kind bitmask.
 ///
 /// Severity order (highest to lowest, used for reported `fault.code` and displayed state):
-/// `ThermalTrip` > `BusLoss` > `CollisionLatched` > `JointLimit` > `Other` (non-recoverable)
-/// > `Estop` > `Other` (recoverable) > `WatchdogTimeout`.
+/// `ThermalTrip` > `BusLoss` > `CollisionLatched` > `JointLimit` > `CanTxStalled`
+/// > `Other` (non-recoverable) > `Estop` > `Other` (recoverable) > `WatchdogTimeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FaultKind {
@@ -332,29 +383,31 @@ pub enum FaultKind {
     BusLoss = 1,
     CollisionLatched = 2,
     JointLimit = 3,
-    Other = 4,
-    WatchdogTimeout = 5,
-    Estop = 6,
+    CanTxStalled = 4,
+    Other = 5,
+    WatchdogTimeout = 6,
+    Estop = 7,
 }
 
 impl FaultKind {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
     /// All known kinds in strict descending severity order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::ThermalTrip,
         Self::BusLoss,
         Self::CollisionLatched,
         Self::JointLimit,
+        Self::CanTxStalled,
         Self::Other,
         Self::WatchdogTimeout,
         Self::Estop,
     ];
     /// Bitmask covering every known [`FaultKind`]; any bit outside this mask fails closed.
-    pub const ALL_MASK: u8 = (1u8 << Self::COUNT) - 1;
+    pub const ALL_MASK: u16 = (1u16 << Self::COUNT) - 1;
 
     #[inline]
-    pub const fn bit(self) -> u8 {
-        1u8 << (self as u8)
+    pub const fn bit(self) -> u16 {
+        1u16 << (self as u8)
     }
 
     #[inline]
@@ -364,9 +417,10 @@ impl FaultKind {
             1 => Some(Self::BusLoss),
             2 => Some(Self::CollisionLatched),
             3 => Some(Self::JointLimit),
-            4 => Some(Self::Other),
-            5 => Some(Self::WatchdogTimeout),
-            6 => Some(Self::Estop),
+            4 => Some(Self::CanTxStalled),
+            5 => Some(Self::Other),
+            6 => Some(Self::WatchdogTimeout),
+            7 => Some(Self::Estop),
             _ => None,
         }
     }
@@ -379,6 +433,7 @@ impl FaultKind {
             Self::BusLoss => FaultCode::BusLoss,
             Self::CollisionLatched => FaultCode::Collision,
             Self::JointLimit => FaultCode::JointLimit,
+            Self::CanTxStalled => FaultCode::CanTxStalled,
             Self::Other => FaultCode::Other,
             Self::WatchdogTimeout => FaultCode::WatchdogTimeout,
             Self::Estop => FaultCode::Estop,
@@ -389,10 +444,11 @@ impl FaultKind {
     #[inline]
     pub const fn severity(self, code: FaultCode) -> u8 {
         match self {
-            Self::ThermalTrip => 7,
-            Self::BusLoss => 6,
-            Self::CollisionLatched => 5,
-            Self::JointLimit => 4,
+            Self::ThermalTrip => 8,
+            Self::BusLoss => 7,
+            Self::CollisionLatched => 6,
+            Self::JointLimit => 5,
+            Self::CanTxStalled => 4,
             Self::Other => {
                 if matches!(code, FaultCode::ControlDeadline | FaultCode::HandoverUnsettled) {
                     1
@@ -414,6 +470,7 @@ impl FaultKind {
                 | Self::BusLoss
                 | Self::CollisionLatched
                 | Self::JointLimit
+                | Self::CanTxStalled
                 | Self::Estop
         )
     }
@@ -425,6 +482,7 @@ impl FaultKind {
             FaultReason::ThermalTrip { .. } => Self::ThermalTrip,
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
+            FaultReason::CanTxStalled => Self::CanTxStalled,
             FaultReason::Other(_) => Self::Other,
         }
     }
@@ -436,6 +494,7 @@ impl FaultKind {
             FaultCode::BusLoss => Self::BusLoss,
             FaultCode::Collision => Self::CollisionLatched,
             FaultCode::JointLimit => Self::JointLimit,
+            FaultCode::CanTxStalled => Self::CanTxStalled,
             FaultCode::WatchdogTimeout => Self::WatchdogTimeout,
             FaultCode::Estop => Self::Estop,
             _ => Self::Other,
@@ -453,6 +512,8 @@ pub enum FaultDetail {
     BusLoss,
     /// Control lease expired while torqued.
     WatchdogTimeout,
+    /// Bounded CAN TX stalled (optional inline numeric diagnostics, 0 heap ops).
+    CanTxStalled(Option<TxStallDetail>),
     /// Joint temperature exceeded `max_temperature`.
     ThermalTrip { joint_idx: usize, temperature: f32, limit: f32 },
     /// Joint position exceeded configured/driver limits.
@@ -493,6 +554,7 @@ impl FaultDetail {
             }
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
+            FaultReason::CanTxStalled => Self::CanTxStalled(None),
             FaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max } => {
                 Self::JointLimitExceeded {
                     joint_idx: *joint_idx,
@@ -512,6 +574,7 @@ impl FaultDetail {
             Self::Estop => FaultCode::Estop,
             Self::BusLoss => FaultCode::BusLoss,
             Self::WatchdogTimeout => FaultCode::WatchdogTimeout,
+            Self::CanTxStalled(_) => FaultCode::CanTxStalled,
             Self::ThermalTrip { .. } => FaultCode::ThermalTrip,
             Self::JointLimitExceeded { .. } => FaultCode::JointLimit,
             Self::Static(sf) => sf.code(),
@@ -528,6 +591,7 @@ impl FaultDetail {
             Self::Estop => BoundedFaultReason::Other(BoundedText::new("E-stop latched")),
             Self::BusLoss => BoundedFaultReason::BusLoss,
             Self::WatchdogTimeout => BoundedFaultReason::WatchdogTimeout,
+            Self::CanTxStalled(detail) => BoundedFaultReason::CanTxStalled(detail),
             Self::ThermalTrip { joint_idx, temperature, limit } => {
                 BoundedFaultReason::ThermalTrip { joint_idx, temperature, limit }
             }
@@ -655,6 +719,7 @@ pub enum BoundedFaultReason {
     ThermalTrip { joint_idx: usize, temperature: f32, limit: f32 },
     BusLoss,
     WatchdogTimeout,
+    CanTxStalled(Option<TxStallDetail>),
     Other(BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
 }
 
@@ -668,6 +733,7 @@ impl BoundedFaultReason {
                 Self::ThermalTrip { joint_idx: *joint_idx, temperature: *temperature, limit: *limit },
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
+            FaultReason::CanTxStalled => Self::CanTxStalled(None),
             FaultReason::Other(m) => Self::Other(BoundedText::new(m)),
         }
     }
@@ -686,6 +752,12 @@ impl BoundedFaultReason {
             }
             Self::WatchdogTimeout => {
                 let _ = w.write_str("Control lease expired while torqued");
+            }
+            Self::CanTxStalled(Some(detail)) => {
+                detail.write_message_into(w);
+            }
+            Self::CanTxStalled(None) => {
+                let _ = w.write_str("CAN TX stalled (bounded transmit queue did not drain within age limit)");
             }
             Self::Other(m) => {
                 let _ = write!(w, "{m}");
@@ -706,6 +778,7 @@ impl std::fmt::Debug for BoundedFaultReason {
                 .field("joint_idx", joint_idx).field("temperature", temperature).field("limit", limit).finish(),
             Self::BusLoss => f.write_str("BusLoss"),
             Self::WatchdogTimeout => f.write_str("WatchdogTimeout"),
+            Self::CanTxStalled(_) => f.write_str("CanTxStalled"),
             Self::Other(m) => f.debug_tuple("Other").field(&m.as_str()).finish(),
         }
     }
@@ -993,6 +1066,9 @@ pub enum ClearRefusal {
     HardwareResetRequired,
     HardwareResetSent,
     FreshFeedbackRequired,
+    TxQueueNotDrained,
+    TxProbeRequired,
+    TxProbeFeedbackRequired,
     TemperatureConfirmationRequired,
     TemperatureAboveThreshold,
     ThermalCooldownNotElapsed { elapsed_ms: u64, required_ms: u64 },
@@ -1040,6 +1116,9 @@ impl std::fmt::Display for ClearRefusal {
             Self::HardwareResetRequired => f.write_str("Hardware fault bit active; motor reset is required before re-evaluating clear conditions"),
             Self::HardwareResetSent => f.write_str("Hardware reset sent; wait for fresh fault-free feedback before retrying"),
             Self::FreshFeedbackRequired => f.write_str("Fresh feedback is required before resetting a fault"),
+            Self::TxQueueNotDrained => f.write_str("CAN TX queue still has pending frames; wait for the bus to drain before clearing CAN_TX_STALLED"),
+            Self::TxProbeRequired => f.write_str("CAN TX transmit probe is required before clearing CAN_TX_STALLED"),
+            Self::TxProbeFeedbackRequired => f.write_str("CAN TX probe sent; wait for fresh feedback received after the probe before clearing CAN_TX_STALLED"),
             Self::TemperatureConfirmationRequired => f.write_str("Temperature must be confirmed below the reset threshold"),
             Self::TemperatureAboveThreshold => f.write_str("Temperature is above the reset threshold"),
             Self::ThermalCooldownNotElapsed { elapsed_ms, required_ms } =>
@@ -1066,6 +1145,13 @@ pub struct ClearContext {
     pub disable_pending: bool,
     pub has_driver: bool,
     pub feedback_fresh: bool,
+    /// True when the driver's bounded TX carry-over queues (motion + stopped-hold) are empty.
+    pub tx_queue_drained: bool,
+    /// True when a CAN transmit probe (refresh/status frame sent with no backpressure or error
+    /// after an empty queue) has been confirmed by fresh feedback received after that probe.
+    pub tx_probe_confirmed: bool,
+    /// True when a CAN transmit probe was sent cleanly and is awaiting post-probe fresh feedback.
+    pub tx_probe_sent: bool,
     pub thermal_sensor_available: bool,
     pub thermal_below_threshold: bool,
     pub thermal_cooldown_elapsed_ms: u64,
@@ -1100,6 +1186,9 @@ impl ClearContext {
             disable_pending: false,
             has_driver: false,
             feedback_fresh: true,
+            tx_queue_drained: true,
+            tx_probe_confirmed: true,
+            tx_probe_sent: false,
             thermal_sensor_available: true,
             thermal_below_threshold: true,
             thermal_cooldown_elapsed_ms: 0,
@@ -1191,6 +1280,7 @@ pub struct SafetyManager {
     armed_arc: Arc<SafetyState>,
     moving_arc: Arc<SafetyState>,
     estop_arc: Arc<SafetyState>,
+    can_tx_stalled_arc: Arc<SafetyState>,
     bus_loss_arc: Arc<SafetyState>,
     watchdog_timeout_arc: Arc<SafetyState>,
     detail_unavailable_arc: Arc<SafetyState>,
@@ -1219,7 +1309,7 @@ pub struct SafetyManager {
     /// Code recorded by the trigger site of the current shown Fault.
     fault_code: Option<FaultCode>,
     /// Bitmask of every [`FaultKind`] latched since the last clear to `Idle`.
-    latched_fault_kinds: u8,
+    latched_fault_kinds: u16,
     /// Bitmask of every [`FaultCode`] latched since the last clear to `Idle`.
     latched_fault_codes: u32,
     /// Sticky worst-of recoverability flag: set whenever ANY latched detail is non-recoverable,
@@ -1238,6 +1328,7 @@ impl Clone for SafetyManager {
             armed_arc: Arc::clone(&self.armed_arc),
             moving_arc: Arc::clone(&self.moving_arc),
             estop_arc: Arc::clone(&self.estop_arc),
+            can_tx_stalled_arc: Arc::clone(&self.can_tx_stalled_arc),
             bus_loss_arc: Arc::clone(&self.bus_loss_arc),
             watchdog_timeout_arc: Arc::clone(&self.watchdog_timeout_arc),
             detail_unavailable_arc: Arc::clone(&self.detail_unavailable_arc),
@@ -1291,6 +1382,7 @@ impl Default for SafetyManager {
             armed_arc: Arc::new(SafetyState::Armed),
             moving_arc: Arc::new(SafetyState::Moving),
             estop_arc: Arc::new(SafetyState::EStop),
+            can_tx_stalled_arc: Arc::new(SafetyState::Fault(FaultReason::CanTxStalled)),
             bus_loss_arc: Arc::new(SafetyState::Fault(FaultReason::BusLoss)),
             watchdog_timeout_arc: Arc::new(SafetyState::Fault(FaultReason::WatchdogTimeout)),
             detail_unavailable_arc: Arc::new(SafetyState::Fault(FaultReason::Other(
@@ -1566,7 +1658,7 @@ impl SafetyManager {
 
     /// Bitmask of every [`FaultKind`] latched since the last clear to `Idle`.
     #[inline]
-    pub fn latched_fault_kinds(&self) -> u8 {
+    pub fn latched_fault_kinds(&self) -> u16 {
         self.latched_fault_kinds
     }
 
@@ -1578,7 +1670,7 @@ impl SafetyManager {
 
     /// Sets an arbitrary bit in the latched-kind bitmask for fail-closed unknown-kind tests.
     #[doc(hidden)]
-    pub fn record_unknown_kind_bit_for_test(&mut self, bit: u8) {
+    pub fn record_unknown_kind_bit_for_test(&mut self, bit: u16) {
         self.latched_fault_kinds |= bit;
     }
 
@@ -1645,8 +1737,8 @@ impl SafetyManager {
         if self.has_non_recoverable {
             return false;
         }
-        for bit in 0..8u8 {
-            if (self.latched_fault_kinds & (1u8 << bit)) != 0 {
+        for bit in 0..16u8 {
+            if (self.latched_fault_kinds & (1u16 << bit)) != 0 {
                 let Some(kind) = FaultKind::from_bit_index(bit) else {
                     return false;
                 };
@@ -1746,7 +1838,8 @@ impl SafetyManager {
     }
 
     fn is_cached_fault_arc(&self, arc: &Arc<SafetyState>) -> bool {
-        Arc::ptr_eq(arc, &self.bus_loss_arc)
+        Arc::ptr_eq(arc, &self.can_tx_stalled_arc)
+            || Arc::ptr_eq(arc, &self.bus_loss_arc)
             || Arc::ptr_eq(arc, &self.watchdog_timeout_arc)
             || Arc::ptr_eq(arc, &self.detail_unavailable_arc)
             || self.static_fault_arcs.iter().any(|a| Arc::ptr_eq(arc, a))
@@ -1758,6 +1851,7 @@ impl SafetyManager {
             FaultDetail::Estop => Some(Arc::clone(&self.estop_arc)),
             FaultDetail::BusLoss => Some(Arc::clone(&self.bus_loss_arc)),
             FaultDetail::WatchdogTimeout => Some(Arc::clone(&self.watchdog_timeout_arc)),
+            FaultDetail::CanTxStalled(_) => Some(Arc::clone(&self.can_tx_stalled_arc)),
             FaultDetail::Static(sf) => Some(Arc::clone(&self.static_fault_arcs[sf as usize])),
             FaultDetail::DetailUnavailable(_) => {
                 if kind == FaultKind::Estop {
@@ -1986,6 +2080,7 @@ impl SafetyManager {
         // permitted after every OTHER recorded kind's condition has passed.
         const CHECK_ORDER: [FaultKind; FaultKind::COUNT] = [
             FaultKind::BusLoss,
+            FaultKind::CanTxStalled,
             FaultKind::ThermalTrip,
             FaultKind::WatchdogTimeout,
             FaultKind::JointLimit,
@@ -2003,6 +2098,14 @@ impl SafetyManager {
                 FaultKind::BusLoss => {
                     if !ctx.feedback_fresh {
                         return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                }
+                FaultKind::CanTxStalled => {
+                    if !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                    if !ctx.tx_queue_drained {
+                        return Err(ClearRefusal::TxQueueNotDrained);
                     }
                 }
                 FaultKind::ThermalTrip => {
@@ -2046,9 +2149,9 @@ impl SafetyManager {
                 }
             }
         }
-        // Exhaustive bit-level fail-closed guard over all 8 bits.
-        for bit in 0..8u8 {
-            if (self.latched_fault_kinds & (1u8 << bit)) != 0
+        // Exhaustive bit-level fail-closed guard over all 16 bits.
+        for bit in 0..16u8 {
+            if (self.latched_fault_kinds & (1u16 << bit)) != 0
                 && FaultKind::from_bit_index(bit).is_none()
             {
                 return Err(ClearRefusal::UnknownFaultKind);
@@ -2057,16 +2160,22 @@ impl SafetyManager {
         if !checked_any && self.state_arc.is_stopped() && ctx.has_driver && !ctx.feedback_fresh {
             return Err(ClearRefusal::FreshFeedbackRequired);
         }
-        // Hardware-fault reset & status checks run ONLY after every other recorded kind passed.
+        // Hardware-fault reset, CAN TX probe, and status checks run ONLY after every other recorded kind passed.
         if checked_any || self.state_arc.is_stopped() {
+            if let Some(err) = ctx.hardware_error {
+                return Err(ClearRefusal::DriverError(err));
+            }
+            if ctx.has_driver && self.has_latched_fault_kind(FaultKind::CanTxStalled) && !ctx.tx_probe_confirmed {
+                if ctx.tx_probe_sent {
+                    return Err(ClearRefusal::TxProbeFeedbackRequired);
+                }
+                return Err(ClearRefusal::TxProbeRequired);
+            }
             if ctx.hardware_reset_sent {
                 return Err(ClearRefusal::HardwareResetSent);
             }
             if ctx.hardware_reset_required {
                 return Err(ClearRefusal::HardwareResetRequired);
-            }
-            if let Some(err) = ctx.hardware_error {
-                return Err(ClearRefusal::DriverError(err));
             }
             if ctx.has_driver && !ctx.enable_state_known {
                 return Err(ClearRefusal::EnableStateUnknown);
@@ -2114,6 +2223,17 @@ impl SafetyManager {
         match &*self.state_arc {
             SafetyState::EStop => Some(FaultCode::Estop),
             SafetyState::Fault(reason) => Some(self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason))),
+            _ => None,
+        }
+    }
+
+    /// Inline detail of the latched [`FaultKind::CanTxStalled`] fault, if any.
+    pub fn tx_stall_detail(&self) -> Option<TxStallDetail> {
+        match self.latched_fault_details[FaultKind::CanTxStalled as usize] {
+            Some(LatchedFaultDetail {
+                reason: BoundedFaultReason::CanTxStalled(detail),
+                ..
+            }) => detail,
             _ => None,
         }
     }

@@ -59,6 +59,9 @@ struct VirtualBusState {
     tx_script: VecDeque<(TxRule, Duration)>,
     default_rule: TxRule,
     default_step: Duration,
+    /// Optional periodic TX spike: every Nth transmit (when > 0) adds `tx_spike_step` to clock.
+    tx_spike_every: usize,
+    tx_spike_step: Duration,
     flush_error: Option<TxRule>,
     clock: MockClock,
     on_tx: Option<Arc<dyn Fn(usize, &CanFrame) + Send + Sync>>,
@@ -66,6 +69,9 @@ struct VirtualBusState {
     tx_attempts: usize,
     /// Optional busy-work loop per transmit to produce nonzero CLOCK_THREAD_CPUTIME_ID on Linux.
     cpu_spin_iters: u64,
+    /// When true, `flush_is_noop()` returns `false` to model transports with a real flush.
+    real_flush: bool,
+    flush_calls: usize,
 }
 
 impl VirtualBusState {
@@ -85,12 +91,16 @@ impl VirtualBusState {
             tx_script: VecDeque::new(),
             default_rule: TxRule::Ok,
             default_step: Duration::ZERO,
+            tx_spike_every: 0,
+            tx_spike_step: Duration::ZERO,
             flush_error: None,
             clock,
             on_tx: None,
             on_flush: None,
             tx_attempts: 0,
             cpu_spin_iters: 0,
+            real_flush: false,
+            flush_calls: 0,
         }
     }
 
@@ -225,12 +235,15 @@ impl CanTransport for VirtualBus {
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let (rule, step, spin, cb, attempt_idx) = {
             let mut s = self.0.lock().unwrap();
-            let (rule, step) = s
+            let (rule, mut step) = s
                 .tx_script
                 .pop_front()
                 .unwrap_or((s.default_rule, s.default_step));
             let idx = s.tx_attempts;
             s.tx_attempts += 1;
+            if s.tx_spike_every > 0 && (idx + 1).is_multiple_of(s.tx_spike_every) {
+                step += s.tx_spike_step;
+            }
             s.tx_log.push(*frame);
             (rule, step, s.cpu_spin_iters, s.on_tx.clone(), idx)
         };
@@ -275,6 +288,7 @@ impl CanTransport for VirtualBus {
     fn flush(&mut self) -> Result<(), TransportError> {
         let (err, cb) = {
             let mut s = self.0.lock().unwrap();
+            s.flush_calls += 1;
             (s.flush_error.take(), s.on_flush.clone())
         };
         if let Some(cb) = cb {
@@ -286,6 +300,10 @@ impl CanTransport for VirtualBus {
             Some(TxRule::Enobufs) => Err(TransportError::NoBufferSpace),
             Some(TxRule::HardError) => Err(TransportError::Can("injected flush error".into())),
         }
+    }
+
+    fn flush_is_noop(&self) -> bool {
+        !self.0.lock().unwrap().real_flush
     }
 }
 
@@ -659,22 +677,32 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
     assert_eq!((m.frames, m.dropped_stale, m.pending), (1, 2, 0));
     assert_eq!(bus.with(|s| s.tx_accepted.iter().map(|f| f.id).collect::<Vec<_>>()), vec![0x105]);
 
-    // A stalled single transmit pushing the current batch past 45 ms must fail closed (Timeout),
-    // never falsely reporting Complete after dropping the remaining frames as stale.
+    // A stalled single transmit pushing the current batch past 45 ms must fail closed uniformly as
+    // Expired { dropped: 6, pending: 0 } (never falsely reporting Complete), while legacy
+    // write_joint_targets maps Expired to Timeout.
     let (mut d, bus, _) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(100), frame_max_age: ms(45) });
     bus.with(|s| s.tx_script.push_back((TxRule::Ok, ms(45))));
     reset_tx_metrics();
-    let err = d.write_joint_targets_bounded(&targets_const(0.3)).unwrap_err();
-    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.3)).unwrap(),
+        TxBatchOutcome::Expired { dropped: 6, pending: 0 }
+    );
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.dropped_stale, m.pending), (1, 6, 0));
+
+    let (mut d, bus, _) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(100), frame_max_age: ms(45) });
+    bus.with(|s| s.tx_script.push_back((TxRule::Ok, ms(45))));
+    let err = d.write_joint_targets(&targets_const(0.3)).unwrap_err();
+    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
 }
 
 #[test]
 fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
     // Part A: defer 3 frames, advance 45 ms, raise budget, submit a fresh full 7-joint batch ->
-    // write_joint_targets_bounded MUST return Expired { dropped: 3, pending: 0 }, never Complete.
+    // write_joint_targets_bounded fails closed immediately with Expired { dropped: 3, pending: 0 }
+    // and sends ZERO replacement motion frames in the same tick.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
     assert_eq!(
@@ -690,33 +718,18 @@ fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
     assert_eq!(
         out,
         TxBatchOutcome::Expired { dropped: 3, pending: 0 },
-        "fresh write after carried-over expiry must not report Complete"
+        "fresh write after carried-over expiry must fail closed as Expired"
     );
     assert_eq!(d.pending_tx_len(), 0);
-    let sent_ids: Vec<(u32, f32)> = bus.with(|s| {
-        s.tx_accepted
-            .iter()
-            .map(|f| (f.id, pos_vel_target_rad(f)))
-            .collect()
-    });
-    assert_eq!(
-        sent_ids,
-        vec![
-            (0x101, -0.25),
-            (0x102, -0.25),
-            (0x103, -0.25),
-            (0x104, -0.25),
-            (0x105, -0.25),
-            (0x106, -0.25),
-            (0x107, -0.25),
-        ],
-        "fresh batch transmits all 7 current targets after dropping expired carry-over"
+    assert!(
+        bus.with(|s| s.tx_accepted.is_empty()),
+        "expired motion carry-over must not transmit replacement motion targets"
     );
     let m = take_tx_metrics();
-    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (7, 3, 0, 0));
+    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (0, 3, 0, 0));
 
-    // Part B: same expired carry-over followed by a fresh batch under constrained budget (max_frames = 4) ->
-    // reports Expired { dropped: 3, pending: 3 } so both stale loss and remaining pending count are visible.
+    // Part B: same expired carry-over under constrained budget (max_frames = 4) ->
+    // fails closed with Expired { dropped: 3, pending: 0 } and zero replacement sends.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
     assert_eq!(
@@ -729,14 +742,15 @@ fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
     d.begin_tx_tick();
     assert_eq!(
         d.write_joint_targets_bounded(&targets_const(-0.25)).unwrap(),
-        TxBatchOutcome::Expired { dropped: 3, pending: 3 }
+        TxBatchOutcome::Expired { dropped: 3, pending: 0 }
     );
-    assert_eq!(d.pending_tx_len(), 3);
+    assert_eq!(d.pending_tx_len(), 0);
+    assert!(bus.with(|s| s.tx_accepted.is_empty()));
     let m = take_tx_metrics();
-    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (4, 3, 3, 3));
+    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (0, 3, 0, 0));
 
-    // Part C: under legacy write_joint_targets, expired carry-over followed by a fresh full batch
-    // maps Expired -> Err(TransportError::Timeout) (never Ok(())).
+    // Part C: under legacy write_joint_targets, expired carry-over maps Expired -> Timeout
+    // with zero replacement sends.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
     assert_eq!(
@@ -754,8 +768,9 @@ fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
         "legacy write_joint_targets must map Expired carry-over to Timeout: {err:?}"
     );
     assert_eq!(d.pending_tx_len(), 0);
+    assert!(bus.with(|s| s.tx_accepted.is_empty()));
     let m = take_tx_metrics();
-    assert_eq!((m.frames, m.dropped_stale, m.pending), (7, 3, 0));
+    assert_eq!((m.frames, m.dropped_stale, m.pending), (0, 3, 0));
 }
 
 #[test]
@@ -1113,33 +1128,71 @@ fn legacy_supervisor_fails_closed_on_backpressured_final_release_batch() {
         .expect("start gripper open");
 
     // Inject ENOBUFS on every transmit on the final tick where the gripper open reaches Done.
+    // Ticks 1..=3 defer without faulting and MUST NOT mark the release done or clear releasing;
+    // Tick 4 hits the 4-tick stall threshold (50 Hz default = ceil(45/20) + 1) and latches CAN_TX_STALLED.
     bus.with(|s| {
         s.push_all_feedback();
         s.default_rule = TxRule::Enobufs;
     });
-    inner.tick(0.02);
+    for tick in 1..=3 {
+        if tick > 1 {
+            bus.with(|s| s.push_all_feedback());
+        }
+        inner.tick(0.02);
+        assert!(
+            !inner.safety.state().is_stopped(),
+            "transient ENOBUFS deferral on tick {tick} (< 4 at 50 Hz) must carry over without faulting: {:?}",
+            inner.safety.state()
+        );
+        assert_eq!(inner.last_action.as_ref().unwrap().state, "running");
+        assert!(inner.releasing, "deferred final release must not clear releasing flag");
+    }
 
+    bus.with(|s| s.push_all_feedback());
+    inner.tick(0.02);
     assert!(
-        matches!(inner.safety.state(), SafetyState::Fault(_)),
-        "legacy bridge must fail closed on deferred TX: {:?}",
+        matches!(inner.safety.state(), SafetyState::Fault(armd::safety::FaultReason::CanTxStalled)),
+        "sustained deferral past stall threshold must latch CAN_TX_STALLED: {:?}",
         inner.safety.state()
     );
-    assert_eq!(inner.safety.fault().map(|f| f.code), Some(FaultCode::DriverWriteFailed));
+    assert_eq!(inner.safety.fault().map(|f| f.code), Some(FaultCode::CanTxStalled));
     let action = inner.last_action.as_ref().unwrap();
     assert_ne!(action.state, "done", "backpressured final release must not report done: {action:?}");
+    assert_eq!(action.code.as_deref(), Some("CAN_TX_STALLED"));
     assert!(inner.releasing, "backpressured final release must not clear releasing flag");
 }
 
 #[test]
 fn wrapper_default_bounded_write_fails_closed_and_flush_estop_drops_pending() {
-    // Part A: ZeroOffsetDriver uses ArmDriver::write_joint_targets_bounded default impl.
-    // Because DamiaoArmDriver::write_joint_targets discards pending frames on TxDeferred,
-    // the default impl must propagate Err(TxDeferred) instead of falsely returning Ok(Deferred).
+    // Part A1: ZeroOffsetDriver overrides write_joint_targets_bounded and preserves carryover cleanly.
     let (mut d, bus, _clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 3, max_duration: ms(5), frame_max_age: ms(45) });
     let mut wrapped = armd::joint_zero::ZeroOffsetDriver::new(Box::new(d), &[0.0; 7]);
     reset_tx_metrics();
-    let err = wrapped.write_joint_targets_bounded(&targets_const(0.2)).unwrap_err();
+    assert_eq!(
+        wrapped.write_joint_targets_bounded(&targets_const(0.2)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 4 }
+    );
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.deferred, m.dropped_stopped, m.pending), (3, 4, 0, 4));
+    assert_eq!(bus.with(|s| s.tx_accepted.len()), 3);
+
+    // Part A2: A wrapper that does NOT override ArmDriver::write_joint_targets_bounded falls back
+    // to write_joint_targets, which discards pending frames and propagates Err(TxDeferred).
+    struct DefaultBoundedWrapper(Box<dyn ArmDriver>);
+    impl ArmDriver for DefaultBoundedWrapper {
+        fn capabilities(&self) -> armd::driver::DriverCapabilities { self.0.capabilities() }
+        fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, ArmDriverError> { self.0.read_joint_states() }
+        fn write_joint_targets(&mut self, t: &[JointTarget]) -> Result<(), ArmDriverError> { self.0.write_joint_targets(t) }
+        fn set_torque(&mut self, e: bool) -> Result<(), ArmDriverError> { self.0.set_torque(e) }
+        fn enable_state(&self) -> armd::driver::EnableState { self.0.enable_state() }
+        fn clear_fault(&mut self) -> Result<(), ArmDriverError> { self.0.clear_fault() }
+    }
+    let (mut d, bus, _clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 3, max_duration: ms(5), frame_max_age: ms(45) });
+    let mut default_wrapped = DefaultBoundedWrapper(Box::new(d));
+    reset_tx_metrics();
+    let err = default_wrapped.write_joint_targets_bounded(&targets_const(0.2)).unwrap_err();
     assert!(matches!(err, ArmDriverError::TxDeferred { pending: 4 }), "{err:?}");
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.deferred, m.dropped_stopped, m.pending), (3, 4, 4, 0));
@@ -1459,7 +1512,8 @@ fn preflight_rejection_trips_mit_fence_and_clears_pending_queue() {
 fn frames_expiring_during_flush_drop_stale_and_return_timeout() {
     // Frame 0 succeeds, frame 1 hits WouldBlock, then successful flush() advances clock to 45 ms:
     // remaining 6 current-batch frames expire during flush -> dropped as stale, queue empty,
-    // and write_joint_targets_bounded fails closed with Timeout (never returning Deferred).
+    // and write_joint_targets_bounded reports Expired { dropped: 6, pending: 0 } uniformly
+    // (never Deferred), while legacy write_joint_targets maps Expired to Timeout.
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
     let clock_hook = clock.clone();
@@ -1471,11 +1525,26 @@ fn frames_expiring_during_flush_drop_stale_and_return_timeout() {
         }));
     });
     reset_tx_metrics();
-    let err = d.write_joint_targets_bounded(&targets_const(0.3)).unwrap_err();
-    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.3)).unwrap(),
+        TxBatchOutcome::Expired { dropped: 6, pending: 0 }
+    );
     assert_eq!(d.pending_tx_len(), 0, "expired frames must not remain queued after flush");
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.would_block, m.dropped_stale, m.pending), (1, 1, 6, 0));
+
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
+    let clock_hook = clock.clone();
+    bus.with(|s| {
+        s.tx_script.push_back((TxRule::Ok, Duration::ZERO));
+        s.tx_script.push_back((TxRule::WouldBlock, Duration::ZERO));
+        s.on_flush = Some(Arc::new(move || {
+            clock_hook.advance(ms(45));
+        }));
+    });
+    let err = d.write_joint_targets(&targets_const(0.3)).unwrap_err();
+    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
 }
 
 #[test]
@@ -3525,4 +3594,270 @@ fn production_damiao_operations_under_latched_estop_table() {
     }
     assert_eq!(refused_checked + allowed_checked, table.len());
     assert_eq!(table.len(), 25, "expected all 25 production Damiao TX operations verified");
+}
+
+/// Major 3 (part 1): Tick cutoff elapsing between Step 2 and Step 5 (during `build`) must refuse
+/// frame submission (`Deferred`) with 0 CAN frames transmitted.
+#[test]
+fn cutoff_elapsing_during_send_build_refuses_submission_without_transmitting() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct JumpingClock {
+        inner: MockClock,
+        armed: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        jump_on_call: usize,
+        jump_by: Duration,
+    }
+    impl DriverClock for JumpingClock {
+        fn clock_id(&self) -> u64 { self.inner.clock_id() }
+        fn now(&self) -> std::time::Instant {
+            if self.armed.load(Ordering::SeqCst) {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.jump_on_call {
+                    self.inner.advance(self.jump_by);
+                }
+            }
+            self.inner.now()
+        }
+        fn sleep(&self, d: Duration) { self.inner.sleep(d); }
+        fn yield_now(&self) { self.inner.yield_now(); }
+    }
+
+    struct CustomClockBus {
+        inner: VirtualBus,
+        clock: Arc<dyn DriverClock>,
+    }
+    impl CanTransport for CustomClockBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { Some(Arc::clone(&self.clock)) }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> { self.inner.transmit(frame) }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn flush_is_noop(&self) -> bool { true }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+    }
+
+    let limits = b601_limits();
+    let (vbus, base_clock) = VirtualBus::new(&limits);
+    let armed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    // During `write_joint_targets_bounded` on an empty queue:
+    //   1: drop_stale -> now
+    //   2: batch_ts -> now
+    //   3: ensure_tx_pass -> now (deadline = t0 + 10 ms)
+    //   4: send Step 1 deadline check -> now
+    //   5: send Step 2 can_start_tick_tx -> now (still < deadline!)
+    //   6: send Step 5 deadline check -> now (still < deadline, or jumps to +10 ms right here!)
+    //   7: send Step 5 can_start_tick_tx -> now (>= deadline -> Deferred, 0 frames sent!)
+    // Test every jump call index in 4..=7: calls 4..=5 trip Step 2, calls 6..=7 trip Step 5
+    // (after `build`, immediately before `can.transmit`), and NONE may transmit any frame.
+    let mut hit_post_step2_deferral = false;
+    for jump_on_call in 4..=7 {
+        armed.store(false, Ordering::SeqCst);
+        calls.store(0, Ordering::SeqCst);
+        let jclock: Arc<dyn DriverClock> = Arc::new(JumpingClock {
+            inner: base_clock.clone(),
+            armed: Arc::clone(&armed),
+            calls: Arc::clone(&calls),
+            jump_on_call,
+            jump_by: ms(10),
+        });
+        let bus = CustomClockBus { inner: vbus.clone(), clock: jclock };
+        let mut d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap()
+            .with_tx_budget(TxBudget {
+                max_frames: 16,
+                max_duration: ms(10),
+                frame_max_age: ms(45),
+            });
+        vbus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.set_torque(true).unwrap();
+        vbus.clear();
+        d.begin_tx_tick();
+        armed.store(true, Ordering::SeqCst);
+        let out = d.write_joint_targets_bounded(&targets_const(0.1)).unwrap();
+        armed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            out,
+            TxBatchOutcome::Deferred { pending: 7 },
+            "jump_on_call={jump_on_call}: cutoff elapsed before transmit must defer all 7 frames"
+        );
+        assert!(
+            vbus.with(|s| s.tx_log.is_empty()),
+            "jump_on_call={jump_on_call}: zero frames may be transmitted after cutoff elapses"
+        );
+        if jump_on_call >= 6 {
+            hit_post_step2_deferral = true;
+        }
+    }
+    assert!(hit_post_step2_deferral);
+}
+
+/// Major 3 (part 2): When a transport has a real flush (`!flush_is_noop()`) and the tick TX
+/// cutoff elapses during `transmit()`, all four bounded paths (unfenced motion, unfenced hold,
+/// fenced motion, fenced hold) fail closed with `Timeout` without starting `flush()`.
+#[test]
+fn real_flush_cutoff_elapsed_fails_closed_across_all_four_paths() {
+    // 1. Unfenced motion (`write_joint_targets_bounded`)
+    {
+        let (mut d, bus, _) = enabled_driver();
+        d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(10), frame_max_age: ms(45) });
+        bus.with(|s| {
+            s.real_flush = true;
+            s.flush_calls = 0;
+            // Frame 0 starts at t=0 (< 10 ms) and completes at t=11 ms (>= 10 ms).
+            s.default_step = ms(11);
+        });
+        d.begin_tx_tick();
+        let err = d.write_joint_targets_bounded(&targets_const(0.1)).unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::Transport(TransportError::Timeout)),
+            "unfenced motion real flush past cutoff must fail closed with Timeout, got {err:?}"
+        );
+        assert_eq!(bus.with(|s| s.flush_calls), 0, "unfenced motion must not start flush past cutoff");
+        assert_eq!(d.pending_tx_len(), 0, "unfenced motion must discard pending queue on flush refusal");
+    }
+
+    // 2. Unfenced stopped hold (`write_estop_hold_bounded`)
+    {
+        let (mut d, bus, _) = enabled_driver();
+        d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(10), frame_max_age: ms(45) });
+        bus.with(|s| {
+            s.real_flush = true;
+            s.flush_calls = 0;
+            s.default_step = ms(11);
+        });
+        d.begin_tx_tick();
+        let err = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::Transport(TransportError::Timeout)),
+            "unfenced hold real flush past cutoff must fail closed with Timeout, got {err:?}"
+        );
+        assert_eq!(bus.with(|s| s.flush_calls), 0, "unfenced hold must not start flush past cutoff");
+        assert_eq!(d.pending_hold_tx_len(), 0, "unfenced hold must discard hold queue on flush refusal");
+        assert!(!d.last_hold_tx_sent_any(), "unflushed hold must not report wire progress");
+    }
+
+    // 3. Fenced motion (`write_joint_targets_bounded` under armed MIT fence)
+    {
+        let (mut d, bus, _) = enabled_driver();
+        d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(10), frame_max_age: ms(45) });
+        d.set_mit_deadline_fence(Some(ms(45)), ms(250));
+        bus.with(|s| {
+            s.real_flush = true;
+            s.flush_calls = 0;
+            // 7 frames * 1.5 ms = 10.5 ms -> last frame starts at 9.0 ms (< 10 ms), ends at 10.5 ms (>= 10 ms).
+            s.default_step = us(1_500);
+        });
+        d.begin_tx_tick();
+        let err = d.write_joint_targets_bounded(&targets_const(0.1)).unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::Transport(TransportError::Timeout)),
+            "fenced motion real flush past cutoff must fail closed with Timeout, got {err:?}"
+        );
+        assert_eq!(bus.with(|s| s.flush_calls), 0, "fenced motion must not start flush past cutoff");
+        assert!(d.mit_fence_trip().is_some(), "fenced motion flush cutoff refusal must trip MIT fence");
+    }
+
+    // 4. Fenced stopped hold (`write_estop_hold_bounded` under armed MIT fence)
+    {
+        let (mut d, bus, _) = enabled_driver();
+        d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(10), frame_max_age: ms(45) });
+        d.set_mit_deadline_fence(Some(ms(45)), ms(250));
+        bus.with(|s| {
+            s.real_flush = true;
+            s.flush_calls = 0;
+            s.default_step = us(1_500);
+        });
+        d.begin_tx_tick();
+        let err = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap_err();
+        assert!(
+            matches!(err, ArmDriverError::Transport(TransportError::Timeout)),
+            "fenced hold real flush past cutoff must fail closed with Timeout, got {err:?}"
+        );
+        assert_eq!(bus.with(|s| s.flush_calls), 0, "fenced hold must not start flush past cutoff");
+        assert!(d.mit_fence_trip().is_some(), "fenced hold flush cutoff refusal must trip MIT fence");
+        assert!(!d.last_hold_tx_sent_any(), "unflushed fenced hold must not report wire progress");
+    }
+}
+
+/// Major 4: An unconfirmed non-POS_FORCE joint stages BOTH POS_VEL (`0x100 + id`) and MIT (`id`).
+/// Under slow cadence (90 ms > 45 ms frame max age) and `max_frames = 1`, `write_estop_hold_bounded`
+/// must rotate across frame keys `(joint, slot)` so BOTH the POS_VEL and MIT hold frames are
+/// transmitted instead of starving the MIT slot.
+#[test]
+fn slow_cadence_unconfirmed_joint_rotates_both_posvel_and_mit_hold_slots() {
+    let limits = b601_limits();
+    let (bus, clock) = VirtualBus::new(&limits);
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_torque(true).unwrap();
+
+    // Force J1 into unconfirmed mode (`joint_modes[0] == None`):
+    // 1. Switch J1 to MIT cleanly first (verifies MIT limits via REG_READ).
+    // 2. Inject HardError and switch J1 back to Position -> forward write_modes & rollback both fail,
+    //    leaving J1 unconfirmed (`joint_modes[0] == None`).
+    let mut modes_mit = vec![armd::driver::JointMode::Position; 7];
+    modes_mit[0] = armd::driver::JointMode::Mit;
+    d.set_joint_modes(&modes_mit, &targets_const(0.0)).expect("switch J1 to MIT");
+    bus.with(|s| {
+        s.default_rule = TxRule::HardError;
+    });
+    let modes_pos = vec![armd::driver::JointMode::Position; 7];
+    let _ = d.set_joint_modes(&modes_pos, &targets_const(0.0));
+    assert!(d.joint_modes_uncertain(), "J1 must be unconfirmed after failed mode switch + rollback");
+
+    // Restore healthy bus, set max_frames = 1 and slow 90 ms cadence (> 45 ms expiry, <= 100 ms fresh).
+    bus.with(|s| {
+        s.default_rule = TxRule::Ok;
+        s.tx_log.clear();
+        s.tx_accepted.clear();
+    });
+    d.set_tx_budget(TxBudget {
+        max_frames: 1,
+        max_duration: ms(10),
+        frame_max_age: ms(45),
+    });
+
+    // 8 total frame keys (J1 POS_VEL 0x101, J1 MIT 0x001, J2..J7 POS_VEL 0x102..=0x107).
+    // Across 8 slow-cadence releases (1 frame/release), every single key must be sent once.
+    for _ in 0..8 {
+        clock.advance(ms(90));
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        let out = d.write_estop_hold_bounded(&targets_const(0.0)).unwrap();
+        assert!(
+            matches!(out, TxBatchOutcome::Deferred { .. } | TxBatchOutcome::Expired { .. }),
+            "expected partial progress under max_frames=1, got {out:?}"
+        );
+        assert!(d.last_hold_tx_sent_any(), "each slow release must send 1 hold frame");
+    }
+
+    let sent_ids: Vec<u32> = bus.with(|s| {
+        s.tx_accepted
+            .iter()
+            .filter(|f| f.id != 0x7FF)
+            .map(|f| f.id)
+            .collect()
+    });
+    assert!(
+        sent_ids.contains(&0x101),
+        "unconfirmed J1 must receive POS_VEL hold (0x101): {sent_ids:#x?}"
+    );
+    assert!(
+        sent_ids.contains(&0x001),
+        "unconfirmed J1 must receive MIT hold (0x001) without starvation: {sent_ids:#x?}"
+    );
+    for j in 2u32..=7 {
+        assert!(
+            sent_ids.contains(&(0x100 + j)),
+            "joint {j} must receive POS_VEL hold: {sent_ids:#x?}"
+        );
+    }
 }
