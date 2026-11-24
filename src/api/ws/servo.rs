@@ -58,6 +58,13 @@ pub(super) fn is_explicit_or_cartesian_servo(kind: &str, value: &Value) -> bool 
         || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream")
 }
 
+/// Legacy servo-frame predicate used by Stop/E-stop queue cancellation (`drain_cancellable` and
+/// `cancelled_reply`), matching explicit servo, `cartesian_joint_stream`, or any frame carrying
+/// a top-level `positions` key.
+pub(super) fn is_servo_frame(kind: &str, value: &Value) -> bool {
+    is_explicit_or_cartesian_servo(kind, value) || value.get("positions").is_some()
+}
+
 /// Pre-lease missing-generation check for explicit / cartesian-stream servo frames.
 pub(super) fn missing_generation_reject(kind: &str, value: &Value) -> Option<Value> {
     if is_explicit_or_cartesian_servo(kind, value)

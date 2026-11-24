@@ -19,7 +19,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_policy_start),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Conditional,
+        auth: AuthRequirement::Conditional(policy_start_auth_check),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -31,6 +31,21 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         reply: ReplyPolicy::CommandImmediate,
     },
 ];
+
+#[cfg(feature = "policy-runtime")]
+fn policy_start_auth_check(
+    ws_auth: &WsAuth,
+    inner: &mut SupervisorInner,
+    _path: &str,
+    _body: &Value,
+    _epoch: u64,
+) -> Option<ApiError> {
+    if !ws_auth.is_operator() && !inner.policy_live_allowed() {
+        Some(ApiError::operator_required("policy/start (real arm)"))
+    } else {
+        None
+    }
+}
 
 #[cfg(not(feature = "policy-runtime"))]
 pub(super) const ENTRIES: &[DispatchEntry] = &[];

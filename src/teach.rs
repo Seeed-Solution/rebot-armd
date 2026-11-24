@@ -458,9 +458,18 @@ async fn monitor(lock: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInne
 // ---- lease-free WS commands ----
 
 /// Teach commands that need no motion lease (recorder ownership or nothing).
+/// WS command paths handled without holding a motion lease.
+pub const LEASE_FREE_PATHS: &[&str] = &[
+    "/api/v1/record/start",
+    "/api/v1/record/stop",
+    "/api/v1/episodes/update",
+    "/api/v1/episodes/delete",
+    "/api/v1/datasets/create",
+    "/api/v1/datasets/delete",
+];
+
 pub fn is_lease_free(path: &str) -> bool {
-    matches!(path, "/api/v1/record/start" | "/api/v1/record/stop" | "/api/v1/episodes/update" | "/api/v1/episodes/delete"
-        | "/api/v1/datasets/create" | "/api/v1/datasets/delete")
+    LEASE_FREE_PATHS.contains(&path)
 }
 
 fn str_field<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, ArmError> {

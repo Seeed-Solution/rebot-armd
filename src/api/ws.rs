@@ -36,8 +36,8 @@ mod servo;
 use servo::*;
 mod dispatch;
 use dispatch::{
-    AdmissionClass, AuthRequirement, DispatchHandler, FrameKind, LeaseFreeCtx, LeaseFreeOutcome,
-    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    AdmissionClass, AuthRequirement, DispatchHandler, FrameKind, LeaseFreeCtx, LeaseRequirement,
+    OwnerDispatchCtx, ReplyPolicy, UrgentEStopCtx, UrgentStopCtx,
 };
 
 pub type ConnectionRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>;
@@ -428,26 +428,25 @@ fn runs_during_macro_check(value: &Value) -> bool {
 
 /// The reply to a message cancelled by a stop / e-stop before it ran (`code` STOPPED /
 /// ESTOP_ACTIVE). None for messages that are not acknowledged.
+/// Preserves the legacy cancellation precedence (`command` > `preset` > `servo::is_servo_frame`),
+/// including mixed-field lease frames carrying `positions` or `mode: "cartesian_joint_stream"`.
 fn cancelled_reply(value: &Value, code: &str, epoch: Option<u64>) -> Option<Value> {
-    let (kind, entry) = dispatch::classify(value);
+    let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     let mut reply = json!({"status":409, "code":code, "error":code, "message":"Cancelled by a stop before it began"});
     if let Some(ep) = epoch {
         reply["epoch_id"] = json!(ep);
     }
-    match (kind, entry.map(|e| e.reply)) {
-        (FrameKind::Command, _) => {
-            reply["type"] = json!("command_reject");
-            reply["request_id"] = value.get("request_id").cloned().unwrap_or(Value::Null);
-        }
-        (FrameKind::Preset, Some(ReplyPolicy::PresetReply)) => {
-            reply["type"] = json!("preset_reject");
-            reply["name"] = value.get("name").cloned().unwrap_or(Value::Null);
-        }
-        (FrameKind::Servo | FrameKind::ImplicitServo, Some(ReplyPolicy::ServoRejectOnly)) => {
-            reply["type"] = json!("servo_reject");
-            reply["reason"] = json!("stopped");
-        }
-        _ => return None,
+    if raw_kind == "command" {
+        reply["type"] = json!("command_reject");
+        reply["request_id"] = value.get("request_id").cloned().unwrap_or(Value::Null);
+    } else if raw_kind == "preset" {
+        reply["type"] = json!("preset_reject");
+        reply["name"] = value.get("name").cloned().unwrap_or(Value::Null);
+    } else if servo::is_servo_frame(raw_kind, value) {
+        reply["type"] = json!("servo_reject");
+        reply["reason"] = json!("stopped");
+    } else {
+        return None;
     }
     Some(reply)
 }
@@ -1222,6 +1221,8 @@ impl OrdinaryQueue {
 
     /// Drains cancellable motion/RPC items (`command`, `preset`, `servo`) while preserving
     /// non-cancellable session/lease frames (`acquire_lease`, `release_lease`, `auth`, `heartbeat`).
+    /// Preserves the legacy cancellation predicate (`command` | `preset` | `servo::is_servo_frame`)
+    /// so mixed-field frames retain exact baseline cancellation parity.
     /// Builds JSON cancellation payloads outside the sync lock so the reader critical section stays O(1).
     fn drain_cancellable(&self, code: &'static str, epoch: Option<u64>) -> Vec<Value> {
         let mut to_cancel = Vec::new();
@@ -1230,18 +1231,14 @@ impl OrdinaryQueue {
             let n = g.items.len();
             for _ in 0..n {
                 if let Some(item) = g.items.pop_front() {
-                    let (frame_kind, entry) = dispatch::classify(&item.value);
+                    let raw_kind = item.value.get("type").and_then(Value::as_str).unwrap_or("");
+                    let (_, entry) = dispatch::classify(&item.value);
                     let exempt_disable = code == "STOPPED"
                         && entry.is_some_and(|e| e.admission == AdmissionClass::OrdinaryTorqueOrStopExempt)
                         && lease::is_torque_disable_command(&item.value);
                     let cancellable = !exempt_disable
-                        && matches!(
-                            frame_kind,
-                            FrameKind::Command
-                                | FrameKind::Preset
-                                | FrameKind::Servo
-                                | FrameKind::ImplicitServo
-                        );
+                        && (matches!(raw_kind, "command" | "preset")
+                            || servo::is_servo_frame(raw_kind, &item.value));
                     if cancellable {
                         to_cancel.push(item.value);
                     } else {
@@ -1254,6 +1251,11 @@ impl OrdinaryQueue {
             .into_iter()
             .filter_map(|v| cancelled_reply(&v, code, epoch))
             .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).items.len()
     }
 
     fn close(&self) {
@@ -1464,96 +1466,279 @@ impl WsAuth {
     }
 }
 
-/// Check privileged-operations authorization under the supervisor write lock.
-/// Returns `Some(ApiError)` if rejected, `None` if allowed.
-fn check_operator_privilege(
-    ws_auth: &WsAuth,
-    inner: &mut SupervisorInner,
-    path: &str,
-    body: &Value,
-    epoch: u64,
-) -> Option<ApiError> {
-    if path == "/api/v1/safety/clear_fault"
-        && inner.consume_pending_estop()
-        && inner.safety.epoch_id() != epoch
-    {
-        return Some(ArmError::Safety(SafetyError::EpochMismatch {
-            expected: inner.safety.epoch_id(),
-            received: epoch,
-        }).into());
-    }
-    if ws_auth.is_operator() {
-        return None;
-    }
-    match path {
-        "/api/v1/workspace/keepout"
-        | "/api/v1/safety/collision"
-        | "/api/v1/mode/gravity_comp"
-        | "/api/v1/gripper/calibration"
-        | "/api/v1/calibration/apply"
-        | "/api/v1/calibration/restore"
-        | "/api/v1/calibration/motor_zero"
-        | "/api/v1/calibration/joint_zero/restore"
-        | crate::mit::TIMEOUT_PATH
-        | crate::mit::QUALIFICATION_PATH
-        | "/api/v1/poses/save"
-        | "/api/v1/poses/rename"
-        | "/api/v1/poses/delete"
-        | "/api/v1/sequences/save"
-        | "/api/v1/sequences/delete"
-        | "/api/v1/grasp/setup"
-        | "/api/v1/tool/commissioning/confirm" => Some(ApiError::operator_required(path)),
-        // moves the arm and triggers the camera (like /api/v1/detection/trigger)
-        crate::measure_multiview::PATH => Some(ApiError::operator_required(path)),
-        // a sequence run that records writes episodes (like /api/v1/dataset/record/*)
-        "/api/v1/action/run_sequence"
-            if body.get("record").is_some_and(|r| !r.is_null()) =>
-        {
-            Some(ApiError::operator_required("run_sequence (record)"))
-        }
-        // learns the free-motion torque of the jaw (stored on the device)
-        crate::gripper_calib::CALIBRATE_PATH => Some(ApiError::operator_required("gripper_calibrate")),
-        "/api/v1/action/gripper_zero_check"
-            if body.get("store_offset").and_then(Value::as_bool) == Some(true) =>
-        {
-            Some(ApiError::operator_required("gripper_zero_check (store_offset=true)"))
-        }
-        // a policy run on a real (or unknown) driver, in any mode; mock / sim drivers stay open.
-        // policy/stop needs no session, like /api/v1/motion/stop. Rechecked after loading.
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/start" if !inner.policy_live_allowed() => {
-            Some(ApiError::operator_required("policy/start (real arm)"))
-        }
-        "/api/v1/safety/clear_fault" => {
-            if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
-                return Some(ArmError::Safety(SafetyError::EpochMismatch {
-                    expected: inner.safety.epoch_id(),
-                    received: epoch,
-                }).into());
-            }
-            if inner.e_stop_latched.load(Ordering::SeqCst) {
-                return Some(ApiError::operator_required("clear_fault (EStop latched)"));
-            }
-            if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
-                && !inner.safety.recoverable()
-            {
-                return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
-            }
-            None
-        }
-        _ => None,
-    }
+/// Bound `auth` lane handler executed off-reader by `auth_task` via `DISPATCH_TABLE`.
+fn handle_auth_frame(ws_auth: &WsAuth, value: &Value) -> Value {
+    let next_token = value
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let status = ws_auth.update_token(next_token);
+    json!({
+        "type": "auth_ack",
+        "seq": value.get("seq"),
+        "auth_enforced": status.auth_enforced,
+        "role": status.role,
+        "expires_in_s": status.expires_in_s
+    })
 }
 
-/// OperatorAuth for the WS commands handled without a lease (teach v1 episode store and
-/// recorder, depth measurement). Every one of them writes the episode store or triggers the
-/// camera, so it needs an operator session when auth is enforced, like
-/// `/api/v1/dataset/record/*` and `/api/v1/detection/trigger`; the owner can always end a
-/// recording without saving it (`record/stop {save: false}`).
-fn lease_free_operator_check(ws_auth: &WsAuth, path: &str, body: &Value) -> Option<ApiError> {
-    if ws_auth.is_operator() { return None; }
-    if path == "/api/v1/record/stop" && body.get("save").and_then(Value::as_bool) == Some(false) { return None; }
-    Some(ApiError::operator_required(path))
+/// Bound urgent E-stop reader transition handler (`estop` / `e_stop`).
+/// Reserves urgent reply capacity before latching, always latches in O(1) via lock-free atomics,
+/// and returns `true` iff the writer estop channel is already closed.
+fn handle_urgent_estop_frame(ctx: &mut UrgentEStopCtx<'_>) -> bool {
+    ctx.reader_writer.mark_estop_admitted();
+    let estop_guard = ctx.reader_writer.enter_in_flight_estop();
+    let reserved = ctx.reader_writer.try_reserve_estop();
+    let closed = matches!(reserved, Err(mpsc::error::TrySendError::Closed(())));
+    let ticket = ctx.reader_supervisor.begin_e_stop_checked();
+    let req_id = ctx.value.get("request_id").cloned();
+    let sup = ctx.reader_supervisor.clone();
+    let cancel_tx = ctx.reader_cancel_tx.clone();
+    let writer_c = ctx.reader_writer.clone();
+    ctx.reader_tasks.spawn(async move {
+        let _estop_guard = estop_guard;
+        let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
+            Ok((state, epoch)) => (
+                json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}),
+                Some(epoch),
+            ),
+            Err(err) => {
+                let api: ApiError = err.into();
+                let mut r = json!({"type":"estop_reject", "status":api.status.as_u16(), "code":api.code, "error":api.error, "message":api.message, "latched":true});
+                if let Some(id) = req_id {
+                    r["request_id"] = id;
+                }
+                (r, sup.hub().latest().map(|s| s.obs.epoch_id))
+            }
+        };
+        match reserved {
+            Ok(permit) => {
+                permit.send(reply);
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let _ = writer_c.send_estop_blocking(reply).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {}
+        }
+        let _ = cancel_tx.send(Some(CancelSignal {
+            gen: sup.stop_generation(),
+            code: "ESTOP_ACTIVE",
+            epoch: cancel_epoch,
+        }));
+    });
+    closed
+}
+
+/// Bound urgent Stop reader transition handler (`/api/v1/motion/stop`).
+/// Non-blocking handoff with coalescing; returns `true` iff the writer stop channel is closed.
+fn handle_urgent_stop_frame(ctx: &mut UrgentStopCtx<'_>) -> bool {
+    let permit = match ctx.reader_writer.try_reserve_stop() {
+        Ok(p) => Some(p),
+        Err(mpsc::error::TrySendError::Full(())) => {
+            ctx.reader_writer.trigger_fatal(FatalClose::urgent_queue_full());
+            None
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => return true,
+    };
+    let local_gen = ctx.reader_generation.load(Ordering::SeqCst);
+    let supplied_gen = ctx.value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let label_ok = {
+        let lbl = ctx
+            .reader_client_label
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ctx.value
+            .get("client_id")
+            .is_none_or(|id| id.as_str() == lbl.as_deref())
+    };
+    let conn_label = crate::model::HolderLabel::try_new(ctx.reader_connection);
+    let effective_gen = if conn_label.is_some()
+        && local_gen != 0
+        && supplied_gen == local_gen
+        && label_ok
+    {
+        local_gen
+    } else {
+        0
+    };
+    let raw_request_id = ctx.value.get("request_id").cloned().unwrap_or(Value::Null);
+    let parsed_request_id = ctx.value.get("request_id").and_then(Value::as_u64);
+    let epoch = ctx.value.get("epoch_id").and_then(Value::as_u64);
+    let body_error = validate_command_body_common(&ctx.value["body"]).err();
+
+    let dispatch = {
+        let last_req = last_request_get(ctx.reader_last_request);
+        let mut st = ctx
+            .reader_in_flight_stop
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let high_water = match (
+            last_req,
+            st.active.as_ref().and_then(|a| a.pending_max_request_id),
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let request_id_valid =
+            parsed_request_id.is_some_and(|id| high_water.is_none_or(|last| id > last));
+        let waiter = CoalescedStopWaiter {
+            raw_request_id,
+            parsed_request_id,
+            request_id_valid,
+            body_error,
+            permit,
+        };
+        if let Some(active) = st.active.as_mut() {
+            if active.lease_generation == effective_gen && active.epoch == epoch {
+                if request_id_valid {
+                    active.pending_max_request_id =
+                        match (active.pending_max_request_id, parsed_request_id) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                }
+                if waiter.permit.is_some() || active.waiters.len() < URGENT_OUT_CAPACITY {
+                    active.waiters.push(waiter);
+                }
+                None
+            } else {
+                let stop = crate::rt_core::urgent::UrgentStop {
+                    connection: conn_label.unwrap_or_default(),
+                    lease_generation: effective_gen,
+                    epoch,
+                    request_id: parsed_request_id.unwrap_or(0),
+                    request_id_valid,
+                    body_error,
+                };
+                Some((None, stop, Some(waiter)))
+            }
+        } else {
+            let stop = crate::rt_core::urgent::UrgentStop {
+                connection: conn_label.unwrap_or_default(),
+                lease_generation: effective_gen,
+                epoch,
+                request_id: parsed_request_id.unwrap_or(0),
+                request_id_valid,
+                body_error,
+            };
+            let can_lead = effective_gen != 0 && request_id_valid && body_error.is_none();
+            if can_lead {
+                st.next_leader_id += 1;
+                let leader_id = st.next_leader_id;
+                st.active = Some(ActiveStopBatch {
+                    leader_id,
+                    lease_generation: effective_gen,
+                    epoch,
+                    pending_max_request_id: parsed_request_id,
+                    waiters: vec![waiter],
+                });
+                Some((Some(leader_id), stop, None))
+            } else {
+                Some((None, stop, Some(waiter)))
+            }
+        }
+    };
+
+    if let Some((leader_id, stop, single_waiter)) = dispatch {
+        let take_waiters = |state: &Mutex<InFlightStopState>,
+                            lid: Option<u64>,
+                            single: Option<CoalescedStopWaiter>|
+         -> Vec<CoalescedStopWaiter> {
+            if let Some(id) = lid {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.active.as_ref().is_some_and(|a| a.leader_id == id) {
+                    return st.active.take().map(|b| b.waiters).unwrap_or_default();
+                }
+                Vec::new()
+            } else {
+                single.into_iter().collect()
+            }
+        };
+        match ctx.reader_supervisor.try_enqueue_executor_urgent_stop(stop) {
+            Ok(Some((client, mut rx))) => {
+                let stop_guard = ctx.reader_writer.enter_in_flight_stop();
+                let in_flight_c = ctx.reader_in_flight_stop.clone();
+                let last_req_c = ctx.reader_last_request.clone();
+                let cancel_tx_c = ctx.reader_cancel_tx.clone();
+                let ord_q_c = ctx.reader_ordinary_queue.clone();
+                let writer_c = ctx.reader_writer.clone();
+                ctx.reader_tasks.spawn(async move {
+                    let _stop_guard = stop_guard;
+                    let stop_res = client.await_ticket(&mut rx).await.map_err(ArmError::from);
+                    let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
+                    deliver_urgent_stop_batch(
+                        waiters,
+                        stop_res,
+                        None,
+                        &last_req_c,
+                        &cancel_tx_c,
+                        &ord_q_c,
+                        &writer_c,
+                    )
+                    .await;
+                });
+            }
+            Ok(None) => {
+                let stop_guard = ctx.reader_writer.enter_in_flight_stop();
+                let sup_c = ctx.reader_supervisor.clone();
+                let in_flight_c = ctx.reader_in_flight_stop.clone();
+                let last_req_c = ctx.reader_last_request.clone();
+                let cancel_tx_c = ctx.reader_cancel_tx.clone();
+                let ord_q_c = ctx.reader_ordinary_queue.clone();
+                let writer_c = ctx.reader_writer.clone();
+                ctx.reader_tasks.spawn(async move {
+                    let _stop_guard = stop_guard;
+                    let mut pre_drained: Option<Vec<Value>> = None;
+                    let stop_res = sup_c
+                        .urgent_stop_with_legacy_hook(stop, |applied_epoch, next_gen| {
+                            // Owner `stop_gen` was already advanced under `inner.write()`;
+                            // notify macro cancellation and drain the ordinary queue atomically.
+                            let _ = cancel_tx_c.send(Some(CancelSignal {
+                                gen: next_gen,
+                                code: "STOPPED",
+                                epoch: Some(applied_epoch),
+                            }));
+                            pre_drained =
+                                Some(ord_q_c.drain_cancellable("STOPPED", Some(applied_epoch)));
+                        })
+                        .await;
+                    let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
+                    deliver_urgent_stop_batch(
+                        waiters,
+                        stop_res,
+                        pre_drained,
+                        &last_req_c,
+                        &cancel_tx_c,
+                        &ord_q_c,
+                        &writer_c,
+                    )
+                    .await;
+                });
+            }
+            Err(err) => {
+                let api = ApiError::from(err);
+                let waiters = take_waiters(ctx.reader_in_flight_stop, leader_id, single_waiter);
+                for w in waiters {
+                    let reply = format_urgent_stop_outcome(
+                        &w.raw_request_id,
+                        w.parsed_request_id,
+                        ctx.reader_last_request,
+                        Err(&api),
+                    );
+                    match w.permit {
+                        Some(permit) => {
+                            permit.send(reply);
+                        }
+                        None => {
+                            let _ = ctx.reader_writer.try_send_stop_best_effort(reply);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// `command_ack` carrying the fields of `reply`.
@@ -1954,16 +2139,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let auth_ws_auth = ws_auth.clone();
     let auth_writer = writer.clone();
     let auth_task = tokio::spawn(async move {
+        let Some(DispatchHandler::Auth(auth_handler)) =
+            dispatch::lookup(FrameKind::Auth, None).map(|e| e.handler)
+        else {
+            unreachable!("FrameKind::Auth must bind DispatchHandler::Auth");
+        };
         while let Some(value) = auth_in_rx.recv().await {
-            let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
-            let status = auth_ws_auth.update_token(next_token);
-            let reply = json!({
-                "type": "auth_ack",
-                "seq": value.get("seq"),
-                "auth_enforced": status.auth_enforced,
-                "role": status.role,
-                "expires_in_s": status.expires_in_s
-            });
+            let reply = auth_handler(&auth_ws_auth, &value);
             if !auth_writer.send_auth(reply).await {
                 break;
             }
@@ -1978,13 +2160,18 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let hb_slot = heartbeat_slot.clone();
     let hb_writer = writer.clone();
     let heartbeat_task = tokio::spawn(async move {
+        let Some(DispatchHandler::Heartbeat(hb_handler)) =
+            dispatch::lookup(FrameKind::Heartbeat, None).map(|e| e.handler)
+        else {
+            unreachable!("FrameKind::Heartbeat must bind DispatchHandler::Heartbeat");
+        };
         while let Some(value) = hb_slot.pop().await {
             if hb_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
                 continue;
             }
             let reply = {
                 let mut inner = hb_supervisor.inner().write().await;
-                lease::handle_heartbeat_task_step(
+                hb_handler(
                     &mut inner,
                     &value,
                     &hb_connection,
@@ -2062,207 +2249,38 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 continue;
             }
 
-            // Urgent E-stop (both aliases): reserve urgent reply capacity BEFORE latching, ALWAYS
-            // latch immediately in O(1) via lock-free atomics (no ACK-drain mutex, no waiter scan),
-            // and never exit reader because of reply-queue capacity.
-            if is_estop {
-                reader_writer.mark_estop_admitted();
-                let estop_guard = reader_writer.enter_in_flight_estop();
-                let reserved = reader_writer.try_reserve_estop();
-                let closed = matches!(reserved, Err(mpsc::error::TrySendError::Closed(())));
-                let ticket = reader_supervisor.begin_e_stop_checked();
-                let req_id = value.get("request_id").cloned();
-                let sup = reader_supervisor.clone();
-                let cancel_tx = reader_cancel_tx.clone();
-                let writer_c = reader_writer.clone();
-                reader_tasks.spawn(async move {
-                    let _estop_guard = estop_guard;
-                    let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
-                        Ok((state, epoch)) => (
-                            json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}),
-                            Some(epoch),
-                        ),
-                        Err(err) => {
-                            let api: ApiError = err.into();
-                            let mut r = json!({"type":"estop_reject", "status":api.status.as_u16(), "code":api.code, "error":api.error, "message":api.message, "latched":true});
-                            if let Some(id) = req_id { r["request_id"] = id; }
-                            (r, sup.hub().latest().map(|s| s.obs.epoch_id))
-                        }
-                    };
-                    match reserved {
-                        Ok(permit) => { permit.send(reply); }
-                        Err(mpsc::error::TrySendError::Full(())) => {
-                            let _ = writer_c.send_estop_blocking(reply).await;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(())) => {}
-                    }
-                    let _ = cancel_tx.send(Some(CancelSignal { gen: sup.stop_generation(), code: "ESTOP_ACTIVE", epoch: cancel_epoch }));
-                });
-                if closed { break; }
+            // Urgent E-stop (both aliases): dispatched through bound table handler.
+            if let Some(DispatchHandler::UrgentEStop(handler)) = entry.map(|e| e.handler) {
+                let mut ctx = UrgentEStopCtx {
+                    value: &value,
+                    reader_supervisor: &reader_supervisor,
+                    reader_cancel_tx: &reader_cancel_tx,
+                    reader_writer: &reader_writer,
+                    reader_tasks: &reader_tasks,
+                };
+                if handler(&mut ctx) {
+                    break;
+                }
                 continue;
             }
 
-            // Urgent Stop (`/api/v1/motion/stop`): non-blocking handoff; coalesces into an already
-            // pending Stop from this connection with matching lease/epoch; never enters ordinary
-            // queue and NEVER exits the reader on reply-queue capacity (only writer closes after
-            // its bounded grace, while reader keeps reading and latching any E-stop behind it).
-            if is_stop {
-                let permit = match reader_writer.try_reserve_stop() {
-                    Ok(p) => Some(p),
-                    Err(mpsc::error::TrySendError::Full(())) => {
-                        reader_writer.trigger_fatal(FatalClose::urgent_queue_full());
-                        None
-                    }
-                    Err(mpsc::error::TrySendError::Closed(())) => break,
+            // Urgent Stop (`/api/v1/motion/stop`): dispatched through bound table handler.
+            if let Some(DispatchHandler::UrgentStop(handler)) = entry.map(|e| e.handler) {
+                let mut ctx = UrgentStopCtx {
+                    value: &value,
+                    reader_supervisor: &reader_supervisor,
+                    reader_connection: &reader_connection,
+                    reader_generation: &reader_generation,
+                    reader_client_label: &reader_client_label,
+                    reader_last_request: &reader_last_request,
+                    reader_in_flight_stop: &reader_in_flight_stop,
+                    reader_ordinary_queue: &reader_ordinary_queue,
+                    reader_cancel_tx: &reader_cancel_tx,
+                    reader_writer: &reader_writer,
+                    reader_tasks: &reader_tasks,
                 };
-                let local_gen = reader_generation.load(Ordering::SeqCst);
-                let supplied_gen = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-                let label_ok = {
-                    let lbl = reader_client_label.lock().unwrap_or_else(|e| e.into_inner());
-                    value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
-                };
-                let conn_label = crate::model::HolderLabel::try_new(&reader_connection);
-                let effective_gen = if conn_label.is_some() && local_gen != 0 && supplied_gen == local_gen && label_ok { local_gen } else { 0 };
-                let raw_request_id = value.get("request_id").cloned().unwrap_or(Value::Null);
-                let parsed_request_id = value.get("request_id").and_then(Value::as_u64);
-                let epoch = value.get("epoch_id").and_then(Value::as_u64);
-                let body_error = validate_command_body_common(&value["body"]).err();
-
-                let dispatch = {
-                    let last_req = last_request_get(&reader_last_request);
-                    let mut st = reader_in_flight_stop.lock().unwrap_or_else(|e| e.into_inner());
-                    let high_water = match (last_req, st.active.as_ref().and_then(|a| a.pending_max_request_id)) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                    let request_id_valid = parsed_request_id.is_some_and(|id| high_water.is_none_or(|last| id > last));
-                    let waiter = CoalescedStopWaiter {
-                        raw_request_id,
-                        parsed_request_id,
-                        request_id_valid,
-                        body_error,
-                        permit,
-                    };
-                    if let Some(active) = st.active.as_mut() {
-                        if active.lease_generation == effective_gen && active.epoch == epoch {
-                            if request_id_valid {
-                                active.pending_max_request_id = match (active.pending_max_request_id, parsed_request_id) {
-                                    (Some(a), Some(b)) => Some(a.max(b)),
-                                    (a, b) => a.or(b),
-                                };
-                            }
-                            if waiter.permit.is_some() || active.waiters.len() < URGENT_OUT_CAPACITY {
-                                active.waiters.push(waiter);
-                            }
-                            None
-                        } else {
-                            let stop = crate::rt_core::urgent::UrgentStop {
-                                connection: conn_label.unwrap_or_default(),
-                                lease_generation: effective_gen,
-                                epoch,
-                                request_id: parsed_request_id.unwrap_or(0),
-                                request_id_valid,
-                                body_error,
-                            };
-                            Some((None, stop, Some(waiter)))
-                        }
-                    } else {
-                        let stop = crate::rt_core::urgent::UrgentStop {
-                            connection: conn_label.unwrap_or_default(),
-                            lease_generation: effective_gen,
-                            epoch,
-                            request_id: parsed_request_id.unwrap_or(0),
-                            request_id_valid,
-                            body_error,
-                        };
-                        let can_lead = effective_gen != 0 && request_id_valid && body_error.is_none();
-                        if can_lead {
-                            st.next_leader_id += 1;
-                            let leader_id = st.next_leader_id;
-                            st.active = Some(ActiveStopBatch {
-                                leader_id,
-                                lease_generation: effective_gen,
-                                epoch,
-                                pending_max_request_id: parsed_request_id,
-                                waiters: vec![waiter],
-                            });
-                            Some((Some(leader_id), stop, None))
-                        } else {
-                            Some((None, stop, Some(waiter)))
-                        }
-                    }
-                };
-
-                if let Some((leader_id, stop, single_waiter)) = dispatch {
-                    let take_waiters = |state: &Mutex<InFlightStopState>, lid: Option<u64>, single: Option<CoalescedStopWaiter>| -> Vec<CoalescedStopWaiter> {
-                        if let Some(id) = lid {
-                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                            if st.active.as_ref().is_some_and(|a| a.leader_id == id) {
-                                return st.active.take().map(|b| b.waiters).unwrap_or_default();
-                            }
-                            Vec::new()
-                        } else {
-                            single.into_iter().collect()
-                        }
-                    };
-                    match reader_supervisor.try_enqueue_executor_urgent_stop(stop) {
-                        Ok(Some((client, mut rx))) => {
-                            let stop_guard = reader_writer.enter_in_flight_stop();
-                            let in_flight_c = reader_in_flight_stop.clone();
-                            let last_req_c = reader_last_request.clone();
-                            let cancel_tx_c = reader_cancel_tx.clone();
-                            let ord_q_c = reader_ordinary_queue.clone();
-                            let writer_c = reader_writer.clone();
-                            reader_tasks.spawn(async move {
-                                let _stop_guard = stop_guard;
-                                let stop_res = client.await_ticket(&mut rx).await.map_err(ArmError::from);
-                                let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
-                                deliver_urgent_stop_batch(
-                                    waiters, stop_res, None, &last_req_c, &cancel_tx_c, &ord_q_c, &writer_c,
-                                ).await;
-                            });
-                        }
-                        Ok(None) => {
-                            let stop_guard = reader_writer.enter_in_flight_stop();
-                            let sup_c = reader_supervisor.clone();
-                            let in_flight_c = reader_in_flight_stop.clone();
-                            let last_req_c = reader_last_request.clone();
-                            let cancel_tx_c = reader_cancel_tx.clone();
-                            let ord_q_c = reader_ordinary_queue.clone();
-                            let writer_c = reader_writer.clone();
-                            reader_tasks.spawn(async move {
-                                let _stop_guard = stop_guard;
-                                let mut pre_drained: Option<Vec<Value>> = None;
-                                let stop_res = sup_c.urgent_stop_with_legacy_hook(stop, |applied_epoch, next_gen| {
-                                    // Owner `stop_gen` was already advanced under `inner.write()`;
-                                    // notify macro cancellation and drain the ordinary queue atomically.
-                                    let _ = cancel_tx_c.send(Some(CancelSignal {
-                                        gen: next_gen,
-                                        code: "STOPPED",
-                                        epoch: Some(applied_epoch),
-                                    }));
-                                    pre_drained = Some(ord_q_c.drain_cancellable("STOPPED", Some(applied_epoch)));
-                                }).await;
-                                let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
-                                deliver_urgent_stop_batch(
-                                    waiters, stop_res, pre_drained, &last_req_c, &cancel_tx_c, &ord_q_c, &writer_c,
-                                ).await;
-                            });
-                        }
-                        Err(err) => {
-                            let api = ApiError::from(err);
-                            let waiters = take_waiters(&reader_in_flight_stop, leader_id, single_waiter);
-                            for w in waiters {
-                                let reply = format_urgent_stop_outcome(
-                                    &w.raw_request_id, w.parsed_request_id, &reader_last_request, Err(&api),
-                                );
-                                match w.permit {
-                                    Some(permit) => { permit.send(reply); }
-                                    None => { let _ = reader_writer.try_send_stop_best_effort(reply); }
-                                }
-                            }
-                        }
-                    }
+                if handler(&mut ctx) {
+                    break;
                 }
                 continue;
             }
@@ -2406,11 +2424,37 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 continue;
             }
             // Pre-lock lease-free commands (depth measurement, teach episode/recorder store).
-            if let Some(DispatchHandler::LeaseFree(handler)) = entry.map(|e| e.handler) {
-                let outcome = handler(LeaseFreeCtx {
+            // Request-ID ordering and `entry.auth` are enforced uniformly by the dispatcher before
+            // invoking the bound handler.
+            if let Some((auth_req, DispatchHandler::LeaseFree(handler))) =
+                entry.map(|e| (e.auth, e.handler))
+            {
+                let request_id = value.get("request_id").and_then(Value::as_u64);
+                if request_id.is_none()
+                    || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last)
+                {
+                    let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
+                    if !worker_writer.send_ordinary_control(reply).await {
+                        break;
+                    }
+                    continue;
+                }
+                last_ordinary_request = request_id;
+                let path = value.get("path").and_then(Value::as_str).unwrap_or("");
+                if let Some(error) = auth_req.check_lease_free(&ws_auth, path, &value["body"]) {
+                    let mut reply = rejection(
+                        error,
+                        "command_reject",
+                        recv_supervisor.inner().read().await.safety.epoch_id(),
+                    );
+                    reply["request_id"] = value["request_id"].clone();
+                    if !worker_writer.send_ordinary_control(reply).await {
+                        break;
+                    }
+                    continue;
+                }
+                handler(LeaseFreeCtx {
                     value,
-                    last_ordinary_request: &mut last_ordinary_request,
-                    ws_auth: &ws_auth,
                     recv_supervisor: &recv_supervisor,
                     recv_deps: &recv_deps,
                     recv_connection: &recv_connection,
@@ -2418,17 +2462,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     ack_tx: &ack_tx,
                     worker_tasks: &worker_tasks,
                 });
-                match outcome {
-                    LeaseFreeOutcome::Spawned => {}
-                    LeaseFreeOutcome::RejectImmediate(reply) => {
-                        if !worker_writer.send_ordinary_control(reply).await { break; }
-                    }
-                    LeaseFreeOutcome::RejectWithEpoch { error, request_id } => {
-                        let mut reply = rejection(error, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
-                        reply["request_id"] = request_id;
-                        if !worker_writer.send_ordinary_control(reply).await { break; }
-                    }
-                }
                 continue;
             }
             let mut response: Option<Value>;
@@ -2525,8 +2558,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             } else {
                                 last_ordinary_request = request_id;
                                 let path = value.get("path").and_then(Value::as_str).unwrap_or("");
-                                let needs_priv = entry.is_none_or(|e| e.auth != AuthRequirement::None);
-                                if let Some(auth_err) = needs_priv.then(|| check_operator_privilege(&ws_auth, &mut inner, path, &value["body"], epoch)).flatten() {
+                                let auth_req = entry.map_or(AuthRequirement::None, |e| e.auth);
+                                if let Some(auth_err) = auth_req.check_owner(&ws_auth, &mut inner, path, &value["body"], epoch) {
                                     response = Some(command_reject(&inner, &value["request_id"], auth_err));
                                 } else if let Some(code) = calibration_busy_code(&inner, path) {
                                     response = Some(command_reject(&inner, &value["request_id"],
@@ -2559,6 +2592,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
             }
 
+            let allows_deferred = entry.is_some_and(|e| e.reply == ReplyPolicy::CommandDeferred);
+            if allows_deferred {
                 if let Some((plan, generation)) = action_pending.plan.take() {
                     let Some(next) = actions::complete_pending_plan(
                         plan,
@@ -2654,6 +2689,28 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         &worker_tasks,
                     );
                 }
+            } else {
+                #[cfg(feature = "policy-runtime")]
+                let has_policy = action_pending.policy.is_some();
+                #[cfg(not(feature = "policy-runtime"))]
+                let has_policy = false;
+                debug_assert!(
+                    action_pending.plan.is_none()
+                        && action_pending.macro_action.is_none()
+                        && action_pending.replay.is_none()
+                        && !has_policy
+                        && action_pending.dry_run_grasp.is_none()
+                        && pending_calibration.is_none()
+                        && pending_config_write.is_none(),
+                    "non-CommandDeferred entry populated a deferred async slot"
+                );
+                if entry.is_some_and(|e| e.reply == ReplyPolicy::CommandImmediate) {
+                    debug_assert!(
+                        response.is_some(),
+                        "CommandImmediate entry must return an immediate response"
+                    );
+                }
+            }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
                     lease::notify_evicted(evicted_conn, evicted_gen);
                 }

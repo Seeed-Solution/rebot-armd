@@ -16,7 +16,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_calibration_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -24,7 +24,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_calibration_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -32,7 +32,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_calibration_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -40,7 +40,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_calibration_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -48,7 +48,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_calibration_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandImmediate,
     },
     DispatchEntry {
@@ -56,7 +56,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_calibration_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
 ];

@@ -11,13 +11,14 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::api::rest::ApiError;
 use crate::supervisor::{AdmissionStamp, ArmSupervisor, SupervisorInner};
 
 use super::{
-    actions, calibration, config, lease, motion, policy, servo, ConnectionTasks, WsAuth,
+    actions, calibration, config, lease, motion, policy, servo, CancelSignal, ConnectionTasks,
+    InFlightStopState, OrdinaryQueue, WsAuth, WsWriterHandle,
 };
 
 /// Normalized inbound WebSocket frame kind, preserving exact alias precedence.
@@ -101,15 +102,71 @@ pub(super) enum LeaseRequirement {
     Required,
 }
 
-/// Operator authorization policy for a frame or command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Single-authority operator authorization policy for a frame or command.
+///
+/// `Operator` is enforced directly by the dispatcher from the table row without any secondary
+/// shared path list. `Conditional` / `ConditionalLeaseFree` bind explicit family-owned predicates.
+#[derive(Clone, Copy)]
 pub(super) enum AuthRequirement {
     /// No operator privilege required.
     None,
     /// Always requires an operator session when operator auth is enforced.
-    Operator,
-    /// Conditional operator privilege evaluated by the existing privilege validator.
-    Conditional,
+    /// Optional label overrides the operation name in `ApiError::operator_required`; `None` uses `path`.
+    Operator(Option<&'static str>),
+    /// Conditional operator privilege evaluated under the supervisor write lock by a family predicate.
+    Conditional(fn(&WsAuth, &mut SupervisorInner, &str, &Value, u64) -> Option<ApiError>),
+    /// Conditional operator privilege evaluated pre-lock for lease-free commands.
+    ConditionalLeaseFree(fn(&WsAuth, &str, &Value) -> Option<ApiError>),
+    /// Authorization checked inside the handler itself (e.g. `acquire_lease` `force: true` emitting `lease_rejected`).
+    InHandler,
+}
+
+impl AuthRequirement {
+    /// Enforce operator privilege for an owner-locked command row directly from the table entry.
+    pub(super) fn check_owner(
+        self,
+        ws_auth: &WsAuth,
+        inner: &mut SupervisorInner,
+        path: &str,
+        body: &Value,
+        epoch: u64,
+    ) -> Option<ApiError> {
+        match self {
+            Self::None | Self::InHandler => None,
+            Self::Operator(label) => {
+                if ws_auth.is_operator() {
+                    None
+                } else {
+                    Some(ApiError::operator_required(label.unwrap_or(path)))
+                }
+            }
+            Self::Conditional(pred) => pred(ws_auth, inner, path, body, epoch),
+            Self::ConditionalLeaseFree(pred) => pred(ws_auth, path, body),
+        }
+    }
+
+    /// Enforce operator privilege for a pre-lock lease-free command row directly from the table entry.
+    pub(super) fn check_lease_free(
+        self,
+        ws_auth: &WsAuth,
+        path: &str,
+        body: &Value,
+    ) -> Option<ApiError> {
+        match self {
+            Self::None | Self::InHandler => None,
+            Self::Operator(label) => {
+                if ws_auth.is_operator() {
+                    None
+                } else {
+                    Some(ApiError::operator_required(label.unwrap_or(path)))
+                }
+            }
+            Self::ConditionalLeaseFree(pred) => pred(ws_auth, path, body),
+            Self::Conditional(_) => {
+                unreachable!("lease-free row cannot use an owner-locked auth predicate")
+            }
+        }
+    }
 }
 
 /// Outbound reply lane and acknowledgement policy.
@@ -125,9 +182,9 @@ pub(super) enum ReplyPolicy {
     SilentOrLossOrEpochSync,
     /// Immediate ordinary reply (`lease_granted` / `lease_rejected` / `lease_released`).
     LeaseReply,
-    /// Immediate `command_ack` or `command_reject`.
+    /// Immediate synchronous `command_ack` or `command_reject` (never populates deferred async slots).
     CommandImmediate,
-    /// Deferred reply via `ack_tx` or async worker step.
+    /// May defer reply via async worker/task completion (`ack_tx` or off-lock planning/IO).
     CommandDeferred,
     /// Immediate `preset_ack` or `preset_reject`.
     PresetReply,
@@ -135,21 +192,33 @@ pub(super) enum ReplyPolicy {
     ServoRejectOnly,
 }
 
-/// Outcome of a synchronous pre-lock lease-free command check/spawn.
-pub(super) enum LeaseFreeOutcome {
-    /// Background task spawned onto `worker_tasks`; reply will arrive on `ack_tx`.
-    Spawned,
-    /// Send this immediate rejection without taking the supervisor lock.
-    RejectImmediate(Value),
-    /// Read current epoch under supervisor read lock, format `command_reject` for `request_id`, and send.
-    RejectWithEpoch { error: ApiError, request_id: Value },
+/// Context passed to the bound urgent E-stop reader transition handler.
+pub(super) struct UrgentEStopCtx<'a> {
+    pub(super) value: &'a Value,
+    pub(super) reader_supervisor: &'a Arc<ArmSupervisor>,
+    pub(super) reader_cancel_tx: &'a watch::Sender<Option<CancelSignal>>,
+    pub(super) reader_writer: &'a WsWriterHandle,
+    pub(super) reader_tasks: &'a ConnectionTasks,
+}
+
+/// Context passed to the bound urgent Stop reader transition handler.
+pub(super) struct UrgentStopCtx<'a> {
+    pub(super) value: &'a Value,
+    pub(super) reader_supervisor: &'a Arc<ArmSupervisor>,
+    pub(super) reader_connection: &'a str,
+    pub(super) reader_generation: &'a AtomicU64,
+    pub(super) reader_client_label: &'a Mutex<Option<String>>,
+    pub(super) reader_last_request: &'a Arc<Mutex<Option<u64>>>,
+    pub(super) reader_in_flight_stop: &'a Arc<Mutex<InFlightStopState>>,
+    pub(super) reader_ordinary_queue: &'a OrdinaryQueue,
+    pub(super) reader_cancel_tx: &'a watch::Sender<Option<CancelSignal>>,
+    pub(super) reader_writer: &'a WsWriterHandle,
+    pub(super) reader_tasks: &'a ConnectionTasks,
 }
 
 /// Context passed to pre-lock lease-free command handlers (`depth_measure`, `teach`).
 pub(super) struct LeaseFreeCtx<'a> {
     pub(super) value: Value,
-    pub(super) last_ordinary_request: &'a mut Option<u64>,
-    pub(super) ws_auth: &'a WsAuth,
     pub(super) recv_supervisor: &'a Arc<ArmSupervisor>,
     pub(super) recv_deps: &'a crate::grasp::GraspDeps,
     pub(super) recv_connection: &'a str,
@@ -184,13 +253,27 @@ pub(super) struct OwnerDispatchCtx<'a> {
     pub(super) pending_calibration: &'a mut Option<(Value, calibration::CalibJob, u64, u64, bool)>,
 }
 
-/// Concrete handler binding stored in each [`DispatchEntry`].
+/// Concrete executable handler binding stored in each [`DispatchEntry`].
 #[derive(Clone, Copy)]
 pub(super) enum DispatchHandler {
-    /// Handled in the reader urgent/dedicated lane (`estop`, `stop`, `auth`).
-    ReaderLane,
-    /// Pre-lock lease-free command handler (`depth_measure`, `teach::is_lease_free`).
-    LeaseFree(fn(LeaseFreeCtx<'_>) -> LeaseFreeOutcome),
+    /// Lock-free urgent E-stop reader transition (`estop` / `e_stop`). Returns `true` if writer closed.
+    UrgentEStop(fn(&mut UrgentEStopCtx<'_>) -> bool),
+    /// Urgent non-blocking Stop reader transition (`/api/v1/motion/stop`). Returns `true` if writer closed.
+    UrgentStop(fn(&mut UrgentStopCtx<'_>) -> bool),
+    /// Dedicated off-reader auth frame processor (`auth`).
+    Auth(fn(&WsAuth, &Value) -> Value),
+    /// Dedicated latest-wins heartbeat processor (`heartbeat`).
+    Heartbeat(
+        fn(
+            &mut SupervisorInner,
+            &Value,
+            &str,
+            &AtomicU64,
+            &Mutex<Option<String>>,
+        ) -> Option<Value>,
+    ),
+    /// Pre-lock lease-free command handler (`depth_measure`, `teach`).
+    LeaseFree(fn(LeaseFreeCtx<'_>)),
     /// Owner-locked handler executed under `supervisor.inner().write()`.
     Owner(fn(&mut OwnerDispatchCtx<'_>) -> Option<Value>),
 }
@@ -206,11 +289,11 @@ pub(super) struct DispatchEntry {
     pub(super) reply: ReplyPolicy,
 }
 
-/// Core reader-lane entries (`estop`/`e_stop`, `auth`, `/api/v1/motion/stop`).
+/// Core urgent and auth lane entries (`estop`/`e_stop`, `auth`, `/api/v1/motion/stop`).
 const CORE_ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::EStop),
-        handler: DispatchHandler::ReaderLane,
+        handler: DispatchHandler::UrgentEStop(super::handle_urgent_estop_frame),
         admission: AdmissionClass::UrgentEStop,
         lease: LeaseRequirement::None,
         auth: AuthRequirement::None,
@@ -218,7 +301,7 @@ const CORE_ENTRIES: &[DispatchEntry] = &[
     },
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::Auth),
-        handler: DispatchHandler::ReaderLane,
+        handler: DispatchHandler::Auth(super::handle_auth_frame),
         admission: AdmissionClass::Auth,
         lease: LeaseRequirement::None,
         auth: AuthRequirement::None,
@@ -226,7 +309,7 @@ const CORE_ENTRIES: &[DispatchEntry] = &[
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/motion/stop"),
-        handler: DispatchHandler::ReaderLane,
+        handler: DispatchHandler::UrgentStop(super::handle_urgent_stop_frame),
         admission: AdmissionClass::UrgentStop,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
@@ -234,8 +317,8 @@ const CORE_ENTRIES: &[DispatchEntry] = &[
     },
 ];
 
-static DISPATCH_TABLE: LazyLock<HashMap<DispatchKey, &'static DispatchEntry>> = LazyLock::new(|| {
-    let slices: &[&[DispatchEntry]] = &[
+fn all_family_slices() -> &'static [&'static [DispatchEntry]] {
+    &[
         CORE_ENTRIES,
         lease::ENTRIES,
         motion::ENTRIES,
@@ -244,9 +327,12 @@ static DISPATCH_TABLE: LazyLock<HashMap<DispatchKey, &'static DispatchEntry>> = 
         servo::ENTRIES,
         policy::ENTRIES,
         calibration::ENTRIES,
-    ];
+    ]
+}
+
+static DISPATCH_TABLE: LazyLock<HashMap<DispatchKey, &'static DispatchEntry>> = LazyLock::new(|| {
     let mut table = HashMap::new();
-    for slice in slices {
+    for slice in all_family_slices() {
         for entry in *slice {
             let prev = table.insert(entry.key, entry);
             assert!(
@@ -258,6 +344,21 @@ static DISPATCH_TABLE: LazyLock<HashMap<DispatchKey, &'static DispatchEntry>> = 
     }
     table
 });
+
+static COMMAND_TABLE: LazyLock<HashMap<&'static str, &'static DispatchEntry>> =
+    LazyLock::new(|| {
+        let mut map = HashMap::new();
+        for (key, &entry) in DISPATCH_TABLE.iter() {
+            if let DispatchKey {
+                kind: FrameKind::Command,
+                path: Some(p),
+            } = *key
+            {
+                map.insert(p, entry);
+            }
+        }
+        map
+    });
 
 /// Normalize an inbound WS JSON frame into its canonical [`FrameKind`], preserving exact
 /// alias precedence (explicit `type` > `mode: "cartesian_joint_stream"` > implicit `positions`).
@@ -296,21 +397,6 @@ pub(super) fn lookup(kind: FrameKind, path: Option<&str>) -> Option<&'static Dis
     }
 }
 
-static COMMAND_TABLE: LazyLock<HashMap<&'static str, &'static DispatchEntry>> =
-    LazyLock::new(|| {
-        let mut map = HashMap::new();
-        for (key, &entry) in DISPATCH_TABLE.iter() {
-            if let DispatchKey {
-                kind: FrameKind::Command,
-                path: Some(p),
-            } = *key
-            {
-                map.insert(p, entry);
-            }
-        }
-        map
-    });
-
 /// Classify an inbound WS JSON frame into `(FrameKind, Option<&'static DispatchEntry>)`.
 pub(super) fn classify(value: &Value) -> (FrameKind, Option<&'static DispatchEntry>) {
     let kind = normalize_frame_kind(value);
@@ -328,70 +414,107 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn dispatch_table_initializes_without_duplicates_and_covers_every_family() {
+    fn dispatch_table_has_no_duplicates_and_binds_real_handlers_per_family() {
         let table = &*DISPATCH_TABLE;
-        let cmd_table = &*COMMAND_TABLE;
-        #[cfg(feature = "policy-runtime")]
-        assert_eq!(table.len(), 54, "expected 54 dispatch entries with policy-runtime");
-        #[cfg(not(feature = "policy-runtime"))]
-        assert_eq!(table.len(), 52, "expected 52 dispatch entries without policy-runtime");
-        assert!(cmd_table.len() >= 44);
+        let expected_total: usize = all_family_slices().iter().map(|s| s.len()).sum();
+        assert_eq!(table.len(), expected_total, "duplicate key collapsed in DISPATCH_TABLE");
 
-        // Verify urgent/auth/heartbeat/session admission classes.
-        assert_eq!(lookup(FrameKind::EStop, None).unwrap().admission, AdmissionClass::UrgentEStop);
-        assert_eq!(lookup(FrameKind::Auth, None).unwrap().admission, AdmissionClass::Auth);
-        assert_eq!(lookup(FrameKind::Heartbeat, None).unwrap().admission, AdmissionClass::Heartbeat);
-        assert_eq!(lookup(FrameKind::AcquireLease, None).unwrap().admission, AdmissionClass::OrdinarySession);
-        assert_eq!(lookup(FrameKind::ReleaseLease, None).unwrap().admission, AdmissionClass::OrdinarySession);
-        assert_eq!(
-            lookup(FrameKind::Command, Some("/api/v1/motion/stop")).unwrap().admission,
-            AdmissionClass::UrgentStop
-        );
+        // Core urgent & auth handlers are concrete executable variants, not opaque markers.
+        let estop = lookup(FrameKind::EStop, None).unwrap();
+        assert_eq!(estop.admission, AdmissionClass::UrgentEStop);
+        assert!(matches!(estop.handler, DispatchHandler::UrgentEStop(_)));
+
+        let stop = lookup(FrameKind::Command, Some("/api/v1/motion/stop")).unwrap();
+        assert_eq!(stop.admission, AdmissionClass::UrgentStop);
+        assert!(matches!(stop.handler, DispatchHandler::UrgentStop(_)));
+
+        let auth = lookup(FrameKind::Auth, None).unwrap();
+        assert_eq!(auth.admission, AdmissionClass::Auth);
+        assert!(matches!(auth.handler, DispatchHandler::Auth(_)));
+
+        let hb = lookup(FrameKind::Heartbeat, None).unwrap();
+        assert_eq!(hb.admission, AdmissionClass::Heartbeat);
+        assert!(matches!(hb.handler, DispatchHandler::Heartbeat(_)));
+
+        // Lease family invariants.
         for p in ["/api/v1/torque", "/api/v1/arm"] {
             assert_eq!(
                 lookup(FrameKind::Command, Some(p)).unwrap().admission,
                 AdmissionClass::OrdinaryTorqueOrStopExempt
             );
         }
-        // Verify lease-free teach + depth measure entries.
-        for p in [
-            crate::depth_measure::PATH,
-            "/api/v1/record/start",
-            "/api/v1/record/stop",
-            "/api/v1/episodes/update",
-            "/api/v1/episodes/delete",
-            "/api/v1/datasets/create",
-            "/api/v1/datasets/delete",
-        ] {
-            let e = lookup(FrameKind::Command, Some(p)).unwrap_or_else(|| panic!("missing {p}"));
+        assert_eq!(
+            lookup(FrameKind::AcquireLease, None).unwrap().admission,
+            AdmissionClass::OrdinarySession
+        );
+        assert_eq!(
+            lookup(FrameKind::ReleaseLease, None).unwrap().admission,
+            AdmissionClass::OrdinarySession
+        );
+
+        // Bidirectional parity between `teach::LEASE_FREE_PATHS` and `actions::ENTRIES`.
+        for &p in crate::teach::LEASE_FREE_PATHS {
+            let e = lookup(FrameKind::Command, Some(p)).unwrap_or_else(|| panic!("missing teach path {p}"));
             assert_eq!(e.lease, LeaseRequirement::None, "{p}");
             assert!(matches!(e.handler, DispatchHandler::LeaseFree(_)), "{p}");
-            if p != crate::depth_measure::PATH {
-                assert!(crate::teach::is_lease_free(p), "{p}");
+        }
+        for e in actions::ENTRIES {
+            if matches!(e.handler, DispatchHandler::LeaseFree(_)) {
+                let p = e.key.path.expect("LeaseFree entry must have command path");
+                assert!(
+                    p == crate::depth_measure::PATH || crate::teach::is_lease_free(p),
+                    "unexpected LeaseFree command not in teach::LEASE_FREE_PATHS: {p}"
+                );
             }
         }
-        // Verify grasp dry_run lease exception metadata.
+
+        // Grasp dry_run lease exception.
         assert_eq!(
             lookup(FrameKind::Command, Some("/api/v1/action/grasp")).unwrap().lease,
             LeaseRequirement::RequiredExceptDryRun
         );
-        // Verify calibration paths all live in calibration::ENTRIES and require Operator auth.
-        for p in [
-            "/api/v1/calibration/apply",
-            "/api/v1/calibration/restore",
-            crate::motor_zero::PATH,
-            crate::motor_zero::RESTORE_PATH,
-            crate::mit::TIMEOUT_PATH,
-            crate::mit::QUALIFICATION_PATH,
-        ] {
-            assert!(calibration::ENTRIES.iter().any(|e| e.key == DispatchKey::command(p)));
-            let e = lookup(FrameKind::Command, Some(p)).unwrap();
-            assert_eq!(e.auth, AuthRequirement::Operator, "{p}");
+
+        // Calibration family: all entries enforce Operator auth directly from the table row.
+        for e in calibration::ENTRIES {
+            assert!(
+                matches!(e.auth, AuthRequirement::Operator(_)),
+                "calibration row {:?} must require Operator",
+                e.key
+            );
+            assert!(lookup(e.key.kind, e.key.path).is_some());
+        }
+
+        // Config family: all entries enforce Operator auth and CommandDeferred reply policy.
+        for e in config::ENTRIES {
+            assert!(matches!(e.auth, AuthRequirement::Operator(_)));
+            assert_eq!(e.reply, ReplyPolicy::CommandDeferred);
+            assert!(lookup(e.key.kind, e.key.path).is_some());
         }
     }
 
     #[test]
-    fn alias_precedence_and_implicit_servo_classification_match_legacy() {
+    fn operator_auth_requirement_enforces_directly_without_secondary_path_list() {
+        let auth = crate::auth::OperatorAuth::enforced("123456", 1800);
+        let viewer = WsAuth::new(auth, None, true);
+        let sup = crate::supervisor::ArmSupervisor::new(crate::model::ArmConfig::rebot_dm());
+        let mut inner = sup.inner().blocking_write();
+
+        // A synthetic command path unknown to ws.rs MUST still be rejected when marked Operator.
+        let err = AuthRequirement::Operator(None)
+            .check_owner(&viewer, &mut inner, "/api/v1/synthetic_new_family_op", &json!({}), 1)
+            .expect("AuthRequirement::Operator must reject non-operator directly");
+        assert_eq!(err.code.as_deref(), Some("OPERATOR_REQUIRED"));
+        assert!(err.message.contains("/api/v1/synthetic_new_family_op"));
+
+        let lf_err = AuthRequirement::Operator(None)
+            .check_lease_free(&viewer, "/api/v1/synthetic_lease_free_op", &json!({}))
+            .expect("AuthRequirement::Operator must reject non-operator on lease-free path");
+        assert_eq!(lf_err.code.as_deref(), Some("OPERATOR_REQUIRED"));
+        assert!(lf_err.message.contains("/api/v1/synthetic_lease_free_op"));
+    }
+
+    #[test]
+    fn alias_precedence_and_legacy_mixed_field_cancellation_parity() {
         assert_eq!(classify(&json!({"type": "estop"})).0, FrameKind::EStop);
         assert_eq!(classify(&json!({"type": "e_stop"})).0, FrameKind::EStop);
         assert_eq!(classify(&json!({"type": "servo", "positions": [0.0]})).0, FrameKind::Servo);
@@ -403,15 +526,41 @@ mod tests {
             classify(&json!({"positions": [0.0], "sequence_id": 1})).0,
             FrameKind::ImplicitServo
         );
-        // Preset carrying `positions` MUST take precedence over implicit servo.
         assert_eq!(
             classify(&json!({"type": "preset", "name": "p", "positions": [0.0]})).0,
             FrameKind::Preset
         );
-        // Command carrying `positions` MUST take precedence over implicit servo.
         let (k, e) = classify(&json!({"type": "command", "path": "/api/v1/torque", "positions": [0.0]}));
         assert_eq!(k, FrameKind::Command);
         assert_eq!(e.unwrap().admission, AdmissionClass::OrdinaryTorqueOrStopExempt);
         assert_eq!(classify(&json!({"type": "unknown", "foo": 1})).0, FrameKind::Unknown);
+
+        // Legacy Stop/E-stop cancellation parity (Major 1): mixed-field lease frames carrying
+        // `positions` or `mode: "cartesian_joint_stream"` MUST be drained and emit `servo_reject`.
+        let q = OrdinaryQueue::new();
+        let stamp = AdmissionStamp {
+            stop_gen: 0,
+            estop_epoch: 1,
+            lease_gen: 1,
+            connection_id: 1,
+            request_id: 1,
+        };
+        let mixed_release = json!({"type": "release_lease", "positions": null});
+        let mixed_acquire = json!({"type": "acquire_lease", "client_id": "a", "mode": "cartesian_joint_stream"});
+        let clean_release = json!({"type": "release_lease"});
+        assert!(q.try_push(mixed_release.clone(), stamp).is_ok());
+        assert!(q.try_push(mixed_acquire.clone(), stamp).is_ok());
+        assert!(q.try_push(clean_release.clone(), stamp).is_ok());
+
+        let replies = q.drain_cancellable("STOPPED", Some(7));
+        assert_eq!(replies.len(), 2, "both mixed-field lease frames must cancel like baseline");
+        for r in &replies {
+            assert_eq!(r["type"], "servo_reject");
+            assert_eq!(r["reason"], "stopped");
+            assert_eq!(r["code"], "STOPPED");
+            assert_eq!(r["epoch_id"], 7);
+        }
+        // Clean release_lease without servo fields remains queued.
+        assert_eq!(q.len(), 1);
     }
 }

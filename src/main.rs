@@ -478,7 +478,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let bind_ip: std::net::IpAddr = match std::env::var("ARMD_BIND_HOST") {
+        Ok(s) if !s.trim().is_empty() => s
+            .trim()
+            .parse()
+            .map_err(|_| format!("Invalid ARMD_BIND_HOST: {s}"))?,
+        _ => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    };
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, port)).await?;
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_limits: Option<Vec<_>> = config.damiao_ranges.as_ref().map(|r| r.iter().map(|r| r.limits()).collect());
     let config_dof = config.dof;

@@ -26,7 +26,7 @@ macro_rules! config_entry {
             handler: DispatchHandler::Owner(dispatch_config_entry),
             admission: AdmissionClass::Ordinary,
             lease: LeaseRequirement::Required,
-            auth: AuthRequirement::Operator,
+            auth: AuthRequirement::Operator(None),
             reply: ReplyPolicy::CommandDeferred,
         }
     };

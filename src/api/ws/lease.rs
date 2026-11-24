@@ -12,7 +12,7 @@ use super::dispatch::{
 pub(super) const ENTRIES: &[DispatchEntry] = &[
     DispatchEntry {
         key: DispatchKey::frame(FrameKind::Heartbeat),
-        handler: DispatchHandler::Owner(dispatch_heartbeat_inline),
+        handler: DispatchHandler::Heartbeat(handle_heartbeat_task_step),
         admission: AdmissionClass::Heartbeat,
         lease: LeaseRequirement::RequiredAllowZeroGeneration,
         auth: AuthRequirement::None,
@@ -23,7 +23,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_acquire_lease),
         admission: AdmissionClass::OrdinarySession,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Conditional,
+        auth: AuthRequirement::InHandler,
         reply: ReplyPolicy::LeaseReply,
     },
     DispatchEntry {
@@ -55,10 +55,42 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_clear_fault),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Conditional,
+        auth: AuthRequirement::Conditional(clear_fault_auth_check),
         reply: ReplyPolicy::CommandImmediate,
     },
 ];
+
+fn clear_fault_auth_check(
+    ws_auth: &WsAuth,
+    inner: &mut SupervisorInner,
+    _path: &str,
+    _body: &Value,
+    epoch: u64,
+) -> Option<ApiError> {
+    if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
+        return Some(
+            ArmError::Safety(SafetyError::EpochMismatch {
+                expected: inner.safety.epoch_id(),
+                received: epoch,
+            })
+            .into(),
+        );
+    }
+    if ws_auth.is_operator() {
+        return None;
+    }
+    if inner.e_stop_latched.load(Ordering::SeqCst) {
+        return Some(ApiError::operator_required("clear_fault (EStop latched)"));
+    }
+    if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+        && !inner.safety.recoverable()
+    {
+        return Some(ApiError::operator_required(
+            "clear_fault (non-recoverable fault or EStop)",
+        ));
+    }
+    None
+}
 
 fn dispatch_acquire_lease(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
     let (resp, evicted) = handle_acquire_lease(
@@ -84,10 +116,6 @@ fn dispatch_release_lease(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
         ctx.recv_generation,
         ctx.recv_client_label,
     ))
-}
-
-fn dispatch_heartbeat_inline(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
-    handle_heartbeat_inline(ctx.inner, ctx.recv_connection, ctx.epoch)
 }
 
 fn dispatch_torque(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
@@ -436,16 +464,6 @@ pub(super) fn handle_release_lease(
     recv_generation.store(0, Ordering::SeqCst);
     *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = None;
     json!({"type":"lease_released", "success":released})
-}
-
-/// Handle an inline heartbeat under the supervisor write lock.
-pub(super) fn handle_heartbeat_inline(
-    inner: &mut SupervisorInner,
-    recv_connection: &str,
-    epoch: u64,
-) -> Option<Value> {
-    let _ = inner.heartbeat(recv_connection, epoch);
-    None
 }
 
 /// Deliver a `lease_lost` (`reason: "preempted"`) notice to an evicted connection via the registry.

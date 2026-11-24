@@ -7,7 +7,7 @@
 use super::*;
 use super::dispatch::{
     AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, LeaseFreeCtx,
-    LeaseFreeOutcome, LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
 };
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
@@ -40,7 +40,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_action_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Conditional,
+        auth: AuthRequirement::Conditional(gripper_zero_check_auth_check),
         reply: ReplyPolicy::CommandImmediate,
     },
     DispatchEntry {
@@ -80,7 +80,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_action_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Conditional,
+        auth: AuthRequirement::Conditional(run_sequence_auth_check),
         reply: ReplyPolicy::CommandImmediate,
     },
     DispatchEntry {
@@ -96,7 +96,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_action_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(Some("gripper_calibrate")),
         reply: ReplyPolicy::CommandImmediate,
     },
     DispatchEntry {
@@ -104,7 +104,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::Owner(dispatch_action_entry),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandImmediate,
     },
     DispatchEntry {
@@ -112,7 +112,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::LeaseFree(dispatch_depth_measure),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -120,7 +120,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -128,7 +128,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Conditional,
+        auth: AuthRequirement::ConditionalLeaseFree(record_stop_auth_check),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -136,7 +136,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -144,7 +144,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -152,7 +152,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
     DispatchEntry {
@@ -160,10 +160,52 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
         handler: DispatchHandler::LeaseFree(dispatch_teach_lease_free),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::None,
-        auth: AuthRequirement::Operator,
+        auth: AuthRequirement::Operator(None),
         reply: ReplyPolicy::CommandDeferred,
     },
 ];
+
+fn run_sequence_auth_check(
+    ws_auth: &WsAuth,
+    _inner: &mut SupervisorInner,
+    _path: &str,
+    body: &Value,
+    _epoch: u64,
+) -> Option<ApiError> {
+    if !ws_auth.is_operator() && body.get("record").is_some_and(|r| !r.is_null()) {
+        Some(ApiError::operator_required("run_sequence (record)"))
+    } else {
+        None
+    }
+}
+
+fn gripper_zero_check_auth_check(
+    ws_auth: &WsAuth,
+    _inner: &mut SupervisorInner,
+    _path: &str,
+    body: &Value,
+    _epoch: u64,
+) -> Option<ApiError> {
+    if !ws_auth.is_operator()
+        && body.get("store_offset").and_then(Value::as_bool) == Some(true)
+    {
+        Some(ApiError::operator_required(
+            "gripper_zero_check (store_offset=true)",
+        ))
+    } else {
+        None
+    }
+}
+
+fn record_stop_auth_check(ws_auth: &WsAuth, path: &str, body: &Value) -> Option<ApiError> {
+    if ws_auth.is_operator() {
+        return None;
+    }
+    if body.get("save").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    Some(ApiError::operator_required(path))
+}
 
 fn dispatch_action_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
     dispatch_action_command(
@@ -181,26 +223,7 @@ fn dispatch_action_entry(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
     )
 }
 
-fn dispatch_depth_measure(ctx: LeaseFreeCtx<'_>) -> LeaseFreeOutcome {
-    let request_id = ctx.value.get("request_id").and_then(Value::as_u64);
-    if request_id.is_none()
-        || ctx
-            .last_ordinary_request
-            .is_some_and(|last| request_id.unwrap() <= last)
-    {
-        return LeaseFreeOutcome::RejectImmediate(
-            json!({"type":"command_reject", "request_id":ctx.value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}),
-        );
-    }
-    *ctx.last_ordinary_request = request_id;
-    if let Some(error) =
-        lease_free_operator_check(ctx.ws_auth, crate::depth_measure::PATH, &ctx.value["body"])
-    {
-        return LeaseFreeOutcome::RejectWithEpoch {
-            error,
-            request_id: ctx.value["request_id"].clone(),
-        };
-    }
+fn dispatch_depth_measure(ctx: LeaseFreeCtx<'_>) {
     let (sup, source, tx) = (
         ctx.recv_supervisor.clone(),
         ctx.recv_deps.source.clone(),
@@ -211,31 +234,9 @@ fn dispatch_depth_measure(ctx: LeaseFreeCtx<'_>) -> LeaseFreeOutcome {
         let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
         let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
     });
-    LeaseFreeOutcome::Spawned
 }
 
-fn dispatch_teach_lease_free(ctx: LeaseFreeCtx<'_>) -> LeaseFreeOutcome {
-    let request_id = ctx.value.get("request_id").and_then(Value::as_u64);
-    if request_id.is_none()
-        || ctx
-            .last_ordinary_request
-            .is_some_and(|last| request_id.unwrap() <= last)
-    {
-        return LeaseFreeOutcome::RejectImmediate(
-            json!({"type":"command_reject", "request_id":ctx.value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}),
-        );
-    }
-    *ctx.last_ordinary_request = request_id;
-    if let Some(error) = lease_free_operator_check(
-        ctx.ws_auth,
-        ctx.value["path"].as_str().unwrap_or(""),
-        &ctx.value["body"],
-    ) {
-        return LeaseFreeOutcome::RejectWithEpoch {
-            error,
-            request_id: ctx.value["request_id"].clone(),
-        };
-    }
+fn dispatch_teach_lease_free(ctx: LeaseFreeCtx<'_>) {
     let caller_label = ctx
         .recv_client_label
         .lock()
@@ -257,7 +258,6 @@ fn dispatch_teach_lease_free(ctx: LeaseFreeCtx<'_>) -> LeaseFreeOutcome {
         let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
         let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
     });
-    LeaseFreeOutcome::Spawned
 }
 
 pub(super) enum ActionStart {
