@@ -421,6 +421,7 @@ impl SupervisorInner {
                         limit: self.config.max_temperature,
                     },
                 );
+                self.stopped_disable_retry_until = None;
                 if !self.disable_pending
                     || self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
                 {

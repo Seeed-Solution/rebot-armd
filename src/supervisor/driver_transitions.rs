@@ -1027,6 +1027,7 @@ impl SupervisorInner {
         self.is_torqued = false;
         self.pending_rearm = false;
         self.disable_pending = false;
+        self.stopped_disable_retry_until = None;
         self.gripper_hold_vel_ceiling = None;
     }
 
@@ -1464,6 +1465,10 @@ impl SupervisorInner {
         self.gravity_comp_servo_busy()
             .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))?;
         self.torque_off_check_rt()?;
+        if self.torque_off_stopped() {
+            self.stopped_disable_retry_until =
+                Some(Instant::now() + crate::supervisor::torque_off::STOPPED_DISABLE_RETRY_BOUND);
+        }
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable_bounded() {
@@ -1483,6 +1488,10 @@ impl SupervisorInner {
 
     fn torque_off_in_place(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
         self.torque_off_check(stillness_verified)?;
+        if self.torque_off_stopped() {
+            self.stopped_disable_retry_until =
+                Some(Instant::now() + crate::supervisor::torque_off::STOPPED_DISABLE_RETRY_BOUND);
+        }
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
@@ -1591,6 +1600,10 @@ impl SupervisorInner {
             })
         } else {
             self.torque_off_check_rt()?;
+            if self.torque_off_stopped() {
+                self.stopped_disable_retry_until =
+                    Some(Instant::now() + crate::supervisor::torque_off::STOPPED_DISABLE_RETRY_BOUND);
+            }
             self.stop_motion();
             self.commanded_velocities.fill(0.0);
             self.disable_requested();
@@ -1655,6 +1668,12 @@ impl SupervisorInner {
         budget: &crate::rt_core::ops::ServiceBudget,
     ) -> Option<(u16, bool)> {
         if !self.disable_pending || self.torque_transition.is_some() {
+            return None;
+        }
+        if self
+            .stopped_disable_retry_until
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return None;
         }
         let d = self.driver.as_ref()?;
@@ -2816,6 +2835,7 @@ impl SupervisorInner {
     /// Uses bounded `try_lock()` so a contended driver mutex cannot block indefinitely past `timeout`.
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
         self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.stopped_disable_retry_until = None;
         self.disable_requested();
         let Some(ref d) = self.driver else {
             self.disable_confirmed();

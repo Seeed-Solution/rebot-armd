@@ -6439,6 +6439,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if mit_fenced { self.mit_fence = None; }
                 Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
             }
+            // Bounded driver-level handshake retry within `DAMIAO_DISABLE_CONFIRM` (150 ms),
+            // itself bounded by the supervisor's 1 s `STOPPED_DISABLE_RETRY_BOUND`.
             Service::Retry { mask, wake } => {
                 for i in handshake::mask_joints(mask) {
                     let Some(&id) = self.motor_ids.get(i) else { continue };

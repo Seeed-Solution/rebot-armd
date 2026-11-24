@@ -431,6 +431,22 @@ fn stopped_torque_off_tx_failure_zero_alloc() {
         (0, 0),
         "failed ImmediateOp::TorqueOff while already stopped must allocate 0"
     );
+
+    // Expiring the 1 s stopped-disable retry bound on RT must end retries with 0 allocs and
+    // resume normal E-stop hold without sending disable frames or mutating EStop / epoch.
+    fx.core.stopped_disable_retry_until = Some(std::time::Instant::now() - Duration::from_millis(1));
+    fx.core.last_disable_attempt = Some(std::time::Instant::now() - Duration::from_millis(300));
+    bus.with(|s| {
+        s.tx_would_block = false;
+        s.push_all_feedback();
+    });
+    let (_exp_rep, a5, f5) = counted(|| fx.step());
+    clock.advance(RELEASE);
+    assert!(!fx.core.disable_pending, "1 s bound expiry must clear disable_pending");
+    assert!(fx.core.stopped_disable_retry_until.is_none());
+    assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
+    assert_eq!(fx.core.safety.epoch_id(), epoch_before);
+    assert_eq!((a5, f5), (0, 0), "expiring 1 s stopped-disable retry bound must allocate 0");
 }
 
 #[test]

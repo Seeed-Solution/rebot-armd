@@ -1228,3 +1228,57 @@ fn thermal_trip_and_shutdown_disable_at_raised_pose_without_consulting_rest_pose
         "shutdown/panic disable must NOT consult eval_stopped_torque_off"
     );
 }
+
+#[test]
+fn stopped_disable_retries_are_bounded_to_1s_and_new_request_requires_new_rest_check() {
+    let (mut inner, bus, _clock) = make_driver_rig();
+    inner.set_torque(true).unwrap();
+    inner.apply_stop_policy(StopPolicy::EStopLatch);
+    let epoch_before = inner.safety.epoch_id();
+
+    // Authorize a stopped disable at rest whose TX fails -> sets disable_pending and a 1 s bound.
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.tx_error = true;
+        s.push_all_feedback();
+    });
+    assert!(inner.set_torque(false).is_err());
+    assert!(inner.disable_pending);
+    assert!(inner.stopped_disable_retry_until.is_some());
+
+    // Within the 1 s window, periodic retry (>= 250 ms since last attempt) still tries to complete it.
+    inner.last_disable_attempt = Some(Instant::now() - Duration::from_millis(300));
+    bus.with(|s| {
+        s.tx_log.clear();
+        s.push_all_feedback();
+    });
+    inner.tick(0.02);
+    assert!(inner.disable_pending, "still pending while TX fails within 1 s window");
+
+    // Once the 1 s bound elapses, the request ends: no disable frames are sent, disable_pending
+    // clears, is_torqued and EStop latch + epoch stay intact, and a new request needs a fresh rest check.
+    inner.stopped_disable_retry_until = Some(Instant::now() - Duration::from_millis(1));
+    inner.last_disable_attempt = Some(Instant::now() - Duration::from_millis(300));
+    bus.with(|s| {
+        s.tx_error = false;
+        s.tx_log.clear();
+        s.motors[1].q = 0.35; // arm raised after the failed disable window
+        s.push_all_feedback();
+    });
+    inner.tick(0.02);
+    assert!(!inner.disable_pending, "stopped disable request must end after 1 s bound");
+    assert!(inner.stopped_disable_retry_until.is_none());
+    assert!(inner.is_torqued);
+    assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert_eq!(inner.safety.epoch_id(), epoch_before);
+    assert!(
+        bus.with(|s| s.tx_log.iter().all(|f| f.data != armd::protocol::damiao::CMD_DISABLE)),
+        "no disable frame may be sent once the 1 s retry bound has elapsed"
+    );
+
+    // A new disable request while raised must run a fresh rest check and refuse with TORQUE_OFF_WOULD_DROP.
+    assert!(matches!(
+        inner.set_torque(false),
+        Err(SafetyError::TorqueOffWouldDrop { joint: Some(ref j), .. }) if j == "joint_2"
+    ));
+}
