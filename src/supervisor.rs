@@ -3026,9 +3026,23 @@ impl SupervisorInner {
         self.joint_limit_clear_violation().is_none()
     }
 
-    /// Thermal protection remains active while torqued or while torque disable is unconfirmed.
-    /// `was_active` preserves thermal protection when a torque transition confirmed disable on
-    /// the exact same Step 2 poll that delivered an over-temperature sample.
+    /// Thermal protection is active whenever motors are torqued, a torque disable is
+    /// unconfirmed, or an enable transition is in flight (`Enabling`).
+    #[inline]
+    pub(crate) fn thermal_protection_active(&self) -> bool {
+        self.is_torqued
+            || self.disable_pending
+            || self.enable_lifecycle == EnableLifecycle::Enabling
+            || matches!(
+                self.torque_transition,
+                Some(driver_transitions::TorqueTransition::Enable(_))
+            )
+    }
+
+    /// Thermal protection remains active while torqued, while enabling, or while torque
+    /// disable is unconfirmed. `was_active` preserves thermal protection when a torque
+    /// transition confirmed disable or exited `Enabling` on the exact same Step 2 poll that
+    /// delivered an over-temperature sample.
     ///
     /// Thermal cooldown accrues ONLY across consecutive fresh temperature samples; stale,
     /// unavailable, or gapped (> [`THERMAL_FEEDBACK_FRESHNESS_LIMIT`]) feedback resets or
@@ -3077,7 +3091,7 @@ impl SupervisorInner {
         // torque-off request; it intentionally bypasses `may_disable_torque_while_stopped` and
         // disables the motors in any pose (leaving an overheating motor energized is worse than
         // the arm dropping).
-        if (self.is_torqued || self.disable_pending || was_active)
+        if (self.thermal_protection_active() || was_active)
             && temperature_available
             && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip)
             && self
@@ -3932,7 +3946,7 @@ impl SupervisorInner {
         budget: &crate::rt_core::ops::ServiceBudget,
         release_deadline: Option<Instant>,
     ) -> crate::rt_core::ops::HardwarePoll {
-        let was_torqued_or_disabling = self.is_torqued || self.disable_pending;
+        let was_thermal_active = self.thermal_protection_active();
         // Install the release publish-margin TX cap BEFORE enable-transition polling, background
         // disable polling, and RX feedback intake so every TX in Step 2 obeys the same cutoff.
         let applied_step2_tx_cap = release_deadline
@@ -3953,9 +3967,9 @@ impl SupervisorInner {
         self.pending_rx_poll = rx;
         // Run thermal protection BEFORE consuming background disable confirmation and before
         // Step 2b maintenance (`ClearFault`/`RequestShutdown`) or Step 3 command admission so an
-        // over-temperature sample arriving on the same poll as confirmed disable cannot suppress
-        // `ThermalTrip`.
-        self.check_thermal_protection(was_torqued_or_disabling);
+        // over-temperature sample arriving on the same poll as confirmed disable or enabling
+        // cannot suppress `ThermalTrip`.
+        self.check_thermal_protection(was_thermal_active);
         let _ = self.confirm_background_disable_if_ready();
         let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
         let Some(driver) = self.driver.as_ref() else {

@@ -1965,6 +1965,38 @@ impl SupervisorInner {
         msg
     }
 
+    /// Enforces thermal protection inside the enable reducer (`Enabling` and post-enable
+    /// `Validate` before arming): any finite joint temperature above `max_temperature` aborts
+    /// the enable through `enter_failed_hold`, latches `FaultKind::ThermalTrip`, and starts
+    /// `DisableProtective { Thermal }` without ever arming.
+    fn check_enable_thermal_trip(
+        &mut self,
+        was_torqued: bool,
+        temperature_available: bool,
+    ) -> Option<EnableStepOutcome> {
+        if !temperature_available
+            || !self
+                .temperatures
+                .iter()
+                .any(|t| t.is_finite() && *t > self.config.max_temperature)
+        {
+            return None;
+        }
+        // Run `enter_failed_hold` BEFORE `StopPolicy::ThermalTrip` because `enter_failed_hold`
+        // clears `disable_pending` / `active_disable_kind`; `ThermalTrip` then latches
+        // highest-severity `FaultKind::ThermalTrip` and starts `DisableProtective { Thermal }`.
+        let message = self.enter_failed_hold(was_torqued, |buf| {
+            buf.push_str("thermal trip during enable");
+        });
+        self.apply_stop_policy(StopPolicy::ThermalTrip);
+        Some(EnableStepOutcome::Failed {
+            rt_code: "THERMAL_TRIP",
+            message,
+            feedback_unavailable: false,
+            estop_interrupted: false,
+        })
+    }
+
     /// Reducer-owned cancellation of an in-flight enable when `StopPolicy::ThermalTrip` takes
     /// over: cancels queued enable work, records the `ENABLE_FAILED` diagnostic with per-joint
     /// status (while `ThermalTrip` retains highest display precedence), and ends any pending RT
@@ -2112,8 +2144,12 @@ impl SupervisorInner {
                         None,
                     );
                 };
-                let (poll_res, rx, enable_fb, drv_now) = {
+                let mut scratch_states = std::mem::take(&mut self.scratch.states);
+                let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+                let lock_res = {
                     let Ok(mut drv) = d.lock() else {
+                        self.scratch.states = scratch_states;
+                        self.scratch.ages = scratch_ages;
                         let message = self.enter_failed_hold(reducer.was_torqued, |buf| {
                             buf.push_str("driver mutex poisoned during enable poll");
                         });
@@ -2127,18 +2163,42 @@ impl SupervisorInner {
                             None,
                         );
                     };
-                    let enable_fb = drv.capabilities().enable_feedback;
+                    let caps = drv.capabilities();
+                    let enable_fb = caps.enable_feedback;
+                    let temp_fb = caps.temperature_feedback;
                     let drv_now = drv.clock_now();
-                    if let Some(b) = budget {
+                    let (r, rx) = if let Some(b) = budget {
                         let span = b.deadline.saturating_duration_since(b.now);
                         let r = drv.poll_torque_budgeted(drv_now + span, b.max_rx_frames);
                         let rx = drv.take_last_poll_rx();
-                        (r, rx, enable_fb, drv_now)
+                        (r, rx)
                     } else {
                         let r = drv.poll_torque(drv_now + crate::driver::DAMIAO_RX_PASS);
-                        (r, None, enable_fb, drv_now)
+                        (r, None)
+                    };
+                    let mut cached_temps_read = false;
+                    if temp_fb && drv.read_cached_joint_states_into(&mut scratch_states).is_some() {
+                        drv.feedback_ages_into(&mut scratch_ages);
+                        cached_temps_read = true;
                     }
+                    (r, rx, enable_fb, temp_fb, drv_now, cached_temps_read)
                 };
+                let (poll_res, rx, enable_fb, temp_fb, drv_now, cached_temps_read) = lock_res;
+                if cached_temps_read {
+                    let n = self.config.dof.min(self.temperatures.len()).min(scratch_states.len());
+                    for i in 0..n {
+                        if scratch_ages.get(i).copied().flatten().is_some()
+                            && scratch_states[i].temperature.is_finite()
+                        {
+                            self.temperatures[i] = scratch_states[i].temperature;
+                        }
+                    }
+                }
+                self.scratch.states = scratch_states;
+                self.scratch.ages = scratch_ages;
+                if let Some(failed) = self.check_enable_thermal_trip(reducer.was_torqued, temp_fb) {
+                    return (failed, rx);
+                }
                 match poll_res {
                     Ok(Drv::Pending { wake }) => {
                         self.torque_transition = Some(TorqueTransition::Enable(reducer));
@@ -2232,11 +2292,12 @@ impl SupervisorInner {
             let mut scratch_states = std::mem::take(&mut self.scratch.states);
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
             let mut scratch_loads = std::mem::take(&mut self.scratch.loads);
-            let validate_res = {
+            let (validate_res, temp_fb) = {
                 let d = self.driver.as_ref().expect("checked is_some");
                 match d.lock() {
-                    Err(_) => Err("driver mutex poisoned during validation"),
+                    Err(_) => (Err("driver mutex poisoned during validation"), false),
                     Ok(mut driver) => {
+                        let temp_fb = driver.capabilities().temperature_feedback;
                         let read_res: Result<(), ()> = if use_cached {
                             if driver.read_cached_joint_states_into(&mut scratch_states).is_some() {
                                 Ok(())
@@ -2254,7 +2315,7 @@ impl SupervisorInner {
                             driver.read_joint_states_into(&mut scratch_states).map_err(|_| ())
                         };
                         if read_res.is_err() {
-                            Err("post-enable feedback unavailable")
+                            (Err("post-enable feedback unavailable"), temp_fb)
                         } else {
                             let has_loads = driver.joint_loads_into(&mut scratch_loads);
                             let loads_slice = has_loads.then_some(scratch_loads.as_slice());
@@ -2262,7 +2323,20 @@ impl SupervisorInner {
                                 || !Self::states_valid(&scratch_states, driver.capabilities(), self.config.dof, loads_slice)
                                 || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled)
                             {
-                                Err("post-enable feedback invalid or enable unconfirmed")
+                                // Preserve any finite received temperatures for thermal enforcement
+                                // even when another joint failed post-enable validation.
+                                if temp_fb {
+                                    driver.feedback_ages_into(&mut scratch_ages);
+                                    let n = self.config.dof.min(self.temperatures.len()).min(scratch_states.len());
+                                    for i in 0..n {
+                                        if scratch_ages.get(i).copied().flatten().is_some()
+                                            && scratch_states[i].temperature.is_finite()
+                                        {
+                                            self.temperatures[i] = scratch_states[i].temperature;
+                                        }
+                                    }
+                                }
+                                (Err("post-enable feedback invalid or enable unconfirmed"), temp_fb)
                             } else {
                                 driver.feedback_ages_into(&mut scratch_ages);
                                 let oldest_age = if scratch_ages.iter().all(Option::is_some) {
@@ -2283,7 +2357,7 @@ impl SupervisorInner {
                                     &scratch_states,
                                     loads_slice,
                                 );
-                                Ok(())
+                                (Ok(()), temp_fb)
                             }
                         }
                     }
@@ -2292,6 +2366,9 @@ impl SupervisorInner {
             self.scratch.states = scratch_states;
             self.scratch.ages = scratch_ages;
             self.scratch.loads = scratch_loads;
+            if let Some(failed) = self.check_enable_thermal_trip(was_torqued, temp_fb) {
+                return failed;
+            }
             if let Err(cause) = validate_res {
                 let message = self.enter_failed_hold(was_torqued, |buf| {
                     buf.push_str(cause);
@@ -2303,6 +2380,8 @@ impl SupervisorInner {
                     estop_interrupted: false,
                 };
             }
+        } else if let Some(failed) = self.check_enable_thermal_trip(was_torqued, true) {
+            return failed;
         }
 
         // Initialize commanded_positions to verified measured_positions to prevent sudden jumps

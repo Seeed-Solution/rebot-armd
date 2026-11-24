@@ -6016,3 +6016,243 @@ fn e4_damiao_unverified_mode_unheld_never_assumed_posvel() {
         "FailedHold tick must emit ZERO hold frames for unverified J3"
     );
 }
+
+/// Rule T1: Thermal checks are active during `Enabling`.
+/// Verifies:
+/// 1. RT `TransitionOp::TorqueOn` in `Enabling` (pending motor reply) receiving an over-temperature
+///    frame trips `ThermalTrip`, delivers `Outcome::Failed("THERMAL_TRIP")` to the broker, never
+///    arms, and transmits protective `CMD_DISABLE` even at a raised pose.
+/// 2. RT `TransitionOp::TorqueOn` whose confirming feedback frame carries an over-temperature
+///    sample trips inside `step_enable_validate` BEFORE arming (never returns `Completed` or arms).
+/// 3. Blocking `enable_torque()` trips `ThermalTrip` while `Enabling` when an over-temperature
+///    sample arrives, never arms, and transmits protective `CMD_DISABLE`.
+#[test]
+fn t1_thermal_checks_active_during_enabling_rt_and_legacy() {
+    use armd::rt_core::broker::{Outcome, Reply};
+    use armd::rt_core::ops::VirtualClock;
+
+    // 1. RT `TransitionOp::TorqueOn` still Pending in `Enabling` when J1 reports 92 °C (> 70 °C):
+    //    thermal protection MUST trip immediately, fail the transition with `THERMAL_TRIP`,
+    //    never arm, and send protective `CMD_DISABLE` at a raised pose.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.q = 0.40; // raised pose (not at rest)
+                m.enabled = false;
+                m.temperature_c = 35;
+                m.drop_torque_frames = 10; // keep TorqueOn pending
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            max_temperature: 70.0,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.tick(0.02);
+
+        let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(101),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(clock.clone()),
+        );
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        broker
+            .submit(
+                ClientId(1),
+                1,
+                auth,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::Enabling);
+        assert!(fx.core.torque_transition_pending());
+        assert!(!fx.core.is_torqued);
+
+        // Inject over-temperature on J1 while enable is still Pending in Enabling.
+        bus.clear_log();
+        bus.with(|s| {
+            s.motors[0].temperature_c = 92;
+            s.push_all_feedback();
+        });
+        let rep = fx.step();
+        assert!(
+            fx.core.safety.has_latched_fault_kind(armd::safety::FaultKind::ThermalTrip),
+            "T1: over-temp during Pending Enabling must latch ThermalTrip"
+        );
+        assert_eq!(fx.core.safety.fault_code(), Some(FaultCode::ThermalTrip));
+        assert!(
+            !matches!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::Armed),
+            "T1: thermal trip during Enabling must never arm"
+        );
+        assert!(
+            spec_count_damiao_disables(&bus) >= 7,
+            "T1: thermal trip during Enabling must transmit protective CMD_DISABLE at raised pose"
+        );
+        assert_eq!(
+            rep.transition_ended.map(|(_, o)| o),
+            Some(Outcome::Failed("THERMAL_TRIP")),
+            "T1: broker transition must end with THERMAL_TRIP"
+        );
+        let mut terminals = Vec::new();
+        broker.poll(|_, r| {
+            if let Reply::Terminal { outcome, .. } = r {
+                terminals.push(outcome);
+            }
+            true
+        });
+        assert_eq!(
+            terminals,
+            vec![Outcome::Failed("THERMAL_TRIP")],
+            "T1: broker must receive exactly one THERMAL_TRIP terminal"
+        );
+    }
+
+    // 2. RT `TransitionOp::TorqueOn` where the confirming feedback frame itself carries 95 °C:
+    //    `step_enable_validate` MUST trip ThermalTrip BEFORE arming (never returns Completed).
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.q = 0.40;
+                m.enabled = false;
+                m.temperature_c = 35;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            max_temperature: 70.0,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.rt_executor_owned = true;
+        inner.tick(0.02);
+
+        let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(102),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(clock.clone()),
+        );
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        broker
+            .submit(
+                ClientId(1),
+                2,
+                auth,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+
+        // Advance past the 20 ms causal settle window and make the confirming enable frames hot.
+        bus.clear_log();
+        bus.with(|s| {
+            s.motors[2].temperature_c = 95;
+        });
+        let mut terminal_outcomes = Vec::new();
+        for _ in 0..4 {
+            let _ = fx.step();
+            broker.poll(|_, r| {
+                if let Reply::Terminal { outcome, .. } = r {
+                    terminal_outcomes.push(outcome);
+                }
+                true
+            });
+        }
+        assert!(
+            fx.core.safety.has_latched_fault_kind(armd::safety::FaultKind::ThermalTrip),
+            "T1: confirming enable frame with 95 °C must latch ThermalTrip before arming"
+        );
+        assert!(
+            !matches!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::Armed),
+            "T1: arm must NEVER reach Armed when confirming frame is over-temperature"
+        );
+        assert_eq!(
+            terminal_outcomes,
+            vec![Outcome::Failed("THERMAL_TRIP")],
+            "T1: confirming over-temp frame must deliver THERMAL_TRIP, never Completed"
+        );
+        assert!(
+            spec_count_damiao_disables(&bus) >= 7,
+            "T1: protective CMD_DISABLE must be sent when confirming frame trips thermal"
+        );
+    }
+
+    // 3. Blocking `enable_torque()` when over-temperature arrives during `Enabling`:
+    //    must fail (never arm), latch `ThermalTrip`, and transmit protective `CMD_DISABLE`.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            for m in &mut s.motors {
+                m.q = 0.40;
+                m.enabled = false;
+                m.temperature_c = 35;
+            }
+            s.push_all_feedback();
+        });
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        drv.read_joint_states().unwrap();
+        drv.set_torque(false).unwrap();
+        drv.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            max_temperature: 70.0,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(drv));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+
+        // Over-temperature arrives on the motor replies during blocking enable_torque().
+        bus.clear_log();
+        bus.with(|s| {
+            s.motors[1].temperature_c = 88;
+        });
+        let res = enable_torque_admitted(&mut inner);
+        assert!(res.is_err(), "T1: blocking enable_torque must fail on over-temperature during Enabling");
+        assert!(
+            inner.safety.has_latched_fault_kind(armd::safety::FaultKind::ThermalTrip),
+            "T1: blocking enable_torque must latch ThermalTrip"
+        );
+        assert!(!inner.is_torqued, "T1: blocking enable_torque must confirm protective disable");
+        assert!(
+            !matches!(inner.enable_lifecycle(), armd::supervisor::EnableLifecycle::Armed),
+            "T1: blocking enable_torque must never arm on over-temperature"
+        );
+        assert!(
+            spec_count_damiao_disables(&bus) >= 7,
+            "T1: blocking enable_torque thermal trip must transmit protective CMD_DISABLE"
+        );
+    }
+}
