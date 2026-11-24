@@ -544,7 +544,13 @@ fn stopped_torque_off_confirm_timeout_zero_alloc() {
             break;
         }
     }
-    assert_eq!(ended, Some(Outcome::Failed("FEEDBACK_UNCONFIRMED")));
+    assert_eq!(
+        ended,
+        Some(Outcome::Completed),
+        "R10: accepted disable at rest finishes Completed after bounded repeats even when motors are silent"
+    );
+    assert_eq!(fx.core.torque_intent, armd::TorqueIntent::Off);
+    assert!(!fx.core.is_torqued);
     assert_eq!(*fx.core.safety.state(), SafetyState::EStop);
     assert_eq!(fx.core.safety.epoch_id(), epoch_before);
     assert_eq!(fx.core.safety.latched_fault_kinds(), kinds_before);
@@ -552,7 +558,7 @@ fn stopped_torque_off_confirm_timeout_zero_alloc() {
     assert_eq!(
         (total_allocs, total_frees),
         (0, 0),
-        "confirmation timeout while already stopped must allocate 0"
+        "bounded disable repeats with silent motors while stopped must allocate 0"
     );
 }
 
@@ -910,8 +916,10 @@ fn r1_feetech_failed_hold_zero_alloc() {
     assert!(SupervisorInner::enable_torque(admitted).is_err());
     assert_eq!(inner2.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
 
-    // Refresh fresh feedback + owner_driver_snapshot via one FailedHold tick, then prove
+    // Advance past Feetech's 20 ms poisoned-line quiet window after enable readback timeout,
+    // refresh fresh feedback + owner_driver_snapshot via one FailedHold tick, then prove
     // zero-allocation stopped-hold service passes (no Vec alloc for positions or SYNC_WRITE pkt).
+    clock.advance(Duration::from_millis(25));
     inner2.tick(0.02);
     bus.state.lock().unwrap().sync_write_count = 0;
     for _ in 0..3 {
@@ -1066,7 +1074,8 @@ fn r1_mit_stopped_hold_zero_alloc() {
 #[test]
 fn l3_stopped_hold_try_lock_contention_and_empty_mask_zero_alloc() {
     use armd::diagnostics::tick::{
-        reset_stopped_hold_lock_contended, stopped_hold_lock_contended_count,
+        reset_stopped_hold_contention_escalations, reset_stopped_hold_lock_contended,
+        stopped_hold_contention_escalations_count, stopped_hold_lock_contended_count,
     };
     use std::time::Instant;
 
@@ -1079,33 +1088,43 @@ fn l3_stopped_hold_try_lock_contention_and_empty_mask_zero_alloc() {
     assert_ne!(fx.core.owner_hold_mask(), 0);
     assert_eq!(fx.core.owner_pending_hold_mask(), 0);
 
-    // Hold the driver mutex on another OS thread throughout the contention + empty-mask checks.
+    // Hold the driver mutex on another OS thread throughout the contention + escalation + empty-mask checks.
     reset_stopped_hold_lock_contended();
+    reset_stopped_hold_contention_escalations();
     fx.core.with_contended_driver_for_test(|core| {
-        // 1. Non-empty hold mask while driver mutex is contended:
-        //    `service_stopped_measured_hold_complete` MUST NOT block, skips send (`false`),
-        //    increments `stopped_hold_lock_contended_count`, and allocates (0, 0).
-        let t0 = Instant::now();
-        let (sent, a1, f1) = counted(|| core.service_stopped_measured_hold_complete(0.02, false));
-        let elapsed1 = t0.elapsed();
-        assert!(!sent, "L3: contended driver mutex must skip stopped-hold TX");
-        assert!(
-            elapsed1 < Duration::from_millis(20),
-            "L3: contended try_lock must not block, took {elapsed1:?}"
-        );
-        assert_eq!(
-            stopped_hold_lock_contended_count(),
-            1,
-            "L3: contended try_lock must increment diagnostics counter"
-        );
-        assert_eq!(
-            (a1, f1),
-            (0, 0),
-            "L3: contended stopped-hold skip must allocate 0 and free 0"
-        );
+        // 1. Non-empty hold mask while driver mutex is contended across all N=25 consecutive skips:
+        //    MUST NOT block, skips send (`false`), increments `stopped_hold_lock_contended_count`,
+        //    escalates on tick N=25 with a counted warning + non-recoverable HardwareFault, and
+        //    allocates (0, 0) on EVERY tick including the escalation tick!
+        for skip in 1..=armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+            let t0 = Instant::now();
+            let (sent, a1, f1) = counted(|| core.service_stopped_measured_hold_complete(0.02, false));
+            let elapsed1 = t0.elapsed();
+            assert!(!sent, "L3: contended driver mutex must skip stopped-hold TX (skip {skip})");
+            assert!(
+                elapsed1 < Duration::from_millis(20),
+                "L3: contended try_lock must not block on skip {skip}, took {elapsed1:?}"
+            );
+            assert_eq!(
+                stopped_hold_lock_contended_count(),
+                u64::from(skip),
+                "L3: contended try_lock must increment diagnostics counter on skip {skip}"
+            );
+            assert_eq!(
+                (a1, f1),
+                (0, 0),
+                "L3: contended stopped-hold skip #{skip} (incl. N=25 escalation) must allocate 0 and free 0"
+            );
+            if skip < armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS {
+                assert_eq!(stopped_hold_contention_escalations_count(), 0);
+            } else {
+                assert_eq!(stopped_hold_contention_escalations_count(), 1);
+                assert!(core.safety.has_latched_fault_code(armd::FaultCode::HardwareFault));
+            }
+        }
 
         // 2. Empty hold mask (no eligible joints, no pending holds) while driver mutex is STILL
-        //    held: MUST take NO lock at all -> counter stays unchanged at 1 and allocates (0, 0).
+        //    held: MUST take NO lock at all -> counter stays unchanged at N=25 and allocates (0, 0).
         core.invalidate_owner_driver_snapshot_for_test();
         let t1 = Instant::now();
         let (sent_empty, a2, f2) =
@@ -1119,7 +1138,7 @@ fn l3_stopped_hold_try_lock_contention_and_empty_mask_zero_alloc() {
         );
         assert_eq!(
             stopped_hold_lock_contended_count(),
-            1,
+            u64::from(armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS),
             "L3: empty mask MUST NOT call try_lock or touch driver mutex"
         );
         assert_eq!(
@@ -1137,5 +1156,8 @@ fn l3_stopped_hold_try_lock_contention_and_empty_mask_zero_alloc() {
     let (sent_ok, a3, f3) = counted(|| fx.core.service_stopped_measured_hold_complete(0.02, false));
     assert!(sent_ok, "L3: uncontended stopped-hold TX must succeed");
     assert_eq!((a3, f3), (0, 0));
-    assert_eq!(stopped_hold_lock_contended_count(), 1);
+    assert_eq!(
+        stopped_hold_lock_contended_count(),
+        u64::from(armd::STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS)
+    );
 }

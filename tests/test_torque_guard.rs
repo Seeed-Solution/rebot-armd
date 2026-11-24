@@ -429,7 +429,9 @@ fn j4_incident_ramp_trips_before_9_5_is_held_100_ms() {
     assert!(t_trip - t_peak < 100.0, "9.5 N·m held {} ms before the trip", t_trip - t_peak);
 }
 
-/// Bus loss, then the motors come back Disabled (power reset): torque state off, Fault kept.
+/// Bus loss, then the motors come back Disabled (power reset): feedback claiming Disabled is
+/// telemetry only — holds stay active (`is_torqued == true`) and Fault is kept until cleared;
+/// explicit disable stops holds.
 #[test]
 fn bus_loss_then_motors_back_disabled_sets_torque_off_and_keeps_the_fault() {
     let (mut inner, arm) = rig();
@@ -438,20 +440,27 @@ fn bus_loss_then_motors_back_disabled_sets_torque_off_and_keeps_the_fault() {
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "{:?}", obs.safety_state);
     assert_eq!(obs.fault.as_ref().unwrap().code, FaultCode::BusLoss);
     assert!(obs.is_torqued, "torque state unknown while feedback is stale");
-    // feedback returns, every motor reports Disabled (supervisor no longer runs decode-seq sync
-    // during stopped ticks; OffConfirmed motors are skipped by measured-position holds, and
-    // explicit clear_fault reconciles is_torqued = false once every motor is Disabled).
+    // feedback returns, every motor reports Disabled (telemetry only — holds remain default
+    // and is_torqued stays true until an explicit disable is accepted).
     arm.with(|s| { s.stale = false; s.torqued = false; });
     let obs = ticks(&mut inner, 1);
     println!("SIM bus loss + power reset: is_torqued {} enable_state {:?} fault {:?}", obs.is_torqued, obs.enable_state, obs.fault.as_ref().map(|f| f.code));
     assert_eq!(obs.enable_state, EnableState::Disabled);
+    assert!(obs.is_torqued, "reported Disabled feedback is telemetry only; holds continue");
     assert_eq!(obs.fault.as_ref().unwrap().code, FaultCode::BusLoss, "fault kept until clear_fault");
     let obs = ticks(&mut inner, 20);
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)));
-    // clear_fault works and leaves torque off; re-arm is a normal torque-on
+    assert!(obs.is_torqued);
+    // clear_fault clears the fault latch while holds remain active; move to rest pose so
+    // explicit disable passes the rest-pose gate and turns torque off.
     inner.clear_fault().unwrap();
     let obs = ticks(&mut inner, 2);
-    assert!(!obs.is_torqued && obs.fault.is_none(), "{:?}", obs.safety_state);
+    assert!(obs.is_torqued && obs.fault.is_none(), "{:?}", obs.safety_state);
+    arm.with(|s| { s.q = [0.0; 7]; s.forced[2] = Some(0.0); });
+    ticks(&mut inner, 3);
+    inner.disable_torque().unwrap();
+    assert!(!ticks(&mut inner, 2).is_torqued);
+    arm.with(|s| s.forced[2] = None);
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     assert!(ticks(&mut inner, 2).is_torqued);
 }

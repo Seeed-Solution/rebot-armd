@@ -7,7 +7,7 @@ mod mit_support;
 static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1495,7 +1495,12 @@ fn paired_fault_kinds_refuse_clear_until_both_conditions_hold_and_report_most_se
             Ok((0..self.dof).map(|_| JointState { temperature: t, ..JointState::default() }).collect())
         }
         fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
-        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+            if !enable {
+                return Err(ArmDriverError::HardwareFault("bus busy".into()));
+            }
+            Ok(())
+        }
     }
     let mut sup_inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(AgeTempDriver {
         dof: cfg.dof,
@@ -2566,10 +2571,17 @@ fn mit_expiry_recovery_final_check_uses_post_recovery_feedback() {
             FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("joint 1 out of limits")),
         );
         let over_limit = cfg.limits[0].max_position + 0.3;
+        let disable_frames = Arc::new(AtomicUsize::new(0));
+        let disable_frames_cb = Arc::clone(&disable_frames);
         bus.with(|s| {
             s.motors[0].q = cfg.home_positions[0];
             s.on_disable_state = Some(Arc::new(move |st| {
-                st.motors[0].q = over_limit;
+                // R10 disable sends 3 repeats x 7 motors = 21 CMD_DISABLE frames.
+                // Move J0 over limit on the 15th frame (J0 on the 3rd/final pass) so
+                // passes 1-2 pass Rule A' at rest and post-recovery feedback reports over_limit.
+                if disable_frames_cb.fetch_add(1, Ordering::Relaxed) + 1 >= 15 {
+                    st.motors[0].q = over_limit;
+                }
             }));
         });
         for i in 0..3 {
@@ -3423,7 +3435,9 @@ fn mit_recovery_no_fence_ack_or_state_change_before_clear_check_passes() {
                 clock.advance(Duration::from_millis(12));
             }
             bus.with(|s| s.push_all_feedback());
-            inner.driver.as_ref().unwrap().lock().unwrap().read_joint_states().unwrap();
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            drv.begin_control_release(100 + i as u64);
+            drv.read_joint_states().unwrap();
         }
         let err_unconf = inner.clear_fault_confirmed(false).unwrap_err();
         assert!(matches!(err_unconf, ArmError::Rejected { ref code, .. } if code == mit::RECOVERY_CONFIRM_CODE), "{err_unconf}");

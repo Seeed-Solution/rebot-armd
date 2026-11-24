@@ -86,7 +86,8 @@ fn damiao_requires_new_enable_feedback_and_exposes_real_sample_age() {
         driver.set_torque(true).is_err(),
         "queued pre-enable feedback must not confirm enable"
     );
-    assert_eq!(driver.enable_state(), EnableState::Unknown);
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+    assert!(!driver.is_enabled());
     let ctrl_mode_reply = CanFrame::new_standard(
         0x11,
         &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
@@ -154,28 +155,30 @@ fn damiao_disable_needs_feedback_and_failure_does_not_fabricate_disabled_status(
         Some(vec![1]),
         "a failed write must not rewrite observed state"
     );
-    assert_eq!(driver.enable_state(), EnableState::Unknown);
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
 
+    driver.can_mut().take_tx_frames();
     driver.set_torque(false).unwrap();
+    let disable_tx: Vec<_> = driver
+        .can_mut()
+        .take_tx_frames()
+        .into_iter()
+        .filter(|f| *f == damiao::build_disable_frame(1))
+        .collect();
+    assert_eq!(
+        disable_tx.len(),
+        usize::from(armd::driver::DAMIAO_DISABLE_REPEATS),
+        "accepted disable must transmit all bounded repeats"
+    );
+    assert!(!driver.is_enabled());
+    assert_eq!(driver.motor_status(), Some(vec![1]));
     assert_eq!(
         driver.enable_state(),
-        EnableState::Unknown,
-        "successful send alone is not disable confirmation"
+        EnableState::Enabled,
+        "successful send alone must not fabricate state=0"
     );
-    for i in 0..3 {
-        if i > 0 {
-            thread::sleep(Duration::from_millis(12));
-        }
-        driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
-        driver.read_joint_states().unwrap();
-        if i < 2 {
-            assert_eq!(
-                driver.enable_state(),
-                EnableState::Unknown,
-                "single/sub-20ms state-0 feedback must not confirm disable"
-            );
-        }
-    }
+    driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
+    driver.read_joint_states().unwrap();
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 
@@ -228,27 +231,21 @@ fn queued_disabled_feedback_cannot_acknowledge_a_later_disable_command() {
     driver
         .can_mut()
         .remove_transmit_response(&damiao::build_refresh_frame(1));
+    driver.can_mut().take_tx_frames();
     driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
     driver.set_torque(false).unwrap();
+    let disable_tx: Vec<_> = driver
+        .can_mut()
+        .take_tx_frames()
+        .into_iter()
+        .filter(|f| *f == damiao::build_disable_frame(1))
+        .collect();
     assert_eq!(
-        driver.enable_state(),
-        EnableState::Unknown,
-        "pre-command state=0 is not a disable ACK"
+        disable_tx.len(),
+        usize::from(armd::driver::DAMIAO_DISABLE_REPEATS),
+        "pre-command state=0 telemetry must not skip disable TX repeats"
     );
-    for i in 0..3 {
-        if i > 0 {
-            thread::sleep(Duration::from_millis(12));
-        }
-        driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
-        driver.read_joint_states().unwrap();
-        if i < 2 {
-            assert_eq!(
-                driver.enable_state(),
-                EnableState::Unknown,
-                "single/sub-20ms state-0 feedback must not confirm disable"
-            );
-        }
-    }
+    assert!(!driver.is_enabled());
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 
@@ -278,32 +275,25 @@ fn overloaded_rx_still_sends_disable_but_requires_a_new_feedback_boundary() {
         driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
     }
     driver.set_torque(false).unwrap();
-    assert!(driver
-        .can_mut()
-        .take_tx_frames()
-        .iter()
-        .any(|f| *f == damiao::build_disable_frame(1)));
+    assert_eq!(
+        driver
+            .can_mut()
+            .take_tx_frames()
+            .into_iter()
+            .filter(|f| *f == damiao::build_disable_frame(1))
+            .count(),
+        usize::from(armd::driver::DAMIAO_DISABLE_REPEATS)
+    );
+    assert!(!driver.is_enabled());
     assert_eq!(driver.enable_state(), EnableState::Unknown);
     driver.read_joint_states().unwrap();
     assert_eq!(
         driver.enable_state(),
         EnableState::Unknown,
-        "draining old frames cannot confirm disable"
+        "draining old frames cannot update telemetry past the boundary"
     );
-    for i in 0..3 {
-        if i > 0 {
-            thread::sleep(Duration::from_millis(12));
-        }
-        driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
-        driver.read_joint_states().unwrap();
-        if i < 2 {
-            assert_eq!(
-                driver.enable_state(),
-                EnableState::Unknown,
-                "single/sub-20ms state-0 feedback must not confirm disable"
-            );
-        }
-    }
+    driver.can_mut().provide_rx_frame(feedback(0, 30, 32));
+    driver.read_joint_states().unwrap();
     assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 

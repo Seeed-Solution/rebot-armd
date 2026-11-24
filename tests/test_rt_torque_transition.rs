@@ -178,11 +178,11 @@ fn an_enable_a_motor_never_confirms_fails_with_the_fault_and_torque_stays_off() 
     let raised_fault = r_raised.fx.core.safety.fault().expect("ENABLE_FAILED fault expected");
     assert_eq!(raised_fault.code, armd::FaultCode::EnableFailed);
     assert!(!r_raised.fx.core.safety.recoverable(), "ENABLE_FAILED must be non-recoverable");
-    assert!(raised_fault.message.contains("J4:unk/queued"), "missing initial per-joint status: {}", raised_fault.message);
+    assert!(raised_fault.message.contains("J4:queued"), "missing initial per-joint status: {}", raised_fault.message);
     r_raised.bus.with(|s| s.push_all_feedback());
     r_raised.step();
     let live_fault = r_raised.fx.core.current_observation().fault.expect("live observation fault expected");
-    assert!(live_fault.message.contains("J4:unk/held"), "missing live post-hold per-joint status: {}", live_fault.message);
+    assert!(live_fault.message.contains("J4:held"), "missing live post-hold per-joint status: {}", live_fault.message);
 
     // 3. Rest pose with non-confirming motor: STILL NO automatic rollback (0 disables), enters
     //    FailedHold + non-recoverable `ENABLE_FAILED`; a later explicit TorqueOff at rest
@@ -246,10 +246,13 @@ fn a_disable_waits_for_fresh_disabled_feedback_and_holds_no_output_meanwhile() {
     // no target frame while the transition owned the bus (only disable retries / polls)
     let targets = r.bus.tx_log().iter().filter(|f| (1..=7).contains(&f.id) && f.data != damiao::CMD_DISABLE).count();
     assert_eq!(targets, 0, "{:?}", r.bus.tx_log());
+    let disables = r.bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
+    assert_eq!(disables, 14, "remaining 2 bounded disable repeats across 7 motors: {disables}");
     let inner = &r.fx.core;
+    assert_eq!(inner.torque_intent(), armd::TorqueIntent::Off);
     assert!(!inner.is_torqued && !inner.disable_pending && !inner.pending_rearm && !inner.torque_transition_pending());
     assert_eq!(*inner.safety.state(), armd::SafetyState::Idle);
-    assert!(reports.iter().map(|p| p.wakes).sum::<u32>() > 0, "the confirmation was served between releases");
+    assert!(reports.len() >= 2, "bounded 20 ms repeats execute across release ticks");
 }
 
 

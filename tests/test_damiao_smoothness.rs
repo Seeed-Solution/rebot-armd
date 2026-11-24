@@ -309,8 +309,9 @@ fn is_refresh(frame: &CanFrame) -> bool {
 
 #[test]
 fn all_motors_reporting_disabled_override_cached_enable_flag() {
-    // Motor power dip: an unsolicited 0x0 frame after enable invalidates OnConfirmed to Unknown
-    // (never claims Enabled and never uses unsolicited 0x0 to claim OffConfirmed).
+    // Reported enable state from feedback is telemetry: when the motor reports state 0
+    // (e.g., power dip), telemetry reflects EnableState::Disabled immediately while a subsequent
+    // disable transaction also leaves telemetry at Disabled.
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
     let fb_on = feedback_frame(1, 1, 0.0);
     let fb_off = feedback_frame(1, 0, 0.0);
@@ -323,9 +324,8 @@ fn all_motors_reporting_disabled_override_cached_enable_flag() {
     thread::sleep(Duration::from_millis(5));
     driver.can_mut().provide_rx_frame(fb_off);
     driver.read_joint_states().unwrap();
-    assert_eq!(driver.enable_state(), EnableState::Unknown);
+    assert_eq!(driver.enable_state(), EnableState::Disabled);
 
-    // Only a verified disable transaction with post-disable 0x0 confirms Disabled.
     driver.can_mut().respond_to_transmit(damiao::build_disable_frame(1), fb_off);
     driver.can_mut().replace_transmit_response(damiao::build_refresh_frame(1), fb_off);
     driver.set_torque(false).unwrap();

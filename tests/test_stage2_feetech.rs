@@ -199,29 +199,20 @@ fn test_feetech_torque_enable_rollback() {
     let mut rx = Vec::new();
     rx.extend_from_slice(&resp1);
     rx.extend_from_slice(&resp2);
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx);
-    }
+    driver.transport_mut().provide_rx(&rx);
 
     let res = driver.set_torque(true);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert!(matches!(err, ArmDriverError::HardwareFault(_)));
-    // Per-motor evidence reflects causal readback: servo 1 OnConfirmed, servo 2 OffConfirmed -> aggregate Unknown.
+    // Telemetry reflects causal readback: servo 1 enabled, servo 2 disabled -> aggregate Unknown.
     assert_eq!(driver.enable_state(), EnableState::Unknown);
-    let mut ev = [armd::driver::MotorTorqueEvidence::Unknown; 2];
-    driver.motor_torque_evidence_into(&mut ev);
-    assert_eq!(
-        ev,
-        [
-            armd::driver::MotorTorqueEvidence::OnConfirmed,
-            armd::driver::MotorTorqueEvidence::OffConfirmed,
-        ]
-    );
+    assert!(driver.has_known_partial_enable());
+    assert!(driver.has_any_joint_enabled());
 
-    // Verify NO local rollback: only pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + 3 rounds Readback reads (3*2*8=48) = 78 bytes
+    // Verify NO local rollback: only pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + 1 round Readback reads (2*8=16) = 46 bytes
     let tx = driver.transport_mut().take_tx();
-    assert_eq!(tx.len(), 78, "Feetech must not transmit automatic rollback disable packets");
+    assert_eq!(tx.len(), 46, "Feetech must not transmit automatic rollback disable packets");
 }
 
 // -------------------------------------------------------------------------
@@ -684,9 +675,7 @@ fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     let mut rx = Vec::new();
     rx.extend_from_slice(&resp1);
     rx.extend_from_slice(&resp2);
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx);
-    }
+    driver.transport_mut().provide_rx(&rx);
     driver.set_torque(true).unwrap();
     assert_eq!(driver.enable_state(), EnableState::Enabled);
     let _ = driver.transport_mut().take_tx();
@@ -699,9 +688,7 @@ fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     let mut rx_fail = Vec::new();
     rx_fail.extend_from_slice(&resp1);
     rx_fail.extend_from_slice(&resp2_zero);
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_fail);
-    }
+    driver.transport_mut().provide_rx(&rx_fail);
 
     let res = driver.set_torque(true);
     assert!(res.is_err());
@@ -709,10 +696,10 @@ fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     assert_eq!(driver.enable_state(), EnableState::Unknown);
 
     // M4: Holding targets are preserved on already-enabled joints, so no pre-seeding SYNC_WRITE is sent.
-    // TX should contain 2 enable writes + 3 rounds * 2 readback reads = 64 bytes.
+    // TX should contain 2 enable writes + 1 round * 2 readback reads = 32 bytes.
     // It must NOT contain rollback disable writes (which would be another 16 bytes with value 0).
     let tx = driver.transport_mut().take_tx();
-    assert_eq!(tx.len(), 64);
+    assert_eq!(tx.len(), 32);
     for window in tx.windows(8) {
         if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE && window[5] == REG_TORQUE_ENABLE {
             assert_eq!(window[6], 1, "Must never send torque disable rollback when already enabled");
@@ -1168,12 +1155,10 @@ fn test_feetech_set_torque_preseeding_goal_position() {
     let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs2 = calculate_checksum(2, 3, 0x00, &[1]);
     driver.transport_mut().take_tx(); // clear previous TX
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&[
-            0xFF, 0xFF, 1, 3, 0x00, 1, cs1,
-            0xFF, 0xFF, 2, 3, 0x00, 1, cs2,
-        ]);
-    }
+    driver.transport_mut().provide_rx(&[
+        0xFF, 0xFF, 1, 3, 0x00, 1, cs1,
+        0xFF, 0xFF, 2, 3, 0x00, 1, cs2,
+    ]);
     driver.set_torque(true).unwrap();
 
     let tx_with_fb = driver.transport_mut().take_tx();
@@ -1236,9 +1221,7 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
     {
         let mut m = mock.lock().unwrap();
         m.provide_rx(&rx_normal);
-        for _ in 0..3 {
-            m.provide_rx(&rx_tq1);
-        }
+        m.provide_rx(&rx_tq1);
         m.provide_rx(&rx_normal);
     }
 
@@ -1265,19 +1248,26 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
 
     // Attempting clear_fault() calls drv.clear_fault(), which disables torque on the bus (REG_TORQUE_ENABLE = 0),
     // and asks to wait for fresh fault-free feedback before retrying.
-    // Provide fresh feedback for resting-pose support pre-check (still showing 0x20 error), followed by tq0 for clear_fault readback
+    // Feed 3 spaced rest-pose ticks (>= 20 ms span across 3 control releases) so the K=3 rest-pose gate passes,
+    // followed by fresh rest feedback and 1 causal tq0 reply for clear_fault's own check + readback.
     let mut rx_rest = vec![0xFF, 0xFF, 1, 10, 0x20];
     rx_rest.extend_from_slice(&normal_params);
     rx_rest.push(cs_overload);
+    for _ in 0..3 {
+        {
+            let mut m = mock.lock().unwrap();
+            m.advance_clock(Duration::from_millis(10));
+            m.provide_rx(&rx_rest);
+        }
+        supervisor.tick(0.02).await;
+    }
     let cs_tq0 = calculate_checksum(1, 3, 0x00, &[0]);
     let rx_tq0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_tq0];
     {
         let mut m = mock.lock().unwrap();
         m.advance_clock(Duration::from_millis(10));
         m.provide_rx(&rx_rest);
-        for _ in 0..3 {
-            m.provide_rx(&rx_tq0);
-        }
+        m.provide_rx(&rx_tq0);
     }
 
     let clear_err = supervisor.clear_fault().await.unwrap_err();
@@ -1542,18 +1532,16 @@ fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable()
 
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs_tq2 = calculate_checksum(2, 3, 0x00, &[0]);
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&[
-            0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1,
-            0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq2,
-        ]);
-    }
+    driver.transport_mut().provide_rx(&[
+        0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1,
+        0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq2,
+    ]);
 
     let _ = driver.transport_mut().take_tx();
     driver.clear_fault().unwrap();
 
     let tx = driver.transport_mut().take_tx();
-    assert_eq!(tx.len(), 56);
+    assert_eq!(tx.len(), 24);
     assert_eq!(tx[2], 2);
     assert_eq!(tx[4], INST_WRITE);
     assert_eq!(tx[5], REG_TORQUE_ENABLE);
@@ -1600,9 +1588,7 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
     {
         let mut m = mock.lock().unwrap();
         m.provide_rx(&rx_normal);
-        for _ in 0..3 {
-            m.provide_rx(&rx_tq1);
-        }
+        m.provide_rx(&rx_tq1);
         m.provide_rx(&rx_normal);
     }
 
@@ -1667,9 +1653,7 @@ async fn test_supervisor_set_torque_and_clear_fault_sync_loads_enforcing_support
     {
         let mut m = mock.lock().unwrap();
         m.provide_rx(&rx_heavy);
-        for _ in 0..3 {
-            m.provide_rx(&rx_tq1);
-        }
+        m.provide_rx(&rx_tq1);
         m.provide_rx(&rx_heavy);
     }
 
@@ -1846,9 +1830,7 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
     let cs_en1 = calculate_checksum(1, 3, 0x00, &[0]);
     let cs_en2 = calculate_checksum(2, 3, 0x00, &[0]);
     let rx_ref = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_ref);
-    }
+    driver.transport_mut().provide_rx(&rx_ref);
     let en_state = driver.refresh_enable_state().unwrap();
     assert_eq!(en_state, EnableState::Disabled);
     let _ = driver.transport_mut().take_tx();
@@ -1871,9 +1853,7 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
     assert!(driver.transport_mut().take_tx().is_empty());
 
     let rx_tq_off = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_tq_off);
-    }
+    driver.transport_mut().provide_rx(&rx_tq_off);
     driver
         .disable_torque(armd::driver::DisableKind::DisableProtective {
             reason: armd::driver::DisableProtectiveReason::ProcessExit,
@@ -1924,9 +1904,7 @@ fn test_feetech_partial_enable_holding_preservation() {
     let cs_en1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs_en2 = calculate_checksum(2, 3, 0x00, &[0]);
     let rx_refresh = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_refresh);
-    }
+    driver.transport_mut().provide_rx(&rx_refresh);
     let state = driver.refresh_enable_state().unwrap();
     assert_eq!(state, EnableState::Unknown);
     assert!(driver.has_known_partial_enable());
@@ -1942,9 +1920,7 @@ fn test_feetech_partial_enable_holding_preservation() {
         0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq_rb1,
         0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq_rb2,
     ];
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_enable_rb);
-    }
+    driver.transport_mut().provide_rx(&rx_enable_rb);
 
     let err = driver.set_torque(true).unwrap_err();
     assert!(matches!(err, ArmDriverError::HardwareFault(_)));
@@ -1957,19 +1933,11 @@ fn test_feetech_partial_enable_holding_preservation() {
     assert_eq!(tx[4], feetech::INST_SYNC_WRITE);
     assert_eq!(tx[7], 2); // Servo ID 2 only!
 
-    // Verify NO local rollback write: SyncWrite (11) + Enable writes (2*8=16) + 3 rounds Readback reads (3*2*8=48) = 75 bytes
-    assert_eq!(tx.len(), 75);
+    // Verify NO local rollback write: SyncWrite (11) + Enable writes (2*8=16) + 1 round Readback reads (2*8=16) = 43 bytes
+    assert_eq!(tx.len(), 43);
 
-    // And joint 1 remains known enabled while joint 2 is confirmed off!
-    let mut ev = [armd::driver::MotorTorqueEvidence::Unknown; 2];
-    driver.motor_torque_evidence_into(&mut ev);
-    assert_eq!(
-        ev,
-        [
-            armd::driver::MotorTorqueEvidence::OnConfirmed,
-            armd::driver::MotorTorqueEvidence::OffConfirmed,
-        ]
-    );
+    // And telemetry reports joint 1 enabled while joint 2 disabled (partial enable).
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
     assert!(driver.has_known_partial_enable());
     assert!(driver.has_any_joint_enabled());
 }
@@ -1988,9 +1956,7 @@ fn test_feetech_refresh_enable_state_bus_recovery() {
     let cs_0_1 = calculate_checksum(1, 3, 0x00, &[0]);
     let cs_0_2 = calculate_checksum(2, 3, 0x00, &[0]);
     let rx_all_0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_0_1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_0_2];
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_all_0);
-    }
+    driver.transport_mut().provide_rx(&rx_all_0);
 
     let state = driver.refresh_enable_state().unwrap();
     assert_eq!(state, EnableState::Disabled);
@@ -2002,9 +1968,7 @@ fn test_feetech_refresh_enable_state_bus_recovery() {
     let cs_1_1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs_1_2 = calculate_checksum(2, 3, 0x00, &[1]);
     let rx_all_1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_1_1, 0xFF, 0xFF, 2, 3, 0x00, 1, cs_1_2];
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_all_1);
-    }
+    driver.transport_mut().provide_rx(&rx_all_1);
 
     let state = driver.refresh_enable_state().unwrap();
     assert_eq!(state, EnableState::Enabled);
@@ -2051,9 +2015,7 @@ async fn test_supervisor_clear_fault_rejects_stale_or_moving_pose_before_hardwar
     {
         let mut m = mock.lock().unwrap();
         m.provide_rx(&rx_normal);
-        for _ in 0..3 {
-            m.provide_rx(&rx_tq1);
-        }
+        m.provide_rx(&rx_tq1);
         m.provide_rx(&rx_normal);
     }
 
@@ -2362,16 +2324,11 @@ async fn test_feetech_supervisor_estop_abort_lifecycle() {
     let tx_tick = mock.lock().unwrap().take_tx();
     assert!(!tx_tick.is_empty(), "tick sends hold targets during E-stop hold");
 
-    // Clear fault: supervisor.clear_fault() succeeds
-    let cs_en1 = calculate_checksum(1, 3, 0x00, &[0]);
-    let cs_en2 = calculate_checksum(2, 3, 0x00, &[0]);
-    let rx_cf = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
+    // Clear fault: supervisor.clear_fault() succeeds (enable state is telemetry only under R10,
+    // so clear_fault only reads joint states when no hardware fault is latched).
     {
         let mut m = mock.lock().unwrap();
         m.provide_rx(&rx_fb);
-        for _ in 0..3 {
-            m.provide_rx(&rx_cf);
-        }
     }
     let clear_res = supervisor.clear_fault().await;
     assert!(clear_res.is_ok(), "clear_fault must succeed: {:?}", clear_res);
@@ -2382,9 +2339,7 @@ async fn test_feetech_supervisor_estop_abort_lifecycle() {
     let rx_enable = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1, 0xFF, 0xFF, 2, 3, 0x00, 1, cs_tq2];
     {
         let mut m = mock.lock().unwrap();
-        for _ in 0..3 {
-            m.provide_rx(&rx_enable);
-        }
+        m.provide_rx(&rx_enable);
     }
     let enable_res = supervisor.enable_torque(supervisor.capture_admission_stamp()).await;
     assert!(enable_res.is_ok(), "set_torque(true) must succeed after clear_fault: {:?}", enable_res);
@@ -2717,9 +2672,7 @@ fn test_feetech_enable_poll_unstarves_when_position_chunk_timeouts() {
 
     let mut init_rx = Vec::new();
     init_rx.extend_from_slice(&fb);
-    for _ in 0..3 {
-        init_rx.extend_from_slice(&rx_tq1);
-    }
+    init_rx.extend_from_slice(&rx_tq1);
     driver.transport_mut().provide_rx(&init_rx);
 
     driver.set_torque(true).unwrap();
@@ -2736,20 +2689,20 @@ fn test_feetech_enable_poll_unstarves_when_position_chunk_timeouts() {
     driver.transport_mut().provide_rx(&rx_tq0);
 
     // read_joint_states() should poll REG_TORQUE_ENABLE first (before position chunks),
-    // detect torque loss immediately (dropping enable_state from Enabled to Unknown on 1 sample),
-    // and then K=3 refresh_enable_state confirms EnableState::Disabled even after position chunk timeout.
+    // updating reported enable telemetry to EnableState::Disabled on the single causal 0 read,
+    // and refresh_enable_state() also confirms EnableState::Disabled after position chunk timeout.
     let _ = driver.read_joint_states();
     assert_eq!(
         driver.enable_state(),
-        EnableState::Unknown,
-        "Torque loss must drop enable_state out of Enabled even when position chunk hits timeout"
+        EnableState::Disabled,
+        "Telemetry must update to EnableState::Disabled on single causal 0 read even when position chunk hits timeout"
     );
     let en_read = feetech::build_read(1, REG_TORQUE_ENABLE, 1);
     driver.transport_mut().stage_reply(&en_read, &rx_tq0);
     assert_eq!(
         driver.refresh_enable_state().unwrap(),
         EnableState::Disabled,
-        "Torque disable must be confirmed across K=3 samples after position chunk timeout"
+        "Torque disable must be confirmed by causal readback after position chunk timeout"
     );
 }
 
@@ -2833,9 +2786,7 @@ fn test_feetech_stale_enable_poll_degrades_to_unknown_and_hardware_fault() {
     driver.read_joint_states().unwrap();
     assert!(driver.is_feedback_valid());
 
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_tq1);
-    }
+    driver.transport_mut().provide_rx(&rx_tq1);
     driver.set_torque(true).unwrap();
     assert_eq!(driver.enable_state(), EnableState::Enabled);
     let _ = driver.transport_mut().take_tx();
@@ -2855,9 +2806,7 @@ fn test_feetech_stale_enable_poll_degrades_to_unknown_and_hardware_fault() {
     // Re-enable and test 3 consecutive missed enable polls degrades to Unknown
     driver.transport_mut().provide_rx(&fb);
     driver.read_joint_states().unwrap();
-    for _ in 0..3 {
-        driver.transport_mut().provide_rx(&rx_tq1);
-    }
+    driver.transport_mut().provide_rx(&rx_tq1);
     driver.set_torque(true).unwrap();
     assert_eq!(driver.enable_state(), EnableState::Enabled);
 
@@ -3568,9 +3517,7 @@ async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware
     {
         let mut m = mock.lock().unwrap();
         m.provide_rx(&rx_normal);
-        for _ in 0..3 {
-            m.provide_rx(&rx_tq1);
-        }
+        m.provide_rx(&rx_tq1);
         m.provide_rx(&rx_normal);
     }
 

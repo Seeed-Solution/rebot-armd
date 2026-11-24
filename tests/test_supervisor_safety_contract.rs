@@ -93,15 +93,32 @@ async fn thermal_trip_overrides_estop_and_retries_failed_disable_without_epoch_c
 
 #[tokio::test]
 async fn successful_disable_write_without_feedback_is_not_reported_as_power_off() {
+    // Part 1: Accepted disable completes by decision (`torque_intent = Off`, `!is_torqued`,
+    // `!disable_pending`, `shutdown_ready()`) even when enable feedback still reports Enabled.
     let (supervisor, h) = setup(full_caps(), None).await;
     h.lock().unwrap().confirm_disable = false;
+    assert_eq!(supervisor.disable_torque().await.unwrap(), SafetyState::Idle);
+    let obs = supervisor.get_observation().await;
+    assert!(!obs.is_torqued && !obs.disable_pending && obs.safety_state == SafetyState::Idle);
+    assert_eq!(obs.enable_state, EnableState::Enabled);
+    assert!(supervisor.shutdown_ready().await);
+
+    // Part 2: A failed disable write keeps `disable_pending == true && is_torqued == true && !shutdown_ready()`
+    // and inhibits ordinary motion frames until a later disable write succeeds.
+    let (supervisor, h) = setup(full_caps(), None).await;
+    {
+        let mut h = h.lock().unwrap();
+        h.confirm_disable = false;
+        h.disable_fails = true;
+    }
     assert!(supervisor.disable_torque().await.is_err());
     let obs = supervisor.get_observation().await;
     assert!(obs.is_torqued && obs.disable_pending && obs.safety_state.is_stopped());
     assert!(!supervisor.shutdown_ready().await);
     supervisor.tick(0.02).await;
     assert!(h.lock().unwrap().written.is_empty(), "Pending shutdown must not send ordinary motion frames");
-    h.lock().unwrap().enabled = EnableState::Disabled;
+    supervisor.inner().write().await.last_disable_attempt = Some(Instant::now() - Duration::from_millis(251));
+    h.lock().unwrap().disable_fails = false;
     let obs = supervisor.tick(0.02).await;
     assert!(!obs.is_torqued && !obs.disable_pending);
     assert!(supervisor.shutdown_ready().await);
@@ -125,11 +142,11 @@ async fn missing_sensor_capabilities_and_old_samples_cannot_prove_safe_rest() {
 async fn fault_reset_requires_fresh_known_enable_state_and_discards_old_targets() {
     let (supervisor, h) = setup(full_caps(), None).await;
     supervisor.trigger_e_stop().await;
-    h.lock().unwrap().enabled = EnableState::Unknown;
-    assert!(supervisor.clear_fault().await.is_err());
+    // Missing fresh feedback (`age = None`) blocks clear_fault().
     { let mut h = h.lock().unwrap(); h.enabled = EnableState::Enabled; h.age = None; }
     assert!(supervisor.clear_fault().await.is_err());
-    { let mut h = h.lock().unwrap(); h.age = Some(Duration::ZERO); h.states[0].position = 0.4; }
+    // `EnableState::Unknown` is telemetry only and does NOT block clear_fault() once feedback is fresh.
+    { let mut h = h.lock().unwrap(); h.enabled = EnableState::Unknown; h.age = Some(Duration::ZERO); h.states[0].position = 0.4; }
     supervisor.clear_fault().await.unwrap();
     let inner = supervisor.inner().read().await;
     assert_eq!(inner.commanded_positions, vec![0.4]);

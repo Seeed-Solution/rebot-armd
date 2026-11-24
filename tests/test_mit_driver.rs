@@ -478,20 +478,49 @@ fn mit_hand_back_past_the_deadline_fails_and_plain_switch_is_refused_after_a_tri
     assert!(bus.tx_log().is_empty(), "{:?}", bus.tx_log());
 }
 
-/// Review round 3, #5: with the MIT fence armed, a disable that is not confirmed by fresh state-0
-/// feedback from every motor fails and keeps the fence: no status poll resumes afterwards.
+/// Under R10, there is no 150 ms confirmation error: with the MIT fence armed, a disable sends
+/// bounded repeats (`DAMIAO_DISABLE_REPEATS`) while keeping the fence armed until all repeats
+/// complete, and then releases the fence even if a motor is silent.
 #[test]
 fn mit_unconfirmed_disable_fails_and_keeps_the_fence() {
     let (mut d, bus, clock) = mit_rig(2000);
+    let hold = hold_at(&mut d);
     bus.with(|s| s.motors[J4].silent = true);
-    assert!(d.set_torque(false).is_err(), "an unconfirmed disable reported success");
+    let t0 = clock.now();
+    let mut p = d.begin_torque(false).expect("disable accepted");
+    let mut round = 1u8;
+    while let armd::driver::TorqueProgress::Pending { wake } = p {
+        // Fence stays armed while bounded disable repeats are pending: plain mode switch refused
+        // and no status polls are sent.
+        assert!(
+            d.set_joint_modes(&[JointMode::Position; 7], &hold).is_err(),
+            "plain switch must remain refused while disable repeats are pending"
+        );
+        bus.clear_log();
+        let _ = d.read_joint_states();
+        assert!(
+            !bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "status polls must not run while MIT fence is still armed: {:?}",
+            bus.tx_log()
+        );
+        let now = clock.now();
+        clock.advance(wake.saturating_duration_since(now));
+        p = d.poll_torque(clock.now() + Duration::from_millis(5)).expect("poll disable repeat");
+        round += 1;
+        assert!(round <= armd::driver::DAMIAO_DISABLE_REPEATS + 1);
+    }
+    assert_eq!(p, armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed));
+    assert_eq!(clock.now().saturating_duration_since(t0), Duration::from_millis(40));
+    assert!(d.mit_fence_trip().is_none());
+    // Fence released after all repeats complete: status polls are allowed again even with J4 silent.
     bus.clear_log();
-    for _ in 0..6 { clock.advance(Duration::from_millis(110)); let _ = d.read_joint_states(); }
+    clock.advance(Duration::from_millis(110));
+    let _ = d.read_joint_states();
     let log = bus.tx_log();
-    assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC), "status polls resumed: {log:?}");
-    // confirmed disable: fence released, polls allowed again
+    assert!(log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC), "status polls did not resume after fence release: {log:?}");
+    // Blocking set_torque(false) also completes cleanly and releases the fence.
     let (mut d, _bus, _) = mit_rig(2000);
-    d.set_torque(false).expect("confirmed disable");
+    d.set_torque(false).expect("bounded disable repeats complete");
     assert!(d.mit_fence_trip().is_none());
 }
 

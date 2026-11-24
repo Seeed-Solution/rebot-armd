@@ -3556,8 +3556,8 @@ fn production_damiao_operations_under_latched_estop_table() {
                 );
                 assert_eq!(
                     tx.iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
-                    7,
-                    "expected 7 CMD_DISABLE frames: {tx:?}"
+                    7 * usize::from(armd::driver::DAMIAO_DISABLE_REPEATS),
+                    "expected 21 CMD_DISABLE frames: {tx:?}"
                 );
                 assert!(
                     tx.iter().all(|f| {
@@ -3573,7 +3573,14 @@ fn production_damiao_operations_under_latched_estop_table() {
             "begin_torque(false)",
             Outcome::AllowedTx,
             |latch, _| {
-                let (mut d, bus, _) = enabled_driver();
+                let (mut d, bus, clock) = enabled_driver();
+                for i in 0..3 {
+                    if i > 0 {
+                        clock.advance(ms(11));
+                    }
+                    bus.with(|s| s.push_all_feedback());
+                    d.read_joint_states().unwrap();
+                }
                 latch(&mut d);
                 bus.clear();
                 let res = d.begin_torque(false);
@@ -3589,7 +3596,14 @@ fn production_damiao_operations_under_latched_estop_table() {
             "begin_torque_budgeted(false, 16)",
             Outcome::AllowedTx,
             |latch, _| {
-                let (mut d, bus, _) = enabled_driver();
+                let (mut d, bus, clock) = enabled_driver();
+                for i in 0..3 {
+                    if i > 0 {
+                        clock.advance(ms(11));
+                    }
+                    bus.with(|s| s.push_all_feedback());
+                    d.read_joint_states().unwrap();
+                }
                 latch(&mut d);
                 bus.clear();
                 let res = d.begin_torque_budgeted(false, 16);

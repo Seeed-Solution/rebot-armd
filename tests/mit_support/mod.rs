@@ -526,6 +526,10 @@ impl CanTransport for FakeBus {
                 let mut tmp = std::mem::take(&mut s.scratch_frames);
                 tmp.clear();
                 tmp.extend(s.rx.drain(before..));
+                let pending_len = s.pending.len();
+                if s.pending_timestamps.len() > pending_len {
+                    s.pending_timestamps.truncate(pending_len);
+                }
                 while s.pending_timestamps.len() < s.pending.len() {
                     s.pending_timestamps.push_back(Some(tx_ts));
                 }

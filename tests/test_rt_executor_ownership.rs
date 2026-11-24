@@ -2368,7 +2368,10 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     assert_eq!(fx_a.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
     assert!(fx_a.core.safety.has_latched_fault_kind(armd::safety::FaultKind::Estop));
     assert!(fx_a.core.safety.has_latched_fault_code(armd::FaultCode::EnableFailed));
-    assert!(!fx_a.core.is_torqued, "arm was never enabled; all motors stayed OffConfirmed so is_torqued stays false");
+    assert!(
+        fx_a.core.is_torqued && fx_a.core.torque_intent == armd::TorqueIntent::On,
+        "holds are the default on failed/interrupted enable until an explicit disable is accepted"
+    );
 
     // (b) E-stop AFTER `CMD_ENABLE` transmitted and motors enabled, BEFORE confirmation poll finishes:
     // transition ends `Outcome::Failed("ESTOP_ACTIVE")`, zero extra enable frames, AND honest
