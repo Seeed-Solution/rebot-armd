@@ -300,6 +300,7 @@ enum NormValue {
     NormTimingUs,
     NormPositiveF64,
     NormPositiveU64,
+    NormNonNegU64,
     NormNonNegF64,
     NormPartialProgress,
     NormOperationalState,
@@ -329,6 +330,7 @@ impl NormValue {
             Self::NormTimingUs => "<timing:us>".into(),
             Self::NormPositiveF64 => "<pos:f64>".into(),
             Self::NormPositiveU64 => "<pos:u64>".into(),
+            Self::NormNonNegU64 => "<nonneg:u64>".into(),
             Self::NormNonNegF64 => "<nonneg:f64>".into(),
             Self::NormPartialProgress => "<progress:partial>".into(),
             Self::NormOperationalState => "<state:operational>".into(),
@@ -541,7 +543,13 @@ impl Normalizer {
                     if let Some(obj) = val.as_object() {
                         let mut out = BTreeMap::new();
                         for (pk, pv) in obj {
-                            if pv.as_u64().is_some_and(|n| n > 0) {
+                            // `start` and `done` are zero-work orchestration bookkeeping phases
+                            // whose `Instant::elapsed().as_millis()` can be 0 when fast or >= 1
+                            // under scheduling jitter; real work phases (`pose`, `wait`, ...)
+                            // stay strictly positive (`> 0`).
+                            if matches!(pk.as_str(), "start" | "done") && pv.as_u64().is_some() {
+                                out.insert(pk.clone(), NormValue::NormNonNegU64);
+                            } else if pv.as_u64().is_some_and(|n| n > 0) {
                                 out.insert(pk.clone(), NormValue::NormPositiveU64);
                             } else {
                                 out.insert(pk.clone(), self.normalize_plain_value(pv));

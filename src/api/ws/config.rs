@@ -315,6 +315,7 @@ fn commit_staged(
         });
         return reject(staged, reply);
     }
+    inner.consume_pending_estop();
     if inner.safety.epoch_id() != epoch {
         let reply = json!({
             "type": "command_reject",
