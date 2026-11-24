@@ -667,6 +667,7 @@ pub struct HeldObject {
 /// Owner identity bound to a [`DeferredActionDone`] so a later `Complete` never commits a
 /// stale or superseded action, macro child, or internal park gripper step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // inline Copy HolderLabel avoids RT heap allocation
 pub(crate) enum DeferredCompletionTarget {
     Action(u64),
     MacroSub {
@@ -5286,8 +5287,9 @@ impl SupervisorInner {
         // a hold at the measured pose so this release sends the replacement hold and commits
         // `SubState::Done` strictly through the post-output accepted-output gate.
         if self.macro_run.is_some() {
+            let pre_tick_now = release_bound.map_or_else(Instant::now, |(now, _)| now);
             self.step_macro_contact();
-            self.expire_macro_child(Instant::now());
+            self.expire_macro_child(pre_tick_now);
         }
         let mut reference_stepped = false;
 

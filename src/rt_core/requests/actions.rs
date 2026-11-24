@@ -1136,6 +1136,16 @@ impl ActionSnapshot {
     /// Checks operational preconditions against the published snapshot (mirrors
     /// `SupervisorInner::action_preconditions` + `gravity_comp_motion_busy`).
     pub fn check_preconditions(&self) -> Result<(), ArmError> {
+        self.check_preconditions_inner(false)
+    }
+
+    /// Checks operational preconditions for gripper actions (mirrors `action_preconditions`:
+    /// gripper remains allowed while gravity compensation is active).
+    pub fn check_gripper_preconditions(&self) -> Result<(), ArmError> {
+        self.check_preconditions_inner(true)
+    }
+
+    fn check_preconditions_inner(&self, allow_gravity_comp: bool) -> Result<(), ArmError> {
         if self.owner.handover_settling {
             return Err(SafetyError::HandoverSettling.into());
         }
@@ -1175,7 +1185,7 @@ impl ActionSnapshot {
         if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {
             return Err(MotionError::MotionBusy("the arm is still moving".into()).into());
         }
-        if self.owner.gravity_comp_active {
+        if !allow_gravity_comp && self.owner.gravity_comp_active {
             return Err(
                 MotionError::MotionBusy("gravity compensation is active".into()).into(),
             );
@@ -1296,13 +1306,63 @@ pub struct PreparedCartesianAction {
     pub expected_duration_s: f64,
 }
 
+/// Resolves `(path_to_stage, approach_then)` for RT staging so `backlash::Pre::Ready(cp)` is
+/// NEVER staged without its second-leg final approach segment; falls back cleanly to `direct`.
+pub fn resolve_cartesian_rt_legs<'a>(
+    direct: &'a JointPath,
+    pre: &'a backlash::Pre,
+    approach_plan: Option<&backlash::Plan>,
+    power_budget: Option<&PowerBudget>,
+    arm: &crate::chain::ArmModel,
+) -> (&'a JointPath, Option<StagedQuinticLeg>) {
+    if let (backlash::Pre::Ready(cp), Some(plan)) = (pre, approach_plan) {
+        let dof = cp.path.dof;
+        if dof > 0 && dof <= MAX_DOF && cp.target.len() == dof {
+            let zeros = vec![0.0f32; dof];
+            if let Ok(seg) = crate::trajectory::TrajectoryPlanner::plan(
+                cp.path.last_slice(),
+                &zeros,
+                &cp.target,
+                &zeros,
+                Some(backlash::MIN_SEGMENT_S),
+                &plan.seg_limits,
+            ) {
+                if let Ok((seg, power_scale)) = fit_quintic_power_off_lock(
+                    seg,
+                    cp.path.last_slice(),
+                    &zeros,
+                    &cp.target,
+                    &plan.seg_limits,
+                    power_budget,
+                    arm,
+                ) {
+                    let mut target = [0.0f32; MAX_DOF];
+                    target[..dof].copy_from_slice(&cp.target);
+                    return (
+                        &cp.path,
+                        Some(StagedQuinticLeg {
+                            target,
+                            duration_s: seg.duration,
+                            power_scale,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    (direct, None)
+}
+
 impl PreparedCartesianAction {
     /// Stages this prepared Cartesian path into a broker [`PlanSlot`] (no IK on RT).
     pub fn to_plan_slot(&self, child: Option<ChildSpec>) -> Result<PlanSlot, &'static str> {
-        let path = match &self.pre {
-            backlash::Pre::Ready(cp) => &cp.path,
-            _ => &self.direct,
-        };
+        let (path, approach_then) = resolve_cartesian_rt_legs(
+            &self.direct,
+            &self.pre,
+            self.approach_plan.as_ref(),
+            self.input.power.as_ref(),
+            &self.input.arm,
+        );
         if self.start.len() != path.dof || self.start.len() > MAX_DOF {
             return Err("INVALID_COMMAND");
         }
@@ -1319,7 +1379,7 @@ impl PreparedCartesianAction {
             start,
             duration_s: path.duration,
             power_scale: self.input.power.as_ref().map(|_| path.power_scale),
-            approach_then: None,
+            approach_then,
         });
         Ok(slot)
     }
@@ -1530,8 +1590,9 @@ pub fn prepare_gripper_request(
         .into());
     }
     // Note: macro children run while parent macro is alive (motion_active is false between children).
+    // Standalone gripper remains permitted while gravity compensation is active (`action_preconditions`).
     if max_budget_s.is_none() {
-        snap.check_preconditions()?;
+        snap.check_gripper_preconditions()?;
     }
     if policy.max_close_torque_nm.is_some() {
         let close_dir = if policy.closed_rad >= policy.open_rad { 1.0_f32 } else { -1.0_f32 };
@@ -1875,6 +1936,7 @@ pub fn prepare_replay_from_input(
 
 /// Result of off-thread `prepare_move_to` / `prepare_move_relative`.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum PreparedMoveAction {
     Cartesian(PreparedCartesianAction),
     Joint(PreparedJointAction),
@@ -2167,6 +2229,18 @@ pub fn prepare_child_cartesian_slot(
     power_scale: Option<f64>,
     child: ChildSpec,
 ) -> Result<PlanSlot, &'static str> {
+    prepare_child_cartesian_slot_with_approach(start, path, power_scale, None, child)
+}
+
+/// Off-thread helper: stage a prepared Cartesian macro child with an optional second-leg
+/// same-side approach quintic into a [`PlanSlot`].
+pub fn prepare_child_cartesian_slot_with_approach(
+    start: &[f32],
+    path: &JointPath,
+    power_scale: Option<f64>,
+    approach_then: Option<StagedQuinticLeg>,
+    child: ChildSpec,
+) -> Result<PlanSlot, &'static str> {
     if start.len() != path.dof || start.len() > MAX_DOF {
         return Err("INVALID_COMMAND");
     }
@@ -2183,7 +2257,7 @@ pub fn prepare_child_cartesian_slot(
         start: start_arr,
         duration_s: path.duration,
         power_scale,
-        approach_then: None,
+        approach_then,
     });
     Ok(slot)
 }
@@ -2421,6 +2495,42 @@ pub enum CartesianInstallPayload {
     },
 }
 
+/// Single zero-alloc RT validator for an optional second-leg same-side approach quintic
+/// (shared by `install_move_cartesian_slot_rt`, `install_move_joint_rt`, and
+/// `install_macro_child_slot_rt`): enforces finite duration/target, safety motion validation,
+/// and inline swept-workspace keepout BEFORE admission consumption.
+fn validate_approach_leg_rt(
+    inner: &mut SupervisorInner,
+    epoch: u64,
+    dof: usize,
+    leg_start: &[f32],
+    leg: StagedQuinticLeg,
+) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, StagedQuinticLeg), &'static str> {
+    if !leg.duration_s.is_finite()
+        || leg.duration_s <= 0.0
+        || leg.target[..dof].iter().any(|v| !v.is_finite())
+    {
+        return Err("INVALID_COMMAND");
+    }
+    inner
+        .safety
+        .validate_motion_command(Some(epoch), &leg.target[..dof], &inner.config.limits)
+        .map_err(|e| static_code(ArmError::Safety(e)))?;
+    let zeros = [0.0f32; MAX_DOF];
+    let seg = crate::trajectory::MultiJointQuinticTrajectory::new(
+        &leg_start[..dof],
+        &zeros[..dof],
+        &leg.target[..dof],
+        &zeros[..dof],
+        leg.duration_s,
+    )
+    .map_err(|_| "INVALID_COMMAND")?;
+    inner
+        .check_workspace_quintic_inline(&seg)
+        .map_err(|e| static_code(ArmError::Safety(e)))?;
+    Ok((seg, leg))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_move_cartesian_slot_rt(
     inner: &mut SupervisorInner,
@@ -2439,23 +2549,22 @@ fn install_move_cartesian_slot_rt(
     }
     check_start_fresh(&inner.commanded_positions, &start[..dof]).map_err(|r| r.code)?;
     inner.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+    if inner.gravity_comp.is_some() {
+        return Err("MOTION_BUSY");
+    }
     inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
     let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
     let mut last_buf = [0.0f32; MAX_DOF];
     last_buf[..dof].copy_from_slice(last_slice);
-    let then_traj = if let Some(leg) = approach_then {
-        let zeros = [0.0f32; MAX_DOF];
-        let traj = crate::trajectory::MultiJointQuinticTrajectory::new(
+    let then_traj = match approach_then {
+        Some(leg) => Some(validate_approach_leg_rt(
+            inner,
+            stamp.admission.estop_epoch,
+            dof,
             &last_buf[..dof],
-            &zeros[..dof],
-            &leg.target[..dof],
-            &zeros[..dof],
-            leg.duration_s,
-        )
-        .map_err(|_| "INVALID_COMMAND")?;
-        Some((traj, leg))
-    } else {
-        None
+            leg,
+        )?),
+        None => None,
     };
     let admitted = consume_action_admission(inner, stamp, ctx.stop_generation).map_err(|r| r.code)?;
     let (this, proof) = admitted.consume().map_err(|e| static_code(e.into()))?;
@@ -2607,6 +2716,9 @@ fn install_move_joint_rt(
     if inner.config.active_tool.commissioning_required && kind == PreparedActionKind::MoveToPose {
         return Err("COMMISSIONING_REQUIRED");
     }
+    if inner.gravity_comp.is_some() {
+        return Err("MOTION_BUSY");
+    }
     inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
     let (mut limits_buf, lim_n) = inner
         .planning_limits_inline(None)
@@ -2640,21 +2752,15 @@ fn install_move_joint_rt(
     inner
         .check_workspace_quintic_inline(&traj)
         .map_err(|e| static_code(ArmError::Safety(e)))?;
-    let then_traj = if let Some(leg) = approach_then {
-        let seg = crate::trajectory::MultiJointQuinticTrajectory::new(
+    let then_traj = match approach_then {
+        Some(leg) => Some(validate_approach_leg_rt(
+            inner,
+            stamp.admission.estop_epoch,
+            dof,
             &tgt[..dof],
-            &zeros[..dof],
-            &leg.target[..dof],
-            &zeros[..dof],
-            leg.duration_s,
-        )
-        .map_err(|_| "INVALID_COMMAND")?;
-        inner
-            .check_workspace_quintic_inline(&seg)
-            .map_err(|e| static_code(ArmError::Safety(e)))?;
-        Some((seg, leg))
-    } else {
-        None
+            leg,
+        )?),
+        None => None,
     };
 
     let admitted = consume_action_admission(inner, stamp, ctx.stop_generation).map_err(|r| r.code)?;
@@ -2804,10 +2910,10 @@ fn install_gripper_rt(
         .as_ref()
         .ok_or("UNSUPPORTED")?
         .clone_without_jaw_opening();
-    if inner.config.active_tool.commissioning_required {
-        if speed_scale.is_some_and(|s| s > 0.2 + 1e-6) || speed > 0.4 + 1e-6 {
-            return Err("COMMISSIONING_REQUIRED");
-        }
+    if inner.config.active_tool.commissioning_required
+        && (speed_scale.is_some_and(|s| s > 0.2 + 1e-6) || speed > 0.4 + 1e-6)
+    {
+        return Err("COMMISSIONING_REQUIRED");
     }
     inner.check_prepared_fresh_static(stamp.admission.estop_epoch)?;
     let request = GripperRequest {
@@ -2939,6 +3045,9 @@ fn install_replay_slot_rt(
         return Err("INVALID_COMMAND");
     }
     check_start_fresh(&inner.commanded_positions, &start[..dof]).map_err(|r| r.code)?;
+    if inner.gravity_comp.is_some() {
+        return Err("MOTION_BUSY");
+    }
     let checked = inner.validate_prepared_replay(
         dof,
         &slot.path,
@@ -2984,6 +3093,9 @@ pub fn install_begin_macro(
         return Err(ActionRefusal::new("DEADLINE_EXPIRED"));
     }
     if inner.rt_executor_owned {
+        if inner.gravity_comp.is_some() {
+            return Err(ActionRefusal::new("MOTION_BUSY"));
+        }
         inner
             .check_prepared_fresh_static(stamp.admission.estop_epoch)
             .map_err(ActionRefusal::new)?;
@@ -3463,19 +3575,15 @@ fn install_macro_child_slot_rt(
             let last_slice = &slot.path.samples()[slot.path.len() - 1][..dof];
             let mut last_buf = [0.0f32; MAX_DOF];
             last_buf[..dof].copy_from_slice(last_slice);
-            let then_traj = if let Some(leg) = approach_then {
-                let zeros = [0.0f32; MAX_DOF];
-                let seg = crate::trajectory::MultiJointQuinticTrajectory::new(
+            let then_traj = match approach_then {
+                Some(leg) => Some(validate_approach_leg_rt(
+                    inner,
+                    stamp.admission.estop_epoch,
+                    dof,
                     &last_buf[..dof],
-                    &zeros[..dof],
-                    &leg.target[..dof],
-                    &zeros[..dof],
-                    leg.duration_s,
-                )
-                .map_err(|_| "INVALID_COMMAND")?;
-                Some((seg, leg))
-            } else {
-                None
+                    leg,
+                )?),
+                None => None,
             };
             inner.guard_next_macro_child(parent_id, spec.contact);
             let admitted = match consume_action_admission(inner, stamp, ctx.stop_generation) {

@@ -502,7 +502,7 @@ impl SupervisorInner {
     }
 
     pub fn macro_sub(&self, id: u64) -> Option<SubState> {
-        self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.sub.clone())
+        self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.sub)
     }
 
     /// Set `phase` / `progress` (and centring stats) of the running action `id`.
@@ -632,7 +632,7 @@ impl SupervisorInner {
     /// replaced, or `t` is not its current child (a late result is never read as another's).
     pub fn macro_child_state(&self, t: ChildTicket) -> Option<SubState> {
         if !self.macro_alive(t.parent.0) { return None; }
-        self.macro_run.as_ref().filter(|m| m.ticket() == Some(t)).map(|m| m.sub.clone())
+        self.macro_run.as_ref().filter(|m| m.ticket() == Some(t)).map(|m| m.sub)
     }
 
     /// What the contact guard of child `t` saw (also after the parent ended, until the next child).

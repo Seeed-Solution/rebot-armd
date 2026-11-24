@@ -264,8 +264,8 @@ fn dispatch_teach_lease_free(ctx: LeaseFreeCtx<'_>) {
 
 pub(super) enum ActionStart {
     Started(u64, f64),
-    Plan(PendingPlan),
-    Macro(PendingMacro),
+    Plan(Box<PendingPlan>),
+    Macro(Box<PendingMacro>),
     DryRunGrasp(Value),
     Sequence(Box<crate::sequences::RunPlan>),
     CalibHover(Box<crate::calib_hover::HoverPlan>),
@@ -388,12 +388,12 @@ pub(super) fn prepare_action(
                 std::time::Instant::now()
                     + crate::rt_core::requests::actions::DEFAULT_ACTION_DEADLINE,
             );
-            Ok(ActionStart::Plan(PendingPlan {
+            Ok(ActionStart::Plan(Box::new(PendingPlan {
                 request_id: request_id.clone(),
                 kind,
                 snap,
                 body: body.clone(),
-            }))
+            })))
         }
         "/api/v1/action/gripper_zero_check" => {
             let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
@@ -411,16 +411,16 @@ pub(super) fn prepare_action(
             }
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            Ok(ActionStart::Macro(PendingMacro::Grasp(
+            Ok(ActionStart::Macro(Box::new(PendingMacro::Grasp(
                 crate::grasp::prepare(inner, body, epoch)?,
-            )))
+            ))))
         }
         "/api/v1/action/place" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
             inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            Ok(ActionStart::Macro(PendingMacro::Place(
+            Ok(ActionStart::Macro(Box::new(PendingMacro::Place(
                 crate::place::prepare(inner, body, epoch)?,
-            )))
+            ))))
         }
         "/api/v1/action/run_sequence" => {
             inner.preflight_admission(stamp).map_err(ArmError::from)?;
@@ -493,11 +493,11 @@ pub(super) fn dispatch_action_command(
             Some(command_ack(inner, &value["request_id"], Some((id, duration))))
         }
         Ok(ActionStart::Plan(plan)) => {
-            pending.plan = Some((plan, local_generation));
+            pending.plan = Some((*plan, local_generation));
             None
         }
         Ok(ActionStart::Macro(m)) => {
-            pending.macro_action = Some((value["request_id"].clone(), m, local_generation));
+            pending.macro_action = Some((value["request_id"].clone(), *m, local_generation));
             None
         }
         Ok(ActionStart::DryRunGrasp(body)) => {

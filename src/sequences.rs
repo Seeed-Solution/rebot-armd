@@ -700,7 +700,7 @@ fn finish_begin_setup(
     tokio::spawn(async move {
         let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, stamp, deadline).await }) };
         let outcome = worker.await;
-        cleanup(&sup, id, outcome.err().map(|e| e.to_string())).await;
+        cleanup(&sup, id, stamp, deadline, outcome.err().map(|e| e.to_string())).await;
     });
     (id, duration)
 }
@@ -772,7 +772,37 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
 
 /// After the orchestrator: discard an unfinished repeat's recording, release the pins, end
 /// the action when the orchestrator died without ending it.
-async fn cleanup(sup: &Arc<ArmSupervisor>, id: u64, panic: Option<String>) {
+async fn cleanup(
+    sup: &Arc<ArmSupervisor>,
+    id: u64,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+    panic: Option<String>,
+) {
+    if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+        if let Some(e) = panic {
+            tracing::error!("Sequence {id} orchestrator failed: {e}");
+            let ctx = MacroCtx {
+                sup: sup.clone(),
+                id,
+                stamp,
+                deadline,
+                phase_timeout_s: 30.0,
+                timeout_code: "SEQUENCE_TIMEOUT",
+                timeout_message: String::new(),
+            };
+            ctx.finish(
+                crate::rt_core::requests::actions::FinishState::Failed,
+                Some("INTERNAL"),
+                Some(format!("sequence orchestrator failed: {e}")),
+                None,
+                None,
+                crate::rt_core::requests::actions::HeldUpdate::Unchanged,
+            )
+            .await;
+        }
+        return;
+    }
     let owned = sup.inner().read().await.recording.as_ref()
         .is_some_and(|r| r.owner == crate::teach::RecorderOwner::Sequence { action_id: id });
     if owned {

@@ -357,10 +357,31 @@ fn finish_begin_hover(
         let worker = { let sup = sup.clone(); let dir = dir.clone(); tokio::spawn(async move { run(sup, id, plan, upstream, dir, stamp, deadline_at).await }) };
         if let Err(e) = worker.await {
             tracing::error!("Calibration hover {id} orchestrator failed: {e}");
-            let mut inner = sup.inner().write().await;
-            inner.finish_macro(id, "failed", Some("INTERNAL"), Some(format!("hover orchestrator failed: {e}")), None, None);
-            if let Some(j) = inner.hover_jobs.iter_mut().find(|j| j.action_id == Some(id) && j.state == "running") {
-                j.state = "failed".into(); j.code = Some("INTERNAL".into()); j.message = Some(e.to_string());
+            if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+                let ctx = MacroCtx {
+                    sup: sup.clone(),
+                    id,
+                    stamp,
+                    deadline: deadline_at,
+                    phase_timeout_s: deadline_s,
+                    timeout_code: "HOVER_TIMEOUT",
+                    timeout_message: String::new(),
+                };
+                ctx.finish(
+                    crate::rt_core::requests::actions::FinishState::Failed,
+                    Some("INTERNAL"),
+                    Some(format!("hover orchestrator failed: {e}")),
+                    None,
+                    None,
+                    crate::rt_core::requests::actions::HeldUpdate::Unchanged,
+                )
+                .await;
+            } else {
+                let mut inner = sup.inner().write().await;
+                inner.finish_macro(id, "failed", Some("INTERNAL"), Some(format!("hover orchestrator failed: {e}")), None, None);
+                if let Some(j) = inner.hover_jobs.iter_mut().find(|j| j.action_id == Some(id) && j.state == "running") {
+                    j.state = "failed".into(); j.code = Some("INTERNAL".into()); j.message = Some(e.to_string());
+                }
             }
         }
     });

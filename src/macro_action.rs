@@ -802,11 +802,16 @@ impl MacroCtx {
                 .then(|| m.child_seq.checked_add(1))
                 .flatten()
                 .ok_or_else(|| before(Stop::Cancelled))?;
-            let chosen_path = match &pre {
-                crate::backlash::Pre::Ready(cp) => &cp.path,
-                _ => &path,
-            };
-            let timeout_s = ((chosen_path.duration + 0.5) * 2.0 + 5.0).min(self.phase_timeout_s);
+            let (chosen_path, approach_then) = req::resolve_cartesian_rt_legs(
+                &path,
+                &pre,
+                plan.as_ref(),
+                input.power.as_ref(),
+                &input.arm,
+            );
+            let leg2_s = approach_then.map_or(0.0, |l| l.duration_s);
+            let timeout_s =
+                ((chosen_path.duration + leg2_s + 0.5) * 2.0 + 5.0).min(self.phase_timeout_s);
             let child_spec = ChildSpec {
                 ticket: ChildTicket {
                     parent: ActionId(self.id),
@@ -816,10 +821,11 @@ impl MacroCtx {
                 timeout_code: self.timeout_code,
                 contact,
             };
-            let slot = req::prepare_child_cartesian_slot(
+            let slot = req::prepare_child_cartesian_slot_with_approach(
                 &snap.commanded_positions,
                 chosen_path,
                 input.power.as_ref().map(|_| chosen_path.power_scale),
+                approach_then,
                 child_spec,
             )
             .map_err(|c| before(fail(c, format!("failed to stage Cartesian child: {c}"))))?;

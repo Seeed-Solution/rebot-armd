@@ -621,7 +621,26 @@ fn spawn_measure_worker(
         let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, source, stamp, deadline_at).await }) };
         if let Err(e) = worker.await {
             tracing::error!("measure_multiview {id} orchestrator failed: {e}");
-            if sup.owner_mode() != crate::supervisor::OWNER_EXECUTOR {
+            if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+                let ctx = MacroCtx {
+                    sup: sup.clone(),
+                    id,
+                    stamp,
+                    deadline: deadline_at,
+                    phase_timeout_s: deadline_s,
+                    timeout_code: "MEASURE_TIMEOUT",
+                    timeout_message: String::new(),
+                };
+                ctx.finish(
+                    crate::rt_core::requests::actions::FinishState::Failed,
+                    Some("INTERNAL"),
+                    Some(format!("orchestrator failed: {e}")),
+                    None,
+                    None,
+                    crate::rt_core::requests::actions::HeldUpdate::Unchanged,
+                )
+                .await;
+            } else {
                 sup.inner().write().await.finish_macro(id, "failed", Some("INTERNAL"), Some(format!("orchestrator failed: {e}")), None, None);
             }
         }
