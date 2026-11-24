@@ -28,6 +28,7 @@ pub mod kinematics;
 pub mod mjcf_compose;
 pub mod model;
 pub mod motion;
+pub mod motor_mode;
 #[cfg(not(target_arch = "wasm32"))] pub mod persist;
 #[cfg(not(target_arch = "wasm32"))] pub mod place;
 #[cfg(all(feature = "policy-runtime", not(target_arch = "wasm32")))] pub mod policy_runtime;
@@ -63,6 +64,11 @@ pub use gravity::{compute_gravity_torques, GravityError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use gravity::verify_urdf_sha256;
 pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, JointState, ObservationSchema};
+pub use motor_mode::{
+    ControlMode, ImpedanceLimits, JointControlModeConfig, ModeLimits, PositionForceLimits,
+    PositionLimits, PositionVelocityLimits, ResolvedJointMode, VendorBinding, VendorCapability,
+    VENDOR_CAPABILITIES,
+};
 #[cfg(not(target_arch = "wasm32"))] pub use recording::{
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,
