@@ -1,5 +1,6 @@
 {
   "baseline_commit": "0afeb1d",
+  "policy_disabled_session": "16_policy_disabled_reject.json",
   "sessions": [
     "01_lease_lifecycle.json",
     "02_lease_validation.json",
@@ -34,6 +35,7 @@
     "31_rest_lease_restrictions.json",
     "32_disconnect_releases_lease_and_stops.json",
     "33_unknown_frames_and_paths.json",
-    "34_ws_upgrade_query_and_obs_hz.json"
+    "34_ws_upgrade_query_and_obs_hz.json",
+    "35_server_close_and_teardown.json"
   ]
 }

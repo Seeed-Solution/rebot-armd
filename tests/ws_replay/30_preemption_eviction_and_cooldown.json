@@ -31,7 +31,7 @@
     {"ev":"server_frame","client":"c1","frame":{"client_id":"holder_b","generation":2,"seq":2,"type":"lease_granted"}},
     {"ev":"server_frame","client":"c0","frame":{"generation":1,"reason":"preempted","type":"lease_lost"}},
     {"ev":"client_frame","client":"c0","frame":{"client_id":"holder_a","force":true,"seq":2,"type":"acquire_lease"}},
-    {"ev":"server_frame","client":"c0","frame":{"error":"preemption_cooldown","remaining_ms":2999,"seq":2,"type":"lease_rejected"}},
+    {"ev":"server_frame","client":"c0","frame":{"error":"preemption_cooldown","remaining_ms":2959,"seq":2,"type":"lease_rejected"}},
     {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":1,"type":"command"}},
     {"ev":"server_frame","client":"c0","frame":{"code":"LEASE_LOST","epoch_id":1,"error":"LEASE_LOST","message":"This connection does not own an active lease","request_id":1,"status":409,"type":"command_reject"}},
     {"ev":"client_closed","client":"c0"},

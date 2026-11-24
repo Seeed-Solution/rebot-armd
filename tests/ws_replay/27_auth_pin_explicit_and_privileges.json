@@ -46,13 +46,13 @@
     {"ev":"client_frame","client":"c0","frame":{"seq":1,"token":"wrong-token","type":"auth"}},
     {"ev":"server_frame","client":"c0","frame":{"auth_enforced":true,"expires_in_s":null,"role":"program","seq":1,"type":"auth_ack"}},
     {"ev":"rest_response","method":"POST","path":"/api/v1/auth/unlock","status":403,"body":{"code":"INVALID_PIN","error":"invalid_pin","message":"Invalid operator PIN"}},
-    {"ev":"rest_response","method":"POST","path":"/api/v1/auth/unlock","status":200,"body":{"expires_in_s":1800,"role":"operator","token":"f61346b487cdd091bf9f0f4dd72001566a10b48769b8d60d6ade1069b3a3f9a2"}},
-    {"ev":"client_frame","client":"c0","frame":{"seq":2,"token":"f61346b487cdd091bf9f0f4dd72001566a10b48769b8d60d6ade1069b3a3f9a2","type":"auth"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/auth/unlock","status":200,"body":{"expires_in_s":1800,"role":"operator","token":"011aa676fd2de92a6c1775b52ad46dc14afb13d5422e4c444e6e64636112b9b1"}},
+    {"ev":"client_frame","client":"c0","frame":{"seq":2,"token":"011aa676fd2de92a6c1775b52ad46dc14afb13d5422e4c444e6e64636112b9b1","type":"auth"}},
     {"ev":"server_frame","client":"c0","frame":{"auth_enforced":true,"expires_in_s":1800,"role":"operator","seq":2,"type":"auth_ack"}},
     {"ev":"client_frame","client":"c0","frame":{"body":{"boxes":[],"expected_revision":1},"epoch_id":1,"generation":1,"path":"/api/v1/workspace/keepout","request_id":5,"type":"command"}},
     {"ev":"server_frame","client":"c0","frame":{"boxes":[],"control_mode":"position","durability_confirmed":true,"epoch_id":1,"is_torqued":false,"persisted":true,"request_id":5,"revision":2,"safety_state":"Idle","source":"runtime","status":"accepted","type":"command_ack"}},
     {"ev":"client_frame","client":"c0","frame":{"body":{"name":"authed_ds"},"path":"/api/v1/datasets/create","request_id":6,"type":"command"}},
-    {"ev":"server_frame","client":"c0","frame":{"dataset":{"bytes":0,"created_at":"2026-11-24T04:29:44.388Z","description":"","duration_s":0.0,"episodes":0,"name":"authed_ds"},"epoch_id":1,"is_torqued":false,"request_id":6,"safety_state":"Idle","status":"accepted","type":"command_ack"}},
+    {"ev":"server_frame","client":"c0","frame":{"dataset":{"bytes":0,"created_at":"2026-11-24T05:31:05.977Z","description":"","duration_s":0.0,"episodes":0,"name":"authed_ds"},"epoch_id":1,"is_torqued":false,"request_id":6,"safety_state":"Idle","status":"accepted","type":"command_ack"}},
     {"ev":"client_closed","client":"c0"}
   ]
 }

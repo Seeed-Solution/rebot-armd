@@ -11,10 +11,13 @@
     {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":1,"type":"command"}},
     {"op":"expect_control","client":"c0","count":1},
     {"op":"send","client":"c0","frame":{"body":{"duration_secs":2.0,"target_positions":[0.4,0.0,0.0,0.0,0.0,0.0,0.0]},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/motion/jog","request_id":2,"type":"command"}},
-    {"op":"expect_control","client":"c0","count":1},
+    {"op":"expect_control","client":"c0","count":1,"capture_action":"disc_jog"},
     {"op":"close_client","client":"c0"},
-    {"op":"sleep_ms","ms":80},
+    {"op":"expect_terminal","client":"c1","action_alias":"disc_jog"},
+    {"op":"sleep_ms","ms":40},
     {"op":"send","client":"c1","frame":{"client_id":"successor","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c1","count":1},
+    {"op":"send","client":"c1","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c1}}","path":"/api/v1/motion/stop","request_id":1,"type":"command"}},
     {"op":"expect_control","client":"c1","count":1},
     {"op":"close_client","client":"c1"}
   ],
@@ -28,8 +31,11 @@
     {"ev":"client_frame","client":"c0","frame":{"body":{"duration_secs":2.0,"target_positions":[0.4,0.0,0.0,0.0,0.0,0.0,0.0]},"epoch_id":1,"generation":1,"path":"/api/v1/motion/jog","request_id":2,"type":"command"}},
     {"ev":"server_frame","client":"c0","frame":{"action_id":1,"control_mode":"position","epoch_id":1,"expected_duration_s":2.0,"is_torqued":true,"request_id":2,"safety_state":"Moving","status":"accepted","type":"command_ack"}},
     {"ev":"client_closed","client":"c0"},
+    {"ev":"action_terminal","client":"c1","action_id":1,"kind":"joint_move","state":"cancelled","code":"LEASE_LOST","message":"Control lease lost or released","safety_state":"Armed","epoch_id":1,"is_torqued":true,"control_mode":"position"},
     {"ev":"client_frame","client":"c1","frame":{"client_id":"successor","seq":1,"type":"acquire_lease"}},
     {"ev":"server_frame","client":"c1","frame":{"client_id":"successor","generation":2,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c1","frame":{"body":{},"epoch_id":1,"generation":2,"path":"/api/v1/motion/stop","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c1","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":1,"safety_state":"Armed","status":"accepted","stop_generation":1,"type":"command_ack"}},
     {"ev":"client_closed","client":"c1"}
   ]
 }

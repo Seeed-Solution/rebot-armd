@@ -27,7 +27,7 @@
     {"ev":"server_frame","client":"c0","frame":{"action_id":1,"artifact_digest":"3a1587e4041981e46c738fadd050d27732416f228ecd4fcbe5ee3baee7a27b3e","backend":"mlp","control_mode":"position","epoch_id":1,"expected_duration_s":5.0,"is_torqued":false,"max_fps":500000,"mode":"shadow","period_us":50000,"policy_id":"shadow_demo","request_id":2,"safety_state":"Idle","status":"accepted","too_slow":false,"type":"command_ack","warmup_infer_us":{"max":1,"n":9,"p50":1}}},
     {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/action/policy/stop","request_id":3,"type":"command"}},
     {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":false,"request_id":3,"safety_state":"Idle","status":"accepted","stopped":true,"type":"command_ack"}},
-    {"ev":"action_terminal","client":"c0","action_id":1,"kind":"policy","state":"cancelled","code":"STOPPED","safety_state":"Idle","epoch_id":1,"is_torqued":false,"control_mode":"position"},
+    {"ev":"action_terminal","client":"c0","action_id":1,"kind":"policy","state":"cancelled","code":"STOPPED","message":"Policy stopped: STOPPED","safety_state":"Idle","epoch_id":1,"is_torqued":false,"control_mode":"position"},
     {"ev":"client_closed","client":"c0"}
   ]
 }

@@ -24,7 +24,7 @@
     {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":1,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
     {"ev":"client_frame","client":"c0","frame":{"body":{"episode":"01J00000000000000000000001","speed":1.0},"epoch_id":1,"generation":1,"path":"/api/v1/action/replay","request_id":2,"type":"command"}},
     {"ev":"server_frame","client":"c0","frame":{"action_id":1,"control_mode":"position","epoch_id":1,"expected_duration_s":0.72,"is_torqued":true,"request_id":2,"safety_state":"Moving","status":"accepted","type":"command_ack"}},
-    {"ev":"action_terminal","client":"c0","action_id":1,"kind":"replay","state":"done","code":null,"safety_state":"Moving","epoch_id":1,"is_torqued":true,"control_mode":"position"},
+    {"ev":"action_terminal","client":"c0","action_id":1,"kind":"replay","state":"done","code":null,"settled":true,"progress":1.0,"safety_state":"Armed","epoch_id":1,"is_torqued":true,"control_mode":"position"},
     {"ev":"client_frame","client":"c0","frame":{"body":{"episode":"01ARZ3NDEKTSV4RRFFQ69G5FAV"},"epoch_id":1,"generation":1,"path":"/api/v1/action/replay","request_id":3,"type":"command"}},
     {"ev":"server_frame","client":"c0","frame":{"code":"EPISODE_NOT_FOUND","epoch_id":1,"error":"EPISODE_NOT_FOUND","message":"Episode '01ARZ3NDEKTSV4RRFFQ69G5FAV' not found","request_id":3,"safety_state":null,"status":404,"type":"command_reject"}},
     {"ev":"client_closed","client":"c0"}
