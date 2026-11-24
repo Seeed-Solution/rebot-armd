@@ -702,11 +702,16 @@ impl crate::supervisor::SupervisorInner {
                 Some(a) => a.motion_limits.as_ref(),
                 None => self.tracking.retained_motion_limits.as_ref(),
             };
-            if let Some(mlim) = caps.filter(|v| v.len() == base.len())
-            {
+            if let Some(mlim) = caps.filter(|v| v.len() == base.len()) {
                 for (l, m) in base.iter_mut().zip(mlim.iter()) {
                     l.max_velocity = l.max_velocity.min(m.max_velocity);
                     l.max_acceleration = l.max_acceleration.min(m.max_acceleration);
+                }
+            } else if let Some((vcaps, dof)) = self.active_trajectory.as_ref().and_then(|a| a.motion_vel_caps) {
+                if dof == base.len() {
+                    for (l, &v) in base.iter_mut().zip(&vcaps[..dof]) {
+                        l.max_velocity = l.max_velocity.min(v);
+                    }
                 }
             }
             base

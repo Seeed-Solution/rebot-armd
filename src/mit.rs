@@ -512,6 +512,9 @@ pub struct MitRuntime {
     pub lost_reason: Option<String>,
     /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
     pub park_after_hand_back: bool,
+    /// When true, MIT handback transitions `park_continuation` to `ReadyForPlan` instead of
+    /// planning synchronously inside `tick_control`.
+    pub deferred_park_off_owner: bool,
     /// Action id of that deferred park (its outcome is reported on it).
     pub deferred_park_action: Option<u64>,
     /// A rearm was refused while MIT moved the arm: brake, then hand back at rest.
@@ -550,6 +553,7 @@ impl crate::supervisor::SupervisorInner {
 
     /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
     pub fn mit_motion_blocker(&self) -> Option<String> {
+        if self.park_continuation.is_some() { return Some("a park continuation is pending".into()); }
         if !self.is_torqued || mit_joints(&self.config).is_empty() { return None; }
         if self.mit.park_after_hand_back { return Some("a park waits for the MIT hand back at rest".into()); }
         if self.mit.revoke_pending { return Some("MIT authorization revoked: braking to rest and handing back".into()); }
@@ -709,7 +713,11 @@ impl crate::supervisor::SupervisorInner {
                     return Some(gm.wire_velocity_ceiling());
                 }
             }
-            active.motion_limits.as_ref().and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+            active
+                .motion_limits
+                .as_ref()
+                .and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+                .or_else(|| active.motion_vel_caps.and_then(|(caps, dof)| (g < dof).then_some(caps[g])))
         } else if let Some(ramp) = &self.tracking.fallback_ramp {
             ramp.limits.get(g).map(|l| l.max_velocity)
         } else if let Some(lim) = self.tracking.retained_motion_limits.as_ref().and_then(|ls| ls.get(g)) {
@@ -984,7 +992,8 @@ impl crate::supervisor::SupervisorInner {
     pub(crate) fn mit_maybe_activate(&mut self) {
         let joints = mit_joints(&self.config);
         if joints.is_empty() || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
-            || self.disable_pending || self.pending_rearm || self.pending_normal_unload || self.gravity_comp.is_some()
+            || self.disable_pending || self.pending_rearm || self.pending_normal_unload
+            || self.park_continuation.is_some() || self.gravity_comp.is_some()
             || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
             || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
             || self.collision.hold.is_some() || self.torque_guard.hold.is_some() || self.servo_blocked_hold

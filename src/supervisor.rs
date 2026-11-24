@@ -30,7 +30,7 @@ mod actions;
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
 pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
-pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until};
+pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until, ParkRearmStart};
 
 /// Global monotonic allocator for single-use [`AdmissionStamp::request_id`] values.
 static NEXT_ADMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -722,6 +722,29 @@ pub struct TickPublished {
     pub body_end: Option<Instant>,
 }
 
+/// Phase of an off-owner deferred park continuation (MIT moving-park handback or bounded
+/// `holding_after_clear` rearm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkContinuationPhase {
+    /// Waiting for `TorqueTransition::Enable { origin: ParkRearm }` confirmation.
+    WaitingRearm,
+    /// Waiting for MIT tracking to brake to rest and hand back to position mode.
+    WaitingMitHandback,
+    /// Confirmed rearm or MIT handback complete; off-lock worker may prepare and install.
+    ReadyForPlan,
+}
+
+/// Exclusive in-flight park continuation owned by a single park action (zero heap allocations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParkContinuation {
+    pub action_id: u64,
+    pub phase: ParkContinuationPhase,
+    pub epoch: u64,
+    pub lease_gen: Option<u64>,
+    pub workspace_revision: u64,
+    pub motion_config_revision: u64,
+}
+
 /// Internal mutable state of the robotic arm supervisor
 pub struct SupervisorInner {
     pub config: ArmConfig,
@@ -1127,6 +1150,22 @@ pub struct SupervisorInner {
     pub(crate) retired_trajectories: std::collections::VecDeque<ActiveTrajectory>,
     /// Preallocated reusable `UnloadSettle` ring returned on stop/finish (0 alloc / 0 free on RT).
     pub(crate) unload_settle_spare: Option<UnloadSettle>,
+    /// Monotonic revision bumped on every change to motion planning inputs (limits, workspace,
+    /// keep-out boxes, camera mount, kinematics, commissioning, gripper calibration, power).
+    pub motion_config_revision: u64,
+    /// Static hardware driver capabilities cached once in [`Self::with_driver`] (0 driver lock on RT).
+    pub(crate) driver_caps: DriverCapabilities,
+    /// Step-2 / RX-poll cached hardware enable & freshness snapshot (0 extra driver lock on RT settle).
+    pub(crate) last_poll_enable_state: EnableState,
+    pub(crate) last_poll_partial_enable: bool,
+    pub(crate) last_poll_oldest_age: Option<Duration>,
+    pub(crate) last_poll_feedback_valid: bool,
+    /// Park action cancelled by an authorized stop before the first disable write.
+    pub(crate) park_stopped_action: Option<u64>,
+    /// Active off-owner deferred park continuation (MIT handback or `holding_after_clear` rearm).
+    pub(crate) park_continuation: Option<ParkContinuation>,
+    /// Off-RT waiter notification for legacy WS park continuations (never touched on `rt_executor_owned`).
+    pub(crate) park_continuation_notify: Arc<tokio::sync::Notify>,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -1759,6 +1798,15 @@ impl SupervisorInner {
             ],
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
+            motion_config_revision: 1,
+            driver_caps: DriverCapabilities::default(),
+            last_poll_enable_state: EnableState::Unknown,
+            last_poll_partial_enable: false,
+            last_poll_oldest_age: None,
+            last_poll_feedback_valid: false,
+            park_stopped_action: None,
+            park_continuation: None,
+            park_continuation_notify: Arc::new(tokio::sync::Notify::new()),
         };
         inner.prepare_workspace_eval_bufs();
         inner
@@ -2806,20 +2854,98 @@ impl SupervisorInner {
         (!failures.is_empty()).then(|| failures.join("; "))
     }
 
+    pub fn bump_motion_config_revision(&mut self) {
+        self.motion_config_revision = self.motion_config_revision.wrapping_add(1).max(1);
+    }
+
+    pub(crate) fn notify_park_continuation(&self) {
+        if !self.rt_executor_owned { self.park_continuation_notify.notify_waiters(); }
+    }
+
+    /// True when replacing `self.active_trajectory` will not drop heap storage on RT.
+    pub(crate) fn can_replace_active_trajectory(&self) -> bool {
+        !self.rt_executor_owned
+            || !self.active_trajectory.as_ref().is_some_and(ActiveTrajectory::has_heap_storage)
+            || self.retired_trajectories.len() < self.retired_trajectories.capacity()
+    }
+
+    /// Replaces `self.active_trajectory`, retiring any heap-backed previous trajectory off-thread on RT.
+    pub(crate) fn replace_active_trajectory(&mut self, next: Option<ActiveTrajectory>) {
+        if let Some(old) = std::mem::replace(&mut self.active_trajectory, next) {
+            if old.has_heap_storage() { self.retire_active_trajectory(old); }
+        }
+    }
+
+    /// Zero-allocation, zero-driver-lock static resting-pose check for RT park settle/disable.
+    pub(crate) fn is_resting_pose_static_ok(&mut self) -> bool {
+        let dof = self.config.dof;
+        let Some(policy) = self.resting_policy() else { return false; };
+        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof { return false; }
+        if self.driver.is_some() {
+            let c = self.driver_caps;
+            let max_age = Duration::from_millis(policy.feedback_max_age_ms);
+            if !c.velocity_feedback || !c.enable_feedback
+                || (!policy.support_torque_limits.is_empty() && !c.torque_feedback)
+                || (!policy.support_load_limits.is_empty() && !c.load_feedback)
+                || (self.last_poll_enable_state != EnableState::Enabled && !self.last_poll_partial_enable)
+                || self.safety.state().is_stopped()
+                || !self.feedback_numeric_valid
+                || !self.last_poll_oldest_age.is_some_and(|age| age <= max_age)
+            { return false; }
+        }
+        let rest = self.config.resting_positions();
+        let mut total = 0.0f32;
+        for (i, &tol) in policy.position_tolerances.iter().enumerate().take(dof) {
+            let dev = (self.measured_positions[i] - rest[i]).abs();
+            if !dev.is_finite() || dev > tol { return false; }
+            total += dev;
+        }
+        if total > policy.max_total_deviation { return false; }
+        if self.driver.is_some()
+            && (policy.support_torque_limits.iter().any(|&(i, m)| i >= dof || self.torques.get(i).is_none_or(|t| !t.is_finite() || t.abs() > m))
+                || policy.support_load_limits.iter().any(|&(i, m)| i >= dof || self.loads.get(i).is_none_or(|l| !l.is_finite() || l.abs() > m)))
+        { return false; }
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let ok = self.measured_workspace_violation_bounded(&mut bufs).is_none();
+        self.ws_eval_bufs = bufs;
+        ok
+    }
+
+    /// Zero-allocation stationary check over the settle hold window (matches [`Self::unload_still_violation`]).
+    fn is_unload_still_ok(&self, settle: &UnloadSettle) -> bool {
+        let Some(policy) = self.resting_policy() else { return false; };
+        if settle.held_s + 1e-6 < UNLOAD_SETTLE_HOLD.as_secs_f64() || settle.samples.is_empty() { return false; }
+        let (n, recent_from) = (settle.samples.len() as f32, settle.pending_s - UNLOAD_STILL_RECENT.as_secs_f64() - 1e-6);
+        for i in 0..self.config.dof {
+            let (mut lo, mut hi, mut sum, mut peak, mut r_sum, mut r_n) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f32, 0.0f32, 0.0f32, 0u32);
+            for s in &settle.samples {
+                if i >= s.dof { return false; }
+                let (q, v) = (s.positions[i], s.velocities[i]);
+                if !q.is_finite() || !v.is_finite() { return false; }
+                lo = lo.min(q); hi = hi.max(q); sum += v; peak = peak.max(v.abs());
+                if s.t >= recent_from { r_sum += v; r_n += 1; }
+            }
+            let limit = policy.max_velocity_of(i);
+            if (r_sum / r_n.max(1) as f32).abs() > limit || (hi - lo) > UNLOAD_STILL_POSITION_SPAN_RAD
+                || (sum / n).abs() > limit || peak > limit * UNLOAD_STILL_VELOCITY_PEAK_FACTOR
+            { return false; }
+        }
+        true
+    }
+
     /// Automatic unload requires a configured resting pose and observable
     /// velocity, supporting torque and enable state. This is a capability check,
     /// not a claim that the arm is currently resting or ready to disable.
     pub fn supports_automatic_unload(&self) -> bool {
-        self.driver.as_ref().is_none_or(|driver| {
-            self.config.resting_pose.as_ref().is_some_and(|policy| {
-                driver.lock().is_ok_and(|driver| {
-                    let capabilities = driver.capabilities();
-                    capabilities.velocity_feedback
-                        && capabilities.enable_feedback
-                        && (capabilities.torque_feedback || policy.support_torque_limits.is_empty())
-                        && (capabilities.load_feedback || policy.support_load_limits.is_empty())
-                })
-            })
+        if self.driver.is_none() {
+            return true;
+        }
+        self.config.resting_pose.as_ref().is_some_and(|policy| {
+            let capabilities = self.driver_caps;
+            capabilities.velocity_feedback
+                && capabilities.enable_feedback
+                && (capabilities.torque_feedback || policy.support_torque_limits.is_empty())
+                && (capabilities.load_feedback || policy.support_load_limits.is_empty())
         })
     }
 
@@ -3351,14 +3477,26 @@ impl SupervisorInner {
             .ceil() as usize
             + 16)
             .max(64);
-        let mut settle = self
+        let settle_opt = self
             .unload_settle
             .take()
             .or_else(|| self.unload_settle_spare.take())
-            .unwrap_or_else(|| UnloadSettle::with_capacity(cap));
+            .or_else(|| (!self.rt_executor_owned).then(|| UnloadSettle::with_capacity(cap)));
+        let Some(mut settle) = settle_opt else {
+            // Fail-closed on RT without allocating if spare was ever exhausted: hold resting pose.
+            let g_idx = self.config.gripper_index();
+            let saved_gripper = g_idx.and_then(|g| self.commanded_positions.get(g).copied());
+            copy_into(&mut self.commanded_positions, self.config.resting_positions());
+            if let (Some(g), Some(pos)) = (g_idx, saved_gripper) {
+                if let Some(slot) = self.commanded_positions.get_mut(g) { *slot = pos; }
+            }
+            copy_into(&mut self.target_positions, &self.commanded_positions);
+            self.commanded_velocities.fill(0.0);
+            return;
+        };
         settle.pending_s += dt;
-        let static_violation = self.resting_pose_static_violation();
-        if static_violation.is_none() {
+        let static_ok = self.is_resting_pose_static_ok();
+        if static_ok {
             let since = *settle.held_since_s.get_or_insert(settle.pending_s);
             settle.held_s = settle.pending_s - since;
             let oldest = settle.pending_s - UNLOAD_SETTLE_HOLD.as_secs_f64() - 1e-6;
@@ -3376,30 +3514,38 @@ impl SupervisorInner {
             settle.held_since_s = None;
             settle.samples.clear();
         }
-        let blocker = static_violation.or_else(|| self.unload_still_violation(&settle));
-        let Some(blocker) = blocker else {
+        let settled_ok = static_ok && self.is_unload_still_ok(&settle);
+        if settled_ok {
+            let pending_s = settle.pending_s;
+            // Always recycle `settle` into `unload_settle_spare` (zero drop on RT).
+            self.unload_settle = Some(settle);
+            self.clear_unload_settle();
             self.pending_normal_unload = false;
-            tracing::info!("Arm settled cleanly at home position for {} ms after {:.2} s; safely cutting torque to Standby/Idle.",
-                UNLOAD_SETTLE_HOLD.as_millis(), settle.pending_s);
-            let watchdog_park = self.watchdog_park.take().is_some();
-            match self.torque_off(true) {
-                Ok(_) if watchdog_park => tracing::info!("Watchdog park complete: torque off at resting pose"),
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("Failed to cut torque after normal unload settle: {}", e);
-                    self.safety.mark_motion_finished();
-                    if watchdog_park && self.is_torqued && !self.safety.state().is_stopped() {
-                        tracing::warn!("Watchdog park failed at torque off; holding torque and latching WatchdogTimeout");
-                        self.latch_watchdog_fault();
-                    }
-                }
+            if !self.rt_executor_owned {
+                tracing::info!(
+                    "Arm settled cleanly at home position for {} ms after {:.2} s; safely cutting torque to Standby/Idle.",
+                    UNLOAD_SETTLE_HOLD.as_millis(), pending_s
+                );
             }
+            let watchdog_park = self.watchdog_park.take().is_some();
+            let park_action_id = self
+                .last_action
+                .as_ref()
+                .filter(|a| a.is_running() && a.kind == "park")
+                .map(|a| a.id);
+            self.begin_park_disable_transition(watchdog_park, park_action_id);
             return;
-        };
-        let report_after = UNLOAD_SETTLE_HOLD.as_secs_f64() + UNLOAD_SETTLE_REPORT_AFTER_S;
-        if settle.pending_s >= report_after && settle.last_report_s.is_none_or(|t| settle.pending_s - t >= 1.0) {
-            tracing::warn!("Unload settle pending for {:.1} s: {blocker}", settle.pending_s);
-            settle.last_report_s = Some(settle.pending_s);
+        }
+        if !self.rt_executor_owned {
+            let report_after = UNLOAD_SETTLE_HOLD.as_secs_f64() + UNLOAD_SETTLE_REPORT_AFTER_S;
+            if settle.pending_s >= report_after && settle.last_report_s.is_none_or(|t| settle.pending_s - t >= 1.0) {
+                let blocker = self
+                    .resting_pose_static_violation()
+                    .or_else(|| self.unload_still_violation(&settle))
+                    .unwrap_or_else(|| "settle pending".into());
+                tracing::warn!("Unload settle pending for {:.1} s: {blocker}", settle.pending_s);
+                settle.last_report_s = Some(settle.pending_s);
+            }
         }
         // Not yet stably at rest: hold the home target in place (0 alloc). Gripper keeps its
         // command: driving it to the home value would squeeze anything still in the jaw.
@@ -3865,7 +4011,9 @@ impl SupervisorInner {
             .is_some_and(|rd| self.install_driver_tx_release_cap(budget.now, rd));
         let trans = self.service_torque_transition(budget);
         let transition_rx = if let Some(tp) = trans {
-            self.core.begin_transition(tp.progress);
+            if tp.broker_owned {
+                self.core.begin_transition(tp.progress);
+            }
             tp.rx
         } else {
             self.service_background_disable(budget)
@@ -3980,6 +4128,15 @@ impl SupervisorInner {
                                 out.recovery_ages = true;
                             }
                             let driver_valid = driver.is_feedback_valid();
+                            let all_ages = sc.ages.len() == self.config.dof && sc.ages.iter().all(Option::is_some);
+                            self.last_poll_enable_state = driver.enable_state();
+                            self.last_poll_partial_enable = driver.has_known_partial_enable();
+                            self.last_poll_feedback_valid = driver_valid;
+                            self.last_poll_oldest_age = if all_ages {
+                                sc.ages.iter().flatten().copied().max()
+                            } else {
+                                None
+                            };
                             let all_fresh_age = sc.ages.len() == self.config.dof
                                 && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
                             if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
@@ -4032,6 +4189,8 @@ impl SupervisorInner {
                         }
                         Err(_) => {
                             self.last_can_feedback_instant = None;
+                            self.last_poll_feedback_valid = false;
+                            self.last_poll_oldest_age = None;
                             self.thermal_cooldown.reset();
                             out.reset_stillness_on_read_err = true;
                         }
@@ -4135,9 +4294,19 @@ impl SupervisorInner {
 
         // Reuse Step 2's single budgeted hardware poll when present; legacy callers without
         // a preceding `poll_hardware` perform the receive pass here.
-        let rx = if self.pending_rx_poll.active {
+        let was_step2_poll = self.pending_rx_poll.active;
+        let rx = if was_step2_poll {
             std::mem::take(&mut self.pending_rx_poll)
         } else {
+            if self.has_non_broker_torque_transition() {
+                let now = Instant::now();
+                let budget = crate::rt_core::ops::ServiceBudget {
+                    now,
+                    deadline: now + crate::rt_core::ops::RX_TIME_BUDGET,
+                    max_rx_frames: crate::rt_core::ops::RX_FRAME_BUDGET,
+                };
+                let _ = self.service_torque_transition(&budget);
+            }
             self.poll_hardware_rx(None, None, None)
         };
         let invalid_feedback = rx.invalid_feedback;
@@ -5121,8 +5290,8 @@ impl SupervisorInner {
                     if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
                 }
                 if finished && approach_started.is_none() {
-                    self.active_trajectory = None;
-                    self.commanded_velocities = vec![0.0; self.config.dof];
+                    self.replace_active_trajectory(None);
+                    self.commanded_velocities.fill(0.0);
                     if !self.pending_normal_unload {
                         self.safety.mark_motion_finished();
                         if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
@@ -5435,21 +5604,42 @@ impl SupervisorInner {
             }
         }
         if self.mit.park_after_hand_back {
-            // a park waits for rest and the confirmed hand back, then starts
+            // a park waits for rest and the confirmed hand back, then starts (or wakes off-owner continuation)
             let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
             if !self.mit_active() || self.safety.state().is_stopped() {
                 self.mit.park_after_hand_back = false;
+                self.mit.deferred_park_off_owner = false;
+                if let Some(c) = self.park_continuation.take() {
+                    let mut msg = self.take_action_msg_buf(c.action_id, 96);
+                    msg.clear();
+                    msg.push_str("Park cancelled: MIT tracking lost or a fault");
+                    self.finish_action(c.action_id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
+                    self.notify_park_continuation();
+                }
                 if let Some(id) = self.mit.deferred_park_action.take() {
-                    self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park cancelled: MIT tracking lost or a fault".into()), None, None, None);
+                    let mut msg = self.take_action_msg_buf(id, 96);
+                    msg.clear();
+                    msg.push_str("Park cancelled: MIT tracking lost or a fault");
+                    self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
                 }
             } else if at_rest && self.mit_hand_back("park").is_ok() {
                 self.mit.park_after_hand_back = false;
-                self.apply_stop_policy(StopPolicy::NormalUnload);
-                if let Some(id) = self.mit.deferred_park_action.take() {
-                    if self.pending_normal_unload {
-                        if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
-                    } else {
-                        self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park could not start after the MIT hand back".into()), None, None, None);
+                if std::mem::take(&mut self.mit.deferred_park_off_owner) {
+                    if let Some(c) = self.park_continuation.as_mut() {
+                        c.phase = ParkContinuationPhase::ReadyForPlan;
+                    }
+                    self.notify_park_continuation();
+                } else {
+                    self.apply_stop_policy(StopPolicy::NormalUnload);
+                    if let Some(id) = self.mit.deferred_park_action.take() {
+                        if self.pending_normal_unload {
+                            if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+                        } else {
+                            let mut msg = self.take_action_msg_buf(id, 96);
+                            msg.clear();
+                            msg.push_str("Park could not start after the MIT hand back");
+                            self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
+                        }
                     }
                 }
             }

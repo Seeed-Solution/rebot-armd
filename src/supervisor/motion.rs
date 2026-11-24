@@ -98,13 +98,50 @@ impl SupervisorInner {
         }
     }
 
+    /// Pure read-only preview of torque-guard and power-governor hold clamping without
+    /// mutating `self.motion_limit`. Returns `(torque_clamped_joint, power_clamped_joint)`.
+    pub(crate) fn preview_hold_filters(&self, targets: &mut [f32]) -> (Option<usize>, Option<usize>) {
+        let mut torque_clamped = None;
+        if let Some(h) = self.torque_guard.hold {
+            if let Some(t) = targets.get_mut(h.joint) {
+                if (*t - h.hold_q) * h.sign > 0.0 {
+                    *t = h.hold_q;
+                    torque_clamped = Some(h.joint);
+                }
+            }
+        }
+        let mut power_clamped = None;
+        if let Some(h) = self.power.gov.hold {
+            for (j, t) in targets.iter_mut().enumerate().take(crate::power::MAX_JOINTS) {
+                if h.push[j] != 0.0 && (*t - h.hold_q[j]) * h.push[j] > 0.0 {
+                    *t = h.hold_q[j];
+                    power_clamped.get_or_insert(j);
+                }
+            }
+        }
+        (torque_clamped, power_clamped)
+    }
+
+    pub(crate) fn commit_hold_filter_notes(&mut self, torque_clamped: Option<usize>, power_clamped: Option<usize>) {
+        if let Some(j) = torque_clamped {
+            self.note_motion_limit(MotionLimitReason::Torque, Some(j));
+        }
+        if let Some(j) = power_clamped {
+            self.note_motion_limit(MotionLimitReason::Power, Some(j));
+        }
+    }
+
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     /// In RT executor mode, heap-owning motion payloads are retired off-thread (zero RT frees).
     pub fn stop_motion(&mut self) {
         // a STOP cancels a park deferred behind the MIT hand back
+        self.mit.deferred_park_off_owner = false;
         if std::mem::take(&mut self.mit.park_after_hand_back) {
             if let Some(id) = self.mit.deferred_park_action.take() {
-                self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+                let mut msg = self.take_action_msg_buf(id, 32);
+                msg.clear();
+                msg.push_str("Motion stopped");
+                self.finish_action(id, "cancelled", Some("STOPPED"), Some(msg), None, None, None);
             }
         }
         // (the message is built only when a run ends: a stop without one does not allocate)
@@ -956,6 +993,7 @@ impl SupervisorInner {
         if self.handover_settling_since.is_some() { return Err("REJECTED"); }
         if self.e_stop_latched.load(Ordering::SeqCst) { return Err("ESTOP_ACTIVE"); }
         if self.pending_rearm || self.pending_normal_unload { return Err("NOT_ARMED"); }
+        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() { return Err("MOTION_BUSY"); }
         Ok(())
     }
 
@@ -1039,6 +1077,9 @@ impl SupervisorInner {
         }
         if self.pending_rearm || self.pending_normal_unload {
             return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
+        }
+        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() {
+            return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
         }
         self.pending_normal_unload = false;
 
@@ -1185,6 +1226,9 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
         }
+        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() {
+            return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
+        }
         self.pending_normal_unload = false;
 
         // 1. Validate command against single controller authority, safety state, and soft limits
@@ -1272,7 +1316,9 @@ impl SupervisorInner {
     /// running (each was checked against the current rule).
     pub fn workspace_change_blocker(&self) -> Option<String> {
         if self.macro_run.is_some() { return Some("a macro action is running".into()); }
-        if self.pending_normal_unload { return Some("a park is running".into()); }
+        if self.pending_normal_unload || self.park_continuation.is_some() || self.park_disable_in_flight() {
+            return Some("a park is running".into());
+        }
         self.busy_reason()
     }
 
@@ -1557,8 +1603,18 @@ impl SupervisorInner {
     // -- RT commit (armd 1.6 RT core, track C) ------------------------------------------
 
     /// Feedback a commit may plan from: numerically valid, and fresh per the driver (no driver: simulated).
+    /// On RT executor ownership, uses the Step-2 cached poll state with zero extra driver locks.
     pub fn commit_feedback_valid(&self) -> bool {
-        self.feedback_numeric_valid && self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
+        if !self.feedback_numeric_valid {
+            return false;
+        }
+        if self.driver.is_none() {
+            return true;
+        }
+        if self.rt_executor_owned {
+            return self.last_poll_feedback_valid;
+        }
+        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
     }
 
     /// The refusal code when a primitive admitted under `admitted` may not be installed,
@@ -1597,10 +1653,31 @@ impl SupervisorInner {
             crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), park.elapsed_s, park.budget_s);
             return false;
         }
+        if self.is_watchdog_park_disable_in_flight() {
+            crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), 0.0, 0.0);
+            return false;
+        }
         if self.gravity_comp.is_some() {
             self.exit_gravity_comp("STOPPED", "Stop command");
         }
+        let disable_in_flight = self.park_disable_in_flight();
+        let running_park_id = self
+            .last_action
+            .as_ref()
+            .filter(|a| a.is_running() && a.kind == "park")
+            .map(|a| a.id);
+        let cancelled_continuation = self.park_continuation.take();
+        if cancelled_continuation.is_some() {
+            self.abort_park_rearm_transition();
+            self.notify_park_continuation();
+        }
         self.stop_motion();
+        if !disable_in_flight {
+            if let Some(id) = cancelled_continuation.map(|c| c.action_id).or(running_park_id) {
+                self.park_stopped_action = None;
+                self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
+            }
+        }
         if self.macro_run.is_some() {
             self.request_macro_stop();
         }

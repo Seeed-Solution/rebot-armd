@@ -329,6 +329,7 @@ pub fn commit_commissioning_confirm(
     inner.config.active_tool.commissioning_required = false;
     inner.tool_commissioning_confirmed_at = Some(prepared.confirmed_at);
     inner.tool_commissioning_revision += 1;
+    inner.bump_motion_config_revision();
     Ok((inner.config.active_tool.clone(), inner.tool_commissioning_revision))
 }
 

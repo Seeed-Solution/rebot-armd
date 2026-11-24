@@ -2473,17 +2473,23 @@ pub struct ActiveTrajectory {
     pub span: Option<(f64, f64)>,
     /// Per-joint velocity/acceleration limits used when planning this trajectory (e.g. after `speed_scale`).
     pub motion_limits: Option<Vec<JointLimit>>,
+    /// Zero-allocation inline per-joint velocity caps (used by RT prepared jog/home/park with `speed_scale`).
+    pub motion_vel_caps: Option<([f32; 8], usize)>,
 }
 
 impl ActiveTrajectory {
     pub fn new(action_id: Option<u64>, reference: Reference) -> Self {
-        Self { action_id, reference, then: None, span: None, motion_limits: None }
+        Self { action_id, reference, then: None, span: None, motion_limits: None, motion_vel_caps: None }
     }
     pub fn quintic(traj: MultiJointQuinticTrajectory, action_id: Option<u64>) -> Self {
         Self::new(action_id, Reference::Quintic(traj))
     }
     pub fn with_motion_limits(mut self, limits: Vec<JointLimit>) -> Self {
         self.motion_limits = Some(limits);
+        self
+    }
+    pub fn with_motion_vel_caps(mut self, caps: [f32; 8], dof: usize) -> Self {
+        self.motion_vel_caps = Some((caps, dof));
         self
     }
     /// `reference` followed by the short segment `then` (same-side approach).

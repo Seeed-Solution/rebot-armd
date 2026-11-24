@@ -104,6 +104,7 @@ impl SupervisorInner {
         self.keepout.runtime_boxes = boxes;
         self.keepout.runtime = true;
         self.workspace_revision += 1;
+        self.bump_motion_config_revision();
         self.servo_ws_min_depths = None;
         self.keepout.revision += 1;
         self.prepare_workspace_eval_bufs();

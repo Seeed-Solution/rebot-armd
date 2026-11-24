@@ -444,6 +444,9 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
+        if self.disable_pending || self.torque_transition.is_some() || self.park_continuation.is_some() {
+            return Err(MotionError::MotionBusy("a torque transition or park is pending".into()).into());
+        }
         self.collision_hold_check()?;
         self.config_motion_check()?;
         if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
@@ -1446,6 +1449,13 @@ impl SupervisorInner {
             };
             // a macro sub-motion or a replay must not outlive its action
             if (is_macro || is_replay) && carried { self.stop_motion(); }
+            if is_park && self.park_continuation.is_some_and(|c| c.action_id == id) {
+                self.park_continuation = None;
+                self.mit.park_after_hand_back = false;
+                self.mit.deferred_park_off_owner = false;
+                self.abort_park_rearm_transition();
+                self.notify_park_continuation();
+            }
             self.pending_deferred_done = None;
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
             let mut message = self.take_action_msg_buf(id, 256);
@@ -1528,17 +1538,34 @@ impl SupervisorInner {
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
         if is_park {
-            if self.mit.deferred_park_action == Some(id) { return; }
+            if self.mit.deferred_park_action == Some(id)
+                || self.park_continuation.is_some_and(|c| c.action_id == id)
+                || self.park_disable_in_flight_for(id)
+            {
+                return;
+            }
+            if self.park_stopped_action == Some(id) {
+                self.park_stopped_action = None;
+                self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
+                return;
+            }
             if self.pending_normal_unload {
                 let progress = self.active_trajectory.as_ref().and_then(|a| a.as_quintic()).map_or(1.0, |t| (t.elapsed / t.duration).min(1.0) as f32);
                 if let Some(a) = self.last_action.as_mut() { a.progress = progress; }
-            } else if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) {
+            } else if !self.is_torqued
+                && matches!(self.safety.state(), SafetyState::Idle)
+                && !self.disable_pending
+                && !self.park_disable_in_flight()
+            {
                 self.finish_action(id, "done", None, None, None, None, None);
             } else if superseded {
                 self.pending_deferred_done = None;
                 self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
             } else {
-                self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park ended with torque still on".into()), None, None, None);
+                let mut msg = self.take_action_msg_buf(id, 64);
+                msg.clear();
+                msg.push_str("Park ended with torque still on");
+                self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some(msg), None, None, None);
             }
             return;
         }
