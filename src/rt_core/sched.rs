@@ -180,6 +180,51 @@ pub fn apply_to_current_thread(cfg: &RtSchedConfig, memory: &MemoryLock) -> Cont
     }
 }
 
+/// Reads the calling thread's current scheduling policy and priority without modifying it or
+/// updating process-wide [`RtReadiness`].
+pub fn observe_current_thread(memory: &MemoryLock) -> ControlThreadSched {
+    #[cfg(target_os = "linux")]
+    {
+        let mut policy: libc::c_int = 0;
+        // SAFETY: `sched_param` is plain old data; both out-pointers are valid for the call.
+        let mut now: libc::sched_param = unsafe { std::mem::zeroed() };
+        let rc_get = unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut now) };
+        let name = if rc_get != 0 {
+            "unknown".to_string()
+        } else {
+            match policy {
+                libc::SCHED_FIFO => "fifo".to_string(),
+                libc::SCHED_RR => "rr".to_string(),
+                libc::SCHED_OTHER => "other".to_string(),
+                p => p.to_string(),
+            }
+        };
+        ControlThreadSched {
+            policy: name,
+            priority: if rc_get == 0 { now.sched_priority } else { 0 },
+            realtime: rc_get == 0 && policy == libc::SCHED_FIFO,
+            requested_priority: None,
+            cpu: None,
+            memory_locked: Some(memory.is_locked()),
+            memory_lock: Some(memory.describe()),
+            errors: Vec::new(),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        ControlThreadSched {
+            policy: "other".into(),
+            priority: 0,
+            realtime: false,
+            requested_priority: None,
+            cpu: None,
+            memory_locked: Some(memory.is_locked()),
+            memory_lock: Some(memory.describe()),
+            errors: Vec::new(),
+        }
+    }
+}
+
 /// Whether the executor runs as the RT design requires (SCHED_FIFO, memory locked); MIT
 /// tracking is refused otherwise (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]

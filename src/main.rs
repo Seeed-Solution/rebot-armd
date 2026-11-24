@@ -598,6 +598,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let control_stop_flag = control_stop.clone();
             let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
+            supervisor.attach_legacy_loop_stats(executor_stats.clone());
             let loop_stats = executor_stats.clone();
             let runtime = tokio::runtime::Handle::current();
             std::thread::Builder::new().name("armd-control".into()).spawn(move || {

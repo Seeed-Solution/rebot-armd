@@ -249,6 +249,10 @@ pub struct ExecutorStats {
     pub skipped_releases: AtomicU64,
     /// Diagnostic `TickSample` values dropped because the off-thread ring was full.
     pub diag_dropped: AtomicU64,
+    /// Cumulative releases whose raw wakeup lateness exceeded 1 ms / 5 ms / 10 ms.
+    pub wake_lateness_over_1ms: AtomicU64,
+    pub wake_lateness_over_5ms: AtomicU64,
+    pub wake_lateness_over_10ms: AtomicU64,
     /// Sub-release transition wakes started by `armd-control`.
     pub wakes: AtomicU64,
     /// Sub-release transition wakes completed (Release-incremented strictly AFTER `wake_allocs` is updated).
@@ -264,6 +268,25 @@ pub struct ExecutorStats {
 }
 
 impl ExecutorStats {
+    /// Classifies raw wakeup lateness (`actual_release_start - scheduled_release`, ns), updates
+    /// the cumulative `> 1 / 5 / 10 ms` counters atomically (zero allocation), and returns the
+    /// saturating microsecond value for `TickSample::wake_lateness_us`.
+    #[inline]
+    pub fn record_wake_lateness_ns(&self, lateness_ns: u64) -> u32 {
+        let (us, over_1ms, over_5ms, over_10ms) =
+            crate::diagnostics::tick::classify_wake_lateness_ns(lateness_ns);
+        if over_1ms {
+            self.wake_lateness_over_1ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if over_5ms {
+            self.wake_lateness_over_5ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if over_10ms {
+            self.wake_lateness_over_10ms.fetch_add(1, Ordering::Relaxed);
+        }
+        us
+    }
+
     /// Combined cumulative heap counts across both whole releases and sub-release wakes
     /// (independent of the droppable diagnostic ring).
     pub fn total_allocs(&self) -> crate::diagnostics::alloc::AllocCounts {
@@ -2732,6 +2755,9 @@ fn control_thread_main(
         }
         sched::set_readiness(RtReadiness::from_sched(&s));
         *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    } else {
+        let s = sched::observe_current_thread(&cfg.memory_lock);
+        *control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
     }
     if cfg.alloc_timing {
         crate::diagnostics::alloc::time_this_thread();
@@ -2820,6 +2846,8 @@ fn control_thread_main(
             let release_start = now_inst();
             let usage_start = UsageMark::now();
             let now_ns = now_ns_fn();
+            let wake_lateness_ns = now_ns.saturating_sub(scheduled_ns);
+            let wake_lateness_us = stats.record_wake_lateness_ns(wake_lateness_ns);
             let skipped = releases.advance(now_ns);
             if skipped > 0 {
                 stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed);
@@ -2929,6 +2957,7 @@ fn control_thread_main(
                         } else {
                             0
                         },
+                        wake_lateness_us,
                         reader_hold_us: 0,
                         writer_hold_us: 0,
                         reader_acquire_us: 0,
@@ -2951,6 +2980,7 @@ fn control_thread_main(
                         },
                         waited_for: None,
                         longest_hold: None,
+                        wake_lateness_ns,
                         late: !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1)),
                     };
                     if diag_tx.push(sample).is_err() {
@@ -3235,21 +3265,46 @@ impl Releases {
 
 /// Runs `step(dt)` at every release until `stop` is set. `dt` is the real time since the
 /// previous step's start (seconds). Allocation free.
-pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, mut step: impl FnMut(f64)) {
-    let mut releases = Releases::start(period);
-    let mut last = Instant::now();
+pub fn run_periodic(period: Duration, stop: &AtomicBool, stats: &ExecutorStats, step: impl FnMut(f64)) {
+    run_periodic_with_clock(period, stop, stats, None, step);
+}
+
+/// [`run_periodic`] with an optional deterministic [`ExecutorClock`] for tests.
+pub fn run_periodic_with_clock(
+    period: Duration,
+    stop: &AtomicBool,
+    stats: &ExecutorStats,
+    clock: Option<&dyn ExecutorClock>,
+    mut step: impl FnMut(f64),
+) {
+    let now_inst = || clock.map_or_else(Instant::now, ExecutorClock::now);
+    let now_ns = || clock.map_or_else(mono_now_ns, ExecutorClock::now_ns);
+    let mut releases = Releases::start_at(now_ns(), period);
+    let mut last = now_inst();
     while !stop.load(Ordering::Acquire) {
-        sleep_until_ns(releases.next_ns());
-        let woke = Instant::now();
-        let skipped = releases.advance(mono_now_ns());
+        let scheduled_ns = releases.next_ns();
+        if let Some(c) = clock {
+            c.sleep_until_ns(scheduled_ns, stop);
+        } else {
+            sleep_until_ns(scheduled_ns);
+        }
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let actual_ns = now_ns();
+        let woke = now_inst();
+        let wake_lateness_ns = actual_ns.saturating_sub(scheduled_ns);
+        let _ = stats.record_wake_lateness_ns(wake_lateness_ns);
+        let skipped = releases.advance(actual_ns);
         if skipped > 0 { stats.skipped_releases.fetch_add(skipped, Ordering::Relaxed); }
-        let elapsed = woke - last;
+        let elapsed = woke.saturating_duration_since(last);
         last = woke;
         if elapsed > LATE_LOG_AFTER {
             stats.last_late_us.store(elapsed.as_micros() as u64, Ordering::Relaxed);
             stats.late.fetch_add(1, Ordering::Release);
         }
         stats.steps.fetch_add(1, Ordering::Relaxed);
+        let _lateness_guard = crate::diagnostics::tick::WakeLatenessGuard::enter(wake_lateness_ns);
         step(elapsed.as_secs_f64());
     }
 }

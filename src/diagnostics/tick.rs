@@ -8,6 +8,60 @@ use serde::{Serialize, Serializer};
 /// Ticks the percentiles cover.
 pub const TICK_WINDOW: usize = 1000;
 
+/// Strict wakeup-lateness thresholds evaluated on raw nanoseconds (`actual - scheduled`).
+pub const WAKE_LATENESS_1MS_NS: u64 = 1_000_000;
+pub const WAKE_LATENESS_5MS_NS: u64 = 5_000_000;
+pub const WAKE_LATENESS_10MS_NS: u64 = 10_000_000;
+
+/// Converts raw wakeup lateness (`actual_release_start - scheduled_release`, ns) to saturating
+/// microseconds and strict threshold flags (`> 1 ms`, `> 5 ms`, `> 10 ms` on raw nanoseconds).
+#[inline]
+pub fn classify_wake_lateness_ns(lateness_ns: u64) -> (u32, bool, bool, bool) {
+    let us = (lateness_ns / 1_000).min(u64::from(u32::MAX)) as u32;
+    (
+        us,
+        lateness_ns > WAKE_LATENESS_1MS_NS,
+        lateness_ns > WAKE_LATENESS_5MS_NS,
+        lateness_ns > WAKE_LATENESS_10MS_NS,
+    )
+}
+
+thread_local! {
+    static CURRENT_WAKE_LATENESS_NS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Scoped thread-local handoff carrying raw wakeup lateness (ns) from `run_periodic` into
+/// `ArmSupervisor::tick_shared` on the same OS thread; restores the prior value on drop
+/// (including panic unwinds and early returns).
+pub struct WakeLatenessGuard {
+    prev: u64,
+}
+
+impl WakeLatenessGuard {
+    #[inline]
+    pub fn enter(lateness_ns: u64) -> Self {
+        let prev = CURRENT_WAKE_LATENESS_NS
+            .try_with(|c| c.replace(lateness_ns))
+            .unwrap_or(0);
+        Self { prev }
+    }
+}
+
+impl Drop for WakeLatenessGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let _ = CURRENT_WAKE_LATENESS_NS.try_with(|c| c.set(self.prev));
+    }
+}
+
+/// Takes and clears the calling thread's pending raw wakeup lateness (ns).
+#[inline]
+pub fn take_current_wake_lateness_ns() -> u64 {
+    CURRENT_WAKE_LATENESS_NS
+        .try_with(|c| c.replace(0))
+        .unwrap_or(0)
+}
+
 /// Outcome of one CAN `transmit` attempt recorded in the tick's TX diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxAttemptKind {
@@ -261,6 +315,8 @@ pub struct TickSample {
     pub post_us: u32,
     /// `dt` of the tick: start-to-start interval of the control loop.
     pub period_us: u32,
+    /// Wakeup lateness `actual_release_start - scheduled_release`, µs (0 when driven directly).
+    pub wake_lateness_us: u32,
     /// Longest read / write hold by another task released since the previous tick.
     pub reader_hold_us: u32,
     pub writer_hold_us: u32,
@@ -279,6 +335,9 @@ pub struct TickSample {
     pub waited_for: Option<Holder>,
     /// The longest other hold since the previous tick (may differ from `waited_for`).
     pub longest_hold: Option<Holder>,
+    /// Raw wakeup lateness (ns) used for exact `> 1 / 5 / 10 ms` threshold classification.
+    #[serde(skip)]
+    pub wake_lateness_ns: u64,
     #[serde(skip)]
     pub late: bool,
 }
@@ -302,6 +361,9 @@ pub struct TickStats {
     next: usize,
     late_count: u64,
     ticks: u64,
+    wake_lateness_over_1ms: u64,
+    wake_lateness_over_5ms: u64,
+    wake_lateness_over_10ms: u64,
     tx_totals: TxTotals,
 }
 
@@ -433,6 +495,20 @@ pub struct TickSnapshot {
     pub post_us: Percentiles,
     /// Start-to-start interval of the control loop (`dt`).
     pub period_us: Percentiles,
+    /// Wakeup lateness (`actual_release_start - scheduled_release`) over the window, µs.
+    pub wake_lateness_us: Percentiles,
+    /// Cumulative releases since boot with wakeup lateness strictly greater than 1 ms / 5 ms / 10 ms.
+    pub wake_lateness_over_1ms: u64,
+    pub wake_lateness_over_5ms: u64,
+    pub wake_lateness_over_10ms: u64,
+    /// Cumulative scheduled releases skipped since boot (`ExecutorStats::skipped_releases` in
+    /// executor mode, or `run_periodic`'s skip counter in legacy mode).
+    pub skipped_releases: u64,
+    /// Cumulative diagnostic `TickSample` values dropped because the off-thread ring was full
+    /// (executor mode; 0 in legacy mode).
+    pub diag_dropped: u64,
+    /// Active control-loop owner mode (`"legacy"`, `"transferring"`, `"executor"`, `"failed"`).
+    pub owner_mode: &'static str,
     /// Longest read-lock hold by another task per tick interval (includes preemption of that task).
     pub reader_hold_us: Percentiles,
     /// Longest write-lock hold by another task per tick interval.
@@ -466,6 +542,9 @@ impl Default for TickStats {
             next: 0,
             late_count: 0,
             ticks: 0,
+            wake_lateness_over_1ms: 0,
+            wake_lateness_over_5ms: 0,
+            wake_lateness_over_10ms: 0,
             tx_totals: TxTotals::default(),
         }
     }
@@ -557,6 +636,9 @@ pub struct TickWindow {
     rows: Vec<TickSample>,
     late_count: u64,
     ticks: u64,
+    wake_lateness_over_1ms: u64,
+    wake_lateness_over_5ms: u64,
+    wake_lateness_over_10ms: u64,
     tx_totals: TxTotals,
 }
 
@@ -567,6 +649,15 @@ impl TickStats {
         self.len = (self.len + 1).min(TICK_WINDOW);
         self.ticks += 1;
         if s.late { self.late_count += 1; }
+        let raw_ns = if s.wake_lateness_ns > 0 {
+            s.wake_lateness_ns
+        } else {
+            u64::from(s.wake_lateness_us).saturating_mul(1_000)
+        };
+        let (_, over_1ms, over_5ms, over_10ms) = classify_wake_lateness_ns(raw_ns);
+        if over_1ms { self.wake_lateness_over_1ms += 1; }
+        if over_5ms { self.wake_lateness_over_5ms += 1; }
+        if over_10ms { self.wake_lateness_over_10ms += 1; }
         self.tx_totals.frames = self.tx_totals.frames.saturating_add(u64::from(s.usage.tx_frames));
         self.tx_totals.would_block = self.tx_totals.would_block.saturating_add(u64::from(s.usage.tx_would_block));
         self.tx_totals.enobufs = self.tx_totals.enobufs.saturating_add(u64::from(s.usage.tx_enobufs));
@@ -579,7 +670,15 @@ impl TickStats {
     pub fn window(&self) -> TickWindow {
         let start = if self.len < TICK_WINDOW { 0 } else { self.next };
         let rows = (0..self.len).map(|i| self.rows[(start + i) % TICK_WINDOW]).collect();
-        TickWindow { rows, late_count: self.late_count, ticks: self.ticks, tx_totals: self.tx_totals }
+        TickWindow {
+            rows,
+            late_count: self.late_count,
+            ticks: self.ticks,
+            wake_lateness_over_1ms: self.wake_lateness_over_1ms,
+            wake_lateness_over_5ms: self.wake_lateness_over_5ms,
+            wake_lateness_over_10ms: self.wake_lateness_over_10ms,
+            tx_totals: self.tx_totals,
+        }
     }
 
     pub fn snapshot(&self) -> TickSnapshot { self.window().snapshot() }
@@ -615,6 +714,13 @@ impl TickWindow {
             wait_us: self.col(|r| r.wait_us),
             post_us: self.col(|r| r.post_us),
             period_us: self.col(|r| r.period_us),
+            wake_lateness_us: self.col(|r| r.wake_lateness_us),
+            wake_lateness_over_1ms: self.wake_lateness_over_1ms,
+            wake_lateness_over_5ms: self.wake_lateness_over_5ms,
+            wake_lateness_over_10ms: self.wake_lateness_over_10ms,
+            skipped_releases: 0,
+            diag_dropped: 0,
+            owner_mode: "legacy",
             reader_hold_us: self.col(|r| r.reader_hold_us),
             writer_hold_us: self.col(|r| r.writer_hold_us),
             stats_wait_us: self.col(|r| r.stats_wait_us),

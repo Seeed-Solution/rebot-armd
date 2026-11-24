@@ -3934,6 +3934,8 @@ pub struct ArmSupervisor {
     estop_reg: Arc<std::sync::Mutex<crate::rt_core::executor::EstopRegistry>>,
     /// Off-thread consumer sinks installed when ownership transfers to the RT executor.
     sinks: Arc<std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>>,
+    /// Shared periodic-loop timing stats attached in Legacy mode (`run_periodic`).
+    legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -4023,12 +4025,30 @@ impl ArmSupervisor {
             executor_base_gen: AtomicU64::new(0),
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
+            legacy_loop_stats: std::sync::Mutex::new(None),
         }
     }
 
     /// Current ownership mode (`OWNER_LEGACY`, `OWNER_TRANSFERRING`, `OWNER_EXECUTOR`, `OWNER_FAILED`).
     pub fn owner_mode(&self) -> u8 {
         self.owner_mode.load(Ordering::Acquire)
+    }
+
+    /// Human-readable ownership mode name exposed in `GET /api/v1/diagnostics/tick`.
+    pub fn owner_mode_name(&self) -> &'static str {
+        match self.owner_mode() {
+            OWNER_LEGACY => "legacy",
+            OWNER_TRANSFERRING => "transferring",
+            OWNER_EXECUTOR => "executor",
+            OWNER_FAILED => "failed",
+            _ => "unknown",
+        }
+    }
+
+    /// Attaches the legacy periodic control loop's [`ExecutorStats`] so `GET /api/v1/diagnostics/tick`
+    /// reports `skipped_releases` and cumulative wake-lateness threshold counts in Legacy mode.
+    pub fn attach_legacy_loop_stats(&self, stats: Arc<crate::rt_core::executor::ExecutorStats>) {
+        *self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats);
     }
 
     /// Handle to the synchronous RT executor when ownership has transferred.
@@ -5006,6 +5026,8 @@ impl ArmSupervisor {
     /// when `keep`.
     async fn tick_shared(&self, dt: f64, keep: bool) -> Option<ArmObservation> {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick_shared");
+        let wake_lateness_ns = crate::diagnostics::tick::take_current_wake_lateness_ns();
+        let wake_lateness_us = (wake_lateness_ns / 1_000).min(u64::from(u32::MAX)) as u32;
         if self.owner_mode() != OWNER_LEGACY {
             return None;
         }
@@ -5276,6 +5298,7 @@ impl ArmSupervisor {
             lock_us: us(lock_held),
             post_us: us(done - released),
             period_us: if dt.is_finite() && dt >= 0.0 { us(Duration::from_secs_f64(dt.min(4.0e3))) } else { 0 },
+            wake_lateness_us,
             reader_hold_us: us(log.reader_hold),
             writer_hold_us: us(log.writer_hold),
             reader_acquire_us: us(log.reader_acquire),
@@ -5294,6 +5317,7 @@ impl ArmSupervisor {
             },
             waited_for: log.last_release.map(holder),
             longest_hold: log.longest.map(holder),
+            wake_lateness_ns,
             late,
         };
         let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -5315,6 +5339,22 @@ impl ArmSupervisor {
         self.drain_diag();
         let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
         let mut snap = window.snapshot();
+        snap.owner_mode = self.owner_mode_name();
+        let active_stats = if let Some(h) = self.executor_handle() {
+            Some(Arc::clone(h.stats()))
+        } else {
+            self.legacy_loop_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+        if let Some(s) = active_stats {
+            snap.skipped_releases = s.skipped_releases.load(Ordering::Relaxed);
+            snap.diag_dropped = s.diag_dropped.load(Ordering::Relaxed);
+            snap.wake_lateness_over_1ms = s.wake_lateness_over_1ms.load(Ordering::Relaxed);
+            snap.wake_lateness_over_5ms = s.wake_lateness_over_5ms.load(Ordering::Relaxed);
+            snap.wake_lateness_over_10ms = s.wake_lateness_over_10ms.load(Ordering::Relaxed);
+        }
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),
