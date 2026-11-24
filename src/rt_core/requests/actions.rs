@@ -762,6 +762,12 @@ pub fn check_action_authority(
         authority: stamp.broker_authority(),
         deadline: stamp.deadline,
     };
+    if stamp.admission.estop_epoch != inner.safety.epoch_id()
+        && (inner.e_stop_latched.load(Ordering::SeqCst)
+            || matches!(inner.safety.state(), SafetyState::EStop))
+    {
+        return Err(ActionRefusal::new("ESTOP_ACTIVE"));
+    }
     if let Some(code) = wire_stamp.check(ctx.arm, ctx.boot, ctx.now, &current) {
         return Err(ActionRefusal::new(code));
     }
@@ -1579,6 +1585,7 @@ pub fn prepare_gripper_request(
         }
     }
     let mut stamp = snap.stamp;
+    stamp.parent_generation = 0;
     stamp.poses_revision = None;
     stamp.sequences_revision = None;
     stamp.grasp_setup_revision = None;
@@ -1612,9 +1619,12 @@ pub fn prepare_saved_pose(
     let name = body
         .get("name")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| MotionError::InvalidCommand("name must be a non-empty string".into()))?;
+        .ok_or_else(|| MotionError::InvalidCommand("name must be a string".into()))?;
+    if !crate::poses::valid_name(name) {
+        return Err(
+            MotionError::InvalidCommand("name must match ^[A-Za-z0-9_-]{1,64}$".into()).into(),
+        );
+    }
     let include_gripper = motion::flag(body, "include_gripper", false)?;
     let speed_scale = crate::poses::speed_scale(body)?;
     let tag = motion::tag(body)?;
@@ -1696,22 +1706,16 @@ pub fn prepare_saved_pose(
     }
     if pose.positions.len() != cfg.dof {
         return Err(MotionError::InvalidCommand(format!(
-            "positions length {} does not match profile dof {}",
-            pose.positions.len(),
+            "positions must have {} entries",
             cfg.dof
         ))
         .into());
     }
-    for (i, (&p, l)) in pose.positions.iter().zip(&cfg.limits).enumerate() {
-        if !p.is_finite() {
-            return Err(
-                MotionError::InvalidCommand(format!("position[{i}] is not finite")).into(),
-            );
-        }
-        if p < l.min_position || p > l.max_position {
+    for (&p, l) in pose.positions.iter().zip(&cfg.limits) {
+        if !p.is_finite() || p < l.min_position || p > l.max_position {
             return Err(MotionError::InvalidCommand(format!(
-                "joint '{}' position {:.3} outside [{:.3}, {:.3}]",
-                l.name, p, l.min_position, l.max_position
+                "joint '{}' position {p} outside [{}, {}]",
+                l.name, l.min_position, l.max_position
             ))
             .into());
         }
@@ -1786,7 +1790,12 @@ pub fn prepare_saved_pose(
         traj,
         power_scale,
     });
+    let use_same_side = !matches!(
+        snap.env.approach_plan("move_to_pose", approach),
+        Err(None)
+    );
     let mut stamp = snap.stamp;
+    stamp.parent_generation = 0;
     stamp.sequences_revision = None;
     stamp.grasp_setup_revision = None;
     stamp.gripper_calib_revision = None;
@@ -1800,7 +1809,7 @@ pub fn prepare_saved_pose(
         speed_scale,
         prepared_quintic,
         approach_use: "move_to_pose",
-        same_side: Some(approach),
+        same_side: use_same_side.then_some(approach),
         tag,
         expected_duration_s: base_duration,
         settle: true,
@@ -1849,6 +1858,7 @@ pub fn prepare_replay_from_input(
     let eff_speed = plan.input.request.speed * plan.power_scale.unwrap_or(1.0);
     let expected_duration_s = approach_s + plan.duration / eff_speed.max(1e-6) + 0.5;
     let mut stamp = snap.stamp;
+    stamp.parent_generation = 0;
     stamp.poses_revision = None;
     stamp.sequences_revision = None;
     stamp.grasp_setup_revision = None;
@@ -1898,7 +1908,7 @@ pub fn prepare_move_to(
     snap: &ActionSnapshot,
     body: &Value,
 ) -> Result<PreparedMoveAction, ArmError> {
-    prepare_move_common(snap, body, false)
+    prepare_move_with_branch_hint(snap, body, false).map_err(|(e, _)| e)
 }
 
 /// Off-thread preparation for `/api/v1/action/move_relative` from a published [`ActionSnapshot`].
@@ -1906,39 +1916,110 @@ pub fn prepare_move_relative(
     snap: &ActionSnapshot,
     body: &Value,
 ) -> Result<PreparedMoveAction, ArmError> {
-    prepare_move_common(snap, body, true)
+    prepare_move_with_branch_hint(snap, body, true).map_err(|(e, _)| e)
+}
+
+/// Off-thread preparation for `move_to` / `move_relative`, additionally reporting whether
+/// `path: "joint"` is feasible when a straight line fails with `IK_BRANCH_FLIP` (so WS can
+/// append `JOINT_PATH_HINT` without taking `SupervisorLock`).
+pub fn prepare_move_with_branch_hint(
+    snap: &ActionSnapshot,
+    body: &Value,
+    relative: bool,
+) -> Result<PreparedMoveAction, (ArmError, bool)> {
+    prepare_move_common(snap, body, relative)
+}
+
+fn joint_goal_feasible_off_lock(snap: &ActionSnapshot, q: &[f64; 6]) -> bool {
+    let target = crate::supervisor::joint_goal_target_from(
+        &snap.commanded_positions,
+        q,
+        snap.env.config.arm_dof(),
+        snap.env.config.gripper_index(),
+    );
+    let limits = snap.env.planning_limits(None);
+    if target
+        .iter()
+        .zip(&snap.env.config.limits)
+        .any(|(t, l)| !t.is_finite() || *t < l.min_position || *t > l.max_position)
+    {
+        return false;
+    }
+    let zeros = vec![0.0f32; snap.env.config.dof];
+    let Ok(traj) = TrajectoryPlanner::plan(
+        &snap.commanded_positions,
+        &zeros,
+        &target,
+        &zeros,
+        None,
+        &limits,
+    ) else {
+        return false;
+    };
+    if let Some(ws) = snap.env.workspace_policy.as_ref() {
+        check_quintic_workspace_off_lock(
+            &traj,
+            &snap.commanded_positions,
+            ws,
+            &snap.env.config.camera_mount,
+            &snap.env.config.arm_model,
+            snap.env.config.tcp_offset,
+        )
+        .is_ok()
+    } else {
+        true
+    }
 }
 
 fn prepare_move_common(
     snap: &ActionSnapshot,
     body: &Value,
     relative: bool,
-) -> Result<PreparedMoveAction, ArmError> {
+) -> Result<PreparedMoveAction, (ArmError, bool)> {
+    let no_hint = |e: ArmError| (e, false);
     if !body.is_object() {
-        return Err(MotionError::InvalidCommand("Command body must be an object".into()).into());
+        return Err(no_hint(
+            MotionError::InvalidCommand("Command body must be an object".into()).into(),
+        ));
     }
     let kind_name = if relative { "move_relative" } else { "move_to" };
     let (spec, mut speed, tag) = if relative {
-        motion::parse_move_relative(body)?
+        motion::parse_move_relative(body)
+            .map_err(ArmError::from)
+            .map_err(no_hint)?
     } else {
-        motion::parse_move_to(body)?
+        motion::parse_move_to(body)
+            .map_err(ArmError::from)
+            .map_err(no_hint)?
     };
-    let precise = motion::flag(body, "precise", false)?;
-    let request = backlash::parse_request(body)?;
-    let path_mode = motion::parse_path_mode(body)?;
+    let precise = motion::flag(body, "precise", false)
+        .map_err(ArmError::from)
+        .map_err(no_hint)?;
+    let request = backlash::parse_request(body)
+        .map_err(ArmError::from)
+        .map_err(no_hint)?;
+    let path_mode = motion::parse_path_mode(body)
+        .map_err(ArmError::from)
+        .map_err(no_hint)?;
     let same_side = precise || request != backlash::Request::Profile;
     if path_mode == PathMode::Joint && body.get("speed").is_some_and(|v| !v.is_null()) {
-        return Err(MotionError::InvalidCommand(
-            "speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)".into(),
-        )
-        .into());
+        return Err(no_hint(
+            MotionError::InvalidCommand(
+                "speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)"
+                    .into(),
+            )
+            .into(),
+        ));
     }
     let linear_speed_scale = if path_mode == PathMode::Linear {
-        if let Some(s) = motion::num(body, "speed_scale")? {
+        if let Some(s) = motion::num(body, "speed_scale")
+            .map_err(ArmError::from)
+            .map_err(no_hint)?
+        {
             if !(0.05..=1.0).contains(&s) {
-                return Err(
+                return Err(no_hint(
                     MotionError::InvalidCommand("speed_scale must be in [0.05, 1.0]".into()).into(),
-                );
+                ));
             }
             if body.get("speed").is_none_or(Value::is_null) {
                 speed.linear = (motion::MAX_LINEAR_MPS * s).min(motion::MAX_LINEAR_MPS);
@@ -1951,10 +2032,11 @@ fn prepare_move_common(
     } else {
         None
     };
-    let input = snap.plan_input_in(GoalFrame::Tcp)?;
+    let input = snap.plan_input_in(GoalFrame::Tcp).map_err(no_hint)?;
     let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
     let seeds = motion::goal_seeds(&input, &goal, &snap.env.goal_seed_poses());
     let mut stamp = snap.stamp;
+    stamp.parent_generation = 0;
     stamp.poses_revision = None;
     stamp.sequences_revision = None;
     stamp.grasp_setup_revision = None;
@@ -1968,12 +2050,14 @@ fn prepare_move_common(
                 let speed_ok = speed.linear <= 0.2 * motion::MAX_LINEAR_MPS + 1e-6
                     && speed.angular <= 0.2 * motion::MAX_ANGULAR_RPS + 1e-6;
                 if !scale_ok || !speed_ok {
-                    return Err(SafetyError::CommissioningRequired(format!(
-                        "{kind_name} (requires speed_scale <= 0.2 or speed <= {:.3} m/s / {:.2} rad/s)",
-                        0.2 * motion::MAX_LINEAR_MPS,
-                        0.2 * motion::MAX_ANGULAR_RPS
-                    ))
-                    .into());
+                    return Err(no_hint(
+                        SafetyError::CommissioningRequired(format!(
+                            "{kind_name} (requires speed_scale <= 0.2 or speed <= {:.3} m/s / {:.2} rad/s)",
+                            0.2 * motion::MAX_LINEAR_MPS,
+                            0.2 * motion::MAX_ANGULAR_RPS
+                        ))
+                        .into(),
+                    ));
                 }
             }
             let approach = if same_side {
@@ -1981,7 +2065,16 @@ fn prepare_move_common(
             } else {
                 Err(None)
             };
-            let direct = motion::plan_cartesian_opts(&input, goal, speed, opts)?;
+            let direct = match motion::plan_cartesian_opts(&input, goal, speed, opts) {
+                Ok(d) => d,
+                Err(e) => {
+                    let hint = matches!(&e, MotionError::IkBranchFlip { .. })
+                        && motion::solve_goal_joints(&input, &goal, opts, &seeds)
+                            .ok()
+                            .is_some_and(|q| joint_goal_feasible_off_lock(snap, &q));
+                    return Err((ArmError::from(e), hint));
+                }
+            };
             let pre = match &approach {
                 Ok(plan) => backlash::plan_cartesian_pre(&input, &direct, plan, None, speed, opts),
                 Err(Some(r)) => backlash::Pre::Direct((*r).to_string()),
@@ -2006,14 +2099,18 @@ fn prepare_move_common(
             }))
         }
         PathMode::Joint => {
-            let speed_scale = crate::poses::speed_scale(body)?;
+            let speed_scale = crate::poses::speed_scale(body).map_err(no_hint)?;
             if snap.env.config.active_tool.commissioning_required && speed_scale > 0.2 + 1e-6 {
-                return Err(SafetyError::CommissioningRequired(format!(
-                    "{kind_name} (speed_scale {speed_scale:.2} > 0.2)"
-                ))
-                .into());
+                return Err(no_hint(
+                    SafetyError::CommissioningRequired(format!(
+                        "{kind_name} (speed_scale {speed_scale:.2} > 0.2)"
+                    ))
+                    .into(),
+                ));
             }
-            let q = motion::solve_goal_joints(&input, &goal, opts, &seeds)?;
+            let q = motion::solve_goal_joints(&input, &goal, opts, &seeds)
+                .map_err(ArmError::from)
+                .map_err(no_hint)?;
             let jsnap = snap.joint_goal_snapshot(speed_scale);
             let target = crate::supervisor::joint_goal_target_from(
                 &jsnap.start,
@@ -2412,6 +2509,7 @@ pub fn install_move_joint(
             if prep.kind == PreparedActionKind::MoveToPose {
                 inner.check_commissioning_for_ordinary_motion("move_to_pose")?;
             }
+            inner.check_prepared_fresh(stamp.admission.estop_epoch)?;
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
@@ -2629,6 +2727,7 @@ pub fn install_gripper(
                     .into());
                 }
             }
+            inner.check_prepared_fresh(stamp.admission.estop_epoch)?;
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
@@ -2793,6 +2892,7 @@ pub fn install_replay(
             if tool_digest_hash(&inner.config.active_tool.config_digest) != prep.tool_digest {
                 return Err(ActionRefusal::new("TOOL_MISMATCH").into_arm_error(inner));
             }
+            inner.check_prepared_fresh(stamp.admission.estop_epoch)?;
             let epoch = inner.safety.epoch_id();
             let admitted = consume_action_admission(inner, stamp, ctx.stop_generation)
                 .map_err(|r| r.into_arm_error_with_epoch(epoch))?;
