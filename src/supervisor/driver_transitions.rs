@@ -1293,10 +1293,17 @@ impl SupervisorInner {
         );
     }
 
-    /// Initiates a non-blocking background disable strictly through the driver's single
-    /// `begin_torque_budgeted(false, 0)` choke point (zero RX, zero sleep, zero RT allocs).
-    /// Arms bounded [`BackgroundDisableRetry`] whenever torque-off is not immediately confirmed.
-    fn begin_background_disable_budgeted(&mut self, now: Instant) {
+    /// Single merge-time choke point for every PR L rollback disable triggered by a failed or
+    /// interrupted torque-enable transition (`enable_finish_rt`, `enable_step_failed`,
+    /// `abort_enable_transition_for_fenced_lease_impl`, `service_torque_transition` authority
+    /// revocation). Routes strictly through the driver's single `begin_torque_budgeted(false, 0)`
+    /// choke point (zero RX, zero sleep, zero RT allocs) and arms bounded
+    /// [`BackgroundDisableRetry`] whenever torque-off is not immediately confirmed.
+    ///
+    /// TODO(torque-off-merge): Replace this rollback disable with `feat/torque-off-when-stopped`'s
+    /// `FailedHold` reducer when integrating both branches (no automatic rollback disable at any
+    /// pose, while carrying PR L's live authority revocation / fencing checks into `FailedHold`).
+    fn rollback_disable_after_failed_or_interrupted_enable(&mut self, now: Instant) {
         self.disable_requested_at(now);
         let Some(ref d) = self.driver else {
             self.disable_confirmed();
@@ -1600,7 +1607,7 @@ impl SupervisorInner {
                 self.scratch.ages = scratch_ages;
                 self.scratch.loads = scratch_loads;
                 if !was_torqued {
-                    self.begin_background_disable_budgeted(now);
+                    self.rollback_disable_after_failed_or_interrupted_enable(now);
                 }
                 return Err("FEEDBACK_UNAVAILABLE");
             }
@@ -1615,7 +1622,7 @@ impl SupervisorInner {
                 self.scratch.ages = scratch_ages;
                 self.scratch.loads = scratch_loads;
                 if !was_torqued {
-                    self.begin_background_disable_budgeted(now);
+                    self.rollback_disable_after_failed_or_interrupted_enable(now);
                 }
                 return Err("FEEDBACK_UNAVAILABLE");
             }
@@ -2096,7 +2103,7 @@ impl SupervisorInner {
             self.is_torqued = was_torqued || still_enabled;
             self.pending_rearm = true;
         } else if !was_torqued {
-            self.begin_background_disable_budgeted(Instant::now());
+            self.rollback_disable_after_failed_or_interrupted_enable(Instant::now());
         } else {
             if let Some(ref d) = self.driver {
                 if let Ok(mut drv) = d.lock() {
@@ -2272,7 +2279,7 @@ impl SupervisorInner {
             .err()
             .unwrap_or("ENABLE_FAILED");
         if !was_torqued {
-            self.begin_background_disable_budgeted(now);
+            self.rollback_disable_after_failed_or_interrupted_enable(now);
         }
         self.safety.latch(crate::safety::FaultKind::Other, detail);
         Err(code)
@@ -2466,7 +2473,7 @@ impl SupervisorInner {
                         self.is_torqued = was_torqued || still_enabled;
                         self.pending_rearm = true;
                     } else if !was_torqued {
-                        self.begin_background_disable_budgeted(budget.now);
+                        self.rollback_disable_after_failed_or_interrupted_enable(budget.now);
                     } else {
                         self.is_torqued = true;
                         self.pending_rearm = true;
