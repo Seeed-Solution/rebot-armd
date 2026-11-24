@@ -205,14 +205,15 @@ fn classify_wake_lateness_ns_boundaries_and_guard_unwind_safety() {
     assert_eq!(classify_wake_lateness_ns(10_000_001), (10_000, true, true, true));
     assert_eq!(classify_wake_lateness_ns(u64::MAX), (u32::MAX, true, true, true));
 
-    // TickStats fallback preserves raw-ns threshold classification even when no ExecutorStats is attached.
+    // Single authority: ExecutorStats owns cumulative raw-ns threshold counts, while TickStats
+    // computes window percentiles from TickSample::wake_lateness_us.
+    let exec_stats = ExecutorStats::default();
     let mut stats = TickStats::default();
     for &ns in &SCRIPTED_LATENESS_NS {
-        let (us, _, _, _) = classify_wake_lateness_ns(ns);
+        let us = exec_stats.record_wake_lateness_ns(ns);
         stats.record(&TickSample {
             tick_us: 500,
             wake_lateness_us: us,
-            wake_lateness_ns: ns,
             ..Default::default()
         });
     }
@@ -220,9 +221,9 @@ fn classify_wake_lateness_ns_boundaries_and_guard_unwind_safety() {
     assert_eq!(snap.wake_lateness_us.p50, 2_500);
     assert_eq!(snap.wake_lateness_us.p99, 23_400);
     assert_eq!(snap.wake_lateness_us.max, 23_400);
-    assert_eq!(snap.wake_lateness_over_1ms, 7);
-    assert_eq!(snap.wake_lateness_over_5ms, 4);
-    assert_eq!(snap.wake_lateness_over_10ms, 2);
+    assert_eq!(exec_stats.wake_lateness_over_1ms.load(Ordering::Relaxed), 7);
+    assert_eq!(exec_stats.wake_lateness_over_5ms.load(Ordering::Relaxed), 4);
+    assert_eq!(exec_stats.wake_lateness_over_10ms.load(Ordering::Relaxed), 2);
 
     // WakeLatenessGuard restores prior thread-local value even across panic unwind.
     let _ = take_current_wake_lateness_ns();
@@ -552,4 +553,126 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     std::fs::write(&breach_path, breach_lines).unwrap();
     let breach_rep = run_analyze(&breach_path, Some(&devstat_path));
     assert!(breach_rep.contains("**Overall Verdict: FAIL**"), "{breach_rep}");
+
+    // (e) Missing `diag_dropped` with all other criteria clean -> MUST be INCOMPLETE (not PASS)!
+    let missing_dd_path = dir.path().join("q1_missing_diag_dropped.jsonl");
+    let mut m0 = d0.clone();
+    m0.as_object_mut().unwrap().remove("diag_dropped");
+    let mut m1 = m0.clone();
+    m1["since_boot_ticks"] = serde_json::json!(300);
+    std::fs::write(
+        &missing_dd_path,
+        format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "q1-missing-dd" }),
+            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": m0 }),
+            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": m1 }),
+        ),
+    )
+    .unwrap();
+    let missing_dd_rep = run_analyze(&missing_dd_path, Some(&devstat_path));
+    assert!(missing_dd_rep.contains("**Overall Verdict: INCOMPLETE"), "{missing_dd_rep}");
+    assert!(missing_dd_rep.contains("`diag_dropped`: not present in input JSON"), "{missing_dd_rep}");
+
+    // (f) Mid-run counter reset `0 -> 7 -> 0` on `diag_dropped` -> delta=7 AND INCOMPLETE!
+    let reset_dd_path = dir.path().join("q1_reset_dd.jsonl");
+    let mut r0 = d0.clone();
+    r0["diag_dropped"] = serde_json::json!(0);
+    let mut r1 = d0.clone();
+    r1["since_boot_ticks"] = serde_json::json!(200);
+    r1["diag_dropped"] = serde_json::json!(7);
+    let mut r2 = d0.clone();
+    r2["since_boot_ticks"] = serde_json::json!(50);
+    r2["diag_dropped"] = serde_json::json!(0);
+    std::fs::write(
+        &reset_dd_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "q1-reset-dd" }),
+            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": r0 }),
+            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": r1 }),
+            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": r2 }),
+        ),
+    )
+    .unwrap();
+    let reset_dd_rep = run_analyze(&reset_dd_path, Some(&devstat_path));
+    assert!(
+        reset_dd_rep.contains("**Overall Verdict: INCOMPLETE (diagnostic samples dropped: diag_dropped delta=7)**"),
+        "{reset_dd_rep}"
+    );
+
+    // (g) Mid-run counter reset `0 -> 7 -> 0` on `skipped_releases` -> delta=7 AND FAIL!
+    let reset_skip_path = dir.path().join("q1_reset_skip.jsonl");
+    let mut s0 = d0.clone();
+    s0["skipped_releases"] = serde_json::json!(0);
+    let mut s1 = d0.clone();
+    s1["since_boot_ticks"] = serde_json::json!(200);
+    s1["skipped_releases"] = serde_json::json!(7);
+    let mut s2 = d0.clone();
+    s2["since_boot_ticks"] = serde_json::json!(50);
+    s2["skipped_releases"] = serde_json::json!(0);
+    std::fs::write(
+        &reset_skip_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "q1-reset-skip" }),
+            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": s0 }),
+            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": s1 }),
+            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": s2 }),
+        ),
+    )
+    .unwrap();
+    let reset_skip_rep = run_analyze(&reset_skip_path, Some(&devstat_path));
+    assert!(reset_skip_rep.contains("**Overall Verdict: FAIL**"), "{reset_skip_rep}");
+    assert!(reset_skip_rep.contains("skipped_releases delta=7"), "{reset_skip_rep}");
+
+    // (h) Partial missing `diag_dropped` on middle sample -> INCOMPLETE!
+    let partial_dd_path = dir.path().join("q1_partial_dd.jsonl");
+    let mut p1 = d0.clone();
+    p1["since_boot_ticks"] = serde_json::json!(200);
+    p1.as_object_mut().unwrap().remove("diag_dropped");
+    let mut p2 = d0.clone();
+    p2["since_boot_ticks"] = serde_json::json!(300);
+    std::fs::write(
+        &partial_dd_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "q1-partial-dd" }),
+            serde_json::json!({ "type": "sample", "phase": "baseline", "tick": d0 }),
+            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": p1 }),
+            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": p2 }),
+        ),
+    )
+    .unwrap();
+    let partial_dd_rep = run_analyze(&partial_dd_path, Some(&devstat_path));
+    assert!(partial_dd_rep.contains("**Overall Verdict: INCOMPLETE"), "{partial_dd_rep}");
+    assert!(partial_dd_rep.contains("`diag_dropped` missing on some samples"), "{partial_dd_rep}");
+
+    // (i) Recurring phase `full_load -> cooldown -> full_load`: skip occurring during `cooldown`
+    // must be attributed strictly to `cooldown` (2 / 0), NOT `full_load` (0 / 0)!
+    let recur_path = dir.path().join("q1_recurring_phase.jsonl");
+    let mut f0 = q0.clone();
+    f0["skipped_releases"] = serde_json::json!(0);
+    let mut c1 = q0.clone();
+    c1["since_boot_ticks"] = serde_json::json!(200);
+    c1["skipped_releases"] = serde_json::json!(2);
+    let mut f2 = q0.clone();
+    f2["since_boot_ticks"] = serde_json::json!(300);
+    f2["skipped_releases"] = serde_json::json!(2);
+    std::fs::write(
+        &recur_path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({ "type": "meta", "run_id": "q1-recur" }),
+            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": f0 }),
+            serde_json::json!({ "type": "sample", "phase": "cooldown", "tick": c1 }),
+            serde_json::json!({ "type": "sample", "phase": "full_load", "tick": f2 }),
+        ),
+    )
+    .unwrap();
+    let recur_rep = run_analyze(&recur_path, None);
+    let fl_line = recur_rep.lines().find(|l| l.starts_with("| `full_load` |")).expect("full_load row");
+    let cd_line = recur_rep.lines().find(|l| l.starts_with("| `cooldown` |")).expect("cooldown row");
+    assert!(fl_line.contains("| 0 / 0 |"), "full_load must show 0 skips, got: {fl_line}");
+    assert!(cd_line.contains("| 2 / 0 |"), "cooldown must show 2 skips, got: {cd_line}");
 }

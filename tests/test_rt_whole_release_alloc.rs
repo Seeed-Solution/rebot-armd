@@ -383,7 +383,7 @@ fn sample_persist_job(action_id: u64, dir: &std::path::Path) -> PendingZeroCheck
         action_id,
         offset_rad: 0.01,
         jaw_opening: None,
-        base_revision: 0,
+        base_revision: 1,
         lease_owner: None,
         operator_auth: None,
         write: armd::persist::PendingWrite::new(
@@ -855,17 +855,38 @@ async fn saturated_estop_and_persistence_queues_zero_heap_ops_and_off_thread_rec
     jh_e.join().unwrap();
     h_e.stop_and_join();
 
-    // (b) Saturated persistence queue: pause `armd-persist`, inject 6 pre-built
-    // `PendingZeroCheckPersist` jobs (exceeding 4-slot `persist_job_tx`, exercising BOTH
-    // initial `sat_msg_buf` rejection and repeated rejection after scratch depletion) +
-    // verify 0 heap ops on `armd-control`, advancing publication, and off-thread drop!
+    // (b) Saturated persistence queue: pause `armd-persist`, seed a running zero-check action for
+    // job #1 so `armd-persist` completes real `Reserve` + `Activate` after unpause, inject 6
+    // pre-built `PendingZeroCheckPersist` jobs (4 fill `persist_job_tx`, 2 are rejected into
+    // `offload_reclaim_tx` carrying `DropTid` witnesses), verify 0 heap ops on `armd-control`,
+    // advancing publication, UNCONDITIONAL off-thread drop of BOTH rejected jobs AND the Reserve
+    // payload, and full `Reserve` + `Activate` completion on disk (proving `armd-persist` was NOT
+    // terminated by unsolicited replies).
     let dir = tempfile::tempdir().unwrap();
     let clock_p = ScriptedClock::new();
     let sup_p = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    sup_p.set_lease_enabled(false).await;
+    {
+        let mut inner = sup_p.inner().write().await;
+        inner.lease_enabled = false;
+        inner.gripper_calib_path = Some(dir.path().join("gripper_calib_1.json"));
+        inner.last_action = Some(
+            serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "kind": "gripper_zero_check",
+                "state": "running",
+                "progress": 1.0,
+                "started_at": 0.0,
+            }))
+            .expect("valid ActionStatus"),
+        );
+    }
     let pause_persist = Arc::new(AtomicBool::new(true));
-    let job_slot: Arc<Mutex<Option<PendingZeroCheckPersist>>> = Arc::new(Mutex::new(None));
+    let job_slot: Arc<
+        Mutex<Option<(PendingZeroCheckPersist, Option<Box<dyn std::any::Any + Send>>)>>,
+    > = Arc::new(Mutex::new(None));
     let payload_dropped_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let rej5_dropped_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let rej6_dropped_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
     struct DropTid(Arc<Mutex<Option<ThreadId>>>);
     impl Drop for DropTid {
         fn drop(&mut self) {
@@ -890,7 +911,12 @@ async fn saturated_estop_and_persistence_queues_zero_heap_ops_and_off_thread_rec
     let (rel_p, jh_p) = pause_hub(&sup_p);
     let seq_p0 = sup_p.hub().published_seq();
     for id in 1..=6u64 {
-        *job_slot.lock().unwrap() = Some(sample_persist_job(id, dir.path()));
+        let probe: Option<Box<dyn std::any::Any + Send>> = match id {
+            5 => Some(Box::new(DropTid(rej5_dropped_on.clone()))),
+            6 => Some(Box::new(DropTid(rej6_dropped_on.clone()))),
+            _ => None,
+        };
+        *job_slot.lock().unwrap() = Some((sample_persist_job(id, dir.path()), probe));
         clock_p.run_steps(period_ns, 1);
     }
     assert_eq!(
@@ -899,24 +925,119 @@ async fn saturated_estop_and_persistence_queues_zero_heap_ops_and_off_thread_rec
         "saturated persist_job_tx + repeated release-tail job rejections must do 0 heap ops on armd-control"
     );
     assert!(sup_p.hub().published_seq() >= seq_p0 + 6);
+    assert!(rej5_dropped_on.lock().unwrap().is_none(), "rejected job #5 must remain alive while hub is paused");
+    assert!(rej6_dropped_on.lock().unwrap().is_none(), "rejected job #6 must remain alive while hub is paused");
 
-    // Unpause persistence worker & hub, allow off-thread drain & payload drop.
+    // Unpause persistence worker & hub, allow off-thread drain, rejected-job drop, AND Reserve+Activate!
     pause_persist.store(false, Ordering::Release);
     rel_p.send(()).unwrap();
     jh_p.join().unwrap();
-    // Advance releases so `armd-persist` completes its Reserve/Activate round-trips.
+    let calib_1_path = dir.path().join("gripper_calib_1.json");
     let mut ticks = 0;
-    while payload_dropped_on.lock().unwrap().is_none() && ticks < 40 {
+    while (rej5_dropped_on.lock().unwrap().is_none()
+        || rej6_dropped_on.lock().unwrap().is_none()
+        || payload_dropped_on.lock().unwrap().is_none()
+        || !calib_1_path.exists())
+        && ticks < 80
+    {
         clock_p.run_steps(period_ns, 1);
         tokio::time::sleep(Duration::from_millis(5)).await;
         ticks += 1;
     }
+    let obs_after = sup_p.get_observation().await;
     h_p.stop_and_join();
-    assert_eq!(h_p.stats().total_allocs(), AllocCounts::ZERO);
-    let dropped_tid = *payload_dropped_on.lock().unwrap();
-    if let Some(tid) = dropped_tid {
-        assert_ne!(tid, exec_tid, "persistence payload must be dropped off armd-control");
+    assert_eq!(
+        h_p.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "post-unpause ticks={ticks} calib_exists={} action={:?} gripper_zero={:?} release={:?} wake={:?}",
+        calib_1_path.exists(),
+        obs_after.action,
+        obs_after.gripper_zero,
+        h_p.stats().release_allocs.snapshot(),
+        h_p.stats().wake_allocs.snapshot(),
+    );
+    let rej5_tid = rej5_dropped_on
+        .lock()
+        .unwrap()
+        .expect("rejected job #5 payload MUST drop off-thread");
+    let rej6_tid = rej6_dropped_on
+        .lock()
+        .unwrap()
+        .expect("rejected job #6 payload MUST drop off-thread");
+    let reserve_tid = payload_dropped_on
+        .lock()
+        .unwrap()
+        .expect("armd-persist Reserve payload MUST drop off-thread");
+    assert_ne!(rej5_tid, exec_tid, "rejected job #5 must not drop on armd-control");
+    assert_ne!(rej6_tid, exec_tid, "rejected job #6 must not drop on armd-control");
+    assert_ne!(reserve_tid, exec_tid, "Reserve payload must not drop on armd-control");
+    assert!(
+        calib_1_path.exists(),
+        "valid queued job #1 must complete Reserve+Activate on armd-persist after rejections"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_start_driverless_default_resting_pose_and_legacy_j6_zero_alloc() {
+    let period_ns = 10_000_000u64;
+
+    // (a) Driverless profile with `zero_reference: Some(...)` and `resting_pose: None`:
+    // default resting pose fallback must be prewarmed before release #1 (0 heap ops on release #1).
+    let mut cfg_no_rest = ArmConfig::rebot_dm();
+    cfg_no_rest.resting_pose = None;
+    let clock_a = ScriptedClock::new();
+    let sup_a = Arc::new(ArmSupervisor::new(cfg_no_rest));
+    sup_a.set_lease_enabled(false).await;
+    let h_a = sup_a
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock_a.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    clock_a.run_steps(period_ns, 5);
+    assert_eq!(h_a.stats().total_allocs(), AllocCounts::ZERO);
+    h_a.stop_and_join();
+
+    // (b) Legacy J6 detection (+90 deg in rest pose) on release #1 must format & log off-thread
+    // (0 heap ops on `armd-control`) while preserving exact JSON message formatting.
+    let clock_b = ScriptedClock::new();
+    let sup_b = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup_b.inner().write().await;
+        inner.lease_enabled = false;
+        inner.commanded_positions[5] = 1.574;
+        inner.measured_positions[5] = 1.574;
+        inner.target_positions[5] = 1.574;
     }
+    let h_b = sup_b
+        .start_executor_with_hooks(
+            alloc_cfg(Duration::from_nanos(period_ns)),
+            PersistTestHooks { clock: Some(clock_b.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    clock_b.run_steps(period_ns, 5);
+    assert_eq!(
+        h_b.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "legacy_j6 classification in step_zero_convention must perform 0 heap ops on armd-control"
+    );
+    h_b.stop_and_join();
+
+    // Verify off-thread JSON serialization still renders the exact legacy_j6 warning text.
+    let zc = armd::joint_zero::check_convention(
+        &[0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052],
+        &[0.0; 7],
+        &[0.15, 0.08, 0.08, 0.08, 0.08, 0.08],
+    )
+    .expect("legacy_j6 verdict");
+    let v = serde_json::to_value(zc).unwrap();
+    assert_eq!(v["status"], "legacy_j6");
+    assert!(
+        v["message"].as_str().unwrap().contains("J6 reads 90.2 deg"),
+        "unexpected legacy_j6 JSON: {v}"
+    );
 }
 
 // ============================================================================
