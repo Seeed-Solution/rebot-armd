@@ -8439,6 +8439,14 @@ impl ArmSupervisor {
         snap
     }
 
+    /// Thread-CPU-time percentiles of lock-held tick execution over the current tick window
+    /// (`CLOCK_THREAD_CPUTIME_ID` on Linux, excluding off-CPU OS preemption under host load).
+    #[doc(hidden)]
+    pub fn tick_lock_cpu_us(&self) -> crate::diagnostics::tick::Percentiles {
+        self.drain_diag();
+        self.tick_stats.window().lock_cpu_us()
+    }
+
     pub async fn set_mock_gripper_stall_offset(&self, offset: Option<f32>) {
         let mut inner = self.inner.write().await;
         if self.check_legacy_under_guard(&inner).is_ok() {
