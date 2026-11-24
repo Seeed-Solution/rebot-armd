@@ -3693,50 +3693,47 @@ impl SupervisorInner {
                         if let Ok(mut driver) = d.lock() {
                             if driver.enable_state() != EnableState::Disabled {
                                 let is_hold = self.safety.state().is_stopped();
+                                let write_res = if is_hold {
+                                    driver.write_estop_hold_bounded(&targets)
+                                } else {
+                                    driver.write_joint_targets_bounded(&targets)
+                                };
                                 let now = driver.clock_now();
                                 let max_age = driver.tx_frame_max_age();
-                                tick_output = if is_hold {
-                                    match driver.write_estop_hold(&targets) {
-                                        Ok(()) => TickOutput::Complete { is_hold: true },
-                                        Err(e) => TickOutput::Error {
-                                            message: e.to_string(),
-                                            now,
-                                            is_hold: true,
-                                        },
-                                    }
-                                } else {
-                                    match driver.write_joint_targets_bounded(&targets) {
-                                        Ok(crate::driver::TxBatchOutcome::Complete) => {
+                                let hold_sent_any = is_hold && driver.last_hold_tx_sent_any();
+                                tick_output = match write_res {
+                                    Ok(crate::driver::TxBatchOutcome::Complete) => {
+                                        if !is_hold {
                                             allow_output_accepted = true;
-                                            TickOutput::Complete { is_hold: false }
                                         }
-                                        Ok(crate::driver::TxBatchOutcome::Deferred { pending }) => {
-                                            TickOutput::Deferred {
-                                                pending,
-                                                now,
-                                                max_age,
-                                                oldest_age: driver.oldest_pending_tx_age(),
-                                                is_hold: false,
-                                                sent_any: false,
-                                            }
-                                        }
-                                        Ok(crate::driver::TxBatchOutcome::Expired { dropped, pending }) => {
-                                            TickOutput::Expired {
-                                                dropped,
-                                                pending,
-                                                now,
-                                                max_age,
-                                                oldest_age: driver.last_tx_expired_age(),
-                                                is_hold: false,
-                                                sent_any: false,
-                                            }
-                                        }
-                                        Err(e) => TickOutput::Error {
-                                            message: e.to_string(),
-                                            now,
-                                            is_hold: false,
-                                        },
+                                        TickOutput::Complete { is_hold }
                                     }
+                                    Ok(crate::driver::TxBatchOutcome::Deferred { pending }) => {
+                                        TickOutput::Deferred {
+                                            pending,
+                                            now,
+                                            max_age,
+                                            oldest_age: driver.oldest_pending_tx_age(),
+                                            is_hold,
+                                            sent_any: hold_sent_any,
+                                        }
+                                    }
+                                    Ok(crate::driver::TxBatchOutcome::Expired { dropped, pending }) => {
+                                        TickOutput::Expired {
+                                            dropped,
+                                            pending,
+                                            now,
+                                            max_age,
+                                            oldest_age: driver.last_tx_expired_age(),
+                                            is_hold,
+                                            sent_any: hold_sent_any,
+                                        }
+                                    }
+                                    Err(e) => TickOutput::Error {
+                                        message: e.to_string(),
+                                        now,
+                                        is_hold,
+                                    },
                                 };
                             }
                         }

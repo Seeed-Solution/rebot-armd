@@ -365,12 +365,13 @@ impl SupervisorInner {
                         || self.safety.state().is_stopped()
                         || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst);
                     let write_res = if is_hold {
-                        drv.write_estop_hold(&targets).map(|()| TxBatchOutcome::Complete)
+                        drv.write_estop_hold_bounded(&targets)
                     } else {
                         drv.write_joint_targets_bounded(&targets)
                     };
                     let now = drv.clock_now();
                     let max_age = drv.tx_frame_max_age();
+                    let hold_sent_any = is_hold && drv.last_hold_tx_sent_any();
                     match write_res {
                         Ok(TxBatchOutcome::Complete) => TickOutput::Complete { is_hold },
                         Ok(TxBatchOutcome::Deferred { pending }) => TickOutput::Deferred {
@@ -379,7 +380,7 @@ impl SupervisorInner {
                             max_age,
                             oldest_age: drv.oldest_pending_tx_age(),
                             is_hold,
-                            sent_any: true,
+                            sent_any: hold_sent_any,
                         },
                         Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
                             dropped,
@@ -388,7 +389,7 @@ impl SupervisorInner {
                             max_age,
                             oldest_age: drv.last_tx_expired_age(),
                             is_hold,
-                            sent_any: false,
+                            sent_any: hold_sent_any,
                         },
                         Err(e) => TickOutput::Error {
                             message: e.to_string(),

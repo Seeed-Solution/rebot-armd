@@ -205,6 +205,21 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
+    fn write_estop_hold_bounded(&mut self, targets: &[JointTarget]) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
+        if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_estop_hold_bounded(targets); }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone(); // plain fields: no allocation
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        let r = self.inner.write_estop_hold_bounded(&m);
+        self.motor_targets = m;
+        r
+    }
+    fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }
