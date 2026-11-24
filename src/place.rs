@@ -262,9 +262,124 @@ pub fn expected_duration(planned: &PlannedPlace) -> f64 {
     moves + if planned.request.release { 2.0 } else { 0.0 }
 }
 
+/// Build the A7 [`BeginMacroSpec`] for a planned `place` macro (shared by Legacy and RT Executor).
+pub fn begin_macro_spec(
+    planned: &PlannedPlace,
+    prepared_boot: crate::rt_core::broker::BootId,
+    dof: usize,
+    gripper_idx: Option<usize>,
+    deadline: Instant,
+) -> crate::rt_core::requests::actions::BeginMacroSpec {
+    use crate::rt_core::requests::actions::{BeginMacroSpec, MacroKind};
+    let mut start = vec![0.0f32; dof];
+    let arm_dof = planned.input.arm.arm_dof().min(dof).min(6);
+    for (i, dst) in start.iter_mut().take(arm_dof).enumerate() {
+        *dst = planned.input.q0[i] as f32;
+    }
+    if let Some(g) = gripper_idx.filter(|&g| g < dof) {
+        start[g] = planned.input.j7;
+    }
+    let mut spec = BeginMacroSpec::new(MacroKind::Place, prepared_boot);
+    if let Ok(s) = spec.with_start(&start) {
+        spec = s;
+    }
+    spec.check_workspace_revision = true;
+    spec.macro_deadline = Some(deadline);
+    spec.timeout_code = crate::safety::BoundedText::new("PLACE_TIMEOUT");
+    spec.orientation_levelled = planned.orientation_levelled;
+    if let Some(tag) = planned.request.tag.as_deref() {
+        spec.tag = crate::model::HolderLabel::new(tag);
+    }
+    spec
+}
+
+/// Begin a planned place through the single owner-side [`install_begin_macro_admitted`] path
+/// and spawn its orchestrator. Returns (action id, expected duration).
+pub fn begin(
+    admitted: crate::supervisor::Admitted<'_>,
+    supervisor: &Arc<ArmSupervisor>,
+    planned: PlannedPlace,
+) -> Result<(u64, f64), ArmError> {
+    let stamp = admitted.stamp();
+    let budget = expected_duration(&planned) * 2.0 + 20.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(budget);
+    let (inner, proof) = admitted.consume()?;
+    let spec = begin_macro_spec(
+        &planned,
+        inner.boot_id,
+        inner.config.dof,
+        inner.config.gripper_index(),
+        deadline,
+    );
+    let duration = expected_duration(&planned)
+        + inner.approach_estimate_s("place_final", planned.request.approach);
+    let ws_rev = planned.input.workspace_revision;
+    let tag = planned.request.tag.clone();
+    let id = crate::rt_core::requests::actions::install_begin_macro_with_proof(
+        inner,
+        &proof,
+        &spec,
+        Some(ws_rev),
+        tag,
+        None,
+    )?;
+    spawn_with_deadline(supervisor.clone(), id, planned, stamp, deadline, budget);
+    Ok((id, duration))
+}
+
+/// Begin a planned place under a short write lock through the single owner-side
+/// [`crate::rt_core::requests::actions::install_begin_macro`] function and spawn its orchestrator.
+pub fn begin_with_stamp(
+    inner: &mut SupervisorInner,
+    stamp: crate::supervisor::AdmissionStamp,
+    supervisor: &Arc<ArmSupervisor>,
+    planned: PlannedPlace,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{
+        install_begin_macro, ActionStamp, OwnerCheckCtx, DEFAULT_ACTION_DEADLINE,
+    };
+    let budget = expected_duration(&planned) * 2.0 + 20.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(budget);
+    let spec = begin_macro_spec(
+        &planned,
+        inner.boot_id,
+        inner.config.dof,
+        inner.config.gripper_index(),
+        deadline,
+    );
+    let action_stamp = ActionStamp {
+        arm: inner.core.id(),
+        boot: inner.boot_id,
+        admission: stamp,
+        config_revision: planned.input.workspace_revision,
+        calibration_revision: None,
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: Instant::now() + DEFAULT_ACTION_DEADLINE,
+    };
+    let owner_ctx = OwnerCheckCtx::for_legacy(inner);
+    let id = install_begin_macro(
+        inner,
+        &action_stamp,
+        &owner_ctx,
+        &spec,
+        planned.request.tag.clone(),
+        None,
+    )
+    .map_err(|r| r.into_arm_error(inner))?;
+    let duration = expected_duration(&planned)
+        + inner.approach_estimate_s("place_final", planned.request.approach);
+    spawn_with_deadline(supervisor.clone(), id, planned, stamp, deadline, budget);
+    Ok((id, duration))
+}
+
 /// Start a place (tests, in-process agents): caller passes the `AdmissionStamp` captured at
 /// admission (never re-sampled internally). Prepares, plans, validates `stamp` under the owner
-/// lock, and spawns the orchestrator. Returns (action id, expected duration).
+/// lock through [`begin_with_stamp`], and spawns the orchestrator. Returns (action id, expected duration).
 pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::AdmissionStamp, body: &Value) -> Result<(u64, f64), ApiError> {
     let pending = {
         let inner = supervisor.inner().read().await;
@@ -272,25 +387,26 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
     };
     let planned = tokio::task::spawn_blocking(move || plan(pending)).await
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-    let (id, duration) = {
-        let mut inner = supervisor.inner().write().await;
-        let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-        let id = SupervisorInner::begin_macro(admitted, "place", &planned.input, planned.request.tag.clone())?;
-        if planned.orientation_levelled {
-            inner.update_action(id, |a| {
-                a.orientation = Some("levelled".into());
-            });
-        }
-        let duration = expected_duration(&planned) + inner.approach_estimate_s("place_final", planned.request.approach);
-        (id, duration)
-    };
-    spawn(supervisor.clone(), id, planned, stamp);
-    Ok((id, duration))
+    let mut inner = supervisor.inner().write().await;
+    Ok(begin_with_stamp(&mut inner, stamp, supervisor, planned)?)
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "place", ..)`.
 pub fn spawn(supervisor: Arc<ArmSupervisor>, id: u64, planned: PlannedPlace, stamp: crate::supervisor::AdmissionStamp) {
-    tokio::spawn(run(supervisor, id, planned, stamp));
+    let budget = expected_duration(&planned) * 2.0 + 20.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(budget);
+    spawn_with_deadline(supervisor, id, planned, stamp, deadline, budget);
+}
+
+fn spawn_with_deadline(
+    supervisor: Arc<ArmSupervisor>,
+    id: u64,
+    planned: PlannedPlace,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+    budget: f64,
+) {
+    tokio::spawn(run(supervisor, id, planned, stamp, deadline, budget));
 }
 
 async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
@@ -361,29 +477,72 @@ async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
     Ok(())
 }
 
-async fn run(sup: Arc<ArmSupervisor>, id: u64, planned: PlannedPlace, stamp: crate::supervisor::AdmissionStamp) {
-    // generous whole-action budget: twice the planned time plus 20 s
-    let budget = expected_duration(&planned) * 2.0 + 20.0;
+async fn run(
+    sup: Arc<ArmSupervisor>,
+    id: u64,
+    planned: PlannedPlace,
+    stamp: crate::supervisor::AdmissionStamp,
+    deadline: Instant,
+    budget: f64,
+) {
+    use crate::rt_core::requests::actions::{FinishState, HeldUpdate};
     let ctx = MacroCtx {
-        sup: sup.clone(), id, stamp,
-        deadline: Instant::now() + Duration::from_secs_f64(budget),
-        phase_timeout_s: PHASE_TIMEOUT_S, timeout_code: "PLACE_TIMEOUT",
+        sup: sup.clone(),
+        id,
+        stamp,
+        deadline,
+        phase_timeout_s: PHASE_TIMEOUT_S,
+        timeout_code: "PLACE_TIMEOUT",
         timeout_message: format!("Place did not finish within {budget:.0} s"),
     };
     let result = phases(&ctx, &planned).await;
-    let mut inner = sup.inner().write().await;
     match result {
         // released: the jaws are open, nothing is held
-        Ok(()) => inner.finish_macro(id, "done", None, None, planned.request.release.then_some(false), None),
-        Err(Stop::Fail(code, message)) => {
-            inner.finish_macro(id, "failed", Some(&code), Some(message), None, None);
+        Ok(()) => {
+            ctx.finish(
+                FinishState::Done,
+                None,
+                None,
+                planned.request.release.then_some(false),
+                None,
+                if planned.request.release {
+                    HeldUpdate::Clear
+                } else {
+                    HeldUpdate::Unchanged
+                },
+            )
+            .await;
         }
-        Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),
+        Err(Stop::Fail(code, message)) => {
+            ctx.finish(
+                FinishState::Failed,
+                Some(&code),
+                Some(message),
+                None,
+                None,
+                HeldUpdate::Unchanged,
+            )
+            .await;
+        }
+        Err(Stop::Cancelled) => {
+            ctx.finish(
+                FinishState::Cancelled,
+                None,
+                None,
+                None,
+                None,
+                HeldUpdate::Unchanged,
+            )
+            .await;
+        }
     }
-    if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
-        let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
-        let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
-        tracing::info!("Place {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
+    if !ctx.is_executor() {
+        let inner = sup.inner().read().await;
+        if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
+            let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
+            let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
+            tracing::info!("Place {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
+        }
     }
 }
 

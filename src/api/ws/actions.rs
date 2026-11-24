@@ -318,33 +318,17 @@ impl PlannedMacro {
     /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
     pub(super) fn start(
         self,
-        admitted: crate::supervisor::Admitted<'_>,
+        inner: &mut SupervisorInner,
+        stamp: crate::supervisor::AdmissionStamp,
         supervisor: &Arc<ArmSupervisor>,
         deps: &crate::grasp::GraspDeps,
     ) -> Result<(u64, f64), ArmError> {
-        let stamp = admitted.stamp();
         match self {
             Self::Grasp(planned) => {
+                let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
                 crate::grasp::begin(admitted, supervisor, deps.source.clone(), planned)
             }
-            Self::Place(planned) => {
-                let (inner, proof) = admitted.consume()?;
-                let id = inner.begin_macro_inner(
-                    &proof,
-                    "place",
-                    &planned.input,
-                    planned.request.tag.clone(),
-                )?;
-                if planned.orientation_levelled {
-                    inner.update_action(id, |a| {
-                        a.orientation = Some("levelled".into());
-                    });
-                }
-                let duration = crate::place::expected_duration(&planned)
-                    + inner.approach_estimate_s("place_final", planned.request.approach);
-                crate::place::spawn(supervisor.clone(), id, planned, stamp);
-                Ok((id, duration))
-            }
+            Self::Place(planned) => crate::place::begin_with_stamp(inner, stamp, supervisor, planned),
         }
     }
 }
@@ -634,11 +618,7 @@ pub(super) async fn complete_macro_check(
                 {
                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                 } else {
-                    match inner
-                        .check_admission(stamp)
-                        .map_err(ArmError::from)
-                        .and_then(|admitted| planned.start(admitted, recv_supervisor, recv_deps))
-                    {
+                    match planned.start(&mut inner, stamp, recv_supervisor, recv_deps) {
                         Ok(started) => command_ack(&inner, &request_id, Some(started)),
                         Err(error) => command_reject(&inner, &request_id, error.into()),
                     }

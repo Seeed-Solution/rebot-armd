@@ -188,6 +188,14 @@ pub struct MacroCtx {
 }
 
 impl MacroCtx {
+    /// Whether this supervisor is currently owned by the synchronous RT executor (`OWNER_EXECUTOR`),
+    /// in which case all reads use published [`StateHub`] snapshots and all child/finish actions
+    /// go through the RT broker without ever taking `SupervisorLock`.
+    #[inline]
+    pub fn is_executor(&self) -> bool {
+        self.sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR
+    }
+
     /// Derives a fresh single-use child [`AdmissionStamp`] preserving the parent macro's
     /// admission-captured authority without re-sampling live owner state.
     #[inline]
@@ -195,13 +203,54 @@ impl MacroCtx {
         self.stamp.for_macro_child()
     }
 
-    pub async fn alive(&self) -> bool { self.sup.inner().read().await.macro_alive(self.id) }
+    /// Captures a coherent planning snapshot (`StateHub` on `OWNER_EXECUTOR`, brief read lock on
+    /// `OWNER_LEGACY`) carrying a fresh child `AdmissionStamp`.
+    pub async fn snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::rt_core::requests::actions::ActionSnapshot, Stop> {
+        match crate::rt_core::requests::actions::ActionSnapshot::capture(
+            &self.sup,
+            self.next_child_stamp(),
+            deadline,
+        )
+        .await
+        {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                if !self.alive().await {
+                    Err(Stop::Cancelled)
+                } else {
+                    Err(arm_fail(e))
+                }
+            }
+        }
+    }
+
+    pub async fn alive(&self) -> bool {
+        if self.is_executor() {
+            self.sup.hub().latest().is_some_and(|s| {
+                let m = s.rt.owner.macro_state;
+                m.active_id == self.id && m.alive
+            })
+        } else {
+            self.sup.inner().read().await.macro_alive(self.id)
+        }
+    }
 
     /// Map a child motion-install error under the owner write lock: admission-stamp refusal
     /// (`STOPPED`, `LEASE_LOST`, `ESTOP_ACTIVE`, `EPOCH_MISMATCH`) cancels the parent macro
     /// (preserving `cancelled` state and exact reason code) rather than failing it.
     pub fn map_install_err(&self, inner: &mut SupervisorInner, e: ArmError) -> Stop {
         use crate::safety::SafetyError;
+        if let ArmError::Rejected { ref code, .. } = e {
+            if code == "PARENT_REPLACED" {
+                return Stop::Cancelled;
+            }
+            if code == "DEADLINE_EXPIRED" {
+                return fail(self.timeout_code, self.timeout_message.clone());
+            }
+        }
         if matches!(
             e,
             ArmError::Safety(
@@ -229,23 +278,132 @@ impl MacroCtx {
     /// Report `phase` in `action.phase` (after a [`check`](Self::check)).
     pub async fn phase(&self, phase: &str, progress: f32) -> Result<(), Stop> {
         self.check().await?;
-        self.sup.inner().write().await.set_action_phase(self.id, phase, progress, None, None);
+        if !self.is_executor() {
+            self.sup.inner().write().await.set_action_phase(self.id, phase, progress, None, None);
+        }
         Ok(())
     }
 
-    /// FK of the commanded J1..J6 in `end_link` frame.
+    /// FK of the commanded J1..J6 in `end_link` frame (0 lock on `OWNER_EXECUTOR`).
     pub async fn pose(&self) -> Pose {
+        if self.is_executor() {
+            if let (Some(snap), Some(env)) = (self.sup.hub().latest(), self.sup.hub().prep_env()) {
+                let arm = &env.config.arm_model;
+                return arm
+                    .fk_f32(&snap.rt.commanded_positions)
+                    .unwrap_or_else(|| arm.fk(&[0.0; crate::chain::MAX_CHAIN_JOINTS]));
+            }
+            return Pose::new([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]);
+        }
         let inner = self.sup.inner().read().await;
         let arm = &inner.config.arm_model;
         arm.fk_f32(&inner.commanded_positions).unwrap_or_else(|| arm.fk(&[0.0; crate::chain::MAX_CHAIN_JOINTS]))
     }
 
-    /// FK of the commanded J1..J6 in the active TCP frame.
+    /// FK of the commanded J1..J6 in the active TCP frame (0 lock on `OWNER_EXECUTOR`).
     pub async fn tcp_pose(&self) -> Pose {
+        if self.is_executor() {
+            if let (Some(snap), Some(env)) = (self.sup.hub().latest(), self.sup.hub().prep_env()) {
+                return env
+                    .config
+                    .tcp_pose_f32(&snap.rt.commanded_positions)
+                    .unwrap_or_else(|| {
+                        env.config
+                            .end_to_tcp(&env.config.arm_model.fk(&[0.0; crate::chain::MAX_CHAIN_JOINTS]))
+                    });
+            }
+            return Pose::new([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], [0.0; 3]);
+        }
         let inner = self.sup.inner().read().await;
         inner.config.tcp_pose_f32(&inner.commanded_positions).unwrap_or_else(|| {
             inner.config.end_to_tcp(&inner.config.arm_model.fk(&[0.0; crate::chain::MAX_CHAIN_JOINTS]))
         })
+    }
+
+    /// Measured joint positions, measured joint velocities, and arm joint indices
+    /// (0 lock on `OWNER_EXECUTOR`, short read lock on `OWNER_LEGACY`).
+    pub async fn measured_with_vel(&self) -> (Vec<f32>, Vec<f32>, Vec<usize>) {
+        if self.is_executor() {
+            if let (Some(snap), Some(env)) = (self.sup.hub().latest(), self.sup.hub().prep_env()) {
+                return (
+                    snap.rt.positions.clone(),
+                    snap.rt.velocities.clone(),
+                    env.config.arm_joint_indices(),
+                );
+            }
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let inner = self.sup.inner().read().await;
+        (
+            inner.measured_positions.clone(),
+            inner.measured_velocities.clone(),
+            inner.config.arm_joint_indices(),
+        )
+    }
+
+    /// Measured positions, arm-joint feedback instants, arm-joint feedback sequence counters,
+    /// and arm-joint receive-queue bounds from one coherent sample (0 lock on `OWNER_EXECUTOR`).
+    pub async fn arm_receive_progress(
+        &self,
+    ) -> (Vec<f32>, Vec<Option<Instant>>, Vec<u64>, Vec<Option<Instant>>) {
+        if self.is_executor() {
+            if let (Some(snap), Some(env)) = (self.sup.hub().latest(), self.sup.hub().prep_env()) {
+                let arm = env.config.arm_joint_indices();
+                let instant = |i: usize| snap.rt.feedback_instants.get(i).copied().flatten();
+                let instants = arm.iter().map(|&i| instant(i)).collect();
+                let seqs = arm
+                    .iter()
+                    .map(|&i| snap.rt.feedback_seqs.get(i).copied().unwrap_or(0))
+                    .collect();
+                let bounds = arm
+                    .iter()
+                    .map(|&i| match snap.rt.feedback_queue_bounds.get(i) {
+                        Some(b) => *b,
+                        None => instant(i),
+                    })
+                    .collect();
+                return (snap.rt.positions.clone(), instants, seqs, bounds);
+            }
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        let inner = self.sup.inner().read().await;
+        let arm = inner.config.arm_joint_indices();
+        let raw_instants = inner.core.feedback().instants();
+        let raw_seqs = inner.core.feedback().seqs();
+        let instant = |i: usize| raw_instants.get(i).copied().flatten();
+        let instants = arm.iter().map(|&i| instant(i)).collect();
+        let seqs = arm
+            .iter()
+            .map(|&i| raw_seqs.get(i).copied().unwrap_or(0))
+            .collect();
+        let bounds = arm
+            .iter()
+            .map(|&i| match inner.joint_feedback_queue_bounds.get(i) {
+                Some(b) => *b,
+                None => instant(i),
+            })
+            .collect();
+        (inner.measured_positions.clone(), instants, seqs, bounds)
+    }
+
+    /// Read the [`ContactWatch`] recorded for `ticket` (0 lock on `OWNER_EXECUTOR`).
+    pub async fn child_watch(&self, ticket: ChildTicket) -> ContactWatch {
+        if self.is_executor() {
+            return self
+                .sup
+                .hub()
+                .latest()
+                .map(|s| s.rt.owner.macro_state)
+                .filter(|m| m.active_id == ticket.parent.0 && m.child_seq == ticket.child_seq)
+                .map(|m| m.child_watch)
+                .unwrap_or_default();
+        }
+        self.sup
+            .inner()
+            .read()
+            .await
+            .macro_child_watch(ticket)
+            .unwrap_or_default()
     }
 
     /// RT deadline of a child that may run `limit_s` (at most `phase_timeout_s`, at most the
@@ -276,10 +434,45 @@ impl MacroCtx {
         self.wait_child(ticket).await
     }
 
-    /// Wait for child `ticket` with the read lock only: its result, [`Stop::Cancelled`] when
-    /// the parent ended or was replaced. The control tick ends an overdue child (its timeout
-    /// failure); only when no tick did so for [`OVERDUE_GRACE`] does the worker end it.
+    /// Wait for child `ticket`:
+    /// - On `OWNER_EXECUTOR`: polls published `StateHub` snapshots with zero `SupervisorLock`.
+    /// - On `OWNER_LEGACY`: polls under read lock and expires overdue children only after
+    ///   [`OVERDUE_GRACE`].
     pub async fn wait_child(&self, ticket: ChildTicket) -> Result<SubDone, Stop> {
+        if self.is_executor() {
+            loop {
+                tokio::time::sleep(POLL).await;
+                let Some(snap) = self.sup.hub().latest() else {
+                    if Instant::now() > self.deadline {
+                        return Err(fail(self.timeout_code, self.timeout_message.clone()));
+                    }
+                    continue;
+                };
+                let m = snap.rt.owner.macro_state;
+                if m.active_id != ticket.parent.0 || !m.alive {
+                    return Err(Stop::Cancelled);
+                }
+                if m.child_seq < ticket.child_seq {
+                    if Instant::now() > self.deadline {
+                        return Err(fail(self.timeout_code, self.timeout_message.clone()));
+                    }
+                    continue;
+                }
+                if m.child_seq > ticket.child_seq {
+                    return Err(Stop::Cancelled);
+                }
+                match m.child_sub {
+                    SubState::Done(d) => return Ok(d),
+                    SubState::Failed { code, message } => {
+                        return Err(Stop::Fail(
+                            code.as_str().to_owned(),
+                            message.as_str().to_owned(),
+                        ));
+                    }
+                    SubState::Running | SubState::Idle => {}
+                }
+            }
+        }
         loop {
             tokio::time::sleep(POLL).await;
             let overdue = {
@@ -293,6 +486,189 @@ impl MacroCtx {
             };
             if overdue { self.sup.inner().write().await.expire_macro_child(Instant::now()); }
         }
+    }
+
+    /// Submits an A7 `InstallChild` or `FinishMacro` command through the RT executor's broker
+    /// without touching `SupervisorLock` and without stealing other clients' replies.
+    async fn submit_action_executor(
+        &self,
+        stamp: &crate::rt_core::requests::actions::ActionStamp,
+        deadline: Instant,
+        make_submit: impl Fn() -> crate::rt_core::requests::actions::ActionSubmit<'static, crate::rt_core::ops::PlanSlot>,
+        ignore_parent_dead: bool,
+    ) -> Result<ActionId, Stop> {
+        use crate::rt_core::broker::{AdmitError, ClientId, DeliveryDecision, Reply, Submit};
+        let Some(handle) = self.sup.executor_handle() else {
+            return Err(Stop::Cancelled);
+        };
+        let client = ClientId(stamp.admission.connection_id);
+        let auth = stamp.broker_authority();
+        let req_id = loop {
+            let res = {
+                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
+                broker.reclaim_plans();
+                let sub = make_submit();
+                broker.submit(client, 0, auth, deadline, Submit::Action(sub))
+            };
+            match res {
+                Ok(id) => break id,
+                Err(AdmitError::Disconnected) => return Err(Stop::Cancelled),
+                Err(AdmitError::PlansFull | AdmitError::CommandsFull | AdmitError::RepliesFull) => {
+                    if !ignore_parent_dead && !self.alive().await {
+                        return Err(Stop::Cancelled);
+                    }
+                    if Instant::now() > deadline {
+                        return Err(fail(self.timeout_code, self.timeout_message.clone()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        };
+        let wait_limit = deadline + Duration::from_secs(2);
+        loop {
+            let mut got: Option<Reply> = None;
+            {
+                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
+                broker.try_poll(|_, reply| {
+                    if reply.request() == req_id {
+                        got = Some(reply);
+                        DeliveryDecision::Delivered
+                    } else {
+                        DeliveryDecision::Backpressured
+                    }
+                });
+                broker.reclaim_plans();
+            }
+            if let Some(reply) = got {
+                return match reply {
+                    Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
+                    Reply::Refused { code, .. } => match code {
+                        "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
+                        | "PARENT_REPLACED" => Err(Stop::Cancelled),
+                        "DEADLINE_EXPIRED" => {
+                            Err(fail(self.timeout_code, self.timeout_message.clone()))
+                        }
+                        other => Err(fail(other, format!("RT action refused: {other}"))),
+                    },
+                    Reply::Terminal { .. } => Ok(ActionId(self.id)),
+                };
+            }
+            if !ignore_parent_dead && !self.alive().await {
+                return Err(Stop::Cancelled);
+            }
+            if Instant::now() > wait_limit {
+                return Err(fail(self.timeout_code, self.timeout_message.clone()));
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Finishes the parent macro through the single owner-side [`install_finish_macro`] path
+    /// (Legacy write lock or RT Executor `ActionSubmit::FinishMacro`, 0 lock on Executor).
+    pub async fn finish(
+        &self,
+        state: crate::rt_core::requests::actions::FinishState,
+        code: Option<&str>,
+        message: Option<String>,
+        holding: Option<bool>,
+        gripper_gap_rad: Option<f32>,
+        held: crate::rt_core::requests::actions::HeldUpdate,
+    ) {
+        use crate::rt_core::requests::actions::{
+            install_finish_macro, ActionStamp, FinishMacroSpec, OwnerCheckCtx,
+            DEFAULT_FINISH_DEADLINE,
+        };
+        let now = Instant::now();
+        let finish_deadline = now + DEFAULT_FINISH_DEADLINE;
+        if self.is_executor() {
+            let Some(handle) = self.sup.executor_handle() else {
+                return;
+            };
+            let boot = handle.boot();
+            let arm = self
+                .sup
+                .hub()
+                .latest()
+                .map_or(crate::rt_core::ids::ArmId::LOCAL, |s| s.rt.owner.arm);
+            let mut spec = match state {
+                crate::rt_core::requests::actions::FinishState::Done => {
+                    FinishMacroSpec::done(ActionId(self.id), boot)
+                }
+                crate::rt_core::requests::actions::FinishState::Failed => FinishMacroSpec::failed(
+                    ActionId(self.id),
+                    boot,
+                    code.unwrap_or("FAILED"),
+                    message.as_deref().unwrap_or(""),
+                ),
+                crate::rt_core::requests::actions::FinishState::Cancelled => {
+                    FinishMacroSpec::cancelled(ActionId(self.id), boot, code, message.as_deref())
+                }
+            };
+            spec.holding = holding;
+            spec.gripper_gap_rad = gripper_gap_rad;
+            spec.held = held;
+            let stamp = ActionStamp {
+                arm,
+                boot,
+                admission: self.stamp,
+                config_revision: 0,
+                calibration_revision: None,
+                poses_revision: None,
+                sequences_revision: None,
+                grasp_setup_revision: None,
+                gripper_calib_revision: None,
+                power_budget_revision: None,
+                parent_generation: self.id,
+                deadline: finish_deadline,
+            };
+            let _ = self
+                .submit_action_executor(
+                    &stamp,
+                    finish_deadline,
+                    || crate::rt_core::requests::actions::ActionSubmit::FinishMacro(spec),
+                    true,
+                )
+                .await;
+            return;
+        }
+        let mut inner = self.sup.inner().write().await;
+        if !inner.macro_alive(self.id) {
+            return;
+        }
+        let boot = inner.boot_id;
+        let mut spec = match state {
+            crate::rt_core::requests::actions::FinishState::Done => {
+                FinishMacroSpec::done(ActionId(self.id), boot)
+            }
+            crate::rt_core::requests::actions::FinishState::Failed => FinishMacroSpec::failed(
+                ActionId(self.id),
+                boot,
+                code.unwrap_or("FAILED"),
+                message.as_deref().unwrap_or(""),
+            ),
+            crate::rt_core::requests::actions::FinishState::Cancelled => {
+                FinishMacroSpec::cancelled(ActionId(self.id), boot, code, message.as_deref())
+            }
+        };
+        spec.holding = holding;
+        spec.gripper_gap_rad = gripper_gap_rad;
+        spec.held = held;
+        let ctx = OwnerCheckCtx::for_legacy(&inner);
+        let stamp = ActionStamp {
+            arm: inner.core.id(),
+            boot,
+            admission: self.stamp,
+            config_revision: inner.workspace_revision,
+            calibration_revision: None,
+            poses_revision: None,
+            sequences_revision: None,
+            grasp_setup_revision: None,
+            gripper_calib_revision: None,
+            power_budget_revision: None,
+            parent_generation: self.id,
+            deadline: finish_deadline,
+        };
+        let _ = install_finish_macro(&mut inner, &stamp, &ctx, &spec, message);
     }
 
     /// Plan (outside the lock) a Cartesian path from the current commanded state, install it
@@ -341,13 +717,41 @@ impl MacroCtx {
         approach: Option<FinalApproach>,
         table_clearance: Option<(Vec<crate::kinematics::Vec3>, f64)>,
     ) -> Result<SubDone, (Stop, bool)> {
+        self.move_arm_staged_in_with_table_guarded(
+            frame,
+            phase,
+            spec,
+            speed,
+            approach,
+            table_clearance,
+            None,
+        )
+        .await
+        .map(|(done, _)| done)
+    }
+
+    /// [`move_arm_staged_in_with_table`](Self::move_arm_staged_in_with_table) with an optional
+    /// [`ContactGuard`] folded atomically into `ChildSpec.contact` at `InstallChild` time
+    /// (zero pre-arm leak on refusal). Returns `(SubDone, ContactWatch)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn move_arm_staged_in_with_table_guarded(
+        &self,
+        frame: GoalFrame,
+        phase: &str,
+        spec: GoalSpec,
+        speed: Speed,
+        approach: Option<FinalApproach>,
+        table_clearance: Option<(Vec<crate::kinematics::Vec3>, f64)>,
+        contact: Option<ContactGuard>,
+    ) -> Result<(SubDone, ContactWatch), (Stop, bool)> {
+        use crate::rt_core::requests::actions as req;
         let before = |s: Stop| (s, false);
-        let (input, plan) = {
-            let inner = self.sup.inner().read().await;
-            if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
-            let plan = approach.as_ref().map(|a| inner.approach_plan(a.use_, a.request));
-            (inner.plan_input_in(frame).map_err(arm_fail).map_err(before)?, plan)
-        };
+        if !self.alive().await {
+            return Err(before(Stop::Cancelled));
+        }
+        let snap = self.snapshot(self.deadline).await.map_err(before)?;
+        let input = snap.plan_input_in(frame).map_err(arm_fail).map_err(before)?;
+        let plan = approach.as_ref().map(|a| snap.env.approach_plan(a.use_, a.request));
         let effective_rules: Option<crate::backlash::DescentRules> = match (&approach, &table_clearance) {
             (Some(a), Some(t)) => {
                 let mut r = a.rules.clone();
@@ -376,33 +780,103 @@ impl MacroCtx {
         let (path, pre, plan) = match planned {
             Ok(p) => p,
             Err(e) => {
-                if let motion::MotionError::WorkspaceViolation { ref detail, .. } = e {
-                    self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
+                if !self.is_executor() {
+                    if let motion::MotionError::WorkspaceViolation { ref detail, .. } = e {
+                        self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
+                    }
                 }
                 return Err(before(arm_fail(e.into())));
             }
         };
-        let ticket = {
-            let mut inner = self.sup.inner().write().await;
-            if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
-            let admitted = match inner.check_admission(self.next_child_stamp()) {
-                Ok(a) => a,
-                Err(e) => return Err(before(self.map_install_err(&mut inner, e.into()))),
+        let mut child_stamp = snap.stamp.for_child(ActionId(self.id), self.deadline);
+        child_stamp.poses_revision = None;
+        child_stamp.sequences_revision = None;
+        child_stamp.grasp_setup_revision = None;
+        child_stamp.gripper_calib_revision = None;
+        child_stamp.calibration_revision = None;
+        child_stamp.power_budget_revision = None;
+
+        let ticket = if self.is_executor() {
+            let m = snap.owner.macro_state;
+            let next_seq = (m.active_id == self.id && m.alive)
+                .then(|| m.child_seq.checked_add(1))
+                .flatten()
+                .ok_or_else(|| before(Stop::Cancelled))?;
+            let chosen_path = match &pre {
+                crate::backlash::Pre::Ready(cp) => &cp.path,
+                _ => &path,
             };
-            match SupervisorInner::install_macro_path_same_side_with_rules(admitted, self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
-                Ok(l) => self.arm_child(&mut inner, phase, l * 2.0 + 5.0),
+            let timeout_s = ((chosen_path.duration + 0.5) * 2.0 + 5.0).min(self.phase_timeout_s);
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s,
+                timeout_code: self.timeout_code,
+                contact,
+            };
+            let slot = req::prepare_child_cartesian_slot(
+                &snap.commanded_positions,
+                chosen_path,
+                input.power.as_ref().map(|_| chosen_path.power_scale),
+                child_spec,
+            )
+            .map_err(|c| before(fail(c, format!("failed to stage Cartesian child: {c}"))))?;
+            self.submit_child_slot_executor(&child_stamp, slot, true, None)
+                .await
+                .map_err(before)?;
+            child_spec.ticket
+        } else {
+            let mut inner = self.sup.inner().write().await;
+            let Some(next_seq) = inner
+                .macro_run
+                .as_ref()
+                .filter(|m| m.id == self.id && inner.macro_alive(self.id))
+                .and_then(|m| m.next_child_seq())
+            else {
+                return Err(before(Stop::Cancelled));
+            };
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact,
+            };
+            let owner_ctx = req::OwnerCheckCtx::for_legacy(&inner);
+            let installed = match req::install_macro_child(
+                &mut inner,
+                &child_stamp,
+                &owner_ctx,
+                true,
+                req::MacroChildPayload::LegacyCartesian {
+                    spec: child_spec,
+                    start: snap.commanded_positions.clone(),
+                    input: input.clone(),
+                    direct: path,
+                    pre,
+                    approach_plan: plan,
+                    rules: effective_rules,
+                },
+            ) {
+                Ok(v) => v,
                 Err(e) => {
                     if let Some(detail) = e.workspace_detail() {
                         inner.set_action_workspace_violation(self.id, detail);
                     }
                     return Err(before(self.map_install_err(&mut inner, e)));
                 }
-            }
+            };
+            installed.ticket
         };
         let t0 = Instant::now();
-        let sub_res = match ticket { Some(t) => self.wait_child(t).await, None => Err(Stop::Cancelled) };
+        let sub_res = self.wait_child(ticket).await;
         let ms = t0.elapsed().as_millis() as u32;
-        {
+        let watch = self.child_watch(ticket).await;
+        if !self.is_executor() {
             let mut inner = self.sup.inner().write().await;
             let meas_opt = inner.config.arm_model.fk_f32(&inner.measured_positions).map(|p| motion::end_to_frame(&p, &input));
             let cmd_opt = inner.config.arm_model.fk_f32(&inner.commanded_positions).map(|p| motion::end_to_frame(&p, &input));
@@ -411,7 +885,7 @@ impl MacroCtx {
                 let track_deg = crate::kinematics::angle_between(&meas.r, &cmd.r).to_degrees() as f32;
                 let goal_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &goal.p)) * 1000.0) as f32;
                 let goal_deg = crate::kinematics::angle_between(&meas.r, &goal.r).to_degrees() as f32;
-                let contact = inner.last_action.as_ref().filter(|a| a.id == self.id).and_then(|a| a.descend_contact);
+                let contact_flag = inner.last_action.as_ref().filter(|a| a.id == self.id).and_then(|a| a.descend_contact);
                 if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == self.id) {
                     if a.motions.len() < 32 {
                         a.motions.push(motion::MacroMotionDiag {
@@ -421,19 +895,229 @@ impl MacroCtx {
                             track_deg,
                             goal_mm,
                             goal_deg,
-                            contact,
+                            contact: contact_flag,
                         });
                     }
                 }
             }
         }
-        sub_res.map_err(|s| (s, true))
+        sub_res.map(|done| (done, watch)).map_err(|s| (s, true))
+    }
+
+    /// Install a joint-space quintic macro child through the single `install_macro_child` /
+    /// `InstallChild` path (shared by `sequences` pose steps and `measure_multiview` views) and
+    /// wait for completion. `Err((stop, false))` = refused before motion; `Err((stop, true))` =
+    /// failed after installation.
+    pub async fn install_joint_child(
+        &self,
+        phase: &str,
+        target: Vec<f32>,
+        limits: Vec<crate::model::JointLimit>,
+        check_workspace_rev: bool,
+        workspace_rev_override: Option<u64>,
+        calibration_rev: Option<u64>,
+    ) -> Result<SubDone, (Stop, bool)> {
+        use crate::rt_core::requests::actions as req;
+        let before = |s: Stop| (s, false);
+        if !self.alive().await {
+            return Err(before(Stop::Cancelled));
+        }
+        let snap = self.snapshot(self.deadline).await.map_err(before)?;
+        let mut child_stamp = snap.stamp.for_child(ActionId(self.id), self.deadline);
+        if let Some(ws) = workspace_rev_override {
+            child_stamp.config_revision = ws;
+        }
+        child_stamp.calibration_revision = calibration_rev;
+        child_stamp.poses_revision = None;
+        child_stamp.sequences_revision = None;
+        child_stamp.grasp_setup_revision = None;
+        child_stamp.gripper_calib_revision = None;
+        child_stamp.power_budget_revision = None;
+
+        let ticket = if self.is_executor() {
+            let m = snap.owner.macro_state;
+            let next_seq = (m.active_id == self.id && m.alive)
+                .then(|| m.child_seq.checked_add(1))
+                .flatten()
+                .ok_or_else(|| before(Stop::Cancelled))?;
+            let zeros = vec![0.0f32; snap.env.config.dof];
+            let traj = crate::trajectory::TrajectoryPlanner::plan(
+                &snap.commanded_positions,
+                &snap.commanded_velocities,
+                &target,
+                &zeros,
+                None,
+                &limits,
+            )
+            .map_err(|e| before(arm_fail(e.into())))?;
+            let max_vel: Vec<f32> = limits.iter().map(|l| l.max_velocity).collect();
+            let timeout_s = ((traj.duration + motion::SETTLE_MAX_S) * 2.0 + 5.0).min(self.phase_timeout_s);
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
+            };
+            let slot = req::prepare_child_joint_slot(
+                &snap.commanded_positions,
+                &target,
+                &max_vel,
+                traj.duration,
+                None,
+                child_spec,
+            )
+            .map_err(|c| before(fail(c, format!("failed to stage joint child for {phase}: {c}"))))?;
+            self.submit_child_slot_executor(
+                &child_stamp,
+                slot,
+                check_workspace_rev,
+                calibration_rev,
+            )
+            .await
+            .map_err(before)?;
+            child_spec.ticket
+        } else {
+            let mut inner = self.sup.inner().write().await;
+            let Some(next_seq) = inner
+                .macro_run
+                .as_ref()
+                .filter(|m| m.id == self.id && inner.macro_alive(self.id))
+                .and_then(|m| m.next_child_seq())
+            else {
+                return Err(before(Stop::Cancelled));
+            };
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
+            };
+            let owner_ctx = req::OwnerCheckCtx::for_legacy(&inner);
+            match req::install_macro_child(
+                &mut inner,
+                &child_stamp,
+                &owner_ctx,
+                check_workspace_rev,
+                req::MacroChildPayload::LegacyJoint {
+                    spec: child_spec,
+                    start: snap.commanded_positions,
+                    target,
+                    limits,
+                },
+            ) {
+                Ok(v) => v.ticket,
+                Err(e) => {
+                    if let Some(detail) = e.workspace_detail() {
+                        inner.set_action_workspace_violation(self.id, detail);
+                    }
+                    return Err(before(self.map_install_err(&mut inner, e)));
+                }
+            }
+        };
+        self.wait_child(ticket).await.map_err(|s| (s, true))
+    }
+
+    /// Install a prepared replay macro child through the single `install_macro_child` /
+    /// `InstallChild` path and wait for completion.
+    pub async fn install_replay_child(
+        &self,
+        phase: &str,
+        plan: crate::replay::ReplayPlan,
+        workspace_rev_override: Option<u64>,
+        calibration_rev: Option<u64>,
+    ) -> Result<SubDone, Stop> {
+        use crate::rt_core::requests::actions as req;
+        if !self.alive().await {
+            return Err(Stop::Cancelled);
+        }
+        let snap = self.snapshot(self.deadline).await?;
+        let mut child_stamp = snap.stamp.for_child(ActionId(self.id), self.deadline);
+        if let Some(ws) = workspace_rev_override {
+            child_stamp.config_revision = ws;
+        }
+        child_stamp.calibration_revision = calibration_rev;
+        child_stamp.poses_revision = None;
+        child_stamp.sequences_revision = None;
+        child_stamp.grasp_setup_revision = None;
+        child_stamp.gripper_calib_revision = None;
+        child_stamp.power_budget_revision = None;
+        let tool_digest = snap.env.tool_digest_hash;
+
+        let ticket = if self.is_executor() {
+            let m = snap.owner.macro_state;
+            let next_seq = (m.active_id == self.id && m.alive)
+                .then(|| m.child_seq.checked_add(1))
+                .flatten()
+                .ok_or(Stop::Cancelled)?;
+            let timeout_s = ((plan.duration + 1.0) * 2.0 + 5.0).min(self.phase_timeout_s);
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
+            };
+            let slot = req::prepare_child_replay_slot(
+                &snap.commanded_positions,
+                &plan,
+                tool_digest,
+                child_spec,
+            )
+            .map_err(|c| fail(c, format!("failed to stage replay child for {phase}: {c}")))?;
+            self.submit_child_slot_executor(&child_stamp, slot, true, calibration_rev)
+                .await?;
+            child_spec.ticket
+        } else {
+            let mut inner = self.sup.inner().write().await;
+            let Some(next_seq) = inner
+                .macro_run
+                .as_ref()
+                .filter(|m| m.id == self.id && inner.macro_alive(self.id))
+                .and_then(|m| m.next_child_seq())
+            else {
+                return Err(Stop::Cancelled);
+            };
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
+            };
+            let owner_ctx = req::OwnerCheckCtx::for_legacy(&inner);
+            match req::install_macro_child(
+                &mut inner,
+                &child_stamp,
+                &owner_ctx,
+                true,
+                req::MacroChildPayload::LegacyReplay {
+                    spec: child_spec,
+                    start: snap.commanded_positions,
+                    plan,
+                    tool_digest,
+                },
+            ) {
+                Ok(v) => v.ticket,
+                Err(e) => return Err(self.map_install_err(&mut inner, e)),
+            }
+        };
+        self.wait_child(ticket).await
     }
 
     /// Reconcile a planned gripper sub-motion with the remaining macro budget before installation,
-    /// arm its RT child deadline under the same write lock, and wait on its `ChildTicket`:
+    /// arm its RT child deadline under the same owner install call, and wait on its `ChildTicket`:
     /// pos-force closes arm up to `(timeout_s + 10 s).min(self.deadline)` (not clamped to
-    /// `phase_timeout_s`), while pos-vel and opening moves use `arm_child` (`phase_timeout_s`).
+    /// `phase_timeout_s`), while pos-vel and opening moves use `phase_timeout_s`.
     async fn run_gripper_planned(
         &self,
         phase: &str,
@@ -441,52 +1125,214 @@ impl MacroCtx {
         fraction: Option<f64>,
         grasp: bool,
     ) -> Result<SubDone, Stop> {
-        let ticket = {
-            let mut inner = self.sup.inner().write().await;
-            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            let now = Instant::now();
-            if now >= self.deadline {
-                return Err(fail(self.timeout_code, self.timeout_message.clone()));
-            }
-            let closes = match command {
-                GripperCommand::Close | GripperCommand::Seek => true,
-                GripperCommand::Open => false,
-                GripperCommand::Move => match (inner.config.gripper_policy.as_ref(), inner.config.gripper_index()) {
-                    (Some(p), Some(g)) => {
-                        let target = p.closed_rad + fraction.unwrap_or(0.0) as f32 * (p.open_rad - p.closed_rad);
-                        let dir = if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 };
-                        (target - inner.commanded_positions.get(g).copied().unwrap_or(target)) * dir > 1e-3
-                    }
-                    _ => true,
+        use crate::rt_core::requests::actions as req;
+        if !self.alive().await {
+            return Err(Stop::Cancelled);
+        }
+        let now = Instant::now();
+        if now >= self.deadline {
+            return Err(fail(self.timeout_code, self.timeout_message.clone()));
+        }
+        let snap = self.snapshot(self.deadline).await?;
+        let closes = match command {
+            GripperCommand::Close | GripperCommand::Seek => true,
+            GripperCommand::Open => false,
+            GripperCommand::Move => match (
+                snap.env.config.gripper_policy.as_ref(),
+                snap.env.config.gripper_index(),
+            ) {
+                (Some(p), Some(g)) => {
+                    let target =
+                        p.closed_rad + fraction.unwrap_or(0.0) as f32 * (p.open_rad - p.closed_rad);
+                    let dir = if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 };
+                    (target - snap.commanded_positions.get(g).copied().unwrap_or(target)) * dir
+                        > 1e-3
+                }
+                _ => true,
+            },
+        };
+        let close_speed = snap
+            .env
+            .config
+            .gripper_policy
+            .as_ref()
+            .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
+        let (speed, timeout_s) = if closes { (close_speed, None) } else { (1.0, Some(8.0)) };
+        let request = GripperRequest { command, fraction, grasp, speed, timeout_s, tag: None };
+        let remaining_s = self.deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+        let mut child_stamp = snap.stamp.for_child(ActionId(self.id), self.deadline);
+        child_stamp.poses_revision = None;
+        child_stamp.sequences_revision = None;
+        child_stamp.grasp_setup_revision = None;
+        child_stamp.gripper_calib_revision = None;
+        child_stamp.calibration_revision = None;
+        child_stamp.power_budget_revision = None;
+
+        let ticket = if self.is_executor() {
+            let m = snap.owner.macro_state;
+            let next_seq = (m.active_id == self.id && m.alive)
+                .then(|| m.child_seq.checked_add(1))
+                .flatten()
+                .ok_or(Stop::Cancelled)?;
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
                 },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
             };
-            let close_speed = inner.config.gripper_policy.as_ref()
-                .map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
-            let (speed, timeout_s) = if closes { (close_speed, None) } else { (1.0, Some(8.0)) };
-            let request = GripperRequest { command, fraction, grasp, speed, timeout_s, tag: None };
-            let remaining_s = self.deadline.duration_since(now).as_secs_f64();
-            let admitted = match inner.check_admission(self.next_child_stamp()) {
-                Ok(a) => a,
-                Err(e) => return Err(self.map_install_err(&mut inner, e.into())),
+            let slot = req::prepare_child_gripper_slot(
+                &snap.commanded_positions,
+                command,
+                fraction,
+                grasp,
+                speed,
+                timeout_s,
+                Some(remaining_s),
+                true,
+                child_spec,
+            )
+            .map_err(|c| fail(c, format!("failed to stage gripper child for {phase}: {c}")))?;
+            self.submit_child_slot_executor(&child_stamp, slot, false, None)
+                .await?;
+            child_spec.ticket
+        } else {
+            let mut inner = self.sup.inner().write().await;
+            let Some(next_seq) = inner
+                .macro_run
+                .as_ref()
+                .filter(|m| m.id == self.id && inner.macro_alive(self.id))
+                .and_then(|m| m.next_child_seq())
+            else {
+                return Err(Stop::Cancelled);
             };
-            let (duration, timeout_s, is_pos_force_close) = match SupervisorInner::start_macro_gripper_within(admitted, self.id, request, Some(remaining_s), true) {
-                Ok(v) => v,
+            let child_spec = ChildSpec {
+                ticket: ChildTicket {
+                    parent: ActionId(self.id),
+                    child_seq: next_seq,
+                },
+                timeout_s: self.phase_timeout_s,
+                timeout_code: self.timeout_code,
+                contact: None,
+            };
+            let owner_ctx = req::OwnerCheckCtx::for_legacy(&inner);
+            match req::install_macro_child(
+                &mut inner,
+                &child_stamp,
+                &owner_ctx,
+                false,
+                req::MacroChildPayload::LegacyGripper {
+                    spec: child_spec,
+                    start: snap.commanded_positions,
+                    request,
+                    learn: crate::motion::LearnMode::Opening,
+                    max_budget_s: Some(remaining_s),
+                    extend_pos_force_close_timeout: true,
+                },
+            ) {
+                Ok(v) => v.ticket,
                 Err(ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg)))
                     if msg.contains("remaining macro budget") =>
                 {
                     return Err(fail(self.timeout_code, format!("Phase {phase}: {msg}")));
                 }
                 Err(other) => return Err(self.map_install_err(&mut inner, other)),
-            };
-            if is_pos_force_close {
-                let s = if timeout_s.is_finite() { (timeout_s + 10.0).clamp(0.0, 1e6) } else { 1e6 };
-                let deadline = (now + Duration::from_secs_f64(s)).min(self.deadline);
-                inner.arm_macro_child(self.id, deadline, self.timeout_code, format!("Phase {phase} did not finish in time"))
-            } else {
-                self.arm_child(&mut inner, phase, duration + 10.0)
             }
         };
-        self.wait_child(ticket.ok_or(Stop::Cancelled)?).await
+        self.wait_child(ticket).await
+    }
+
+    /// Helper to submit a staged child `PlanSlot` to `OWNER_EXECUTOR` without leaking heap memory.
+    async fn submit_child_slot_executor(
+        &self,
+        stamp: &crate::rt_core::requests::actions::ActionStamp,
+        slot: crate::rt_core::ops::PlanSlot,
+        check_workspace_revision: bool,
+        calibration_revision: Option<u64>,
+    ) -> Result<ActionId, Stop> {
+        use crate::rt_core::broker::{AdmitError, ClientId, DeliveryDecision, Reply, Submit};
+        use crate::rt_core::requests::actions::ActionSubmit;
+        let Some(handle) = self.sup.executor_handle() else {
+            return Err(Stop::Cancelled);
+        };
+        let client = ClientId(stamp.admission.connection_id);
+        let auth = stamp.broker_authority();
+        let deadline = stamp.deadline;
+        let boot = stamp.boot;
+        let req_id = loop {
+            let res = {
+                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
+                broker.reclaim_plans();
+                let write = |dst: &mut crate::rt_core::ops::PlanSlot| {
+                    *dst = slot.clone();
+                };
+                broker.submit(
+                    client,
+                    0,
+                    auth,
+                    deadline,
+                    Submit::Action(ActionSubmit::InstallChild {
+                        write: &write,
+                        prepared_boot: boot,
+                        check_workspace_revision,
+                        calibration_revision,
+                        power_budget_revision: None,
+                    }),
+                )
+            };
+            match res {
+                Ok(id) => break id,
+                Err(AdmitError::Disconnected) => return Err(Stop::Cancelled),
+                Err(AdmitError::PlansFull | AdmitError::CommandsFull | AdmitError::RepliesFull) => {
+                    if !self.alive().await {
+                        return Err(Stop::Cancelled);
+                    }
+                    if Instant::now() > deadline {
+                        return Err(fail(self.timeout_code, self.timeout_message.clone()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        };
+        let wait_limit = deadline + Duration::from_secs(2);
+        loop {
+            let mut got: Option<Reply> = None;
+            {
+                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
+                broker.try_poll(|_, reply| {
+                    if reply.request() == req_id {
+                        got = Some(reply);
+                        DeliveryDecision::Delivered
+                    } else {
+                        DeliveryDecision::Backpressured
+                    }
+                });
+                broker.reclaim_plans();
+            }
+            if let Some(reply) = got {
+                return match reply {
+                    Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
+                    Reply::Refused { code, .. } => match code {
+                        "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
+                        | "PARENT_REPLACED" => Err(Stop::Cancelled),
+                        "DEADLINE_EXPIRED" => {
+                            Err(fail(self.timeout_code, self.timeout_message.clone()))
+                        }
+                        other => Err(fail(other, format!("RT child refused: {other}"))),
+                    },
+                    Reply::Terminal { .. } => Ok(ActionId(self.id)),
+                };
+            }
+            if !self.alive().await {
+                return Err(Stop::Cancelled);
+            }
+            if Instant::now() > wait_limit {
+                return Err(fail(self.timeout_code, self.timeout_message.clone()));
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     /// Run a gripper open / close sub-motion and wait for it. Opens at 1 rad/s within 8 s; a

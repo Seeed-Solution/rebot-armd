@@ -2991,9 +2991,15 @@ pub fn install_begin_macro(
         inner
             .check_terminal_fifo_for_new_action()
             .map_err(|e| ActionRefusal::new(static_code(e.into())))?;
-        inner
-            .action_preconditions()
-            .map_err(|e| ActionRefusal::new(static_code(e)))?;
+        if spec.check_start {
+            inner
+                .check_prepared_fresh(stamp.admission.estop_epoch)
+                .map_err(|e| ActionRefusal::new(static_code(e)))?;
+        } else {
+            inner
+                .action_preconditions()
+                .map_err(|e| ActionRefusal::new(static_code(e)))?;
+        }
         inner
             .gravity_comp_motion_busy()
             .map_err(|e| ActionRefusal::new(static_code(ArmError::Motion(e))))?;
@@ -3002,6 +3008,92 @@ pub fn install_begin_macro(
     let (this, proof) = admitted
         .consume()
         .map_err(|e| ActionRefusal::new(static_code(e.into())))?;
+    Ok(install_begin_macro_committed(
+        this,
+        &proof,
+        spec,
+        legacy_tag,
+        legacy_task,
+    ))
+}
+
+/// Legacy adapter entry point for callers that already hold an A1 [`Admitted<'_>`] token
+/// (e.g. `sequences::begin`, `grasp::begin`, `calib_hover::begin`, `measure_multiview::begin`).
+/// Enforces the same start freshness, deadline, revision, and precondition checks and commits
+/// through the single [`install_begin_macro_committed`] path.
+pub fn install_begin_macro_admitted(
+    admitted: Admitted<'_>,
+    spec: &BeginMacroSpec,
+    expected_workspace_revision: Option<u64>,
+    legacy_tag: Option<String>,
+    legacy_task: Option<String>,
+) -> Result<u64, ArmError> {
+    let (this, proof) = admitted.consume()?;
+    install_begin_macro_with_proof(
+        this,
+        &proof,
+        spec,
+        expected_workspace_revision,
+        legacy_tag,
+        legacy_task,
+    )
+}
+
+/// Same single owner-side `BeginMacro` commit path when the caller already consumed `Admitted`
+/// to inspect `SupervisorInner` (e.g. computing approach estimate or reading `boot_id`/`dof`).
+pub(crate) fn install_begin_macro_with_proof(
+    this: &mut SupervisorInner,
+    proof: &crate::supervisor::AdmittedProof,
+    spec: &BeginMacroSpec,
+    expected_workspace_revision: Option<u64>,
+    legacy_tag: Option<String>,
+    legacy_task: Option<String>,
+) -> Result<u64, ArmError> {
+    let now = Instant::now();
+    if let Some(ws_rev) = expected_workspace_revision.filter(|_| spec.check_workspace_revision) {
+        if this.workspace_revision != ws_rev {
+            return Err(ActionRefusal::new("PLAN_STALE").into_arm_error(this));
+        }
+    }
+    if let Some(cal_rev) = spec.calibration_revision {
+        if this.calibration_revision != cal_rev {
+            return Err(ActionRefusal::new("CALIBRATION_CHANGED").into_arm_error(this));
+        }
+    }
+    if spec.check_start {
+        let dof = usize::from(spec.dof);
+        if dof == 0 || dof > MAX_DOF {
+            return Err(MotionError::InvalidCommand("invalid start DOF".into()).into());
+        }
+        check_start_fresh(&this.commanded_positions, &spec.start[..dof])
+            .map_err(|r| r.into_arm_error(this))?;
+    }
+    if spec.macro_deadline.is_some_and(|d| now > d) {
+        return Err(ActionRefusal::new("DEADLINE_EXPIRED").into_arm_error(this));
+    }
+    this.check_terminal_fifo_for_new_action()?;
+    if spec.check_start {
+        this.check_prepared_fresh(proof.stamp().estop_epoch)?;
+    } else {
+        this.action_preconditions()?;
+    }
+    this.gravity_comp_motion_busy()?;
+    Ok(install_begin_macro_committed(
+        this,
+        proof,
+        spec,
+        legacy_tag,
+        legacy_task,
+    ))
+}
+
+fn install_begin_macro_committed(
+    this: &mut SupervisorInner,
+    proof: &crate::supervisor::AdmittedProof,
+    spec: &BeginMacroSpec,
+    legacy_tag: Option<String>,
+    legacy_task: Option<String>,
+) -> u64 {
     let id = if this.rt_executor_owned {
         this.begin_action_rt(spec.kind.action_kind_str())
     } else {
@@ -3010,7 +3102,7 @@ pub fn install_begin_macro(
         });
         this.begin_action(spec.kind.action_kind_str(), tag)
     };
-    let mut run = MacroRun::new(id, stamp.admission.estop_epoch, proof.stamp());
+    let mut run = MacroRun::new(id, proof.stamp().estop_epoch, proof.stamp());
     if let Some(d) = spec.macro_deadline {
         let tc = if spec.timeout_code.is_empty() {
             "TIMEOUT"
@@ -3032,7 +3124,7 @@ pub fn install_begin_macro(
             this.update_action(id, |a| a.task = Some(task));
         }
     }
-    Ok(id)
+    id
 }
 
 /// Payload for [`install_macro_child`] (A7).
@@ -3145,7 +3237,7 @@ pub fn install_macro_child(
                     return Err(e);
                 }
             };
-            let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, None)
+            let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, Some((dur * 2.0 + 5.0).min(spec.timeout_s)))
                 .ok_or_else(|| ActionRefusal::new("PARENT_REPLACED").into_arm_error(inner))?;
             Ok(InstalledMacroChild {
                 parent: ActionId(parent_id),
@@ -3178,7 +3270,7 @@ pub fn install_macro_child(
                     return Err(e);
                 }
             };
-            let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, None)
+            let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, Some((dur * 2.0 + 5.0).min(spec.timeout_s)))
                 .ok_or_else(|| ActionRefusal::new("PARENT_REPLACED").into_arm_error(inner))?;
             Ok(InstalledMacroChild {
                 parent: ActionId(parent_id),
@@ -3223,7 +3315,7 @@ pub fn install_macro_child(
             let explicit_timeout = if is_pf {
                 Some(timeout_s + 10.0)
             } else {
-                None
+                Some((dur + 10.0).min(spec.timeout_s))
             };
             let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, explicit_timeout)
                 .ok_or_else(|| ActionRefusal::new("PARENT_REPLACED").into_arm_error(inner))?;
@@ -3261,7 +3353,7 @@ pub fn install_macro_child(
                     return Err(e);
                 }
             };
-            let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, None)
+            let ticket = arm_child_deadline_clamped(inner, parent_id, &spec, ctx.now, Some((dur * 2.0 + 5.0).min(spec.timeout_s)))
                 .ok_or_else(|| ActionRefusal::new("PARENT_REPLACED").into_arm_error(inner))?;
             Ok(InstalledMacroChild {
                 parent: ActionId(parent_id),
