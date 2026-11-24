@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use armd::api::{create_router_full, proxy::DetectorUpstream};
 use armd::diagnostics::alloc::{AllocCounts, TimedAlloc};
 use armd::diagnostics::tick::{
-    classify_wake_lateness_ns, take_current_wake_lateness_ns, TickSample, TickStats,
-    WakeLatenessGuard,
+    classify_release_duration_ns, classify_wake_lateness_ns, take_current_wake_lateness_ns,
+    TickSample, TickStats, WakeLatenessGuard, TICK_WINDOW,
 };
 use armd::diagnostics::DiagnosticsState;
 use armd::rt_core::executor::{
@@ -67,6 +67,13 @@ impl LatenessClock {
             }),
             cv: Condvar::new(),
         })
+    }
+
+    /// Advances the scripted clock monotonically by `delta_ns` (simulating in-release work).
+    fn advance_ns(&self, delta_ns: u64) {
+        let mut s = self.state.lock().unwrap();
+        s.now_ns = s.now_ns.saturating_add(delta_ns);
+        self.cv.notify_all();
     }
 
     /// Runs `latenesses_ns.len()` releases in lockstep, waking each release at
@@ -140,13 +147,20 @@ impl ExecutorClock for LatenessClock {
 }
 
 async fn serve(supervisor: Arc<ArmSupervisor>) -> std::net::SocketAddr {
+    serve_with_auth(supervisor, armd::OperatorAuth::disabled()).await
+}
+
+async fn serve_with_auth(
+    supervisor: Arc<ArmSupervisor>,
+    auth: armd::OperatorAuth,
+) -> std::net::SocketAddr {
     let grasp = armd::grasp::GraspDeps::http(DetectorUpstream::from_env(), None);
     let router = create_router_full(
         supervisor,
         DetectorUpstream::from_env(),
         grasp,
         DiagnosticsState::default(),
-        armd::OperatorAuth::disabled(),
+        auth,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -698,4 +712,812 @@ fn analyze_py_uses_q1_fields_handles_diag_dropped_and_keeps_legacy_compat() {
     let cd_line = recur_rep.lines().find(|l| l.starts_with("| `cooldown` |")).expect("cooldown row");
     assert!(fl_line.contains("| 0 / 0 |"), "full_load must show 0 skips, got: {fl_line}");
     assert!(cd_line.contains("| 2 / 0 |"), "cooldown must show 2 skips, got: {cd_line}");
+}
+
+// ============================================================================
+// 5. Full `release_us` (25 ms post-publish), >1000-tick rollover, & baseline mark (both owners)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_publish_25ms_delay_rollover_and_baseline_mark_both_owners() {
+    // Exact boundary classification: 19_999_999 ns is < 20 ms; 20_000_000 ns is >= 20 ms.
+    assert_eq!(classify_release_duration_ns(9_999_999), (9_999, false, false, false));
+    assert_eq!(classify_release_duration_ns(10_000_000), (10_000, true, false, false));
+    assert_eq!(classify_release_duration_ns(14_999_999), (14_999, true, false, false));
+    assert_eq!(classify_release_duration_ns(15_000_000), (15_000, true, true, false));
+    assert_eq!(classify_release_duration_ns(19_999_999), (19_999, true, true, false));
+    assert_eq!(classify_release_duration_ns(20_000_000), (20_000, true, true, true));
+    assert_eq!(classify_release_duration_ns(u64::MAX), (u32::MAX, true, true, true));
+
+    // ---- (A) Legacy owner: 25 ms post-publish work + >1000-tick rollover + baseline mark ----
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let post_delay_ns = Arc::new(std::sync::atomic::AtomicU64::new(25_000_000));
+
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let delay_t = post_delay_ns.clone();
+        let jh = thread::Builder::new()
+            .name("armd-control".into())
+            .spawn(move || {
+                run_periodic_with_clock(
+                    Duration::from_millis(20),
+                    &stop_t,
+                    &stats_t,
+                    Some(clock_t.as_ref()),
+                    |dt| {
+                        rt.block_on(sup_t.control_tick(dt));
+                        // Simulate work AFTER tick_shared/StateHub publication and tick_us end mark.
+                        let d = delay_t.swap(0, Ordering::AcqRel);
+                        if d > 0 {
+                            clock_t.advance_ns(d);
+                        }
+                    },
+                );
+            })
+            .unwrap();
+
+        clock.run_schedule(&[0]);
+        let addr = serve(sup.clone()).await;
+        let client = reqwest::Client::new();
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["owner_mode"], "legacy");
+        assert!(body["instance_id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(body["tick_us"]["max"].as_u64().unwrap() < 20_000, "tick_us missed post-publish delay: {body}");
+        assert!(body["release_us"]["max"].as_u64().unwrap() >= 25_000, "release_us must include 25ms post-publish work: {body}");
+        assert!(body["release_us_max_ever"].as_u64().unwrap() >= 25_000, "{body}");
+        assert_eq!(body["releases_over_20ms"], 1);
+        assert_eq!(body["releases_over_15ms"], 1);
+        assert_eq!(body["releases_over_10ms"], 1);
+        assert_eq!(body["releases_total"], 1);
+
+        // Roll over TICK_WINDOW + 50 clean releases: window max ages out, monotonic peaks persist!
+        let clean = vec![0u64; TICK_WINDOW + 50];
+        clock.run_schedule(&clean);
+        let rolled: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rolled["window"], TICK_WINDOW);
+        assert!(
+            rolled["release_us"]["max"].as_u64().unwrap() < 20_000,
+            "windowed release_us.max should have aged out past 1000 ticks: {}",
+            rolled["release_us"]
+        );
+        assert!(rolled["release_us_max_ever"].as_u64().unwrap() >= 25_000);
+        assert_eq!(rolled["releases_over_20ms"], 1);
+        assert_eq!(rolled["releases_total"], (TICK_WINDOW + 51) as u64);
+
+        // Operator baseline marker: pending -> active after next release; superseded POSTs collapse cleanly.
+        let m1: serde_json::Value = client
+            .post(format!("http://{addr}/api/v1/diagnostics/tick/mark"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(m1["marker_id"], 1);
+        assert_eq!(m1["status"], "pending");
+        let pending_get: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pending_get["since_marker"]["marker_id"], 1);
+        assert_eq!(pending_get["since_marker"]["status"], "pending");
+
+        // Overlapping mark request #2 supersedes #1 before the next release acknowledges.
+        let m2: serde_json::Value = client
+            .post(format!("http://{addr}/api/v1/diagnostics/tick/mark"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(m2["marker_id"], 2);
+
+        // 1 release acknowledges marker #2 at its completion (not charged to marker #2),
+        // then 2 post-marker releases run (one with 12 ms duration + 3 ms wake lateness).
+        clock.run_schedule(&[0]);
+        post_delay_ns.store(12_000_000, Ordering::Release);
+        clock.run_schedule(&[3_000_000, 0]);
+        let marked: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(marked["since_marker"]["marker_id"], 2);
+        assert_eq!(marked["since_marker"]["status"], "active");
+        assert_eq!(marked["since_marker"]["releases_total_delta"], 2);
+        assert_eq!(marked["since_marker"]["releases_over_10ms_delta"], 1);
+        assert_eq!(marked["since_marker"]["releases_over_20ms_delta"], 0);
+        assert_eq!(marked["since_marker"]["release_us_max"], 12_000);
+        assert_eq!(marked["since_marker"]["wake_late_max"], 3_000);
+        // Process-lifetime peaks never reset!
+        assert!(marked["release_us_max_ever"].as_u64().unwrap() >= 25_000);
+        assert_eq!(marked["releases_over_20ms"], 1);
+
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+
+        // Stopped legacy loop -> POST /mark must return 503.
+        let stopped_resp = client
+            .post(format!("http://{addr}/api/v1/diagnostics/tick/mark"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stopped_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ---- (B) Legacy owner on production wall clock: real 25 ms post-publish sleep ----
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let slept = Arc::new(AtomicBool::new(false));
+
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let slept_t = slept.clone();
+        let jh = thread::Builder::new()
+            .name("armd-control".into())
+            .spawn(move || {
+                armd::rt_core::executor::run_periodic(
+                    Duration::from_millis(5),
+                    &stop_t,
+                    &stats_t,
+                    |dt| {
+                        rt.block_on(sup_t.control_tick(dt));
+                        if !slept_t.swap(true, Ordering::AcqRel) {
+                            thread::sleep(Duration::from_millis(25));
+                        } else {
+                            stop_t.store(true, Ordering::Release);
+                        }
+                    },
+                );
+            })
+            .unwrap();
+        jh.join().unwrap();
+        let snap = sup.tick_stats();
+        assert!(snap.release_us.max >= 25_000, "real clock release_us.max={}", snap.release_us.max);
+        assert!(snap.release_us_max_ever >= 25_000);
+        assert_eq!(snap.releases_over_20ms, 1);
+    }
+
+    // ---- (C) Executor owner: 25 ms post-publish work + >1000-tick rollover + mark + 0 alloc ----
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let clock = LatenessClock::new();
+        let post_delay = Arc::new(Mutex::new(Some(Duration::from_millis(25))));
+
+        let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(20));
+        cfg.alloc_timing = true;
+        let handle = sup
+            .start_executor_with_hooks(
+                cfg,
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    post_publish_delay_once: Some(post_delay.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        clock.run_schedule(&[0]);
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
+        let addr = serve(sup.clone()).await;
+        let client = reqwest::Client::new();
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["owner_mode"], "executor");
+        assert!(body["tick_us"]["max"].as_u64().unwrap() < 20_000, "tick_us should exclude post-publish delay: {body}");
+        assert!(body["release_us"]["max"].as_u64().unwrap() >= 25_000, "release_us must include 25ms post-publish delay: {body}");
+        assert!(body["release_us_max_ever"].as_u64().unwrap() >= 25_000);
+        assert_eq!(body["releases_over_20ms"], 1);
+        assert_eq!(body["releases_over_15ms"], 1);
+        assert_eq!(body["releases_over_10ms"], 1);
+        assert_eq!(body["releases_total"], 1);
+
+        // Roll over >1000 clean releases in chunks smaller than DIAG_RING_CAPACITY so diag_dropped stays 0.
+        let chunk = vec![0u64; 100];
+        for _ in 0..11 {
+            clock.run_schedule(&chunk);
+            let _ = sup.tick_stats();
+        }
+        let rolled: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(rolled["window"], TICK_WINDOW);
+        assert_eq!(rolled["diag_dropped"], 0);
+        assert!(
+            rolled["release_us"]["max"].as_u64().unwrap() < 20_000,
+            "windowed release_us.max must have aged out after 1100 ticks: {}",
+            rolled["release_us"]
+        );
+        assert!(rolled["release_us_max_ever"].as_u64().unwrap() >= 25_000);
+        assert_eq!(rolled["releases_over_20ms"], 1);
+        assert_eq!(rolled["releases_total"], 1101);
+
+        // Baseline mark in executor mode + 0 heap ops on armd-control.
+        let mark_resp: serde_json::Value = client
+            .post(format!("http://{addr}/api/v1/diagnostics/tick/mark"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(mark_resp["marker_id"], 1);
+        assert_eq!(mark_resp["status"], "pending");
+        clock.run_schedule(&[0]); // acknowledges marker #1 at end of release
+        *post_delay.lock().unwrap() = Some(Duration::from_millis(16));
+        clock.run_schedule(&[2_000_000, 0]);
+        let marked: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/diagnostics/tick"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(marked["since_marker"]["marker_id"], 1);
+        assert_eq!(marked["since_marker"]["status"], "active");
+        assert_eq!(marked["since_marker"]["releases_total_delta"], 2);
+        assert_eq!(marked["since_marker"]["releases_over_15ms_delta"], 1);
+        assert_eq!(marked["since_marker"]["releases_over_20ms_delta"], 0);
+        assert_eq!(marked["since_marker"]["release_us_max"], 16_000);
+        assert_eq!(marked["since_marker"]["wake_late_max"], 2_000);
+        assert_eq!(
+            handle.stats().total_allocs(),
+            AllocCounts::ZERO,
+            "monotonic counters + baseline marker must perform 0 heap ops on armd-control"
+        );
+
+        handle.stop_and_join();
+        let stopped_resp = client
+            .post(format!("http://{addr}/api/v1/diagnostics/tick/mark"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stopped_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+// ============================================================================
+// 6. Operator auth & same-origin enforcement on POST /api/v1/diagnostics/tick/mark (both owners)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mark_endpoint_enforces_operator_auth_and_same_origin_both_owners() {
+    let client = reqwest::Client::new();
+
+    // (a) Legacy owner with OperatorAuth enforced
+    {
+        let auth = armd::OperatorAuth::enforced("1234", 3600);
+        let (token, _) = auth.unlock("1234").unwrap();
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+            });
+        });
+        clock.run_schedule(&[0]);
+        let addr = serve_with_auth(sup.clone(), auth).await;
+        let url = format!("http://{addr}/api/v1/diagnostics/tick/mark");
+
+        // Missing token -> 401/403
+        let r_unauth = client.post(&url).send().await.unwrap();
+        assert!(
+            matches!(r_unauth.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN),
+            "expected 401/403 without token, got {}",
+            r_unauth.status()
+        );
+        // Cross-origin -> 403 even with valid token
+        let r_xorigin = client
+            .post(&url)
+            .header("Origin", "http://evil.example")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_xorigin.status(), reqwest::StatusCode::FORBIDDEN);
+        // Valid same-origin operator token -> 200
+        let r_ok = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_ok.status(), reqwest::StatusCode::OK);
+
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+    }
+
+    // (b) Executor owner with OperatorAuth enforced
+    {
+        let auth = armd::OperatorAuth::enforced("1234", 3600);
+        let (token, _) = auth.unlock("1234").unwrap();
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        clock.run_schedule(&[0]);
+        let addr = serve_with_auth(sup.clone(), auth).await;
+        let url = format!("http://{addr}/api/v1/diagnostics/tick/mark");
+
+        let r_unauth = client.post(&url).send().await.unwrap();
+        assert!(
+            matches!(r_unauth.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN),
+            "expected 401/403 in executor mode without token, got {}",
+            r_unauth.status()
+        );
+        let r_xorigin = client
+            .post(&url)
+            .header("Origin", "http://evil.example")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_xorigin.status(), reqwest::StatusCode::FORBIDDEN);
+        let r_ok = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_ok.status(), reqwest::StatusCode::OK);
+        handle.stop_and_join();
+    }
+}
+
+// ============================================================================
+// 7. Shutdown final-overrun skips, clean shutdown, panic accounting, & bounded odd stats_seq
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_overrun_skips_clean_exit_and_panic_accounting_both_owners() {
+    // (a) Legacy: 25 ms overrun on final release (20 ms period) -> 1 skip accounted at loop exit!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+                clock_t.advance_ns(25_000_000);
+            });
+        });
+        clock.run_schedule(&[0]);
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+        assert_eq!(loop_stats.skipped_releases.load(Ordering::Acquire), 1);
+        assert_eq!(loop_stats.releases_over_20ms.load(Ordering::Acquire), 1);
+        assert_eq!(loop_stats.releases_total.load(Ordering::Acquire), 1);
+    }
+
+    // (b) Legacy: clean release followed by late stop wake past next_ns -> 0 false-positive skips!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        sup.attach_legacy_loop_stats(loop_stats.clone());
+        let rt = tokio::runtime::Handle::current();
+        let sup_t = sup.clone();
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |dt| {
+                rt.block_on(sup_t.control_tick(dt));
+            });
+        });
+        clock.run_schedule(&[0]);
+        // Advance clock 30 ms while parked in sleep_until, then stop: release did NOT overrun!
+        clock.advance_ns(30_000_000);
+        stop.store(true, Ordering::Release);
+        clock.wake();
+        jh.join().unwrap();
+        assert_eq!(loop_stats.skipped_releases.load(Ordering::Acquire), 0);
+        assert_eq!(loop_stats.releases_total.load(Ordering::Acquire), 1);
+    }
+
+    // (c) Legacy: first-release panic after 25 ms overrun accounts both release duration and exit skip!
+    {
+        let clock = LatenessClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stats = Arc::new(ExecutorStats::default());
+        let clock_t = clock.clone();
+        let stop_t = stop.clone();
+        let stats_t = loop_stats.clone();
+        let jh = thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_periodic_with_clock(Duration::from_millis(20), &stop_t, &stats_t, Some(clock_t.as_ref()), |_| {
+                    clock_t.advance_ns(25_000_000);
+                    panic!("simulated legacy release panic");
+                });
+            }));
+        });
+        // Unblock 1 release; thread exits via panic unwind rather than parking again.
+        {
+            let mut s = clock.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.cv.notify_all();
+        }
+        jh.join().unwrap();
+        assert_eq!(loop_stats.skipped_releases.load(Ordering::Acquire), 1);
+        assert_eq!(loop_stats.releases_over_20ms.load(Ordering::Acquire), 1);
+        assert_eq!(loop_stats.releases_total.load(Ordering::Acquire), 1);
+        assert!(!loop_stats.is_loop_active());
+    }
+
+    // (d) Executor: 25 ms final overrun -> 1 skip on shutdown; clean exit -> 0 skips; odd stats_seq terminates!
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    post_publish_delay_once: Some(Arc::new(Mutex::new(Some(Duration::from_millis(25))))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        clock.run_schedule(&[0]);
+        handle.stop_and_join();
+        assert_eq!(handle.stats().skipped_releases.load(Ordering::Acquire), 1);
+        assert_eq!(handle.stats().releases_over_20ms.load(Ordering::Acquire), 1);
+        assert_eq!(handle.stats().releases_total.load(Ordering::Acquire), 1);
+
+        // Bounded termination when monotonic stats_seq is held odd.
+        handle.stats().set_odd_stats_seq_for_test(true);
+        let snap = sup.tick_stats();
+        handle.stats().set_odd_stats_seq_for_test(false);
+        assert!(snap.stats_snapshot_lapped);
+    }
+
+    // (e) Executor: first-release panic with 25 ms overrun accounts skips & duration before StopExecutor exit.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let clock = LatenessClock::new();
+        let handle = sup
+            .start_executor_with_hooks(
+                ExecutorConfig::for_tests(Duration::from_millis(20)),
+                PersistTestHooks {
+                    clock: Some(clock.clone()),
+                    panic_on_release: Some(1),
+                    post_publish_delay_once: Some(Arc::new(Mutex::new(Some(Duration::from_millis(25))))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let mut s = clock.state.lock().unwrap();
+            s.lateness_queue_ns.push_back(0);
+            s.remaining_releases = 1;
+            clock.cv.notify_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_exited() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(handle.is_exited());
+        assert_eq!(handle.stats().skipped_releases.load(Ordering::Acquire), 1);
+        assert_eq!(handle.stats().releases_over_20ms.load(Ordering::Acquire), 1);
+        assert_eq!(handle.stats().releases_total.load(Ordering::Acquire), 1);
+        handle.stop_and_join();
+    }
+}
+
+// ============================================================================
+// 8. Legacy lock-free `tick_stats` under concurrent HTTP reader flood (zero control blocking)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_lock_free_stats_under_concurrent_http_readers_never_blocks_control_thread() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    sup.set_lease_enabled(false).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let loop_stats = Arc::new(ExecutorStats::default());
+    sup.attach_legacy_loop_stats(loop_stats.clone());
+
+    let rt = tokio::runtime::Handle::current();
+    let sup_t = sup.clone();
+    let stop_t = stop.clone();
+    let stats_t = loop_stats.clone();
+    let control_jh = thread::Builder::new()
+        .name("armd-control".into())
+        .spawn(move || {
+            armd::rt_core::executor::run_periodic(
+                Duration::from_millis(1),
+                &stop_t,
+                &stats_t,
+                |dt| {
+                    rt.block_on(sup_t.control_tick(dt));
+                },
+            );
+        })
+        .unwrap();
+
+    let addr = serve(sup.clone()).await;
+    let url = format!("http://{addr}/api/v1/diagnostics/tick");
+    let readers_stop = Arc::new(AtomicBool::new(false));
+    let reads_ok = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut reader_handles = Vec::new();
+    for _ in 0..4 {
+        let url_r = url.clone();
+        let stop_r = readers_stop.clone();
+        let ok_r = reads_ok.clone();
+        reader_handles.push(tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            while !stop_r.load(Ordering::Acquire) {
+                let body: serde_json::Value = client
+                    .get(&url_r)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(body["owner_mode"], "legacy");
+                assert_eq!(body["stats_wait_us"]["max"], 0);
+                ok_r.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // Let control loop execute >= 150 releases while 4 HTTP readers continuously hammer /diagnostics/tick.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (loop_stats.releases_total.load(Ordering::Acquire) < 150
+        || reads_ok.load(Ordering::Relaxed) < 40)
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    readers_stop.store(true, Ordering::Release);
+    for h in reader_handles {
+        h.await.unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    control_jh.join().unwrap();
+
+    let snap = sup.tick_stats();
+    assert!(snap.releases_total >= 150, "releases_total={}", snap.releases_total);
+    assert!(reads_ok.load(Ordering::Relaxed) >= 40);
+    assert_eq!(snap.stats_wait_us.max, 0, "control thread must never wait for tick_stats");
+    assert_eq!(snap.stats_writer_drops, 0, "single legacy control thread must have 0 writer drops");
+    assert!(!snap.stats_snapshot_lapped);
+}
+
+// ============================================================================
+// 9. `analyze.py`: INVALID rules (counter reset, failed poll, missing field, gap, restart) & rollover FAIL
+// ============================================================================
+
+#[test]
+fn analyze_py_invalid_rules_rollover_breach_and_clean_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let devstat_path = dir.path().join("devstat.txt");
+    std::fs::write(
+        &devstat_path,
+        "=== META ===\nrun_id=q1-fix\n=== ONCE_START ===\n--- armd_version ---\nARMD_ALLOC_TIMING=1\n=== ONCE_END ===\n",
+    )
+    .unwrap();
+
+    let make_clean = |ticks: u64, elapsed_s: f64| -> serde_json::Value {
+        let mut t = base_tick_json(20_100, 1_200);
+        t["instance_id"] = serde_json::json!("armd-inst-1");
+        t["owner_mode"] = serde_json::json!("executor");
+        t["since_boot_ticks"] = serde_json::json!(ticks);
+        t["release_us"] = serde_json::json!({ "p50": 550, "p99": 950, "max": 1_400 });
+        t["releases_total"] = serde_json::json!(ticks);
+        t["release_us_max_ever"] = serde_json::json!(1_400);
+        t["releases_over_10ms"] = serde_json::json!(0);
+        t["releases_over_15ms"] = serde_json::json!(0);
+        t["releases_over_20ms"] = serde_json::json!(0);
+        t["wake_late_max_ever"] = serde_json::json!(400);
+        t["skipped_releases"] = serde_json::json!(0);
+        t["diag_dropped"] = serde_json::json!(0);
+        t["wake_lateness_us"] = serde_json::json!({ "p50": 100, "p99": 300, "max": 400 });
+        t["wake_lateness_over_1ms"] = serde_json::json!(0);
+        t["wake_lateness_over_5ms"] = serde_json::json!(0);
+        t["wake_lateness_over_10ms"] = serde_json::json!(0);
+        t["control_thread_lock_attempts"] = serde_json::json!(0);
+        t["enqueue_to_wire_us"] = serde_json::json!({ "p50": 80, "p99": 150, "max": 200 });
+        serde_json::json!({ "type": "sample", "phase": "full_load", "elapsed_s": elapsed_s, "tick": t })
+    };
+
+    let write_and_run = |name: &str, lines: &[serde_json::Value]| -> String {
+        let p = dir.path().join(name);
+        let mut buf = format!("{}\n", serde_json::json!({ "type": "meta", "run_id": name }));
+        for l in lines {
+            buf.push_str(&format!("{l}\n"));
+        }
+        std::fs::write(&p, buf).unwrap();
+        run_analyze(&p, Some(&devstat_path))
+    };
+
+    // 1. Clean full-coverage run -> PASS
+    let clean_rep = write_and_run("clean.jsonl", &[make_clean(100, 0.0), make_clean(300, 4.0)]);
+    assert!(clean_rep.contains("**Overall Verdict: PASS**"), "{clean_rep}");
+
+    // 2. Counter reset (releases_total decreased 300 -> 50) -> INVALID
+    let reset_rep = write_and_run("reset.jsonl", &[make_clean(300, 0.0), make_clean(50, 4.0)]);
+    assert!(reset_rep.contains("**Overall Verdict: INVALID"), "{reset_rep}");
+    assert!(reset_rep.contains("counter decreased mid-run (restart/reset): releases_total"), "{reset_rep}");
+
+    // 3. Same/higher counters across a daemon restart (instance_id changed) -> INVALID
+    let mut restart_s1 = make_clean(250, 4.0);
+    restart_s1["tick"]["instance_id"] = serde_json::json!("armd-inst-2");
+    let restart_rep = write_and_run("restart_id.jsonl", &[make_clean(100, 0.0), restart_s1]);
+    assert!(restart_rep.contains("**Overall Verdict: INVALID"), "{restart_rep}");
+    assert!(restart_rep.contains("instance_id changed"), "{restart_rep}");
+
+    // 4. Failed poll (tick: null + tick_error) -> INVALID
+    let failed_poll_line = serde_json::json!({
+        "type": "sample", "phase": "full_load", "elapsed_s": 2.0,
+        "tick": null, "tick_error": "URLError: timed out"
+    });
+    let poll_fail_rep = write_and_run(
+        "failed_poll.jsonl",
+        &[make_clean(100, 0.0), failed_poll_line.clone(), make_clean(300, 4.0)],
+    );
+    assert!(poll_fail_rep.contains("**Overall Verdict: INVALID"), "{poll_fail_rep}");
+    assert!(poll_fail_rep.contains("failed poll(s): 1"), "{poll_fail_rep}");
+
+    // 5. All-failed JSONL (0 valid samples) -> INVALID (must not crash!)
+    let all_fail_rep = write_and_run("all_failed.jsonl", &[failed_poll_line]);
+    assert!(all_fail_rep.contains("**Overall Verdict: INVALID (all 1 poll(s) failed"), "{all_fail_rep}");
+
+    // 6. Single-sample run -> INVALID (cannot compute delta)
+    let one_rep = write_and_run("single.jsonl", &[make_clean(100, 0.0)]);
+    assert!(one_rep.contains("**Overall Verdict: INVALID"), "{one_rep}");
+    assert!(one_rep.contains("fewer than 2 tick samples"), "{one_rep}");
+
+    // 7. Zero releases completed (releases_total: 100 -> 100) -> INVALID
+    let zero_rep = write_and_run("zero_rel.jsonl", &[make_clean(100, 0.0), make_clean(100, 4.0)]);
+    assert!(zero_rep.contains("**Overall Verdict: INVALID"), "{zero_rep}");
+    assert!(zero_rep.contains("zero releases completed"), "{zero_rep}");
+
+    // 8. Missing or malformed required fields (release_us: {}, missing wait_us) -> INVALID (never 0!)
+    let mut bad_rel = make_clean(300, 4.0);
+    bad_rel["tick"]["release_us"] = serde_json::json!({});
+    let bad_rel_rep = write_and_run("malformed_rel.jsonl", &[make_clean(100, 0.0), bad_rel]);
+    assert!(bad_rel_rep.contains("**Overall Verdict: INVALID"), "{bad_rel_rep}");
+    assert!(bad_rel_rep.contains("release_us (1/2)"), "{bad_rel_rep}");
+
+    let mut no_wait = make_clean(300, 4.0);
+    no_wait["tick"].as_object_mut().unwrap().remove("wait_us");
+    let no_wait_rep = write_and_run("missing_wait.jsonl", &[make_clean(100, 0.0), no_wait]);
+    assert!(no_wait_rep.contains("**Overall Verdict: INVALID"), "{no_wait_rep}");
+    assert!(no_wait_rep.contains("wait_us.max (1/2)"), "{no_wait_rep}");
+
+    // 9. Sample gap > 1000 ticks with missing monotonic counters -> INVALID mentioning sample gap!
+    let mut gap0 = make_clean(100, 0.0);
+    let mut gap1 = make_clean(2500, 48.0);
+    for key in [
+        "releases_total",
+        "release_us_max_ever",
+        "releases_over_10ms",
+        "releases_over_15ms",
+        "releases_over_20ms",
+        "wake_late_max_ever",
+    ] {
+        gap0["tick"].as_object_mut().unwrap().remove(key);
+        gap1["tick"].as_object_mut().unwrap().remove(key);
+    }
+    let gap_rep = write_and_run("window_gap.jsonl", &[gap0, gap1]);
+    assert!(gap_rep.contains("**Overall Verdict: INVALID"), "{gap_rep}");
+    assert!(gap_rep.contains("sample gap (2400 ticks > window 1000) with missing monotonic counters"), "{gap_rep}");
+
+    // 10. Owner mode changed mid-run -> INVALID
+    let mut sw1 = make_clean(300, 4.0);
+    sw1["tick"]["owner_mode"] = serde_json::json!("legacy");
+    let sw_rep = write_and_run("owner_switch.jsonl", &[make_clean(100, 0.0), sw1]);
+    assert!(sw_rep.contains("**Overall Verdict: INVALID"), "{sw_rep}");
+    assert!(sw_rep.contains("owner_mode changed mid-run"), "{sw_rep}");
+
+    // 11. Lock-free lapped snapshot -> INVALID
+    let mut lap1 = make_clean(300, 4.0);
+    lap1["tick"]["stats_snapshot_lapped"] = serde_json::json!(true);
+    let lap_rep = write_and_run("lapped.jsonl", &[make_clean(100, 0.0), lap1]);
+    assert!(lap_rep.contains("**Overall Verdict: INVALID"), "{lap_rep}");
+    assert!(lap_rep.contains("stats_snapshot_lapped=true"), "{lap_rep}");
+
+    // 12. Pre-run boot spike in samples[0] (releases_over_20ms: 1 -> 1) does NOT falsely FAIL clean run!
+    let mut pre0 = make_clean(100, 0.0);
+    pre0["tick"]["release_us"]["max"] = serde_json::json!(25_000);
+    pre0["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
+    pre0["tick"]["releases_over_20ms"] = serde_json::json!(1);
+    let mut pre1 = make_clean(300, 4.0);
+    pre1["tick"]["release_us"]["max"] = serde_json::json!(25_000);
+    pre1["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
+    pre1["tick"]["releases_over_20ms"] = serde_json::json!(1);
+    let pre_rep = write_and_run("prerun_spike.jsonl", &[pre0, pre1]);
+    assert!(pre_rep.contains("**Overall Verdict: PASS**"), "{pre_rep}");
+
+    // 13. In-run 25 ms spike that aged out past 1000-tick window (releases_over_20ms: 0 -> 1) -> FAIL!
+    let mut roll1 = make_clean(1600, 30.0);
+    roll1["tick"]["release_us"]["max"] = serde_json::json!(1_500);
+    roll1["tick"]["release_us_max_ever"] = serde_json::json!(25_000);
+    roll1["tick"]["releases_over_20ms"] = serde_json::json!(1);
+    let roll_rep = write_and_run("rollover_breach.jsonl", &[make_clean(100, 0.0), roll1]);
+    assert!(roll_rep.contains("**Overall Verdict: FAIL**"), "{roll_rep}");
 }
