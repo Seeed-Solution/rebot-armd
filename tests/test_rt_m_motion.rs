@@ -450,6 +450,37 @@ async fn validation_precedence_commissioning_motion_config_revision_and_zero_mut
         req::install_park(&mut inner, stamp, &park_plan.slot, None, Some(ep), false).unwrap_err(),
         MotionInstallError::UnsupportedUnload
     );
+
+    // 2e. Review regressions:
+    //   - Blocker #1: refresh_for_drift_retry refuses stale config after workspace/motion revision bump.
+    let stale_cfg = snap.config.clone();
+    assert!(MotionPlanSnapshot::refresh_for_drift_retry(&inner, stale_cfg).is_none());
+    //   - Major #1: torque-hold clamped jog fails PlanStale if hold clears before install;
+    //     preserves clamp attribution (`motion_limit`) when hold stays active.
+    let q0 = inner.commanded_positions[0];
+    inner.torque_guard.hold = Some(armd::torque_guard::TorqueHold {
+        joint: 0, sign: 1.0, hold_q: q0 + 0.05, anchor_q: q0 + 0.06,
+        torque_nm: 10.0, threshold_nm: 8.0, since_s: 0.0, push_in: false, retreat: armd::torque_guard::Retreat::Unused,
+    });
+    let hold_snap = MotionPlanSnapshot::from_supervisor(&inner);
+    let mut clamped_t = inner.commanded_positions.clone();
+    clamped_t[0] = q0 + 0.20;
+    let clamped_plan = req::prepare_motion(&hold_snap, &MotionRequest::jog(clamped_t, Some(0.5), None)).unwrap();
+    assert!((clamped_plan.slot.target[0] - (q0 + 0.05)).abs() < 1e-5);
+    assert!((clamped_plan.slot.requested_target[0] - (q0 + 0.20)).abs() < 1e-5);
+    inner.torque_guard.hold = None;
+    let stamp = inner.current_admission_stamp();
+    let ep = inner.safety.epoch_id();
+    assert_eq!(req::install_jog(&mut inner, stamp, &clamped_plan.slot, None, Some(ep), false).unwrap_err(), MotionInstallError::PlanStale);
+    //   - Major #3: live calibration_busy blocks commit even after Lock #1 preflight passed.
+    let clean_snap = MotionPlanSnapshot::from_supervisor(&inner);
+    let mut t2 = inner.commanded_positions.clone();
+    t2[0] += 0.05;
+    let plan2 = req::prepare_motion(&clean_snap, &MotionRequest::jog(t2, Some(0.5), None)).unwrap();
+    inner.calibration_busy = true;
+    let stamp = inner.current_admission_stamp();
+    assert_eq!(req::install_jog(&mut inner, stamp, &plan2.slot, None, Some(ep), false).unwrap_err(), MotionInstallError::MotionBusy);
+    inner.calibration_busy = false;
 }
 
 // ============================================================================
@@ -575,7 +606,7 @@ async fn park_disable_confirm_failure_stop_boundary_and_estop_inhibit() {
         let clock = ScriptedClock::new();
         let (drv, knobs) = MotionTestDriver::new(vec![0.0, 0.0], Duration::from_millis(2), Duration::from_millis(25), Some(clock.clone()));
         let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
-        let handle = start_scripted_executor(&sup, period, clock.clone(), false).await;
+        let handle = start_scripted_executor(&sup, period, clock.clone(), true).await;
         clock.run_steps(period_ns, 2);
         let auth = submit_enable_and_wait(&sup, &handle, &clock, period_ns, 1);
         let snap = MotionPlanSnapshot::from_published(&sup.hub().latest().unwrap(), sup.hub().motion_config().unwrap()).unwrap();
@@ -747,7 +778,7 @@ async fn holding_after_clear_bounded_rearm_and_continue_park() {
         let clock = ScriptedClock::new();
         let (drv, knobs) = MotionTestDriver::new(vec![0.4, 0.2], Duration::from_millis(20), Duration::from_millis(4), Some(clock.clone()));
         let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
-        let handle = start_scripted_executor(&sup, period, clock.clone(), false).await;
+        let handle = start_scripted_executor(&sup, period, clock.clone(), true).await;
         clock.run_steps(period_ns, 2);
         let _ = submit_enable_and_wait(&sup, &handle, &clock, period_ns, 1);
         let maint_done = Arc::new(AtomicBool::new(false));
@@ -787,7 +818,68 @@ async fn holding_after_clear_bounded_rearm_and_continue_park() {
             assert!(rs.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Failed(_), .. } if *request == r_park)), "{rs:?}");
             let s = sup.hub().latest().unwrap();
             assert!(s.obs.is_torqued);
+            // Blocker #4: failed ParkRearm on RT performs strictly zero heap allocs/frees.
+            assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO);
         }
+        drop(handle);
+    }
+
+    // 5c. Blocker #3 & Blocker #5 regressions:
+    //   - 7-DOF park carrying an object (gripper contact -> Opening -> Closing -> DisableConfirm)
+    //     completes with AllocCounts::ZERO on armd-control.
+    //   - E-stop arriving AFTER first disable write preserves SafetyState::EStop, marks !is_torqued
+    //     once confirmed, and performs AllocCounts::ZERO (no heap SafetyError constructed).
+    {
+        let mut dm_cfg = ArmConfig::rebot_dm();
+        dm_cfg.workspace = None;
+        dm_cfg.lease_timeout_ms = 60_000;
+        let g_idx = dm_cfg.gripper_index().unwrap();
+        let gp = dm_cfg.gripper_policy.as_ref().unwrap().clone();
+        let mut q0 = dm_cfg.resting_positions().to_vec();
+        q0[g_idx] = gp.closed_rad + (gp.open_rad - gp.closed_rad) * 0.5;
+        let close_dir = if gp.closed_rad >= gp.open_rad { 1.0_f32 } else { -1.0_f32 };
+        let clock = ScriptedClock::new();
+        let (mut drv, knobs) = MotionTestDriver::new(q0, Duration::from_millis(2), Duration::from_millis(20), Some(clock.clone()));
+        drv.caps.torque_feedback = true;
+        let sup = Arc::new(ArmSupervisor::new(dm_cfg).with_driver(Box::new(drv)));
+        {
+            // Simulate an object stalled in the jaw so 7-DOF park triggers step_park_release (Opening -> Closing) on RT.
+            let mut inner = sup.inner().write().await;
+            inner.gripper_stalled = true;
+            inner.gripper_stall_sign = close_dir;
+        }
+        let handle = start_scripted_executor(&sup, period, clock.clone(), true).await;
+        clock.run_steps(period_ns, 2);
+        let auth = submit_enable_and_wait(&sup, &handle, &clock, period_ns, 1);
+        let snap = MotionPlanSnapshot::from_published(&sup.hub().latest().unwrap(), sup.hub().motion_config().unwrap()).unwrap();
+        let park = req::prepare_motion(&snap, &MotionRequest::park()).unwrap();
+        let _r_park = handle.broker().lock().unwrap().submit(
+            ClientId(1), 2, auth, clock.now() + Duration::from_secs(15),
+            Submit::InstallPark(&|s: &mut PlanSlot| req::stage_park(s, &park.slot)),
+        ).unwrap();
+        for _ in 0..1400 {
+            clock.run_steps(period_ns, 1);
+            if knobs.disable_started.load(Ordering::Acquire) { break; }
+        }
+        assert!(knobs.disable_started.load(Ordering::Acquire), "7-DOF park with gripper release did not reach disable");
+        // Trigger E-stop AFTER first disable write while disable confirmation is in flight!
+        let estop_done = Arc::new(AtomicBool::new(false));
+        let estop_done_bg = estop_done.clone();
+        let clock_step = clock.clone();
+        let step_jh = tokio::task::spawn_blocking(move || {
+            while !estop_done_bg.load(Ordering::Acquire) {
+                clock_step.run_steps(period_ns, 1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let _ = sup.trigger_e_stop().await;
+        estop_done.store(true, Ordering::Release);
+        step_jh.await.unwrap();
+        clock.run_steps(period_ns, 15);
+        let end_snap = sup.hub().latest().unwrap();
+        assert_eq!(end_snap.obs.safety_state, SafetyState::EStop, "must preserve latched EStop");
+        assert!(!end_snap.obs.is_torqued, "confirmed disable must clear is_torqued even under EStop");
+        assert_eq!(handle.stats().total_allocs(), AllocCounts::ZERO, "Blocker #5: stopped disable confirm must be 0 alloc");
         drop(handle);
     }
 }
