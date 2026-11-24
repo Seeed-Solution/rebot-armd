@@ -2997,6 +2997,9 @@ impl SupervisorInner {
     /// Release step of a park that carried an object, run once the park trajectory ends:
     /// open [`PARK_RELEASE_OPEN_RAD`] past the contact, then close (stall-protected gripper
     /// moves), then the unload settle. Returns true while the release owns the tick.
+    ///
+    /// Exempt from `Admitted` (Invariant 1a): system-initiated stop-direction motion
+    /// completing a `NormalUnload` park so the gripper releases safely before torque-off.
     fn step_park_release(&mut self) -> bool {
         let next = match self.park_release {
             None if self.park_gripper_contact => ParkRelease::Opening,
@@ -6140,6 +6143,8 @@ impl ArmSupervisor {
         .map_err(ArmError::Safety)
     }
 
+    /// Exempt from `Admitted` (Invariant 1c): torque disable is a stop-direction action that
+    /// removes actuator output and must never be blocked by a Stop or admission check.
     pub async fn disable_torque(&self) -> Result<SafetyState, ArmError> {
         let mut inner = self.inner.clone().write_owned().await;
         self.check_legacy_under_guard(&inner)?;

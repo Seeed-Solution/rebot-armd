@@ -944,6 +944,10 @@ impl SupervisorInner {
 
     /// [`Self::policy_step_with_vision`] from a slice: no allocation on an accepted step once
     /// the run's buffers hold a target (the latest-target path consumes through it).
+    ///
+    /// Exempt from `Admitted` (Invariant 1b): continuation step of a policy run that was already
+    /// admitted via `begin_policy_run(Admitted<'_>, ...)`; gated by the active run's
+    /// `action_id`, authorization generation, epoch, lease, and E-stop/Stop termination.
     pub fn policy_step_slice(
         &mut self,
         action_id: u64,

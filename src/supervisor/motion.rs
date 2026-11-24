@@ -266,6 +266,10 @@ impl SupervisorInner {
         }
         match policy {
             StopPolicy::NormalUnload => {
+                // Exempt from `Admitted` (Invariant 1a): system-initiated stop-direction park
+                // motion (triggered by stop policy / lease watchdog / already-admitted unload)
+                // returns the arm to the resting pose and disables torque, rather than starting
+                // new client motion.
                 if self.handover_settling_since.is_some() {
                     tracing::warn!("NormalUnload rejected while handover settling; maintaining holding torque");
                     return;

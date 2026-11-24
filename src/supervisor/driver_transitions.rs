@@ -996,6 +996,9 @@ impl SupervisorInner {
         self.enable_finish(was_torqued, prev_gripper_cmd)
     }
 
+    /// Exempt from `Admitted` (Invariant 1c): torque disable is a stop-direction action that
+    /// removes actuator output and must never be blocked by a Stop or admission check (still
+    /// subject to resting-pose and torque-off safety checks).
     pub fn disable_torque(&mut self) -> Result<SafetyState, SafetyError> {
         if self.torque_transition.is_some() {
             return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into()));
@@ -1492,8 +1495,11 @@ impl SupervisorInner {
         })
     }
 
-    /// Starts a torque-disable transition without waiting for its confirmation (unstamped:
-    /// torque disable is a stop-direction action governed by normal disable rules).
+    /// Starts a torque-disable transition without waiting for its confirmation.
+    ///
+    /// Exempt from `Admitted` (Invariant 1c): torque disable is a stop-direction action that
+    /// removes actuator output and must never be blocked by a Stop or admission check (still
+    /// governed by resting-pose and torque-off safety checks).
     pub(crate) fn begin_disable_torque_transition(&mut self) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
         use crate::rt_core::ops::TorqueProgress as Rt;
         if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
