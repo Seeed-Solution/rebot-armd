@@ -2039,6 +2039,19 @@ impl SupervisorInner {
                     }
                     return Err(refusal.into_safety_error());
                 }
+                // MIT expiry recovery disables every motor on the bus. Unless every arm joint
+                // (J1..J6) is already disabled or its own watchdog has already expired
+                // (`status == 0 || status >= 8`), this is an operator torque-off request and must
+                // pass the single Rule A′ rest-pose decision with no override.
+                let arm_joints = self.config.arm_joints();
+                let all_arm_already_disabled = !arm_joints.is_empty()
+                    && arm_joints
+                        .iter()
+                        .all(|&i| st.get(i).copied().is_some_and(|c| c == 0 || c >= 8));
+                if !all_arm_already_disabled {
+                    self.eval_stopped_torque_off()
+                        .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
+                }
                 if !std::mem::take(&mut self.mit.recovery_confirmed) {
                     return Err(SafetyError::ClearFaultRejected(format!(
                         "{}: {}",
@@ -2047,7 +2060,7 @@ impl SupervisorInner {
                     )));
                 }
                 commit_probed_limits(self);
-                return self.mit_expiry_recovery_for_epoch(expected_epoch);
+                return self.mit_expiry_recovery_for_epoch(expected_epoch, all_arm_already_disabled);
             }
         }
 

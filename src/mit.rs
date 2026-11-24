@@ -47,9 +47,9 @@ pub const QUALIFICATION_PATH: &str = "/api/v1/calibration/mit_qualification";
 pub const MIT_DEADLINE: Duration = Duration::from_millis(45);
 /// Code of a clear_fault that needs the operator's confirmation of the MIT expiry recovery.
 pub const RECOVERY_CONFIRM_CODE: &str = "MIT_RECOVERY_CONFIRM_REQUIRED";
-/// What the confirmation accepts: torque goes off on every joint.
-pub const RECOVERY_WARNING: &str = "A motor's command timeout expired after the MIT loss. Clearing recovers by turning torque off on every joint: \
-    the arm drops like a park torque-off. Support the arm or bring it to rest, then clear again with {\"mit_recovery\": \"torque_off_all\"}";
+/// What the confirmation accepts: torque goes off on every joint (rest pose or already disabled only).
+pub const RECOVERY_WARNING: &str = "A motor's command timeout expired after the MIT loss. Clearing recovers by turning torque off on every joint at the resting pose (or when every arm motor is already disabled): \
+    support the arm or bring it to rest, then clear again with {\"mit_recovery\": \"torque_off_all\"}; away from the resting pose while arm motors hold torque, recovery is refused with TORQUE_OFF_WOULD_DROP";
 /// Code of a clear_fault refused inside the post-trip quiet period (no frame is sent).
 pub const QUIET_PERIOD_CODE: &str = "MIT_QUIET_PERIOD";
 /// Body value of clear_fault that confirms the MIT expiry recovery.
@@ -1114,6 +1114,7 @@ impl crate::supervisor::SupervisorInner {
     pub(crate) fn mit_expiry_recovery_for_epoch(
         &mut self,
         expected_epoch: Option<u64>,
+        all_arm_already_disabled: bool,
     ) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
         use crate::driver::EnableState;
         use crate::safety::{ClearRefusal, FaultDetail, FaultKind, SafetyError};
@@ -1134,6 +1135,10 @@ impl crate::supervisor::SupervisorInner {
                 }
             }
             return Err(refusal.into_safety_error());
+        }
+        if !all_arm_already_disabled {
+            self.eval_stopped_torque_off()
+                .map_err(|r| r.into_safety_error(&self.config.joint_names))?;
         }
         let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
             Some(mut drv) => drv.mit_expiry_recover(),

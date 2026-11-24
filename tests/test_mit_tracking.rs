@@ -625,8 +625,14 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     bus.clear_log();
     for _ in 0..5 { inner.tick(DT); }
     assert!(bus.tx_log().is_empty(), "polls resumed without clearance: {:?}", bus.tx_log());
-    // reconnect: explicit clearance (polls resume, the first try waits for fresh feedback), rearm
-    // (fresh readback, base modes restored), then a fresh handover
+    // reconnect: away from rest while other arm motors still hold torque, recovery is refused with
+    // TORQUE_OFF_WOULD_DROP; once at the resting pose, explicit clearance recovers with torque off,
+    // rearm restores base modes, and a fresh handover follows.
+    bus.with(|s| {
+        s.follow_commands = false;
+        for m in s.motors.iter_mut() { m.q = 0.0; }
+        s.push_all_feedback();
+    });
     let mut cleared = false;
     for _ in 0..20 {
         if inner.clear_fault_confirmed(true).is_ok() { cleared = true; break; }
@@ -1213,12 +1219,26 @@ fn expired_after_loss() -> (SupervisorInner, FakeBus, armd::transport::MockClock
     (inner, bus, clock)
 }
 
-/// Coordinator decision (round 4): clear_fault in that state recovers under operator control:
-/// clear-error to the faulted motor, a fenced disable of every motor confirmed per motor, then Idle
-/// with torque off and the MIT group reset; no MIT or POS_VEL target frame after the loss.
+/// Same MIT-expired stuck state with the arm at the resting pose (0.0 rad) so Rule A′ allows
+/// torque-off recovery.
+fn expired_after_loss_at_rest() -> (SupervisorInner, FakeBus, armd::transport::MockClock) {
+    let (inner, bus, clock) = expired_after_loss();
+    bus.with(|s| {
+        s.follow_commands = false;
+        for m in s.motors.iter_mut() {
+            m.q = 0.0;
+        }
+    });
+    (inner, bus, clock)
+}
+
+/// Coordinator decision (round 4) + Rule A′ (2026-11-24): clear_fault at the resting pose recovers
+/// under operator control: clear-error to the faulted motor, a fenced disable of every motor
+/// confirmed per motor, then Idle with torque off and the MIT group reset; no MIT or POS_VEL
+/// target frame after the loss.
 #[test]
 fn mit_expiry_recovery_clears_to_idle_with_torque_off() {
-    let (mut inner, bus, clock) = expired_after_loss();
+    let (mut inner, bus, clock) = expired_after_loss_at_rest();
     let msg = inner.safety.fault().unwrap().message;
     assert!(msg.contains("torque off"), "the fault must say the recovery turns torque off: {msg}");
     bus.clear_log();
@@ -1241,7 +1261,7 @@ fn mit_expiry_recovery_clears_to_idle_with_torque_off() {
 /// A motor that never confirms the disable keeps the fault latched and is named; no retry loop.
 #[test]
 fn mit_expiry_recovery_keeps_the_fault_when_a_motor_does_not_confirm() {
-    let (mut inner, bus, clock) = expired_after_loss();
+    let (mut inner, bus, clock) = expired_after_loss_at_rest();
     bus.with(|s| s.motors[1].no_feedback = true); // J2 answers nothing any more
     let mut last = None;
     for _ in 0..4 {
@@ -1261,11 +1281,12 @@ fn recovery_commands(log: &[armd::transport::CanFrame]) -> usize {
     log.iter().filter(|f| (1..=7).contains(&f.id) && [damiao::CMD_DISABLE, damiao::CMD_CLEAR_FAULTS].contains(&f.data)).count()
 }
 
-/// Round 6, #1b: without the explicit confirmation the expiry recovery is refused with a specific
-/// code and a message that every joint loses torque; nothing but read-only polls goes out.
+/// Round 6, #1b: at the resting pose, without the explicit confirmation the expiry recovery is
+/// refused with a specific code and a message that every joint loses torque; nothing but
+/// read-only polls goes out.
 #[test]
 fn mit_expiry_recovery_needs_the_operator_confirmation() {
-    let (mut inner, bus, _clock) = expired_after_loss();
+    let (mut inner, bus, _clock) = expired_after_loss_at_rest();
     // the full log since the loss: only read-only polls, no recovery command, no motion
     let start = bus.tx_log().len();
     let e = inner.clear_fault_confirmed(false).unwrap_err();
@@ -1285,14 +1306,14 @@ fn mit_expiry_recovery_needs_the_operator_confirmation() {
 #[test]
 fn mit_expiry_recovery_reads_fresh_feedback_first() {
     // stale: no motor answers the fresh read
-    let (mut inner, bus, _clock) = expired_after_loss();
+    let (mut inner, bus, _clock) = expired_after_loss_at_rest();
     bus.with(|s| for m in s.motors.iter_mut() { m.silent = true; });
     bus.clear_log();
     assert!(inner.clear_fault_confirmed(true).is_err());
     assert_eq!(recovery_commands(&bus.tx_log()), 0, "recovery command on stale feedback");
     assert!(inner.safety.state().is_stopped());
     // the cache says expiry, the motors now report: all disabled, no error
-    let (mut inner, bus, _clock) = expired_after_loss();
+    let (mut inner, bus, _clock) = expired_after_loss_at_rest();
     bus.with(|s| for m in s.motors.iter_mut() { m.enabled = false; m.state_override = None; });
     bus.clear_log();
     let _ = inner.clear_fault_confirmed(true);
@@ -1304,7 +1325,7 @@ fn mit_expiry_recovery_reads_fresh_feedback_first() {
 /// state is EStop, the reply is not a success.
 #[test]
 fn mit_expiry_recovery_honours_an_estop_arriving_mid_recovery() {
-    let (mut inner, bus, _clock) = expired_after_loss();
+    let (mut inner, bus, _clock) = expired_after_loss_at_rest();
     let (count, latched) = (inner.requested_estop_count.clone(), inner.e_stop_latched.clone());
     bus.with(|s| s.on_disable = Some(std::sync::Arc::new(move || {
         count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1367,4 +1388,81 @@ fn mit_clear_inside_the_quiet_period_sends_nothing() {
     let polls = bus.tx_log().iter().filter(|f| f.id == 0x7FF && f.data[2] == 0xCC).count();
     assert!(polls > 0, "no fresh read after the quiet period: {r:?}");
     assert!(motion_frames(&bus.tx_log()).is_empty(), "{:?}", bus.tx_log());
+}
+
+/// Torque-off round 2, item 1: MIT expiry recovery (`mit_recovery: "torque_off_all"`) is an
+/// operator torque-off request, so away from the resting pose while any arm joint is still
+/// enabled it MUST be refused with `TORQUE_OFF_WOULD_DROP` with NO override, sending no disable
+/// or clear-error frames and leaving the fault record and epoch untouched.
+#[test]
+fn mit_expiry_recovery_refused_away_from_rest_with_torque_off_would_drop_no_override() {
+    let (mut inner, bus, _clock) = expired_after_loss();
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.35;
+        s.push_all_feedback();
+    });
+    inner.tick(DT);
+    let epoch_before = inner.safety.epoch_id();
+    let kinds_before = inner.safety.latched_fault_kinds();
+    let fault_before = inner.safety.fault();
+    bus.clear_log();
+
+    // Even with explicit mit_recovery: "torque_off_all", raised arm is refused with TORQUE_OFF_WOULD_DROP.
+    for confirmed in [false, true] {
+        let err = inner.clear_fault_confirmed(confirmed).unwrap_err();
+        match err {
+            armd::ArmError::Safety(armd::safety::SafetyError::TorqueOffWouldDrop {
+                joint: Some(ref j),
+                position: Some(p),
+                ..
+            }) => {
+                assert_eq!(j, "joint_2");
+                assert!((p - 0.35).abs() < 0.02, "expected ~0.35 rad, got {p}");
+            }
+            other => panic!("expected TorqueOffWouldDrop (confirmed={confirmed}), got {other:?}"),
+        }
+    }
+    assert_eq!(recovery_commands(&bus.tx_log()), 0, "no disable or clear-error frame may be sent");
+    assert_eq!(inner.safety.epoch_id(), epoch_before);
+    assert_eq!(inner.safety.latched_fault_kinds(), kinds_before);
+    assert_eq!(inner.safety.fault(), fault_before);
+    assert!(inner.is_torqued);
+}
+
+/// Torque-off round 2, item 1 exception: when every arm motor's own watchdog has already expired
+/// (or is already disabled) in fresh feedback, MIT expiry recovery may proceed even away from rest
+/// because turning torque off changes nothing physically.
+#[test]
+fn mit_expiry_recovery_proceeds_raised_when_all_arm_motors_already_expired_or_disabled() {
+    let (mut inner, bus, clock) = expired_after_loss();
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.motors[1].q = 0.35;
+        for j in 0..6 {
+            s.motors[j].enabled = false;
+            s.motors[j].state_override = Some(if j % 2 == 0 { 0xD } else { 0 });
+        }
+        s.push_all_feedback();
+    });
+    inner.tick(DT);
+    let mut cleared = None;
+    for _ in 0..6 {
+        match inner.clear_fault_confirmed(true) {
+            Ok(s) => {
+                cleared = Some(s);
+                break;
+            }
+            Err(_) => {
+                clock.advance(std::time::Duration::from_millis(120));
+                inner.tick(DT);
+            }
+        }
+    }
+    assert!(
+        matches!(cleared, Some(armd::SafetyState::Idle)),
+        "MIT recovery must proceed when all arm motors are already expired/disabled, got: {:?}",
+        inner.clear_fault_confirmed(true)
+    );
+    assert!(!inner.is_torqued);
 }

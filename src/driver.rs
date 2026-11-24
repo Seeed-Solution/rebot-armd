@@ -6787,7 +6787,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.pending_stop_check(Some(start_stamp)).map_err(|e| format!("clear-error flush inhibited: {e}"))?;
             self.can.flush().map_err(|e| format!("flush: {e}"))?;
         }
-        // 2. no cached frame may ever be replayed; then the disable of every motor
+        // 2. no cached frame may ever be replayed; then the disable of every motor.
+        // Callers (`SupervisorInner::clear_fault_for_epoch` / `mit_expiry_recovery_for_epoch`)
+        // gate this through `may_disable_torque_while_stopped` unless every arm motor is already
+        // disabled or its own watchdog has already expired (`status == 0 || status >= 8`).
         self.clear_cached_targets();
         let res = self.set_torque(false);
         let unconfirmed: Vec<String> = (0..self.motor_ids.len()).filter(|&i| {
