@@ -5413,3 +5413,392 @@ fn dual_owner_stale_j7_gates_replay_sequence_policy_macros_and_never_sends_stale
         }
     }
 }
+
+/// R1 architectural restructure regression: ONE single J7 `PosForce` (`0x307`) emitter called
+/// once per control tick from the tick epilogue on BOTH owners (Legacy + RT Executor), plus
+/// direct-driver verification across EVERY review case:
+/// 1. Fenced motion write with J7 precheck stale (> 100 ms) -> 0 MIT frames, exact 1 `0x307` FREEZE frame;
+/// 2. Fenced motion write with MIT fence already tripped (fresh AND stale J7) -> 0 MIT frames,
+///    exact 1 `0x307` Hold (`vel_raw == 0`) or FREEZE frame;
+/// 3. Fenced motion write with MIT fence tripping MID-BATCH -> MIT aborts, exact 1 `0x307` Hold (`vel_raw == 0`) frame;
+/// 4. Invalid caller J7 target (`NaN` / sub-quantum `0.005 rad/s`) in stopped hold (direct driver
+///    unfenced & fenced + dual-owner) AND operational motion (dual-owner) -> NEVER suppresses J7;
+///    exact 1 `0x307` Hold/Stop (`vel_raw == 0`) or FREEZE frame;
+/// 5. `send_to_bus == false` (> 500 ms `BUS_LOSS` while torqued) -> 0 J1-J6 frames, exact 1 `0x307` FREEZE frame.
+#[test]
+fn dual_owner_single_j7_emitter_covers_all_fenced_and_invalid_target_paths() {
+    use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DamiaoControlMode, JointMode, JointTarget};
+    use armd::mit::{MitOwner, MIT_DEADLINE};
+    use armd::transport::CanFrame;
+
+    let pf_cur = j7_pf_current_raw(&base_cfg());
+    let is_mit_or_arm_cmd = |f: &CanFrame| (1..=6).contains(&f.id) || (0x101..=0x106).contains(&f.id);
+
+    let assert_exact_one_j7 = |log: &[CanFrame], expected_pos: f32, expected_vel: u16, expected_cur: u16, label: &str| {
+        let j7 = j7_pf_frames(log);
+        assert_eq!(j7.len(), 1, "{label}: expected exact 1 J7 0x307 frame per tick, got {j7:?}");
+        let pos = f32::from_le_bytes(j7[0].data[0..4].try_into().unwrap());
+        let vel = u16::from_le_bytes([j7[0].data[4], j7[0].data[5]]);
+        let cur = u16::from_le_bytes([j7[0].data[6], j7[0].data[7]]);
+        assert!((pos - expected_pos).abs() < 1e-2, "{label}: J7 pos {pos} != expected {expected_pos}");
+        assert_eq!(vel, expected_vel, "{label}: J7 vel_raw {vel} != expected {expected_vel}");
+        assert_eq!(cur, expected_cur, "{label}: J7 cur {cur} != expected {expected_cur}");
+    };
+
+    let make_fenced_driver = |j7_start: f32| {
+        let clock = MockClock::new();
+        let limits = dm_limits();
+        let bus = FakeBus::with_clock(&limits, clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+            }
+            s.motors[6].q = j7_start;
+            s.motors[3].set_reg_u32(armd::protocol::damiao::RID_TIMEOUT, 2000);
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let pf_cfg = armd::driver::GripperPosForce {
+            joint: 6,
+            current_raw: pf_cur,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        };
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_gripper_pos_force(pf_cfg)
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).expect("enable");
+        let hold: Vec<JointTarget> = (0..7)
+            .map(|i| JointTarget::mit(if i == 6 { j7_start } else { 0.1 * i as f32 }, 0.0, 12.0, 0.4, 0.0))
+            .collect();
+        let modes: Vec<JointMode> = (0..7)
+            .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
+            .collect();
+        d.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+        assert_eq!(d.joint_control_modes()[3], Some(DamiaoControlMode::Mit));
+        assert_eq!(d.joint_control_modes()[6], Some(DamiaoControlMode::PosForce));
+        d.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+        d.read_joint_states().unwrap();
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        (d, bus, clock, hold)
+    };
+
+    // === Part A: Direct-driver verification for all 4 review cases ===
+    // A1. Fenced motion write: J7 precheck stale (> 100 ms) while J1-J6 fresh -> 0 MIT frames + 1 FREEZE frame.
+    {
+        let (mut d, bus, clock, mut tgt) = make_fenced_driver(-2.5);
+        tgt[6] = JointTarget::position(-0.5);
+        bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[6].mute_feedback = true;
+        });
+        // Keep J1-J6 fresh while aging J7 to 115 ms WITHOUT calling read_joint_states (so fence
+        // is NOT yet tripped before write_joint_targets_bounded — hits the J7 precheck stale path!).
+        clock.advance(ms(115));
+        bus.clear_log();
+        d.begin_tx_tick();
+        let err = d.write_joint_targets_bounded(&tgt).unwrap_err();
+        assert!(matches!(err, ArmDriverError::PosForceFeedbackStale { joint: 6 }), "expected PosForceFeedbackStale, got {err:?}");
+        let log = bus.tx_log();
+        assert!(!log.iter().any(is_mit_or_arm_cmd), "A1 must send 0 MIT/arm frames: {log:?}");
+        assert_exact_one_j7(&log, -2.5, 0, pf_cur, "A1 direct fenced motion precheck stale");
+    }
+
+    // A2. Fenced motion write: fence ALREADY tripped before batch (J7 still fresh!) -> 0 MIT frames + 1 Hold frame.
+    {
+        let (mut d, bus, clock, mut tgt) = make_fenced_driver(-2.5);
+        tgt[6] = JointTarget::position(-0.5);
+        // Trip fence via J4-only 50 ms outage while J7 stays fresh!
+        bus.with(|s| {
+            s.rx.clear();
+            s.pending.clear();
+            s.motors[3].mute_feedback = true;
+        });
+        clock.advance(ms(50));
+        bus.with(|s| {
+            for i in [0, 1, 2, 4, 5, 6] {
+                s.push_feedback(i);
+            }
+        });
+        let _ = d.read_joint_states();
+        assert!(d.mit_fence_trip().is_some(), "J4 outage must trip fence while J7 stays fresh");
+        assert!(d.pos_force_feedback_fresh(), "J7 must still be fresh");
+        bus.clear_log();
+        d.begin_tx_tick();
+        let err = d.write_joint_targets_bounded(&tgt).unwrap_err();
+        assert!(matches!(err, ArmDriverError::MitFenceTripped(_)), "expected MitFenceTripped, got {err:?}");
+        let log = bus.tx_log();
+        assert!(!log.iter().any(is_mit_or_arm_cmd), "A2 must send 0 MIT/arm frames: {log:?}");
+        assert_exact_one_j7(&log, -2.5, 0, pf_cur, "A2 direct fenced motion fence already tripped (fresh J7)");
+    }
+
+    // A3. Fenced motion write: fence trips MID-BATCH during J2 transmit -> MIT aborts + 1 Hold frame.
+    {
+        let (mut d, bus, clock, mut tgt) = make_fenced_driver(-2.5);
+        tgt[6] = JointTarget::position(-0.5);
+        // Age mit_fence_last_cmd to 44 ms (< 45 ms MIT deadline so pre-batch fence check passes),
+        // while keeping feedback fresh and tick elapsed duration (2 ms) well inside max_duration.
+        clock.advance(ms(44));
+        bus.with(|s| s.push_all_feedback());
+        let _ = d.read_joint_states();
+        let clock_mid = clock.clone();
+        let tx_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tx_count_cb = tx_count.clone();
+        bus.with(|s| {
+            s.on_tx = Some(Arc::new(move || {
+                // On frame 2 (J2), advance clock by 2 ms (44 + 2 = 46 ms > 45 ms MIT fence) so
+                // the fence trips mid-batch before J4 without exhausting tx_budget.max_duration!
+                if tx_count_cb.fetch_add(1, Ordering::SeqCst) == 1 {
+                    clock_mid.advance(ms(2));
+                }
+            }));
+        });
+        bus.clear_log();
+        d.begin_tx_tick();
+        let err = d.write_joint_targets_bounded(&tgt).unwrap_err();
+        assert!(matches!(err, ArmDriverError::MitFenceTripped(_)), "expected mid-batch MitFenceTripped, got {err:?}");
+        let log = bus.tx_log();
+        assert!(log.iter().any(|f| f.id == 0x101), "A3 should have started batch (J1 sent) before mid-batch trip: {log:?}");
+        assert!(!log.iter().any(|f| f.id == 4), "A3 must abort before J4 MIT frame: {log:?}");
+        assert_exact_one_j7(&log, -2.5, 0, pf_cur, "A3 direct fenced motion mid-batch fence trip");
+    }
+
+    // A4. Stopped-hold writer (`write_estop_hold_bounded`, BOTH unfenced and fenced) with invalid
+    //     caller J7 targets (NaN position, Inf velocity, sub-quantum 0.005 velocity): NEVER suppresses J7!
+    for fenced in [false, true] {
+        for (label, bad_pos, bad_vel) in [
+            ("NaN pos", f32::NAN, Some(0.30)),
+            ("Inf vel", -0.5, Some(f32::INFINITY)),
+            ("sub-quantum vel 0.005", -0.5, Some(0.005)),
+        ] {
+            let (mut d, bus, _clock, mut hold) = make_fenced_driver(-2.5);
+            if !fenced {
+                d.set_mit_deadline_fence(None, Duration::ZERO);
+            }
+            hold[6].position = bad_pos;
+            hold[6].velocity = bad_vel;
+            bus.clear_log();
+            d.begin_tx_tick();
+            let res = d.write_estop_hold_bounded(&hold);
+            assert!(res.is_ok(), "A4 fenced={fenced} {label}: stopped hold must not fail on invalid caller J7 target: {res:?}");
+            assert_exact_one_j7(&bus.tx_log(), -2.5, 0, pf_cur, &format!("A4 direct stopped-hold fenced={fenced} {label}"));
+        }
+    }
+
+    // === Part B: Dual-owner (Legacy + RT Executor) tick-epilogue verification ===
+    let mut jt = armd::tracking::JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    for j in &mut jt.joints {
+        j.strategy = armd::tracking::TrackingStrategy::Position;
+    }
+    jt.joints[3].strategy = armd::tracking::TrackingStrategy::Mit;
+    jt.joints[3].kp = 10.0;
+    jt.joints[3].kd = 0.3;
+    jt.joints[3].hold_kp = Some(12.0);
+    jt.joints[3].hold_kd = Some(0.4);
+    jt.joints[3].effort_limit_nm = 3.0;
+    jt.joints[3].gravity_scale = 1.0;
+
+    let setup_mit_rig = |owner: Owner, j7_start: f32| -> DualRig {
+        let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+        rig.inner_mut().config.joint_tracking = Some(jt.clone());
+        if let RigOwner::Executor { fx, .. } = &mut rig.owner {
+            let stops = fx.stops().clone();
+            fx.core.attach_stop_requests(stops);
+            let gate = fx.core.estop_gate();
+            fx.core.driver.as_ref().unwrap().lock().unwrap().set_estop_gate(gate);
+        }
+        rig.inner_mut().commanded_positions[6] = j7_start;
+        rig.inner_mut().target_positions[6] = j7_start;
+        rig.inner_mut().measured_positions[6] = j7_start;
+        rig.bus.with(|s| {
+            s.motors[6].q = j7_start;
+            s.motors[3].set_reg_u32(armd::protocol::damiao::RID_TIMEOUT, 2000);
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        rig.step();
+        {
+            let hold: Vec<JointTarget> = (0..7)
+                .map(|i| JointTarget::mit(rig.inner().measured_positions[i], 0.0, 12.0, 0.4, 0.0))
+                .collect();
+            let modes: Vec<JointMode> = (0..7)
+                .map(|i| if i == 3 { JointMode::Mit } else { JointMode::Position })
+                .collect();
+            let mut drv = rig.inner().driver.as_ref().unwrap().lock().unwrap();
+            drv.set_joint_modes_confirmed(&modes, &hold).expect("handover J4 to MIT");
+            drv.set_mit_deadline_fence(Some(MIT_DEADLINE), ms(300));
+        }
+        rig.inner_mut().mit.owner = MitOwner::Active;
+        rig.inner_mut().mit.joints = vec![3];
+        rig.inner_mut().mit.last_output = Some(armd::transport::DriverClock::now(&rig.clock));
+        rig.bus.with(|s| {
+            s.immediate_replies = false;
+            s.motors[6].q = j7_start;
+            s.rx.clear();
+            s.pending.clear();
+            s.push_all_feedback();
+        });
+        rig.step();
+        assert!((rig.bus.with(|s| s.motors[6].q) - j7_start).abs() < 1e-2);
+        rig
+    };
+
+    for owner in [Owner::Legacy, Owner::Executor] {
+        // B1. Fenced motion tick with J7 precheck stale (> 100 ms) -> 0 MIT frames + exact 1 FREEZE frame.
+        {
+            let mut rig = setup_mit_rig(owner, -2.5);
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[6].mute_feedback = true;
+            });
+            rig.clock.advance(ms(115));
+            rig.bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+            let log = rig.bus.tx_log();
+            assert!(!log.iter().any(is_mit_or_arm_cmd), "{owner:?} B1 sent MIT/arm frame: {log:?}");
+            assert_exact_one_j7(&log, -2.5, 0, pf_cur, &format!("{owner:?} B1 fenced motion precheck stale"));
+        }
+
+        // B2. Fenced motion tick with fence ALREADY tripped (fresh J7 AND stale J7) -> 0 MIT + exact 1 Hold/Freeze.
+        {
+            let mut rig = setup_mit_rig(owner, -2.5);
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                s.motors[3].mute_feedback = true;
+            });
+            rig.clock.advance(ms(50));
+            rig.bus.with(|s| for i in [0, 1, 2, 4, 5, 6] { s.push_feedback(i); });
+            // Tick 1 trips fence via J4 outage (J7 still fresh at -2.5) -> 0 MIT + exact 1 Hold frame (vel 0).
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+            let log1 = rig.bus.tx_log();
+            assert!(!log1.iter().any(is_mit_or_arm_cmd), "{owner:?} B2a sent MIT/arm frame: {log1:?}");
+            assert_exact_one_j7(&log1, -2.5, 0, pf_cur, &format!("{owner:?} B2a fence tripped (fresh J7)"));
+
+            // Tick 2 while MitOwner::Lost and J7 now stale > 100 ms -> 0 MIT + exact 1 FREEZE frame (vel 0).
+            rig.bus.with(|s| s.motors[6].mute_feedback = true);
+            rig.clock.advance(ms(115));
+            rig.bus.with(|s| for i in [0, 1, 2, 4, 5] { s.push_feedback(i); });
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+            let log2 = rig.bus.tx_log();
+            assert!(!log2.iter().any(is_mit_or_arm_cmd), "{owner:?} B2b sent MIT/arm frame: {log2:?}");
+            assert_exact_one_j7(&log2, -2.5, 0, pf_cur, &format!("{owner:?} B2b fence already tripped (stale J7)"));
+        }
+
+        // B3. Fenced motion tick with fence tripping MID-BATCH -> MIT aborts + exact 1 Hold frame (vel 0).
+        {
+            let mut rig = setup_mit_rig(owner, -2.5);
+            // Age last MIT command to exactly 44 ms (< 45 ms MIT deadline so pre-batch check passes
+            // on BOTH Legacy and Executor), refresh feedback, then advance +2 ms during J2 transmit
+            // so MIT fence trips mid-batch before J4 while tick wall duration stays within max_duration.
+            let last_out = rig.inner().mit.last_output.expect("MIT last_output recorded");
+            let now = armd::transport::DriverClock::now(&rig.clock);
+            let elapsed = now.saturating_duration_since(last_out);
+            if elapsed < ms(44) {
+                rig.clock.advance(ms(44) - elapsed);
+            }
+            let clock_mid = rig.clock.clone();
+            let tx_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tx_count_cb = tx_count.clone();
+            rig.bus.with(|s| {
+                s.push_all_feedback();
+                s.on_tx = Some(Arc::new(move || {
+                    if tx_count_cb.fetch_add(1, Ordering::SeqCst) == 1 {
+                        clock_mid.advance(ms(2));
+                    }
+                }));
+            });
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+            let log = rig.bus.tx_log();
+            assert!(log.iter().any(|f| f.id == 0x101), "{owner:?} B3 should have started batch before mid-batch trip: {log:?}");
+            assert!(!log.iter().any(|f| f.id == 4), "{owner:?} B3 sent J4 MIT frame after mid-batch trip: {log:?}");
+            assert_exact_one_j7(&log, -2.5, 0, pf_cur, &format!("{owner:?} B3 mid-batch fence trip"));
+        }
+
+        // B4. Invalid caller J7 target on BOTH owners: (a) stopped hold with NaN, (b) operational motion with 0.005 ceiling.
+        {
+            let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            rig.inner_mut().commanded_positions[6] = -2.5;
+            rig.inner_mut().target_positions[6] = -2.5;
+            rig.inner_mut().measured_positions[6] = -2.5;
+            rig.bus.with(|s| {
+                s.motors[6].q = -2.5;
+                s.push_all_feedback();
+            });
+            rig.step();
+
+            // B4a: Operational motion with unrepresentable sub-quantum J7 velocity limit (0.005 rad/s).
+            rig.inner_mut().config.limits[6].max_velocity = 0.005;
+            rig.inner_mut().config.joint_tracking = None;
+            let mut tgt = rig.inner().commanded_positions.clone();
+            tgt[6] = -0.5;
+            rig.inner_mut().servo_target = Some(tgt);
+            rig.inner_mut().last_motion_frame = std::time::Instant::now();
+            rig.bus.clear_log();
+            rig.step();
+            let log_motion = rig.bus.tx_log();
+            assert!(
+                !log_motion.iter().any(|f| (0x101..=0x106).contains(&f.id)),
+                "{owner:?} B4a invalid J7 target sent partial arm frames: {log_motion:?}"
+            );
+            assert_exact_one_j7(&log_motion, -2.5, 0, pf_cur, &format!("{owner:?} B4a invalid caller J7 target in motion"));
+            assert!(rig.inner().safety.state().is_stopped(), "{owner:?} B4a must latch fault");
+
+            // B4b: Stopped hold with NaN in commanded_positions[6] -> NEVER suppresses J7 hold!
+            rig.inner_mut().commanded_positions[6] = f32::NAN;
+            rig.bus.clear_log();
+            rig.step();
+            assert_exact_one_j7(&rig.bus.tx_log(), -2.5, 0, pf_cur, &format!("{owner:?} B4b invalid NaN J7 target in stopped hold"));
+        }
+
+        // B5. `send_to_bus == false` (> 500 ms BUS_LOSS while still torqued) -> 0 J1-J6 frames, exact 1 FREEZE frame!
+        {
+            let mut rig = DualRig::new_pos_force(owner, base_cfg(), None);
+            rig.inner_mut().commanded_positions[6] = -2.5;
+            rig.inner_mut().target_positions[6] = -2.5;
+            rig.inner_mut().measured_positions[6] = -2.5;
+            rig.bus.with(|s| {
+                s.motors[6].q = -2.5;
+                s.push_all_feedback();
+            });
+            rig.step();
+            rig.bus.with(|s| {
+                s.rx.clear();
+                s.pending.clear();
+                for m in &mut s.motors {
+                    m.mute_feedback = true;
+                }
+            });
+            rig.clock.advance(ms(550));
+            rig.bus.clear_log();
+            rig.step_dt(DT, false);
+            assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::BusLoss));
+            let log = rig.bus.tx_log();
+            assert!(!log.iter().any(is_mit_or_arm_cmd), "{owner:?} B5 BUS_LOSS sent arm frames: {log:?}");
+            assert_exact_one_j7(&log, -2.5, 0, pf_cur, &format!("{owner:?} B5 send_to_bus==false (BUS_LOSS) still emits J7 freeze"));
+        }
+    }
+}

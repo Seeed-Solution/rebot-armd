@@ -738,6 +738,7 @@ impl crate::supervisor::SupervisorInner {
         dt: f64,
         override_limits: Option<&[crate::model::JointLimit]>,
     ) -> crate::supervisor::TickOutput {
+        use crate::driver::PosForceIntent;
         use crate::supervisor::TickOutput;
         // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
         // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
@@ -746,66 +747,23 @@ impl crate::supervisor::SupervisorInner {
         let ff = match self.mit.owner {
             MitOwner::Off => None,
             MitOwner::Lost => {
-                // A tripped MIT fence / cancelled MIT group suppresses ONLY the MIT joints; an
-                // active PosForce J7 (`TIMEOUT=0`) MUST still receive its freeze/hold frame via
-                // the shared unfenced J7 stopped-hold helper so STOP / E-stop / J7 outages never
-                // leave the jaw running its previous moving target.
-                if let Some(d) = self.driver.as_ref() {
-                    if let Ok(mut drv) = d.try_lock() {
-                        if drv.gripper_pos_force_info().is_some_and(|c| c.active) {
-                            let write_res = drv.write_pos_force_stopped_hold_only();
-                            return crate::supervisor::SupervisorInner::tick_output_from_driver_write(
-                                &mut **drv,
-                                true,
-                                write_res,
-                            );
-                        }
-                    }
-                }
+                // A tripped MIT fence / cancelled MIT group suppresses ONLY the MIT joints; set
+                // the J7 intent so the tick epilogue's ONE J7 emitter writes the hold/freeze frame.
+                self.j7_intent = Some(if is_hold { PosForceIntent::Stop } else { PosForceIntent::Hold });
                 return TickOutput::None;
             }
             MitOwner::Active => match self.mit_prepare(targets, dt) {
                 Ok(ff) => Some(ff),
                 Err(e) => {
-                    // Emit J7's freeze/hold frame BEFORE returning the MIT preparation refusal
-                    // (e.g. a J7-only > 45 ms outage tripping the MIT deadline on a STOP/E-stop
-                    // or motion tick) so J7 stops immediately while MIT joints remain suppressed.
-                    let (now, max_age, sent_any, due_mask, sent_mask, pf_status) = self
+                    // Record J7 Hold/Stop intent so the tick epilogue's ONE J7 emitter still writes
+                    // J7's freeze/hold frame while MIT joints remain suppressed.
+                    self.j7_intent = Some(if is_hold { PosForceIntent::Stop } else { PosForceIntent::Hold });
+                    let (now, max_age) = self
                         .driver
                         .as_ref()
                         .and_then(|d| d.try_lock().ok())
-                        .map(|mut drv| {
-                            if drv.gripper_pos_force_info().is_some_and(|c| c.active) {
-                                let _ = drv.write_pos_force_stopped_hold_only();
-                                (
-                                    drv.clock_now(),
-                                    drv.tx_frame_max_age(),
-                                    drv.last_hold_tx_sent_any(),
-                                    drv.last_hold_tx_due_mask(),
-                                    drv.last_hold_tx_sent_mask(),
-                                    drv.take_last_pos_force_tx_status(),
-                                )
-                            } else {
-                                (
-                                    drv.clock_now(),
-                                    drv.tx_frame_max_age(),
-                                    false,
-                                    0,
-                                    0,
-                                    crate::driver::PosForceTxStatus::Unobserved,
-                                )
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                self.mit_now(),
-                                crate::driver::DAMIAO_TX_FRAME_MAX_AGE,
-                                false,
-                                0,
-                                0,
-                                crate::driver::PosForceTxStatus::Unobserved,
-                            )
-                        });
+                        .map(|drv| (drv.clock_now(), drv.tx_frame_max_age()))
+                        .unwrap_or_else(|| (self.mit_now(), crate::driver::DAMIAO_TX_FRAME_MAX_AGE));
                     let mut buf = OutputErrorText::empty();
                     let _ = core::fmt::write(&mut buf, format_args!("MIT output refused: {e}"));
                     return TickOutput::Error {
@@ -813,10 +771,10 @@ impl crate::supervisor::SupervisorInner {
                         now,
                         max_age,
                         is_hold,
-                        sent_any,
-                        due_mask,
-                        sent_mask,
-                        pf_status,
+                        sent_any: false,
+                        due_mask: 0,
+                        sent_mask: 0,
+                        pf_status: crate::driver::PosForceTxStatus::Unobserved,
                     };
                 }
             },
@@ -827,20 +785,20 @@ impl crate::supervisor::SupervisorInner {
                 .map(|c| self.gripper_hold_vel_ceiling.map_or(c, |h| c.min(h)))
                 .or_else(|| self.active_joint_velocity_ceiling(g))
         });
+        let mut computed_j7_intent: Option<PosForceIntent> = None;
         let res = self.driver.as_ref().and_then(|d| d.lock().ok())
             .map(|mut drv| {
-                // Enforce the active authorized velocity ceiling across both moving ticks and
-                // zero-velocity position targets (e.g. grasp squeeze, settle, hold) on an active
-                // pos-force gripper joint:
-                // - When the authorized ceiling quantizes to raw >= 1, bound zero-velocity targets
-                //   and any over-ceiling velocity to `wire_speed_f32(ceiling_raw)`, and floor
-                //   transient sub-quantum accel/braking velocities (0 < |v| < 0.01) to raw 1
-                //   (always <= authorized ceiling and <= close_speed_rad_s).
-                // - When the authorized ceiling itself encodes to 0 (unrepresentable), never fall
-                //   back to vlim()/close_speed_rad_s or bump up to raw 1: forward the
-                //   unrepresentable ceiling/velocity so DamiaoArmDriver fails closed with 0 frames.
+                // Resolve the J7 PosForce intent (never writing a 0x307 frame here: the tick
+                // epilogue's ONE J7 emitter writes every 0x307 frame after arm output finishes).
+                // - In stopped hold (`is_hold`), caller's J7 target is ignored and intent is `Stop`.
+                // - In motion (`!is_hold`), enforce the active authorized velocity ceiling and
+                //   validate the caller's J7 target BEFORE writing arm frames: an invalid caller
+                //   J7 target (non-finite or unrepresentable sub-quantum speed) refuses arm motion
+                //   and degrades J7 intent to `Stop` so the epilogue still emits a hold/freeze.
                 if let Some(cap) = drv.gripper_pos_force_info().filter(|c| c.active) {
-                    if let Some(t) = targets.get_mut(cap.joint) {
+                    if is_hold {
+                        computed_j7_intent = Some(PosForceIntent::Stop);
+                    } else if let Some(t) = targets.get_mut(cap.joint) {
                         if !t.velocity.is_some_and(|v| !v.is_finite()) {
                             let ceiling_raw = active_pf_ceiling
                                 .filter(|c| c.is_finite() && *c > 0.0)
@@ -864,6 +822,19 @@ impl crate::supervisor::SupervisorInner {
                                 }
                             }
                         }
+                        if let Err(err) = drv.validate_pos_force_intent_target(t.position, t.velocity, None) {
+                            computed_j7_intent = Some(PosForceIntent::Stop);
+                            return crate::supervisor::SupervisorInner::tick_output_from_driver_write(
+                                &mut **drv,
+                                false,
+                                Err(err),
+                            );
+                        }
+                        computed_j7_intent = Some(PosForceIntent::Target {
+                            position: t.position,
+                            velocity: t.velocity,
+                            current_raw: None,
+                        });
                     }
                 }
                 let write_res = if is_hold {
@@ -874,6 +845,9 @@ impl crate::supervisor::SupervisorInner {
                 crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res)
             })
             .unwrap_or(TickOutput::None);
+        if let Some(intent) = computed_j7_intent {
+            self.j7_intent = Some(intent);
+        }
         if let Some(ff) = ff {
             match &res {
                 TickOutput::Complete { .. } => {
@@ -881,18 +855,22 @@ impl crate::supervisor::SupervisorInner {
                     self.mit.last_output = Some(self.mit_now());
                 }
                 TickOutput::EstopInhibited { .. } => {
+                    self.j7_intent = Some(PosForceIntent::Stop);
                     self.mit_lose(
                         format!("MIT batch write failed: {}", crate::driver::ESTOP_INHIBITED),
                         crate::safety::FaultCode::BusLoss,
                     );
                 }
                 TickOutput::Error { message, .. } => {
+                    self.j7_intent = Some(PosForceIntent::Stop);
                     self.mit_lose(format!("MIT batch write failed: {message}"), crate::safety::FaultCode::BusLoss);
                 }
                 TickOutput::Deferred { pending, .. } => {
+                    self.j7_intent = Some(PosForceIntent::Stop);
                     self.mit_lose(format!("MIT batch write deferred ({pending} frames queued)"), crate::safety::FaultCode::BusLoss);
                 }
                 TickOutput::Expired { dropped, .. } => {
+                    self.j7_intent = Some(PosForceIntent::Stop);
                     self.mit_lose(format!("MIT batch write expired ({dropped} frames dropped)"), crate::safety::FaultCode::BusLoss);
                 }
                 TickOutput::None => {}

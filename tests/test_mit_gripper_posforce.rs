@@ -2677,8 +2677,15 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         inner_lim.clear_log();
         clock_lim.advance(Duration::from_millis(20));
         sup_lim.tick(DT);
-        assert!(j7_commands(&inner_lim.tx_log()).is_empty(),
-            "sub-quantum J7 limit 0.005 was silently bumped and transmitted: {:?}", inner_lim.tx_log());
+        let lim_tx = inner_lim.tx_log();
+        let lim_arm: Vec<_> = lim_tx.iter().filter(|f| (0x101..=0x106).contains(&f.id)).collect();
+        assert!(lim_arm.is_empty(), "sub-quantum J7 limit 0.005 must not send arm motion frames: {lim_tx:?}");
+        let lim_j7 = j7_commands(&lim_tx);
+        assert_eq!(lim_j7.len(), 1, "expected 1 stationary vel_raw=0 hold frame from R1 tick epilogue: {lim_j7:?}");
+        let lim_pos = f32::from_le_bytes(lim_j7[0].data[0..4].try_into().unwrap());
+        let lim_vel = u16::from_le_bytes([lim_j7[0].data[4], lim_j7[0].data[5]]);
+        assert!((lim_pos - (-1.0)).abs() < 1e-3, "invalid target -0.5 must not reach wire: {lim_pos}");
+        assert_eq!(lim_vel, 0, "sub-quantum J7 limit 0.005 must not be bumped to vel_raw >= 1: {lim_j7:?}");
         assert!(sup_lim.safety.state().is_stopped(), "expected fault on unrepresentable stream ceiling");
     }
 
@@ -2835,15 +2842,25 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         assert!(rec_15_raws.iter().all(|&r| r == 15),
             "autonomous recovery bypassed J7 ceiling 0.15: {rec_15_raws:?}");
 
-        // 7c. Unvalidated sub-quantum J7 ceiling (0.005) on a zero-velocity tick fails closed (0 frames).
+        // 7c. Unvalidated sub-quantum J7 ceiling (0.005) on a zero-velocity tick fails closed:
+        //     0 arm motion frames, latches fault, and the single J7 tick-epilogue emitter sends
+        //     only a stationary hold (vel_raw == 0 at measured -1.0; never bumping 0.005 to vel_raw >= 1).
         inner_low.with(|s| { s.motors[J7].mute_feedback = false; s.push_all_feedback(); });
         sup_low.tick(DT);
         sup_low.config.limits[J7].max_velocity = 0.005;
         inner_low.clear_log();
         clock_low.advance(Duration::from_millis(20));
         sup_low.tick(DT);
-        assert!(j7_commands(&inner_low.tx_log()).is_empty(),
-            "zero-velocity tick bypassed unrepresentable ceiling 0.005: {:?}", inner_low.tx_log());
+        let j7_7c = j7_commands(&inner_low.tx_log());
+        assert_eq!(j7_7c.len(), 1, "single J7 epilogue emitter must send 1 stationary hold: {:?}", inner_low.tx_log());
+        assert_eq!(
+            u16::from_le_bytes([j7_7c[0].data[4], j7_7c[0].data[5]]),
+            0,
+            "zero-velocity tick bypassed unrepresentable ceiling 0.005 (must hold at vel_raw=0): {:?}",
+            j7_7c[0]
+        );
+        let hold_p_7c = f32::from_le_bytes(j7_7c[0].data[0..4].try_into().unwrap());
+        assert!((hold_p_7c - (-1.0)).abs() < 1e-2, "hold pos {hold_p_7c} != measured -1.0");
         assert!(sup_low.safety.state().is_stopped());
     }
 
@@ -4456,15 +4473,11 @@ fn pos_force_carryover_j7_at_100ms_boundary_never_counted_as_fifo_expired() {
             matches!(d.take_last_pos_force_tx_status(), PosForceTxStatus::Stale { joint: J7, .. }),
             "jump={jump_on_call}: expected Stale status for J7"
         );
-        // Under `max_frames = 6`, if `read_joint_states()` at t = 100 ms ran a recovery write
-        // that emptied `pending_tx`, J1–J6 consume the 6-frame budget and defer J7's freeze frame
-        // (`Deferred { pending: 1 }`) to the very next tick; either way, ZERO non-freeze 0x307
-        // frames may appear and the emitted 0x307 frame must be the exact freeze frame.
-        if matches!(outcome, TxBatchOutcome::Deferred { pending: 1 }) {
-            assert!(
-                j7_commands(&raw_bus.tx_log()).is_empty(),
-                "jump={jump_on_call}: deferred J7 must not emit a moving 0x307 on the first pass"
-            );
+        // Under `max_frames = 6`, budget reservation emits J7's freeze frame immediately (deferring
+        // 1 arm joint); if J7 itself was deferred on the first pass, draining completes it cleanly.
+        if matches!(outcome, TxBatchOutcome::Deferred { pending: 1 })
+            && j7_commands(&raw_bus.tx_log()).is_empty()
+        {
             d.begin_tx_tick();
             let drain = d.drain_pending_tx().unwrap();
             assert_eq!(drain, TxBatchOutcome::Complete, "jump={jump_on_call}: freeze frame must drain cleanly");

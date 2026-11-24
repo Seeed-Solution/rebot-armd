@@ -1185,6 +1185,9 @@ pub struct SupervisorInner {
     pub(crate) retired_macro_runs: std::collections::VecDeque<crate::macro_action::MacroRun>,
     /// Preallocated reusable `UnloadSettle` ring returned on stop/finish (0 alloc / 0 free on RT).
     pub(crate) unload_settle_spare: Option<UnloadSettle>,
+    /// Current control tick's J7 `PosForce` intent set by arm/motion/hold paths and consumed
+    /// strictly once by the tick epilogue's single J7 emitter (`emit_j7_tick_epilogue`).
+    pub(crate) j7_intent: Option<crate::driver::PosForceIntent>,
 }
 
 /// Copy `src` into `dst` (for `ArmObservation::{action, previous_action}`), routing
@@ -1825,6 +1828,7 @@ impl SupervisorInner {
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             retired_macro_runs: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
+            j7_intent: None,
         };
         inner.prepare_workspace_eval_bufs();
         inner
@@ -3569,8 +3573,10 @@ impl SupervisorInner {
         self.safety.can_accept_fault_transition()
     }
 
-    /// Attach a driver and cache its lock-free clock handle (if provided).
-    pub(crate) fn install_driver(&mut self, driver: Box<dyn ArmDriver>) {
+    /// Attach a driver, bind tick-epilogue ownership of the single J7 `PosForce` emitter, and
+    /// cache its lock-free clock handle (if provided).
+    pub(crate) fn install_driver(&mut self, mut driver: Box<dyn ArmDriver>) {
+        driver.set_external_pos_force_emitter(true);
         self.driver_clock = driver.driver_clock();
         self.driver = Some(std::sync::Mutex::new(driver));
     }
@@ -3970,6 +3976,266 @@ impl SupervisorInner {
                 );
             }
         }
+    }
+
+    /// Single owner-side J7 `PosForce` (`0x307`) emitter invoked strictly ONCE per control tick
+    /// via [`Self::emit_j7_tick_epilogue`] in `tick_control_inner` (shared by BOTH Legacy and RT
+    /// Executor owners).
+    ///
+    /// Runs AFTER whatever arm-write path ran (whether that path succeeded, refused, tripped the
+    /// MIT fence, hit `BuildRefused`, had an invalid caller target, or returned early) and merges
+    /// J7's progress masks and freshness status into `tick_output` without heap allocation.
+    fn emit_and_merge_pos_force_j7(
+        drv: &mut dyn ArmDriver,
+        j7_is_hold: bool,
+        intent: crate::driver::PosForceIntent,
+        tick_output: &mut TickOutput,
+        allow_output_accepted: &mut bool,
+    ) {
+        use crate::driver::{ArmDriverError, PosForceEmitOutcome};
+        if drv.enable_state() == EnableState::Disabled {
+            return;
+        }
+        let now = drv.clock_now();
+        let max_age = drv.tx_frame_max_age();
+        match drv.emit_pos_force_j7(intent) {
+            Ok(PosForceEmitOutcome::NotApplicable) => {}
+            Ok(PosForceEmitOutcome::Sent { joint, pf_status, .. }) => {
+                let pf_bit_hold = if joint.saturating_mul(2) < 64 {
+                    1u64 << (joint * 2)
+                } else {
+                    0
+                };
+                let pf_bit_motion = if joint < 64 { 1u64 << joint } else { 0 };
+                match tick_output {
+                    TickOutput::None => {
+                        *tick_output = TickOutput::Complete {
+                            is_hold: j7_is_hold,
+                            now,
+                            max_age,
+                            due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
+                            sent_mask: if j7_is_hold { pf_bit_hold } else { 0 },
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Complete { is_hold, due_mask, sent_mask, pf_status: dst_pf, .. } => {
+                        if *is_hold {
+                            *due_mask |= pf_bit_hold;
+                            *sent_mask |= pf_bit_hold;
+                        }
+                        *dst_pf = pf_status;
+                    }
+                    TickOutput::Deferred { is_hold, due_mask, sent_mask, pf_status: dst_pf, .. } => {
+                        if *is_hold {
+                            *due_mask |= pf_bit_hold;
+                            *sent_mask |= pf_bit_hold;
+                        } else {
+                            *sent_mask |= pf_bit_motion;
+                        }
+                        *dst_pf = pf_status;
+                    }
+                    TickOutput::Expired { is_hold, due_mask, sent_mask, pf_status: dst_pf, .. } => {
+                        if *is_hold {
+                            *due_mask |= pf_bit_hold;
+                            *sent_mask |= pf_bit_hold;
+                        }
+                        *dst_pf = pf_status;
+                    }
+                    TickOutput::Error { is_hold, sent_any, due_mask, sent_mask, pf_status: dst_pf, .. } => {
+                        if *is_hold {
+                            *sent_any = true;
+                            *due_mask |= pf_bit_hold;
+                            *sent_mask |= pf_bit_hold;
+                        }
+                        *dst_pf = pf_status;
+                    }
+                    TickOutput::EstopInhibited { .. } => {}
+                }
+            }
+            Ok(PosForceEmitOutcome::Deferred { joint, pf_status }) => {
+                let pf_bit_hold = if joint.saturating_mul(2) < 64 {
+                    1u64 << (joint * 2)
+                } else {
+                    0
+                };
+                match std::mem::replace(tick_output, TickOutput::None) {
+                    TickOutput::None => {
+                        *tick_output = TickOutput::Deferred {
+                            pending: 1,
+                            now,
+                            max_age,
+                            oldest_age: drv.oldest_pending_tx_age(),
+                            due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
+                            is_hold: j7_is_hold,
+                            sent_mask: 0,
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Complete { is_hold, now, max_age, due_mask, sent_mask, .. } => {
+                        *allow_output_accepted = false;
+                        *tick_output = TickOutput::Deferred {
+                            pending: 1,
+                            now,
+                            max_age,
+                            oldest_age: drv.oldest_pending_tx_age(),
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { 0 },
+                            is_hold,
+                            sent_mask: if is_hold { sent_mask } else { drv.last_target_tx_sent_mask() },
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Deferred {
+                        pending,
+                        now,
+                        max_age,
+                        oldest_age,
+                        due_mask,
+                        is_hold,
+                        sent_mask,
+                        ..
+                    } => {
+                        *tick_output = TickOutput::Deferred {
+                            pending: pending.saturating_add(1),
+                            now,
+                            max_age,
+                            oldest_age: oldest_age.or_else(|| drv.oldest_pending_tx_age()),
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
+                            is_hold,
+                            sent_mask,
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Expired {
+                        dropped,
+                        pending,
+                        now,
+                        max_age,
+                        oldest_age,
+                        due_mask,
+                        sent_mask,
+                        is_hold,
+                        ..
+                    } => {
+                        *tick_output = TickOutput::Expired {
+                            dropped,
+                            pending: pending.saturating_add(1),
+                            now,
+                            max_age,
+                            oldest_age,
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
+                            sent_mask,
+                            is_hold,
+                            pf_status,
+                        };
+                    }
+                    TickOutput::Error {
+                        message,
+                        now,
+                        max_age,
+                        is_hold,
+                        sent_any,
+                        due_mask,
+                        sent_mask,
+                        ..
+                    } => {
+                        *tick_output = TickOutput::Error {
+                            message,
+                            now,
+                            max_age,
+                            is_hold,
+                            sent_any,
+                            due_mask: if is_hold { due_mask | pf_bit_hold } else { due_mask },
+                            sent_mask,
+                            pf_status,
+                        };
+                    }
+                    TickOutput::EstopInhibited { is_hold } => {
+                        *tick_output = TickOutput::EstopInhibited { is_hold };
+                    }
+                }
+            }
+            Err(ArmDriverError::EstopInhibited) => {
+                if matches!(tick_output, TickOutput::None) {
+                    *tick_output = TickOutput::EstopInhibited { is_hold: j7_is_hold };
+                }
+            }
+            Err(e) => {
+                let pf_bit_hold = drv
+                    .gripper_pos_force_info()
+                    .map_or(0, |c| if c.joint.saturating_mul(2) < 64 { 1u64 << (c.joint * 2) } else { 0 });
+                let pf_status = drv.take_last_pos_force_tx_status();
+                match tick_output {
+                    TickOutput::Error { is_hold, due_mask, pf_status: dst_pf, .. }
+                    | TickOutput::Expired { is_hold, due_mask, pf_status: dst_pf, .. } => {
+                        if *is_hold {
+                            *due_mask |= pf_bit_hold;
+                        }
+                        *dst_pf = pf_status;
+                    }
+                    TickOutput::Complete { is_hold, due_mask, sent_mask, .. }
+                    | TickOutput::Deferred { is_hold, due_mask, sent_mask, .. } => {
+                        let was_hold = *is_hold;
+                        let prev_due = *due_mask;
+                        let prev_sent = *sent_mask;
+                        *allow_output_accepted = false;
+                        let mut buf = crate::mit::OutputErrorText::empty();
+                        e.write_bounded(&mut buf);
+                        *tick_output = TickOutput::Error {
+                            message: buf,
+                            now,
+                            max_age,
+                            is_hold: was_hold || j7_is_hold,
+                            sent_any: was_hold && prev_sent != 0,
+                            due_mask: if was_hold || j7_is_hold { prev_due | pf_bit_hold } else { 0 },
+                            sent_mask: if was_hold || j7_is_hold { prev_sent } else { 0 },
+                            pf_status,
+                        };
+                    }
+                    TickOutput::None => {
+                        *allow_output_accepted = false;
+                        let mut buf = crate::mit::OutputErrorText::empty();
+                        e.write_bounded(&mut buf);
+                        *tick_output = TickOutput::Error {
+                            message: buf,
+                            now,
+                            max_age,
+                            is_hold: j7_is_hold,
+                            sent_any: false,
+                            due_mask: if j7_is_hold { pf_bit_hold } else { 0 },
+                            sent_mask: 0,
+                            pf_status,
+                        };
+                    }
+                    TickOutput::EstopInhibited { .. } => {}
+                }
+            }
+        }
+    }
+
+    /// Tick-epilogue wrapper invoking [`Self::emit_and_merge_pos_force_j7`] under a non-blocking
+    /// `try_lock()` on the driver mutex (zero blocking locks on `armd-control`).
+    fn emit_j7_tick_epilogue(
+        &mut self,
+        j7_is_hold: bool,
+        intent: crate::driver::PosForceIntent,
+        tick_output: &mut TickOutput,
+        allow_output_accepted: &mut bool,
+    ) {
+        let Some(ref d) = self.driver else {
+            return;
+        };
+        let mut drv = match d.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        Self::emit_and_merge_pos_force_j7(
+            &mut **drv,
+            j7_is_hold,
+            intent,
+            tick_output,
+            allow_output_accepted,
+        );
     }
 
     /// Single shared constructor converting any bounded driver motion or stopped-hold write
@@ -6097,9 +6363,15 @@ impl SupervisorInner {
         let mut gravity_exiting_or_failed = false;
         let mut gravity_driverless_ok = false;
         let mut gravity_handback_ran = false;
+        self.j7_intent = None;
         // a torque transition in flight owns the bus until it ends (the driver refuses targets)
         let transition_owns_bus = self.torque_transition.is_some();
         if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
+            self.j7_intent = Some(if self.safety.state().is_stopped() {
+                crate::driver::PosForceIntent::Stop
+            } else {
+                crate::driver::PosForceIntent::Hold
+            });
             // If a prior release completed `exit_hold_ms` (and stationary settle when tracking is
             // enabled), execute POS_VEL handback on this dedicated transition release using the
             // active release's TX pass (`set_joint_modes_in_tick`) without first spending 7 frames
@@ -6404,6 +6676,33 @@ impl SupervisorInner {
                 _ => {}
             }
         }
+        // Tick epilogue (BOTH Legacy and RT Executor owners): invoke the ONE J7 PosForce emitter
+        // exactly once per control tick AFTER whatever arm-write path ran (whether arm output
+        // succeeded, deferred, expired, errored, tripped the MIT fence before/mid-batch, hit
+        // stale precheck / BuildRefused / invalid caller J7 target, or was skipped by send_to_bus).
+        if !self.shutdown_committed
+            && self.is_torqued
+            && !self.disable_pending
+            && !transition_owns_bus
+            && !self.urgent_stop_unapplied()
+        {
+            let j7_is_hold = self.safety.state().is_stopped()
+                || self.e_stop_latched.load(Ordering::SeqCst);
+            let j7_intent = if j7_is_hold {
+                crate::driver::PosForceIntent::Stop
+            } else if matches!(tick_output, TickOutput::Error { .. } | TickOutput::Expired { .. }) {
+                crate::driver::PosForceIntent::Hold
+            } else {
+                self.j7_intent.unwrap_or(crate::driver::PosForceIntent::Hold)
+            };
+            self.emit_j7_tick_epilogue(
+                j7_is_hold,
+                j7_intent,
+                &mut tick_output,
+                &mut allow_output_accepted,
+            );
+        }
+        self.j7_intent = None;
         let has_pending_motion = matches!(tick_output, TickOutput::None)
             && self.max_tx_joint_no_progress_ticks() > 0
             && self.driver.as_ref().is_some_and(|d| {

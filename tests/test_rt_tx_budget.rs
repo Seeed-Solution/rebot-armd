@@ -3862,3 +3862,331 @@ fn slow_cadence_unconfirmed_joint_rotates_both_posvel_and_mit_hold_slots() {
         );
     }
 }
+
+/// Remove every `#[cfg(test)]` item (module, function, or `mod foo;` declaration) from a
+/// comment/literal-stripped Rust source string so static production-code proofs never trip on
+/// unit tests while preserving all non-test production tokens.
+fn strip_cfg_test_items(clean: &str) -> String {
+    let bytes = clean.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+    while i < len {
+        if bytes[i] == b'#' {
+            // Match `#[cfg(test)]` allowing arbitrary whitespace inside the attribute.
+            let mut j = i + 1;
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && bytes[j] == b'[' {
+                let mut depth = 0usize;
+                let attr_start = j;
+                while j < len {
+                    match bytes[j] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            j += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let attr_compact: String = clean[attr_start..j]
+                    .chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
+                if attr_compact == "[cfg(test)]" {
+                    // Skip any chained outer attributes (`#[path = "..."]`, `#[allow(...)]`, ...),
+                    // then skip either the item's balanced `{ ... }` block or terminating `;`.
+                    loop {
+                        while j < len && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < len && bytes[j] == b'#' {
+                            j += 1;
+                            while j < len && bytes[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                            if j < len && bytes[j] == b'[' {
+                                let mut ad = 0usize;
+                                while j < len {
+                                    match bytes[j] {
+                                        b'[' => ad += 1,
+                                        b']' => {
+                                            ad -= 1;
+                                            j += 1;
+                                            if ad == 0 {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
+                                    j += 1;
+                                }
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    while j < len {
+                        if bytes[j] == b';' {
+                            j += 1;
+                            break;
+                        }
+                        if bytes[j] == b'{' {
+                            let mut bd = 0usize;
+                            while j < len {
+                                match bytes[j] {
+                                    b'{' => bd += 1,
+                                    b'}' => {
+                                        bd -= 1;
+                                        j += 1;
+                                        if bd == 0 {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                                j += 1;
+                            }
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = clean[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Partition `clean` (already comment/literal/test-stripped) around the unique function definition
+/// matching `fn_prefix` (e.g. `"fn emit_pos_force_frame("`) into `(outside_compact, body_compact)`.
+fn partition_unique_fn_compact(clean: &str, fn_prefix: &str) -> (String, String) {
+    let matches: Vec<usize> = clean.match_indices(fn_prefix).map(|(idx, _)| idx).collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one `{fn_prefix}` definition, found {}",
+        matches.len()
+    );
+    let fn_start = matches[0];
+    let body_open = clean[fn_start..]
+        .find('{')
+        .map(|rel| fn_start + rel)
+        .unwrap_or_else(|| panic!("missing opening brace for `{fn_prefix}`"));
+    let mut depth = 0usize;
+    let mut body_end = None;
+    for (rel, ch) in clean[body_open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = Some(body_open + rel);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body_end = body_end.unwrap_or_else(|| panic!("missing closing brace for `{fn_prefix}`"));
+    let body = &clean[body_open..=body_end];
+    let outside = format!("{}{}", &clean[..fn_start], &clean[body_end + 1..]);
+    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
+    (compact(&outside), compact(body))
+}
+
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn pos_force_0x307_frame_construction_exists_only_in_single_emitter() {
+    // Self-check: verify multi-line splits are caught and #[cfg(test)] / comments / literals ignored.
+    let synthetic = r#"
+        impl Demo {
+            // damiao::build_pos_force_frame(0x300, 7, 0.0, 0, 0);
+            fn emit_pos_force_frame(&mut self) {
+                let _s = "build_pos_force_frame(0x307)";
+                damiao::
+                    build_pos_force_frame(0x300, 7, 0.0, 0, 0);
+            }
+            fn sneaky(&mut self) {
+                build_pos_force_frame
+                    (0x300, 7, 0.0, 0, 0);
+            }
+        }
+        #[cfg(test)]
+        mod tests {
+            fn t() { build_pos_force_frame(0x300, 7, 0.0, 0, 0); }
+        }
+    "#;
+    let syn_prod = strip_cfg_test_items(&strip_rust_comments_and_literals(synthetic));
+    let (syn_out, syn_in) = partition_unique_fn_compact(&syn_prod, "fn emit_pos_force_frame(");
+    assert_eq!(syn_in.matches("build_pos_force_frame(").count(), 1);
+    assert_eq!(
+        syn_out.matches("build_pos_force_frame(").count(),
+        1,
+        "must catch multi-line build_pos_force_frame( outside emitter: {syn_out}"
+    );
+
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+    assert!(!files.is_empty(), "expected Rust source files under src/");
+
+    let mut total_driver_build_sites = 0usize;
+    let mut total_owner_emit_j7_calls = 0usize;
+
+    for path in &files {
+        let rel = path
+            .strip_prefix(&src_root)
+            .expect("relative under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let prod = strip_cfg_test_items(&strip_rust_comments_and_literals(&raw));
+        let compact: String = prod.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let compact_lower = compact.to_ascii_lowercase();
+
+        if rel == "protocol/damiao.rs" {
+            // Only the `pub fn build_pos_force_frame(` definition itself may appear here.
+            assert_eq!(
+                compact.matches("build_pos_force_frame(").count(),
+                1,
+                "src/protocol/damiao.rs must contain only the build_pos_force_frame definition"
+            );
+            assert!(
+                compact.contains("pubfnbuild_pos_force_frame("),
+                "expected pub fn build_pos_force_frame definition in src/protocol/damiao.rs"
+            );
+            continue;
+        }
+
+        if rel == "driver.rs" {
+            let (outside, inside) = partition_unique_fn_compact(&prod, "fn emit_pos_force_frame(");
+            assert_eq!(
+                inside.matches("build_pos_force_frame(").count(),
+                1,
+                "DamiaoArmDriver::emit_pos_force_frame must contain EXACTLY ONE build_pos_force_frame( call"
+            );
+            assert_eq!(
+                outside.matches("build_pos_force_frame(").count(),
+                0,
+                "src/driver.rs must have ZERO build_pos_force_frame( calls outside emit_pos_force_frame"
+            );
+            total_driver_build_sites += inside.matches("build_pos_force_frame(").count();
+            continue;
+        }
+
+        // Every other production source file in src/: ZERO 0x307 / POS_FORCE_BASE_ID / build_pos_force_frame.
+        assert_eq!(
+            compact.matches("build_pos_force_frame(").count(),
+            0,
+            "production file src/{rel} must not call build_pos_force_frame("
+        );
+        assert_eq!(
+            compact.matches("POS_FORCE_BASE_ID").count(),
+            0,
+            "production file src/{rel} must not reference POS_FORCE_BASE_ID"
+        );
+        assert_eq!(
+            compact_lower.matches("0x307").count(),
+            0,
+            "production file src/{rel} must not hardcode CAN ID 0x307"
+        );
+
+        // Outside driver.rs and joint_zero.rs (trait + zero-offset wrapper), `emit_pos_force_j7(`
+        // may be invoked ONLY inside `SupervisorInner::emit_and_merge_pos_force_j7` in supervisor.rs,
+        // which itself is called ONLY from `emit_j7_tick_epilogue`, which is called ONLY once in
+        // `tick_control_inner` (shared by BOTH Legacy and RT Executor owners).
+        if rel == "supervisor.rs" {
+            let (outside_merge, inside_merge) =
+                partition_unique_fn_compact(&prod, "fn emit_and_merge_pos_force_j7(");
+            assert_eq!(
+                inside_merge.matches("emit_pos_force_j7(").count(),
+                1,
+                "SupervisorInner::emit_and_merge_pos_force_j7 must call emit_pos_force_j7( once"
+            );
+            assert_eq!(
+                outside_merge.matches("emit_pos_force_j7(").count(),
+                0,
+                "src/supervisor.rs must have ZERO emit_pos_force_j7( calls outside emit_and_merge_pos_force_j7"
+            );
+            total_owner_emit_j7_calls += inside_merge.matches("emit_pos_force_j7(").count();
+
+            let (outside_epilogue, inside_epilogue) =
+                partition_unique_fn_compact(&prod, "fn emit_j7_tick_epilogue(");
+            assert_eq!(
+                inside_epilogue.matches("emit_and_merge_pos_force_j7(").count(),
+                1,
+                "emit_j7_tick_epilogue must call emit_and_merge_pos_force_j7( once"
+            );
+            // Outside `emit_j7_tick_epilogue`, only the definition `fn emit_and_merge_pos_force_j7(` exists.
+            assert_eq!(
+                outside_epilogue.matches("emit_and_merge_pos_force_j7(").count(),
+                1,
+                "emit_and_merge_pos_force_j7 must have no callers outside emit_j7_tick_epilogue"
+            );
+
+            let (outside_tick, inside_tick) =
+                partition_unique_fn_compact(&prod, "fn tick_control_inner(");
+            assert_eq!(
+                inside_tick.matches("emit_j7_tick_epilogue(").count(),
+                1,
+                "tick_control_inner must call emit_j7_tick_epilogue( exactly once"
+            );
+            // Outside `tick_control_inner`, only the definition `fn emit_j7_tick_epilogue(` exists.
+            assert_eq!(
+                outside_tick.matches("emit_j7_tick_epilogue(").count(),
+                1,
+                "emit_j7_tick_epilogue must have no callers outside tick_control_inner"
+            );
+        } else if rel != "joint_zero.rs" {
+            assert_eq!(
+                compact.matches("emit_pos_force_j7(").count(),
+                0,
+                "production file src/{rel} must not call emit_pos_force_j7("
+            );
+            assert_eq!(
+                compact.matches("emit_and_merge_pos_force_j7(").count(),
+                0,
+                "production file src/{rel} must not call emit_and_merge_pos_force_j7("
+            );
+        }
+    }
+
+    assert_eq!(
+        total_driver_build_sites, 1,
+        "expected exactly 1 production build_pos_force_frame call site across src/"
+    );
+    assert_eq!(
+        total_owner_emit_j7_calls, 1,
+        "expected exactly 1 owner-side emit_pos_force_j7 call site across src/"
+    );
+}

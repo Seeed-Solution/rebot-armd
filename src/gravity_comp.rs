@@ -417,7 +417,16 @@ impl SupervisorInner {
         } else {
             drv.write_joint_targets_bounded(&targets)
         };
-        crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res)
+        let out = crate::supervisor::SupervisorInner::tick_output_from_driver_write(&mut **drv, is_hold, write_res);
+        // Never write a 0x307 frame outside the tick epilogue's ONE J7 emitter: record intent
+        // only so an in-tick urgent E-stop emits J7 strictly once in the epilogue and an off-tick
+        // exit hands J7 off to the next control tick.
+        self.j7_intent = Some(if is_hold {
+            crate::driver::PosForceIntent::Stop
+        } else {
+            crate::driver::PosForceIntent::Hold
+        });
+        out
     }
 
     /// Stack-allocated gravity-comp targets (`ARM` MIT joints + 1 position gripper), 0 heap allocs.

@@ -220,8 +220,34 @@ impl ArmDriver for ZeroOffsetDriver {
         self.motor_targets = m;
         r
     }
-    fn write_pos_force_stopped_hold_only(&mut self) -> Result<crate::driver::TxBatchOutcome, ArmDriverError> {
-        self.inner.write_pos_force_stopped_hold_only()
+    fn set_external_pos_force_emitter(&mut self, enabled: bool) {
+        self.inner.set_external_pos_force_emitter(enabled);
+    }
+    fn validate_pos_force_intent_target(
+        &self,
+        position: f32,
+        velocity: Option<f32>,
+        current_raw: Option<u16>,
+    ) -> Result<(), ArmDriverError> {
+        let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+        self.inner.validate_pos_force_intent_target(position + offset, velocity, current_raw)
+    }
+    fn emit_pos_force_j7(
+        &mut self,
+        intent: crate::driver::PosForceIntent,
+    ) -> Result<crate::driver::PosForceEmitOutcome, ArmDriverError> {
+        let mapped = match intent {
+            crate::driver::PosForceIntent::Target { position, velocity, current_raw } => {
+                let offset = self.inner.gripper_pos_force_info().map_or(0.0, |info| self.off(info.joint));
+                crate::driver::PosForceIntent::Target {
+                    position: position + offset,
+                    velocity,
+                    current_raw,
+                }
+            }
+            other => other,
+        };
+        self.inner.emit_pos_force_j7(mapped)
     }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
     fn last_hold_tx_due_mask(&self) -> u64 { self.inner.last_hold_tx_due_mask() }
