@@ -1069,6 +1069,13 @@ pub struct SupervisorInner {
     pub stop_gen: Arc<AtomicU64>,
     /// Lock-free mirror of the active lease generation (`0` when no lease is held).
     pub lease_gen_mirror: Arc<AtomicU64>,
+    /// Lock-free closed-connection bitset shared with [`ArmSupervisor`] so socket close fences
+    /// immediately across both legacy and RT owners without locking.
+    pub(crate) shared_closed_bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
+    /// Lock-free highest lease generation fenced on immediate socket close (`fetch_max`).
+    pub(crate) atomic_fenced_lease_gen: Arc<AtomicU64>,
+    /// Lock-free count of queued socket-close fences awaiting owner drain (fail-closed hold when > 0).
+    pub(crate) pending_disconnect_hold: Arc<AtomicU64>,
     pub last_preemption: Option<Instant>,
     /// Connection and generation most recently evicted by a forced acquire.
     pub last_evicted: Option<(String, u64)>,
@@ -2083,6 +2090,9 @@ impl SupervisorInner {
             estop_applied: Arc::new(AtomicU64::new(0)),
             stop_gen: Arc::new(AtomicU64::new(0)),
             lease_gen_mirror: Arc::new(AtomicU64::new(0)),
+            shared_closed_bitset: Arc::new(crate::rt_core::requests::actions::ClosedBitset::new()),
+            atomic_fenced_lease_gen: Arc::new(AtomicU64::new(0)),
+            pending_disconnect_hold: Arc::new(AtomicU64::new(0)),
             last_preemption: None,
             last_evicted: None,
             handover_settling_since: None,
@@ -2220,12 +2230,18 @@ impl SupervisorInner {
         requested_estop_count: Arc<AtomicU64>,
         stop_gen: Arc<AtomicU64>,
         lease_gen_mirror: Arc<AtomicU64>,
+        shared_closed_bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
+        atomic_fenced_lease_gen: Arc<AtomicU64>,
+        pending_disconnect_hold: Arc<AtomicU64>,
     ) -> Self {
         let mut shell = Self::new(config.clone());
         shell.e_stop_latched = e_stop_latched;
         shell.requested_estop_count = requested_estop_count;
         shell.stop_gen = stop_gen;
         shell.lease_gen_mirror = lease_gen_mirror;
+        shell.shared_closed_bitset = shared_closed_bitset;
+        shell.atomic_fenced_lease_gen = atomic_fenced_lease_gen;
+        shell.pending_disconnect_hold = pending_disconnect_hold;
         shell.detached = true;
         shell
     }
@@ -2239,12 +2255,108 @@ impl SupervisorInner {
         }
     }
 
-    /// Current valid (unexpired, unfenced) active lease generation, or `0` when no valid lease is held.
+    /// Effective highest fenced lease generation, combining owner-local and lock-free immediate
+    /// socket-close fences (`SeqCst`).
+    #[inline]
+    pub(crate) fn effective_fenced_lease_generation(&self) -> u64 {
+        self.fenced_lease_generation
+            .max(self.atomic_fenced_lease_gen.load(Ordering::SeqCst))
+    }
+
+    /// Lock-free check evaluated immediately before emitting actuator targets: true when an
+    /// un-drained disconnect hold is active, an immediate socket-close generation fence has not
+    /// yet been synced, or the active lease's connection is already closed and unfenced.
+    #[inline]
+    pub(crate) fn disconnect_fence_blocks_output(&self) -> bool {
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return true;
+        }
+        let atomic_fenced = self.atomic_fenced_lease_gen.load(Ordering::SeqCst);
+        if atomic_fenced > self.fenced_lease_generation {
+            return true;
+        }
+        if self.active_lease_conn_id != 0
+            && self.is_connection_closed(self.active_lease_conn_id)
+            && self
+                .active_lease
+                .as_ref()
+                .is_some_and(|a| a.generation > self.fenced_lease_generation)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Lock-free, zero-allocation owner synchronization of immediate socket-close fences
+    /// (`atomic_fenced_lease_gen`, `shared_closed_bitset`, and `pending_disconnect_hold`).
+    /// Runs at the top of every control tick, RT Step 1, and every RT checkpoint BEFORE any
+    /// command commit, target intake, or bus output.
+    pub(crate) fn sync_nonblocking_disconnect_fence(&mut self, _now: Instant) -> bool {
+        let mut fenced_any = false;
+        let atomic_fenced = self.atomic_fenced_lease_gen.load(Ordering::SeqCst);
+        if atomic_fenced > self.fenced_lease_generation {
+            let stop_client_motion =
+                self.watchdog_park.is_none() && !self.pending_normal_unload;
+            self.fence_displaced_lease_generation(atomic_fenced, stop_client_motion);
+            fenced_any = true;
+        }
+        let closed_active = self.active_lease.as_ref().and_then(|a| {
+            let conn_closed = self.active_lease_conn_id != 0
+                && self.is_connection_closed(self.active_lease_conn_id);
+            let gen_fenced = a.generation <= self.fenced_lease_generation;
+            (conn_closed || gen_fenced).then_some((a.generation, conn_closed))
+        });
+        if let Some((gen, conn_closed)) = closed_active {
+            let stop_client_motion =
+                self.watchdog_park.is_none() && !self.pending_normal_unload;
+            self.fence_displaced_lease_generation(gen, stop_client_motion);
+            if conn_closed {
+                let cid = self.active_lease_conn_id;
+                if cid != 0 {
+                    self.mark_connection_closed(cid);
+                }
+                let _ = self.clear_active_lease_in_place();
+            }
+            fenced_any = true;
+        }
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            if self.watchdog_park.is_none() && !self.pending_normal_unload {
+                self.stop_motion();
+                self.core.revoke_stream();
+            }
+            fenced_any = true;
+        }
+        fenced_any
+    }
+
+    /// Purges any connection ID already closed in the lock-free `shared_closed_bitset` from
+    /// `live_connections` (and records it in `closed_connections`) with zero heap allocations.
+    /// Called before RT ownership handoff so RT never inherits a stale connection or lease.
+    pub(crate) fn purge_closed_live_connections(&mut self) {
+        let mut closed_ids = [0u64; MAX_LIVE_CONNECTIONS];
+        let mut n = 0usize;
+        for &id in &self.live_connections.ids[..self.live_connections.len] {
+            if id != 0 && self.is_connection_closed(id) {
+                closed_ids[n] = id;
+                n += 1;
+            }
+        }
+        for &id in &closed_ids[..n] {
+            self.mark_connection_closed(id);
+        }
+        self.sync_nonblocking_disconnect_fence(Instant::now());
+    }
+
+    /// Current valid (unexpired, unfenced, open-connection) active lease generation, or `0` when no valid lease is held.
     pub fn current_active_lease_gen(&self) -> u64 {
+        let fenced = self.effective_fenced_lease_generation();
+        if self.active_lease_conn_id != 0 && self.is_connection_closed(self.active_lease_conn_id) {
+            return 0;
+        }
         self.active_lease
             .as_ref()
             .filter(|a| {
-                a.generation > self.fenced_lease_generation
+                a.generation > fenced
                     && a.acquired_at.elapsed() < self.lease_timeout
             })
             .map_or(0, |a| a.generation)
@@ -2263,8 +2375,13 @@ impl SupervisorInner {
     }
 
     /// Registers a live WS connection ID (`>= 1`) under the owner lock (fail-closed at
-    /// [`MAX_LIVE_CONNECTIONS`]).
+    /// [`MAX_LIVE_CONNECTIONS`]). Rejects IDs already fenced closed in the lock-free bitset.
     pub fn register_live_connection(&mut self, connection_id: u64) -> Result<(), &'static str> {
+        if connection_id != 0 && self.is_connection_closed(connection_id) {
+            self.closed_connections
+                .mark_closed(connection_id, &self.live_connections);
+            return Err("DISCONNECTED");
+        }
         self.live_connections
             .register(connection_id, &self.closed_connections)
     }
@@ -2276,6 +2393,7 @@ impl SupervisorInner {
         self.live_connections.remove(connection_id);
         self.closed_connections
             .mark_closed(connection_id, &self.live_connections);
+        self.shared_closed_bitset.mark_closed(connection_id);
         if let Some(rt) = self.rt_closed_connections.as_ref() {
             rt.mark_closed(connection_id);
         }
@@ -2339,9 +2457,10 @@ impl SupervisorInner {
     }
 
     /// Returns true if WS connection `connection_id` (`>= 1`) has been marked closed under
-    /// either the legacy owner lock or the lock-free RT broker bitset.
+    /// the legacy owner lock, the lock-free shared disconnect bitset, or the RT broker bitset.
     pub fn is_connection_closed(&self, connection_id: u64) -> bool {
         self.closed_connections.is_closed(connection_id)
+            || self.shared_closed_bitset.is_closed(connection_id)
             || self
                 .rt_closed_connections
                 .as_ref()
@@ -2350,7 +2469,7 @@ impl SupervisorInner {
 
     /// Returns true if `connection_id` (`>= 1`) is currently registered and open.
     pub fn is_connection_live(&self, connection_id: u64) -> bool {
-        !self.closed_connections.is_closed(connection_id)
+        !self.is_connection_closed(connection_id)
             && self.live_connections.contains(connection_id)
     }
 
@@ -2378,7 +2497,7 @@ impl SupervisorInner {
         if client_id == 0 {
             return Ok(());
         }
-        if self.closed_connections.is_closed(client_id) {
+        if self.is_connection_closed(client_id) {
             return Err("DISCONNECTED");
         }
         if require_registered && !self.live_connections.contains(client_id) {
@@ -2487,6 +2606,8 @@ impl SupervisorInner {
             return;
         }
         self.fenced_lease_generation = self.fenced_lease_generation.max(displaced_gen);
+        self.atomic_fenced_lease_gen
+            .fetch_max(self.fenced_lease_generation, Ordering::SeqCst);
         self.core.revoke_stream();
         if self.gripper_stream_lease == Some(displaced_gen) {
             self.end_gripper_stream();
@@ -3044,10 +3165,17 @@ impl SupervisorInner {
     /// Zero-allocation, lock-free `Copy` snapshot of owner authority, lease, torque, busy, and
     /// planning inputs published alongside every observation on `StateHub`.
     pub(crate) fn owner_state_snapshot(&self, now: Instant) -> crate::rt_core::publish::OwnerStateSnapshot {
-        let active = self.active_lease.as_ref().filter(|a| {
-            a.generation > self.fenced_lease_generation
-                && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
-        });
+        let fenced_gen = self.effective_fenced_lease_generation();
+        let active_conn_closed = self.active_lease_conn_id != 0
+            && self.is_connection_closed(self.active_lease_conn_id);
+        let active = if active_conn_closed {
+            None
+        } else {
+            self.active_lease.as_ref().filter(|a| {
+                a.generation > fenced_gen
+                    && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
+            })
+        };
         let (lease_generation, lease_owner, lease_owner_conn_id, lease_label, lease_expires_at) =
             match active {
                 Some(a) => (
@@ -3080,7 +3208,7 @@ impl SupervisorInner {
             lease_expires_at,
             last_evicted_owner,
             last_evicted_generation,
-            fenced_lease_generation: self.fenced_lease_generation,
+            fenced_lease_generation: fenced_gen,
             last_preemption: self.last_preemption,
             epoch: self.safety.epoch_id(),
             stop_generation: self.current_stop_gen(),
@@ -6605,7 +6733,11 @@ impl SupervisorInner {
         // the scratch goes back for the helpers below; `before_velocities` stays in it
         self.scratch = sc;
 
-        // 0.0 Fence an expired lease generation BEFORE gripper/motion/watchdog output runs
+        // 0.0 Apply any non-blocking socket-close lease fence & pending disconnect hold BEFORE
+        // expiry check, gripper, motion, or bus output runs.
+        self.sync_nonblocking_disconnect_fence(Instant::now());
+
+        // 0.0b Fence an expired lease generation BEFORE gripper/motion/watchdog output runs
         // (preserves `active_lease = Some(expired)` for expiry telemetry, retires expired client
         // servo/trajectory motion, and preserves any autonomous watchdog park explicitly).
         if let Some(expired_gen) = self
@@ -7909,14 +8041,16 @@ impl SupervisorInner {
                     if let Ok(mut driver) = d.lock() {
                         if driver.enable_state() != EnableState::Disabled {
                             let is_hold = self.safety.state().is_stopped();
-                            let write_res = if is_hold {
-                                driver.write_estop_hold_bounded(&targets)
-                            } else {
-                                driver.write_joint_targets_bounded(&targets)
-                            };
-                            tick_output = Self::tick_output_from_driver_write(&mut **driver, is_hold, write_res);
-                            if matches!(tick_output, TickOutput::Complete { is_hold: false, .. }) {
-                                allow_output_accepted = true;
+                            if is_hold || !self.disconnect_fence_blocks_output() {
+                                let write_res = if is_hold {
+                                    driver.write_estop_hold_bounded(&targets)
+                                } else {
+                                    driver.write_joint_targets_bounded(&targets)
+                                };
+                                tick_output = Self::tick_output_from_driver_write(&mut **driver, is_hold, write_res);
+                                if matches!(tick_output, TickOutput::Complete { is_hold: false, .. }) {
+                                    allow_output_accepted = true;
+                                }
                             }
                         }
                     }
@@ -8906,6 +9040,12 @@ pub struct ArmSupervisor {
     stop_gen: Arc<AtomicU64>,
     estop_epoch: Arc<AtomicU64>,
     lease_gen_mirror: Arc<AtomicU64>,
+    closed_bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
+    atomic_fenced_lease_gen: Arc<AtomicU64>,
+    pending_disconnect_hold: Arc<AtomicU64>,
+    /// Leaf queue of socket-close disconnects deferred when the owner write lock is contended
+    /// or ownership is transitioning (`OWNER_TRANSFERRING`); NEVER locked on `armd-control`.
+    pending_disconnects: std::sync::Mutex<std::collections::VecDeque<crate::rt_core::requests::lease::ConnectionHandle>>,
     tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     control_sched: Arc<std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     /// Readers' side of the tick's state publication (`crate::rt_core::publish`).
@@ -9097,11 +9237,14 @@ struct TransferGuard<'a> {
 impl Drop for TransferGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let mut slot = self.sup.owner.lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(*slot, OwnerSlot::Transferring) {
-                *slot = OwnerSlot::Legacy;
-                self.sup.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+            {
+                let mut slot = self.sup.owner.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*slot, OwnerSlot::Transferring) {
+                    *slot = OwnerSlot::Legacy;
+                    self.sup.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+                }
             }
+            self.sup.try_drain_pending_disconnects_legacy();
         }
     }
 }
@@ -9205,12 +9348,18 @@ impl ArmSupervisor {
         let requested_estop_count = Arc::new(AtomicU64::new(0));
         let stop_gen = Arc::new(AtomicU64::new(0));
         let lease_gen_mirror = Arc::new(AtomicU64::new(0));
+        let closed_bitset = Arc::new(crate::rt_core::requests::actions::ClosedBitset::new());
+        let atomic_fenced_lease_gen = Arc::new(AtomicU64::new(0));
+        let pending_disconnect_hold = Arc::new(AtomicU64::new(0));
         let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
         inner.stop_gen = stop_gen.clone();
         inner.lease_gen_mirror = lease_gen_mirror.clone();
+        inner.shared_closed_bitset = closed_bitset.clone();
+        inner.atomic_fenced_lease_gen = atomic_fenced_lease_gen.clone();
+        inner.pending_disconnect_hold = pending_disconnect_hold.clone();
         inner.terminals = Some(Arc::clone(&terminals));
         let template_obs = inner.current_observation();
         let initial_pub_cfg = crate::rt_core::requests::config::PublishedConfig::from_inner(&inner);
@@ -9234,6 +9383,10 @@ impl ArmSupervisor {
             stop_gen,
             estop_epoch,
             lease_gen_mirror,
+            closed_bitset,
+            atomic_fenced_lease_gen,
+            pending_disconnect_hold,
+            pending_disconnects: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tick_stats: Arc::new(crate::diagnostics::tick::LockFreeTickStats::new()),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
             hub,
@@ -9611,7 +9764,14 @@ impl ArmSupervisor {
             rollback.armed = false;
         };
 
-        // Zero `.await` points below this line: swap + synchronous spawn + commit/rollback.
+        // Zero `.await` points below this line: drain all socket-close disconnects queued while
+        // the write lock was held or during `OWNER_TRANSFERRING` BEFORE checking transfer state,
+        // seeding `ConnLifecycleClient`, or spawning RT, so RT never inherits a stale connection
+        // or lease.
+        if !guard.detached {
+            let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
+            guard.purge_closed_live_connections();
+        }
         if guard.detached
             || guard.calibration_busy
             || guard.motor_zero_busy
@@ -9687,6 +9847,9 @@ impl ArmSupervisor {
             self.requested_estop_count.clone(),
             self.stop_gen.clone(),
             self.lease_gen_mirror.clone(),
+            self.closed_bitset.clone(),
+            self.atomic_fenced_lease_gen.clone(),
+            self.pending_disconnect_hold.clone(),
         );
         let real = std::mem::replace(&mut *guard, shell);
 
@@ -9712,13 +9875,19 @@ impl ArmSupervisor {
                 }
                 rollback.armed = false;
                 drop(guard);
+                // Forward any socket-close disconnects queued in the tiny window between draining
+                // `guard` and publishing `OWNER_EXECUTOR` directly to the new RT owner.
+                self.forward_pending_disconnects_to_executor(&handle);
                 self.hub.wake();
                 Ok(handle)
             }
             Err((Some(real), msg)) => {
                 *guard = *real;
+                let _ = self.drain_pending_disconnects_under_guard(&mut guard, None);
+                guard.purge_closed_live_connections();
                 restore_legacy(&mut rollback);
                 drop(guard);
+                self.try_drain_pending_disconnects_legacy();
                 Err(ArmError::Internal(msg))
             }
             Err((None, msg)) => {
@@ -10679,12 +10848,201 @@ impl ArmSupervisor {
         }
     }
 
+    /// True when one or more socket-close disconnect fences are queued awaiting owner drain
+    /// (fail-closed output hold active).
+    pub fn has_pending_disconnect_hold(&self) -> bool {
+        self.pending_disconnect_hold.load(Ordering::SeqCst) > 0
+    }
+
+    /// True if `conn_id` (`>= 1`) has been marked closed in the lock-free immediate disconnect fence.
+    pub fn is_connection_fenced_closed(&self, conn_id: u64) -> bool {
+        self.closed_bitset.is_closed(conn_id)
+    }
+
+    /// Highest lease generation fenced via the lock-free immediate socket-close fence.
+    pub fn atomic_fenced_lease_gen(&self) -> u64 {
+        self.atomic_fenced_lease_gen.load(Ordering::SeqCst)
+    }
+
+    fn enqueue_pending_disconnect(&self, conn: crate::rt_core::requests::lease::ConnectionHandle) {
+        let mut q = self
+            .pending_disconnects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !q.iter().any(|c| c.id() == conn.id()) {
+            q.push_back(conn);
+        }
+        self.pending_disconnect_hold
+            .store(q.len() as u64, Ordering::SeqCst);
+    }
+
+    fn drain_pending_disconnects_under_guard(
+        &self,
+        inner: &mut SupervisorInner,
+        target_conn_id: Option<u64>,
+    ) -> Option<crate::rt_core::requests::lease::LeaseOutcome> {
+        use crate::rt_core::requests::lease::{install_lease_disconnect, prepare_lease_disconnect};
+        let mut target_outcome = None;
+        loop {
+            let next = {
+                let q = self
+                    .pending_disconnects
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                q.front().copied()
+            };
+            let Some(conn) = next else {
+                break;
+            };
+            let prep = prepare_lease_disconnect(conn);
+            let outcome = install_lease_disconnect(inner, &prep.request, Instant::now());
+            if target_conn_id == Some(conn.id()) {
+                target_outcome = Some(outcome);
+            }
+            let mut q = self
+                .pending_disconnects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if q.front().is_some_and(|c| c.id() == conn.id()) {
+                q.pop_front();
+            }
+            self.pending_disconnect_hold
+                .store(q.len() as u64, Ordering::SeqCst);
+        }
+        target_outcome
+    }
+
+    fn forward_pending_disconnects_to_executor(
+        &self,
+        handle: &crate::rt_core::executor::RtExecutorHandle,
+    ) {
+        loop {
+            let next = {
+                let q = self
+                    .pending_disconnects
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                q.front().copied()
+            };
+            let Some(conn) = next else {
+                break;
+            };
+            handle.enqueue_disconnect_detached(conn);
+            let mut q = self
+                .pending_disconnects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if q.front().is_some_and(|c| c.id() == conn.id()) {
+                q.pop_front();
+            }
+            self.pending_disconnect_hold
+                .store(q.len() as u64, Ordering::SeqCst);
+        }
+    }
+
+    fn try_drain_pending_disconnects_legacy(&self) {
+        if self.pending_disconnect_hold.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.try_write() {
+            if !inner.detached && self.owner_mode() == OWNER_LEGACY {
+                let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
+            }
+        }
+    }
+
+    /// Single non-blocking socket-close fence entry point (M1): marks the connection closed in the
+    /// lock-free bitset, monotonically fences `local_gen` if non-zero, and dispatches a
+    /// non-blocking owner-side fence BEFORE any task abort, join, or cleanup runs.
+    ///
+    /// - Under `OWNER_EXECUTOR`: immediately disconnects the broker client and pushes priority
+    ///   `LifecycleCmd::Disconnect` onto the RT priority intake without awaiting.
+    /// - Under `OWNER_LEGACY`: attempts `try_write()` to run `install_lease_disconnect` inline;
+    ///   when the write lock is contended, queues the fence and activates fail-closed hold.
+    /// - Under `OWNER_TRANSFERRING` / `OWNER_FAILED`: queues the fence to the winning owner and
+    ///   activates fail-closed hold so teardown never returns unfenced and RT never inherits a
+    ///   stale connection or lease.
+    pub fn fence_ws_connection_immediate(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        local_gen: u64,
+    ) {
+        let _ = self.fence_ws_connection_immediate_outcome(conn, local_gen);
+    }
+
+    fn fence_ws_connection_immediate_outcome(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        local_gen: u64,
+    ) -> Option<crate::rt_core::requests::lease::LeaseOutcome> {
+        use crate::rt_core::requests::lease::{install_lease_disconnect, prepare_lease_disconnect};
+        if conn.id() != 0 {
+            self.closed_bitset.mark_closed(conn.id());
+        }
+        if local_gen > 0 {
+            self.atomic_fenced_lease_gen
+                .fetch_max(local_gen, Ordering::SeqCst);
+            let _ = self.lease_gen_mirror.compare_exchange(
+                local_gen,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                if let Some(handle) = self.executor_handle() {
+                    handle.enqueue_disconnect_detached(conn);
+                } else {
+                    self.enqueue_pending_disconnect(conn);
+                }
+                None
+            }
+            OWNER_LEGACY => {
+                if let Ok(mut inner) = self.inner.try_write() {
+                    if !inner.detached && self.owner_mode() == OWNER_LEGACY {
+                        let queued_out =
+                            self.drain_pending_disconnects_under_guard(&mut inner, Some(conn.id()));
+                        let prep = prepare_lease_disconnect(conn);
+                        let direct_out =
+                            install_lease_disconnect(&mut inner, &prep.request, Instant::now());
+                        return Some(queued_out.unwrap_or(direct_out));
+                    }
+                }
+                self.enqueue_pending_disconnect(conn);
+                if self.owner_mode() == OWNER_EXECUTOR {
+                    if let Some(handle) = self.executor_handle() {
+                        self.forward_pending_disconnects_to_executor(&handle);
+                    }
+                }
+                None
+            }
+            _ => {
+                self.enqueue_pending_disconnect(conn);
+                match self.owner_mode() {
+                    OWNER_EXECUTOR => {
+                        if let Some(handle) = self.executor_handle() {
+                            self.forward_pending_disconnects_to_executor(&handle);
+                        }
+                    }
+                    OWNER_LEGACY => {
+                        self.try_drain_pending_disconnects_legacy();
+                    }
+                    _ => {}
+                }
+                None
+            }
+        }
+    }
+
     /// Unified owner-routed WS connection disconnect (same `prepare_lease_disconnect` +
     /// `install_lease_disconnect` split on both legacy and executor; priority lossless channel
     /// on executor, never dropped when the ordinary broker ring is full).
     ///
-    /// Waits out momentary `OWNER_TRANSFERRING` so mid-handoff teardown always reaches the
-    /// winning owner.
+    /// Runs the non-blocking immediate fence FIRST, then waits up to 500 ms for `OWNER_TRANSFERRING`
+    /// or a contended legacy write lock to settle. If the lock or transfer is still held past the
+    /// bound, the connection remains fenced in `closed_bitset`, queued in `pending_disconnects`,
+    /// and held fail-closed (`pending_disconnect_hold > 0`) until the winning owner drains it.
     pub async fn disconnect_ws_connection(
         &self,
         conn: crate::rt_core::requests::lease::ConnectionHandle,
@@ -10692,6 +11050,9 @@ impl ArmSupervisor {
         use crate::rt_core::requests::lease::{
             install_lease_disconnect, prepare_lease_disconnect, LeaseOutcome,
         };
+        if let Some(outcome) = self.fence_ws_connection_immediate_outcome(conn, 0) {
+            return outcome;
+        }
         let prep = prepare_lease_disconnect(conn);
         let settle_deadline = Instant::now() + Duration::from_millis(500);
         let mode = loop {
@@ -10703,23 +11064,48 @@ impl ArmSupervisor {
         };
         match mode {
             OWNER_LEGACY => {
-                let mut inner = self.inner.write().await;
-                if self.check_legacy_under_guard(&inner).is_ok() {
-                    return install_lease_disconnect(&mut inner, &prep.request, Instant::now());
-                }
-                drop(inner);
-                if let Some(handle) = self.executor_handle() {
-                    if let Ok(outcome) = handle.disconnect_connection_async(conn).await {
-                        return outcome;
+                let rem = settle_deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(50));
+                match tokio::time::timeout(rem, self.inner.write()).await {
+                    Ok(mut inner) => {
+                        if self.check_legacy_under_guard(&inner).is_ok() {
+                            let queued_out = self
+                                .drain_pending_disconnects_under_guard(&mut inner, Some(conn.id()));
+                            let direct_out =
+                                install_lease_disconnect(&mut inner, &prep.request, Instant::now());
+                            return queued_out.unwrap_or(direct_out);
+                        }
+                        drop(inner);
+                        if let Some(handle) = self.executor_handle() {
+                            self.forward_pending_disconnects_to_executor(&handle);
+                            if let Ok(outcome) = handle.disconnect_connection_async(conn).await {
+                                return outcome;
+                            }
+                        }
+                        LeaseOutcome::Disconnected {
+                            released: false,
+                            displaced_generation: 0,
+                        }
                     }
-                }
-                LeaseOutcome::Disconnected {
-                    released: false,
-                    displaced_generation: 0,
+                    Err(_) => {
+                        // Write lock held past bound: keep queued & fail-closed (hold); never unfenced.
+                        self.enqueue_pending_disconnect(conn);
+                        if self.owner_mode() == OWNER_EXECUTOR {
+                            if let Some(handle) = self.executor_handle() {
+                                self.forward_pending_disconnects_to_executor(&handle);
+                            }
+                        }
+                        LeaseOutcome::Disconnected {
+                            released: false,
+                            displaced_generation: 0,
+                        }
+                    }
                 }
             }
             OWNER_EXECUTOR => {
                 if let Some(handle) = self.executor_handle() {
+                    self.forward_pending_disconnects_to_executor(&handle);
                     if let Ok(outcome) = handle.disconnect_connection_async(conn).await {
                         return outcome;
                     }
@@ -10729,10 +11115,20 @@ impl ArmSupervisor {
                     displaced_generation: 0,
                 }
             }
-            _ => LeaseOutcome::Disconnected {
-                released: false,
-                displaced_generation: 0,
-            },
+            _ => {
+                // Still `OWNER_TRANSFERRING` past bound (or `OWNER_FAILED`): ensure queued & held
+                // fail-closed so the winning owner drains it before any RT handoff or bus output.
+                self.enqueue_pending_disconnect(conn);
+                if self.owner_mode() == OWNER_EXECUTOR {
+                    if let Some(handle) = self.executor_handle() {
+                        self.forward_pending_disconnects_to_executor(&handle);
+                    }
+                }
+                LeaseOutcome::Disconnected {
+                    released: false,
+                    displaced_generation: 0,
+                }
+            }
         }
     }
 
@@ -10741,20 +11137,7 @@ impl ArmSupervisor {
         &self,
         conn: crate::rt_core::requests::lease::ConnectionHandle,
     ) {
-        if self.owner_mode() == OWNER_EXECUTOR {
-            if let Some(handle) = self.executor_handle() {
-                handle.enqueue_disconnect_detached(conn);
-            }
-        } else if let Ok(mut inner) = self.inner.try_write() {
-            if !inner.detached {
-                let prep = crate::rt_core::requests::lease::prepare_lease_disconnect(conn);
-                let _ = crate::rt_core::requests::lease::install_lease_disconnect(
-                    &mut inner,
-                    &prep.request,
-                    Instant::now(),
-                );
-            }
-        }
+        self.fence_ws_connection_immediate(conn, 0);
     }
 
     fn map_lease_install_err(code: &'static str) -> ArmError {
@@ -12086,6 +12469,9 @@ impl ArmSupervisor {
             let (mut inner, generation) = self.inner.write_tick().await;
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
+            }
+            if self.pending_disconnect_hold.load(Ordering::Acquire) > 0 {
+                let _ = self.drain_pending_disconnects_under_guard(&mut inner, None);
             }
             let locked = Instant::now();
             let usage_locked = UsageMark::now();

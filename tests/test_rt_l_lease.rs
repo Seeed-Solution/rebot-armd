@@ -1518,6 +1518,7 @@ struct L2DriverControl {
     poll_enable_calls: AtomicUsize,
     set_torque_blocking_calls: AtomicUsize,
     abort_enable_calls: AtomicUsize,
+    write_targets_calls: AtomicUsize,
 }
 
 impl Default for L2DriverControl {
@@ -1534,6 +1535,7 @@ impl Default for L2DriverControl {
             poll_enable_calls: AtomicUsize::new(0),
             set_torque_blocking_calls: AtomicUsize::new(0),
             abort_enable_calls: AtomicUsize::new(0),
+            write_targets_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -1622,6 +1624,7 @@ impl ArmDriver for L2MockDriver {
     }
 
     fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        self.ctrl.write_targets_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -3236,6 +3239,289 @@ async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
             "live executor L2 releases must do 0 allocs/frees: {nonzero:?}"
         );
         assert_eq!(sup.inner().control_thread_attempts(), 0);
+        handle.stop_and_join();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m1_disconnect_fences_lease_first_both_owners_and_transfer_lock_over_500ms() {
+    // Part A: Both owners (Legacy & Executor) fence the lease generation immediately on socket
+    // close so zero dynamic output from that generation reaches the bus, before task cleanup.
+    for executor_mode in [false, true] {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let ctrl = Arc::new(L2DriverControl::default());
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+        sup.set_driver(Box::new(L2MockDriver::new(&cfg, None, Arc::clone(&ctrl))))
+            .await;
+        let auth = OperatorAuth::disabled();
+        let addr = serve_with_auth(sup.clone(), auth).await;
+
+        let handle = if executor_mode {
+            let h = sup
+                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+                .await
+                .unwrap();
+            wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+            Some(h)
+        } else {
+            sup.control_tick(0.02).await;
+            None
+        };
+
+        let mut ws1 = connect_ws(addr, "").await;
+        let g1 = ws_reply(
+            &mut ws1,
+            json!({"type": "acquire_lease", "client_id": "m1_holder", "seq": 1}),
+            &["lease_granted"],
+        )
+        .await["generation"]
+            .as_u64()
+            .unwrap();
+        let ep = sup.observation().await.unwrap().epoch_id;
+
+        // Enable torque and verify bus writes happen while lease is active.
+        assert_eq!(
+            ws_reply(
+                &mut ws1,
+                json!({"type": "command", "request_id": 1, "generation": g1, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+                &["command_ack"],
+            )
+            .await["is_torqued"],
+            true
+        );
+
+        if !executor_mode {
+            // Legacy: hold the write lock while closing the socket -> immediate non-blocking fence
+            // MUST fence the generation and suppress bus output BEFORE the lock is even released.
+            let mut guard = sup.inner().write().await;
+            let lease_client_id = guard
+                .active_lease
+                .as_ref()
+                .expect("lease active before close")
+                .client_id
+                .clone();
+            let conn_id: u64 = lease_client_id
+                .strip_prefix("connection:")
+                .expect("ws connection handle prefix")
+                .parse()
+                .expect("numeric ws connection id");
+            assert_ne!(conn_id, 0);
+            // Close the WS socket while the legacy write lock is held.
+            let _ = ws1.close(None).await;
+            drop(ws1);
+            wait_until(Duration::from_secs(2), || {
+                sup.is_connection_fenced_closed(conn_id)
+            })
+            .await;
+            assert!(
+                sup.atomic_fenced_lease_gen() >= g1,
+                "legacy socket close must fence lease generation immediately without blocking on write lock"
+            );
+            assert!(
+                sup.has_pending_disconnect_hold(),
+                "contended legacy close must queue fence and activate fail-closed hold"
+            );
+            let writes_before = ctrl.write_targets_calls.load(Ordering::SeqCst);
+            guard.tick_control(0.02);
+            let writes_after = ctrl.write_targets_calls.load(Ordering::SeqCst);
+            assert_eq!(
+                writes_after, writes_before,
+                "zero bus output from fenced generation may reach driver while fail-closed hold is active"
+            );
+            assert_eq!(
+                guard.current_active_lease_gen(),
+                0,
+                "fenced lease must not remain valid"
+            );
+            drop(guard);
+            // Once lock is released, pending disconnect drains cleanly and hold clears.
+            sup.control_tick(0.02).await;
+            wait_until(Duration::from_secs(2), || {
+                !sup.has_pending_disconnect_hold()
+            })
+            .await;
+            let snap = sup.fresh_snapshot(None).await.unwrap();
+            assert_eq!(snap.owner.lease_generation, 0);
+        } else {
+            // Executor: start a stalled enable transition (after disabling first) OR verify live
+            // disconnect immediately fences `g1`, aborts in-flight enable, and emits zero further
+            // enable polls / bus writes for `g1`.
+            assert_eq!(
+                ws_reply(
+                    &mut ws1,
+                    json!({"type": "command", "request_id": 2, "generation": g1, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": false}}),
+                    &["command_ack"],
+                )
+                .await["is_torqued"],
+                false
+            );
+            ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+            send(
+                &mut ws1,
+                json!({"type": "command", "request_id": 3, "generation": g1, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+            )
+            .await;
+            wait_until(Duration::from_secs(2), || {
+                ctrl.begin_enable_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await;
+            let _ = ws1.close(None).await;
+            drop(ws1);
+            wait_until(Duration::from_secs(2), || {
+                sup.atomic_fenced_lease_gen() >= g1
+                    && handle.as_ref().unwrap().live_connection_slots() == 0
+            })
+            .await;
+            let snap = sup.fresh_snapshot(None).await.unwrap();
+            assert_eq!(snap.owner.lease_generation, 0);
+            assert!(snap.owner.fenced_lease_generation >= g1);
+            assert!(
+                ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1,
+                "executor socket close must abort in-flight enable for fenced generation"
+            );
+        }
+
+        if let Some(h) = handle {
+            h.stop_and_join();
+        }
+    }
+
+    // Part B: Live owner transfer (`OWNER_TRANSFERRING`) with the legacy write lock held for
+    // > 500 ms (650 ms): teardown MUST never return unfenced, MUST queue the fence and fail
+    // closed (hold), and RT MUST NEVER inherit the stale connection or lease once transfer finishes.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let ctrl = Arc::new(L2DriverControl::default());
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+        sup.set_driver(Box::new(L2MockDriver::new(&cfg, None, Arc::clone(&ctrl))))
+            .await;
+        sup.control_tick(0.02).await;
+
+        let conn = ConnectionHandle::from_ws_id(42).unwrap();
+        sup.register_ws_connection(conn.id()).await.unwrap();
+        let grant = sup
+            .acquire_lease_ws(conn, "m1_transfer_holder", 1)
+            .await
+            .unwrap();
+        let LeaseOutcome::Granted { generation: g1, .. } = grant else {
+            panic!("expected lease grant, got {grant:?}");
+        };
+        // Enable torque under the active lease so bus writes would occur if unfenced.
+        {
+            let mut inner = sup.inner().write().await;
+            let stamp = inner.current_admission_stamp();
+            let admitted = inner.check_admission(stamp).unwrap();
+            let _ = SupervisorInner::enable_torque(admitted).unwrap();
+        }
+        sup.control_tick(0.02).await;
+        assert!(ctrl.write_targets_calls.load(Ordering::SeqCst) >= 1);
+
+        // Hold the legacy write lock for > 500 ms while starting ownership transfer.
+        let mut write_guard = sup.inner().write().await;
+
+        let sup_transfer = Arc::clone(&sup);
+        let transfer_task = tokio::spawn(async move {
+            sup_transfer
+                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+                .await
+        });
+        wait_until(Duration::from_secs(2), || {
+            sup.owner_mode() == armd::supervisor::OWNER_TRANSFERRING
+        })
+        .await;
+
+        // Run disconnect teardown during `OWNER_TRANSFERRING` while write_guard stays held for 650 ms.
+        let sup_disc = Arc::clone(&sup);
+        let disc_task = tokio::spawn(async move {
+            sup_disc.fence_ws_connection_immediate(conn, g1);
+            sup_disc.disconnect_ws_connection(conn).await
+        });
+
+        // Wait past the 500 ms settle bound (650 ms total) while STILL holding write_guard.
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        let _disc_out = tokio::time::timeout(Duration::from_secs(2), disc_task)
+            .await
+            .expect("disconnect_ws_connection must return bounded even while transfer lock is held > 500 ms")
+            .unwrap();
+
+        // Even though disconnect_ws_connection hit its 500 ms bound while the lock was held:
+        // it MUST NEVER return unfenced — connection is fenced closed, lease gen fenced,
+        // queued to owner, and fail-closed hold blocks bus output!
+        assert!(
+            sup.is_connection_fenced_closed(conn.id()),
+            "teardown during >500ms transfer lock must fence connection closed"
+        );
+        assert!(
+            sup.atomic_fenced_lease_gen() >= g1,
+            "teardown during >500ms transfer lock must fence lease generation"
+        );
+        assert!(
+            sup.has_pending_disconnect_hold(),
+            "teardown during >500ms transfer lock must queue fence and fail closed (hold)"
+        );
+        let writes_before = ctrl.write_targets_calls.load(Ordering::SeqCst);
+        write_guard.tick_control(0.02);
+        let writes_after = ctrl.write_targets_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            writes_after, writes_before,
+            "fail-closed hold must block bus output while queued disconnect fence is pending"
+        );
+
+        // Now release write_guard so transfer to RT executor completes.
+        drop(write_guard);
+        let handle = transfer_task
+            .await
+            .unwrap()
+            .expect("ownership transfer must succeed cleanly after write_guard drops");
+        assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+
+        // Verify RT NEVER inherited the stale connection or lease!
+        assert!(
+            !sup.has_pending_disconnect_hold(),
+            "transfer handoff must drain all queued disconnect fences before spawning RT"
+        );
+        assert_eq!(
+            handle.live_connection_slots(),
+            0,
+            "RT must never inherit a stale closed connection"
+        );
+        let snap = sup.fresh_snapshot(None).await.unwrap();
+        assert_eq!(
+            snap.owner.lease_generation, 0,
+            "RT must never inherit a stale lease from a connection closed during transfer"
+        );
+        assert!(
+            snap.owner.lease_owner.is_none(),
+            "RT must have no lease owner after transfer drain"
+        );
+        assert!(
+            snap.owner.fenced_lease_generation >= g1,
+            "RT must preserve the fenced generation across handoff"
+        );
+        // Stale connection cannot re-open or renew on RT.
+        assert!(
+            sup.register_ws_connection(conn.id()).await.is_err(),
+            "stale closed connection ID must be rejected by RT"
+        );
+        // A brand-new connection can cleanly open and acquire a fresh generation > g1 on RT.
+        let conn2 = ConnectionHandle::from_ws_id(43).unwrap();
+        sup.register_ws_connection(conn2.id()).await.unwrap();
+        let g2 = match sup
+            .acquire_lease_ws(conn2, "m1_fresh_rt", 1)
+            .await
+            .unwrap()
+        {
+            LeaseOutcome::Granted { generation, .. } => generation,
+            other => panic!("expected fresh lease on RT, got {other:?}"),
+        };
+        assert!(g2 > g1);
+        let _ = sup.disconnect_ws_connection(conn2).await;
         handle.stop_and_join();
     }
 }

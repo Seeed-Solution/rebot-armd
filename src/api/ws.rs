@@ -1896,15 +1896,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     };
     let conn_id = conn_handle.id();
     let connection = conn_handle.as_str().to_owned();
+    let connection_generation = Arc::new(AtomicU64::new(0));
 
     struct WsSlotGuard {
         supervisor: Arc<ArmSupervisor>,
         conn: crate::rt_core::requests::lease::ConnectionHandle,
+        generation: Arc<AtomicU64>,
         disarmed: bool,
     }
     impl Drop for WsSlotGuard {
         fn drop(&mut self) {
             if !self.disarmed {
+                let closing_gen = self.generation.swap(0, Ordering::SeqCst);
+                self.supervisor
+                    .fence_ws_connection_immediate(self.conn, closing_gen);
                 self.supervisor.finish_ws_connection_detached(self.conn);
             }
         }
@@ -1912,6 +1917,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let mut ws_slot_guard = WsSlotGuard {
         supervisor: supervisor.clone(),
         conn: conn_handle,
+        generation: connection_generation.clone(),
         disarmed: false,
     };
 
@@ -1928,7 +1934,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         let _ = reg_tx.send(Some(ok));
     });
 
-    let connection_generation = Arc::new(AtomicU64::new(0));
     let client_label: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Urgent Stop request_id ordering is tracked independently of ordinary RPCs so an urgent Stop
     // overtaking queued ordinary requests never causes earlier ordinary IDs to fail INVALID_COMMAND.
@@ -3025,10 +3030,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut writer_task => FirstExit::Writer,
         _ = &mut reader_task => FirstExit::Reader,
     };
-    // Mark connection closing and record `connection_closed` under the owner lock FIRST,
-    // before awaiting ANY task join, so no resuming async install (policy/start after deployment
-    // lookup, planning, macro) or stale `Admitted` token from this connection can win the owner
-    // lock while teardown waits on worker/heartbeat/auth/writer/reader/child joins.
+    // M1: The VERY FIRST action on socket close is a non-blocking owner-side fence of this
+    // connection's lease generation BEFORE any task abort, join, or cleanup, so zero bus output
+    // from that generation can escape while teardown runs.
+    let closing_gen = connection_generation.swap(0, Ordering::SeqCst);
+    supervisor.fence_ws_connection_immediate(conn_handle, closing_gen);
+
     connection_closing.store(true, Ordering::SeqCst);
     #[cfg(feature = "policy-runtime")]
     ws_closed.store(true, Ordering::SeqCst);
@@ -3036,15 +3043,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     heartbeat_slot.close();
     reg_task.abort();
     let _ = (&mut reg_task).await;
-    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
-        let mut inner = supervisor.inner().write().await;
-        if !inner.detached {
-            inner.mark_connection_closed(conn_id);
-        }
-    } else if supervisor.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
-        supervisor.finish_ws_connection(conn_handle).await;
-        ws_slot_guard.disarmed = true;
-    }
 
     // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
     worker_task.abort();

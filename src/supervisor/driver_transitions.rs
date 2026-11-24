@@ -2048,13 +2048,19 @@ impl SupervisorInner {
         {
             return Some("DISCONNECTED");
         }
+        if self.pending_disconnect_hold.load(Ordering::SeqCst) > 0 {
+            return Some("LEASE_LOST");
+        }
+        let fenced_gen = self.effective_fenced_lease_generation();
         if auth.lease_generation != 0 {
-            if auth.lease_generation <= self.fenced_lease_generation {
+            if auth.lease_generation <= fenced_gen {
                 return Some("LEASE_LOST");
             }
             let lease_matches = self.active_lease.as_ref().is_some_and(|a| {
                 a.generation == auth.lease_generation
-                    && a.generation > self.fenced_lease_generation
+                    && a.generation > fenced_gen
+                    && (self.active_lease_conn_id == 0
+                        || !self.is_connection_closed(self.active_lease_conn_id))
                     && now.saturating_duration_since(a.acquired_at) < self.lease_timeout
             });
             if !lease_matches {

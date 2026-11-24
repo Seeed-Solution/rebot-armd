@@ -886,9 +886,12 @@ impl crate::supervisor::SupervisorInner {
     ) -> crate::supervisor::TickOutput {
         use crate::driver::PosForceIntent;
         use crate::supervisor::TickOutput;
-        // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
-        // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
-        if self.urgent_stop_unapplied() { return TickOutput::None; }
+        // an E-stop or authorized stop requested since the tick applied the last one, or a
+        // non-blocking disconnect lease fence / pending disconnect hold: no dynamic output
+        // reaches the bus (the tick applies stop/fence policy right after, see `tick_control`).
+        if self.urgent_stop_unapplied() || self.disconnect_fence_blocks_output() {
+            return TickOutput::None;
+        }
         if let Some(ref hook) = self.post_stop_check_hook {
             hook();
         }

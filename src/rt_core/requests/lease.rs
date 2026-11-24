@@ -1173,8 +1173,12 @@ pub fn install_lease_acquire(
     let conn = req.connection.as_str();
     let label = if req.has_label { req.label.as_str() } else { "" };
 
+    let fenced_gen = inner.effective_fenced_lease_generation();
+    let active_conn_closed = inner.active_lease_conn_id != 0
+        && inner.is_connection_closed(inner.active_lease_conn_id);
     if let Some(ref mut active) = inner.active_lease {
-        let is_expired = active.generation <= inner.fenced_lease_generation
+        let is_expired = active_conn_closed
+            || active.generation <= fenced_gen
             || ctx.now.saturating_duration_since(active.acquired_at) >= inner.lease_timeout;
         if !is_expired {
             if active.client_id == conn {
@@ -1234,8 +1238,12 @@ pub fn install_lease_preempt(
     let conn = req.connection.as_str();
     let label = req.label.as_str();
 
+    let fenced_gen = inner.effective_fenced_lease_generation();
+    let active_conn_closed = inner.active_lease_conn_id != 0
+        && inner.is_connection_closed(inner.active_lease_conn_id);
     if let Some(ref active) = inner.active_lease {
-        let is_expired = active.generation <= inner.fenced_lease_generation
+        let is_expired = active_conn_closed
+            || active.generation <= fenced_gen
             || ctx.now.saturating_duration_since(active.acquired_at) >= inner.lease_timeout;
         if active.client_id == conn && !is_expired {
             return Ok(LeaseOutcome::Granted {
@@ -1470,10 +1478,14 @@ pub fn renew_lease_heartbeat_at(
     if generation == 0 {
         return Err("NO_LEASE");
     }
+    let fenced_gen = inner.effective_fenced_lease_generation();
+    let active_conn_closed = inner.active_lease_conn_id != 0
+        && inner.is_connection_closed(inner.active_lease_conn_id);
     let Some(ref mut active) = inner.active_lease else {
         return Err("LEASE_LOST");
     };
-    let not_expired = active.generation > inner.fenced_lease_generation
+    let not_expired = !active_conn_closed
+        && active.generation > fenced_gen
         && now.saturating_duration_since(active.acquired_at) < inner.lease_timeout;
     let owner_matches = conn_str.is_none_or(|s| active.client_id == s)
         && (inner.active_lease_conn_id == 0 || inner.active_lease_conn_id == client_id);
@@ -1513,12 +1525,16 @@ pub fn install_broker_heartbeat(
         return Err("NO_LEASE");
     }
     // Verify active lease ownership & freshness BEFORE epoch check (matching legacy WS precedence).
-    let lease_ok = inner.active_lease.as_ref().is_some_and(|a| {
-        a.generation == generation
-            && a.generation > inner.fenced_lease_generation
-            && ctx.now.saturating_duration_since(a.acquired_at) < inner.lease_timeout
-            && (inner.active_lease_conn_id == 0 || inner.active_lease_conn_id == d.stamp.client.0)
-    });
+    let fenced_gen = inner.effective_fenced_lease_generation();
+    let active_conn_closed = inner.active_lease_conn_id != 0
+        && inner.is_connection_closed(inner.active_lease_conn_id);
+    let lease_ok = !active_conn_closed
+        && inner.active_lease.as_ref().is_some_and(|a| {
+            a.generation == generation
+                && a.generation > fenced_gen
+                && ctx.now.saturating_duration_since(a.acquired_at) < inner.lease_timeout
+                && (inner.active_lease_conn_id == 0 || inner.active_lease_conn_id == d.stamp.client.0)
+        });
     if !lease_ok {
         return Err("LEASE_LOST");
     }
@@ -1818,7 +1834,7 @@ impl LifecycleWaiter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotState {
     Open,
-    Closing,
+    Closing { seq: u64 },
 }
 
 struct ConnLifecycleClientInner {
@@ -1830,7 +1846,10 @@ struct ConnLifecycleClientInner {
     slots: HashMap<u64, SlotState>,
     next_seq: u64,
     closed: bool,
-    waiters: HashMap<u64, LifecycleWaiter>,
+    waiters: HashMap<u64, Vec<LifecycleWaiter>>,
+    /// Bounded cache of recently completed disconnect outcomes so an async teardown awaiting
+    /// completion after an immediate non-blocking disconnect fence still gets the exact outcome.
+    completed_disconnects: VecDeque<(u64, LeaseOutcome)>,
     exited: Arc<AtomicBool>,
 }
 
@@ -1844,18 +1863,28 @@ impl ConnLifecycleClientInner {
                     result: Err(_),
                     ..
                 }
-                | LifecycleReply::Disconnected { conn_id, .. }
                 | LifecycleReply::Stopped { conn_id, .. } => {
                     self.slots.remove(&conn_id);
                 }
+                LifecycleReply::Disconnected {
+                    conn_id, outcome, ..
+                } => {
+                    self.slots.remove(&conn_id);
+                    if self.completed_disconnects.len() >= CONN_LIFECYCLE_CAPACITY {
+                        self.completed_disconnects.pop_front();
+                    }
+                    self.completed_disconnects.push_back((conn_id, outcome));
+                }
                 LifecycleReply::Opened { result: Ok(()), .. } => {}
             }
-            if let Some(waiter) = self.waiters.remove(&seq) {
+            if let Some(waiters) = self.waiters.remove(&seq) {
                 let res = match reply {
                     LifecycleReply::Stopped { .. } => Err(ConnLifecycleError::Stopped),
                     other => Ok(other),
                 };
-                waiter.deliver(res);
+                for waiter in waiters {
+                    waiter.deliver(res);
+                }
             }
         }
     }
@@ -1871,8 +1900,10 @@ impl ConnLifecycleClientInner {
     fn fail_remaining(&mut self, err: ConnLifecycleError) {
         let remaining = std::mem::take(&mut self.waiters);
         self.slots.clear();
-        for (_, w) in remaining {
-            w.deliver(Err(err));
+        for (_, waiters) in remaining {
+            for w in waiters {
+                w.deliver(Err(err));
+            }
         }
     }
 }
@@ -1895,6 +1926,7 @@ pub fn conn_lifecycle_channel(exited: Arc<AtomicBool>) -> (ConnLifecycleClient, 
             next_seq: 0,
             closed: false,
             waiters: HashMap::with_capacity(CONN_LIFECYCLE_CAPACITY),
+            completed_disconnects: VecDeque::with_capacity(CONN_LIFECYCLE_CAPACITY),
             exited,
         }),
     };
@@ -1982,14 +2014,14 @@ impl ConnLifecycleClient {
             return Err(ConnLifecycleError::TooManyConnections);
         }
         g.slots.insert(conn_id, SlotState::Open);
-        g.waiters.insert(seq, waiter);
+        g.waiters.entry(seq).or_default().push(waiter);
         Ok(())
     }
 
     fn enqueue_disconnect_inner(
         &self,
         connection: ConnectionHandle,
-        waiter: LifecycleWaiter,
+        waiter: Option<LifecycleWaiter>,
     ) -> Result<(), ConnLifecycleError> {
         let conn_id = connection.id();
         if conn_id == 0 {
@@ -2002,10 +2034,34 @@ impl ConnLifecycleClient {
         }
         // Restrict reserved priority ring capacity strictly to registered open slots so
         // unregistered callers can never consume disconnect credits, and only commit `Closing`
-        // AFTER the ring push succeeds.
-        match g.slots.get(&conn_id) {
+        // AFTER the ring push succeeds. If a non-blocking immediate fence already transitioned
+        // this slot to `Closing { seq }`, attach the waiter to the in-flight sequence without
+        // pushing a duplicate ring command; if RT already completed it, deliver the recorded outcome.
+        match g.slots.get(&conn_id).copied() {
             Some(SlotState::Open) => {}
-            Some(SlotState::Closing) | None => {
+            Some(SlotState::Closing { seq }) => {
+                if let Some(w) = waiter {
+                    g.waiters.entry(seq).or_default().push(w);
+                }
+                return Ok(());
+            }
+            None => {
+                if let Some(outcome) = g
+                    .completed_disconnects
+                    .iter()
+                    .rev()
+                    .find(|(id, _)| *id == conn_id)
+                    .map(|(_, o)| *o)
+                {
+                    if let Some(w) = waiter {
+                        w.deliver(Ok(LifecycleReply::Disconnected {
+                            seq: 0,
+                            conn_id,
+                            outcome,
+                        }));
+                    }
+                    return Ok(());
+                }
                 return Err(ConnLifecycleError::AlreadyClosed);
             }
         }
@@ -2018,9 +2074,11 @@ impl ConnLifecycleClient {
         }
         g.next_seq = seq;
         if let Some(state) = g.slots.get_mut(&conn_id) {
-            *state = SlotState::Closing;
+            *state = SlotState::Closing { seq };
         }
-        g.waiters.insert(seq, waiter);
+        if let Some(w) = waiter {
+            g.waiters.entry(seq).or_default().push(w);
+        }
         Ok(())
     }
 
@@ -2029,7 +2087,7 @@ impl ConnLifecycleClient {
         connection: ConnectionHandle,
         tx: tokio::sync::oneshot::Sender<Result<LifecycleReply, ConnLifecycleError>>,
     ) -> Result<(), ConnLifecycleError> {
-        self.enqueue_disconnect_inner(connection, LifecycleWaiter::Async(tx))
+        self.enqueue_disconnect_inner(connection, Some(LifecycleWaiter::Async(tx)))
     }
 
     pub(crate) fn enqueue_disconnect_sync(
@@ -2037,13 +2095,13 @@ impl ConnLifecycleClient {
         connection: ConnectionHandle,
         tx: mpsc::SyncSender<Result<LifecycleReply, ConnLifecycleError>>,
     ) -> Result<(), ConnLifecycleError> {
-        self.enqueue_disconnect_inner(connection, LifecycleWaiter::Sync(tx))
+        self.enqueue_disconnect_inner(connection, Some(LifecycleWaiter::Sync(tx)))
     }
 
-    /// Non-blocking fire-and-forget disconnect handoff for drop safety nets and checkpoint hooks.
+    /// Non-blocking fire-and-forget disconnect handoff for immediate socket-close fences,
+    /// drop safety nets, and checkpoint hooks (never duplicates an in-flight `Closing` slot).
     pub fn enqueue_disconnect_detached(&self, connection: ConnectionHandle) {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let _ = self.enqueue_disconnect_inner(connection, LifecycleWaiter::Async(tx));
+        let _ = self.enqueue_disconnect_inner(connection, None);
     }
 
     pub fn open_sync(&self, conn_id: u64) -> Result<Result<(), &'static str>, ConnLifecycleError> {
@@ -2074,7 +2132,7 @@ impl ConnLifecycleClient {
         connection: ConnectionHandle,
     ) -> Result<LeaseOutcome, ConnLifecycleError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.enqueue_disconnect_inner(connection, LifecycleWaiter::Sync(tx))?;
+        self.enqueue_disconnect_inner(connection, Some(LifecycleWaiter::Sync(tx)))?;
         match rx.recv() {
             Ok(Ok(LifecycleReply::Disconnected { outcome, .. })) => Ok(outcome),
             Ok(Err(e)) => Err(e),
@@ -2087,7 +2145,7 @@ impl ConnLifecycleClient {
         connection: ConnectionHandle,
     ) -> Result<LeaseOutcome, ConnLifecycleError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.enqueue_disconnect_inner(connection, LifecycleWaiter::Async(tx))?;
+        self.enqueue_disconnect_inner(connection, Some(LifecycleWaiter::Async(tx)))?;
         match rx.await {
             Ok(Ok(LifecycleReply::Disconnected { outcome, .. })) => Ok(outcome),
             Ok(Err(e)) => Err(e),

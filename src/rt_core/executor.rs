@@ -1846,8 +1846,7 @@ impl BrokerDispatcher {
         connection: super::requests::lease::ConnectionHandle,
     ) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let _ = self.conn_lifecycle.enqueue_disconnect_oneshot(connection, tx);
+        self.conn_lifecycle.enqueue_disconnect_detached(connection);
         Self::disconnect_broker_client_locked(&mut st, &self.broker, connection.id());
     }
 

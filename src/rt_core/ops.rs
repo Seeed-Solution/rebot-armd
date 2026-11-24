@@ -568,6 +568,9 @@ pub trait CoreOps {
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal>;
     /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
     fn apply_estop(&mut self) -> bool { false }
+    /// Synchronizes any non-blocking socket-close lease fence (lock-free, zero allocations)
+    /// before command commit, target intake, or bus output.
+    fn sync_disconnect_fence(&mut self, _now: Instant) -> bool { false }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
     /// Applies an authorized stop at `generation` and synchronizes the owner's stop counter.
@@ -830,10 +833,14 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
 }
 
 impl SupervisorInner {
-    /// The lease valid at `now` (unexpired and unfenced; its generation names its holder).
+    /// The lease valid at `now` (unexpired, unfenced, and owning connection not closed).
     pub(crate) fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
+        let fenced = self.effective_fenced_lease_generation();
+        if self.active_lease_conn_id != 0 && self.is_connection_closed(self.active_lease_conn_id) {
+            return None;
+        }
         self.active_lease.as_ref().filter(|l| {
-            l.generation > self.fenced_lease_generation
+            l.generation > fenced
                 && now.saturating_duration_since(l.acquired_at) < self.lease_timeout
         })
     }
@@ -1191,6 +1198,10 @@ impl CoreOps for SupervisorInner {
     }
 
     fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
+
+    fn sync_disconnect_fence(&mut self, now: Instant) -> bool {
+        self.sync_nonblocking_disconnect_fence(now)
+    }
 
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
     fn apply_stop(&mut self) { self.authorized_stop(); }
@@ -1707,6 +1718,7 @@ impl ReleaseEngine {
     pub fn apply_pending_urgent_at<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> bool {
         let estop = core.apply_estop();
         let _lifecycle = self.drain_conn_lifecycle_at(core, now);
+        let _fence = core.sync_disconnect_fence(now);
         let urgent_handoff = if let Some(intake) = self.urgent_stops.as_mut() {
             let stops = &self.stop;
             intake.drain_requests(|req| core.handle_urgent_stop(req, stops, now))

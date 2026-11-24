@@ -234,10 +234,13 @@ impl SupervisorInner {
     /// generation, matching connection identity, and non-expiry at `now`, updating
     /// `last_valid_motion_instant` on success. Zero allocations and zero frees.
     pub fn validate_lease_at(&mut self, client_id: &str, generation: u64, now: Instant) -> bool {
+        let fenced_gen = self.effective_fenced_lease_generation();
         if self.detached
             || generation == 0
-            || generation <= self.fenced_lease_generation
+            || generation <= fenced_gen
             || client_id.is_empty()
+            || (self.active_lease_conn_id != 0
+                && self.is_connection_closed(self.active_lease_conn_id))
         {
             return false;
         }
