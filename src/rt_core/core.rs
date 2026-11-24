@@ -169,6 +169,12 @@ impl ArmCore {
     /// `seq` of the last publication (0: none yet).
     pub fn published_seq(&self) -> u64 { self.hub().published_seq() }
 
+    /// Pre-warms empty triple-buffer observation slots before the RT release loop begins,
+    /// without blocking on a contended reader or advancing `published_seq`.
+    pub fn try_prewarm_observations(&mut self, make: impl FnMut() -> ArmObservation) {
+        self.publisher.try_prewarm_observations(make);
+    }
+
     /// The observation of the publication slot the next [`Self::publish`] writes, moved
     /// out to be filled in place (`SupervisorInner::fill_observation`) and handed back by
     /// `publish`: the tick reuses its memory instead of building a new observation (a blank

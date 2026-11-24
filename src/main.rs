@@ -376,7 +376,7 @@ where
             supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
             // Stop the legacy periodic loop first so it stops competing for the supervisor lock
             // and actuator bus while bounded emergency disable runs.
-            control_stop.store(true, Ordering::SeqCst);
+            supervisor.signal_legacy_stop(&control_stop);
             let sup = Arc::clone(supervisor);
             let outcome = tokio::task::spawn_blocking(move || {
                 sup.attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT)
@@ -391,7 +391,7 @@ where
         after_legacy_commit_before_abort().await;
         // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
         server_handle.abort();
-        control_stop.store(true, Ordering::SeqCst);
+        supervisor.signal_legacy_stop(&control_stop);
         info!("armd stopped after shutdown readiness confirmation");
         return Ok(());
     }
@@ -404,6 +404,7 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
+    let _ = armd::supervisor::init_process_identity();
     let system = armd::diagnostics::boot::SystemInfo::read();
     let cli = parse_cli_args()?;
 
@@ -601,6 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let control_stop_flag = control_stop.clone();
             let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
+            supervisor.attach_legacy_loop_stats(executor_stats.clone());
             let loop_stats = executor_stats.clone();
             let runtime = tokio::runtime::Handle::current();
             std::thread::Builder::new().name("armd-control".into()).spawn(move || {
@@ -632,6 +634,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             runtime.block_on(control_supervisor.control_tick_with_deadline(dt, release_deadline));
                         }));
                     if let Err(e) = tick_res {
+                        armd::rt_core::executor::account_periodic_overrun_on_panic_exit(&loop_stats);
                         control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
                         error!("Control thread panicked during tick: {:?}", e);
                         let outcome = control_supervisor

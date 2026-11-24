@@ -2,11 +2,144 @@
 //! [`TICK_WINDOW`] ticks, recorded by [`crate::ArmSupervisor::tick`].
 
 use std::cell::Cell;
+use std::sync::atomic::{fence, AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use serde::{Serialize, Serializer};
 
 /// Ticks the percentiles cover.
 pub const TICK_WINDOW: usize = 1000;
+
+/// Capacity of [`LockFreeTickStats`] (power of two, strictly larger than [`TICK_WINDOW`] so
+/// concurrent HTTP readers have a >1000-tick cushion against slot reuse).
+pub const LOCK_FREE_RING_CAPACITY: usize = 2048;
+
+const MAX_SEQLOCK_RETRIES: usize = 64;
+const MAX_WINDOW_ATTEMPTS: usize = 4;
+
+/// Strict wakeup-lateness thresholds evaluated on raw nanoseconds (`actual - scheduled`).
+pub const WAKE_LATENESS_1MS_NS: u64 = 1_000_000;
+pub const WAKE_LATENESS_5MS_NS: u64 = 5_000_000;
+pub const WAKE_LATENESS_10MS_NS: u64 = 10_000_000;
+
+/// Inclusive full-release duration thresholds evaluated on raw nanoseconds (`>= 10 / 15 / 20 ms`),
+/// matching the strict Stage 3 §6 `< 20 ms` gate (`release_ns >= 20_000_000` fails `< 20 ms`).
+pub const RELEASE_10MS_NS: u64 = 10_000_000;
+pub const RELEASE_15MS_NS: u64 = 15_000_000;
+pub const RELEASE_20MS_NS: u64 = 20_000_000;
+
+/// Converts nanoseconds to saturating microseconds (`u32`).
+#[inline]
+pub fn ns_to_us_u32(ns: u64) -> u32 {
+    (ns / 1_000).min(u64::from(u32::MAX)) as u32
+}
+
+/// Converts raw full release duration (ns) to saturating microseconds and inclusive threshold
+/// flags (`>= 10 ms`, `>= 15 ms`, `>= 20 ms`).
+#[inline]
+pub fn classify_release_duration_ns(release_ns: u64) -> (u32, bool, bool, bool) {
+    let us = ns_to_us_u32(release_ns);
+    (
+        us,
+        release_ns >= RELEASE_10MS_NS,
+        release_ns >= RELEASE_15MS_NS,
+        release_ns >= RELEASE_20MS_NS,
+    )
+}
+
+/// Converts raw wakeup lateness (`actual_release_start - scheduled_release`, ns) to saturating
+/// microseconds and strict threshold flags (`> 1 ms`, `> 5 ms`, `> 10 ms` on raw nanoseconds).
+#[inline]
+pub fn classify_wake_lateness_ns(lateness_ns: u64) -> (u32, bool, bool, bool) {
+    let us = ns_to_us_u32(lateness_ns);
+    (
+        us,
+        lateness_ns > WAKE_LATENESS_1MS_NS,
+        lateness_ns > WAKE_LATENESS_5MS_NS,
+        lateness_ns > WAKE_LATENESS_10MS_NS,
+    )
+}
+
+thread_local! {
+    static CURRENT_WAKE_LATENESS_NS: Cell<u64> = const { Cell::new(0) };
+    static PERIODIC_DEFER_SAMPLE_PUBLISH: Cell<bool> = const { Cell::new(false) };
+    static PENDING_PERIODIC_SAMPLE: Cell<Option<TickSample>> = const { Cell::new(None) };
+}
+
+/// Scoped thread-local handoff carrying raw wakeup lateness (ns) and periodic single-completion
+/// sample handoff between `run_periodic_with_clock` and `ArmSupervisor::tick_shared` on the same
+/// OS thread; restores the prior values on drop (including panic unwinds and early returns).
+pub struct WakeLatenessGuard {
+    prev_lateness: u64,
+    prev_defer_publish: bool,
+    prev_pending_sample: Option<TickSample>,
+}
+
+impl WakeLatenessGuard {
+    #[inline]
+    pub fn enter(lateness_ns: u64) -> Self {
+        Self::enter_periodic(lateness_ns, false)
+    }
+
+    #[inline]
+    pub fn enter_periodic(lateness_ns: u64, defer_sample_publish: bool) -> Self {
+        let prev_lateness = CURRENT_WAKE_LATENESS_NS
+            .try_with(|c| c.replace(lateness_ns))
+            .unwrap_or(0);
+        let prev_defer_publish = PERIODIC_DEFER_SAMPLE_PUBLISH
+            .try_with(|c| c.replace(defer_sample_publish))
+            .unwrap_or(false);
+        let prev_pending_sample = PENDING_PERIODIC_SAMPLE
+            .try_with(|c| c.replace(None))
+            .unwrap_or(None);
+        Self {
+            prev_lateness,
+            prev_defer_publish,
+            prev_pending_sample,
+        }
+    }
+}
+
+impl Drop for WakeLatenessGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let _ = CURRENT_WAKE_LATENESS_NS.try_with(|c| c.set(self.prev_lateness));
+        let _ = PERIODIC_DEFER_SAMPLE_PUBLISH.try_with(|c| c.set(self.prev_defer_publish));
+        let _ = PENDING_PERIODIC_SAMPLE.try_with(|c| c.set(self.prev_pending_sample.take()));
+    }
+}
+
+/// Takes and clears the calling thread's pending raw wakeup lateness (ns).
+#[inline]
+pub fn take_current_wake_lateness_ns() -> u64 {
+    CURRENT_WAKE_LATENESS_NS
+        .try_with(|c| c.replace(0))
+        .unwrap_or(0)
+}
+
+/// Returns `true` when the calling thread is inside a `run_periodic` release whose completion
+/// point owns publishing the completed `TickSample` with full `release_us`.
+#[inline]
+pub fn periodic_defers_sample_publish() -> bool {
+    PERIODIC_DEFER_SAMPLE_PUBLISH
+        .try_with(Cell::get)
+        .unwrap_or(false)
+}
+
+/// Stashes the calling thread's prepared legacy `TickSample` so `run_periodic_with_clock`
+/// stamps its full `release_us` and publishes it once at release completion.
+#[inline]
+pub fn stash_periodic_sample(sample: TickSample) {
+    let _ = PENDING_PERIODIC_SAMPLE.try_with(|c| c.set(Some(sample)));
+}
+
+/// Takes the calling thread's stashed legacy `TickSample` at periodic release completion.
+#[inline]
+pub fn take_periodic_sample() -> Option<TickSample> {
+    PENDING_PERIODIC_SAMPLE
+        .try_with(|c| c.take())
+        .ok()
+        .flatten()
+}
 
 /// Outcome of one CAN `transmit` attempt recorded in the tick's TX diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,11 +390,15 @@ pub const RELEASE_FLAG_INJECT_ALLOC: u32 = 1 << 4;
 pub const RELEASE_FLAG_THERMAL_TRIP: u32 = 1 << 5;
 pub const RELEASE_FLAG_WATCHDOG_LATCH: u32 = 1 << 6;
 
-/// One tick, µs. Serialized as the breakdown of `max_tick` / `max_lock`.
+/// One tick, µs. Serialized as the breakdown of `max_tick` / `max_release` / `max_lock`.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct TickSample {
-    /// Whole `ArmSupervisor::tick` call.
+    /// Whole `ArmSupervisor::tick` / executor body call (kept for backward compatibility).
     pub tick_us: u32,
+    /// Full release duration measured on the control thread from wake (right after lateness
+    /// sampling) through control, TX, usage collection, publication, dispatcher wake, cleanup,
+    /// and stats publication preparation, µs.
+    pub release_us: u32,
     /// Waiting for the supervisor write lock.
     pub wait_us: u32,
     /// Holding the supervisor write lock.
@@ -270,6 +407,8 @@ pub struct TickSample {
     pub post_us: u32,
     /// `dt` of the tick: start-to-start interval of the control loop.
     pub period_us: u32,
+    /// Wakeup lateness `actual_release_start - scheduled_release`, µs (0 when driven directly).
+    pub wake_lateness_us: u32,
     /// Longest read / write hold by another task released since the previous tick.
     pub reader_hold_us: u32,
     pub writer_hold_us: u32,
@@ -437,12 +576,71 @@ pub struct TxDiagnostics {
     pub since_boot_dropped_stopped: u64,
 }
 
+/// Coherent per-run baseline deltas and peaks since the latest operator
+/// `POST /api/v1/diagnostics/tick/mark`, acknowledged by the control thread at a single
+/// release completion boundary.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TickSinceMarker {
+    pub marker_id: u64,
+    /// `"pending"` until the control thread completes a release and captures the coherent
+    /// baseline; `"active"` once acknowledged.
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_total_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_over_10ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_over_15ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_over_20ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_releases_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diag_dropped_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_lateness_over_1ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_lateness_over_5ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_lateness_over_10ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_us_max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_late_max: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TickSnapshot {
+    /// Unique identifier for this daemon/supervisor instance (changes on every restart).
+    #[serde(default)]
+    pub instance_id: String,
+    /// Kernel boot UUID (`/proc/sys/kernel/random/boot_id` on Linux), or `None` if unavailable.
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    /// Process start wall-clock timestamp (Unix epoch nanoseconds) derived once at startup from
+    /// Linux `/proc/stat` `btime` + `/proc/self/stat` `starttime`, or `None` if unavailable.
+    #[serde(default)]
+    pub process_start_unix_ns: Option<u64>,
     /// Ticks in the window (at most [`TICK_WINDOW`]).
     pub window: usize,
     /// Whole `ArmSupervisor::tick` call: lock wait, tick body and telemetry broadcast.
     pub tick_us: Percentiles,
+    /// Full release duration on the control thread from wake through all release work, µs.
+    pub release_us: Percentiles,
+    /// Monotonic releases started since process start (control-thread incremented at wake).
+    pub releases_started: u64,
+    /// Monotonic completed releases since process start (control-thread written only).
+    pub releases_total: u64,
+    /// Elapsed wall duration (µs) of a currently in-flight control release, or 0 when idle.
+    pub in_flight_release_us: u64,
+    /// Monotonic all-time maximum full `release_us` since process start, µs (never ages out).
+    pub release_us_max_ever: u64,
+    /// Monotonic releases since process start with full duration `>= 10 ms` / `>= 15 ms` / `>= 20 ms`.
+    pub releases_over_10ms: u64,
+    pub releases_over_15ms: u64,
+    pub releases_over_20ms: u64,
+    /// Monotonic all-time maximum wakeup lateness since process start, µs (never ages out).
+    pub wake_late_max_ever: u64,
     /// Time the supervisor write lock was held by the tick.
     pub lock_us: Percentiles,
     /// Ticks since start whose `dt` exceeded two control periods.
@@ -454,6 +652,23 @@ pub struct TickSnapshot {
     pub post_us: Percentiles,
     /// Start-to-start interval of the control loop (`dt`).
     pub period_us: Percentiles,
+    /// Wakeup lateness (`actual_release_start - scheduled_release`) over the window, µs.
+    pub wake_lateness_us: Percentiles,
+    /// Cumulative releases since boot with wakeup lateness strictly greater than 1 ms / 5 ms / 10 ms.
+    pub wake_lateness_over_1ms: u64,
+    pub wake_lateness_over_5ms: u64,
+    pub wake_lateness_over_10ms: u64,
+    /// Cumulative scheduled releases skipped since boot (`ExecutorStats::skipped_releases` in
+    /// executor mode, or `run_periodic`'s skip counter in legacy mode).
+    pub skipped_releases: u64,
+    /// Cumulative diagnostic `TickSample` values dropped because the off-thread ring was full
+    /// (executor mode; 0 in legacy mode).
+    pub diag_dropped: u64,
+    /// Active control-loop owner mode (`"legacy"`, `"transferring"`, `"executor"`, `"failed"`).
+    pub owner_mode: &'static str,
+    /// True while the owning periodic control loop is actively running.
+    #[serde(default)]
+    pub loop_active: bool,
     /// Longest read-lock hold by another task per tick interval (includes preemption of that task).
     pub reader_hold_us: Percentiles,
     /// Longest write-lock hold by another task per tick interval.
@@ -466,8 +681,10 @@ pub struct TickSnapshot {
     pub writer_acquire_us: Percentiles,
     /// The tick's lock hold split into phases.
     pub lock_phases: LockPhasePercentiles,
-    /// The slowest tick in the window, all phases.
+    /// The slowest tick in the window (`tick_us`), all phases.
     pub max_tick: Option<TickBreakdown>,
+    /// The slowest full release in the window (`release_us`), all phases.
+    pub max_release: Option<TickBreakdown>,
     /// The tick with the longest lock hold in the window, all phases.
     pub max_lock: Option<TickBreakdown>,
     /// The tick with the largest summed CAN TX send wall time in the window.
@@ -483,6 +700,19 @@ pub struct TickSnapshot {
     /// Monotonic count of log lines dropped by registered non-blocking log writers (never reset).
     #[serde(default)]
     pub log_writer_dropped: u64,
+    /// True when a lock-free stats reader exhausted bounded retries due to concurrent slot reuse
+    /// or writer contention (explicit coverage loss; `window` is 0 on a lapped snapshot).
+    #[serde(default)]
+    pub stats_snapshot_lapped: bool,
+    /// Cumulative lock-free seqlock reader retries observed on `LockFreeTickStats`.
+    #[serde(default)]
+    pub stats_reader_retries: u64,
+    /// Cumulative non-blocking writer contention drops on `LockFreeTickStats` (0 with single control writer).
+    #[serde(default)]
+    pub stats_writer_drops: u64,
+    /// Coherent deltas and peaks since the latest `POST /api/v1/diagnostics/tick/mark`, if requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_marker: Option<TickSinceMarker>,
 }
 
 impl Default for TickStats {
@@ -579,12 +809,14 @@ fn percentiles(values: &mut [u32]) -> Percentiles {
     Percentiles { p50: rank(50), p99: rank(99), max: values[values.len() - 1] }
 }
 
-/// Copy of the ring taken under the mutex; [`TickWindow::snapshot`] sorts outside it.
+/// Copy of the ring taken from [`TickStats`] or [`LockFreeTickStats`]; [`TickWindow::snapshot`]
+/// sorts outside any writer path.
 pub struct TickWindow {
     rows: Vec<TickSample>,
     late_count: u64,
     ticks: u64,
     tx_totals: TxTotals,
+    snapshot_lapped: bool,
 }
 
 impl TickStats {
@@ -606,15 +838,702 @@ impl TickStats {
     pub fn window(&self) -> TickWindow {
         let start = if self.len < TICK_WINDOW { 0 } else { self.next };
         let rows = (0..self.len).map(|i| self.rows[(start + i) % TICK_WINDOW]).collect();
-        TickWindow { rows, late_count: self.late_count, ticks: self.ticks, tx_totals: self.tx_totals }
+        TickWindow {
+            rows,
+            late_count: self.late_count,
+            ticks: self.ticks,
+            tx_totals: self.tx_totals,
+            snapshot_lapped: false,
+        }
     }
 
     pub fn snapshot(&self) -> TickSnapshot { self.window().snapshot() }
 }
 
+// ============================================================================
+// Lock-Free Seqlock Ring (`LockFreeTickStats`)
+// ============================================================================
+
+#[derive(Default)]
+struct AtomicHolder {
+    /// 0 = None, 1 = "read", 2 = "write"
+    kind: AtomicU8,
+    location: AtomicPtr<std::panic::Location<'static>>,
+    hold_us: AtomicU32,
+    acquire_us: AtomicU32,
+    acquired_before_wait_us: AtomicI64,
+    released_before_lock_us: AtomicI64,
+}
+
+#[derive(Clone, Copy)]
+struct RawHolder {
+    kind: u8,
+    location: *const std::panic::Location<'static>,
+    hold_us: u32,
+    acquire_us: u32,
+    acquired_before_wait_us: i64,
+    released_before_lock_us: i64,
+}
+
+impl AtomicHolder {
+    fn store_relaxed(&self, h: Option<Holder>) {
+        match h {
+            None => {
+                self.kind.store(0, Ordering::Relaxed);
+                self.location.store(std::ptr::null_mut(), Ordering::Relaxed);
+            }
+            Some(h) => {
+                let kind = if h.kind == "write" { 2u8 } else { 1u8 };
+                self.kind.store(kind, Ordering::Relaxed);
+                self.location.store(
+                    h.location as *const std::panic::Location<'static> as *mut std::panic::Location<'static>,
+                    Ordering::Relaxed,
+                );
+                self.hold_us.store(h.hold_us, Ordering::Relaxed);
+                self.acquire_us.store(h.acquire_us, Ordering::Relaxed);
+                self.acquired_before_wait_us.store(h.acquired_before_wait_us, Ordering::Relaxed);
+                self.released_before_lock_us.store(h.released_before_lock_us, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn load_raw_relaxed(&self) -> RawHolder {
+        RawHolder {
+            kind: self.kind.load(Ordering::Relaxed),
+            location: self.location.load(Ordering::Relaxed) as *const std::panic::Location<'static>,
+            hold_us: self.hold_us.load(Ordering::Relaxed),
+            acquire_us: self.acquire_us.load(Ordering::Relaxed),
+            acquired_before_wait_us: self.acquired_before_wait_us.load(Ordering::Relaxed),
+            released_before_lock_us: self.released_before_lock_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl RawHolder {
+    /// Converts a validated raw holder into `Option<Holder>`.
+    ///
+    /// # Safety
+    /// Must only be called after the enclosing seqlock read succeeded (`v1 == v2`, even, Acquire-ordered
+    /// with the writer's Release store) so `self.location` is guaranteed to be either null or an
+    /// immutable `&'static std::panic::Location<'static>` pointer written by `AtomicHolder::store_relaxed`.
+    unsafe fn into_holder_validated(self) -> Option<Holder> {
+        if self.kind == 0 || self.location.is_null() {
+            return None;
+        }
+        // SAFETY: upheld by caller's validated seqlock read and `'static` location provenance.
+        let location: &'static std::panic::Location<'static> = unsafe { &*self.location };
+        let kind = if self.kind == 2 { "write" } else { "read" };
+        Some(Holder {
+            kind,
+            location,
+            hold_us: self.hold_us,
+            acquire_us: self.acquire_us,
+            acquired_before_wait_us: self.acquired_before_wait_us,
+            released_before_lock_us: self.released_before_lock_us,
+        })
+    }
+}
+
+#[derive(Default)]
+struct AtomicTickSlot {
+    /// Per-slot seqlock counter: even = stable, odd = write in progress.
+    seq: AtomicU64,
+    /// 1-based monotonic sample sequence stored in this slot.
+    sample_seq: AtomicU64,
+    tick_us: AtomicU32,
+    release_us: AtomicU32,
+    wait_us: AtomicU32,
+    lock_us: AtomicU32,
+    post_us: AtomicU32,
+    period_us: AtomicU32,
+    wake_lateness_us: AtomicU32,
+    reader_hold_us: AtomicU32,
+    writer_hold_us: AtomicU32,
+    reader_acquire_us: AtomicU32,
+    writer_acquire_us: AtomicU32,
+    stats_wait_us: AtomicU32,
+    // LockPhases
+    pre_us: AtomicU32,
+    rx_us: AtomicU32,
+    control_us: AtomicU32,
+    tx_us: AtomicU32,
+    finish_us: AtomicU32,
+    obs_us: AtomicU32,
+    publish_us: AtomicU32,
+    // ThreadUsage
+    wait_cpu_us: AtomicU32,
+    lock_cpu_us: AtomicU32,
+    wait_vcsw: AtomicU32,
+    wait_ivcsw: AtomicU32,
+    lock_vcsw: AtomicU32,
+    lock_ivcsw: AtomicU32,
+    wait_majflt: AtomicU32,
+    lock_majflt: AtomicU32,
+    lock_minflt: AtomicU32,
+    lock_alloc_calls: AtomicU32,
+    lock_alloc_us: AtomicU32,
+    lock_alloc_max_us: AtomicU32,
+    tx_frames: AtomicU32,
+    tx_would_block: AtomicU32,
+    tx_enobufs: AtomicU32,
+    tx_deferred: AtomicU32,
+    tx_pending: AtomicU32,
+    tx_dropped_stale: AtomicU32,
+    tx_dropped_stopped: AtomicU32,
+    tx_send_us: AtomicU32,
+    tx_send_cpu_us: AtomicU32,
+    tx_frame_max_us: AtomicU32,
+    tx_frame_cpu_max_us: AtomicU32,
+    waited_for: AtomicHolder,
+    longest_hold: AtomicHolder,
+    late: AtomicBool,
+    release_seq: AtomicU64,
+    safety_epoch: AtomicU64,
+    maint_req_id: AtomicU64,
+    release_flags: AtomicU32,
+}
+
+#[derive(Clone, Copy)]
+struct RawTickSlot {
+    sample_seq: u64,
+    tick_us: u32,
+    release_us: u32,
+    wait_us: u32,
+    lock_us: u32,
+    post_us: u32,
+    period_us: u32,
+    wake_lateness_us: u32,
+    reader_hold_us: u32,
+    writer_hold_us: u32,
+    reader_acquire_us: u32,
+    writer_acquire_us: u32,
+    stats_wait_us: u32,
+    phases: LockPhases,
+    usage: ThreadUsage,
+    waited_for: RawHolder,
+    longest_hold: RawHolder,
+    late: bool,
+    release_seq: u64,
+    safety_epoch: u64,
+    maint_req_id: u64,
+    release_flags: u32,
+}
+
+impl AtomicTickSlot {
+    fn store_relaxed(&self, sample_seq: u64, s: &TickSample) {
+        self.sample_seq.store(sample_seq, Ordering::Relaxed);
+        self.tick_us.store(s.tick_us, Ordering::Relaxed);
+        self.release_us.store(s.release_us, Ordering::Relaxed);
+        self.wait_us.store(s.wait_us, Ordering::Relaxed);
+        self.lock_us.store(s.lock_us, Ordering::Relaxed);
+        self.post_us.store(s.post_us, Ordering::Relaxed);
+        self.period_us.store(s.period_us, Ordering::Relaxed);
+        self.wake_lateness_us.store(s.wake_lateness_us, Ordering::Relaxed);
+        self.reader_hold_us.store(s.reader_hold_us, Ordering::Relaxed);
+        self.writer_hold_us.store(s.writer_hold_us, Ordering::Relaxed);
+        self.reader_acquire_us.store(s.reader_acquire_us, Ordering::Relaxed);
+        self.writer_acquire_us.store(s.writer_acquire_us, Ordering::Relaxed);
+        self.stats_wait_us.store(s.stats_wait_us, Ordering::Relaxed);
+        self.pre_us.store(s.phases.pre_us, Ordering::Relaxed);
+        self.rx_us.store(s.phases.rx_us, Ordering::Relaxed);
+        self.control_us.store(s.phases.control_us, Ordering::Relaxed);
+        self.tx_us.store(s.phases.tx_us, Ordering::Relaxed);
+        self.finish_us.store(s.phases.finish_us, Ordering::Relaxed);
+        self.obs_us.store(s.phases.obs_us, Ordering::Relaxed);
+        self.publish_us.store(s.phases.publish_us, Ordering::Relaxed);
+        self.wait_cpu_us.store(s.usage.wait_cpu_us, Ordering::Relaxed);
+        self.lock_cpu_us.store(s.usage.lock_cpu_us, Ordering::Relaxed);
+        self.wait_vcsw.store(s.usage.wait_vcsw, Ordering::Relaxed);
+        self.wait_ivcsw.store(s.usage.wait_ivcsw, Ordering::Relaxed);
+        self.lock_vcsw.store(s.usage.lock_vcsw, Ordering::Relaxed);
+        self.lock_ivcsw.store(s.usage.lock_ivcsw, Ordering::Relaxed);
+        self.wait_majflt.store(s.usage.wait_majflt, Ordering::Relaxed);
+        self.lock_majflt.store(s.usage.lock_majflt, Ordering::Relaxed);
+        self.lock_minflt.store(s.usage.lock_minflt, Ordering::Relaxed);
+        self.lock_alloc_calls.store(s.usage.lock_alloc_calls, Ordering::Relaxed);
+        self.lock_alloc_us.store(s.usage.lock_alloc_us, Ordering::Relaxed);
+        self.lock_alloc_max_us.store(s.usage.lock_alloc_max_us, Ordering::Relaxed);
+        self.tx_frames.store(s.usage.tx_frames, Ordering::Relaxed);
+        self.tx_would_block.store(s.usage.tx_would_block, Ordering::Relaxed);
+        self.tx_enobufs.store(s.usage.tx_enobufs, Ordering::Relaxed);
+        self.tx_deferred.store(s.usage.tx_deferred, Ordering::Relaxed);
+        self.tx_pending.store(s.usage.tx_pending, Ordering::Relaxed);
+        self.tx_dropped_stale.store(s.usage.tx_dropped_stale, Ordering::Relaxed);
+        self.tx_dropped_stopped.store(s.usage.tx_dropped_stopped, Ordering::Relaxed);
+        self.tx_send_us.store(s.usage.tx_send_us, Ordering::Relaxed);
+        self.tx_send_cpu_us.store(s.usage.tx_send_cpu_us, Ordering::Relaxed);
+        self.tx_frame_max_us.store(s.usage.tx_frame_max_us, Ordering::Relaxed);
+        self.tx_frame_cpu_max_us.store(s.usage.tx_frame_cpu_max_us, Ordering::Relaxed);
+        self.waited_for.store_relaxed(s.waited_for);
+        self.longest_hold.store_relaxed(s.longest_hold);
+        self.late.store(s.late, Ordering::Relaxed);
+        self.release_seq.store(s.release_seq, Ordering::Relaxed);
+        self.safety_epoch.store(s.safety_epoch, Ordering::Relaxed);
+        self.maint_req_id.store(s.maint_req_id, Ordering::Relaxed);
+        self.release_flags.store(s.release_flags, Ordering::Relaxed);
+    }
+
+    fn load_raw_relaxed(&self) -> RawTickSlot {
+        RawTickSlot {
+            sample_seq: self.sample_seq.load(Ordering::Relaxed),
+            tick_us: self.tick_us.load(Ordering::Relaxed),
+            release_us: self.release_us.load(Ordering::Relaxed),
+            wait_us: self.wait_us.load(Ordering::Relaxed),
+            lock_us: self.lock_us.load(Ordering::Relaxed),
+            post_us: self.post_us.load(Ordering::Relaxed),
+            period_us: self.period_us.load(Ordering::Relaxed),
+            wake_lateness_us: self.wake_lateness_us.load(Ordering::Relaxed),
+            reader_hold_us: self.reader_hold_us.load(Ordering::Relaxed),
+            writer_hold_us: self.writer_hold_us.load(Ordering::Relaxed),
+            reader_acquire_us: self.reader_acquire_us.load(Ordering::Relaxed),
+            writer_acquire_us: self.writer_acquire_us.load(Ordering::Relaxed),
+            stats_wait_us: self.stats_wait_us.load(Ordering::Relaxed),
+            phases: LockPhases {
+                pre_us: self.pre_us.load(Ordering::Relaxed),
+                rx_us: self.rx_us.load(Ordering::Relaxed),
+                control_us: self.control_us.load(Ordering::Relaxed),
+                tx_us: self.tx_us.load(Ordering::Relaxed),
+                finish_us: self.finish_us.load(Ordering::Relaxed),
+                obs_us: self.obs_us.load(Ordering::Relaxed),
+                publish_us: self.publish_us.load(Ordering::Relaxed),
+            },
+            usage: ThreadUsage {
+                wait_cpu_us: self.wait_cpu_us.load(Ordering::Relaxed),
+                lock_cpu_us: self.lock_cpu_us.load(Ordering::Relaxed),
+                wait_vcsw: self.wait_vcsw.load(Ordering::Relaxed),
+                wait_ivcsw: self.wait_ivcsw.load(Ordering::Relaxed),
+                lock_vcsw: self.lock_vcsw.load(Ordering::Relaxed),
+                lock_ivcsw: self.lock_ivcsw.load(Ordering::Relaxed),
+                wait_majflt: self.wait_majflt.load(Ordering::Relaxed),
+                lock_majflt: self.lock_majflt.load(Ordering::Relaxed),
+                lock_minflt: self.lock_minflt.load(Ordering::Relaxed),
+                lock_alloc_calls: self.lock_alloc_calls.load(Ordering::Relaxed),
+                lock_alloc_us: self.lock_alloc_us.load(Ordering::Relaxed),
+                lock_alloc_max_us: self.lock_alloc_max_us.load(Ordering::Relaxed),
+                tx_frames: self.tx_frames.load(Ordering::Relaxed),
+                tx_would_block: self.tx_would_block.load(Ordering::Relaxed),
+                tx_enobufs: self.tx_enobufs.load(Ordering::Relaxed),
+                tx_deferred: self.tx_deferred.load(Ordering::Relaxed),
+                tx_pending: self.tx_pending.load(Ordering::Relaxed),
+                tx_dropped_stale: self.tx_dropped_stale.load(Ordering::Relaxed),
+                tx_dropped_stopped: self.tx_dropped_stopped.load(Ordering::Relaxed),
+                tx_send_us: self.tx_send_us.load(Ordering::Relaxed),
+                tx_send_cpu_us: self.tx_send_cpu_us.load(Ordering::Relaxed),
+                tx_frame_max_us: self.tx_frame_max_us.load(Ordering::Relaxed),
+                tx_frame_cpu_max_us: self.tx_frame_cpu_max_us.load(Ordering::Relaxed),
+            },
+            waited_for: self.waited_for.load_raw_relaxed(),
+            longest_hold: self.longest_hold.load_raw_relaxed(),
+            late: self.late.load(Ordering::Relaxed),
+            release_seq: self.release_seq.load(Ordering::Relaxed),
+            safety_epoch: self.safety_epoch.load(Ordering::Relaxed),
+            maint_req_id: self.maint_req_id.load(Ordering::Relaxed),
+            release_flags: self.release_flags.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl RawTickSlot {
+    /// # Safety
+    /// Must only be called after the enclosing seqlock read succeeded (`v1 == v2`, even, Acquire-ordered).
+    unsafe fn into_sample_validated(self) -> (u64, TickSample) {
+        (
+            self.sample_seq,
+            TickSample {
+                tick_us: self.tick_us,
+                release_us: self.release_us,
+                wait_us: self.wait_us,
+                lock_us: self.lock_us,
+                post_us: self.post_us,
+                period_us: self.period_us,
+                wake_lateness_us: self.wake_lateness_us,
+                reader_hold_us: self.reader_hold_us,
+                writer_hold_us: self.writer_hold_us,
+                reader_acquire_us: self.reader_acquire_us,
+                writer_acquire_us: self.writer_acquire_us,
+                stats_wait_us: self.stats_wait_us,
+                phases: self.phases,
+                usage: self.usage,
+                // SAFETY: seqlock read validated by caller.
+                waited_for: unsafe { self.waited_for.into_holder_validated() },
+                // SAFETY: seqlock read validated by caller.
+                longest_hold: unsafe { self.longest_hold.into_holder_validated() },
+                late: self.late,
+                release_seq: self.release_seq,
+                safety_epoch: self.safety_epoch,
+                maint_req_id: self.maint_req_id,
+                release_flags: self.release_flags,
+            },
+        )
+    }
+}
+
+/// Lock-free single-writer, multi-reader seqlock ring storing the last [`TICK_WINDOW`]
+/// control-tick samples plus cumulative since-boot totals.
+///
+/// The control thread (in legacy mode) or off-thread `drain_diag` (in executor mode) publishes
+/// complete [`TickSample`] values without ever taking a mutex or allocating. Concurrent HTTP
+/// readers copy a coherent window lock-free with bounded retries and explicit coverage-loss
+/// reporting (`stats_snapshot_lapped`) if stalled across ring reuse.
+pub struct LockFreeTickStats {
+    slots: Box<[AtomicTickSlot]>,
+    writer_busy: AtomicBool,
+    meta_seq: AtomicU64,
+    write_seq: AtomicU64,
+    late_count: AtomicU64,
+    tx_frames: AtomicU64,
+    tx_would_block: AtomicU64,
+    tx_enobufs: AtomicU64,
+    tx_deferred: AtomicU64,
+    tx_dropped_stale: AtomicU64,
+    tx_dropped_stopped: AtomicU64,
+    reader_retries: AtomicU64,
+    reader_window_retries: AtomicU64,
+    reader_lapped_snapshots: AtomicU64,
+    writer_contention_drops: AtomicU64,
+}
+
+impl std::fmt::Debug for LockFreeTickStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockFreeTickStats")
+            .field("write_seq", &self.write_seq.load(Ordering::Relaxed))
+            .field("reader_retries", &self.reader_retries())
+            .field("reader_lapped_snapshots", &self.reader_lapped_snapshots())
+            .field("writer_contention_drops", &self.writer_contention_drops())
+            .finish()
+    }
+}
+
+impl Default for LockFreeTickStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LockFreeTickStats {
+    pub fn new() -> Self {
+        const { assert!(LOCK_FREE_RING_CAPACITY.is_power_of_two() && LOCK_FREE_RING_CAPACITY > TICK_WINDOW) };
+        let slots: Vec<AtomicTickSlot> = (0..LOCK_FREE_RING_CAPACITY)
+            .map(|_| AtomicTickSlot::default())
+            .collect();
+        Self {
+            slots: slots.into_boxed_slice(),
+            writer_busy: AtomicBool::new(false),
+            meta_seq: AtomicU64::new(0),
+            write_seq: AtomicU64::new(0),
+            late_count: AtomicU64::new(0),
+            tx_frames: AtomicU64::new(0),
+            tx_would_block: AtomicU64::new(0),
+            tx_enobufs: AtomicU64::new(0),
+            tx_deferred: AtomicU64::new(0),
+            tx_dropped_stale: AtomicU64::new(0),
+            tx_dropped_stopped: AtomicU64::new(0),
+            reader_retries: AtomicU64::new(0),
+            reader_window_retries: AtomicU64::new(0),
+            reader_lapped_snapshots: AtomicU64::new(0),
+            writer_contention_drops: AtomicU64::new(0),
+        }
+    }
+
+    /// Wait-free publication of one complete sample (never blocks, never allocates).
+    /// Returns `false` and increments `writer_contention_drops` only if two writers call
+    /// `record` concurrently.
+    pub fn record(&self, s: &TickSample) -> bool {
+        self.record_staged(s, || s.release_us).is_some()
+    }
+
+    /// Wait-free staged publication: writes all sample payload fields into the next unpublished
+    /// slot BEFORE invoking `finalize()` (which measures the final release completion timestamp
+    /// and commits monotonic counters), stamps the authoritative `release_us` returned by
+    /// `finalize()`, and publishes both the slot and metadata seqlocks.
+    ///
+    /// Returns `Some(sample_seq)` on success, or `None` (incrementing `writer_contention_drops`)
+    /// if two writers contend concurrently.
+    pub fn record_staged(&self, s: &TickSample, finalize: impl FnOnce() -> u32) -> Option<u64> {
+        if self
+            .writer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        struct BusyGuard<'a>(&'a AtomicBool);
+        impl Drop for BusyGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(&self.writer_busy);
+
+        let prev_seq = self.write_seq.load(Ordering::Relaxed);
+        let sample_seq = prev_seq.wrapping_add(1);
+        let slot = &self.slots[(prev_seq as usize) & (LOCK_FREE_RING_CAPACITY - 1)];
+
+        // Per-slot seqlock write on the unpublished slot (readers do not read this slot until
+        // `write_seq` advances in `meta_seq` below).
+        let s0 = slot.seq.load(Ordering::Relaxed);
+        slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        slot.store_relaxed(sample_seq, s);
+        let final_release_us = finalize();
+        slot.release_us.store(final_release_us, Ordering::Relaxed);
+        slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+
+        // Coherent metadata seqlock write: odd -> Release fence -> totals + write_seq -> even (Release).
+        let m0 = self.meta_seq.load(Ordering::Relaxed);
+        self.meta_seq.store(m0.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.write_seq.store(sample_seq, Ordering::Relaxed);
+        if s.late {
+            let next = self.late_count.load(Ordering::Relaxed).saturating_add(1);
+            self.late_count.store(next, Ordering::Relaxed);
+        }
+        let add_tx = |a: &AtomicU64, delta: u32| {
+            if delta > 0 {
+                let next = a.load(Ordering::Relaxed).saturating_add(u64::from(delta));
+                a.store(next, Ordering::Relaxed);
+            }
+        };
+        add_tx(&self.tx_frames, s.usage.tx_frames);
+        add_tx(&self.tx_would_block, s.usage.tx_would_block);
+        add_tx(&self.tx_enobufs, s.usage.tx_enobufs);
+        add_tx(&self.tx_deferred, s.usage.tx_deferred);
+        add_tx(&self.tx_dropped_stale, s.usage.tx_dropped_stale);
+        add_tx(&self.tx_dropped_stopped, s.usage.tx_dropped_stopped);
+        self.meta_seq.store(m0.wrapping_add(2), Ordering::Release);
+        Some(sample_seq)
+    }
+
+    /// Wait-free single-writer tail amendment of `slot.release_us` for a specific `sample_seq`
+    /// if a post-publication instrumentation tail extended the release duration.
+    pub fn amend_slot_release_us(&self, sample_seq: u64, release_us: u32) {
+        if sample_seq == 0 {
+            return;
+        }
+        if self
+            .writer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        struct BusyGuard<'a>(&'a AtomicBool);
+        impl Drop for BusyGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(&self.writer_busy);
+
+        let slot_idx = ((sample_seq.wrapping_sub(1)) as usize) & (LOCK_FREE_RING_CAPACITY - 1);
+        let slot = &self.slots[slot_idx];
+        if slot.sample_seq.load(Ordering::Relaxed) == sample_seq
+            && slot.release_us.load(Ordering::Relaxed) < release_us
+        {
+            let s0 = slot.seq.load(Ordering::Relaxed);
+            slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+            fence(Ordering::Release);
+            slot.release_us.store(release_us, Ordering::Relaxed);
+            slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+        }
+    }
+
+    /// Wait-free single-writer tail amendment by executor `release_seq` (called only by off-thread
+    /// `drain_diag` under the `diag_rx` consumer mutex so `LockFreeTickStats` stays single-writer).
+    /// Scans up to [`TICK_WINDOW`] recent slots (`1000 > DIAG_RING_CAPACITY`) and returns `true`
+    /// if the target sample was found in the ring, or `false` if evicted or contended.
+    pub fn amend_release_us_by_release_seq(&self, release_seq: u64, release_us: u32) -> bool {
+        if release_seq == 0 {
+            return false;
+        }
+        if self
+            .writer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.writer_contention_drops.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        struct BusyGuard<'a>(&'a AtomicBool);
+        impl Drop for BusyGuard<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(&self.writer_busy);
+
+        let end_seq = self.write_seq.load(Ordering::Relaxed);
+        let scan = (end_seq as usize).min(TICK_WINDOW);
+        for back in 0..scan {
+            let seq = end_seq - back as u64;
+            let slot = &self.slots[((seq - 1) as usize) & (LOCK_FREE_RING_CAPACITY - 1)];
+            if slot.sample_seq.load(Ordering::Relaxed) == seq
+                && slot.release_seq.load(Ordering::Relaxed) == release_seq
+            {
+                if slot.release_us.load(Ordering::Relaxed) < release_us {
+                    let s0 = slot.seq.load(Ordering::Relaxed);
+                    slot.seq.store(s0.wrapping_add(1), Ordering::Relaxed);
+                    fence(Ordering::Release);
+                    slot.release_us.store(release_us, Ordering::Relaxed);
+                    slot.seq.store(s0.wrapping_add(2), Ordering::Release);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn read_meta_seqlock(&self) -> Option<(u64, u64, TxTotals)> {
+        for _ in 0..MAX_SEQLOCK_RETRIES {
+            let m1 = self.meta_seq.load(Ordering::Acquire);
+            if m1 & 1 != 0 {
+                self.reader_retries.fetch_add(1, Ordering::Relaxed);
+                std::hint::spin_loop();
+                continue;
+            }
+            let write_seq = self.write_seq.load(Ordering::Relaxed);
+            let late_count = self.late_count.load(Ordering::Relaxed);
+            let tx_totals = TxTotals {
+                frames: self.tx_frames.load(Ordering::Relaxed),
+                would_block: self.tx_would_block.load(Ordering::Relaxed),
+                enobufs: self.tx_enobufs.load(Ordering::Relaxed),
+                deferred: self.tx_deferred.load(Ordering::Relaxed),
+                dropped_stale: self.tx_dropped_stale.load(Ordering::Relaxed),
+                dropped_stopped: self.tx_dropped_stopped.load(Ordering::Relaxed),
+            };
+            fence(Ordering::Acquire);
+            let m2 = self.meta_seq.load(Ordering::Relaxed);
+            if m1 == m2 {
+                return Some((write_seq, late_count, tx_totals));
+            }
+            self.reader_retries.fetch_add(1, Ordering::Relaxed);
+            std::hint::spin_loop();
+        }
+        None
+    }
+
+    fn read_slot_seqlock(&self, slot: &AtomicTickSlot) -> Option<(u64, TickSample)> {
+        for _ in 0..MAX_SEQLOCK_RETRIES {
+            let v1 = slot.seq.load(Ordering::Acquire);
+            if v1 & 1 != 0 {
+                self.reader_retries.fetch_add(1, Ordering::Relaxed);
+                std::hint::spin_loop();
+                continue;
+            }
+            let raw = slot.load_raw_relaxed();
+            fence(Ordering::Acquire);
+            let v2 = slot.seq.load(Ordering::Relaxed);
+            if v1 == v2 {
+                // SAFETY: `v1 == v2` (even) with Acquire on `v1` and Acquire fence before `v2`.
+                return Some(unsafe { raw.into_sample_validated() });
+            }
+            self.reader_retries.fetch_add(1, Ordering::Relaxed);
+            std::hint::spin_loop();
+        }
+        None
+    }
+
+    /// Lock-free coherent snapshot of the last `min(ticks, TICK_WINDOW)` samples, oldest first.
+    pub fn window(&self) -> TickWindow {
+        self.window_with_hook(|_| {})
+    }
+
+    /// [`Self::window`] with a per-slot callback for deterministic concurrency / lap tests.
+    #[doc(hidden)]
+    pub fn window_with_hook(&self, mut on_slot_read: impl FnMut(usize)) -> TickWindow {
+        for _ in 0..MAX_WINDOW_ATTEMPTS {
+            let Some((end_seq, late_count, tx_totals)) = self.read_meta_seqlock() else {
+                self.reader_window_retries.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let count = (end_seq as usize).min(TICK_WINDOW);
+            let start_seq = end_seq.saturating_sub(count as u64);
+            let mut rows = Vec::with_capacity(count);
+            let mut coherent = true;
+            for i in 0..count {
+                on_slot_read(i);
+                let zero_based = start_seq + i as u64;
+                let expected_sample_seq = zero_based.wrapping_add(1);
+                let slot = &self.slots[(zero_based as usize) & (LOCK_FREE_RING_CAPACITY - 1)];
+                match self.read_slot_seqlock(slot) {
+                    Some((got_seq, sample)) if got_seq == expected_sample_seq => rows.push(sample),
+                    _ => {
+                        coherent = false;
+                        break;
+                    }
+                }
+            }
+            if coherent {
+                return TickWindow {
+                    rows,
+                    late_count,
+                    ticks: end_seq,
+                    tx_totals,
+                    snapshot_lapped: false,
+                };
+            }
+            self.reader_window_retries.fetch_add(1, Ordering::Relaxed);
+        }
+        self.reader_lapped_snapshots.fetch_add(1, Ordering::Relaxed);
+        TickWindow {
+            rows: Vec::new(),
+            late_count: self.late_count.load(Ordering::Relaxed),
+            ticks: self.write_seq.load(Ordering::Acquire),
+            tx_totals: TxTotals::default(),
+            snapshot_lapped: true,
+        }
+    }
+
+    pub fn snapshot(&self) -> TickSnapshot {
+        let mut snap = self.window().snapshot();
+        snap.stats_reader_retries = self.reader_retries();
+        snap.stats_writer_drops = self.writer_contention_drops();
+        snap
+    }
+
+    pub fn reader_retries(&self) -> u64 {
+        self.reader_retries.load(Ordering::Relaxed)
+    }
+
+    pub fn reader_window_retries(&self) -> u64 {
+        self.reader_window_retries.load(Ordering::Relaxed)
+    }
+
+    pub fn reader_lapped_snapshots(&self) -> u64 {
+        self.reader_lapped_snapshots.load(Ordering::Relaxed)
+    }
+
+    pub fn writer_contention_drops(&self) -> u64 {
+        self.writer_contention_drops.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn set_odd_meta_seq_for_test(&self, odd: bool) {
+        let cur = self.meta_seq.load(Ordering::Relaxed);
+        let target = if odd { cur | 1 } else { cur & !1 };
+        self.meta_seq.store(target, Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn set_odd_slot_seq_for_test(&self, slot_idx: usize, odd: bool) {
+        let slot = &self.slots[slot_idx & (LOCK_FREE_RING_CAPACITY - 1)];
+        let cur = slot.seq.load(Ordering::Relaxed);
+        let target = if odd { cur | 1 } else { cur & !1 };
+        slot.seq.store(target, Ordering::Release);
+    }
+}
+
 impl TickWindow {
     /// The samples, oldest first.
     pub fn samples(&self) -> &[TickSample] { &self.rows }
+
+    /// Returns `true` when this window exhausted bounded seqlock retries.
+    pub fn is_lapped(&self) -> bool { self.snapshot_lapped }
 
     fn col(&self, f: impl Fn(&TickSample) -> u32) -> Percentiles {
         let mut v: Vec<u32> = self.rows.iter().map(f).collect();
@@ -634,14 +1553,34 @@ impl TickWindow {
 
     pub fn snapshot(&self) -> TickSnapshot {
         TickSnapshot {
+            instance_id: String::new(),
+            boot_id: None,
+            process_start_unix_ns: None,
             window: self.rows.len(),
             tick_us: self.col(|r| r.tick_us),
+            release_us: self.col(|r| r.release_us),
+            releases_started: 0,
+            releases_total: 0,
+            in_flight_release_us: 0,
+            release_us_max_ever: 0,
+            releases_over_10ms: 0,
+            releases_over_15ms: 0,
+            releases_over_20ms: 0,
+            wake_late_max_ever: 0,
             lock_us: self.col(|r| r.lock_us),
             late_count: self.late_count,
             since_boot_ticks: self.ticks,
             wait_us: self.col(|r| r.wait_us),
             post_us: self.col(|r| r.post_us),
             period_us: self.col(|r| r.period_us),
+            wake_lateness_us: self.col(|r| r.wake_lateness_us),
+            wake_lateness_over_1ms: 0,
+            wake_lateness_over_5ms: 0,
+            wake_lateness_over_10ms: 0,
+            skipped_releases: 0,
+            diag_dropped: 0,
+            owner_mode: "legacy",
+            loop_active: false,
             reader_hold_us: self.col(|r| r.reader_hold_us),
             writer_hold_us: self.col(|r| r.writer_hold_us),
             stats_wait_us: self.col(|r| r.stats_wait_us),
@@ -657,6 +1596,7 @@ impl TickWindow {
                 publish_us: self.col(|r| r.phases.publish_us),
             },
             max_tick: self.max_by(|r| r.tick_us),
+            max_release: self.max_by(|r| r.release_us),
             max_lock: self.max_by(|r| r.lock_us),
             max_tx: self.max_by(|r| r.usage.tx_send_us),
             tx: TxDiagnostics {
@@ -683,6 +1623,10 @@ impl TickWindow {
             observation_cache: ObservationCacheStats::default(),
             safety_log_dropped: 0,
             log_writer_dropped: 0,
+            stats_snapshot_lapped: self.snapshot_lapped,
+            stats_reader_retries: 0,
+            stats_writer_drops: 0,
+            since_marker: None,
         }
     }
 }
@@ -833,5 +1777,355 @@ mod tests {
         assert_eq!(snap2.tx.since_boot_deferred, 2);
         assert_eq!(snap2.tx.since_boot_dropped_stale, 1);
         assert_eq!(snap2.tx.since_boot_dropped_stopped, 4);
+    }
+
+    #[test]
+    fn lock_free_tick_stats_matches_tick_stats_across_rollover_holders_and_tx_totals() {
+        let mut plain = TickStats::default();
+        let lf = LockFreeTickStats::new();
+        let read_holder = Holder {
+            kind: "read",
+            location: std::panic::Location::caller(),
+            hold_us: 12_345,
+            acquire_us: 67,
+            acquired_before_wait_us: 890,
+            released_before_lock_us: -12,
+        };
+        let write_holder = Holder {
+            kind: "write",
+            location: std::panic::Location::caller(),
+            hold_us: 23_456,
+            acquire_us: 89,
+            acquired_before_wait_us: -34,
+            released_before_lock_us: 56,
+        };
+        for i in 1..=(TICK_WINDOW as u32 + 150) {
+            let sample = TickSample {
+                tick_us: i * 3,
+                release_us: i * 3 + 50,
+                wait_us: if i % 25 == 0 { 400 } else { 0 },
+                lock_us: i * 2,
+                post_us: 15,
+                period_us: 20_000 + (i % 7),
+                wake_lateness_us: i % 500,
+                reader_hold_us: if i % 10 == 0 { 300 } else { 0 },
+                writer_hold_us: if i % 20 == 0 { 500 } else { 0 },
+                reader_acquire_us: 5,
+                writer_acquire_us: 9,
+                stats_wait_us: 0,
+                phases: LockPhases {
+                    pre_us: 10,
+                    rx_us: 20 + (i % 5),
+                    control_us: 30,
+                    tx_us: 40,
+                    finish_us: 5,
+                    obs_us: 12,
+                    publish_us: 3,
+                },
+                usage: ThreadUsage {
+                    tx_frames: if i % 3 == 0 { 2 } else { 1 },
+                    tx_would_block: u32::from(i % 11 == 0),
+                    tx_enobufs: u32::from(i % 13 == 0),
+                    tx_deferred: u32::from(i % 17 == 0),
+                    tx_pending: i % 4,
+                    tx_dropped_stale: u32::from(i % 19 == 0),
+                    tx_dropped_stopped: u32::from(i % 23 == 0),
+                    tx_send_us: 100 + (i % 90),
+                    tx_send_cpu_us: 40,
+                    tx_frame_max_us: 60 + (i % 40),
+                    tx_frame_cpu_max_us: 25,
+                    ..Default::default()
+                },
+                waited_for: (i == TICK_WINDOW as u32 + 100).then_some(read_holder),
+                longest_hold: (i == TICK_WINDOW as u32 + 100).then_some(write_holder),
+                late: i % 9 == 0,
+                release_seq: u64::from(i),
+                safety_epoch: u64::from(i % 5),
+                maint_req_id: u64::from(i % 7),
+                release_flags: i & 0x7f,
+            };
+            plain.record(&sample);
+            assert!(lf.record(&sample));
+        }
+
+        let w_plain = plain.window();
+        let w_lf = lf.window();
+        assert_eq!(w_plain.samples(), w_lf.samples());
+        let mut s_plain = w_plain.snapshot();
+        let s_lf = lf.snapshot();
+        s_plain.stats_reader_retries = s_lf.stats_reader_retries;
+        assert_eq!(s_plain, s_lf);
+        assert!(!s_lf.stats_snapshot_lapped);
+        assert_eq!(s_lf.stats_writer_drops, 0);
+    }
+
+    #[test]
+    fn lock_free_tick_stats_handles_paused_reader_reuse_and_bounded_odd_seqlock() {
+        let lf = LockFreeTickStats::new();
+        for i in 1..=(TICK_WINDOW as u32 + 10) {
+            assert!(lf.record(&TickSample { tick_us: i, ..Default::default() }));
+        }
+
+        // 1. Reader paused on slot 0 while writer overwrites the entire 2048-slot ring once:
+        //    first attempt detects slot reuse (`sample_seq != expected`), retries, and succeeds coherently.
+        let mut lapped_once = false;
+        let win = lf.window_with_hook(|slot_i| {
+            if slot_i == 0 && !lapped_once {
+                lapped_once = true;
+                for j in 0..(LOCK_FREE_RING_CAPACITY as u32 + 16) {
+                    assert!(lf.record(&TickSample { tick_us: 50_000 + j, ..Default::default() }));
+                }
+            }
+        });
+        assert!(!win.snapshot_lapped);
+        assert_eq!(win.samples().len(), TICK_WINDOW);
+        assert!(lf.reader_window_retries() >= 1);
+        assert_eq!(
+            win.samples().last().unwrap().tick_us,
+            50_000 + LOCK_FREE_RING_CAPACITY as u32 + 15
+        );
+
+        // 2. Reader repeatedly lapped across every attempt -> explicit `snapshot_lapped = true`.
+        let lapped = lf.window_with_hook(|slot_i| {
+            if slot_i == 0 {
+                for j in 0..(LOCK_FREE_RING_CAPACITY as u32 + 2) {
+                    assert!(lf.record(&TickSample { tick_us: 90_000 + j, ..Default::default() }));
+                }
+            }
+        });
+        assert!(lapped.snapshot_lapped);
+        assert!(lapped.snapshot().stats_snapshot_lapped);
+        assert_eq!(lf.reader_lapped_snapshots(), 1);
+
+        // 3. Odd meta_seq or odd slot seq held across full retry budget terminates deterministically.
+        let retries_before = lf.reader_retries();
+        lf.set_odd_meta_seq_for_test(true);
+        let odd_meta = lf.window();
+        lf.set_odd_meta_seq_for_test(false);
+        assert!(odd_meta.snapshot_lapped);
+        assert!(lf.reader_retries() >= retries_before + MAX_SEQLOCK_RETRIES as u64);
+
+        let retries_before_slot = lf.reader_retries();
+        let end_seq = lf.write_seq.load(Ordering::Acquire);
+        let first_slot = end_seq.saturating_sub(TICK_WINDOW as u64) as usize;
+        lf.set_odd_slot_seq_for_test(first_slot, true);
+        let odd_slot = lf.window();
+        lf.set_odd_slot_seq_for_test(first_slot, false);
+        assert!(odd_slot.snapshot_lapped);
+        assert!(lf.reader_retries() >= retries_before_slot + MAX_SEQLOCK_RETRIES as u64);
+    }
+
+    #[test]
+    fn lock_free_tick_stats_record_staged_and_tail_amendments_are_exact() {
+        let lf = LockFreeTickStats::new();
+        let seq1 = lf
+            .record_staged(
+                &TickSample {
+                    tick_us: 1_200,
+                    release_us: 0,
+                    release_seq: 101,
+                    ..Default::default()
+                },
+                || 4_500,
+            )
+            .expect("staged record");
+        assert_eq!(seq1, 1);
+        assert_eq!(lf.window().samples()[0].release_us, 4_500);
+
+        // Amend downward is ignored; amend upward updates cleanly.
+        lf.amend_slot_release_us(seq1, 3_000);
+        assert_eq!(lf.window().samples()[0].release_us, 4_500);
+        lf.amend_slot_release_us(seq1, 25_200);
+        assert_eq!(lf.window().samples()[0].release_us, 25_200);
+
+        // Executor release_seq-based amendment updates the recorded slot monotonically even > 16 slots deep.
+        let _ = lf.record(&TickSample {
+            tick_us: 900,
+            release_us: 1_100,
+            release_seq: 202,
+            ..Default::default()
+        });
+        for k in 0..32u64 {
+            let _ = lf.record(&TickSample {
+                tick_us: 500,
+                release_us: 600,
+                release_seq: 203 + k,
+                ..Default::default()
+            });
+        }
+        assert!(lf.amend_release_us_by_release_seq(202, 26_700));
+        let samples = lf.window().samples().to_vec();
+        assert_eq!(samples[1].release_seq, 202);
+        assert_eq!(samples[1].release_us, 26_700);
+        // Unknown / evicted sequence returns `false` so callers record explicit coverage loss.
+        assert!(!lf.amend_release_us_by_release_seq(999_999, 10_000));
+        assert_eq!(lf.writer_contention_drops(), 0);
+    }
+
+    #[test]
+    fn lock_free_tick_stats_multithreaded_tear_free_and_writer_nonblocking() {
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let lf = Arc::new(LockFreeTickStats::new());
+        let loc_read: &'static std::panic::Location<'static> = std::panic::Location::caller();
+        let loc_write: &'static std::panic::Location<'static> = std::panic::Location::caller();
+
+        let make_sample = move |k: u64| -> TickSample {
+            let ku = k as u32;
+            let waited_for = if k.is_multiple_of(2) {
+                Some(Holder {
+                    kind: "read",
+                    location: loc_read,
+                    hold_us: ku * 7 + 1,
+                    acquire_us: ku * 3 + 2,
+                    acquired_before_wait_us: k as i64 * 11,
+                    released_before_lock_us: -(k as i64),
+                })
+            } else {
+                None
+            };
+            let longest_hold = if k.is_multiple_of(3) {
+                Some(Holder {
+                    kind: "write",
+                    location: loc_write,
+                    hold_us: ku * 13 + 5,
+                    acquire_us: ku * 5 + 4,
+                    acquired_before_wait_us: -(k as i64 * 2),
+                    released_before_lock_us: k as i64 * 17,
+                })
+            } else {
+                None
+            };
+            TickSample {
+                tick_us: ku * 10 + 1,
+                release_us: ku * 10 + 7,
+                wait_us: ku % 97,
+                lock_us: ku * 4 + 3,
+                post_us: ku % 53,
+                period_us: 20_000 + (ku % 113),
+                wake_lateness_us: ku % 887,
+                reader_hold_us: ku % 311,
+                writer_hold_us: ku % 211,
+                reader_acquire_us: ku % 41,
+                writer_acquire_us: ku % 43,
+                stats_wait_us: 0,
+                phases: LockPhases {
+                    pre_us: ku % 19,
+                    rx_us: ku % 23,
+                    control_us: ku % 29,
+                    tx_us: ku % 31,
+                    finish_us: ku % 37,
+                    obs_us: ku % 41,
+                    publish_us: ku % 43,
+                },
+                usage: ThreadUsage {
+                    lock_cpu_us: ku % 500,
+                    tx_frames: 2,
+                    tx_would_block: u32::from(k.is_multiple_of(5)),
+                    tx_enobufs: u32::from(k.is_multiple_of(11)),
+                    tx_deferred: u32::from(k.is_multiple_of(13)),
+                    tx_pending: ku % 7,
+                    tx_dropped_stale: u32::from(k.is_multiple_of(17)),
+                    tx_dropped_stopped: u32::from(k.is_multiple_of(19)),
+                    tx_send_us: ku % 600,
+                    tx_send_cpu_us: ku % 200,
+                    tx_frame_max_us: ku % 300,
+                    tx_frame_cpu_max_us: ku % 100,
+                    ..Default::default()
+                },
+                waited_for,
+                longest_hold,
+                late: k.is_multiple_of(7),
+                release_seq: k,
+                safety_epoch: k * 3 + 1,
+                maint_req_id: k * 5 + 2,
+                release_flags: ku & 0x7f,
+            }
+        };
+
+        // Pre-populate 16 samples so a frozen reader immediately enters the slot loop.
+        for k in 1..=16u64 {
+            assert!(lf.record(&make_sample(k)));
+        }
+
+        // Freeze one reader mid-window while the writer publishes 6,000 samples (wrapping 2048-slot ring ~3x).
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let lf_frozen = Arc::clone(&lf);
+        let frozen_jh = thread::spawn(move || {
+            let mut paused_once = false;
+            lf_frozen.window_with_hook(|slot_i| {
+                if slot_i == 2 && !paused_once {
+                    paused_once = true;
+                    let _ = paused_tx.send(());
+                    let _ = resume_rx.recv();
+                }
+            })
+        });
+        paused_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("frozen reader entered hook");
+
+        // Spawn 4 concurrent readers hammering `window()` and checking tear-freedom on every field + pointer.
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let verified_windows = Arc::new(AtomicU64::new(0));
+        let mut reader_jhs = Vec::new();
+        for _ in 0..4 {
+            let lf_r = Arc::clone(&lf);
+            let done_r = Arc::clone(&writer_done);
+            let verified_r = Arc::clone(&verified_windows);
+            reader_jhs.push(thread::spawn(move || {
+                while !done_r.load(Ordering::Acquire) || verified_r.load(Ordering::Relaxed) < 40 {
+                    let win = lf_r.window();
+                    if win.snapshot_lapped || win.rows.is_empty() {
+                        continue;
+                    }
+                    let end_seq = win.ticks;
+                    let expected_len = (end_seq as usize).min(TICK_WINDOW);
+                    assert_eq!(win.rows.len(), expected_len, "window length must match ticks");
+                    assert_eq!(win.late_count, end_seq / 7, "late_count torn against ticks={end_seq}");
+                    assert_eq!(win.tx_totals.frames, end_seq * 2, "tx_frames torn against ticks={end_seq}");
+                    assert_eq!(win.tx_totals.would_block, end_seq / 5);
+                    assert_eq!(win.tx_totals.enobufs, end_seq / 11);
+                    assert_eq!(win.tx_totals.deferred, end_seq / 13);
+                    assert_eq!(win.tx_totals.dropped_stale, end_seq / 17);
+                    assert_eq!(win.tx_totals.dropped_stopped, end_seq / 19);
+
+                    let first_k = end_seq - (expected_len as u64) + 1;
+                    for (idx, got) in win.rows.iter().enumerate() {
+                        let k = first_k + idx as u64;
+                        let expected = make_sample(k);
+                        assert_eq!(
+                            *got, expected,
+                            "torn read detected in slot idx={idx}, expected release_seq={k}"
+                        );
+                    }
+                    verified_r.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // Single writer runs to completion BEFORE the frozen reader is allowed to resume!
+        const TOTAL_SAMPLES: u64 = 6_000;
+        for k in 17..=TOTAL_SAMPLES {
+            assert!(lf.record(&make_sample(k)));
+            if k % 64 == 0 {
+                thread::yield_now();
+            }
+        }
+        writer_done.store(true, Ordering::Release);
+        for jh in reader_jhs {
+            jh.join().expect("reader thread panicked on torn read");
+        }
+        // Writer completed all 6,000 samples while frozen reader was parked: zero blocking, zero drops!
+        assert_eq!(lf.writer_contention_drops(), 0);
+        assert!(verified_windows.load(Ordering::Relaxed) >= 40);
+
+        resume_tx.send(()).unwrap();
+        let frozen_win = frozen_jh.join().expect("frozen reader panicked");
+        // Frozen reader detected slot reuse, retried coherently, and returned an intact final window.
+        assert!(!frozen_win.snapshot_lapped);
+        assert_eq!(frozen_win.ticks, TOTAL_SAMPLES);
+        assert_eq!(frozen_win.rows.len(), TICK_WINDOW);
+        assert_eq!(*frozen_win.rows.last().unwrap(), make_sample(TOTAL_SAMPLES));
     }
 }

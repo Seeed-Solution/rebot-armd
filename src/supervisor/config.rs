@@ -141,7 +141,11 @@ impl SupervisorInner {
         let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, &self.config.home_positions, tol) else { return; };
         if self.zero_convention.status == "legacy_j6" && v.status != "legacy_j6" { return; }
         if v.status == "legacy_j6" && self.zero_convention.status != "legacy_j6" {
-            tracing::warn!("Joint zero check: {}", v.message.as_deref().unwrap_or(""));
+            if self.rt_executor_owned {
+                self.pending_legacy_j6_log = Some(v);
+            } else if let Some(msg) = v.message() {
+                tracing::warn!("Joint zero check: {msg}");
+            }
         }
         self.zero_convention = v;
     }

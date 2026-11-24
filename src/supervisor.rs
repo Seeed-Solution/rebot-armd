@@ -909,6 +909,8 @@ pub struct SupervisorInner {
     pub joint_zero_offsets: Vec<f32>,
     /// Zero check against the profile's `zero_reference` (`zero_convention`).
     pub zero_convention: crate::joint_zero::ZeroConvention,
+    /// Pending `legacy_j6` warning deferred from `armd-control` to off-thread log formatting.
+    pub(crate) pending_legacy_j6_log: Option<crate::joint_zero::ZeroConvention>,
     /// Run the zero check on the next tick with fresh feedback and torque off (startup, after
     /// torque went off, after a zero).
     pub zero_check_pending: bool,
@@ -1642,6 +1644,7 @@ impl SupervisorInner {
             calibration_load_error: None,
             joint_zero_offsets: vec![0.0; dof],
             zero_convention: Default::default(),
+            pending_legacy_j6_log: None,
             zero_check_pending: true,
             zero_check_prev_torqued: false,
             profile_camera_mount,
@@ -2004,7 +2007,7 @@ impl SupervisorInner {
         schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
         if let Some(t) = schema.capabilities.teach.as_mut() { t.episodes = self.episodes.enabled(); }
         schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
-        schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(&self.zero_convention).ok());
+        schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(self.zero_convention).ok());
         schema
     }
 
@@ -2398,6 +2401,30 @@ impl SupervisorInner {
         obs
     }
 
+    /// Pre-warms RT-owned scratch/history buffers, static fallback policies, and empty
+    /// triple-buffer observation slots for the RT executor before the first release runs
+    /// (nonblocking under reader contention; leaves `published_seq` unchanged).
+    pub(crate) fn prewarm_observation_slots(&mut self) {
+        let _ = Self::default_rebot_dm_resting_pose();
+        let dof = self.config.dof;
+        let arm_dof = self.config.arm_dof();
+        self.still_anchor_positions.reserve(dof);
+        self.table_still_anchor_positions.reserve(dof);
+        self.table_still_first_rx_instants.reserve(dof);
+        self.table_still_last_rx_instants.reserve(dof);
+        self.joint_feedback_queue_bounds.reserve(dof);
+        self.motor_errors.reserve(dof);
+        self.gravity_torques.reserve(arm_dof);
+        let tmpl = self.current_observation();
+        self.core.try_prewarm_observations(|| {
+            let mut obs = tmpl.clone();
+            obs.ensure_rt_safety_text_spare();
+            obs.gravity_torques.reserve(arm_dof);
+            obs.motor_errors.reserve(dof);
+            obs
+        });
+    }
+
     /// [`Self::current_observation`] at `timestamp` written into `out`, reusing its memory: the
     /// control tick fills its published sample this way, without allocating while no value
     /// changes its shape (armd 1.6 RT core). Every field is overwritten.
@@ -2530,10 +2557,15 @@ impl SupervisorInner {
         })
     }
 
-    fn resting_policy(&self) -> Option<RestingPosePolicy> {
+    fn default_rebot_dm_resting_pose() -> &'static RestingPosePolicy {
+        static DEFAULT_REBOT_DM: std::sync::OnceLock<RestingPosePolicy> = std::sync::OnceLock::new();
+        DEFAULT_REBOT_DM.get_or_init(RestingPosePolicy::rebot_dm)
+    }
+
+    fn resting_policy(&self) -> Option<&RestingPosePolicy> {
         match &self.config.resting_pose {
-            Some(policy) => Some(policy.clone()),
-            None if self.driver.is_none() => Some(RestingPosePolicy::rebot_dm()),
+            Some(policy) => Some(policy),
+            None if self.driver.is_none() => Some(Self::default_rebot_dm_resting_pose()),
             None => None,
         }
     }
@@ -6404,9 +6436,7 @@ pub struct ArmSupervisor {
     stop_gen: Arc<AtomicU64>,
     estop_epoch: Arc<AtomicU64>,
     lease_gen_mirror: Arc<AtomicU64>,
-    tick_stats: Arc<std::sync::Mutex<crate::diagnostics::tick::TickStats>>,
-    /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
-    tick_stats_wait_us: AtomicU64,
+    tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     control_sched: Arc<std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     /// Readers' side of the tick's state publication (`crate::rt_core::publish`).
     hub: Arc<crate::rt_core::publish::StateHub>,
@@ -6436,6 +6466,10 @@ pub struct ArmSupervisor {
     /// Template observation used by `armd-dispatch` to carry drained action terminals if no
     /// control tick has published to `hub` yet.
     template_obs: ArmObservation,
+    /// Shared periodic-loop timing stats attached in Legacy mode (`run_periodic`).
+    legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
+    /// Unique identifier for this daemon/supervisor instance (changes across restarts).
+    instance_id: String,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -6494,8 +6528,90 @@ impl Drop for ArmSupervisor {
     fn drop(&mut self) { self.hub.close(); }
 }
 
+/// Immutable host/process boot identity exposed on `GET /api/v1/diagnostics/tick` so offline
+/// qualification analysis can detect kernel reboots and `panic = "abort"` daemon restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub boot_id: Option<String>,
+    pub process_start_unix_ns: Option<u64>,
+}
+
+/// Pure parser computing a process's Unix-epoch start timestamp (nanoseconds) from Linux
+/// `/proc/stat` (`btime` seconds) and `/proc/self/stat` (field 22 `starttime` in clock ticks),
+/// given `sysconf(_SC_CLK_TCK)`. Handles arbitrary `comm` names containing spaces or parentheses
+/// by splitting after the final `')'`. Returns `None` on parse failure, `clk_tck <= 0`, or
+/// arithmetic overflow (never emits a placeholder).
+pub fn parse_linux_process_start_unix_ns(
+    proc_stat: &str,
+    proc_self_stat: &str,
+    clk_tck: i64,
+) -> Option<u64> {
+    if clk_tck <= 0 {
+        return None;
+    }
+    let btime_secs: u64 = proc_stat.lines().find_map(|line| {
+        let mut toks = line.split_whitespace();
+        if toks.next()? == "btime" {
+            toks.next()?.parse::<u64>().ok()
+        } else {
+            None
+        }
+    })?;
+    let after_comm = proc_self_stat.rsplit_once(')')?.1;
+    // Fields after `)` begin at field 3 (`state`), so field 22 (`starttime`) is 0-based index 19.
+    let start_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+    let btime_ns = u128::from(btime_secs).checked_mul(1_000_000_000)?;
+    let offset_ns = u128::from(start_ticks)
+        .checked_mul(1_000_000_000)?
+        .checked_div(u128::try_from(clk_tck).ok()?)?;
+    let total_ns = btime_ns.checked_add(offset_ns)?;
+    u64::try_from(total_ns).ok()
+}
+
+fn read_process_identity() -> ProcessIdentity {
+    #[cfg(target_os = "linux")]
+    {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // SAFETY: `sysconf(_SC_CLK_TCK)` is a thread-safe POSIX query with no pointer arguments.
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as i64 };
+        let process_start_unix_ns = (|| {
+            let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+            let proc_self_stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+            parse_linux_process_start_unix_ns(&proc_stat, &proc_self_stat, clk_tck)
+        })();
+        ProcessIdentity {
+            boot_id,
+            process_start_unix_ns,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let process_start_unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
+            .filter(|&ns| ns > 0);
+        ProcessIdentity {
+            boot_id: None,
+            process_start_unix_ns,
+        }
+    }
+}
+
+static PROCESS_IDENTITY: std::sync::OnceLock<ProcessIdentity> = std::sync::OnceLock::new();
+
+/// Eagerly initializes and returns the process-wide immutable boot identity.
+/// Called at the top of `main()` and in `ArmSupervisor::new()`.
+pub fn init_process_identity() -> &'static ProcessIdentity {
+    PROCESS_IDENTITY.get_or_init(read_process_identity)
+}
+
 impl ArmSupervisor {
     pub fn new(config: ArmConfig) -> Self {
+        let _ = init_process_identity();
         let (tx, _) = broadcast::channel(128);
         let e_stop_latched = Arc::new(AtomicBool::new(false));
         let requested_estop_count = Arc::new(AtomicU64::new(0));
@@ -6513,6 +6629,12 @@ impl ArmSupervisor {
         let hub = inner.core.hub().clone();
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
         let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
+        static NEXT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
+        let boot_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let seq = NEXT_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let instance_id = format!("armd-{}-{boot_ns:x}-{seq}", std::process::id());
         Self {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
@@ -6522,8 +6644,7 @@ impl ArmSupervisor {
             stop_gen,
             estop_epoch,
             lease_gen_mirror,
-            tick_stats: Arc::new(std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default())),
-            tick_stats_wait_us: AtomicU64::new(0),
+            tick_stats: Arc::new(crate::diagnostics::tick::LockFreeTickStats::new()),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
             hub,
             dispatcher_start: std::sync::Mutex::new(()),
@@ -6540,6 +6661,8 @@ impl ArmSupervisor {
             estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
             sinks: Arc::new(std::sync::Mutex::new(None)),
             template_obs,
+            legacy_loop_stats: std::sync::Mutex::new(None),
+            instance_id,
         }
     }
 
@@ -6576,6 +6699,36 @@ impl ArmSupervisor {
             lease_gen: self.lease_generation(),
             connection_id: 0,
             request_id: next_admission_request_id(),
+        }
+    }
+
+    /// Human-readable ownership mode name exposed in `GET /api/v1/diagnostics/tick`.
+    pub fn owner_mode_name(&self) -> &'static str {
+        match self.owner_mode() {
+            OWNER_LEGACY => "legacy",
+            OWNER_TRANSFERRING => "transferring",
+            OWNER_EXECUTOR => "executor",
+            OWNER_FAILED => "failed",
+            _ => "unknown",
+        }
+    }
+
+    /// Attaches the legacy periodic control loop's [`ExecutorStats`] so `GET /api/v1/diagnostics/tick`
+    /// reports `skipped_releases`, monotonic release peaks/thresholds, and single-completion publication
+    /// into [`LockFreeTickStats`] in Legacy mode.
+    pub fn attach_legacy_loop_stats(&self, stats: Arc<crate::rt_core::executor::ExecutorStats>) {
+        stats.attach_legacy_tick_ring(Arc::clone(&self.tick_stats));
+        *self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats);
+    }
+
+    /// Signals stop on the legacy periodic control loop, recording the monotonic shutdown timestamp
+    /// and waking Linux futex sleep when legacy loop stats are attached.
+    pub fn signal_legacy_stop(&self, stop: &AtomicBool) {
+        let stats = self.legacy_loop_stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(stats) = stats {
+            stats.signal_stop(stop);
+        } else {
+            stop.store(true, Ordering::SeqCst);
         }
     }
 
@@ -7772,6 +7925,8 @@ impl ArmSupervisor {
         scheduled_deadline: Option<Instant>,
     ) -> Option<ArmObservation> {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick_shared");
+        let wake_lateness_ns = crate::diagnostics::tick::take_current_wake_lateness_ns();
+        let wake_lateness_us = (wake_lateness_ns / 1_000).min(u64::from(u32::MAX)) as u32;
         if self.owner_mode() != OWNER_LEGACY {
             return None;
         }
@@ -8070,17 +8225,19 @@ impl ArmSupervisor {
                 released_before_lock_us: signed(locked, r.released),
             }
         };
-        let sample = crate::diagnostics::tick::TickSample {
+        let mut sample = crate::diagnostics::tick::TickSample {
             tick_us: us(done - started),
+            release_us: 0,
             wait_us: us(wait),
             lock_us: us(lock_held),
             post_us: us(done - released),
             period_us: if dt.is_finite() && dt >= 0.0 { us(Duration::from_secs_f64(dt.min(4.0e3))) } else { 0 },
+            wake_lateness_us,
             reader_hold_us: us(log.reader_hold),
             writer_hold_us: us(log.writer_hold),
             reader_acquire_us: us(log.reader_acquire),
             writer_acquire_us: us(log.writer_acquire),
-            stats_wait_us: self.tick_stats_wait_us.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+            stats_wait_us: 0,
             phases: crate::diagnostics::tick::LockPhases {
                 pre_us: us(pre),
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
@@ -8100,25 +8257,154 @@ impl ArmSupervisor {
             maint_req_id: 0,
             release_flags: 0,
         };
-        let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
-        self.tick_stats_wait_us.store(done.elapsed().as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
-        stats.record(&sample);
-        drop(stats);
+        if crate::diagnostics::tick::periodic_defers_sample_publish() {
+            // Single-completion point in `run_periodic_with_clock` will stamp full `release_us`
+            // (covering wake through `block_on` return and stats publication) and record once.
+            crate::diagnostics::tick::stash_periodic_sample(sample);
+        } else {
+            sample.release_us = us(started.elapsed());
+            let _ = self.tick_stats.record(&sample);
+        }
         obs
+    }
+
+    /// Exposes the lock-free tick ring for deterministic paused-reader contention tests.
+    #[doc(hidden)]
+    pub fn tick_stats_ring_for_test(&self) -> &Arc<crate::diagnostics::tick::LockFreeTickStats> {
+        &self.tick_stats
     }
 
     /// The raw samples of the last ticks, oldest first (tests, diagnostics).
     pub fn tick_samples(&self) -> Vec<crate::diagnostics::tick::TickSample> {
         self.drain_diag();
-        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window().samples().to_vec()
+        self.tick_stats.window().samples().to_vec()
     }
 
-    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
-    /// the stats mutex and sorted after it is released, so this route does not delay a tick.
+    /// Requests a coherent control-thread baseline marker (`POST /api/v1/diagnostics/tick/mark`)
+    /// on the currently active periodic owner. Returns 503 if no control loop is actively running.
+    pub fn mark_tick_baseline(&self) -> Result<u64, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let Some(h) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                if h.is_exited() || !h.stats().is_loop_active() {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_STOPPED".into(),
+                        message: "RT executor control loop is not active".into(),
+                    });
+                }
+                Ok(h.stats().request_marker())
+            }
+            OWNER_LEGACY => {
+                let stats = self
+                    .legacy_loop_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let Some(s) = stats else {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "CONTROL_LOOP_INACTIVE".into(),
+                        message: "Legacy periodic control loop is not active".into(),
+                    });
+                };
+                if !s.is_loop_active() {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "CONTROL_LOOP_INACTIVE".into(),
+                        message: "Legacy periodic control loop is not active".into(),
+                    });
+                }
+                Ok(s.request_marker())
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). Reads the lock-free ring
+    /// without ever blocking the control thread.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
-        self.drain_diag();
-        let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
-        let mut snap = window.snapshot();
+        const MAX_ALIGN_ATTEMPTS: usize = 4;
+        let active_stats = if let Some(h) = self.executor_handle() {
+            Some(Arc::clone(h.stats()))
+        } else {
+            self.legacy_loop_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+
+        let mut snap = if let Some(s) = active_stats {
+            // Bounded alignment loop: read monotonic snapshot FIRST (Acquire on `stats_seq`),
+            // drain off-thread diagnostics (guaranteed to include all samples & amendments
+            // published before `mono1`), copy the lock-free window (fast memcpy, no sort),
+            // and re-read monotonic snapshot to confirm no release crossed the capture window.
+            let mut chosen: Option<(
+                crate::diagnostics::tick::TickWindow,
+                crate::rt_core::executor::MonotonicStatsSnapshot,
+            )> = None;
+            let mut last_attempt = None;
+            for _ in 0..MAX_ALIGN_ATTEMPTS {
+                let mono1 = s.snapshot_monotonic();
+                self.drain_diag();
+                let win = self.tick_stats.window();
+                let mono2 = s.snapshot_monotonic();
+                let aligned = mono1.coherent
+                    && mono2.coherent
+                    && !win.is_lapped()
+                    && mono1.releases_started == mono2.releases_started
+                    && mono1.releases_total == mono2.releases_total
+                    && mono1.skipped_releases == mono2.skipped_releases
+                    && mono1.loop_active == mono2.loop_active;
+                if aligned {
+                    chosen = Some((win, mono2));
+                    break;
+                }
+                last_attempt = Some((win, mono2));
+            }
+            let (win, mono, align_lapped) = match chosen {
+                Some((win, mono)) => (win, mono, false),
+                None => {
+                    let (win, mono) = last_attempt.expect("MAX_ALIGN_ATTEMPTS > 0");
+                    (win, mono, true)
+                }
+            };
+            let mut snap = win.snapshot();
+            snap.stats_reader_retries = self.tick_stats.reader_retries();
+            snap.stats_writer_drops = self
+                .tick_stats
+                .writer_contention_drops()
+                .saturating_add(s.amend_missed.load(Ordering::Relaxed));
+            if !mono.coherent || align_lapped {
+                snap.stats_snapshot_lapped = true;
+            }
+            snap.loop_active = mono.loop_active;
+            snap.releases_started = mono.releases_started;
+            snap.releases_total = mono.releases_total;
+            snap.in_flight_release_us = mono.in_flight_release_us;
+            snap.release_us_max_ever = mono.release_us_max_ever;
+            snap.releases_over_10ms = mono.releases_over_10ms;
+            snap.releases_over_15ms = mono.releases_over_15ms;
+            snap.releases_over_20ms = mono.releases_over_20ms;
+            snap.wake_late_max_ever = mono.wake_late_max_ever;
+            snap.skipped_releases = mono.skipped_releases;
+            snap.diag_dropped = mono.diag_dropped;
+            snap.wake_lateness_over_1ms = mono.wake_lateness_over_1ms;
+            snap.wake_lateness_over_5ms = mono.wake_lateness_over_5ms;
+            snap.wake_lateness_over_10ms = mono.wake_lateness_over_10ms;
+            snap.since_marker = mono.since_marker;
+            snap
+        } else {
+            self.drain_diag();
+            self.tick_stats.snapshot()
+        };
+        snap.instance_id = self.instance_id.clone();
+        let ident = init_process_identity();
+        snap.boot_id = ident.boot_id.clone();
+        snap.process_start_unix_ns = ident.process_start_unix_ns;
+        snap.owner_mode = self.owner_mode_name();
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),
@@ -8163,7 +8449,7 @@ fn dispatch_loop(
     tx: &broadcast::Sender<ArmObservation>,
     terminals: &TerminalBroadcaster,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
-    tick_stats: &std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
     template_obs: &ArmObservation,
 ) {
     #[cfg(target_os = "linux")]
@@ -8641,5 +8927,36 @@ mod observation_snapshot_tests {
         assert_eq!(*delivered.lock().unwrap(), vec![a1.id, a2.id, a3.id]);
         assert!(tb.can_start_action(false, false));
         tb.unsubscribe(sub_id);
+    }
+
+    #[test]
+    fn parse_linux_process_start_unix_ns_handles_valid_weird_comm_and_errors() {
+        // 19 fields after `)` before field 22 (`starttime`), e.g. state='S', ppid..=num_threads(18) -> 19 tokens, index 19 is starttime=250.
+        let proc_stat = "cpu 1 2 3\nbtime 1700000000\nprocesses 42\n";
+        let self_stat = "1234 (armd (rt) v1.6) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 250 999 1000";
+        // 1700000000 s + 250 / 100 s = 1700000002.5 s = 1700000002_500_000_000 ns
+        assert_eq!(
+            parse_linux_process_start_unix_ns(proc_stat, self_stat, 100),
+            Some(1_700_000_002_500_000_000)
+        );
+        // Invalid clk_tck <= 0 -> None
+        assert_eq!(parse_linux_process_start_unix_ns(proc_stat, self_stat, 0), None);
+        assert_eq!(parse_linux_process_start_unix_ns(proc_stat, self_stat, -1), None);
+        // Missing btime -> None
+        assert_eq!(parse_linux_process_start_unix_ns("cpu 1 2 3\n", self_stat, 100), None);
+        // Malformed / truncated /proc/self/stat -> None
+        assert_eq!(parse_linux_process_start_unix_ns(proc_stat, "1234 (armd) S 1 2", 100), None);
+        // Overflow -> None
+        let overflow_stat = format!("btime {}\n", u64::MAX);
+        assert_eq!(parse_linux_process_start_unix_ns(&overflow_stat, self_stat, 100), None);
+
+        #[cfg(target_os = "linux")]
+        {
+            let id1 = init_process_identity();
+            let id2 = init_process_identity();
+            assert_eq!(id1, id2);
+            assert!(id1.boot_id.as_deref().is_some_and(|s| !s.is_empty()));
+            assert!(id1.process_start_unix_ns.is_some_and(|ns| ns > 0));
+        }
     }
 }
