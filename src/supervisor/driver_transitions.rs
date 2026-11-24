@@ -1798,7 +1798,7 @@ impl SupervisorInner {
         self.safety.mark_motion_finished();
         if watchdog && self.is_torqued && !self.safety.state().is_stopped() { self.latch_watchdog_fault(); }
         if let Some(id) = action_id {
-            if !self.safety.state().is_stopped() {
+            if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {
                 let mut msg = self.take_action_msg_buf(id, 96);
                 msg.clear(); msg.push_str(text);
                 self.finish_action(id, "failed", Some(code), Some(msg), None, None, None);

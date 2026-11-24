@@ -2876,6 +2876,8 @@ impl SupervisorInner {
         self.motion_config_revision = self.motion_config_revision.wrapping_add(1).max(1);
     }
 
+    pub fn park_continuation(&self) -> Option<ParkContinuation> { self.park_continuation }
+
     pub(crate) fn notify_park_continuation(&self) {
         if !self.rt_executor_owned { self.park_continuation_notify.notify_waiters(); }
     }
@@ -7448,8 +7450,10 @@ impl ArmSupervisor {
                 }
             }
         }
+        inner.driver_caps = caps;
         inner.apply_driver_limits(drv.as_ref());
         inner.driver = Some(std::sync::Mutex::new(drv));
+        inner.bump_motion_config_revision();
         Ok(())
     }
 
@@ -7464,12 +7468,15 @@ impl ArmSupervisor {
                 driver.set_estop_gate(inner.estop_gate());
                 driver.set_gripper_index(inner.config.gripper_index());
                 driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
-                if driver.capabilities().load_feedback {
+                let caps = driver.capabilities();
+                if caps.load_feedback {
                     inner.loads = vec![f32::NAN; inner.config.dof];
                 }
                 let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
+                inner.driver_caps = driver.capabilities();
                 inner.apply_driver_limits(driver.as_ref());
                 inner.driver = Some(std::sync::Mutex::new(driver));
+                inner.bump_motion_config_revision();
             }
         }
         self
