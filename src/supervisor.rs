@@ -8331,7 +8331,7 @@ impl ArmSupervisor {
     /// on executor, never dropped when the ordinary broker ring is full).
     ///
     /// Waits out momentary `OWNER_TRANSFERRING` so mid-handoff teardown always reaches the
-    /// winning owner, and publishes legacy mutations to `StateHub` before dropping the lock.
+    /// winning owner.
     pub async fn disconnect_ws_connection(
         &self,
         conn: crate::rt_core::requests::lease::ConnectionHandle,
@@ -8352,11 +8352,7 @@ impl ArmSupervisor {
             OWNER_LEGACY => {
                 let mut inner = self.inner.write().await;
                 if self.check_legacy_under_guard(&inner).is_ok() {
-                    let out = install_lease_disconnect(&mut inner, &prep.request, Instant::now());
-                    let pub_gen = self.inner.generation();
-                    let ts = inner.now_s();
-                    let _ = inner.publish_at(ts, pub_gen, false);
-                    return out;
+                    return install_lease_disconnect(&mut inner, &prep.request, Instant::now());
                 }
                 drop(inner);
                 if let Some(handle) = self.executor_handle() {
@@ -8488,11 +8484,6 @@ impl ArmSupervisor {
                 };
                 let out = install_lease_acquire(&mut inner, &prep.request, &ctx)
                     .map_err(Self::map_lease_install_err)?;
-                if matches!(out, crate::rt_core::requests::lease::LeaseOutcome::Granted { .. }) {
-                    let pub_gen = self.inner.generation();
-                    let ts = inner.now_s();
-                    let _ = inner.publish_at(ts, pub_gen, false);
-                }
                 Ok(out)
             }
             OWNER_EXECUTOR => {
@@ -8569,11 +8560,6 @@ impl ArmSupervisor {
                 };
                 let out = install_lease_preempt(&mut inner, &prep.request, &ctx)
                     .map_err(Self::map_lease_install_err)?;
-                if matches!(out, crate::rt_core::requests::lease::LeaseOutcome::Granted { .. }) {
-                    let pub_gen = self.inner.generation();
-                    let ts = inner.now_s();
-                    let _ = inner.publish_at(ts, pub_gen, false);
-                }
                 Ok(out)
             }
             OWNER_EXECUTOR => {
@@ -8635,14 +8621,6 @@ impl ArmSupervisor {
                 };
                 let out = install_lease_release(&mut inner, &prep.request, &ctx)
                     .map_err(Self::map_lease_install_err)?;
-                if matches!(
-                    out,
-                    crate::rt_core::requests::lease::LeaseOutcome::Released { released: true, .. }
-                ) {
-                    let pub_gen = self.inner.generation();
-                    let ts = inner.now_s();
-                    let _ = inner.publish_at(ts, pub_gen, false);
-                }
                 Ok(out)
             }
             OWNER_EXECUTOR => {
@@ -8879,9 +8857,6 @@ impl ArmSupervisor {
                 } else {
                     install_torque_off_legacy(&mut inner).map_err(ArmError::from)
                 };
-                let pub_gen = self.inner.generation();
-                let ts = inner.now_s();
-                let _ = inner.publish_at(ts, pub_gen, false);
                 match res {
                     Ok(_) => Ok(TorqueWsOutcome::Accepted {
                         epoch_id: inner.safety.epoch_id(),
@@ -8899,7 +8874,15 @@ impl ArmSupervisor {
                 let Some(handle) = self.executor_handle() else {
                     return Err(executor_unavailable());
                 };
-                let snap = self.fresh_snapshot(None).await?;
+                let mut snap = self.fresh_snapshot(None).await?;
+                if (!request_id_valid || enable.is_err())
+                    && self.e_stop_latched.load(Ordering::SeqCst)
+                    && !snap.owner.e_stop_latched
+                {
+                    snap = self
+                        .fresh_snapshot(Some(snap.meta.generation.saturating_add(1)))
+                        .await?;
+                }
                 let now = Instant::now();
                 if !request_id_valid || enable.is_err() {
                     let lease_ok = local_generation != 0
@@ -9094,9 +9077,6 @@ impl ArmSupervisor {
                     operator,
                     Instant::now(),
                 );
-                let pub_gen = self.inner.generation();
-                let ts = inner.now_s();
-                let _ = inner.publish_at(ts, pub_gen, false);
                 Ok(res)
             }
             OWNER_EXECUTOR => {
