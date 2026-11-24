@@ -834,6 +834,14 @@ pub enum MaintenanceOp {
     PlanningSnapshot,
     Observation,
     ClearFault { expected_epoch: Option<u64> },
+    LeaseClearFault {
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        operator: crate::auth::OperatorGrant,
+    },
     SetJointZeroOffsets { offsets: Vec<f32> },
     SetMotorZero { joint: usize },
     TakeBaselinePending {
@@ -859,6 +867,7 @@ pub enum MaintenanceResult {
     PlanningSnapshot(PlanningSnapshot),
     Observation(Box<ArmObservation>),
     FaultCleared(Result<SafetyState, ClearFaultError>),
+    LeaseFaultCleared(super::requests::lease::LeaseClearFaultOutcome),
     JointZeroOffsetsSet(Result<(), String>),
     MotorZeroSet(Result<(), String>),
     BaselineTaken(BaselineTakeReply),
@@ -1610,7 +1619,6 @@ impl BrokerDispatcher {
         Ok(rx)
     }
 
-    #[allow(dead_code)] // Used by L2 TransitionOp::{TorqueOn, TorqueOff}.
     fn submit_action(
         &self,
         client: super::broker::ClientId,
@@ -2318,6 +2326,65 @@ impl RtExecutorHandle {
         }
     }
 
+    /// Submits a `TransitionOp` (`TorqueOn` or `TorqueOff`) via `BrokerDispatcher::submit_action`
+    /// and awaits BOTH its Step 3 `Ack`/`Refused` AND (when accepted) its post-confirmation
+    /// `Reply::Terminal`. Never reports success on early `Ack` before hardware confirmation.
+    pub async fn submit_transition_async(
+        &self,
+        client: super::broker::ClientId,
+        client_seq: u64,
+        authority: super::broker::Authority,
+        deadline: Instant,
+        op: super::broker::TransitionOp,
+    ) -> Result<super::broker::Reply, BrokerDispatchError> {
+        let (ack_rx, term_rx) = self.shared.broker_dispatcher.submit_action(
+            client,
+            client_seq,
+            authority,
+            deadline,
+            super::broker::Submit::Transition(op),
+        )?;
+        let ack_reply = match ack_rx.await {
+            Ok(Ok(reply)) => reply,
+            _ => return Err(BrokerDispatchError::Stopped),
+        };
+        match ack_reply {
+            super::broker::Reply::Ack { .. } => match term_rx.await {
+                Ok(Ok(term_reply)) => Ok(term_reply),
+                _ => Err(BrokerDispatchError::Stopped),
+            },
+            other => Ok(other),
+        }
+    }
+
+    /// Routes WS `/api/v1/safety/clear_fault` through the single RT owner via
+    /// [`MaintenanceOp::LeaseClearFault`] with live lock-free [`crate::auth::OperatorGrant`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lease_clear_fault_async(
+        &self,
+        connection: super::requests::lease::ConnectionHandle,
+        lease_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        operator: crate::auth::OperatorGrant,
+    ) -> Result<super::requests::lease::LeaseClearFaultOutcome, OwnerError> {
+        match self
+            .call_maintenance_async(MaintenanceOp::LeaseClearFault {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                operator,
+            })
+            .await?
+        {
+            MaintenanceResult::LeaseFaultCleared(out) => Ok(out),
+            _ => Err(OwnerError::Protocol),
+        }
+    }
+
     pub fn drain_broker_replies(&self) {
         self.shared.broker_dispatcher.drain_replies();
     }
@@ -2997,6 +3064,34 @@ impl ControlState {
                 }
                 self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
                 MaintenanceResult::FaultCleared(res)
+            }
+            MaintenanceOp::LeaseClearFault {
+                connection,
+                lease_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                operator,
+            } => {
+                let out = super::requests::lease::install_lease_clear_fault_rt(
+                    core,
+                    connection,
+                    lease_generation,
+                    supplied_epoch,
+                    request_id_valid,
+                    body_error,
+                    operator,
+                    ctx.now,
+                    release_deadline,
+                );
+                if matches!(out, super::requests::lease::LeaseClearFaultOutcome::Cleared { .. }) {
+                    self.shutdown_committed = false;
+                    *release_flags |= RELEASE_FLAG_CLEAR_OK;
+                } else {
+                    *release_flags |= RELEASE_FLAG_CLEAR_REFUSED;
+                }
+                self.stats.last_clear_release_seq.store(step_num, Ordering::Release);
+                MaintenanceResult::LeaseFaultCleared(out)
             }
             MaintenanceOp::SetJointZeroOffsets { offsets } => {
                 let res = if *core.safety.state() != SafetyState::Idle

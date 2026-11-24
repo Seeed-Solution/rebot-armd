@@ -462,6 +462,370 @@ pub fn install_torque_off_legacy(
     inner.disable_torque()
 }
 
+/// Unified outcome of a WS `/api/v1/torque` or `/api/v1/arm` command across legacy and RT executor owners.
+#[derive(Debug)]
+pub enum TorqueWsOutcome {
+    Accepted {
+        epoch_id: u64,
+        safety_state: SafetyState,
+        is_torqued: bool,
+        control_mode_gravity_comp: bool,
+    },
+    LeaseLost {
+        epoch_id: u64,
+    },
+    EpochMismatch {
+        epoch_id: u64,
+    },
+    InvalidRequestId,
+    InvalidBody {
+        message: &'static str,
+        epoch_id: u64,
+    },
+    Rejected {
+        error: crate::api::rest::ApiError,
+        epoch_id: u64,
+    },
+}
+
+impl TorqueWsOutcome {
+    /// True when the command passed lease, epoch, and request_id validation and therefore
+    /// consumes `last_ordinary_request` on the WS connection.
+    #[inline]
+    pub fn consumes_request_id(&self) -> bool {
+        !matches!(
+            self,
+            Self::LeaseLost { .. } | Self::EpochMismatch { .. } | Self::InvalidRequestId
+        )
+    }
+}
+
+/// Maps a static RT torque refusal or transition-terminal code into a wire-compatible `ApiError`.
+pub fn map_torque_code_to_api_error(
+    code: &'static str,
+    safety_state_hint: Option<&SafetyState>,
+) -> crate::api::rest::ApiError {
+    use crate::api::rest::ApiError;
+    use crate::safety::SafetyError;
+    use crate::supervisor::ArmError;
+    use axum::http::StatusCode;
+    match code {
+        "ARM_NOT_AT_RESTING_POSE" => ApiError {
+            status: StatusCode::CONFLICT,
+            error: "ArmNotAtRestingPose".to_string(),
+            message: "Arm is not at safe resting pose".to_string(),
+            code: Some("ARM_NOT_AT_RESTING_POSE".to_string()),
+            safety_state: Some("Armed".to_string()),
+            details: None,
+            workspace_violation: None,
+            current_revision: None,
+            retry_after_s: None,
+        },
+        "MOTION_FORBIDDEN_IN_FAULT_STATE" => ApiError {
+            status: StatusCode::CONFLICT,
+            error: "MotionForbiddenInFaultState".to_string(),
+            message: "Cannot disable torque in EStop or Fault. Call clear_fault first.".to_string(),
+            code: Some("MOTION_FORBIDDEN_IN_FAULT_STATE".to_string()),
+            safety_state: Some("Fault".to_string()),
+            details: None,
+            workspace_violation: None,
+            current_revision: None,
+            retry_after_s: None,
+        },
+        "ESTOP_ACTIVE" => ArmError::Safety(SafetyError::EStopActive).into(),
+        "FAULT_ACTIVE" => {
+            let message = match safety_state_hint {
+                Some(SafetyState::Fault(r)) => SafetyError::FaultActive(r.clone()).to_string(),
+                _ => "Fault is active".to_string(),
+            };
+            ApiError {
+                status: StatusCode::CONFLICT,
+                error: "FAULT_ACTIVE".to_string(),
+                message,
+                code: Some("FAULT_ACTIVE".to_string()),
+                safety_state: Some("Fault".to_string()),
+                details: None,
+                workspace_violation: None,
+                current_revision: None,
+                retry_after_s: None,
+            }
+        }
+        "HANDOVER_SETTLING" => ArmError::Safety(SafetyError::HandoverSettling).into(),
+        "MOTION_BUSY" => ArmError::Safety(SafetyError::MotionBusy).into(),
+        "STOPPED" => ArmError::Safety(SafetyError::Stopped).into(),
+        "LEASE_LOST" | "NO_LEASE" | "DISCONNECTED" => ArmError::Safety(SafetyError::LeaseLost).into(),
+        "EPOCH_MISMATCH" => ApiError(
+            StatusCode::CONFLICT,
+            "Command epoch is no longer current".to_string(),
+            "EPOCH_MISMATCH".to_string(),
+        ),
+        "FEEDBACK_UNAVAILABLE" => ArmError::Safety(SafetyError::FeedbackUnavailable).into(),
+        "TRANSITION_BUSY" => ApiError(
+            StatusCode::CONFLICT,
+            "A torque transition is pending".to_string(),
+            "TRANSITION_BUSY".to_string(),
+        ),
+        "DISABLE_PENDING" => ApiError(
+            StatusCode::CONFLICT,
+            "Torque disable is still pending".to_string(),
+            "DISABLE_PENDING".to_string(),
+        ),
+        "FEEDBACK_UNCONFIRMED" => ApiError(
+            StatusCode::CONFLICT,
+            "Torque transition was not confirmed by fresh hardware feedback".to_string(),
+            "FEEDBACK_UNCONFIRMED".to_string(),
+        ),
+        "ENABLE_FAILED" => ApiError(
+            StatusCode::CONFLICT,
+            "Hardware torque enable failed".to_string(),
+            "ENABLE_FAILED".to_string(),
+        ),
+        "DRIVER_WRITE_FAILED" => ApiError(
+            StatusCode::CONFLICT,
+            "Torque disable transmission failed".to_string(),
+            "DRIVER_WRITE_FAILED".to_string(),
+        ),
+        "UNSUPPORTED" => {
+            ArmError::Unsupported("Torque operation is not supported in current mode".into()).into()
+        }
+        "STAMP_REUSED" => ArmError::Safety(SafetyError::StampAlreadyConsumed).into(),
+        "OWNER_TRANSFERRED" => ArmError::Safety(SafetyError::OwnerTransferred).into(),
+        other => ApiError(
+            StatusCode::CONFLICT,
+            format!("Torque command refused: {other}"),
+            other.to_string(),
+        ),
+    }
+}
+
+/// Bounded zero-allocation outcome of owner-routed WS `/api/v1/safety/clear_fault`
+/// (`MaintenanceOp::LeaseClearFault` on RT, or legacy short write lock).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline ClearFaultError keeps RT clear_fault zero-alloc
+pub enum LeaseClearFaultOutcome {
+    Cleared {
+        safety_state: SafetyState,
+        epoch_id: u64,
+        is_torqued: bool,
+        control_mode_gravity_comp: bool,
+    },
+    LeaseLost {
+        epoch_id: u64,
+    },
+    EpochMismatch {
+        expected: u64,
+        received: u64,
+        consumed_request_id: bool,
+    },
+    InvalidRequestId,
+    OperatorRequired {
+        estop_latched: bool,
+        epoch_id: u64,
+    },
+    MotionBusy {
+        epoch_id: u64,
+    },
+    InvalidBody {
+        message: &'static str,
+        epoch_id: u64,
+    },
+    ClearFailed {
+        err: crate::safety::ClearFaultError,
+        epoch_id: u64,
+    },
+}
+
+impl LeaseClearFaultOutcome {
+    /// True iff lease, initial epoch, and `request_id` checks passed so the WS worker must
+    /// advance `last_ordinary_request`.
+    #[inline]
+    pub fn consumes_request_id(&self) -> bool {
+        match self {
+            Self::LeaseLost { .. } | Self::InvalidRequestId => false,
+            Self::EpochMismatch {
+                consumed_request_id,
+                ..
+            } => *consumed_request_id,
+            Self::Cleared { .. }
+            | Self::OperatorRequired { .. }
+            | Self::MotionBusy { .. }
+            | Self::InvalidBody { .. }
+            | Self::ClearFailed { .. } => true,
+        }
+    }
+}
+
+/// Shared zero-allocation owner-side preflight for `/api/v1/safety/clear_fault` enforcing the exact
+/// legacy WS precedence:
+/// 1. Connection liveness & active lease (`LEASE_LOST`)
+/// 2. `consume_pending_estop()` + `epoch_id` match (`EPOCH_MISMATCH`, pre-`request_id`)
+/// 3. `request_id` strict monotonicity (`InvalidRequestId`)
+/// 4. Pending E-stop + live [`OperatorGrant`] check (`OPERATOR_REQUIRED` / post-auth `EPOCH_MISMATCH`)
+/// 5. `calibration_busy && motor_zero_busy` (`MOTION_BUSY`)
+/// 6. Command body & `mit_recovery` validation (`INVALID_COMMAND`)
+#[allow(clippy::too_many_arguments, clippy::result_large_err)] // inline outcome keeps RT clear_fault zero-alloc
+fn check_lease_clear_fault_owner_preflight(
+    inner: &mut SupervisorInner,
+    connection: ConnectionHandle,
+    lease_generation: u64,
+    supplied_epoch: Option<u64>,
+    request_id_valid: bool,
+    body_error: Option<&'static str>,
+    operator: OperatorGrant,
+    now: Instant,
+) -> Result<u64, LeaseClearFaultOutcome> {
+    let lease_ok = lease_generation != 0
+        && inner
+            .check_client_connection_live(connection.id(), false)
+            .is_ok()
+        && inner.validate_lease_at(connection.as_str(), lease_generation, now);
+    if !lease_ok {
+        return Err(LeaseClearFaultOutcome::LeaseLost {
+            epoch_id: inner.safety.epoch_id(),
+        });
+    }
+    inner.consume_pending_estop();
+    let epoch = inner.safety.epoch_id();
+    if supplied_epoch != Some(epoch) {
+        return Err(LeaseClearFaultOutcome::EpochMismatch {
+            expected: epoch,
+            received: supplied_epoch.unwrap_or(0),
+            consumed_request_id: false,
+        });
+    }
+    if !request_id_valid {
+        return Err(LeaseClearFaultOutcome::InvalidRequestId);
+    }
+    if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
+        return Err(LeaseClearFaultOutcome::EpochMismatch {
+            expected: inner.safety.epoch_id(),
+            received: epoch,
+            consumed_request_id: true,
+        });
+    }
+    let check_now = now.max(Instant::now());
+    if !operator.is_valid_at(check_now, inner.operator_auth_enforced) {
+        if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
+            return Err(LeaseClearFaultOutcome::EpochMismatch {
+                expected: inner.safety.epoch_id(),
+                received: epoch,
+                consumed_request_id: true,
+            });
+        }
+        if inner.e_stop_latched.load(Ordering::SeqCst) {
+            return Err(LeaseClearFaultOutcome::OperatorRequired {
+                estop_latched: true,
+                epoch_id: inner.safety.epoch_id(),
+            });
+        }
+        if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+            && !inner.safety.recoverable()
+        {
+            return Err(LeaseClearFaultOutcome::OperatorRequired {
+                estop_latched: false,
+                epoch_id: inner.safety.epoch_id(),
+            });
+        }
+    }
+    if inner.calibration_busy && inner.motor_zero_busy {
+        return Err(LeaseClearFaultOutcome::MotionBusy {
+            epoch_id: inner.safety.epoch_id(),
+        });
+    }
+    if let Some(message) = body_error {
+        return Err(LeaseClearFaultOutcome::InvalidBody {
+            message,
+            epoch_id: inner.safety.epoch_id(),
+        });
+    }
+    Ok(epoch)
+}
+
+/// Single RT owner-side install function for `MaintenanceOp::LeaseClearFault` (zero heap allocs).
+#[allow(clippy::too_many_arguments)]
+pub fn install_lease_clear_fault_rt(
+    inner: &mut SupervisorInner,
+    connection: ConnectionHandle,
+    lease_generation: u64,
+    supplied_epoch: Option<u64>,
+    request_id_valid: bool,
+    body_error: Option<&'static str>,
+    operator: OperatorGrant,
+    now: Instant,
+    release_deadline: Instant,
+) -> LeaseClearFaultOutcome {
+    let epoch = match check_lease_clear_fault_owner_preflight(
+        inner,
+        connection,
+        lease_generation,
+        supplied_epoch,
+        request_id_valid,
+        body_error,
+        operator,
+        now,
+    ) {
+        Ok(ep) => ep,
+        Err(out) => return out,
+    };
+    match inner.clear_fault_executor_bounded_for_release(now, release_deadline, Some(epoch)) {
+        Ok(safety_state) => LeaseClearFaultOutcome::Cleared {
+            safety_state,
+            epoch_id: inner.safety.epoch_id(),
+            is_torqued: inner.is_torqued,
+            control_mode_gravity_comp: inner.gravity_comp_active(),
+        },
+        Err(crate::safety::ClearFaultError::EpochMismatch { expected, received }) => {
+            LeaseClearFaultOutcome::EpochMismatch {
+                expected,
+                received,
+                consumed_request_id: true,
+            }
+        }
+        Err(err) => LeaseClearFaultOutcome::ClearFailed {
+            err,
+            epoch_id: inner.safety.epoch_id(),
+        },
+    }
+}
+
+/// Single legacy owner-side install function for WS `/api/v1/safety/clear_fault`, sharing the
+/// exact same authority/operator preflight as [`install_lease_clear_fault_rt`].
+#[allow(clippy::too_many_arguments)]
+pub fn install_lease_clear_fault_legacy(
+    inner: &mut SupervisorInner,
+    connection: ConnectionHandle,
+    lease_generation: u64,
+    supplied_epoch: Option<u64>,
+    request_id_valid: bool,
+    body_error: Option<&'static str>,
+    mit_recovery: bool,
+    operator: OperatorGrant,
+    now: Instant,
+) -> Result<LeaseClearFaultOutcome, (crate::supervisor::ArmError, u64)> {
+    let epoch = match check_lease_clear_fault_owner_preflight(
+        inner,
+        connection,
+        lease_generation,
+        supplied_epoch,
+        request_id_valid,
+        body_error,
+        operator,
+        now,
+    ) {
+        Ok(ep) => ep,
+        Err(out) => return Ok(out),
+    };
+    match inner.clear_fault_confirmed_for_epoch(mit_recovery, Some(epoch)) {
+        Ok(safety_state) => Ok(LeaseClearFaultOutcome::Cleared {
+            safety_state,
+            epoch_id: inner.safety.epoch_id(),
+            is_torqued: inner.is_torqued,
+            control_mode_gravity_comp: inner.gravity_comp_active(),
+        }),
+        Err(err) => Err((err, inner.safety.epoch_id())),
+    }
+}
+
 /// Off-thread preparation result for one WS `heartbeat` frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreparedHeartbeat {

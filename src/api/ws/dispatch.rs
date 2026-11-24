@@ -268,6 +268,23 @@ pub(super) type SessionFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = (Option<Value>, Option<(String, u64)>)> + Send + 'a>,
 >;
 
+/// Arguments passed to unified async command handlers (`/api/v1/torque`, `/api/v1/arm`,
+/// `/api/v1/safety/clear_fault`) routed through the active owner (legacy or RT executor).
+pub(super) struct CommandAsyncCtx<'a> {
+    pub(super) supervisor: &'a ArmSupervisor,
+    pub(super) value: &'a Value,
+    pub(super) stamp: AdmissionStamp,
+    pub(super) conn_handle: crate::rt_core::requests::lease::ConnectionHandle,
+    pub(super) recv_generation: &'a AtomicU64,
+    pub(super) recv_client_label: &'a Mutex<Option<String>>,
+    pub(super) ws_auth: &'a WsAuth,
+    pub(super) last_ordinary_request: &'a mut Option<u64>,
+}
+
+/// Boxed future returned by table-bound unified async command handlers.
+pub(super) type CommandAsyncFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>>;
+
 /// Concrete executable handler binding stored in each [`DispatchEntry`].
 #[derive(Clone, Copy)]
 pub(super) enum DispatchHandler {
@@ -289,6 +306,9 @@ pub(super) enum DispatchHandler {
     ),
     /// Unified async session handler (`acquire_lease`, `release_lease`), routed through the active owner.
     SessionAsync(for<'a> fn(SessionDispatchCtx<'a>) -> SessionFuture<'a>),
+    /// Unified async command handler (`/api/v1/torque`, `/api/v1/arm`, `/api/v1/safety/clear_fault`),
+    /// routed through the active owner (legacy or RT executor) with immediate wire reply.
+    CommandAsync(for<'a> fn(CommandAsyncCtx<'a>) -> CommandAsyncFuture<'a>),
     /// Pre-lock lease-free command handler (`depth_measure`, `teach`).
     LeaseFree(fn(LeaseFreeCtx<'_>)),
     /// Owner-locked handler executed under `supervisor.inner().write()`.
@@ -384,6 +404,18 @@ fn validate_entry(entry: &DispatchEntry) {
         DispatchHandler::SessionAsync(_) => {
             assert_eq!(entry.admission, AdmissionClass::OrdinarySession, "{:?}", entry.key);
             assert_eq!(entry.reply, ReplyPolicy::LeaseReply, "{:?}", entry.key);
+        }
+        DispatchHandler::CommandAsync(_) => {
+            assert!(
+                matches!(
+                    entry.admission,
+                    AdmissionClass::OrdinaryTorqueOrStopExempt | AdmissionClass::Ordinary
+                ),
+                "CommandAsync handler must use Ordinary/OrdinaryTorqueOrStopExempt admission: {:?}",
+                entry.key
+            );
+            assert_eq!(entry.lease, LeaseRequirement::Required, "{:?}", entry.key);
+            assert_eq!(entry.reply, ReplyPolicy::CommandImmediate, "{:?}", entry.key);
         }
         DispatchHandler::LeaseFree(_) => {
             assert_eq!(entry.admission, AdmissionClass::Ordinary, "{:?}", entry.key);

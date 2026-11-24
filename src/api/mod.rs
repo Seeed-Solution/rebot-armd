@@ -379,6 +379,9 @@ async fn gate_executor_owner(
                 axum::http::Method::POST => matches!(
                     path,
                     "/api/v1/safety/e_stop"
+                        | "/api/v1/safety/clear_fault"
+                        | "/api/v1/torque"
+                        | "/api/v1/arm"
                         | "/api/v1/auth/unlock"
                         | "/api/v1/auth/lock"
                         | "/api/v1/heartbeat"

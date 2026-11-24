@@ -2529,6 +2529,31 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
             }
+            // Unified table-bound async command handlers (`/api/v1/torque`, `/api/v1/arm`,
+            // `/api/v1/safety/clear_fault`) routed identically across legacy and RT executor.
+            if let Some(DispatchHandler::CommandAsync(handler)) = entry.map(|e| e.handler) {
+                if matches!(
+                    owner_mode,
+                    crate::supervisor::OWNER_LEGACY | crate::supervisor::OWNER_EXECUTOR
+                ) {
+                    maybe_pause_worker_before_lock(&recv_connection).await;
+                    let response = handler(dispatch::CommandAsyncCtx {
+                        supervisor: &recv_supervisor,
+                        value: &value,
+                        stamp,
+                        conn_handle: recv_conn_handle,
+                        recv_generation: &recv_generation,
+                        recv_client_label: &recv_client_label,
+                        ws_auth: &ws_auth,
+                        last_ordinary_request: &mut last_ordinary_request,
+                    })
+                    .await;
+                    if !worker_writer.send_ordinary_control(response).await {
+                        break;
+                    }
+                    continue;
+                }
+            }
             // Fail closed before any legacy lock/reader path (including depth/teach) whenever
             // `ArmCore` is not owned by the legacy supervisor lock.
             if owner_mode != crate::supervisor::OWNER_LEGACY {

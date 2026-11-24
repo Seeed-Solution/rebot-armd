@@ -1818,6 +1818,8 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         .unwrap();
     assert_eq!(estop_resp.status(), StatusCode::OK);
 
+    // PR L2 enables REST `/api/v1/torque` through the executor gate (serving the connection-lease
+    // conflict from `StateHub`), while unmigrated motion routes still return 503 EXECUTOR_ROUTING_PENDING.
     let torque_resp = app
         .clone()
         .oneshot(
@@ -1830,8 +1832,24 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         )
         .await
         .unwrap();
-    assert_eq!(torque_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = axum::body::to_bytes(torque_resp.into_body(), 4096).await.unwrap();
+    assert_eq!(torque_resp.status(), StatusCode::CONFLICT);
+    let torque_body = axum::body::to_bytes(torque_resp.into_body(), 4096).await.unwrap();
+    assert!(String::from_utf8_lossy(&torque_body).contains("LEASE_REQUIRED"), "{torque_body:?}");
+
+    let jog_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/motion/jog")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_positions":[0,0,0,0,0,0,0]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jog_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(jog_resp.into_body(), 4096).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("EXECUTOR_ROUTING_PENDING"), "{body:?}");
 
     // Stage 3 §2 A1: `/api/v1/ws` is allowed through the executor gate (for WS E-stop and
@@ -2269,6 +2287,7 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
         .unwrap();
     let obs_url = format!("http://127.0.0.1:{port}/api/v1/observation");
     let torque_url = format!("http://127.0.0.1:{port}/api/v1/torque");
+    let jog_url = format!("http://127.0.0.1:{port}/api/v1/motion/jog");
 
     let ready_deadline = Instant::now() + Duration::from_secs(5);
     let mut ready = false;
@@ -2287,8 +2306,17 @@ async fn cli_startup_gate_allows_mock_and_rejects_non_mock_and_invalid_env() {
     assert!(ready, "armd with ARMD_RT_OWNER=executor did not serve /api/v1/observation");
 
     let torque_resp = client.post(&torque_url).json(&json!({"enable": true})).send().await.unwrap();
-    assert_eq!(torque_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert!(torque_resp.text().await.unwrap().contains("EXECUTOR_ROUTING_PENDING"));
+    assert_eq!(torque_resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(torque_resp.text().await.unwrap().contains("LEASE_REQUIRED"));
+
+    let jog_resp = client
+        .post(&jog_url)
+        .json(&json!({"target_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(jog_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(jog_resp.text().await.unwrap().contains("EXECUTOR_ROUTING_PENDING"));
 
     // Send SIGTERM and verify clean shutdown exit (0).
     // SAFETY: valid PID of child process spawned above.

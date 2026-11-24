@@ -8807,6 +8807,319 @@ impl ArmSupervisor {
         }
     }
 
+    /// Unified owner-routed WS `/api/v1/torque` and `/api/v1/arm` across legacy and RT executor.
+    ///
+    /// Legacy runs off-lock snapshot + short write lock using `install_torque_on_legacy` (consuming
+    /// A1's `Admitted<'_>`) or `install_torque_off_legacy` + `StateHub` publication.
+    /// Executor prepares off-thread from `StateHub`, submits `TransitionOp::{TorqueOn, TorqueOff}`
+    /// via `BrokerDispatcher::submit_action`, and awaits BOTH `Ack` AND confirmed `Terminal` before
+    /// returning `Accepted` (never acknowledging on early `Ack` before hardware confirmation).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn torque_ws(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        local_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        parsed_request_id: u64,
+        enable: Result<bool, &'static str>,
+        stamp: AdmissionStamp,
+    ) -> Result<crate::rt_core::requests::lease::TorqueWsOutcome, ArmError> {
+        use crate::rt_core::broker::{Outcome, Reply, TransitionOp};
+        use crate::rt_core::requests::lease::{
+            install_torque_off_legacy, install_torque_on_legacy, map_torque_code_to_api_error,
+            prepare_torque, TorqueWsOutcome, DEFAULT_LEASE_REQUEST_DEADLINE,
+        };
+        let mode = self.owner_mode();
+        match mode {
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                self.check_legacy_under_guard(&inner)?;
+                let now = Instant::now();
+                let lease_ok = local_generation != 0
+                    && inner.check_client_connection_live(conn.id(), false).is_ok()
+                    && inner.validate_lease_at(conn.as_str(), local_generation, now);
+                if !lease_ok {
+                    return Ok(TorqueWsOutcome::LeaseLost {
+                        epoch_id: inner.safety.epoch_id(),
+                    });
+                }
+                inner.consume_pending_estop();
+                let epoch = inner.safety.epoch_id();
+                if supplied_epoch != Some(epoch) {
+                    return Ok(TorqueWsOutcome::EpochMismatch { epoch_id: epoch });
+                }
+                if !request_id_valid {
+                    return Ok(TorqueWsOutcome::InvalidRequestId);
+                }
+                if inner.calibration_busy && inner.motor_zero_busy {
+                    return Ok(TorqueWsOutcome::Rejected {
+                        error: crate::api::rest::ApiError(
+                            axum::http::StatusCode::CONFLICT,
+                            "a calibration apply, restore or motor zero is running".into(),
+                            "MOTION_BUSY".into(),
+                        ),
+                        epoch_id: epoch,
+                    });
+                }
+                let enabled = match enable {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Ok(TorqueWsOutcome::InvalidBody {
+                            message,
+                            epoch_id: epoch,
+                        });
+                    }
+                };
+                let res = if enabled {
+                    inner
+                        .check_admission(stamp)
+                        .and_then(install_torque_on_legacy)
+                        .map_err(ArmError::from)
+                } else {
+                    install_torque_off_legacy(&mut inner).map_err(ArmError::from)
+                };
+                let pub_gen = self.inner.generation();
+                let ts = inner.now_s();
+                let _ = inner.publish_at(ts, pub_gen, false);
+                match res {
+                    Ok(_) => Ok(TorqueWsOutcome::Accepted {
+                        epoch_id: inner.safety.epoch_id(),
+                        safety_state: inner.safety.state().clone(),
+                        is_torqued: inner.is_torqued,
+                        control_mode_gravity_comp: inner.gravity_comp_active(),
+                    }),
+                    Err(err) => Ok(TorqueWsOutcome::Rejected {
+                        error: err.into(),
+                        epoch_id: inner.safety.epoch_id(),
+                    }),
+                }
+            }
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                let snap = self.fresh_snapshot(None).await?;
+                let now = Instant::now();
+                if !request_id_valid || enable.is_err() {
+                    let lease_ok = local_generation != 0
+                        && snap.owner.is_lease_active_at(now)
+                        && snap.owner.lease_generation == local_generation
+                        && (snap.owner.lease_owner_conn_id == 0
+                            || snap.owner.lease_owner_conn_id == conn.id());
+                    if !lease_ok {
+                        return Ok(TorqueWsOutcome::LeaseLost {
+                            epoch_id: snap.obs.epoch_id,
+                        });
+                    }
+                    if supplied_epoch != Some(snap.obs.epoch_id) {
+                        return Ok(TorqueWsOutcome::EpochMismatch {
+                            epoch_id: snap.obs.epoch_id,
+                        });
+                    }
+                    if !request_id_valid {
+                        return Ok(TorqueWsOutcome::InvalidRequestId);
+                    }
+                    if let Err(message) = enable {
+                        return Ok(TorqueWsOutcome::InvalidBody {
+                            message,
+                            epoch_id: snap.obs.epoch_id,
+                        });
+                    }
+                }
+                let enabled = enable.expect("checked above");
+                let op = if enabled {
+                    TransitionOp::TorqueOn
+                } else {
+                    TransitionOp::TorqueOff
+                };
+                let deadline = now + DEFAULT_LEASE_REQUEST_DEADLINE;
+                let mut prep = prepare_torque(
+                    &snap.owner,
+                    conn,
+                    local_generation,
+                    supplied_epoch,
+                    enabled,
+                    parsed_request_id,
+                    stamp,
+                    now,
+                    deadline,
+                )
+                .map_err(|_| observation_unavailable())?;
+
+                for attempt in 0..2 {
+                    let reply = handle
+                        .submit_transition_async(
+                            prep.client,
+                            prep.client_seq,
+                            prep.authority,
+                            prep.deadline,
+                            op,
+                        )
+                        .await
+                        .map_err(Self::map_broker_dispatch_err)?;
+                    match reply {
+                        Reply::Refused {
+                            code: "PLAN_STALE",
+                            ..
+                        } if attempt == 0 => {
+                            let fresh = self.fresh_snapshot(None).await?;
+                            prep = prepare_torque(
+                                &fresh.owner,
+                                conn,
+                                local_generation,
+                                supplied_epoch,
+                                enabled,
+                                parsed_request_id,
+                                stamp,
+                                Instant::now(),
+                                deadline,
+                            )
+                            .map_err(|_| observation_unavailable())?;
+                        }
+                        Reply::Refused {
+                            code: "LEASE_LOST" | "NO_LEASE" | "DISCONNECTED",
+                            ..
+                        } => {
+                            let epoch_id = self
+                                .hub
+                                .latest()
+                                .map_or(snap.obs.epoch_id, |s| s.obs.epoch_id);
+                            return Ok(TorqueWsOutcome::LeaseLost { epoch_id });
+                        }
+                        Reply::Refused {
+                            code: "EPOCH_MISMATCH",
+                            ..
+                        } => {
+                            let epoch_id = self
+                                .hub
+                                .latest()
+                                .map_or(snap.obs.epoch_id, |s| s.obs.epoch_id);
+                            return Ok(TorqueWsOutcome::EpochMismatch { epoch_id });
+                        }
+                        Reply::Refused { code, .. } => {
+                            let post = self.hub.latest();
+                            let epoch_id = post
+                                .as_ref()
+                                .map_or(snap.obs.epoch_id, |s| s.obs.epoch_id);
+                            let st = post.as_ref().map(|s| &s.obs.safety_state);
+                            return Ok(TorqueWsOutcome::Rejected {
+                                error: map_torque_code_to_api_error(code, st),
+                                epoch_id,
+                            });
+                        }
+                        Reply::Terminal {
+                            outcome: Outcome::Completed,
+                            ..
+                        } => {
+                            let post = self.hub.latest().unwrap_or(snap);
+                            return Ok(TorqueWsOutcome::Accepted {
+                                epoch_id: post.obs.epoch_id,
+                                safety_state: post.obs.safety_state.clone(),
+                                is_torqued: post.obs.is_torqued,
+                                control_mode_gravity_comp: post.owner.gravity_comp_active,
+                            });
+                        }
+                        Reply::Terminal { outcome, .. } => {
+                            let code = match outcome {
+                                Outcome::Failed(c) | Outcome::Cancelled(c) => c,
+                                Outcome::Stopped => "STOPPED",
+                                Outcome::Superseded => "SUPERSEDED",
+                                Outcome::Completed => unreachable!(),
+                            };
+                            let post = self.hub.latest();
+                            let epoch_id = post
+                                .as_ref()
+                                .map_or(snap.obs.epoch_id, |s| s.obs.epoch_id);
+                            if matches!(code, "LEASE_LOST" | "NO_LEASE" | "DISCONNECTED") {
+                                return Ok(TorqueWsOutcome::LeaseLost { epoch_id });
+                            }
+                            if code == "EPOCH_MISMATCH" {
+                                return Ok(TorqueWsOutcome::EpochMismatch { epoch_id });
+                            }
+                            let st = post.as_ref().map(|s| &s.obs.safety_state);
+                            return Ok(TorqueWsOutcome::Rejected {
+                                error: map_torque_code_to_api_error(code, st),
+                                epoch_id,
+                            });
+                        }
+                        _ => {
+                            return Err(ArmError::Internal(
+                                "Unexpected broker reply for torque transition".into(),
+                            ));
+                        }
+                    }
+                }
+                Err(ArmError::Rejected {
+                    status: 409,
+                    code: "PLAN_STALE".into(),
+                    message: "Torque transition superseded by concurrent config change".into(),
+                })
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Unified owner-routed WS `/api/v1/safety/clear_fault` across legacy and RT executor owners.
+    ///
+    /// Both owners share the exact same authority, pending-E-stop, live [`OperatorGrant`], and
+    /// `motor_zero_busy` precedence in `requests::lease::install_lease_clear_fault_*`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn clear_fault_ws(
+        &self,
+        conn: crate::rt_core::requests::lease::ConnectionHandle,
+        local_generation: u64,
+        supplied_epoch: Option<u64>,
+        request_id_valid: bool,
+        body_error: Option<&'static str>,
+        mit_recovery: bool,
+        operator: crate::auth::OperatorGrant,
+    ) -> Result<
+        Result<crate::rt_core::requests::lease::LeaseClearFaultOutcome, (ArmError, u64)>,
+        ArmError,
+    > {
+        use crate::rt_core::requests::lease::install_lease_clear_fault_legacy;
+        match self.owner_mode() {
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                self.check_legacy_under_guard(&inner)?;
+                let res = install_lease_clear_fault_legacy(
+                    &mut inner,
+                    conn,
+                    local_generation,
+                    supplied_epoch,
+                    request_id_valid,
+                    body_error,
+                    mit_recovery,
+                    operator,
+                    Instant::now(),
+                );
+                let pub_gen = self.inner.generation();
+                let ts = inner.now_s();
+                let _ = inner.publish_at(ts, pub_gen, false);
+                Ok(res)
+            }
+            OWNER_EXECUTOR => {
+                let Some(handle) = self.executor_handle() else {
+                    return Err(executor_unavailable());
+                };
+                let out = handle
+                    .lease_clear_fault_async(
+                        conn,
+                        local_generation,
+                        supplied_epoch,
+                        request_id_valid,
+                        body_error,
+                        operator,
+                    )
+                    .await
+                    .map_err(ArmError::from)?;
+                Ok(Ok(out))
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
     fn executor_lease_active(&self) -> bool {
         if self.owner_mode() != OWNER_EXECUTOR {
             return false;

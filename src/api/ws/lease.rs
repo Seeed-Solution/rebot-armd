@@ -5,8 +5,8 @@
 #[allow(unused_imports)]
 use super::*;
 use super::dispatch::{
-    AdmissionClass, AuthRequirement, DispatchEntry, DispatchHandler, DispatchKey, FrameKind,
-    LeaseRequirement, OwnerDispatchCtx, ReplyPolicy,
+    AdmissionClass, AuthRequirement, CommandAsyncCtx, CommandAsyncFuture, DispatchEntry,
+    DispatchHandler, DispatchKey, FrameKind, LeaseRequirement, ReplyPolicy,
 };
 
 pub(super) const ENTRIES: &[DispatchEntry] = &[
@@ -36,7 +36,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/torque"),
-        handler: DispatchHandler::Owner(dispatch_torque),
+        handler: DispatchHandler::CommandAsync(dispatch_torque_async),
         admission: AdmissionClass::OrdinaryTorqueOrStopExempt,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
@@ -44,7 +44,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/arm"),
-        handler: DispatchHandler::Owner(dispatch_torque),
+        handler: DispatchHandler::CommandAsync(dispatch_torque_async),
         admission: AdmissionClass::OrdinaryTorqueOrStopExempt,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::None,
@@ -52,7 +52,7 @@ pub(super) const ENTRIES: &[DispatchEntry] = &[
     },
     DispatchEntry {
         key: DispatchKey::command("/api/v1/safety/clear_fault"),
-        handler: DispatchHandler::Owner(dispatch_clear_fault),
+        handler: DispatchHandler::CommandAsync(dispatch_clear_fault_async),
         admission: AdmissionClass::Ordinary,
         lease: LeaseRequirement::Required,
         auth: AuthRequirement::Conditional(clear_fault_auth_check),
@@ -139,25 +139,292 @@ fn dispatch_release_lease_async<'a>(
     })
 }
 
-fn dispatch_torque(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
-    let body = &ctx.value["body"];
-    let result = validate_command_body_common(body)
-        .map_err(invalid_command)
-        .and_then(|()| execute_torque_command(ctx.inner, ctx.stamp, body));
-    Some(match result {
-        Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
-        Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+async fn current_reject_epoch(supervisor: &ArmSupervisor) -> u64 {
+    supervisor
+        .fresh_snapshot(None)
+        .await
+        .map_or_else(|_| supervisor.estop_epoch(), |s| s.obs.epoch_id)
+}
+
+fn format_command_lease_lost(request_id: &Value, epoch_id: u64) -> Value {
+    json!({
+        "type": "command_reject",
+        "request_id": request_id,
+        "status": 409,
+        "code": "LEASE_LOST",
+        "message": "This connection does not own an active lease",
+        "error": "LEASE_LOST",
+        "epoch_id": epoch_id
     })
 }
 
-fn dispatch_clear_fault(ctx: &mut OwnerDispatchCtx<'_>) -> Option<Value> {
-    let body = &ctx.value["body"];
-    let result = validate_command_body_common(body)
-        .map_err(invalid_command)
-        .and_then(|()| execute_clear_fault(ctx.inner, body, ctx.epoch));
-    Some(match result {
-        Ok(started) => command_ack(ctx.inner, &ctx.value["request_id"], started),
-        Err(error) => command_reject(ctx.inner, &ctx.value["request_id"], error),
+fn format_command_epoch_mismatch(request_id: &Value, epoch_id: u64) -> Value {
+    json!({
+        "type": "command_reject",
+        "request_id": request_id,
+        "status": 409,
+        "code": "EPOCH_MISMATCH",
+        "message": "Command epoch is no longer current",
+        "error": "EPOCH_MISMATCH",
+        "epoch_id": epoch_id
+    })
+}
+
+fn format_command_invalid_request_id(request_id: &Value) -> Value {
+    json!({
+        "type": "command_reject",
+        "request_id": request_id,
+        "status": 400,
+        "code": "INVALID_COMMAND",
+        "message": "request_id must be present and strictly increase",
+        "error": "INVALID_COMMAND"
+    })
+}
+
+fn format_command_ack_state(
+    request_id: &Value,
+    epoch_id: u64,
+    safety_state: &crate::safety::SafetyState,
+    is_torqued: bool,
+    control_mode_gravity_comp: bool,
+) -> Value {
+    let control_mode = if control_mode_gravity_comp {
+        "gravity_comp"
+    } else {
+        "position"
+    };
+    json!({
+        "type": "command_ack",
+        "request_id": request_id,
+        "status": "accepted",
+        "epoch_id": epoch_id,
+        "safety_state": safety_state,
+        "is_torqued": is_torqued,
+        "control_mode": control_mode
+    })
+}
+
+fn format_command_reject_api(request_id: &Value, error: ApiError, epoch_id: u64) -> Value {
+    let mut reply = rejection(error, "command_reject", epoch_id);
+    reply["request_id"] = request_id.clone();
+    reply
+}
+
+fn check_local_command_lease(
+    value: &Value,
+    recv_generation: &AtomicU64,
+    recv_client_label: &Mutex<Option<String>>,
+) -> Option<u64> {
+    let local_generation = recv_generation.load(Ordering::SeqCst);
+    let supplied_generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let label_matches = {
+        let lbl = recv_client_label.lock().unwrap_or_else(|e| e.into_inner());
+        value
+            .get("client_id")
+            .is_none_or(|id| id.as_str() == lbl.as_deref())
+    };
+    if local_generation != 0 && supplied_generation == local_generation && label_matches {
+        Some(local_generation)
+    } else {
+        None
+    }
+}
+
+/// Table-bound unified async handler for `/api/v1/torque` and `/api/v1/arm`.
+fn dispatch_torque_async<'a>(ctx: CommandAsyncCtx<'a>) -> CommandAsyncFuture<'a> {
+    Box::pin(async move {
+        use crate::rt_core::requests::lease::TorqueWsOutcome;
+        let req_id_val = ctx.value.get("request_id").unwrap_or(&Value::Null);
+        let Some(local_generation) =
+            check_local_command_lease(ctx.value, ctx.recv_generation, ctx.recv_client_label)
+        else {
+            return format_command_lease_lost(req_id_val, current_reject_epoch(ctx.supervisor).await);
+        };
+        let supplied_epoch = ctx.value.get("epoch_id").and_then(Value::as_u64);
+        let parsed_request_id = ctx.value.get("request_id").and_then(Value::as_u64);
+        let request_id_valid = parsed_request_id
+            .is_some_and(|id| ctx.last_ordinary_request.is_none_or(|last| id > last));
+        let body = &ctx.value["body"];
+        let enable_res = validate_command_body_common(body).and_then(|()| {
+            body.get("enable")
+                .and_then(Value::as_bool)
+                .ok_or("enable must be boolean")
+        });
+
+        match ctx
+            .supervisor
+            .torque_ws(
+                ctx.conn_handle,
+                local_generation,
+                supplied_epoch,
+                request_id_valid,
+                parsed_request_id.unwrap_or(0),
+                enable_res,
+                ctx.stamp,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                if outcome.consumes_request_id() {
+                    *ctx.last_ordinary_request = parsed_request_id;
+                }
+                match outcome {
+                    TorqueWsOutcome::Accepted {
+                        epoch_id,
+                        safety_state,
+                        is_torqued,
+                        control_mode_gravity_comp,
+                    } => format_command_ack_state(
+                        req_id_val,
+                        epoch_id,
+                        &safety_state,
+                        is_torqued,
+                        control_mode_gravity_comp,
+                    ),
+                    TorqueWsOutcome::LeaseLost { epoch_id } => {
+                        format_command_lease_lost(req_id_val, epoch_id)
+                    }
+                    TorqueWsOutcome::EpochMismatch { epoch_id } => {
+                        format_command_epoch_mismatch(req_id_val, epoch_id)
+                    }
+                    TorqueWsOutcome::InvalidRequestId => {
+                        format_command_invalid_request_id(req_id_val)
+                    }
+                    TorqueWsOutcome::InvalidBody { message, epoch_id } => {
+                        format_command_reject_api(req_id_val, invalid_command(message), epoch_id)
+                    }
+                    TorqueWsOutcome::Rejected { error, epoch_id } => {
+                        format_command_reject_api(req_id_val, error, epoch_id)
+                    }
+                }
+            }
+            Err(err) => {
+                let epoch_id = current_reject_epoch(ctx.supervisor).await;
+                format_command_reject_api(req_id_val, err.into(), epoch_id)
+            }
+        }
+    })
+}
+
+/// Table-bound unified async handler for `/api/v1/safety/clear_fault`.
+fn dispatch_clear_fault_async<'a>(ctx: CommandAsyncCtx<'a>) -> CommandAsyncFuture<'a> {
+    Box::pin(async move {
+        use crate::rt_core::requests::lease::LeaseClearFaultOutcome;
+        let req_id_val = ctx.value.get("request_id").unwrap_or(&Value::Null);
+        let Some(local_generation) =
+            check_local_command_lease(ctx.value, ctx.recv_generation, ctx.recv_client_label)
+        else {
+            return format_command_lease_lost(req_id_val, current_reject_epoch(ctx.supervisor).await);
+        };
+        let supplied_epoch = ctx.value.get("epoch_id").and_then(Value::as_u64);
+        let parsed_request_id = ctx.value.get("request_id").and_then(Value::as_u64);
+        let request_id_valid = parsed_request_id
+            .is_some_and(|id| ctx.last_ordinary_request.is_none_or(|last| id > last));
+        let body = &ctx.value["body"];
+        let (body_error, mit_recovery) = match validate_command_body_common(body) {
+            Err(msg) => (Some(msg), false),
+            Ok(()) => match body.get("mit_recovery") {
+                None | Some(Value::Null) => (None, false),
+                Some(v) if v.as_str() == Some(crate::mit::RECOVERY_CONFIRM_VALUE) => (None, true),
+                Some(_) => (Some("mit_recovery must be \"torque_off_all\""), false),
+            },
+        };
+        let operator = ctx.ws_auth.operator_grant();
+
+        match ctx
+            .supervisor
+            .clear_fault_ws(
+                ctx.conn_handle,
+                local_generation,
+                supplied_epoch,
+                request_id_valid,
+                body_error,
+                mit_recovery,
+                operator,
+            )
+            .await
+        {
+            Ok(Ok(outcome)) => {
+                if outcome.consumes_request_id() {
+                    *ctx.last_ordinary_request = parsed_request_id;
+                }
+                match outcome {
+                    LeaseClearFaultOutcome::Cleared {
+                        safety_state,
+                        epoch_id,
+                        is_torqued,
+                        control_mode_gravity_comp,
+                    } => format_command_ack_state(
+                        req_id_val,
+                        epoch_id,
+                        &safety_state,
+                        is_torqued,
+                        control_mode_gravity_comp,
+                    ),
+                    LeaseClearFaultOutcome::LeaseLost { epoch_id } => {
+                        format_command_lease_lost(req_id_val, epoch_id)
+                    }
+                    LeaseClearFaultOutcome::EpochMismatch {
+                        expected,
+                        received,
+                        consumed_request_id,
+                    } => {
+                        if consumed_request_id {
+                            let err: ApiError = ArmError::Safety(SafetyError::EpochMismatch {
+                                expected,
+                                received,
+                            })
+                            .into();
+                            format_command_reject_api(req_id_val, err, expected)
+                        } else {
+                            format_command_epoch_mismatch(req_id_val, expected)
+                        }
+                    }
+                    LeaseClearFaultOutcome::InvalidRequestId => {
+                        format_command_invalid_request_id(req_id_val)
+                    }
+                    LeaseClearFaultOutcome::OperatorRequired {
+                        estop_latched,
+                        epoch_id,
+                    } => {
+                        let op_label = if estop_latched {
+                            "clear_fault (EStop latched)"
+                        } else {
+                            "clear_fault (non-recoverable fault or EStop)"
+                        };
+                        format_command_reject_api(
+                            req_id_val,
+                            ApiError::operator_required(op_label),
+                            epoch_id,
+                        )
+                    }
+                    LeaseClearFaultOutcome::MotionBusy { epoch_id } => format_command_reject_api(
+                        req_id_val,
+                        ApiError(
+                            StatusCode::CONFLICT,
+                            "a calibration apply, restore or motor zero is running".into(),
+                            "MOTION_BUSY".into(),
+                        ),
+                        epoch_id,
+                    ),
+                    LeaseClearFaultOutcome::InvalidBody { message, epoch_id } => {
+                        format_command_reject_api(req_id_val, invalid_command(message), epoch_id)
+                    }
+                    LeaseClearFaultOutcome::ClearFailed { err, epoch_id } => {
+                        let api: ApiError = ArmError::Safety(SafetyError::from(err)).into();
+                        format_command_reject_api(req_id_val, api, epoch_id)
+                    }
+                }
+            }
+            Ok(Err((arm_err, epoch_id))) => {
+                *ctx.last_ordinary_request = parsed_request_id;
+                format_command_reject_api(req_id_val, arm_err.into(), epoch_id)
+            }
+            Err(err) => {
+                let epoch_id = current_reject_epoch(ctx.supervisor).await;
+                format_command_reject_api(req_id_val, err.into(), epoch_id)
+            }
+        }
     })
 }
 
@@ -174,47 +441,6 @@ pub(super) fn is_torque_disable_command(value: &Value) -> bool {
             .and_then(|b| b.get("enable"))
             .and_then(Value::as_bool)
             == Some(false)
-}
-
-/// Execute `/api/v1/torque` or `/api/v1/arm` under the supervisor write lock.
-pub(super) fn execute_torque_command(
-    inner: &mut SupervisorInner,
-    stamp: crate::supervisor::AdmissionStamp,
-    body: &Value,
-) -> Result<Started, ApiError> {
-    let enabled = body
-        .get("enable")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| invalid_command("enable must be boolean"))?;
-    if enabled {
-        let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-        SupervisorInner::enable_torque(admitted).map_err(ArmError::from)?;
-    } else {
-        inner.disable_torque().map_err(ArmError::from)?;
-    }
-    Ok(None)
-}
-
-/// Execute `/api/v1/safety/clear_fault` under the supervisor write lock.
-pub(super) fn execute_clear_fault(
-    inner: &mut SupervisorInner,
-    body: &Value,
-    epoch: u64,
-) -> Result<Started, ApiError> {
-    // {"mit_recovery": "torque_off_all"}: the operator accepts the MIT expiry recovery
-    // (torque off on every joint); any other value is refused
-    let mit_recovery = match body.get("mit_recovery") {
-        None | Some(Value::Null) => false,
-        Some(v) if v.as_str() == Some(crate::mit::RECOVERY_CONFIRM_VALUE) => true,
-        Some(_) => {
-            return Err(invalid_command(&format!(
-                "mit_recovery must be \"{}\"",
-                crate::mit::RECOVERY_CONFIRM_VALUE
-            )))
-        }
-    };
-    inner.clear_fault_confirmed_for_epoch(mit_recovery, Some(epoch))?;
-    Ok(None)
 }
 
 /// Table-bound unified WS `heartbeat` handler invoked by `heartbeat_task`.
