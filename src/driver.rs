@@ -10415,7 +10415,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                                 self.motor_enable_attempted[idx] = false;
                             }
                         } else if !self.motor_enable_attempted[idx]
-                            && self.last_enable_command.is_none()
+                            && !self.is_enabled
                             && !self.awaiting_rx_boundary
                         {
                             self.motor_evidence[idx] = MotorTorqueEvidence::OffConfirmed;

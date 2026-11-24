@@ -322,6 +322,10 @@ pub struct TrackingRuntime {
     /// toward this hold pose within the active limits, one tick at a time, until it
     /// is at rest (also while the rejection fault is latched).
     pub fallback_ramp: Option<FallbackRamp>,
+    /// True after a tracking rejection fallback finished braking (or stopped infeasible at the
+    /// last confirmed issued pose) while the rejection fault stays latched on an `Armed` arm.
+    /// Cleared on E-stop, FailedHold, clear_fault, or any new motion.
+    pub holding_fallback_pose: bool,
     /// Reference rest sample: a fresh measured arm position of an earlier control tick, with
     /// the receive time of its newest joint sample, kept while the arm stays within
     /// tolerance of it (`SupervisorInner::note_tracking_position_sample`): stationarity
@@ -418,6 +422,7 @@ impl TrackingRuntime {
             self.recovery_suspended = false;
             self.recovery_joints.clear();
             self.fallback_ramp = None;
+            self.holding_fallback_pose = false;
         } else {
             self.invalidate();
         }
@@ -549,6 +554,7 @@ impl TrackingRuntime {
         self.ws_min_depths = None;
         self.ws_keepout_min_depths = None;
         self.fallback_ramp = None;
+        self.holding_fallback_pose = false;
     }
 
     /// Nominal history entry for an output issued this tick against nominal `q_d`: `q_d`

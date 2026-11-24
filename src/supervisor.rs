@@ -30,7 +30,9 @@ mod torque_off;
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
-pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
+pub use driver_transitions::{
+    run_with_panic_deadline_observer, EnableLifecycle, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT,
+};
 pub use torque_off::{StoppedTorqueOffRefusal, STOPPED_TORQUE_OFF_FEEDBACK_MAX_AGE};
 
 #[derive(Debug, Error)]
@@ -4921,7 +4923,9 @@ impl SupervisorInner {
             let has_fallback_ramp = send_to_bus
                 && tracking_active
                 && self.driver.is_some()
-                && self.tracking.fallback_ramp.is_some();
+                && self.enable_lifecycle == driver_transitions::EnableLifecycle::Armed
+                && !matches!(self.safety.state(), SafetyState::EStop)
+                && (self.tracking.fallback_ramp.is_some() || self.tracking.holding_fallback_pose);
 
             if is_stopped_or_failed_hold && !has_fallback_ramp {
                 self.tracking.invalidate();
@@ -5114,7 +5118,10 @@ impl SupervisorInner {
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else {
                     if tracking_active {
+                        let keep_fallback = self.tracking.holding_fallback_pose
+                            && self.safety.state().is_stopped();
                         self.tracking.invalidate();
+                        self.tracking.holding_fallback_pose = keep_fallback;
                     }
                     if self.driver.is_some() {
                         // built in the tick's scratch (no allocation)

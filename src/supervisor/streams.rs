@@ -532,6 +532,7 @@ impl SupervisorInner {
                         };
                         self.tracking.record_issued_with_ws_depths(fb.positions, fb.velocities, full, park);
                         self.tracking.fallback_ramp = (!done).then_some(ramp);
+                        self.tracking.holding_fallback_pose = done;
                     }
                     TickOutput::Deferred { .. } => {
                         // Keep the in-progress braking ramp intact across transient deferral
@@ -568,6 +569,7 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
                 self.tracking.invalidate();
+                self.tracking.holding_fallback_pose = true;
                 self.safety.latch(
                     crate::safety::FaultKind::Other,
                     crate::safety::FaultDetail::formatted(FaultCode::ServoNoBrake, |buf| {

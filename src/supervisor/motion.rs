@@ -122,6 +122,8 @@ impl SupervisorInner {
         // telemetry when the coherent feedback snapshot is fresh and finite.
         self.measured_hold.clear();
         const ESTOP_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
+        let dof_cap = self.config.dof.min(crate::rt_core::mailbox::MAX_DOF);
+        let mut estop_hold_captured = [None::<f32>; crate::rt_core::mailbox::MAX_DOF];
         let (driver_contended, snapshot_fresh) = match driver {
             None => (false, self.feedback_numeric_valid),
             Some(d) => match d.try_lock() {
@@ -130,25 +132,51 @@ impl SupervisorInner {
                     let now = drv.clock_now();
                     let dof = self.config.dof;
                     let fb = self.core.feedback();
+                    drv.feedback_queue_bounds_into(&mut self.scratch.fb.bounds);
+                    let has_bounds = !self.scratch.fb.bounds.is_empty();
                     let fresh = self.feedback_numeric_valid
                         && (0..dof).all(|i| {
                             fb.instant(i).is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
                         })
-                        && {
-                            drv.feedback_queue_bounds_into(&mut self.scratch.fb.bounds);
-                            if self.scratch.fb.bounds.is_empty() {
-                                true
-                            } else {
-                                self.joint_feedback_queue_bounds.len() == dof
-                                    && self.joint_feedback_queue_bounds.iter().all(|b| {
-                                        b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
-                                    })
-                            }
+                        && (!has_bounds
+                            || (self.joint_feedback_queue_bounds.len() == dof
+                                && self.joint_feedback_queue_bounds.iter().all(|b| {
+                                    b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                                })));
+                    // Capture the exact measured position at E-stop latch time for every joint
+                    // whose feedback is finite and <= 100 ms fresh with a verified hold mode and
+                    // non-OffConfirmed torque evidence (zero alloc, non-blocking).
+                    let mut ev = [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF];
+                    drv.motor_torque_evidence_into(&mut ev[..dof_cap]);
+                    let has_drv_fresh = drv.has_driver_fresh_position_api();
+                    for j in 0..dof_cap {
+                        if ev[j] == crate::driver::MotorTorqueEvidence::OffConfirmed
+                            || !drv.joint_hold_mode_verified(j)
+                        {
+                            continue;
+                        }
+                        estop_hold_captured[j] = if has_drv_fresh {
+                            drv.fresh_measured_position_for(j, crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE)
+                        } else if self.feedback_numeric_valid
+                            && fb.instant(j).is_some_and(|t| {
+                                now.saturating_duration_since(t) <= crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                            })
+                            && (!has_bounds
+                                || self.joint_feedback_queue_bounds.get(j).copied().flatten().is_some_and(|b| {
+                                    now.saturating_duration_since(b) <= crate::driver::STOPPED_DISABLE_FEEDBACK_MAX_AGE
+                                }))
+                        {
+                            self.measured_positions.get(j).copied().filter(|p| p.is_finite())
+                        } else {
+                            None
                         };
+                    }
                     (false, fresh)
                 }
             },
         };
+        self.measured_hold.dof = dof_cap;
+        self.measured_hold.captured_positions[..dof_cap].copy_from_slice(&estop_hold_captured[..dof_cap]);
         if self.measured_positions.iter().all(|p| p.is_finite())
             && self.measured_positions.len() == self.config.dof
             && snapshot_fresh

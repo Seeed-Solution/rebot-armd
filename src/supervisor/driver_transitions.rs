@@ -1298,7 +1298,7 @@ impl SupervisorInner {
                     || bounds_arr[j].is_some_and(|b| {
                         drv_now.saturating_duration_since(b) <= STOPPED_DISABLE_FEEDBACK_MAX_AGE
                     });
-                if age_ok && bound_ok {
+                if self.feedback_numeric_valid && age_ok && bound_ok {
                     self.measured_positions.get(j).copied().filter(|p| p.is_finite())
                 } else {
                     None
