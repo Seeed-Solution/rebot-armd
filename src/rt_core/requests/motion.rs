@@ -678,15 +678,15 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
     inner.preflight_admission(stamp).map_err(map_admission_err)?;
 
     let (this, proof) = inner.check_admission(stamp).map_err(map_admission_err)?.consume().map_err(map_admission_err)?;
-    let (epoch, lease_gen, ws_rev, mc_rev) = (this.safety.epoch_id(), this.active_lease.as_ref().map(|l| l.generation), this.workspace_revision, this.motion_config_revision);
+    let (epoch, stop_gen, lease_gen, ws_rev, mc_rev) = (this.safety.epoch_id(), stamp.stop_gen, this.active_lease.as_ref().map(|l| l.generation), this.workspace_revision, this.motion_config_revision);
 
     if holding {
         let tentative_id = this.next_action_id + 1;
-        let rearm = this.begin_park_rearm_transition(&proof, tentative_id)?;
+        let rearm = this.begin_park_rearm_transition(&proof, tentative_id, stop_gen)?;
         let id = this.begin_action_rt("park");
         debug_assert_eq!(id, tentative_id);
         let phase = match rearm { ParkRearmStart::ConfirmedNow => ParkContinuationPhase::ReadyForPlan, ParkRearmStart::Pending => ParkContinuationPhase::WaitingRearm };
-        this.park_continuation = Some(ParkContinuation { action_id: id, phase, epoch: this.safety.epoch_id(), lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
+        this.park_continuation = Some(ParkContinuation { action_id: id, phase, epoch: this.safety.epoch_id(), stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
         if phase == ParkContinuationPhase::ReadyForPlan { this.notify_park_continuation(); }
         return Ok(MotionInstalled::DeferredContinuation { epoch: this.safety.epoch_id(), action_id: id, expected_duration_s: PARK_DURATION_S + PARK_EXTRA_DURATION_S });
     }
@@ -700,14 +700,14 @@ pub fn install_park(inner: &mut SupervisorInner, stamp: AdmissionStamp, slot: &P
                 this.mit.park_after_hand_back = true;
                 this.mit.deferred_park_off_owner = true;
                 let id = this.begin_action_rt("park");
-                this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::WaitingMitHandback, epoch, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
+                this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::WaitingMitHandback, epoch, stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
                 return Ok(MotionInstalled::DeferredContinuation { epoch, action_id: id, expected_duration_s: PARK_EXTRA_DURATION_S });
             }
             return Err(MotionInstallError::MotionBusy);
         }
         if slot.for_mit_deferral || verify_motion_freshness(this, slot).is_err() {
             let id = this.begin_action_rt("park");
-            this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::ReadyForPlan, epoch, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
+            this.park_continuation = Some(ParkContinuation { action_id: id, phase: ParkContinuationPhase::ReadyForPlan, epoch, stop_gen, lease_gen, workspace_revision: ws_rev, motion_config_revision: mc_rev });
             this.notify_park_continuation();
             return Ok(MotionInstalled::DeferredContinuation { epoch, action_id: id, expected_duration_s: PARK_DURATION_S + PARK_EXTRA_DURATION_S });
         }
@@ -720,6 +720,9 @@ pub fn install_park_continuation(inner: &mut SupervisorInner, action_id: u64, sl
     let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id && c.phase == ParkContinuationPhase::ReadyForPlan) else {
         return Err(MotionInstallError::ContinuationMismatch);
     };
+    if inner.urgent_stop_unapplied() || cont.stop_gen != inner.current_stop_gen() {
+        return Err(MotionInstallError::Stopped);
+    }
     if !inner.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running() && a.kind == "park") {
         return Err(MotionInstallError::ContinuationMismatch);
     }

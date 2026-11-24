@@ -137,6 +137,17 @@ impl SupervisorInner {
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     /// In RT executor mode, heap-owning motion payloads are retired off-thread (zero RT frees).
     pub fn stop_motion(&mut self) {
+        // a STOP cancels a deferred park continuation and any in-flight ParkRearm before disable
+        let cancelled_continuation = self.park_continuation.take();
+        if let Some(cont) = cancelled_continuation {
+            self.abort_park_rearm_transition();
+            self.notify_park_continuation();
+            if !self.park_disable_in_flight()
+                && self.last_action.as_ref().is_some_and(|a| a.id == cont.action_id && a.is_running())
+            {
+                self.finish_action(cont.action_id, "cancelled", Some("STOPPED"), None, None, None, None);
+            }
+        }
         // a STOP cancels a park deferred behind the MIT hand back
         self.mit.deferred_park_off_owner = false;
         if std::mem::take(&mut self.mit.park_after_hand_back) {
@@ -1669,15 +1680,12 @@ impl SupervisorInner {
             .as_ref()
             .filter(|a| a.is_running() && a.kind == "park")
             .map(|a| a.id);
-        let cancelled_continuation = self.park_continuation.take();
-        if cancelled_continuation.is_some() {
-            self.abort_park_rearm_transition();
-            self.notify_park_continuation();
-        }
         self.stop_motion();
         if !disable_in_flight {
-            if let Some(id) = cancelled_continuation.map(|c| c.action_id).or(running_park_id) {
-                self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
+            if let Some(id) = running_park_id {
+                if self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) {
+                    self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
+                }
             }
         }
         if self.macro_run.is_some() {

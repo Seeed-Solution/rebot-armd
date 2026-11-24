@@ -253,7 +253,7 @@ pub(super) async fn complete_pending_motion(
                 let ack = format_motion_ack(&inner, &reply_kind, Some((action_id, expected_duration_s)));
                 drop(inner);
                 spawn_park_continuation(
-                    action_id, epoch, notify, recv_supervisor.clone(), worker_closing.clone(), worker_tasks,
+                    action_id, epoch, stamp.stop_gen, recv_connection.to_string(), notify, recv_supervisor.clone(), worker_closing.clone(), worker_tasks,
                 );
                 return Some(ack);
             }
@@ -273,9 +273,12 @@ pub(super) async fn complete_pending_motion(
     Some(format_motion_reject(&inner, &reply_kind, req::MotionInstallError::PlanStale.into_arm_error(&inner, request.action_kind, Some(epoch)).into()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_park_continuation(
     action_id: u64,
     epoch: u64,
+    request_stop_gen: u64,
+    connection_id: String,
     notify: Arc<tokio::sync::Notify>,
     supervisor: Arc<ArmSupervisor>,
     closing: Arc<AtomicBool>,
@@ -295,7 +298,7 @@ fn spawn_park_continuation(
             let notified = notify.notified();
             let ready_snapshot = {
                 let inner = supervisor.inner().read().await;
-                if inner.detached { return; }
+                if inner.detached || inner.current_stop_gen() != request_stop_gen { return; }
                 let Some(cont) = inner.park_continuation.filter(|c| c.action_id == action_id) else { return; };
                 if cont.phase == crate::supervisor::ParkContinuationPhase::ReadyForPlan {
                     Some(req::MotionPlanSnapshot::from_supervisor(&inner))
@@ -308,12 +311,19 @@ fn spawn_park_continuation(
                 continue;
             };
             let cancel = closing.clone();
+            let plan_conn = connection_id.clone();
             let planned = tokio::task::spawn_blocking(move || {
+                maybe_pause_blocking_plan(&plan_conn);
                 if cancel.load(Ordering::Acquire) { return None; }
                 Some(req::prepare_motion(&snap, &req::MotionRequest::park()))
             }).await;
             let mut inner = supervisor.inner().write().await;
             if inner.detached { return; }
+            if inner.current_stop_gen() != request_stop_gen
+                || !inner.park_continuation.is_some_and(|c| c.action_id == action_id)
+            {
+                return;
+            }
             if closing.load(Ordering::Acquire) || Instant::now() >= deadline {
                 req::fail_park_continuation(&mut inner, action_id, "UNLOAD_FAILED", "Park continuation timed out or disconnected before install");
                 return;

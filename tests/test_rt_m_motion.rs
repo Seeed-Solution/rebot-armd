@@ -978,3 +978,201 @@ async fn legacy_mit_moving_park_off_lock_exclusion_and_executor_mit_gate() {
     req::install_park_continuation(&mut inner, park_id, &cont_plan.slot, None, Some(ep), false).unwrap();
     assert!(inner.park_continuation().is_none() && inner.pending_normal_unload);
 }
+
+// ============================================================================
+// 7. Round 2 B1: Legacy WS Stop cancels ParkRearm & continuation before ACK
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_legacy_ws_stop_cancels_park_rearm_and_continuation_before_ack() {
+    // 7a. Legacy WS Stop during WaitingRearm cancels park_continuation + ParkRearm BEFORE ACK;
+    //     no motion occurs after the Stop ACK.
+    {
+        let (drv, _knobs) = MotionTestDriver::new(vec![0.8, 0.4], Duration::from_millis(250), Duration::ZERO, None);
+        let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+        let (mut ws, gen, _, sup, addr) = common::torqued_rig(sup, &[0.8, 0.4]).await;
+        assert!(reqwest::Client::new().post(format!("http://{addr}/api/v1/safety/e_stop")).send().await.unwrap().status().is_success());
+        let ep = sup.get_observation().await.epoch_id;
+        assert_eq!(common::rpc(&mut ws, gen, ep, "/api/v1/safety/clear_fault", json!({})).await["type"], "command_ack");
+        assert!(sup.inner().read().await.holding_after_clear());
+
+        let ep = sup.get_observation().await.epoch_id;
+        let park = common::rpc(&mut ws, gen, ep, "/api/v1/motion/unload", json!({})).await;
+        assert_eq!(park["type"], "command_ack", "{park}");
+        assert_eq!(sup.inner().read().await.park_continuation().map(|c| c.phase), Some(ParkContinuationPhase::WaitingRearm));
+
+        let stop = common::rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await;
+        assert_eq!(stop["type"], "command_ack", "{stop}");
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.park_continuation().is_none(), "Stop must cancel park_continuation before ACK");
+            assert!(!inner.torque_transition_pending(), "Stop must abort ParkRearm before ACK");
+            assert!(inner.active_trajectory.is_none());
+            assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("STOPPED"));
+        }
+        let q_after_stop = sup.get_observation().await.commanded_positions;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let obs_later = sup.get_observation().await;
+        assert!(obs_later.is_torqued && obs_later.commanded_positions == q_after_stop, "no motion after Stop ACK");
+        assert!(sup.inner().read().await.active_trajectory.is_none());
+    }
+
+    // 7b. Legacy WS Stop while continuation worker is paused mid-planning (ReadyForPlan):
+    //     Stop ACKs cleanly; unpausing continuation worker produces ZERO motion after Stop ACK.
+    {
+        struct PauseGuard(String);
+        impl Drop for PauseGuard {
+            fn drop(&mut self) {
+                armd::api::ws::set_test_ws_blocking_plan_paused(&self.0, false);
+            }
+        }
+        let (drv, _knobs) = MotionTestDriver::new(vec![0.8, 0.4], Duration::from_millis(60), Duration::ZERO, None);
+        let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+        let (mut ws, gen, _, sup, addr) = common::torqued_rig(sup, &[0.8, 0.4]).await;
+        assert!(reqwest::Client::new().post(format!("http://{addr}/api/v1/safety/e_stop")).send().await.unwrap().status().is_success());
+        let ep = sup.get_observation().await.epoch_id;
+        assert_eq!(common::rpc(&mut ws, gen, ep, "/api/v1/safety/clear_fault", json!({})).await["type"], "command_ack");
+        let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+
+        let ep = sup.get_observation().await.epoch_id;
+        let park = common::rpc(&mut ws, gen, ep, "/api/v1/motion/unload", json!({})).await;
+        assert_eq!(park["type"], "command_ack", "{park}");
+        assert_eq!(sup.inner().read().await.park_continuation().map(|c| c.phase), Some(ParkContinuationPhase::WaitingRearm));
+
+        // Pause continuation spawn_blocking before ParkRearm confirms, then wait until the
+        // continuation worker has entered spawn_blocking in ReadyForPlan.
+        armd::api::ws::set_test_ws_blocking_plan_paused(&conn_id, true);
+        let _unpause = PauseGuard(conn_id.clone());
+        let wait_until = tokio::time::Instant::now() + Duration::from_secs(3);
+        while armd::api::ws::test_ws_blocking_plan_blocked_count(&conn_id) < 1 {
+            assert!(tokio::time::Instant::now() < wait_until, "continuation worker never reached spawn_blocking");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sup.inner().read().await.park_continuation().map(|c| c.phase), Some(ParkContinuationPhase::ReadyForPlan));
+
+        let stop = common::rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await;
+        assert_eq!(stop["type"], "command_ack", "{stop}");
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.park_continuation().is_none(), "Stop must cancel ReadyForPlan continuation before ACK");
+            assert!(inner.active_trajectory.is_none());
+            assert_eq!(inner.last_action.as_ref().and_then(|a| a.code.as_deref()), Some("STOPPED"));
+        }
+        let q_after_stop = sup.get_observation().await.commanded_positions;
+
+        // Release the paused continuation worker and prove no motion starts after Stop ACK.
+        drop(_unpause);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let obs_later = sup.get_observation().await;
+        assert!(obs_later.is_torqued && obs_later.commanded_positions == q_after_stop, "no motion after Stop ACK");
+        let inner = sup.inner().read().await;
+        assert!(inner.active_trajectory.is_none() && !inner.pending_normal_unload && inner.park_continuation().is_none());
+    }
+
+    // 7c. Executor Stop during continuation planning (ReadyForPlan) cancels park_continuation
+    //     before ACK, and a subsequent continuation install is refused with no motion.
+    {
+        let period = Duration::from_millis(5);
+        let period_ns = period.as_nanos() as u64;
+        let clock = ScriptedClock::new();
+        let (drv, _knobs) = MotionTestDriver::new(vec![0.8, 0.4], Duration::from_millis(10), Duration::ZERO, Some(clock.clone()));
+        let sup = Arc::new(ArmSupervisor::new(parkable_2dof_config()).with_driver(Box::new(drv)));
+        let handle = start_scripted_executor(&sup, period, clock.clone(), true).await;
+        clock.run_steps(period_ns, 2);
+        let _ = submit_enable_and_wait(&sup, &handle, &clock, period_ns, 1);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_bg = done.clone();
+        let clock_bg = clock.clone();
+        let stepper = tokio::task::spawn_blocking(move || {
+            while !done_bg.load(Ordering::Acquire) {
+                clock_bg.run_steps(period_ns, 1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let _ = sup.trigger_e_stop().await;
+        let _ = handle.clear_fault_async().await.unwrap().unwrap();
+        done.store(true, Ordering::Release);
+        stepper.await.unwrap();
+        clock.run_steps(period_ns, 2);
+
+        let held_snap = sup.hub().latest().unwrap();
+        assert!(held_snap.rt.holding_after_clear);
+        let p_snap = MotionPlanSnapshot::from_published(&held_snap, sup.hub().motion_config().unwrap()).unwrap();
+        let park = req::prepare_motion(&p_snap, &MotionRequest::park()).unwrap();
+        let r_park = handle.broker().lock().unwrap().submit(
+            ClientId(1), 2, auth_from_hub(&sup, &handle), clock.now() + Duration::from_secs(10),
+            Submit::InstallPark(&|s: &mut PlanSlot| req::stage_park(s, &park.slot)),
+        ).unwrap();
+        clock.run_steps(period_ns, 2);
+        let ack_rs = drain_replies(&handle);
+        let action_id = ack_rs.iter().find_map(|r| match r {
+            Reply::Ack { request, action: Some(a), .. } if *request == r_park => Some(a.0),
+            _ => None,
+        }).unwrap_or_else(|| panic!("expected InstallPark ACK with action_id; replies={ack_rs:?}"));
+        // Advance until ParkRearm confirms and continuation enters ReadyForPlan.
+        let mut ready_snap = None;
+        for _ in 0..40 {
+            clock.run_steps(period_ns, 1);
+            let s = sup.hub().latest().unwrap();
+            if !s.rt.holding_after_clear && s.obs.safety_state == SafetyState::Armed {
+                ready_snap = Some(s);
+                break;
+            }
+        }
+        let ready_snap = ready_snap.expect("ParkRearm confirmed on StateHub");
+        // Prepare continuation plan BEFORE Stop arrives (simulating continuation mid-planning).
+        let cont_plan = req::prepare_motion(
+            &MotionPlanSnapshot::from_published(&ready_snap, sup.hub().motion_config().unwrap()).unwrap(),
+            &MotionRequest::park(),
+        ).unwrap();
+        // Client Stop arrives while continuation is being planned.
+        let sg = handle.stop_requests().request();
+        clock.run_steps(period_ns, 3);
+        assert_eq!(handle.stop_requests().applied(), sg);
+        let rs = drain_replies(&handle);
+        assert!(rs.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Stopped, .. } if *request == r_park)), "{rs:?}");
+        let snap_after_stop = sup.hub().latest().unwrap();
+        let q_after_stop = snap_after_stop.obs.commanded_positions.clone();
+
+        // Late continuation install must be refused and produce zero motion.
+        let r_late = handle.broker().lock().unwrap().submit(
+            ClientId(1), 3, auth_from_hub(&sup, &handle), clock.now() + Duration::from_secs(10),
+            Submit::ContinuePark(&|s: &mut PlanSlot| req::stage_park_continuation(s, action_id, &cont_plan.slot)),
+        ).unwrap();
+        clock.run_steps(period_ns, 10);
+        let rs = drain_replies(&handle);
+        assert!(rs.iter().any(|r| matches!(r, Reply::Refused { request, .. } if *request == r_late)), "{rs:?}");
+        let end_snap = sup.hub().latest().unwrap();
+        assert_eq!(end_snap.obs.commanded_positions, q_after_stop, "no motion after Stop ACK on executor");
+        drop(handle);
+    }
+
+    // 7d. Direct unit check: install_park_continuation rejects any advanced stop_gen with Stopped.
+    {
+        let mut inner = SupervisorInner::new(parkable_2dof_config());
+        let stamp = inner.current_admission_stamp();
+        SupervisorInner::enable_torque(inner.check_admission(stamp).unwrap()).unwrap();
+        inner.commanded_positions = vec![0.8, 0.4];
+        inner.measured_positions = vec![0.8, 0.4];
+        inner.target_positions = vec![0.8, 0.4];
+        inner.execute_stop(armd::safety::StopPolicy::EStopLatch);
+        inner.clear_fault().unwrap();
+        assert!(inner.holding_after_clear());
+        let snap = MotionPlanSnapshot::from_supervisor(&inner);
+        let park = req::prepare_motion(&snap, &MotionRequest::park()).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let ep = inner.safety.epoch_id();
+        let action_id = match req::install_park(&mut inner, stamp, &park.slot, None, Some(ep), false).unwrap() {
+            MotionInstalled::DeferredContinuation { action_id, .. } => action_id,
+            other => panic!("expected DeferredContinuation, got {other:?}"),
+        };
+        assert_eq!(inner.park_continuation().unwrap().phase, ParkContinuationPhase::ReadyForPlan);
+        let cont_plan = req::prepare_motion(&MotionPlanSnapshot::from_supervisor(&inner), &MotionRequest::park()).unwrap();
+        inner.advance_stop_generation();
+        assert_eq!(
+            req::install_park_continuation(&mut inner, action_id, &cont_plan.slot, None, Some(ep), false),
+            Err(MotionInstallError::Stopped),
+            "install_park_continuation must verify original request stop_gen"
+        );
+    }
+}

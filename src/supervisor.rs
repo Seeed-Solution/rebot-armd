@@ -740,6 +740,7 @@ pub struct ParkContinuation {
     pub action_id: u64,
     pub phase: ParkContinuationPhase,
     pub epoch: u64,
+    pub stop_gen: u64,
     pub lease_gen: Option<u64>,
     pub workspace_revision: u64,
     pub motion_config_revision: u64,
@@ -8164,15 +8165,17 @@ impl ArmSupervisor {
                     if let Some(message) = stop.body_error {
                         return Ok(UrgentStopOutcome::InvalidBody { message, epoch });
                     }
-                    guard.exit_gravity_comp("STOPPED", "Stop command");
-                    guard.stop_motion();
-                    guard.request_macro_stop();
-                    let stop_gen = guard.advance_stop_generation();
+                    let applied_to_motion = guard.authorized_stop();
+                    let stop_gen = if applied_to_motion {
+                        guard.current_stop_gen()
+                    } else {
+                        guard.advance_stop_generation()
+                    };
                     let applied_epoch = guard.safety.epoch_id();
                     on_legacy_applied(applied_epoch, stop_gen);
                     return Ok(UrgentStopOutcome::Applied {
                         stop_generation: stop_gen,
-                        applied_to_motion: true,
+                        applied_to_motion,
                         epoch: applied_epoch,
                         safety_state: guard.safety.state_arc(),
                         is_torqued: guard.is_torqued,

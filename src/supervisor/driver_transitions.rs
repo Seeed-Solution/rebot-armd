@@ -502,7 +502,7 @@ impl DisableConfirm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnableOrigin {
     BrokerTransition,
-    ParkRearm { action_id: u64 },
+    ParkRearm { action_id: u64, stop_gen: u64 },
 }
 
 /// Origin of a [`TorqueTransition::Disable`] handshake so broker torque-off and park
@@ -1083,7 +1083,7 @@ impl SupervisorInner {
                 | TorqueTransition::Disable { origin: DisableOrigin::BrokerTransition, .. } => {
                     self.core.begin_transition(Err("SUPERSEDED"));
                 }
-                TorqueTransition::Enable { origin: EnableOrigin::ParkRearm { action_id }, .. } => {
+                TorqueTransition::Enable { origin: EnableOrigin::ParkRearm { action_id, .. }, .. } => {
                     self.finish_park_rearm_failed(action_id, "UNLOAD_FAILED");
                 }
                 TorqueTransition::Disable { origin: DisableOrigin::Park { watchdog, action_id }, .. } => {
@@ -1710,8 +1710,12 @@ impl SupervisorInner {
         &mut self,
         _proof: &crate::supervisor::AdmittedProof,
         action_id: u64,
+        stop_gen: u64,
     ) -> Result<ParkRearmStart, crate::rt_core::requests::motion::MotionInstallError> {
         use crate::rt_core::requests::motion::MotionInstallError;
+        if self.urgent_stop_unapplied() || self.current_stop_gen() != stop_gen {
+            return Err(MotionInstallError::Stopped);
+        }
         let map_safety = |e: SafetyError| match e {
             SafetyError::EStopActive => MotionInstallError::EStopActive,
             SafetyError::FaultActive(_) => MotionInstallError::FaultActive,
@@ -1719,7 +1723,7 @@ impl SupervisorInner {
             SafetyError::FeedbackUnavailable => MotionInstallError::FeedbackStale,
             _ => MotionInstallError::EnableFailed,
         };
-        match self.start_enable_transition(EnableOrigin::ParkRearm { action_id }, !self.rt_executor_owned, true).map_err(map_safety)? {
+        match self.start_enable_transition(EnableOrigin::ParkRearm { action_id, stop_gen }, !self.rt_executor_owned, true).map_err(map_safety)? {
             Ok(crate::rt_core::ops::TorqueProgress::Done) => Ok(ParkRearmStart::ConfirmedNow),
             Ok(crate::rt_core::ops::TorqueProgress::Pending { .. }) => Ok(ParkRearmStart::Pending),
             Err(_) => Err(MotionInstallError::EnableFailed),
@@ -1979,10 +1983,32 @@ impl SupervisorInner {
                     } else {
                         "FAULT_ACTIVE"
                     };
-                    if let EnableOrigin::ParkRearm { action_id } = origin {
+                    if let EnableOrigin::ParkRearm { action_id, .. } = origin {
                         self.finish_park_rearm_failed(action_id, code);
                     }
                     return Some(TransitionPoll { progress: Err(code), rx: None, broker_owned });
+                }
+                if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
+                    if self.urgent_stop_unapplied()
+                        || self.current_stop_gen() != stop_gen
+                        || !self.park_continuation.is_some_and(|c| c.action_id == action_id && c.stop_gen == stop_gen)
+                    {
+                        drv.abort_enable();
+                        let still_enabled = drv.enable_state() != EnableState::Disabled
+                            || drv.has_any_joint_enabled()
+                            || drv.has_known_partial_enable();
+                        drop(drv);
+                        self.is_torqued = was_torqued || still_enabled;
+                        self.pending_rearm = true;
+                        if self.park_continuation.is_some_and(|c| c.action_id == action_id) {
+                            self.park_continuation = None;
+                            self.notify_park_continuation();
+                        }
+                        if self.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running()) {
+                            self.finish_action(action_id, "cancelled", Some("STOPPED"), None, None, None, None);
+                        }
+                        return Some(TransitionPoll { progress: Err("STOPPED"), rx: None, broker_owned });
+                    }
                 }
                 let r = if use_budgeted {
                     drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames)
@@ -2002,7 +2028,7 @@ impl SupervisorInner {
                 if estop_inhibited {
                     self.is_torqued = was_torqued || still_enabled;
                     self.pending_rearm = true;
-                    if let EnableOrigin::ParkRearm { action_id } = origin {
+                    if let EnableOrigin::ParkRearm { action_id, .. } = origin {
                         self.finish_park_rearm_failed(action_id, "ESTOP_ACTIVE");
                     }
                     return Some(TransitionPoll { progress: Err("ESTOP_ACTIVE"), rx, broker_owned });
@@ -2013,10 +2039,27 @@ impl SupervisorInner {
                         Ok(Rt::Pending { wake: to_exec(wake) })
                     }
                     Ok(Drv::Done(TorqueOutcome::Confirmed)) => {
+                        if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
+                            if self.urgent_stop_unapplied()
+                                || self.current_stop_gen() != stop_gen
+                                || !self.park_continuation.is_some_and(|c| c.action_id == action_id && c.stop_gen == stop_gen)
+                            {
+                                self.is_torqued = true;
+                                self.pending_rearm = true;
+                                if self.park_continuation.is_some_and(|c| c.action_id == action_id) {
+                                    self.park_continuation = None;
+                                    self.notify_park_continuation();
+                                }
+                                if self.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running()) {
+                                    self.finish_action(action_id, "cancelled", Some("STOPPED"), None, None, None, None);
+                                }
+                                return Some(TransitionPoll { progress: Err("STOPPED"), rx, broker_owned });
+                            }
+                        }
                         match self.enable_finish_inner(was_torqued, prev_gripper_cmd, true) {
                             Ok(_) => {
-                                if let EnableOrigin::ParkRearm { action_id } = origin {
-                                    if let Some(c) = self.park_continuation.as_mut().filter(|c| c.action_id == action_id) {
+                                if let EnableOrigin::ParkRearm { action_id, stop_gen } = origin {
+                                    if let Some(c) = self.park_continuation.as_mut().filter(|c| c.action_id == action_id && c.stop_gen == stop_gen) {
                                         c.phase = super::ParkContinuationPhase::ReadyForPlan;
                                     }
                                     self.notify_park_continuation();
@@ -2025,7 +2068,7 @@ impl SupervisorInner {
                             }
                             Err(e) => {
                                 let code = torque_error_code(&e);
-                                if let EnableOrigin::ParkRearm { action_id } = origin {
+                                if let EnableOrigin::ParkRearm { action_id, .. } = origin {
                                     self.finish_park_rearm_failed(action_id, code);
                                 }
                                 Err(code)
@@ -2034,7 +2077,7 @@ impl SupervisorInner {
                     }
                     r => {
                         let res = self.enable_step_failed(was_torqued, r);
-                        if let (EnableOrigin::ParkRearm { action_id }, Err(code)) = (origin, res) {
+                        if let (EnableOrigin::ParkRearm { action_id, .. }, Err(code)) = (origin, res) {
                             self.finish_park_rearm_failed(action_id, code);
                         }
                         res
