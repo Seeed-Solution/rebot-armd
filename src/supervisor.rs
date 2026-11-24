@@ -371,6 +371,7 @@ pub(crate) enum TickOutput {
         oldest_age: Option<Duration>,
         is_hold: bool,
         sent_any: bool,
+        sent_mask: u64,
     },
     Expired {
         dropped: usize,
@@ -757,10 +758,12 @@ pub struct SupervisorInner {
     pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
     pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Consecutive non-stopped ticks whose bounded CAN TX ended with pending deferred frames.
-    pub(crate) tx_deferral_streak: u32,
-    /// Driver-clock instant of the first tick in the current non-stopped TX deferral streak.
-    pub(crate) tx_deferral_since: Option<Instant>,
+    /// Per-joint consecutive non-stopped ticks without a completed motion target TX (preallocated
+    /// once at `SupervisorInner::new`; mutated strictly in place -> 0 RT allocs/frees).
+    pub(crate) tx_joint_no_progress_ticks: Vec<u32>,
+    /// Driver-clock instant of the first missed tick in each joint's current no-progress run
+    /// (preallocated once at `SupervisorInner::new`; mutated strictly in place -> 0 RT allocs/frees).
+    pub(crate) tx_joint_no_progress_since: Vec<Option<Instant>>,
     /// Driver-clock instant when stopped-hold TX first failed to submit any frame at all.
     pub(crate) hold_tx_unsent_since: Option<Instant>,
     /// True once `CAN_TX_STALLED` has been installed for the current stopped/fault session
@@ -1201,8 +1204,8 @@ impl SupervisorInner {
             estop_ack_overflow_gen: 0,
             safety_log_ring_dropped: 0,
             before_publish_hook: None,
-            tx_deferral_streak: 0,
-            tx_deferral_since: None,
+            tx_joint_no_progress_ticks: vec![0; dof],
+            tx_joint_no_progress_since: vec![None; dof],
             hold_tx_unsent_since: None,
             hold_tx_stalled_latched: false,
             last_hold_tx_error_log: None,
@@ -2696,10 +2699,31 @@ impl SupervisorInner {
         should
     }
 
+    /// Reset all per-joint non-stopped TX lack-of-progress counters and timestamps.
+    pub(crate) fn reset_tx_joint_progress(&mut self) {
+        self.tx_joint_no_progress_ticks.fill(0);
+        self.tx_joint_no_progress_since.fill(None);
+    }
+
+    /// Maximum consecutive non-stopped ticks any joint has gone without a completed target TX.
+    fn max_tx_joint_no_progress_ticks(&self) -> u32 {
+        let n = self.config.dof.min(self.tx_joint_no_progress_ticks.len());
+        self.tx_joint_no_progress_ticks[..n].iter().copied().max().unwrap_or(0)
+    }
+
+    /// Maximum elapsed driver-clock duration any joint has gone without a completed target TX.
+    fn max_tx_joint_no_progress_age(&self, now: Instant) -> Option<Duration> {
+        let n = self.config.dof.min(self.tx_joint_no_progress_since.len());
+        self.tx_joint_no_progress_since[..n]
+            .iter()
+            .flatten()
+            .map(|since| now.saturating_duration_since(*since))
+            .max()
+    }
+
     /// Zero-allocation motion stall latch (`CAN_TX_STALLED`) routed through `SafetyManager::latch`.
     fn latch_can_tx_stalled_motion(&mut self, detail: crate::safety::TxStallDetail, now: Instant) {
-        self.tx_deferral_streak = 0;
-        self.tx_deferral_since = None;
+        self.reset_tx_joint_progress();
         self.hold_tx_unsent_since = None;
         if let Some(ref d) = self.driver {
             if let Ok(mut drv) = d.try_lock() {
@@ -2744,8 +2768,7 @@ impl SupervisorInner {
         force_aged: bool,
         err_msg: Option<&str>,
     ) {
-        self.tx_deferral_streak = 0;
-        self.tx_deferral_since = None;
+        self.reset_tx_joint_progress();
         if sent_any {
             self.hold_tx_unsent_since = None;
             if let Some(msg) = err_msg {
@@ -2831,18 +2854,15 @@ impl SupervisorInner {
         match output {
             TickOutput::None => {
                 if !self.is_torqued || self.disable_pending || self.shutdown_committed {
-                    self.tx_deferral_streak = 0;
-                    self.tx_deferral_since = None;
+                    self.reset_tx_joint_progress();
                     self.hold_tx_unsent_since = None;
                 } else if count_release_streak && !has_pending_motion {
-                    self.tx_deferral_streak = 0;
-                    self.tx_deferral_since = None;
+                    self.reset_tx_joint_progress();
                 }
                 false
             }
             TickOutput::EstopInhibited { is_hold } => {
-                self.tx_deferral_streak = 0;
-                self.tx_deferral_since = None;
+                self.reset_tx_joint_progress();
                 if is_hold || self.safety.state().is_stopped() {
                     self.tracking.invalidate();
                     self.commanded_velocities.fill(0.0);
@@ -2874,12 +2894,11 @@ impl SupervisorInner {
                 false
             }
             TickOutput::Complete { .. } => {
-                self.tx_deferral_streak = 0;
-                self.tx_deferral_since = None;
+                self.reset_tx_joint_progress();
                 self.hold_tx_unsent_since = None;
                 true
             }
-            TickOutput::Deferred { pending, now, max_age, oldest_age, is_hold, sent_any } => {
+            TickOutput::Deferred { pending, now, max_age, oldest_age, is_hold, sent_any, sent_mask } => {
                 if is_hold || self.safety.state().is_stopped() {
                     self.account_stopped_hold_progress(now, max_age, sent_any, pending, 0, oldest_age, false, None);
                     return false;
@@ -2889,18 +2908,43 @@ impl SupervisorInner {
                 if !count_release_streak {
                     return false;
                 }
-                self.tx_deferral_streak = self.tx_deferral_streak.saturating_add(1);
-                let since = *self.tx_deferral_since.get_or_insert(now);
-                let streak_age = now.saturating_duration_since(since);
-                let observed_age = oldest_age.map_or(streak_age, |a| a.max(streak_age));
+                // Track per-motor lack of progress: joints that completed a target TX in this pass
+                // reset their streak, while unsent joints advance their own streak & age. Healthy
+                // partial passes where carry-over frames drain every 1-2 ticks never false-fault.
+                let n = self
+                    .config
+                    .dof
+                    .min(self.tx_joint_no_progress_ticks.len())
+                    .min(self.tx_joint_no_progress_since.len())
+                    .min(64);
+                let mut max_joint_ticks = 0u32;
+                let mut max_joint_age = Duration::ZERO;
+                for j in 0..n {
+                    if (sent_mask & (1u64 << j)) != 0 {
+                        self.tx_joint_no_progress_ticks[j] = 0;
+                        self.tx_joint_no_progress_since[j] = None;
+                    } else {
+                        let ticks = self.tx_joint_no_progress_ticks[j].saturating_add(1);
+                        self.tx_joint_no_progress_ticks[j] = ticks;
+                        let since = *self.tx_joint_no_progress_since[j].get_or_insert(now);
+                        let age = now.saturating_duration_since(since);
+                        if ticks > max_joint_ticks {
+                            max_joint_ticks = ticks;
+                        }
+                        if age > max_joint_age {
+                            max_joint_age = age;
+                        }
+                    }
+                }
+                let observed_age = oldest_age.map_or(max_joint_age, |a| a.max(max_joint_age));
                 let max_ticks = self.config.resolved_tx_stall_ticks();
-                if self.tx_deferral_streak >= max_ticks || observed_age >= max_age {
+                if max_joint_ticks >= max_ticks || observed_age >= max_age {
                     let detail = crate::safety::TxStallDetail {
                         queued: pending,
                         dropped: 0,
                         age_ms: observed_age.as_millis().min(u128::from(u64::MAX)) as u64,
                         limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
-                        consecutive_ticks: self.tx_deferral_streak,
+                        consecutive_ticks: max_joint_ticks,
                         is_hold: false,
                     };
                     self.latch_can_tx_stalled_motion(detail, now);
@@ -2914,7 +2958,7 @@ impl SupervisorInner {
                 }
 
                 let age = oldest_age
-                    .or_else(|| self.tx_deferral_since.map(|s| now.saturating_duration_since(s)))
+                    .or_else(|| self.max_tx_joint_no_progress_age(now))
                     .unwrap_or(max_age)
                     .max(max_age);
                 let detail = crate::safety::TxStallDetail {
@@ -2922,7 +2966,7 @@ impl SupervisorInner {
                     dropped,
                     age_ms: age.as_millis().min(u128::from(u64::MAX)) as u64,
                     limit_ms: max_age.as_millis().min(u128::from(u64::MAX)) as u64,
-                    consecutive_ticks: self.tx_deferral_streak.saturating_add(1),
+                    consecutive_ticks: self.max_tx_joint_no_progress_ticks().saturating_add(1),
                     is_hold: false,
                 };
                 self.latch_can_tx_stalled_motion(detail, now);
@@ -2947,8 +2991,7 @@ impl SupervisorInner {
                         Some(message.as_str()),
                     );
                 } else {
-                    self.tx_deferral_streak = 0;
-                    self.tx_deferral_since = None;
+                    self.reset_tx_joint_progress();
                     self.stop_motion();
                     self.tracking.invalidate();
                     self.commanded_velocities.fill(0.0);
@@ -4647,6 +4690,7 @@ impl SupervisorInner {
                                         oldest_age: driver.oldest_pending_tx_age(),
                                         is_hold,
                                         sent_any: hold_sent_any,
+                                        sent_mask: if is_hold { 0 } else { driver.last_target_tx_sent_mask() },
                                     }
                                 }
                                 Ok(crate::driver::TxBatchOutcome::Expired { dropped, pending }) => {
@@ -4944,7 +4988,7 @@ impl SupervisorInner {
             }
         }
         let has_pending_motion = matches!(tick_output, TickOutput::None)
-            && self.tx_deferral_streak > 0
+            && self.max_tx_joint_no_progress_ticks() > 0
             && self.driver.as_ref().is_some_and(|d| {
                 d.lock().is_ok_and(|drv| drv.pending_motion_tx_len() > 0)
             });

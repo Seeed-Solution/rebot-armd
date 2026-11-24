@@ -977,11 +977,12 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     let _ = inner.core.hub().latest();
     assert_eq!((a, f), (0, 0), "steady-state tick_publish touched allocator");
 
-    // (b) Transient Deferred tick_publish(0.02, 1, false) under Mode::EnobufsAfter(2):
-    // must stay operational (!is_stopped()) with 0 allocs, 0 frees.
+    // (b) Transient Deferred tick_publish(0.02, 1, false) under Mode::EnobufsAfter(1):
+    // must stay operational (!is_stopped()) with 0 allocs, 0 frees while J5..J7 accumulate
+    // per-motor lack of progress (1, 2, 3 < 4 at 50 Hz) and latch on exact tick 4.
     {
         let mut guard = bus.0.lock().unwrap();
-        guard.mode = Mode::EnobufsAfter(2);
+        guard.mode = Mode::EnobufsAfter(1);
         guard.tx_count = 0;
     }
     let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
@@ -1131,7 +1132,7 @@ fn rt_release_deferral_can_tx_stalled_reclaim_saturation_and_gravity_tick_zero_a
     assert_eq!(jog_inner.last_action.as_ref().map(|a| (a.id, a.state.as_str())), Some((jog_id, "running")));
     {
         let mut guard = jog_bus.0.lock().unwrap();
-        guard.mode = Mode::EnobufsAfter(2);
+        guard.mode = Mode::EnobufsAfter(1);
         guard.tx_count = 0;
     }
     for tick in 1..=4 {

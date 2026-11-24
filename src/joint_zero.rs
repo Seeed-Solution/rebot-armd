@@ -221,6 +221,7 @@ impl ArmDriver for ZeroOffsetDriver {
         r
     }
     fn last_hold_tx_sent_any(&self) -> bool { self.inner.last_hold_tx_sent_any() }
+    fn last_target_tx_sent_mask(&self) -> u64 { self.inner.last_target_tx_sent_mask() }
     fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }

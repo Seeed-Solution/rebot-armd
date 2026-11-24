@@ -539,18 +539,18 @@ fn dual_owner_sustained_deferral_beyond_45ms_latches_single_can_tx_stalled() {
             assert_eq!(rig.inner().safety.fault().map(|f| f.code), Some(FaultCode::CanTxStalled));
         }
 
-        // (b) Custom tx_stall_ticks = Some(4) (minimum at 50 Hz = ceil(45/20) + 1) under partial
-        //     deferral (max_frames = 4 so carried frames complete within 20 ms without expiring):
-        //     latches CAN_TX_STALLED on exact tick 4 via consecutive deferred ticks.
+        // (b) Custom tx_stall_ticks = Some(4) (minimum at 50 Hz = ceil(45/20) + 1) under per-motor
+        //     starvation (max_frames = 1 so J5..J7 miss 4 consecutive ticks while frame_max_age = 150 ms
+        //     prevents expiry before tick 4): latches CAN_TX_STALLED on exact tick 4.
         let mut cfg2 = base_cfg();
         cfg2.tx_stall_ticks = Some(4);
         let mut rig2 = DualRig::new(
             owner,
             cfg2,
             Some(TxBudget {
-                max_frames: 4,
+                max_frames: 1,
                 max_duration: ms(10),
-                frame_max_age: ms(45),
+                frame_max_age: ms(150),
             }),
         );
         for tick in 1..=3 {
@@ -1750,6 +1750,219 @@ fn dual_owner_10hz_single_deferral_does_not_latch_sustained_does() {
         assert!(
             msg.contains("2 consecutive ticks"),
             "{owner:?}: expected '2 consecutive ticks' in stall message, got: {msg}"
+        );
+    }
+}
+
+/// Round-3 Item 1:
+/// Healthy TX deferring every tick when output starts late (+16 ms at 50 Hz, 0.4 ms/frame cost):
+/// (a) Carry-over frames are sent FIRST on the next pass, oldest first, with their coalesced
+///     target VALUE updated in place without moving them to the back.
+/// (b) Stall detection counts per-motor lack of progress (not "any deferral in the tick"):
+///     every motor receives a target at least every 2 ticks and NO `CAN_TX_STALLED` latches
+///     across 24 consecutive late ticks on BOTH owners (Legacy and RT Executor).
+/// (c) A truly blocked bus (`tx_enobufs = true`) still latches `CAN_TX_STALLED`.
+#[test]
+fn late_release_healthy_deferral_prioritizes_carryover_and_never_false_faults() {
+    // Part A: Direct driver verification of oldest-first carry-over priority and in-place value
+    // coalescing (queued target value updated in place without moving to the back).
+    let limits = dm_limits();
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.tx_step = Duration::from_micros(400);
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_tx_budget(TxBudget {
+            max_frames: DAMIAO_TX_MAX_FRAMES,
+            max_duration: ms(10),
+            frame_max_age: ms(45),
+        });
+    drv.read_joint_states().unwrap();
+    drv.set_torque(true).unwrap();
+    bus.clear_log();
+
+    let decode_pos = |frame: &armd::transport::CanFrame| -> f32 {
+        f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]])
+    };
+
+    // Tick 1 (t = 16 ms, cutoff = 18 ms -> 2.0 ms -> 5 frames at 0.4 ms/frame):
+    // sends J1..J5 (0x101..=0x105), defers J6 & J7 (0x106, 0x107).
+    clock.advance(ms(16));
+    drv.set_tx_release_deadline(Some(clock.now() + ms(2)));
+    drv.begin_tx_tick();
+    let t1: Vec<JointTarget> = (0..7).map(|j| JointTarget::position(0.10 + 0.01 * j as f32)).collect();
+    assert_eq!(drv.write_joint_targets_bounded(&t1).unwrap(), TxBatchOutcome::Deferred { pending: 2 });
+    assert_eq!(drv.last_target_tx_sent_mask(), 0b001_1111);
+    let log1 = bus.tx_log();
+    assert_eq!(
+        log1.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![0x101, 0x102, 0x103, 0x104, 0x105]
+    );
+
+    // Tick 2 (+20 ms later, t = 36 ms, cutoff = 38 ms):
+    // J6 & J7 MUST go out FIRST (oldest carry-over first, NOT moved to the back) with their
+    // UPDATED coalesced target values (0.25, 0.26), followed by J1..J3 (0x101..=0x103).
+    bus.clear_log();
+    clock.advance(ms(18)); // 18 ms -> 36 ms
+    bus.with(|s| s.push_all_feedback());
+    drv.read_joint_states().unwrap();
+    drv.set_tx_release_deadline(Some(clock.now() + ms(2)));
+    drv.begin_tx_tick();
+    let t2: Vec<JointTarget> = (0..7).map(|j| JointTarget::position(0.20 + 0.01 * j as f32)).collect();
+    assert_eq!(drv.write_joint_targets_bounded(&t2).unwrap(), TxBatchOutcome::Deferred { pending: 2 });
+    assert_eq!(drv.last_target_tx_sent_mask(), 0b110_0111);
+    let log2 = bus.tx_log();
+    assert_eq!(
+        log2.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![0x106, 0x107, 0x101, 0x102, 0x103],
+        "carry-over frames J6, J7 must transmit first before new targets J1..J3"
+    );
+    assert!((decode_pos(&log2[0]) - 0.25).abs() < 1e-4, "J6 must carry coalesced value 0.25, got {}", decode_pos(&log2[0]));
+    assert!((decode_pos(&log2[1]) - 0.26).abs() < 1e-4, "J7 must carry coalesced value 0.26, got {}", decode_pos(&log2[1]));
+
+    // Tick 3 (+20 ms later, t = 56 ms, cutoff = 58 ms):
+    // Carry-over J4, J5 MUST go out FIRST with coalesced values (0.33, 0.34), followed by J1..J3.
+    bus.clear_log();
+    clock.advance(ms(18)); // 38 ms -> 56 ms
+    bus.with(|s| s.push_all_feedback());
+    drv.read_joint_states().unwrap();
+    drv.set_tx_release_deadline(Some(clock.now() + ms(2)));
+    drv.begin_tx_tick();
+    let t3: Vec<JointTarget> = (0..7).map(|j| JointTarget::position(0.30 + 0.01 * j as f32)).collect();
+    assert_eq!(drv.write_joint_targets_bounded(&t3).unwrap(), TxBatchOutcome::Deferred { pending: 2 });
+    assert_eq!(drv.last_target_tx_sent_mask(), 0b001_1111);
+    let log3 = bus.tx_log();
+    assert_eq!(
+        log3.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![0x104, 0x105, 0x101, 0x102, 0x103],
+        "carry-over frames J4, J5 must transmit first before new targets J1..J3"
+    );
+    assert!((decode_pos(&log3[0]) - 0.33).abs() < 1e-4, "J4 must carry coalesced value 0.33, got {}", decode_pos(&log3[0]));
+    assert!((decode_pos(&log3[1]) - 0.34).abs() < 1e-4, "J5 must carry coalesced value 0.34, got {}", decode_pos(&log3[1]));
+
+    // Part B: Full dual-owner (Legacy + Executor) 50 Hz loop with realistic-delay bus:
+    // Output starts at +16 ms EVERY tick with 0.4 ms/frame cost -> 5 frames/tick, 2 deferred/tick.
+    // Every motor receives a target at least every 2 ticks and NO stall latches across 24 ticks.
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut cfg = base_cfg();
+        cfg.control_frequency_hz = 50;
+        cfg.tx_stall_ticks = Some(4);
+        let mut rig = DualRig::new(owner, cfg, None);
+        rig.bus.with(|s| {
+            s.tx_step = Duration::from_micros(400);
+            s.tx_spike_every = 0;
+            s.tx_spike_step = Duration::ZERO;
+        });
+
+        let mut last_seen_tick: [Option<usize>; 7] = [None; 7];
+        let mut max_gap: [usize; 7] = [0; 7];
+        let mut send_counts: [usize; 7] = [0; 7];
+
+        if let RigOwner::Executor { fx, .. } = &mut rig.owner {
+            let late_clock = rig.clock.clone();
+            fx.on_checkpoint(move |cp| {
+                if cp == Checkpoint::BeforeOutput {
+                    late_clock.advance(ms(16));
+                }
+            });
+        }
+
+        const LATE_TICKS: usize = 24;
+        for tick in 1..=LATE_TICKS {
+            rig.bus.clear_log();
+            rig.bus.with(|s| s.push_all_feedback());
+            let release_start = rig.clock.now();
+            let release_deadline = release_start + ms(20);
+            match &mut rig.owner {
+                RigOwner::Legacy(inner) => {
+                    rig.clock.advance(ms(16));
+                    inner.tick_with_release_deadline(DT, rig.clock.now(), release_deadline);
+                    rig.clock.advance(release_deadline.saturating_duration_since(rig.clock.now()));
+                }
+                RigOwner::Executor { fx, .. } => {
+                    fx.dt = DT;
+                    fx.step();
+                }
+            }
+            assert!(
+                rig.inner().safety.state().is_operational(),
+                "{owner:?}: healthy late-release deferral on tick {tick} must NOT latch CAN_TX_STALLED: {:?}",
+                rig.inner().safety.fault()
+            );
+            let tx_frames: Vec<u32> = rig
+                .bus
+                .tx_log()
+                .into_iter()
+                .filter(|f| (0x101..=0x107).contains(&f.id))
+                .map(|f| f.id)
+                .collect();
+            assert_eq!(
+                tx_frames.len(),
+                5,
+                "{owner:?}: tick {tick} (+16 ms start, 2 ms before cutoff, 0.4 ms/frame) must send 5 frames, got {tx_frames:?}"
+            );
+            for fid in tx_frames {
+                let j = (fid - 0x101) as usize;
+                if let Some(prev) = last_seen_tick[j] {
+                    max_gap[j] = max_gap[j].max(tick - prev);
+                } else {
+                    max_gap[j] = max_gap[j].max(tick);
+                }
+                last_seen_tick[j] = Some(tick);
+                send_counts[j] += 1;
+            }
+        }
+
+        for j in 0..7 {
+            assert!(
+                send_counts[j] >= LATE_TICKS / 2,
+                "{owner:?}: motor {} received too few targets ({send_counts:?})",
+                j + 1
+            );
+            assert!(
+                max_gap[j] <= 2,
+                "{owner:?}: motor {} gap exceeded 2 ticks (max_gap={max_gap:?})",
+                j + 1
+            );
+            assert!(
+                LATE_TICKS - last_seen_tick[j].unwrap() <= 1,
+                "{owner:?}: motor {} did not receive a target within the last 2 ticks",
+                j + 1
+            );
+        }
+
+        // Part C: A bus that is truly blocked STILL latches CAN_TX_STALLED.
+        rig.bus.with(|s| s.tx_enobufs = true);
+        let mut latched = false;
+        for _ in 0..6 {
+            rig.bus.with(|s| s.push_all_feedback());
+            let release_start = rig.clock.now();
+            let release_deadline = release_start + ms(20);
+            match &mut rig.owner {
+                RigOwner::Legacy(inner) => {
+                    rig.clock.advance(ms(16));
+                    inner.tick_with_release_deadline(DT, rig.clock.now(), release_deadline);
+                    rig.clock.advance(release_deadline.saturating_duration_since(rig.clock.now()));
+                }
+                RigOwner::Executor { fx, .. } => {
+                    fx.dt = DT;
+                    fx.step();
+                }
+            }
+            if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
+                latched = true;
+                break;
+            }
+        }
+        assert!(
+            latched,
+            "{owner:?}: truly blocked bus (ENOBUFS) must still latch CAN_TX_STALLED, got {:?}",
+            rig.inner().safety.state()
         );
     }
 }

@@ -537,6 +537,11 @@ pub trait ArmDriver: Send {
     /// True if the most recent bounded stopped-hold pass submitted at least one frame to the bus.
     fn last_hold_tx_sent_any(&self) -> bool { true }
 
+    /// Bitmask of 0-based joint indices (`1u64 << i`) that completed a motion target transmit
+    /// (and flush) with no unsent target remaining in the carry-over queue during the most recent
+    /// [`Self::write_joint_targets_bounded`] pass. Non-CAN/sim drivers default to `u64::MAX`.
+    fn last_target_tx_sent_mask(&self) -> u64 { u64::MAX }
+
     /// Bounded target write: distinguishes complete submission ([`TxBatchOutcome::Complete`])
     /// from transient deferral ([`TxBatchOutcome::Deferred`]) without faulting or authorizing
     /// motion completion on deferral. Drivers and wrappers that support pending-queue carry-over
@@ -2976,6 +2981,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     hold_cursor: usize,
     /// True if the most recent `write_estop_hold_bounded` call transmitted at least one frame.
     last_hold_tx_sent_any: bool,
+    /// Bitmask of 0-based joint indices whose motion target transmitted & flushed in the most
+    /// recent `write_joint_targets_bounded` / `drain_pending_tx` pass with no frame still queued.
+    last_target_tx_sent_mask: u64,
     /// Observed age of the oldest frame expired in the most recent bounded TX pass.
     last_expired_oldest_age: Option<Duration>,
     /// Shared TX pass state across `receive_feedback()`, J7 handshakes, and `write_joint_targets*()` in one tick.
@@ -3228,10 +3236,12 @@ impl PendingTxQueue {
             .any(|slot| slot.is_some_and(|e| e.joint == joint))
     }
 
-    /// Replace an existing `(joint, frame_id)` slot in place (preserving FIFO position and, when
-    /// the slot carries the same `stop_stamp`, preserving its original `queued_at` so coalescing
-    /// cannot renew the 45 ms expiry deadline indefinitely; marking it as a fresh command instance
-    /// for deferral metrics), or push to the back if capacity permits.
+    /// Replace an existing `(joint, frame_id)` slot in place without moving it to the back
+    /// (preserving oldest-first carry-over FIFO order and its original `queued_at` under the same
+    /// `stop_stamp` so carry-over frames always drain first with the latest target value and
+    /// coalescing cannot renew the 45 ms expiry deadline indefinitely), or push to the back if
+    /// capacity permits. If an existing slot carried a different `stop_stamp`, it is removed and
+    /// re-appended at the back so entries stay monotonically ordered oldest-first by `queued_at`.
     fn upsert(
         &mut self,
         joint: usize,
@@ -3241,18 +3251,22 @@ impl PendingTxQueue {
         stop_stamp: StopStamp,
     ) -> bool {
         if let Some(idx) = self.find_key(joint, frame_id) {
-            let preserved_queued_at = self.buf[idx]
-                .filter(|prev| prev.stop_stamp == stop_stamp)
-                .map_or(queued_at, |prev| prev.queued_at);
-            self.buf[idx] = Some(PendingTxFrame {
-                joint,
-                frame_id,
-                cmd,
-                queued_at: preserved_queued_at,
-                stop_stamp,
-                was_deferred: false,
-            });
-            return true;
+            if let Some(prev) = self.buf[idx].filter(|prev| prev.stop_stamp == stop_stamp) {
+                self.buf[idx] = Some(PendingTxFrame {
+                    joint,
+                    frame_id,
+                    cmd,
+                    queued_at: prev.queued_at,
+                    stop_stamp,
+                    was_deferred: false,
+                });
+                return true;
+            }
+            for i in (idx + 1)..self.len {
+                self.buf[i - 1] = self.buf[i];
+            }
+            self.len -= 1;
+            self.buf[self.len] = None;
         }
         if self.len >= DAMIAO_PENDING_TX_CAPACITY {
             return false;
@@ -3455,6 +3469,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pending_hold_tx: PendingTxQueue::new(),
             hold_cursor: 0,
             last_hold_tx_sent_any: false,
+            last_target_tx_sent_mask: 0,
             last_expired_oldest_age: None,
             tick_tx: None,
             refresh_cursor: 0,
@@ -5078,7 +5093,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         stop_on_expiry: bool,
     ) -> Result<TxBatchOutcome, ArmDriverError> {
         let _ = self.ensure_tx_pass();
+        self.last_target_tx_sent_mask = 0;
         let mut sent_any = false;
+        let mut sent_mask: u64 = 0;
         let mut dropped_stale_in_pass = 0usize;
         let mut oldest_expired = pre_oldest_expired;
         while let Some(entry) = self.pending_tx.front() {
@@ -5104,6 +5121,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     };
                     self.record_sent_target(entry.joint, sent_frame, mit_params);
                     sent_any = true;
+                    if entry.joint < 64 {
+                        sent_mask |= 1u64 << entry.joint;
+                    }
                 }
                 Err(TxRefusal::DeadlinePassed) => {
                     let _ = self.pending_tx.pop_front();
@@ -5179,6 +5199,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(e);
         }
+        // Record per-joint wire progress only after flush and post-flush stop checks succeed,
+        // excluding any joint that still has an unsent frame remaining in `pending_tx`.
+        let mut completed_mask = sent_mask;
+        for entry in self.pending_tx.buf[..self.pending_tx.len].iter().flatten() {
+            if entry.joint < 64 {
+                completed_mask &= !(1u64 << entry.joint);
+            }
+        }
+        self.last_target_tx_sent_mask = completed_mask;
         // Recheck freshness AFTER flush so frames expiring during send or flush never carry over.
         let (late_stale, late_oldest) = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
         if late_stale > 0 {
@@ -8067,7 +8096,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.last_hold_tx_sent_any
     }
 
+    fn last_target_tx_sent_mask(&self) -> u64 {
+        self.last_target_tx_sent_mask
+    }
+
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
+        self.last_target_tx_sent_mask = 0;
         self.discard_pending_hold_tx();
         if targets.len() != self.motor_ids.len() {
             self.reject_target_tx(MitFenceTripReason::PreflightRejected);
@@ -8263,7 +8297,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             // a batch completing past the deadline trips and never resets it
             self.fence_check()?;
-            for (i, t) in started.into_iter().enumerate().take(targets.len()) { if t.is_some() { self.mit_fence_last_cmd[i] = t; } }
+            let mut sent_mask: u64 = 0;
+            for (i, t) in started.into_iter().enumerate().take(targets.len()) {
+                if t.is_some() {
+                    self.mit_fence_last_cmd[i] = t;
+                    if i < 64 {
+                        sent_mask |= 1u64 << i;
+                    }
+                }
+            }
+            self.last_target_tx_sent_mask = sent_mask;
             return Ok(TxBatchOutcome::Complete);
         }
 

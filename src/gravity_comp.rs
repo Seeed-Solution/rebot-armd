@@ -425,6 +425,7 @@ impl SupervisorInner {
                 oldest_age: drv.oldest_pending_tx_age(),
                 is_hold,
                 sent_any: hold_sent_any,
+                sent_mask: if is_hold { 0 } else { drv.last_target_tx_sent_mask() },
             },
             Ok(TxBatchOutcome::Expired { dropped, pending }) => TickOutput::Expired {
                 dropped,
