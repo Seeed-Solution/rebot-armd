@@ -3957,16 +3957,20 @@ impl SupervisorInner {
             .map_err(SafetyError::from)
     }
 
-    /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
-    /// Uses bounded `try_lock()` so a contended driver mutex cannot block indefinitely past `timeout`.
-    /// Runs synchronously on the caller holding `&mut SupervisorInner` (preserving exclusive driver
-    /// ownership) while logging timeout independently at `hard_deadline`.
-    pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
+    fn mark_panic_disable_requested(&mut self) {
         self.e_stop_latched.store(true, Ordering::SeqCst);
         self.active_disable_kind = Some(crate::driver::DisableKind::DisableProtective {
             reason: crate::driver::DisableProtectiveReason::ProcessExit,
         });
         self.disable_requested();
+    }
+
+    /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
+    /// Uses bounded `try_lock()` so a contended driver mutex cannot block indefinitely past `timeout`.
+    /// Runs synchronously on the caller holding `&mut SupervisorInner` (preserving exclusive driver
+    /// ownership) while logging timeout independently at `hard_deadline`.
+    pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
+        self.mark_panic_disable_requested();
         let origin = Instant::now();
         let (coop_deadline, hard_deadline) = panic_disable_deadlines(origin, timeout);
         let coop_budget = coop_deadline.saturating_duration_since(origin);
@@ -3987,8 +3991,7 @@ impl SupervisorInner {
         hard_deadline: Instant,
         coop_budget: Duration,
     ) -> PanicDisableOutcome {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
-        self.disable_requested();
+        self.mark_panic_disable_requested();
         let Some(ref d) = self.driver else {
             self.disable_confirmed();
             return PanicDisableOutcome::NoDriver;
