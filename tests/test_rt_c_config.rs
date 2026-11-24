@@ -35,8 +35,8 @@ use armd::rt_core::executor::{ExecutorConfig, RtOwner};
 use armd::rt_core::requests::config::{
     build_config_proposal, capture_config_admission, gravity_comp_command,
     prepare_eval_bufs_off_thread, run_config_commit, ConfigAuthContext, ConfigCandidate,
-    ConfigCommitPlan, ConfigCommitTestHooks, ConfigReply, ConfigRequest, ReleaseConfig,
-    ReservationGuard, ReserveConfig, ReservePrecheck,
+    ConfigCommitPlan, ConfigCommitTestHooks, ConfigReply, ConfigRequest, ConfigWriteOp,
+    ReleaseConfig, ReservationGuard, ReserveConfig, ReservePrecheck,
 };
 use armd::sequences::{Sequence, SequenceFile, Step};
 use armd::supervisor::ArmError;
@@ -226,7 +226,7 @@ fn keepout_plan(
     expected_revision: u64,
     conn_id: u64,
     lease_gen: u64,
-    refresh_window: bool,
+    _refresh_window: bool,
 ) -> (
     ConfigCommitPlan,
     Vec<KeepoutBox>,
@@ -253,14 +253,14 @@ fn keepout_plan(
         lease_gen,
         pub_cfg.workspace_revision,
     );
-    let write = Some(PendingWrite::new(
+    let write = ConfigWriteOp::from(Some(PendingWrite::new(
         rig.keepout_path.clone(),
         serde_json::to_string_pretty(&armd::keepout::KeepoutList {
             boxes: boxes.clone(),
             expected_revision: None,
         })
         .unwrap(),
-    ));
+    )));
     let plan = ConfigCommitPlan {
         proposal,
         auth: ConfigAuthContext {
@@ -275,7 +275,8 @@ fn keepout_plan(
             ws_eval_bufs,
         },
         write,
-        refresh_commit_window_after_stage: refresh_window,
+        expected_workspace_revision: Some(pub_cfg.workspace_revision),
+        expected_poses_revision: None,
     };
     (plan, profile_boxes, boxes, effective_boxes)
 }
@@ -565,19 +566,21 @@ async fn run_all_domains_test(owner: RtOwner) {
                 enabled: Some(false),
                 sensitivity: Some(armd::collision::Sensitivity::Low),
             },
-            write: Some(PendingWrite::new(
+            write: ConfigWriteOp::from(Some(PendingWrite::new(
                 rig.collision_path.clone(),
                 serde_json::to_string_pretty(&armd::collision::CollisionSetting {
                     enabled: false,
                     sensitivity: armd::collision::Sensitivity::Low,
                 })
                 .unwrap(),
-            )),
-            refresh_commit_window_after_stage: true,
+            ))),
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
         },
         || Ok(()),
-        |cfg, act| {
+        move |cfg, act| {
             cfg.collision_enabled = false;
+            cfg.collision_active = false;
             cfg.collision_sensitivity = armd::collision::Sensitivity::Low;
             cfg.collision_runtime = true;
             cfg.collision_revision = act.revision;
@@ -633,7 +636,7 @@ async fn run_all_domains_test(owner: RtOwner) {
                 jaw_opening: Some(jaw),
                 clear_stale: true,
             },
-            write: Some(PendingWrite::new(
+            write: ConfigWriteOp::from(Some(PendingWrite::new(
                 rig.gripper_calib_path.clone(),
                 serde_json::to_string_pretty(&armd::gripper_calib::GripperCalibFile {
                     offset_rad: Some(0.01),
@@ -644,14 +647,16 @@ async fn run_all_domains_test(owner: RtOwner) {
                     tool_config_digest: Some(pub2.config.active_tool.config_digest.clone()),
                 })
                 .unwrap(),
-            )),
-            refresh_commit_window_after_stage: true,
+            ))),
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
         },
         || Ok(()),
-        |cfg, act| {
+        move |cfg, act| {
             cfg.config.gripper_policy = Some(pol_pub);
             cfg.gripper_calib_offset = Some(0.01);
             cfg.gripper_calib_jaw_opening = Some(jaw_pub);
+            cfg.gripper_calib_invalid = false;
             cfg.gripper_calib_revision = act.revision;
         },
     )
@@ -715,14 +720,15 @@ async fn run_all_domains_test(owner: RtOwner) {
             candidate: ConfigCandidate::Poses {
                 next_list: next_list.clone(),
             },
-            write: Some(PendingWrite::new(
+            write: ConfigWriteOp::from(Some(PendingWrite::new(
                 rig.poses_path.clone(),
                 serde_json::to_string_pretty(&next_list).unwrap(),
-            )),
-            refresh_commit_window_after_stage: true,
+            ))),
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
         },
         || Ok(()),
-        |cfg, act| {
+        move |cfg, act| {
             cfg.poses.list = nl_pub;
             cfg.poses.revision = act.revision;
         },
@@ -784,14 +790,15 @@ async fn run_all_domains_test(owner: RtOwner) {
             candidate: ConfigCandidate::Sequences {
                 next_file: next_seq_file.clone(),
             },
-            write: Some(PendingWrite::new(
+            write: ConfigWriteOp::from(Some(PendingWrite::new(
                 rig.sequences_path.clone(),
                 serde_json::to_string_pretty(&next_seq_file).unwrap(),
-            )),
-            refresh_commit_window_after_stage: true,
+            ))),
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
         },
         || Ok(()),
-        |cfg, act| {
+        move |cfg, act| {
             cfg.sequences.file = nf_pub;
             cfg.sequences.revision = act.revision;
         },
@@ -845,8 +852,9 @@ async fn run_all_domains_test(owner: RtOwner) {
             candidate: ConfigCandidate::Poses {
                 next_list: PoseList::default(),
             },
-            write: None,
-            refresh_commit_window_after_stage: true,
+            write: ConfigWriteOp::Volatile,
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
         },
         || Ok(()),
         |_, _| {},
@@ -900,14 +908,15 @@ async fn run_all_domains_test(owner: RtOwner) {
                 setup: setup.clone(),
                 ws_eval_bufs: None,
             },
-            write: Some(PendingWrite::new(
+            write: ConfigWriteOp::from(Some(PendingWrite::new(
                 rig.setup_path.clone(),
                 armd::grasp::serialize_setup_for_tool(&setup, &pub5.config.active_tool),
-            )),
-            refresh_commit_window_after_stage: true,
+            ))),
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
         },
         || Ok(()),
-        |cfg, act| {
+        move |cfg, act| {
             cfg.config.grasp = Some(setup_pub);
             cfg.grasp_setup_revision = act.revision;
         },
@@ -1140,6 +1149,8 @@ async fn run_pre_rename_revocations_test(owner: RtOwner) {
             proposal: plan1.proposal,
             auth: plan1.auth,
             precheck: plan1.precheck,
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
         }))
         .await
         .unwrap();
@@ -1485,6 +1496,8 @@ async fn run_reservation_guard_drop_test(owner: RtOwner) {
                 proposal: plan.proposal,
                 auth: plan.auth,
                 precheck: plan.precheck,
+                expected_workspace_revision: None,
+                expected_poses_revision: None,
             }))
             .await
             .unwrap()
@@ -1511,6 +1524,8 @@ async fn run_reservation_guard_drop_test(owner: RtOwner) {
                 proposal: plan.proposal,
                 auth: plan.auth,
                 precheck: plan.precheck,
+                expected_workspace_revision: None,
+                expected_poses_revision: None,
             }))
             .await
             .unwrap()
@@ -1537,6 +1552,8 @@ async fn run_reservation_guard_drop_test(owner: RtOwner) {
                     proposal: probe.proposal,
                     auth: probe.auth,
                     precheck: probe.precheck,
+                    expected_workspace_revision: None,
+                    expected_poses_revision: None,
                 }))
                 .await
                 .unwrap();
@@ -1609,6 +1626,8 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
         admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
         lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
         off_thread_check: Arc::new(|| Ok(())),
+        job_token: None,
+        deadline: Instant::now() + Duration::from_secs(30),
     };
 
     let applied = apply_with_auth(&rig.sup, &cal_deps, req, &check, &auth)
@@ -1647,6 +1666,8 @@ async fn run_calibration_and_zero_test(owner: RtOwner) {
         admission: capture_config_admission(&rig.sup, 10, rig.lease_gen, Some(rig.epoch)),
         lease_holder: Some((HolderLabel::new(&rig.lease_conn), rig.lease_gen)),
         off_thread_check: Arc::new(|| Ok(())),
+        job_token: None,
+        deadline: Instant::now() + Duration::from_secs(30),
     };
     let restored = restore_with_auth(
         &rig.sup,
@@ -1952,4 +1973,215 @@ async fn ws_executor_routes_pr_c_paths_and_leaves_unmigrated_paths_pending() {
     drop(_detached_guard);
     server_jh.abort();
     rig.shutdown().await;
+}
+
+// ============================================================================
+// 9. Codex review regression invariants (zero-alloc refusals, stale workspace,
+//    pre-rename live authority verify, auto gravity-comp exit, exited executor 503)
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_review_regression_invariants_executor() {
+    // 9a. Workspace-dependent keepout commit refused PLAN_STALE when expected_workspace_revision mismatches.
+    let rig = Rig::new(RtOwner::Executor, |_| {}).await;
+    let _detached = rig.sup.inner().write().await;
+    let pub0 = rig.sup.published_config().await.unwrap();
+    let (mut stale_plan, ..) = keepout_plan(&rig, &pub0, vec![make_box("stale_ws", 0.3)], 1, 10, rig.lease_gen, false);
+    stale_plan.expected_workspace_revision = Some(pub0.workspace_revision + 99);
+    let err = run_config_commit(&rig.sup, stale_plan, || Ok(()), |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ArmError::Motion(armd::motion::MotionError::PlanStale(_))),
+        "expected PlanStale for stale workspace_revision, got {err:?}"
+    );
+    assert!(!rig.keepout_path.exists());
+    assert!(!rig.is_config_inhibited().await);
+
+    // 9b. Pre-rename live owner authority check (`VerifyAuthority`): bump stop_gen AFTER reserve
+    // and BEFORE rename -> rename MUST NOT happen, hold releases `Cleared`.
+    let sup_hook = Arc::clone(&rig.sup);
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks {
+        after_reserve_before_rename: Some(Arc::new(move || {
+            let _ = sup_hook.executor_handle().unwrap().stop_requests().request();
+        })),
+        ..Default::default()
+    });
+    let (plan_stop, ..) = keepout_plan(&rig, &pub0, vec![make_box("stop_before_rename", 0.3)], 1, 10, rig.lease_gen, false);
+    let err = run_config_commit(&rig.sup, plan_stop, || Ok(()), |_, _| {})
+        .await
+        .unwrap_err();
+    rig.sup.set_config_commit_test_hooks(ConfigCommitTestHooks::default());
+    assert!(
+        matches!(&err, ArmError::Rejected { status: 409, code, .. } if code == "STOPPED"),
+        "expected 409 STOPPED from pre-rename VerifyAuthority, got {err:?}"
+    );
+    assert!(!rig.keepout_path.exists(), "destination file must not be renamed after pre-rename stop");
+    assert!(!rig.is_config_inhibited().await, "hold must be Cleared after pre-rename stop");
+
+    // 9c. Ordinary motor-zero / offset refusal under E-stop allocates 0 on armd-control.
+    let _ = rig.sup.trigger_e_stop().await;
+    let res = rig
+        .sup
+        .dispatch_config_request(ConfigRequest::SetJointZeroOffsets {
+            offsets: vec![0.0; 7],
+            precomputed_floor: None,
+            auth: None,
+            expected_stop_gen: None,
+            deadline: None,
+            job_token: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(res, ConfigReply::JointZeroOffsetsSet(Err(_))));
+    let handle_ref = rig.sup.executor_handle().unwrap();
+    let legacy_err = handle_ref.set_joint_zero_offsets_async(vec![0.0; 7]).await.unwrap();
+    assert!(legacy_err.is_err());
+
+    rig.assert_executor_zero_alloc("stale workspace + pre-rename VerifyAuthority + E-stop zero refusal");
+    drop(_detached);
+
+    // 9d. Stopped executor MUST fail closed 503 CONFIG_UNAVAILABLE on `published_config()`.
+    let handle = rig.sup.executor_handle().unwrap();
+    tokio::task::spawn_blocking(move || handle.stop_and_join())
+        .await
+        .unwrap();
+    let stopped_err = rig
+        .sup
+        .published_config()
+        .await
+        .err()
+        .expect("stopped executor must fail closed");
+    assert!(
+        matches!(&stopped_err, ArmError::Rejected { status: 503, code, .. } if code == "CONFIG_UNAVAILABLE"),
+        "stopped executor must reject published_config() with 503 CONFIG_UNAVAILABLE, got {stopped_err:?}"
+    );
+
+    // 9e. Automatic gravity-comp exit on lease timeout executes with 0 allocations on armd-control.
+    let sup_gc = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let lease_conn = "gc-auto-exit";
+    let (lease_gen, epoch) = {
+        let mut inner = sup_gc.inner().write().await;
+        inner.lease_timeout = Duration::from_millis(60);
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        let lgen = inner.acquire_lease(lease_conn).unwrap();
+        let ep = inner.safety.epoch_id();
+        let adm = sup_gc.capture_admission_stamp();
+        let admitted = inner.check_admission(adm).unwrap();
+        armd::SupervisorInner::enable_torque(admitted).unwrap();
+        (lgen, ep)
+    };
+    let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(2));
+    ecfg.alloc_timing = true;
+    let handle_gc = sup_gc.start_executor(ecfg).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sup_gc.hub().latest().is_none() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _detached_gc = sup_gc.inner().write().await;
+    let adm = capture_config_admission(&sup_gc, 77, lease_gen, Some(epoch));
+    let enter = gravity_comp_command(
+        &sup_gc,
+        adm,
+        Some((HolderLabel::new(lease_conn), lease_gen)),
+        true,
+        Some(0.8),
+        Some(vec![0.2; 6]),
+    )
+    .await
+    .expect("enter gravity comp");
+    assert!(enter.active);
+    // Wait for lease watchdog (> 60 ms) to trigger automatic gravity-comp exit on armd-control.
+    let wait_exit = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(s) = sup_gc.hub().latest() {
+            if s.obs.control_mode != armd::model::ControlMode::GravityComp {
+                break;
+            }
+        }
+        assert!(Instant::now() < wait_exit, "timed out waiting for automatic gravity_comp exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        handle_gc.stats().total_allocs(),
+        AllocCounts::ZERO,
+        "automatic gravity-comp exit allocated on armd-control: {:?}",
+        handle_gc.stats().total_allocs()
+    );
+    assert_eq!(sup_gc.inner().control_thread_attempts(), 0);
+    drop(_detached_gc);
+    tokio::task::spawn_blocking(move || handle_gc.stop_and_join())
+        .await
+        .unwrap();
+
+    // 9f. Hardware driver gripper calibration validates against cached_driver_pos_limits (0 mutex lock, 0 alloc).
+    let sup_hw = Arc::new(
+        ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(MinimalHwDriver::new(7))),
+    );
+    let lease_conn_hw = "hw-grip-conn";
+    let (lgen_hw, ep_hw) = {
+        let mut inner = sup_hw.inner().write().await;
+        let l = inner.acquire_lease(lease_conn_hw).unwrap();
+        (l, inner.safety.epoch_id())
+    };
+    let mut ecfg_hw = ExecutorConfig::for_tests(Duration::from_millis(2));
+    ecfg_hw.alloc_timing = true;
+    let handle_hw = sup_hw.start_executor(ecfg_hw).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sup_hw.hub().latest().is_none() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _detached_hw = sup_hw.inner().write().await;
+    let pub_hw = sup_hw.published_config().await.unwrap();
+    let next_pol = pub_hw.config.gripper_policy.clone().unwrap();
+    let adm_hw = capture_config_admission(&sup_hw, 88, lgen_hw, Some(ep_hw));
+    let prop_hw = build_config_proposal(
+        &sup_hw,
+        ConfigDomain::GripperCalibration,
+        pub_hw.gripper_calib_revision,
+        adm_hw,
+        lgen_hw,
+        pub_hw.workspace_revision,
+    );
+    let out_hw = run_config_commit(
+        &sup_hw,
+        ConfigCommitPlan {
+            proposal: prop_hw,
+            auth: ConfigAuthContext {
+                admission: adm_hw,
+                lease_holder: Some((HolderLabel::new(lease_conn_hw), lgen_hw)),
+            },
+            precheck: ReservePrecheck::GripperCalibration {
+                candidate_policy: Some(next_pol.clone()),
+            },
+            candidate: ConfigCandidate::GripperCalibration {
+                offset_rad: Some(0.01),
+                policy: next_pol,
+                jaw_opening: None,
+                clear_stale: true,
+            },
+            write: ConfigWriteOp::Volatile,
+            expected_workspace_revision: None,
+            expected_poses_revision: None,
+        },
+        || Ok(()),
+        move |cfg, act| {
+            cfg.gripper_calib_offset = Some(0.01);
+            cfg.gripper_calib_invalid = false;
+            cfg.gripper_calib_revision = act.revision;
+        },
+    )
+    .await
+    .expect("hw gripper calib commit via cached_driver_pos_limits");
+    assert_eq!(out_hw.activated.revision, 2);
+    assert_eq!(handle_hw.stats().total_allocs(), AllocCounts::ZERO);
+    assert_eq!(sup_hw.inner().control_thread_attempts(), 0);
+    drop(_detached_hw);
+    tokio::task::spawn_blocking(move || handle_hw.stop_and_join())
+        .await
+        .unwrap();
 }
