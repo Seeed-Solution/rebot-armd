@@ -2695,6 +2695,7 @@ const I18N = {
     'en.torque_off': '关闭力矩', 'en.torque_off.sub': '仅收纳位可用 · 故障或急停仍保持锁存',
     'en.torque_off.would_drop': '力矩保持开启：{joint} 当前在 {pos} rad（收纳位 {rest}）；关闭力矩会导致机械臂下坠。请先清除故障并停靠收纳，或切断电源。',
     'en.torque_off.would_drop_stale': '力矩保持开启：关节反馈缺失或超过 100 ms，无法确认是否处于收纳位；关闭力矩会导致机械臂下坠。请等待新鲜反馈、清除故障并停靠收纳，或切断电源。',
+    'en.torque_off.no_rest_pose': '力矩保持开启：当前 profile 未配置已标定的收纳位，无法安全断力矩；关闭力矩会导致机械臂下坠。请清除故障并停靠，或切断电源。',
     'toast.torque_off_stopped': '力矩已关闭；故障或急停仍保持锁存，需另行清除',
     'estop': '急停', 'estop.aria': '紧急停止',
     'stop': '停止', 'stop.sub': '保持位置', 'stop.aria': '停止运动并保持位置',
@@ -2943,6 +2944,7 @@ const I18N = {
     'en.torque_off': 'Turn torque off', 'en.torque_off.sub': 'At rest pose only · fault/E-stop latch stays active',
     'en.torque_off.would_drop': 'Torque stays on: {joint} is at {pos} rad (rest {rest}); the arm would drop. Clear the fault and park, or cut power.',
     'en.torque_off.would_drop_stale': 'Torque stays on: feedback is missing or older than 100 ms, so the rest pose cannot be verified; the arm would drop. Wait for fresh feedback, clear the fault and park, or cut power.',
+    'en.torque_off.no_rest_pose': 'Torque stays on: profile has no calibrated resting_pose configured; the arm would drop. Clear the fault and park, or cut power.',
     'toast.torque_off_stopped': 'Torque turned off; fault/E-stop latch remains active until cleared',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
     'stop': 'Stop', 'stop.sub': 'HOLD', 'stop.aria': 'Stop motion and hold position',
@@ -9441,6 +9443,8 @@ function formatTorqueOffWouldDrop(e) {
       rest: r.rest.toFixed(3),
     });
   }
+  if (r && r.reason === 'no_resting_pose') return t('en.torque_off.no_rest_pose');
+  if (r && r.reason === 'stale_feedback') return t('en.torque_off.would_drop_stale');
   return (e && e.message) || t('en.torque_off.would_drop_stale');
 }
 function showTorqueOffInline(msg) {

@@ -191,6 +191,8 @@ pub enum SafetyError {
         position: Option<f32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rest: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
         message: String,
     },
 

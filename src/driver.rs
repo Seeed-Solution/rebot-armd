@@ -360,6 +360,11 @@ pub trait ArmDriver: Send {
         let ages = self.feedback_ages();
         ages.len() == dof && ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
     }
+    /// Every listed joint index has feedback no older than `max_age`.
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        let ages = self.feedback_ages();
+        joints.iter().all(|&i| ages.get(i).copied().flatten().is_some_and(|age| age <= max_age))
+    }
     /// [`Self::feedback_ages`] as whole milliseconds (the observation's `feedback_age_ms`).
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
         out.clear();
@@ -7582,6 +7587,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
     fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
         self.last_feedback_instant.len() == dof && self.last_feedback_instant.iter().all(|t| t.is_some_and(|t| self.since(t) <= max_age))
+    }
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        joints.iter().all(|&i| {
+            self.last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| self.since(t) <= max_age)
+        })
     }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
         out.clear();

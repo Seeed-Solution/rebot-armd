@@ -288,6 +288,7 @@ pub struct SupervisorInner {
     /// The torque transition the RT started and serves from `poll_hardware` (None: none).
     pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
     pub last_disable_attempt: Option<Instant>,
+    pub(crate) last_stopped_torque_off_refusal: Option<StoppedTorqueOffRefusal>,
     pub output_suspended: bool,
     pub feedback_numeric_valid: bool,
     pub(crate) sim_time_s: f64,
@@ -704,6 +705,7 @@ impl SupervisorInner {
             disable_pending: false,
             torque_transition: None,
             last_disable_attempt: None,
+            last_stopped_torque_off_refusal: None,
             output_suspended: false,
             feedback_numeric_valid: true,
             sim_time_s: 0.0,

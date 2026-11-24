@@ -278,6 +278,7 @@ impl From<ArmError> for ApiError {
                     ref joint,
                     position,
                     rest,
+                    ref reason,
                     ref message,
                 } => ApiError {
                     status: StatusCode::CONFLICT,
@@ -287,11 +288,14 @@ impl From<ArmError> for ApiError {
                     safety_state: None,
                     details: match (joint, position, rest) {
                         (Some(j), Some(pos), Some(r)) => Some(Box::new(serde_json::json!({
+                            "reason": reason.as_deref().unwrap_or("outside_rest_pose"),
                             "joint": j,
                             "position": pos,
                             "rest": r,
                         }))),
-                        _ => None,
+                        _ => reason
+                            .as_deref()
+                            .map(|r| Box::new(serde_json::json!({ "reason": r }))),
                     },
                     workspace_violation: None,
                     current_revision: None,

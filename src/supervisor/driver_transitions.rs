@@ -1111,12 +1111,23 @@ impl SupervisorInner {
         Ok(self.safety.state().clone())
     }
 
-    pub(crate) fn torque_off_no_state_clone(&mut self) -> Result<(), SafetyError> {
+    pub(crate) fn torque_off_rt_immediate(&mut self) -> Result<(), &'static str> {
         if self.torque_transition.is_some() {
-            return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into()));
+            return Err("TRANSITION_BUSY");
         }
-        self.gravity_comp_servo_busy()?;
-        self.torque_off_in_place(false)
+        self.gravity_comp_servo_busy()
+            .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))?;
+        self.torque_off_check_rt()?;
+        self.stop_motion();
+        self.commanded_velocities.fill(0.0);
+        if let Err(error) = self.request_disable() {
+            if !self.safety.state().is_stopped() {
+                self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
+            }
+            return Err(crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(error)));
+        }
+        self.torque_off_finish_in_place()
+            .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))
     }
 
     fn torque_off_in_place(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
@@ -1132,11 +1143,24 @@ impl SupervisorInner {
         self.torque_off_finish_in_place()
     }
 
-    /// The refusals of a torque off: E-stop / fault (rest-pose gated), not at the resting pose.
-    fn torque_off_check(&self, stillness_verified: bool) -> Result<(), SafetyError> {
+    /// Zero-allocation stopped torque-off gate for the RT executor (evaluates
+    /// [`Self::may_disable_torque_while_stopped`] once); non-stopped paths fall through to
+    /// [`Self::torque_off_check`].
+    fn torque_off_check_rt(&mut self) -> Result<(), &'static str> {
         if self.safety.state().is_stopped() || self.estop_pending() {
             return self
-                .may_disable_torque_while_stopped()
+                .eval_stopped_torque_off()
+                .map_err(|_| "TORQUE_OFF_WOULD_DROP");
+        }
+        self.torque_off_check(false)
+            .map_err(|e| crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(e)))
+    }
+
+    /// The refusals of a torque off: E-stop / fault (rest-pose gated), not at the resting pose.
+    fn torque_off_check(&mut self, stillness_verified: bool) -> Result<(), SafetyError> {
+        if self.safety.state().is_stopped() || self.estop_pending() {
+            return self
+                .eval_stopped_torque_off()
                 .map_err(|r| r.into_safety_error(&self.config.joint_names));
         }
 
@@ -1172,16 +1196,17 @@ impl SupervisorInner {
     /// `set_torque(enable)`), the commit is refused with the code. Ok: started; its progress,
     /// or its failure code once a step failed (the failure is applied as `set_torque` applies
     /// it: fault `ENABLE_FAILED` / `DRIVER_WRITE_FAILED`). Without a driver it completes now.
-    pub(crate) fn begin_torque_transition(&mut self, enable: bool) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, SafetyError> {
-        use crate::rt_core::ops::TorqueProgress as Rt;
-        if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
-        self.gravity_comp_servo_busy()?;
+    pub(crate) fn begin_torque_transition(&mut self, enable: bool) -> Result<Result<crate::rt_core::ops::TorqueProgress, &'static str>, &'static str> {
+        use crate::rt_core::ops::{static_code, TorqueProgress as Rt};
+        let to_code = |e: SafetyError| static_code(crate::supervisor::ArmError::Safety(e));
+        if self.torque_transition.is_some() { return Err("TRANSITION_BUSY"); }
+        self.gravity_comp_servo_busy().map_err(to_code)?;
         if enable {
-            let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false)?;
+            let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false).map_err(to_code)?;
             let started = match self.driver.as_ref() {
                 None => None,
                 Some(d) => {
-                    let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                    let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
                     let drv_now = drv.clock_now();
                     Some((drv.begin_torque_budgeted(true, 0), drv_now))
                 }
@@ -1204,19 +1229,19 @@ impl SupervisorInner {
                     });
                     self.is_torqued = was_torqued || still_enabled;
                     self.pending_rearm = true;
-                    return Err(SafetyError::EStopActive);
+                    return Err("ESTOP_ACTIVE");
                 }
                 Some((r, _)) => self.enable_step_failed(was_torqued, r),
             })
         } else {
-            self.torque_off_check(false)?;
+            self.torque_off_check_rt()?;
             self.stop_motion();
             self.commanded_velocities.fill(0.0);
             self.disable_requested();
             let started = match self.driver.as_ref() {
                 None => None,
                 Some(d) => {
-                    let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+                    let mut drv = d.lock().map_err(|_| "FEEDBACK_UNAVAILABLE")?;
                     let drv_now = drv.clock_now();
                     Some((drv.begin_torque_budgeted(false, 0), drv_now))
                 }
@@ -1253,10 +1278,11 @@ impl SupervisorInner {
     /// A disable step failed: `disable_pending` stays set and `DRIVER_WRITE_FAILED` latches
     /// (as in `torque_off`).
     fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
-        let message = format!("Torque disable transmission failed: {e}");
+        let already_stopped = self.safety.state().is_stopped();
+        let message = (!already_stopped).then(|| format!("Torque disable transmission failed: {e}"));
         let code = crate::driver::handshake::rt_progress(false, Err(e)).err().unwrap_or("HARDWARE_FAULT");
-        if !self.safety.state().is_stopped() {
-            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(message));
+        if let Some(msg) = message {
+            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(msg));
         }
         code
     }
