@@ -6,13 +6,13 @@
 //! 1 LSB = 20 / 4095 = 0.00488 rad/s) and the torque plus noise. Zero velocity has no
 //! exact code: raw 2047 / 2048 decode to -/+ 0.5 LSB, raw 2046 / 2049 to -/+ 1.5 LSB.
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget};
 use armd::model::{ArmConfig, DamiaoRange};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::safety::FaultReason;
-use armd::transport::{CanFrame, MockCanTransport};
+use armd::transport::{CanFrame, MockCanTransport, MockClock};
 use armd::{ArmSupervisor, SafetyState};
 
 const DT: f64 = 0.02;
@@ -47,17 +47,31 @@ struct Shared(Arc<Mutex<DamiaoArmDriver<MockCanTransport>>>);
 impl ArmDriver for Shared {
     fn capabilities(&self) -> DriverCapabilities { self.0.lock().unwrap().capabilities() }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enable_state() }
+    fn has_known_partial_enable(&self) -> bool { self.0.lock().unwrap().has_known_partial_enable() }
+    fn has_any_joint_enabled(&self) -> bool { self.0.lock().unwrap().has_any_joint_enabled() }
+    fn unconfirmed_disable_joints(&self) -> Vec<usize> { self.0.lock().unwrap().unconfirmed_disable_joints() }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { self.0.lock().unwrap().feedback_ages() }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.0.lock().unwrap().feedback_ages_into(out) }
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.0.lock().unwrap().feedback_all_within(dof, max_age) }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.0.lock().unwrap().feedback_age_ms_into(out) }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.0.lock().unwrap().feedback_instants_into(out) }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.0.lock().unwrap().feedback_receive_instants_into(out) }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { self.0.lock().unwrap().feedback_seqs_into(out) }
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { self.0.lock().unwrap().feedback_queue_bounds_into(out) }
     fn max_command_velocity(&self, j: usize) -> Option<f32> { self.0.lock().unwrap().max_command_velocity(j) }
     fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, ArmDriverError> { self.0.lock().unwrap().read_joint_states() }
+    fn read_joint_states_into(&mut self, out: &mut Vec<armd::model::JointState>) -> Result<(), ArmDriverError> { self.0.lock().unwrap().read_joint_states_into(out) }
     fn write_joint_targets(&mut self, t: &[JointTarget]) -> Result<(), ArmDriverError> { self.0.lock().unwrap().write_joint_targets(t) }
     fn set_torque(&mut self, e: bool) -> Result<(), ArmDriverError> { self.0.lock().unwrap().set_torque(e) }
     fn is_feedback_valid(&self) -> bool { self.0.lock().unwrap().is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.0.lock().unwrap().check_hardware_status() }
     fn is_enabled(&self) -> bool { self.0.lock().unwrap().is_enabled() }
     fn motor_status(&self) -> Option<Vec<u8>> { self.0.lock().unwrap().motor_status() }
+    fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { self.0.lock().unwrap().motor_status_into(out) }
     fn set_torque_flag(&mut self, e: bool) { self.0.lock().unwrap().set_torque_flag(e) }
     fn set_pending_rearm(&mut self, p: bool) { self.0.lock().unwrap().set_pending_rearm(p) }
+    fn clock_now(&self) -> Instant { self.0.lock().unwrap().clock_now() }
+    fn clock_pause(&self, d: Duration) { self.0.lock().unwrap().clock_pause(d) }
 }
 
 /// Feedback noise: Gaussian sigma in LSB, clipped to +/- `clip` LSB.
@@ -67,6 +81,7 @@ struct Noise { vel_sigma_lsb: f64, vel_clip_lsb: f64, torque_sigma_lsb: f64 }
 struct Rig {
     sup: ArmSupervisor,
     drv: Arc<Mutex<DamiaoArmDriver<MockCanTransport>>>,
+    clock: MockClock,
     lim: Vec<DamiaoLimits>,
     q: Vec<f64>,
     /// Plant lag time constant (s); Damiao POS_VEL trails by about v / 2.2 rad.
@@ -86,8 +101,12 @@ impl Rig {
         let mut config = ArmConfig::rebot_dm();
         config.lease_timeout_ms = 50;
         let lim = limits();
-        let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), (1..=7).collect())
-            .with_joint_limits(lim.clone()).unwrap();
+        let clock = MockClock::new();
+        let mut driver = DamiaoArmDriver::new(
+            MockCanTransport::new().with_clock(clock.clone()),
+            (1..=7).collect(),
+        )
+        .with_joint_limits(lim.clone()).unwrap();
         for id in 1..=7u8 {
             let l = &lim[id as usize - 1];
             let p = damiao::float_to_uint(start[id as usize - 1], l.p_min, l.p_max, 16);
@@ -106,13 +125,22 @@ impl Rig {
             inner.measured_positions = start.to_vec();
         }
         sup.set_torque(true).await.unwrap();
-        Self { sup, drv, lim, q: start.iter().map(|&p| p as f64).collect(), tau: 0.15, blocked: None,
+        Self { sup, drv, clock, lim, q: start.iter().map(|&p| p as f64).collect(), tau: 0.15, blocked: None,
             load: vec![0.0; 7], drift: vec![0.0; 7], noise, rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1) }
     }
 
-    /// Advance the plant one tick toward the commanded positions, feed one frame per
-    /// motor and tick the supervisor.
+    /// Deterministically expire the lease watchdog without sleeping on the host scheduler.
+    async fn expire_lease_watchdog(&mut self) {
+        self.sup.set_lease_enabled(true).await;
+        let mut inner = self.sup.inner().write().await;
+        let past = inner.lease_timeout + Duration::from_millis(30);
+        inner.last_heartbeat = Instant::now() - past;
+    }
+
+    /// Advance the virtual clock and plant one tick toward the commanded positions, feed one
+    /// frame per motor and tick the supervisor.
     async fn tick(&mut self) -> armd::ArmObservation {
+        self.clock.advance(Duration::from_secs_f64(DT));
         let cmd = self.sup.inner().read().await.commanded_positions.clone();
         let enabled = self.drv.lock().unwrap().is_enabled();
         let mut frames = Vec::new();
@@ -222,8 +250,7 @@ async fn link_loss_during_jog_parks_to_idle_with_noise() {
         assert!(inner.active_trajectory.is_some());
         assert!(inner.commanded_velocities[2].abs() > 0.2, "mid-jog: {:?}", inner.commanded_velocities);
     }
-    rig.sup.set_lease_enabled(true).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    rig.expire_lease_watchdog().await;
     let obs = rig.tick().await;
     assert!(!obs.safety_state.is_stopped(), "{:?}", obs.safety_state);
     assert!(rig.sup.inner().read().await.watchdog_park.is_some());
@@ -247,8 +274,7 @@ async fn blocked_arm_still_faults_with_torque_held() {
     start[2] = -0.6;
     let mut rig = Rig::new(&start, noise(1.0), 3).await;
     rig.blocked = Some((2, -0.3));
-    rig.sup.set_lease_enabled(true).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    rig.expire_lease_watchdog().await;
     rig.tick().await;
     assert!(rig.sup.inner().read().await.pending_normal_unload);
     let mut t = 0.0;
@@ -322,8 +348,7 @@ async fn watchdog_park_at_pose_but_never_still_faults_after_grace() {
     let home = ArmConfig::rebot_dm().home_positions;
     let shaky = Noise { vel_sigma_lsb: 8.0, vel_clip_lsb: 8.0, torque_sigma_lsb: 2.0 };
     let mut rig = Rig::new(&home, shaky, 13).await;
-    rig.sup.set_lease_enabled(true).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    rig.expire_lease_watchdog().await;
     rig.tick().await;
     let budget = rig.sup.inner().read().await.watchdog_park.as_ref().unwrap().budget_s;
     assert_eq!(budget, WATCHDOG_PARK_TIMEOUT.as_secs_f64(), "short park keeps the floor");
@@ -352,8 +377,7 @@ async fn watchdog_budget_mid_jog_covers_deceleration_travel_and_settle() {
     let mut rig = Rig::new(&home, noise(1.0), 17).await;
     rig.sup.jog(INSPECT.to_vec(), None, None).await.unwrap();
     for _ in 0..150 { rig.tick().await; }
-    rig.sup.set_lease_enabled(true).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    rig.expire_lease_watchdog().await;
     rig.tick().await;
     let inner = rig.sup.inner().read().await;
     let planned = inner.unload_planned_duration.unwrap();
