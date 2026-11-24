@@ -14,7 +14,7 @@ mod common;
 static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,20 +26,30 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use armd::api::create_router;
 use armd::auth::{OperatorAuth, OperatorGrant, UnlockError, MAX_OPERATOR_SESSIONS};
+use armd::driver::{
+    ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget, TorqueOutcome,
+    TorqueProgress as DrvTorqueProgress,
+};
+use armd::model::JointState;
 use armd::rt_core::broker::{
-    AdmitError, Authority, Capacities, ClientId, Descriptor, ImmediateOp, Stamp, Submit,
+    AdmitError, Authority, BootId, Capacities, ClientId, Descriptor, ImmediateOp, Outcome, Reply,
+    Stamp, Submit, TransitionOp,
 };
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks, RtExecutorHandle};
 use armd::rt_core::mailbox::TargetFrame;
-use armd::rt_core::ops::{CommitCtx, ReleaseEngine};
+use armd::rt_core::ops::{
+    CommitCtx, CoreOps, ReleaseEngine, ReleaseFixture, ServiceBudget, VirtualClock,
+};
 use armd::rt_core::requests::lease::{
-    apply_conn_lifecycle, commit_lease_descriptor, install_broker_heartbeat, install_lease_acquire,
+    apply_conn_lifecycle, commit_lease_descriptor, conn_lifecycle_channel,
+    install_broker_heartbeat, install_lease_acquire, install_lease_clear_fault_rt,
     install_lease_disconnect, install_lease_preempt, prepare_lease_acquire, prepare_lease_preempt,
-    ConnectionHandle, LeaseAcquire, LeaseDisconnect, LeaseInstallCtx, LeaseOutcome, LeaseRelease,
-    LeaseRequest, LifecycleCmd,
+    ConnectionHandle, LeaseAcquire, LeaseClearFaultOutcome, LeaseDisconnect, LeaseInstallCtx,
+    LeaseOutcome, LeaseRelease, LeaseRequest, LifecycleCmd,
 };
 use armd::supervisor::{MAX_LIVE_CONNECTIONS, OWNER_EXECUTOR};
-use armd::{ArmConfig, ArmSupervisor, SupervisorInner};
+use armd::transport::{DriverClock, MockClock, TransportError};
+use armd::{ArmConfig, ArmSupervisor, SafetyState, SupervisorInner};
 use common::{next_of, send, ws_reply, TestSocket};
 
 fn ensure_tracing_subscriber() {
@@ -1482,5 +1492,1459 @@ async fn l1_review_regressions_expiry_motion_stalled_estop_churn_transfer_free_a
         drop(ws_holder);
         handle.stop_and_join();
         drop(sup);
+    }
+}
+
+// ============================================================================
+// Milestone L2: TorqueOn / TorqueOff transitions, BackgroundDisableRetry,
+//               in-flight enable abort, WS clear_fault, REST lease gates,
+//               and L2 zero-alloc RT proof
+// ============================================================================
+
+struct L2DriverControl {
+    allow_enable_confirm: AtomicBool,
+    allow_disable_confirm: AtomicBool,
+    fail_enable_poll: AtomicBool,
+    /// Remaining calls to `begin_torque_budgeted(false, 0)` that return `Err(WouldBlock)`.
+    fail_disable_begin_remaining: AtomicUsize,
+    /// When true, `begin_torque_budgeted(false, 0)` returns `Done(Unconfirmed)` instead of confirming.
+    disable_always_unconfirmed: AtomicBool,
+    /// When true, starting enable leaves `enable_state()` in `Unknown` (partial enable) until a
+    /// disable attempt actually succeeds and confirms disabled.
+    partial_enable_unknown_until_disable: AtomicBool,
+    begin_enable_calls: AtomicUsize,
+    begin_disable_calls: AtomicUsize,
+    poll_enable_calls: AtomicUsize,
+    set_torque_blocking_calls: AtomicUsize,
+    abort_enable_calls: AtomicUsize,
+}
+
+impl Default for L2DriverControl {
+    fn default() -> Self {
+        Self {
+            allow_enable_confirm: AtomicBool::new(true),
+            allow_disable_confirm: AtomicBool::new(true),
+            fail_enable_poll: AtomicBool::new(false),
+            fail_disable_begin_remaining: AtomicUsize::new(0),
+            disable_always_unconfirmed: AtomicBool::new(false),
+            partial_enable_unknown_until_disable: AtomicBool::new(false),
+            begin_enable_calls: AtomicUsize::new(0),
+            begin_disable_calls: AtomicUsize::new(0),
+            poll_enable_calls: AtomicUsize::new(0),
+            set_torque_blocking_calls: AtomicUsize::new(0),
+            abort_enable_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+struct L2MockDriver {
+    dof: usize,
+    positions: Vec<f32>,
+    enabled: bool,
+    partial_unknown: bool,
+    pending: Option<bool>,
+    clock: Option<MockClock>,
+    ctrl: Arc<L2DriverControl>,
+}
+
+impl L2MockDriver {
+    fn new(cfg: &ArmConfig, clock: Option<MockClock>, ctrl: Arc<L2DriverControl>) -> Self {
+        Self {
+            dof: cfg.dof,
+            positions: cfg.resting_positions().to_vec(),
+            enabled: false,
+            partial_unknown: false,
+            pending: None,
+            clock,
+            ctrl,
+        }
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.as_ref().map_or_else(Instant::now, DriverClock::now)
+    }
+}
+
+impl ArmDriver for L2MockDriver {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            enable_feedback: true,
+            velocity_feedback: true,
+            torque_feedback: true,
+            temperature_feedback: true,
+            ..DriverCapabilities::default()
+        }
+    }
+
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        Ok(self
+            .positions
+            .iter()
+            .map(|&p| JointState {
+                position: p,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 30.0,
+            })
+            .collect())
+    }
+
+    fn read_joint_states_budgeted(
+        &mut self,
+        out: &mut Vec<JointState>,
+        _deadline: Instant,
+        _max_rx_frames: u16,
+    ) -> Result<(u16, bool), ArmDriverError> {
+        out.clear();
+        for &p in &self.positions {
+            out.push(JointState {
+                position: p,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 30.0,
+            });
+        }
+        Ok((self.dof as u16, false))
+    }
+
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        out.clear();
+        for &p in &self.positions {
+            out.push(JointState {
+                position: p,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 30.0,
+            });
+        }
+        Some(())
+    }
+
+    fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+
+    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+        self.ctrl.set_torque_blocking_calls.fetch_add(1, Ordering::SeqCst);
+        self.enabled = enable;
+        Ok(())
+    }
+
+    fn begin_torque_budgeted(
+        &mut self,
+        enable: bool,
+        _max_rx_frames: u16,
+    ) -> Result<DrvTorqueProgress, ArmDriverError> {
+        if enable {
+            self.ctrl.begin_enable_calls.fetch_add(1, Ordering::SeqCst);
+            if self.ctrl.partial_enable_unknown_until_disable.load(Ordering::SeqCst) {
+                self.partial_unknown = true;
+            }
+            self.pending = Some(true);
+            return Ok(DrvTorqueProgress::Pending {
+                wake: self.now() + Duration::from_millis(2),
+            });
+        }
+        self.ctrl.begin_disable_calls.fetch_add(1, Ordering::SeqCst);
+        self.pending = None;
+        let rem = self.ctrl.fail_disable_begin_remaining.load(Ordering::SeqCst);
+        if rem > 0 {
+            let _ = self.ctrl.fail_disable_begin_remaining.compare_exchange(
+                rem,
+                rem - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            return Err(ArmDriverError::Transport(TransportError::WouldBlock));
+        }
+        if self.ctrl.disable_always_unconfirmed.load(Ordering::SeqCst) {
+            return Ok(DrvTorqueProgress::Done(TorqueOutcome::Unconfirmed));
+        }
+        if self.ctrl.allow_disable_confirm.load(Ordering::SeqCst) {
+            self.enabled = false;
+            self.partial_unknown = false;
+            return Ok(DrvTorqueProgress::Done(TorqueOutcome::Confirmed));
+        }
+        self.pending = Some(false);
+        Ok(DrvTorqueProgress::Pending {
+            wake: self.now() + Duration::from_millis(2),
+        })
+    }
+
+    fn poll_torque_budgeted(
+        &mut self,
+        _deadline: Instant,
+        _max_rx_frames: u16,
+    ) -> Result<DrvTorqueProgress, ArmDriverError> {
+        match self.pending {
+            Some(true) => {
+                self.ctrl.poll_enable_calls.fetch_add(1, Ordering::SeqCst);
+                if self.ctrl.fail_enable_poll.load(Ordering::SeqCst) {
+                    self.pending = None;
+                    return Err(ArmDriverError::Timeout(1));
+                }
+                if self.ctrl.allow_enable_confirm.load(Ordering::SeqCst) {
+                    self.pending = None;
+                    self.enabled = true;
+                    return Ok(DrvTorqueProgress::Done(TorqueOutcome::Confirmed));
+                }
+                Ok(DrvTorqueProgress::Pending {
+                    wake: self.now() + Duration::from_millis(5),
+                })
+            }
+            Some(false) => {
+                if self.ctrl.allow_disable_confirm.load(Ordering::SeqCst) {
+                    self.pending = None;
+                    self.enabled = false;
+                    self.partial_unknown = false;
+                    return Ok(DrvTorqueProgress::Done(TorqueOutcome::Confirmed));
+                }
+                Ok(DrvTorqueProgress::Pending {
+                    wake: self.now() + Duration::from_millis(5),
+                })
+            }
+            None => Err(ArmDriverError::Timeout(0)),
+        }
+    }
+
+    fn abort_enable(&mut self) {
+        if self.pending == Some(true) {
+            self.pending = None;
+            self.ctrl.abort_enable_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn torque_transition_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn clock_now(&self) -> Instant {
+        self.now()
+    }
+
+    fn supports_rt_executor(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    fn is_feedback_valid(&self) -> bool {
+        true
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn enable_state(&self) -> EnableState {
+        if self.partial_unknown {
+            EnableState::Unknown
+        } else if self.enabled {
+            EnableState::Enabled
+        } else {
+            EnableState::Disabled
+        }
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        dof == self.dof && Duration::from_millis(1) <= max_age
+    }
+
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        vec![Some(Duration::from_millis(1)); self.dof]
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        for _ in 0..self.dof {
+            out.push(Some(Duration::from_millis(1)));
+        }
+    }
+
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        out.clear();
+        for _ in 0..self.dof {
+            out.push(Some(1));
+        }
+    }
+
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        vec![Some(self.now()); self.dof]
+    }
+
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        let t = self.now();
+        out.clear();
+        for _ in 0..self.dof {
+            out.push(Some(t));
+        }
+    }
+
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        let t = self.now();
+        out.clear();
+        for _ in 0..self.dof {
+            out.push(Some(t));
+        }
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        vec![1; self.dof]
+    }
+
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        for _ in 0..self.dof {
+            out.push(1);
+        }
+    }
+}
+
+// ============================================================================
+// 9. L2: WS /api/v1/torque & /api/v1/arm across BOTH owners + delayed hardware confirm
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_torque_arm_and_delayed_hardware_confirmation_both_owners() {
+    ensure_tracing_subscriber();
+
+    // (a) Driverless mock: parity across legacy and executor owners.
+    for executor_mode in [false, true] {
+        let (sup, addr, handle) = setup_mode(
+            ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            },
+            OperatorAuth::disabled(),
+            executor_mode,
+        )
+        .await;
+
+        let mut ws = connect_ws(addr, "").await;
+        let g = ws_reply(
+            &mut ws,
+            json!({"type": "acquire_lease", "client_id": "torque_ctrl", "seq": 1}),
+            &["lease_granted"],
+        )
+        .await["generation"]
+            .as_u64()
+            .unwrap();
+        let ep = sup.observation().await.unwrap().epoch_id;
+
+        for (i, (path, enable, want_torqued, want_state)) in [
+            ("/api/v1/torque", true, true, "Armed"),
+            ("/api/v1/torque", false, false, "Idle"),
+            ("/api/v1/arm", true, true, "Armed"),
+            ("/api/v1/arm", false, false, "Idle"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let req_id = (i + 1) as u64;
+            let ack = ws_reply(
+                &mut ws,
+                json!({"type": "command", "request_id": req_id, "generation": g, "epoch_id": ep, "path": path, "body": {"enable": enable}}),
+                &["command_ack", "command_reject"],
+            )
+            .await;
+            assert_eq!(ack["type"], "command_ack", "mode={executor_mode} ack={ack}");
+            assert_eq!(ack["status"], "accepted");
+            assert_eq!(ack["request_id"], req_id);
+            assert_eq!(ack["epoch_id"], ep);
+            assert_eq!(ack["is_torqued"], want_torqued);
+            assert_eq!(ack["safety_state"], want_state);
+            assert_eq!(ack["control_mode"], "position");
+        }
+
+        // Wrong epoch does NOT consume request_id=10.
+        let bad_ep = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 10, "generation": g, "epoch_id": ep + 99, "path": "/api/v1/torque", "body": {"enable": true}}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!((bad_ep["status"].as_u64(), bad_ep["code"].as_str()), (Some(409), Some("EPOCH_MISMATCH")));
+
+        // Wrong generation does NOT consume request_id=10.
+        let bad_gen = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 10, "generation": g + 7, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!((bad_gen["status"].as_u64(), bad_gen["code"].as_str()), (Some(409), Some("LEASE_LOST")));
+
+        // Same request_id=10 now succeeds with valid epoch & generation.
+        let ok10 = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 10, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+            &["command_ack"],
+        )
+        .await;
+        assert_eq!(ok10["is_torqued"], true);
+
+        // Duplicate request_id=10 fails with 400 INVALID_COMMAND (no epoch_id).
+        let dup10 = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 10, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": false}}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!((dup10["status"].as_u64(), dup10["code"].as_str()), (Some(400), Some("INVALID_COMMAND")));
+        assert!(dup10.get("epoch_id").is_none(), "duplicate request_id must omit epoch_id: {dup10}");
+
+        // Non-boolean enable and non-object body.
+        let bad_en = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 11, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": "nope"}}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!((bad_en["status"].as_u64(), bad_en["code"].as_str(), bad_en["message"].as_str()), (Some(400), Some("INVALID_COMMAND"), Some("enable must be boolean")));
+
+        let bad_body = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 12, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": 42}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!((bad_body["status"].as_u64(), bad_body["code"].as_str(), bad_body["message"].as_str()), (Some(400), Some("INVALID_COMMAND"), Some("Command body must be an object")));
+
+        drop(ws);
+        if let Some(h) = handle {
+            h.stop_and_join();
+        }
+    }
+
+    // (b) Executor mode with delayed hardware confirmation: WS `command_ack` MUST wait for
+    //     confirmed `Outcome::Completed` terminal (NEVER sent on early Step 3 `Ack`).
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        ctrl.allow_disable_confirm.store(false, Ordering::SeqCst);
+        let drv = L2MockDriver::new(&cfg, None, ctrl.clone());
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+        let addr = serve_with_auth(sup.clone(), OperatorAuth::disabled()).await;
+        let handle = sup
+            .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        wait_until(Duration::from_secs(2), || sup.hub().latest().is_some()).await;
+
+        let mut ws = connect_ws(addr, "").await;
+        let g = ws_reply(
+            &mut ws,
+            json!({"type": "acquire_lease", "client_id": "hw_ctrl", "seq": 1}),
+            &["lease_granted"],
+        )
+        .await["generation"]
+            .as_u64()
+            .unwrap();
+        let ep = sup.observation().await.unwrap().epoch_id;
+
+        // Send TorqueOn while driver holds confirmation pending.
+        send(
+            &mut ws,
+            json!({"type": "command", "request_id": 1, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+        )
+        .await;
+        wait_until(Duration::from_secs(2), || {
+            ctrl.begin_enable_calls.load(Ordering::SeqCst) >= 1
+                && ctrl.poll_enable_calls.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        assert!(
+            next_non_telemetry_within(&mut ws, Duration::from_millis(50))
+                .await
+                .is_none(),
+            "WS command_ack must NOT arrive before hardware confirms TorqueOn"
+        );
+        assert!(
+            !sup.observation().await.unwrap().is_torqued,
+            "StateHub must not report is_torqued before hardware confirmation"
+        );
+
+        // Release hardware confirmation -> command_ack arrives with is_torqued=true, Armed.
+        ctrl.allow_enable_confirm.store(true, Ordering::SeqCst);
+        let ack_on = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+        assert_eq!(ack_on["type"], "command_ack", "{ack_on}");
+        assert_eq!(ack_on["is_torqued"], true);
+        assert_eq!(ack_on["safety_state"], "Armed");
+
+        // Send TorqueOff while driver holds disable confirmation pending.
+        send(
+            &mut ws,
+            json!({"type": "command", "request_id": 2, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": false}}),
+        )
+        .await;
+        wait_until(Duration::from_secs(2), || {
+            ctrl.begin_disable_calls.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        assert!(
+            next_non_telemetry_within(&mut ws, Duration::from_millis(50))
+                .await
+                .is_none(),
+            "WS command_ack must NOT arrive before hardware confirms TorqueOff"
+        );
+
+        ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
+        let ack_off = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+        assert_eq!(ack_off["type"], "command_ack", "{ack_off}");
+        assert_eq!(ack_off["is_torqued"], false);
+        assert_eq!(ack_off["safety_state"], "Idle");
+
+        // Failed enable poll -> command_reject (ENABLE_FAILED) + fault latched + disable cleanup.
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
+        let before_dis = ctrl.begin_disable_calls.load(Ordering::SeqCst);
+        let rej = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 3, "generation": g, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}),
+            &["command_ack", "command_reject"],
+        )
+        .await;
+        assert_eq!(rej["type"], "command_reject", "{rej}");
+        assert_eq!(rej["code"], "ENABLE_FAILED", "{rej}");
+        assert!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst) > before_dis,
+            "failed enable on previously un-torqued arm must invoke single disable choke point"
+        );
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
+
+        drop(ws);
+        handle.stop_and_join();
+    }
+}
+
+// ============================================================================
+// 10. L2: In-flight TorqueTransition::Enable abort on preempt, disconnect, expiry
+// ============================================================================
+
+#[test]
+fn in_flight_torque_enable_abort_on_preempt_disconnect_and_expiry() {
+    ensure_tracing_subscriber();
+
+    // (a) Preemption during in-flight TorqueOn aborts enable, runs single disable choke point,
+    //     and delivers Terminal(Failed("LEASE_LOST")) strictly AFTER Step 6 publish and
+    //     strictly BEFORE the replacement LeaseOutcome::Granted!
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.operator_auth_enforced = false;
+        inner.prewarm_rt_buffers();
+        let c1 = ConnectionHandle::from_ws_id(1).unwrap();
+        let c2 = ConnectionHandle::from_ws_id(2).unwrap();
+        inner.register_live_connection(1).unwrap();
+        inner.register_live_connection(2).unwrap();
+
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(21),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(mclock.clone()),
+        );
+        let now = fx.now();
+        let dl = now + Duration::from_secs(5);
+        let a0 = fx.core.authority(&fx.ctx(now));
+        b.submit(
+            ClientId(1),
+            1,
+            a0,
+            dl,
+            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
+                connection: c1,
+                label: armd::model::HolderLabel::new("holder"),
+                has_label: true,
+            })),
+        )
+        .unwrap();
+        let _ = fx.step();
+        let mut g1 = 0;
+        b.poll(|_, r| {
+            if let Reply::Lease { outcome: LeaseOutcome::Granted { generation, .. }, .. } = r {
+                g1 = generation;
+            }
+            true
+        });
+        assert!(g1 >= 1);
+
+        // Start in-flight TorqueOn on c1.
+        let a1 = fx.core.authority(&fx.ctx(fx.now()));
+        let req_en = b
+            .submit(
+                ClientId(1),
+                2,
+                a1,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        let r_en = fx.step();
+        assert!(r_en.command.unwrap().1.is_ok());
+        assert!(fx.transition().is_some());
+        b.poll(|_, _| true); // drain Ack
+
+        // Preempt from c2 while TorqueOn is still pending!
+        let a2 = fx.core.authority(&fx.ctx(fx.now()));
+        let req_pre = b
+            .submit(
+                ClientId(2),
+                1,
+                a2,
+                fx.now() + Duration::from_secs(5),
+                Submit::Lease(LeaseRequest::Preempt(armd::rt_core::requests::lease::LeasePreempt {
+                    connection: c2,
+                    label: armd::model::HolderLabel::new("preemptor"),
+                    operator: OperatorGrant::unenforced(),
+                })),
+            )
+            .unwrap();
+        let r_pre = fx.step();
+        assert_eq!(
+            r_pre.transition_ended.map(|(_, o)| o),
+            Some(Outcome::Failed("LEASE_LOST"))
+        );
+        assert!(ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1);
+        assert!(ctrl.begin_disable_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
+
+        // Exact Step 7 ordering: aborted enable Terminal MUST arrive BEFORE replacement Grant!
+        let mut replies = Vec::new();
+        b.poll(|_, r| {
+            replies.push(r);
+            true
+        });
+        let term_pos = replies
+            .iter()
+            .position(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Failed("LEASE_LOST"), .. } if *request == req_en))
+            .expect("aborted enable terminal must be emitted");
+        let grant_pos = replies
+            .iter()
+            .position(|r| matches!(r, Reply::Lease { request, outcome: LeaseOutcome::Granted { .. }, .. } if *request == req_pre))
+            .expect("preempt lease grant must be emitted");
+        assert!(
+            term_pos < grant_pos,
+            "aborted enable Terminal (idx {term_pos}) must precede replacement Grant (idx {grant_pos}): {replies:?}"
+        );
+        let pub_snap = fx.core.core.hub().latest().unwrap();
+        assert!(!pub_snap.owner.torque_transition_pending);
+        assert!(pub_snap.owner.lease_generation > g1);
+    }
+
+    // (b) Disconnect during in-flight TorqueOn (via priority ConnLifecycleIntake) aborts enable,
+    //     calls single disable choke point, and emits Terminal(Failed("DISCONNECTED")).
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.prewarm_rt_buffers();
+        let c1 = ConnectionHandle::from_ws_id(1).unwrap();
+
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(22),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(mclock.clone()),
+        );
+        let exited = Arc::new(AtomicBool::new(false));
+        let (lc_client, lc_intake) = conn_lifecycle_channel(exited);
+        fx.attach_conn_lifecycle(lc_intake);
+
+        let lc_ref = Arc::new(lc_client);
+        let lc_open = lc_ref.clone();
+        let open_th = std::thread::spawn(move || lc_open.open_sync(1));
+        for _ in 0..5 {
+            let _ = fx.step();
+            lc_ref.drain_replies();
+            if open_th.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(open_th.join().unwrap(), Ok(Ok(())));
+
+        let a0 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            a0,
+            fx.now() + Duration::from_secs(5),
+            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
+                connection: c1,
+                label: armd::model::HolderLabel::new("disc_holder"),
+                has_label: true,
+            })),
+        )
+        .unwrap();
+        let _ = fx.step();
+        b.poll(|_, _| true);
+
+        let a1 = fx.core.authority(&fx.ctx(fx.now()));
+        let req_en = b
+            .submit(
+                ClientId(1),
+                2,
+                a1,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        b.poll(|_, _| true);
+
+        let lc_disc = lc_ref.clone();
+        let disc_th = std::thread::spawn(move || lc_disc.disconnect_sync(c1));
+        let mut ended_outcome = None;
+        for _ in 0..5 {
+            let rep = fx.step();
+            lc_ref.drain_replies();
+            if let Some((_, o)) = rep.transition_ended {
+                ended_outcome = Some(o);
+            }
+            if disc_th.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let disc_res = disc_th.join().unwrap().unwrap();
+        assert!(matches!(disc_res, LeaseOutcome::Disconnected { released: true, .. }));
+        assert_eq!(ended_outcome, Some(Outcome::Failed("DISCONNECTED")));
+        assert!(ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1);
+        assert!(ctrl.begin_disable_calls.load(Ordering::SeqCst) >= 1);
+
+        let mut replies = Vec::new();
+        b.poll(|_, r| {
+            replies.push(r);
+            true
+        });
+        assert!(
+            replies.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Failed("DISCONNECTED"), .. } if *request == req_en)),
+            "expected DISCONNECTED terminal: {replies:?}"
+        );
+    }
+
+    // (c) Lease expiry during in-flight TorqueOn aborts BEFORE any retry TX with LEASE_LOST.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 80,
+            ..ArmConfig::rebot_dm()
+        };
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.prewarm_rt_buffers();
+        let c1 = ConnectionHandle::from_ws_id(1).unwrap();
+        inner.register_live_connection(1).unwrap();
+
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(23),
+            Capacities { commands: 8, plans: 1, replies: 16 },
+            VirtualClock::from_mock_clock(mclock.clone()),
+        );
+        let a0 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            a0,
+            fx.now() + Duration::from_secs(5),
+            Submit::Lease(LeaseRequest::Acquire(LeaseAcquire {
+                connection: c1,
+                label: armd::model::HolderLabel::new("exp_holder"),
+                has_label: true,
+            })),
+        )
+        .unwrap();
+        let _ = fx.step();
+        b.poll(|_, _| true);
+
+        let a1 = fx.core.authority(&fx.ctx(fx.now()));
+        let req_en = b
+            .submit(
+                ClientId(1),
+                2,
+                a1,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        b.poll(|_, _| true);
+
+        let polls_before = ctrl.poll_enable_calls.load(Ordering::SeqCst);
+        // Advance virtual clock past lease_timeout (80ms) before the next release!
+        mclock.advance(Duration::from_millis(100));
+        let rep = fx.step();
+        assert_eq!(rep.transition_ended.map(|(_, o)| o), Some(Outcome::Failed("LEASE_LOST")));
+        assert_eq!(
+            ctrl.poll_enable_calls.load(Ordering::SeqCst),
+            polls_before,
+            "expired enable must abort BEFORE calling poll_torque_budgeted"
+        );
+        assert!(ctrl.abort_enable_calls.load(Ordering::SeqCst) >= 1);
+        let mut replies = Vec::new();
+        b.poll(|_, r| {
+            replies.push(r);
+            true
+        });
+        assert!(
+            replies.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Failed("LEASE_LOST"), .. } if *request == req_en)),
+            "expected LEASE_LOST terminal on expiry: {replies:?}"
+        );
+    }
+}
+
+// ============================================================================
+// 11. L2: BackgroundDisableRetry (bounded via single choke point, recovery + fault)
+// ============================================================================
+
+#[test]
+fn background_disable_retry_bounded_choke_point_recovery_and_fault_exhaustion() {
+    ensure_tracing_subscriber();
+
+    // (a) Transient CAN TX failure on disable cleanup recovers on retry 4 via single choke point.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
+        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
+        ctrl.fail_disable_begin_remaining.store(3, Ordering::SeqCst);
+        ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
+
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.lease_enabled = false;
+        inner.prewarm_rt_buffers();
+
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(31),
+            Capacities { commands: 4, plans: 1, replies: 8 },
+            VirtualClock::from_mock_clock(mclock.clone()),
+        );
+        let a0 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            a0,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+        let _ = fx.step(); // commits enable
+        let r_fail = fx.step(); // poll fails -> enable_step_failed -> initial disable fails (1/3) -> arms retry
+        assert_eq!(r_fail.transition_ended.map(|(_, o)| o), Some(Outcome::Failed("ENABLE_FAILED")));
+        assert!(fx.core.disable_pending);
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 1);
+
+        // Step releases (20ms each): retries at >=25ms spacing until call 4 succeeds and confirms.
+        for _ in 0..12 {
+            let _ = fx.step();
+            if !fx.core.disable_pending {
+                break;
+            }
+        }
+        assert!(!fx.core.disable_pending, "background disable must confirm once bus recovers");
+        assert!(!fx.core.is_torqued);
+        assert_eq!(ctrl.begin_disable_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // (b) Persistent disable failure exhausts bounded retry cap, latches DisableUnconfirmed,
+    //     and stops spamming the bus on subsequent releases.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
+        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
+        ctrl.fail_disable_begin_remaining.store(100, Ordering::SeqCst);
+
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        inner.rt_executor_owned = true;
+        inner.lease_enabled = false;
+        inner.prewarm_rt_buffers();
+
+        let (mut fx, mut b, _tw, _st) = ReleaseFixture::new_with_clock(
+            inner,
+            BootId(32),
+            Capacities { commands: 4, plans: 1, replies: 8 },
+            VirtualClock::from_mock_clock(mclock.clone()),
+        );
+        let a0 = fx.core.authority(&fx.ctx(fx.now()));
+        b.submit(
+            ClientId(1),
+            1,
+            a0,
+            fx.now() + Duration::from_secs(5),
+            Submit::Transition(TransitionOp::TorqueOn),
+        )
+        .unwrap();
+        let _ = fx.step();
+        let _ = fx.step(); // fails enable, starts retry
+
+        for _ in 0..30 {
+            let _ = fx.step();
+        }
+        let calls_after_exhaust = ctrl.begin_disable_calls.load(Ordering::SeqCst);
+        assert!(
+            (2..=9).contains(&calls_after_exhaust),
+            "expected bounded retries (1 initial + <= 8 retries), got {calls_after_exhaust}"
+        );
+        assert!(fx.core.disable_pending, "disable_pending must remain true until confirmed");
+        assert!(
+            matches!(fx.core.safety.state(), SafetyState::Fault(r) if format!("{r:?}").contains("DisableUnconfirmed") || fx.core.safety.has_latched_fault()),
+            "exhaustion must latch fault: {:?}",
+            fx.core.safety.state()
+        );
+        assert_eq!(ctrl.set_torque_blocking_calls.load(Ordering::SeqCst), 0);
+
+        // Further stepping must NOT emit any additional disable retries once exhausted.
+        for _ in 0..20 {
+            let _ = fx.step();
+        }
+        assert_eq!(
+            ctrl.begin_disable_calls.load(Ordering::SeqCst),
+            calls_after_exhaust,
+            "exhausted BackgroundDisableRetry must stop issuing retries"
+        );
+    }
+}
+
+// ============================================================================
+// 12. L2: TorqueOff Stop exemption, WS clear_fault OperatorGrant live revocation,
+//         and REST /torque, /arm, /safety/clear_fault lease gates in executor mode
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_torque_off_exempt_across_stop_and_clear_fault_operator_grant_both_owners() {
+    ensure_tracing_subscriber();
+
+    for executor_mode in [false, true] {
+        let auth = OperatorAuth::enforced("246810", 1800);
+        let (sup, addr, handle) = setup_mode(
+            ArmConfig {
+                lease_timeout_ms: 5_000,
+                ..ArmConfig::rebot_dm()
+            },
+            auth,
+            executor_mode,
+        )
+        .await;
+        let http = reqwest::Client::new();
+
+        // REST /torque, /arm, /safety/clear_fault return 409 LEASE_REQUIRED with no lease.
+        for (path, body) in [
+            ("/api/v1/torque", json!({"enable": true})),
+            ("/api/v1/arm", json!({"enable": true})),
+            ("/api/v1/safety/clear_fault", json!({})),
+        ] {
+            let resp = http
+                .post(format!("http://{addr}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "mode={executor_mode} path={path}");
+            assert_eq!(resp.json::<Value>().await.unwrap()["code"], "LEASE_REQUIRED");
+        }
+
+        let mut ws = connect_ws(addr, "auth=explicit").await;
+        let g = ws_reply(
+            &mut ws,
+            json!({"type": "acquire_lease", "client_id": "op_ctrl", "seq": 1}),
+            &["lease_granted"],
+        )
+        .await["generation"]
+            .as_u64()
+            .unwrap();
+
+        // With active WS lease, REST /torque, /arm, /safety/clear_fault return 409 LEASE_ACTIVE.
+        for (path, body) in [
+            ("/api/v1/torque", json!({"enable": true})),
+            ("/api/v1/arm", json!({"enable": true})),
+            ("/api/v1/safety/clear_fault", json!({})),
+        ] {
+            let resp = http
+                .post(format!("http://{addr}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "mode={executor_mode} path={path}");
+            assert_eq!(resp.json::<Value>().await.unwrap()["code"], "LEASE_ACTIVE");
+        }
+
+        // Arm, send urgent Stop, then TorqueOff -> TorqueOff succeeds across Stop!
+        let ep0 = sup.observation().await.unwrap().epoch_id;
+        let on = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 1, "generation": g, "epoch_id": ep0, "path": "/api/v1/torque", "body": {"enable": true}}),
+            &["command_ack"],
+        )
+        .await;
+        assert_eq!(on["is_torqued"], true);
+
+        let stop_ack = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 2, "generation": g, "epoch_id": ep0, "path": "/api/v1/motion/stop", "body": {}}),
+            &["command_ack"],
+        )
+        .await;
+        assert_eq!(stop_ack["type"], "command_ack");
+
+        let off = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 3, "generation": g, "epoch_id": ep0, "path": "/api/v1/torque", "body": {"enable": false}}),
+            &["command_ack", "command_reject"],
+        )
+        .await;
+        assert_eq!(off["type"], "command_ack", "mode={executor_mode} off={off}");
+        assert_eq!(off["is_torqued"], false);
+        assert_eq!(off["safety_state"], "Idle");
+
+        // Trigger WS E-stop -> viewer clear_fault refused 403 OPERATOR_REQUIRED.
+        let estop_sync = ws_reply(&mut ws, json!({"type": "estop"}), &["epoch_sync"]).await;
+        let ep_estop = estop_sync["epoch_id"].as_u64().unwrap();
+        assert_eq!(estop_sync["safety_state"], "EStop");
+
+        let denied = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 4, "generation": g, "epoch_id": ep_estop, "path": "/api/v1/safety/clear_fault", "body": {}}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!(
+            (denied["status"].as_u64(), denied["code"].as_str(), denied["message"].as_str()),
+            (Some(403), Some("OPERATOR_REQUIRED"), Some("Operator unlock is required for clear_fault (EStop latched)")),
+            "mode={executor_mode} denied={denied}"
+        );
+
+        // Unlock via REST + WS auth -> invalid mit_recovery rejected 400, valid clear_fault succeeds!
+        let unlock_resp: Value = http
+            .post(format!("http://{addr}/api/v1/auth/unlock"))
+            .json(&json!({"pin": "246810"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = unlock_resp["token"].as_str().unwrap().to_string();
+        let auth_ack = ws_reply(
+            &mut ws,
+            json!({"type": "auth", "token": token, "seq": 1}),
+            &["auth_ack"],
+        )
+        .await;
+        assert_eq!(auth_ack["role"], "operator");
+
+        let bad_mit = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 5, "generation": g, "epoch_id": ep_estop, "path": "/api/v1/safety/clear_fault", "body": {"mit_recovery": "wrong"}}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!((bad_mit["status"].as_u64(), bad_mit["code"].as_str()), (Some(400), Some("INVALID_COMMAND")));
+
+        let cleared = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 6, "generation": g, "epoch_id": ep_estop, "path": "/api/v1/safety/clear_fault", "body": {}}),
+            &["command_ack", "command_reject"],
+        )
+        .await;
+        assert_eq!(cleared["type"], "command_ack", "mode={executor_mode} cleared={cleared}");
+        assert_eq!(cleared["safety_state"], "Idle");
+        assert!(cleared["epoch_id"].as_u64().unwrap() > ep_estop);
+
+        // Second E-stop + REST /api/v1/auth/lock revokes live OperatorGrant -> clear_fault immediately 403!
+        let estop2 = ws_reply(&mut ws, json!({"type": "estop"}), &["epoch_sync"]).await;
+        let ep_estop2 = estop2["epoch_id"].as_u64().unwrap();
+        let lock_resp = http
+            .post(format!("http://{addr}/api/v1/auth/lock"))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(lock_resp.status(), reqwest::StatusCode::OK);
+
+        let revoked = ws_reply(
+            &mut ws,
+            json!({"type": "command", "request_id": 7, "generation": g, "epoch_id": ep_estop2, "path": "/api/v1/safety/clear_fault", "body": {}}),
+            &["command_reject"],
+        )
+        .await;
+        assert_eq!(
+            (revoked["status"].as_u64(), revoked["code"].as_str()),
+            (Some(403), Some("OPERATOR_REQUIRED")),
+            "revoked OperatorGrant must fail clear_fault live: mode={executor_mode} {revoked}"
+        );
+
+        drop(ws);
+        if let Some(h) = handle {
+            h.stop_and_join();
+            // After executor exit, REST /torque, /arm, /safety/clear_fault return 503 OBSERVATION_UNAVAILABLE.
+            for (path, body) in [
+                ("/api/v1/torque", json!({"enable": true})),
+                ("/api/v1/arm", json!({"enable": true})),
+                ("/api/v1/safety/clear_fault", json!({})),
+            ] {
+                let dead = http
+                    .post(format!("http://{addr}{path}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(dead.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(dead.json::<Value>().await.unwrap()["code"], "OBSERVATION_UNAVAILABLE");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 13. L2: Zero-alloc / zero-free RT proof across torque transitions, retries,
+//         abort, and LeaseClearFault with live tracing subscriber enabled
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_alloc_rt_l2_torque_and_clear_fault_with_tracing_enabled() {
+    ensure_tracing_subscriber();
+
+    // Positive control.
+    armd::diagnostics::alloc::time_this_thread();
+    let _ = armd::diagnostics::alloc::take();
+    let probe: Vec<u8> = vec![0xCD; 256];
+    std::hint::black_box(&probe);
+    drop(probe);
+    assert!(armd::diagnostics::alloc::take().calls > 0);
+
+    // (a) Direct RT-path zero-alloc proof across TorqueOn/TorqueOff commit, refusal, failure,
+    //     abort, BackgroundDisableRetry exhaustion, and LeaseClearFault (refusal + success).
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        };
+        let auth = OperatorAuth::enforced("123456", 1800);
+        let (tok, _) = auth.unlock("123456").unwrap();
+        let grant_ok = auth.operator_grant(Some(&tok));
+        let grant_denied = OperatorGrant::DENIED;
+
+        let mclock = MockClock::new();
+        let ctrl = Arc::new(L2DriverControl::default());
+        let drv = L2MockDriver::new(&cfg, Some(mclock.clone()), ctrl.clone());
+        let mut core = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+        core.rt_executor_owned = true;
+        core.operator_auth_enforced = true;
+        core.prewarm_rt_buffers();
+        for g in 1..=4 {
+            let _ = core.tick_publish(0.005, g, false);
+            let _ = core.core.hub().latest();
+        }
+        let c1 = ConnectionHandle::from_ws_id(1).unwrap();
+        core.register_live_connection(1).unwrap();
+        let now = mclock.now();
+        let dl = now + Duration::from_secs(5);
+        let snap0 = core.core.hub().latest().unwrap().owner;
+        let arm = snap0.arm;
+        let boot = snap0.boot;
+        let p_acq = prepare_lease_acquire(&snap0, c1, "rt_l2_alloc", 1, now, dl).unwrap();
+        let g1 = match install_lease_acquire(
+            &mut core,
+            &p_acq.request,
+            &LeaseInstallCtx {
+                expected_arm: arm,
+                expected_boot: boot,
+                stamp_arm: arm,
+                stamp_boot: boot,
+                now,
+                request_id: 1,
+                client: ClientId(1),
+                deadline: dl,
+                enforce_single_use: true,
+            },
+        ) {
+            Ok(LeaseOutcome::Granted { generation, .. }) => generation,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let cctx = CommitCtx {
+            arm,
+            boot,
+            now,
+            stop_generation: 0,
+        };
+        let ws_rev = core.workspace_revision;
+        let mk_tr = |req_id: u64, op: TransitionOp, ep: u64| Descriptor {
+            stamp: Stamp {
+                arm,
+                boot,
+                request: armd::rt_core::broker::RequestId(req_id),
+                client: ClientId(1),
+                client_seq: req_id,
+                authority: Authority {
+                    lease_generation: g1,
+                    epoch: ep,
+                    stop_generation: 0,
+                    config_revision: ws_rev,
+                    parent_generation: 0,
+                },
+                deadline: now + Duration::from_secs(60),
+            },
+            kind: armd::rt_core::broker::CommandKind::Transition(op),
+        };
+
+        let _ = armd::diagnostics::alloc::take();
+
+        // 1. TorqueOff refused ARM_NOT_AT_RESTING_POSE (enable state Disabled / not at rest) -> 0 alloc.
+        let ep1 = core.safety.epoch_id();
+        let d_off_refuse = mk_tr(10, TransitionOp::TorqueOff, ep1);
+        assert_eq!(
+            core.commit_transition(&d_off_refuse, TransitionOp::TorqueOff, &cctx),
+            Err("ARM_NOT_AT_RESTING_POSE")
+        );
+
+        // 2. TorqueOn start -> poll confirmed -> TorqueOff start -> poll confirmed -> 0 alloc.
+        ctrl.allow_enable_confirm.store(true, Ordering::SeqCst);
+        let d_on = mk_tr(11, TransitionOp::TorqueOn, ep1);
+        assert!(core.commit_transition(&d_on, TransitionOp::TorqueOn, &cctx).is_ok());
+        let b1 = ServiceBudget::for_release(mclock.now(), mclock.now() + Duration::from_millis(20));
+        let p1 = core.poll_hardware(&b1);
+        assert_eq!(p1.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Done)));
+        assert!(core.is_torqued);
+
+        ctrl.allow_disable_confirm.store(false, Ordering::SeqCst);
+        let d_off = mk_tr(12, TransitionOp::TorqueOff, ep1);
+        assert!(core.commit_transition(&d_off, TransitionOp::TorqueOff, &cctx).is_ok());
+        let p2 = core.poll_hardware(&b1);
+        assert!(matches!(p2.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Pending { .. }))));
+        ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
+        let p2b = core.poll_hardware(&b1);
+        assert!(matches!(p2b.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Pending { .. }))));
+        let p3 = core.poll_hardware(&b1);
+        assert_eq!(p3.torque, Some(Ok(armd::rt_core::ops::TorqueProgress::Done)));
+        assert!(!core.is_torqued);
+
+        // 3. TorqueOn failure (enable_step_failed) + BackgroundDisableRetry attempts + exhaustion -> 0 alloc.
+        ctrl.allow_enable_confirm.store(false, Ordering::SeqCst);
+        ctrl.fail_enable_poll.store(true, Ordering::SeqCst);
+        ctrl.partial_enable_unknown_until_disable.store(true, Ordering::SeqCst);
+        ctrl.fail_disable_begin_remaining.store(20, Ordering::SeqCst);
+        let d_on_fail = mk_tr(13, TransitionOp::TorqueOn, ep1);
+        assert!(core.commit_transition(&d_on_fail, TransitionOp::TorqueOn, &cctx).is_ok());
+        let p_fail = core.poll_hardware(&b1);
+        assert_eq!(p_fail.torque, Some(Err("ENABLE_FAILED")));
+        for _ in 0..10 {
+            mclock.advance(Duration::from_millis(30));
+            let bn = ServiceBudget::for_release(mclock.now(), mclock.now() + Duration::from_millis(20));
+            let _ = core.poll_hardware(&bn);
+        }
+
+        // 4. LeaseClearFault refusals (LeaseLost, EpochMismatch, InvalidRequestId, OperatorRequired, InvalidBody, ClearFailed) -> 0 alloc.
+        let ep_fault = core.safety.epoch_id();
+        let now_f = mclock.now();
+        let rd_f = now_f + Duration::from_millis(20);
+        assert!(matches!(
+            install_lease_clear_fault_rt(&mut core, c1, g1 + 1, Some(ep_fault), true, None, grant_ok, now_f, rd_f),
+            LeaseClearFaultOutcome::LeaseLost { .. }
+        ));
+        assert!(matches!(
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault + 1), true, None, grant_ok, now_f, rd_f),
+            LeaseClearFaultOutcome::EpochMismatch { consumed_request_id: false, .. }
+        ));
+        assert!(matches!(
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), false, None, grant_ok, now_f, rd_f),
+            LeaseClearFaultOutcome::InvalidRequestId
+        ));
+        assert!(matches!(
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, None, grant_denied, now_f, rd_f),
+            LeaseClearFaultOutcome::OperatorRequired { .. }
+        ));
+        assert!(matches!(
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, Some("bad"), grant_ok, now_f, rd_f),
+            LeaseClearFaultOutcome::InvalidBody { .. }
+        ));
+        // ClearFailed because disable_pending is still true -> 0 alloc!
+        assert!(matches!(
+            install_lease_clear_fault_rt(&mut core, c1, g1, Some(ep_fault), true, None, grant_ok, now_f, rd_f),
+            LeaseClearFaultOutcome::ClearFailed { .. }
+        ));
+
+        // Confirm background disable via driver, then LeaseClearFault succeeds -> 0 alloc!
+        ctrl.fail_disable_begin_remaining.store(0, Ordering::SeqCst);
+        ctrl.allow_disable_confirm.store(true, Ordering::SeqCst);
+        let _ = core
+            .driver
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .begin_torque_budgeted(false, 0);
+        core.disable_pending = false;
+        core.is_torqued = false;
+        let cleared = install_lease_clear_fault_rt(
+            &mut core,
+            c1,
+            g1,
+            Some(ep_fault),
+            true,
+            None,
+            grant_ok,
+            now_f,
+            rd_f,
+        );
+        assert!(matches!(cleared, LeaseClearFaultOutcome::Cleared { safety_state: SafetyState::Idle, .. }), "{cleared:?}");
+
+        // Refusal on TorqueOn while pending / after fault -> 0 alloc!
+        ctrl.fail_enable_poll.store(false, Ordering::SeqCst);
+        let ep_clean = core.safety.epoch_id();
+        let cctx_clean = CommitCtx { arm, boot, now: now_f, stop_generation: 0 };
+        let d_on2 = mk_tr(14, TransitionOp::TorqueOn, ep_clean);
+        assert!(core.commit_transition(&d_on2, TransitionOp::TorqueOn, &cctx_clean).is_ok());
+        // Fence displaced lease via disconnect while TorqueOn is pending -> abort_enable_transition_for_fenced_lease -> 0 alloc!
+        ctrl.fail_disable_begin_remaining.store(0, Ordering::SeqCst);
+        let _ = install_lease_disconnect(&mut core, &LeaseDisconnect { connection: c1 }, now_f);
+
+        let stats = armd::diagnostics::alloc::take();
+        assert_eq!(
+            stats.calls, 0,
+            "RT L2 torque transitions, retries, abort, and LeaseClearFault must do 0 allocs/frees: {stats:?}"
+        );
+    }
+
+    // (b) Live `armd-control` whole-release zero-alloc proof (`alloc_timing = true`) across
+    //     WS /api/v1/torque, /api/v1/arm, estop, and /api/v1/safety/clear_fault.
+    {
+        let auth = OperatorAuth::enforced("123456", 1800);
+        let (tok_op, _) = auth.unlock("123456").unwrap();
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig {
+            lease_timeout_ms: 5_000,
+            ..ArmConfig::rebot_dm()
+        }));
+        let addr = serve_with_auth(sup.clone(), auth).await;
+
+        let mut ecfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+        ecfg.alloc_timing = true;
+        let handle = sup.start_executor(ecfg).await.unwrap();
+
+        wait_until(Duration::from_secs(2), || sup.tick_samples().len() >= 4).await;
+        let _ = sup.fresh_snapshot(None).await.unwrap();
+        wait_until(Duration::from_secs(2), || sup.tick_samples().len() >= 10).await;
+        let baseline_samples = sup.tick_samples().len();
+
+        let mut ws = connect_ws(addr, "auth=explicit").await;
+        let g = ws_reply(
+            &mut ws,
+            json!({"type": "acquire_lease", "client_id": "l2_alloc_live", "seq": 1}),
+            &["lease_granted"],
+        )
+        .await["generation"]
+            .as_u64()
+            .unwrap();
+        let ep0 = sup.observation().await.unwrap().epoch_id;
+
+        assert_eq!(
+            ws_reply(
+                &mut ws,
+                json!({"type": "command", "request_id": 1, "generation": g, "epoch_id": ep0, "path": "/api/v1/torque", "body": {"enable": true}}),
+                &["command_ack"],
+            )
+            .await["is_torqued"],
+            true
+        );
+        assert_eq!(
+            ws_reply(
+                &mut ws,
+                json!({"type": "command", "request_id": 2, "generation": g, "epoch_id": ep0, "path": "/api/v1/arm", "body": {"enable": false}}),
+                &["command_ack"],
+            )
+            .await["is_torqued"],
+            false
+        );
+
+        let ep1 = ws_reply(&mut ws, json!({"type": "estop"}), &["epoch_sync"])
+            .await["epoch_id"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            ws_reply(
+                &mut ws,
+                json!({"type": "command", "request_id": 3, "generation": g, "epoch_id": ep1, "path": "/api/v1/safety/clear_fault", "body": {}}),
+                &["command_reject"],
+            )
+            .await["code"],
+            "OPERATOR_REQUIRED"
+        );
+        let _ = ws_reply(
+            &mut ws,
+            json!({"type": "auth", "token": tok_op, "seq": 1}),
+            &["auth_ack"],
+        )
+        .await;
+        assert_eq!(
+            ws_reply(
+                &mut ws,
+                json!({"type": "command", "request_id": 4, "generation": g, "epoch_id": ep1, "path": "/api/v1/safety/clear_fault", "body": {}}),
+                &["command_ack"],
+            )
+            .await["safety_state"],
+            "Idle"
+        );
+
+        let _ = ws.close(None).await;
+        drop(ws);
+        wait_until(Duration::from_secs(2), || handle.live_connection_slots() == 0).await;
+        let end_step = handle.stats().steps.load(Ordering::Relaxed);
+        wait_until(Duration::from_secs(2), || {
+            handle.stats().steps.load(Ordering::Relaxed) >= end_step + 4
+        })
+        .await;
+
+        let samples = sup.tick_samples();
+        let nonzero: Vec<(usize, u32)> = samples[baseline_samples..]
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.usage.lock_alloc_calls > 0)
+            .map(|(i, s)| (i, s.usage.lock_alloc_calls))
+            .collect();
+        assert!(
+            nonzero.is_empty(),
+            "live executor L2 releases must do 0 allocs/frees: {nonzero:?}"
+        );
+        assert_eq!(sup.inner().control_thread_attempts(), 0);
+        handle.stop_and_join();
     }
 }
